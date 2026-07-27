@@ -10,7 +10,20 @@ repository contains no game code, assets, or media.
 - Your own legally obtained BT3 USA ISO (SLUS-21678). Other regions are not supported
   (the committed function map is for the USA ELF).
 - Linux, x86-64 CPU with SSE4.1, ~16 GB RAM and ~10 GB free disk for the build.
-- `cmake`, a C++20 compiler, `python3`, `rsync`, and `bsdtar` or `7z`.
+- `cmake`, a C++20 compiler, `python3`, `rsync`, `bsdtar` or `7z`, pkg-config,
+  the FFmpeg development libraries, and (to build the raylib backend) the
+  X11/OpenGL development headers.
+
+  Debian/Ubuntu:
+  ```sh
+  sudo apt install build-essential cmake git python3 rsync libarchive-tools \
+      pkg-config libavcodec-dev libavformat-dev libavutil-dev \
+      libswresample-dev libswscale-dev xorg-dev libgl1-mesa-dev
+  ```
+  Arch and derivatives:
+  ```sh
+  sudo pacman -S --needed base-devel cmake git python rsync libarchive ffmpeg
+  ```
 
 ## Build
 
