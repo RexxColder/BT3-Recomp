@@ -1671,7 +1671,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
             // z samples per texture: wrong-projection (z systematically below buffer) vs
             // corrupt-buffer (buffer z absurdly high) distinguish here.
             static std::map<uint32_t, std::array<uint32_t,2>> s_z; // tbp0 -> {last z, last bufZ}
-            if (!zpass) s_z[ctx.tex0.tbp0] = {z, gs->ReadVram(zpsm, zbp, fbw, x, y)};
+            if (!zpass) s_z[ctx.tex0.tbp0] = {static_cast<uint32_t>(z), static_cast<uint32_t>(gs->ReadVram(zpsm, zbp, fbw, x, y))};
             static std::map<uint32_t, std::array<int,2>> s_xy; // tbp0 -> kill x,y sample
             if (!zpass) s_xy[ctx.tex0.tbp0] = {(int)x, (int)y};
             static std::map<uint32_t, std::array<uint32_t,2>> &s_zr = s_z;

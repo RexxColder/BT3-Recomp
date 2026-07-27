@@ -27,7 +27,9 @@ bool g_kickSrcMapEnabled()
 #include <string>
 #include <vector>
 #include <map>
-#include <execinfo.h>
+#if !defined(_WIN32)
+#include <execinfo.h> // glibc backtrace for the PS2X_WATCH debug probe
+#endif
 #include <cstdio>
 #include <cstdlib>
 
@@ -47,9 +49,11 @@ static inline void ps2xWatchStore(uint32_t address, const void *bytes, uint32_t 
     static int s_n = 0; if (s_n++ >= 10) return;
     const uint32_t *w = reinterpret_cast<const uint32_t *>(bytes);
     std::fprintf(stderr, "[watch] store EEva=0x%08x n=%u val0=0x%08x -- backtrace:\n", address, n, w[0]);
+#if !defined(_WIN32)
     void *bt[24]; int m = backtrace(bt, 24);
     char **sy = backtrace_symbols(bt, m);
     if (sy) { for (int i = 0; i < m && i < 10; ++i) std::fprintf(stderr, "   %s\n", sy[i]); std::free(sy); }
+#endif
 }
 
 // Guest write-watch controls (defined in ps2_runtime.cpp; hooked into ps2TraceGuestWrite).

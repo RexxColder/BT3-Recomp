@@ -1,5 +1,7 @@
 #include <cstdlib>
-#include <execinfo.h>
+#if !defined(_WIN32)
+#include <execinfo.h> // glibc backtrace for the bad-jump diagnostic
+#endif
 #include "ps2_runtime.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
@@ -1291,6 +1293,7 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
             // Capture the C++ stack depth at the first bad jump: a huge depth == guest recursion
             // overflowed the (host) stack and clobbered the saved $ra. Small depth == a stray
             // write corrupted it. No gdb needed -> no timing perturbation.
+#if !defined(_WIN32)
             void *bt[8192];
             const int n = backtrace(bt, 8192);
             std::cerr << "[badjump-bt] C++ stack frames=" << n << " (huge=>stack-overflow/deep recursion)" << std::endl;
@@ -1300,6 +1303,7 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
                 for (int i = 0; i < n && i < 24; ++i) std::cerr << "   " << syms[i] << std::endl;
                 free(syms);
             }
+#endif
         }
     }
 
