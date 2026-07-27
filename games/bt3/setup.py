@@ -144,14 +144,21 @@ def main() -> None:
     cmake_build("ps2_recomp", str(os.cpu_count() or 4))
     recomp = find_binary("ps2_recomp")
 
-    # 4. Generate the runner sources.
+    # 4. Generate the runner sources. The function map first gets its oversized
+    #    Ghidra-truncation rows deduplicated and split into compiler-friendly
+    #    chunks (see split_functions.py) — without this, single generated
+    #    functions reach ~100K lines and exhaust MSVC's heap.
     print("== generating runner sources")
+    sys.path.insert(0, str(HERE))
+    from split_functions import split_csv
+    split = WORK / "functions_split.csv"
+    split_csv(elf, HERE / "functions.csv", split)
     out = WORK / "output"
     if out.exists():
         shutil.rmtree(out)
     cfg_text = (HERE / "config.toml.in").read_text()
     cfg_text = (cfg_text.replace("@ELF@", elf.as_posix())
-                        .replace("@CSV@", (HERE / "functions.csv").as_posix())
+                        .replace("@CSV@", split.as_posix())
                         .replace("@OUT@", out.as_posix() + "/"))
     (WORK / "config.toml").write_text(cfg_text)
     run([recomp, WORK / "config.toml"])
