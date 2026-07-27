@@ -12,7 +12,7 @@ image** — this repository contains no game code, assets, or media.
 
 - **Your own legally obtained BT3 USA ISO** (SLUS-21678). Other regions are not
   supported — the committed function maps are for the USA executable.
-- Linux, x86-64 CPU with SSE4.1.
+- Linux or Windows (experimental, see below), x86-64 CPU with SSE4.1.
 - ~16 GB RAM and ~10 GB free disk for the build.
 - Packages: `cmake`, GCC or Clang with C++20, `python3`, `rsync`,
   `bsdtar` (libarchive) or `7z`, pkg-config, the FFmpeg development libraries,
@@ -58,6 +58,23 @@ env PS2X_CD_IMAGE="/path/to/your/bt3-usa.iso" \
 Gamepads are supported (GLFW mappings; tested with an 8BitDo pad — close Steam
 first if it grabs the controller). Omit `PS2X_GPU=1`/`PS2X_GPU_DEPTH=1` to use
 the software rasterizer instead of the OpenGL renderer.
+
+## Windows (experimental)
+
+The same pipeline builds and boots natively on Windows with MSVC:
+
+1. Install [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
+   (the "Desktop development with C++" workload, which includes CMake) and Python 3.
+   `tar` for ISO extraction ships with Windows 10+.
+2. From a regular terminal:
+   ```
+   python games\bt3\setup.py C:\path\to\bt3-usa.iso 4
+   ```
+3. Run with the command it prints at the end.
+
+Notes: 12 GB+ RAM recommended for the build; adding the repo folder to Windows
+Defender's exclusions speeds compilation up dramatically. The Windows build is
+young — expect rough edges and please report issues.
 
 ## Status
 
