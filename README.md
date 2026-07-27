@@ -14,8 +14,20 @@ image** — this repository contains no game code, assets, or media.
   supported — the committed function maps are for the USA executable.
 - Linux, x86-64 CPU with SSE4.1.
 - ~16 GB RAM and ~10 GB free disk for the build.
-- Packages: `cmake`, GCC or Clang with C++20, `python3`, `rsync`, and
-  `bsdtar` (libarchive) or `7z`.
+- Packages: `cmake`, GCC or Clang with C++20, `python3`, `rsync`,
+  `bsdtar` (libarchive) or `7z`, pkg-config, the FFmpeg development libraries,
+  and the X11/OpenGL development headers (raylib builds from source).
+
+  Debian/Ubuntu:
+  ```sh
+  sudo apt install build-essential cmake git python3 rsync libarchive-tools \
+      pkg-config libavcodec-dev libavformat-dev libavutil-dev \
+      libswresample-dev libswscale-dev xorg-dev libgl1-mesa-dev
+  ```
+  Arch and derivatives:
+  ```sh
+  sudo pacman -S --needed base-devel cmake git python rsync libarchive ffmpeg
+  ```
 
 ## Build — one command
 
