@@ -12,7 +12,7 @@ image** — this repository contains no game code, assets, or media.
 
 - **Your own legally obtained BT3 USA ISO** (SLUS-21678). Other regions are not
   supported — the committed function maps are for the USA executable.
-- Linux or Windows (experimental, see below), x86-64 CPU with SSE4.1.
+- Linux or Windows (experimental), x86-64 CPU with SSE4.1.
 - ~16 GB RAM and ~10 GB free disk for the build.
 - Packages: `cmake`, GCC or Clang with C++20, `python3`, `rsync`,
   `bsdtar` (libarchive) or `7z`, pkg-config, the FFmpeg development libraries,
@@ -31,11 +31,26 @@ image** — this repository contains no game code, assets, or media.
 
 ## Build — one command
 
+**Linux:**
+
 ```sh
 git clone https://github.com/z3xox/BT3-Recomp.git
 cd BT3-Recomp
 ./games/bt3/setup.sh /path/to/your/bt3-usa.iso
 ```
+
+**Windows (experimental):** install [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
+(the "Desktop development with C++" workload, which includes CMake) and Python 3;
+`tar` for ISO extraction ships with Windows 10+. Then, from a regular terminal:
+
+```
+git clone https://github.com/z3xox/BT3-Recomp.git
+cd BT3-Recomp
+python games\bt3\setup.py C:\path\to\bt3-usa.iso 6
+```
+
+12 GB+ RAM recommended on Windows; the Windows build is young — expect rough
+edges and please report issues.
 
 The script extracts and sha256-verifies the game files from your ISO, builds the
 recompiler, generates ~7,800 C++ sources from the game's executable and overlay,
@@ -45,7 +60,8 @@ pass your core count as the second argument if you have 8 GB+ of free RAM.
 
 ## Run
 
-`setup.sh` prints the exact command when it finishes. It looks like this:
+The setup script prints the exact command when it finishes (on Windows it prints
+the `cmd.exe` equivalent). On Linux it looks like this:
 
 ```sh
 cd build/ps2xRuntime
@@ -58,22 +74,6 @@ env PS2X_CD_IMAGE="/path/to/your/bt3-usa.iso" \
 Gamepads are supported (GLFW mappings; tested with an 8BitDo pad — close Steam
 first if it grabs the controller). Omit `PS2X_GPU=1`/`PS2X_GPU_DEPTH=1` to use
 the software rasterizer instead of the OpenGL renderer.
-
-## Windows (experimental)
-
-The same pipeline builds and boots natively on Windows with MSVC:
-
-1. Install [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
-   (the "Desktop development with C++" workload, which includes CMake) and Python 3.
-   `tar` for ISO extraction ships with Windows 10+.
-2. From a regular terminal:
-   ```
-   python games\bt3\setup.py C:\path\to\bt3-usa.iso 6
-   ```
-3. Run with the command it prints at the end.
-
-Notes: 12 GB+ RAM recommended for the build. The Windows build is young —
-expect rough edges and please report issues.
 
 ## Status
 
