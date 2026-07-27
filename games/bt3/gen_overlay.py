@@ -200,13 +200,19 @@ def main() -> None:
     header = header.replace("PS2_RECOMPILED_FUNCTIONS_H", "PS2_OVERLAY_FUNCTIONS_H")
     header = header.replace("// PS2_RECOMPILED_FUNCTIONS_H", "// PS2_OVERLAY_FUNCTIONS_H")
 
+    def install(path: Path, text: str) -> None:
+        # Write only on change: an untouched mtime lets incremental builds skip
+        # recompiling these (one of them is a 487K-line TU).
+        if not path.is_file() or path.read_text() != text:
+            path.write_text(text)
+
     dst = args.runtime / "src" / "runner_overlay"
     dst.mkdir(parents=True, exist_ok=True)
-    (dst / "overlay_functions.cpp").write_text("".join(lines))
-    (dst / "overlay_register.cpp").write_text(reg)
-    (dst / "f_gaps_extra.cpp").write_text(gaps_cpp)
-    (dst / "f_3376b8_extra.cpp").write_text(missing_cpp)
-    (args.runtime / "include" / "ps2_overlay_functions.h").write_text(header)
+    install(dst / "overlay_functions.cpp", "".join(lines))
+    install(dst / "overlay_register.cpp", reg)
+    install(dst / "f_gaps_extra.cpp", gaps_cpp)
+    install(dst / "f_3376b8_extra.cpp", missing_cpp)
+    install(args.runtime / "include" / "ps2_overlay_functions.h", header)
     print(f"installed overlay sources -> {dst}")
 
 
