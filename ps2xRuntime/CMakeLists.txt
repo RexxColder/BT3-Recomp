@@ -455,6 +455,15 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     target_compile_options(ps2EntryRunner PRIVATE -msse4.1)
 endif()
 
+# Mirror the Linux build on MSVC: the generated runner sources compile WITHOUT
+# optimization (the hot loops live in ps2_runtime, which keeps the config's /O2).
+# Optimizing the giant machine-generated TUs pushed a single cl.exe past 34 GB of
+# commit (observed via Resource-Exhaustion event). /bigobj: generated TUs exceed
+# the default COFF section limit.
+if(MSVC)
+    target_compile_options(ps2EntryRunner PRIVATE /Od /bigobj)
+endif()
+
 target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
