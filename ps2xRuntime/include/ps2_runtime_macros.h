@@ -627,7 +627,7 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 static inline float ps2FpuSat(float f)
 {
     uint32_t u;
-    __builtin_memcpy(&u, &f, 4);
+    std::memcpy(&u, &f, 4);
     if ((u & 0x7F800000u) == 0x7F800000u) // IEEE Inf/NaN (exponent 255)
     {
         // PS2X_FPU_SAT=0 disables the saturation (A/B bisection switch).
@@ -635,7 +635,7 @@ static inline float ps2FpuSat(float f)
         if (s_on)
         {
             u = (u & 0x80000000u) | 0x7F7FFFFFu; // +/-FLT_MAX, sign preserved
-            __builtin_memcpy(&f, &u, 4);
+            std::memcpy(&f, &u, 4);
         }
     }
     return f;

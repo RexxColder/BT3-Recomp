@@ -434,7 +434,7 @@ namespace
                 case 0x01: r = a - b; break;              // sub.s
                 case 0x02: r = a * b; break;              // mul.s
                 case 0x03: r = (b != 0.0f) ? a / b : 0.0f; break; // div.s
-                case 0x04: { r = a > 0 ? __builtin_sqrtf(a) : 0.0f; break; } // sqrt.s
+                case 0x04: { r = a > 0 ? std::sqrt(a) : 0.0f; break; } // sqrt.s
                 case 0x05: r = a < 0 ? -a : a; break;     // abs.s
                 case 0x06: r = a; break;                  // mov.s
                 case 0x07: r = -a; break;                 // neg.s
