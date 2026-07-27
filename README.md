@@ -39,9 +39,9 @@ cd BT3-Recomp
 
 The script extracts and sha256-verifies the game files from your ISO, builds the
 recompiler, generates ~7,800 C++ sources from the game's executable and overlay,
-applies the committed patches, and builds the final binary. The last compile step
-is the long one (roughly 10–20 minutes at the default `-j3`; pass a job count as
-the second argument if you have RAM to spare).
+applies the committed patches, and builds the final binary. The compile is quick
+on a modern machine (a few minutes at `-j16`); the conservative default is `-j3` —
+pass your core count as the second argument if you have 8 GB+ of free RAM.
 
 ## Run
 
