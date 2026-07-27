@@ -134,9 +134,13 @@ def main() -> None:
         if os.environ.get("PS2X_SETUP_FORCE") != "1":
             sys.exit(1)
 
-    # 3. Configure + build the recompiler.
+    # 3. Configure + build the recompiler. Configure only once: the globs use
+    #    CONFIGURE_DEPENDS, so later builds re-run cmake by themselves when the
+    #    source set changes — and an unnecessary reconfigure rewrites the MSVC
+    #    project files, which makes MSBuild rebuild everything from scratch.
     print("== building recompiler")
-    run(["cmake", "-S", ROOT, "-B", BUILD])
+    if not (BUILD / "CMakeCache.txt").exists():
+        run(["cmake", "-S", ROOT, "-B", BUILD])
     cmake_build("ps2_recomp", str(os.cpu_count() or 4))
     recomp = find_binary("ps2_recomp")
 
@@ -167,9 +171,8 @@ def main() -> None:
     for h in ("ps2_recompiled_functions.h", "ps2_recompiled_stubs.h"):
         shutil.copyfile(out / h, rt / "include" / h)
 
-    # 7. Build the game.
+    # 7. Build the game (CONFIGURE_DEPENDS re-globs the runner sources on its own).
     print(f"== building ps2EntryRunner (-j{jobs}, this takes a while)")
-    run(["cmake", "-S", ROOT, "-B", BUILD])  # re-glob the runner sources
     cmake_build("ps2EntryRunner", jobs)
     runner = find_binary("ps2EntryRunner")
 
