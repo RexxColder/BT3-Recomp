@@ -74,11 +74,12 @@ def make_wrapper_elf(dbzp: Path, dst: Path) -> None:
 
 def run_recomp(recomp: Path, elf: Path, csv_path: Path, outdir: Path, work: Path) -> None:
     cfg = work / f"config_{csv_path.stem}.toml"
+    # Forward slashes: backslash is an escape character in TOML strings (Windows).
     cfg.write_text(
         "[general]\n"
-        f'input = "{elf}"\n'
-        f'ghidra_output = "{csv_path}"\n'
-        f'output = "{outdir}/"\n'
+        f'input = "{elf.as_posix()}"\n'
+        f'ghidra_output = "{csv_path.as_posix()}"\n'
+        f'output = "{outdir.as_posix()}/"\n'
         "single_file_output = true\n"
         "patch_syscalls = false\n"
         "patch_cop0 = true\n"
