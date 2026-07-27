@@ -1,173 +1,78 @@
-## PS2Recomp: PlayStation 2 Static Recompiler (Experimental)
+# BT3-Recomp — Dragon Ball Z: Budokai Tenkaichi 3 on PC
 
-[![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?logo=discord&logoColor=white)](https://discord.gg/JQ8mawxUEf)
+A statically recompiled, native PC port of *Dragon Ball Z: Budokai Tenkaichi 3*
+(PS2, USA, SLUS-21678), built on [PS2Recomp](https://github.com/ran-j/PS2Recomp).
+The game's MIPS code is translated to C++ **at build time, from your own disc
+image** — this repository contains no game code, assets, or media.
 
-Also check our [WIKI](https://github.com/ran-j/PS2Recomp/wiki)
+> This is not an emulator: the game's executable and its gameplay overlay are
+> recompiled into a native Linux binary with an OpenGL renderer.
 
+## Requirements
 
-This project statically recompiles PS2 ELF binaries into C++ and provides a runtime to execute the generated code.
+- **Your own legally obtained BT3 USA ISO** (SLUS-21678). Other regions are not
+  supported — the committed function maps are for the USA executable.
+- Linux, x86-64 CPU with SSE4.1.
+- ~16 GB RAM and ~10 GB free disk for the build.
+- Packages: `cmake`, GCC or Clang with C++20, `python3`, `rsync`, and
+  `bsdtar` (libarchive) or `7z`.
 
-### Modules
+## Build — one command
 
-* `ps2xAnalyzer`: scans ELF/functions and writes TOML config (`stubs`, `skip`, instruction patches).
-* `ps2xRecomp`: reads TOML + ELF, decodes R5900 instructions, and generates C++ output.
-* `ps2xRuntime`: hosts memory, function registration, syscall dispatch, and hardware stubs.
-
-### Features
-
-* Translates MIPS R5900 instructions to C++ code
-* PS2-specific MMI and VU0 macro support.
-* Single-file or multi-file output.
-* Configurable stubs, skips, and instruction patches.
-* Instruction-driven syscall handling.
-
-### How It Works
-PS2Recomp works by:
-
-* Parsing a PS2 ELF file to extract functions, symbols, and relocations
-* Decoding the MIPS R5900 instructions in each function
-* Translating those instructions to equivalent C++ code
-* Generating a runtime that can execute the recompiled code
-
-The translated code is very literal, with each MIPS instruction mapping to a C++ operation. For example, `addiu $r4, $r4, 0x20` becomes `ctx->r4 = ADD32(ctx->r4, 0X20);`.
-
-### Current Behavior
-
-* `stubs` entries generate wrappers that call known runtime syscall/stub handlers by name.
-* `stubs` also supports address bindings with `handler@0xADDRESS` for stripped games (for example `sceCdRead@0x00123456`).
-* Address bindings also support generic return handlers for triage: `ret0`, `ret1`, `reta0`.
-* Recompiler now tries relocation-symbol auto-binding at callsites (`J/JAL`) before raw address dispatch; when relocation symbol is known (for example `sceCdRead`), it can call runtime handlers without manual address mapping.
-* Recompiler discovers additional internal static entry targets and emits `entry_...` wrappers for those addresses.
-* For unresolved static `J/JAL` sites, generated code falls back to `runtime->lookupFunction(0x...)`.
-* `skip` entries are not recompiled and generate explicit `ps2_stubs::TODO_NAMED(...)` wrappers.
-* Recompiled `SYSCALL` now calls `runtime->handleSyscall(...)` with the encoded syscall immediate.
-* Runtime syscall dispatch tries encoded syscall ID first, then falls back to `$v1`.
-
-### Requirements
-
-* CMake 3.20+
-* C++20 compiler (currently tested mainly with MSVC)
-* SSE4/AVX host support for some vector paths
-
-### Build
-
-```bash
-git clone --recurse-submodules https://github.com/ran-j/PS2Recomp.git
-cd PS2Recomp
-
-cmake -S . -B out/build
-cmake --build out/build --config Debug
+```sh
+git clone https://github.com/z3xox/BT3-Recomp.git
+cd BT3-Recomp
+./games/bt3/setup.sh /path/to/your/bt3-usa.iso
 ```
 
-### Usage
+The script extracts and sha256-verifies the game files from your ISO, builds the
+recompiler, generates ~7,800 C++ sources from the game's executable and overlay,
+applies the committed patches, and builds the final binary. The last compile step
+is the long one (roughly 10–20 minutes at the default `-j3`; pass a job count as
+the second argument if you have RAM to spare).
 
-Preferred workflow for retail or stripped games:
+## Run
 
-1. Open the ELF in Ghidra.
-2. Run `ps2xRecomp/tools/ghidra/ExportPS2Functions.java`.
-3. Use the exported TOML and CSV map.
-4. Recompile with the exported TOML:
+`setup.sh` prints the exact command when it finishes. It looks like this:
 
-```bash
-./ps2_recomp config.toml
+```sh
+cd build/ps2xRuntime
+env PS2X_CD_IMAGE="/path/to/your/bt3-usa.iso" \
+    PS2X_BT3_CDTICK=1 PS2X_SCHED=1 PS2X_GPU=1 PS2X_GPU_DEPTH=1 \
+    PS2X_ASYNC_KICK=1 PS2X_TIMERMULT=4 \
+    ./ps2EntryRunner ../../games/bt3/work/SLUS_216.78
 ```
 
-Fallback workflow for quick local experiments or ELFs with debug symbol :
+Gamepads are supported (GLFW mappings; tested with an 8BitDo pad — close Steam
+first if it grabs the controller). Omit `PS2X_GPU=1`/`PS2X_GPU_DEPTH=1` to use
+the software rasterizer instead of the OpenGL renderer.
 
-```bash
-./ps2_analyzer your_game.elf config.toml
-```
+## Status
 
-Use this only when you do not have a Ghidra project yet. The native analyzer is faster to start, but it is less accurate on stripped retail games and more likely to miss internal callable entry points.
+Playable: boots through logos and title, menus work, and fights render in the
+GPU path at close to the engine's 30 fps cap.
 
-See the [Ghidra Workflow](ps2xAnalyzer/Readme.md#3-ghidra-integration-for-retail-and-stripped-games-preferred) for the recommended path.
+Known issues:
+- stray textured triangle popups in arenas (render-to-texture pass mismatch)
+- shadow blending differences and some stage-texture glitches in GPU mode
+- occasional arm-pose flip during ki charge
+- FMVs are skipped
 
-Then build generated output and link with `ps2xRuntime`.
+## Repository layout
 
-### Configuration
+| Path | What it is |
+| --- | --- |
+| `games/bt3/setup.sh` | one-command build pipeline |
+| `games/bt3/functions.csv`, `dbzp_*.csv` | function address maps (symbols only) |
+| `games/bt3/gen_overlay.py`, `apply_patches.py` | generators for the game-specific pieces |
+| `ps2xRecomp/` | the static recompiler (with EE FPU/VU semantics fixes) |
+| `ps2xRuntime/` | runtime: memory, GS/GPU renderer, VU1, scheduler, game overrides |
+| `PS2Recomp-README.md` | the upstream PS2Recomp documentation |
 
-Main fields in `config.toml`:
+## Credits & license
 
-* `general.input`: source ELF path.
-* `general.ghidra_output`: recommended function map CSV exported from Ghidra.
-* `general.output`: generated C++ output folder.
-* `general.single_file_output`: one combined cpp or one file per function.
-* `general.low_memory_mode`: reduce peak output-generation memory by avoiding retained disassembly strings and forcing serial output generation. Generated instruction comments are still emitted; disassembly text is produced while writing each output file instead of being kept in memory.
-* `general.output_worker_threads`: number of output-generation workers (clamped to nproc * 2). A positive value uses exactly that many workers. `0` uses `nproc - 1` when at least two hardware threads are available, otherwise serial output generation. `1` forces serial output generation.
-* `general.patch_syscalls`: apply configured patches to `SYSCALL` instructions (`false` recommended).
-* `general.patch_cop0`: apply configured patches to COP0 instructions.
-* `general.patch_cache`: apply configured patches to CACHE instructions.
-* `general.stubs`: names to force as stubs. Also accepts `handler@0xADDRESS` to bind a stripped function address directly to a runtime syscall/stub handler. Includes generic handlers `ret0`, `ret1`, `reta0`.
-* `general.skip`: names to force as skipped wrappers.
-* `patches.instructions`: raw instruction replacements by address.
-
-Address binding for stripped ELFs:
-
-* Use `handler@0xADDRESS` inside `general.stubs` to map a stripped function start directly to a runtime handler.
-* Example: `sceCdRead@0x00123456` binds function start `0x00123456` to `ps2_stubs::sceCdRead(...)`.
-* Generic temporary handlers are available: `ret0@0xADDR`, `ret1@0xADDR`, `reta0@0xADDR`.
-* Before manual binding, prefer recompilation from a Ghidra-exported TOML/CSV first. The extra boundaries and synthetic entry points are usually more important than manual early triage.
-* The address must be the function start in that exact ELF build.
-* Addresses are not portable across different games/regions/builds.
-* The handler name must exist in runtime call lists (`PS2_SYSCALL_LIST` or `PS2_STUB_LIST`).
-
-Example:
-
-```toml
-# stripped function binding by address:
-stubs = ["sceCdRead@0x00123456", "SifLoadModule@0x00127890"]
-# temporary return handlers:
-stubs = ["ret0@0x001D9410", "ret1@0x001D5BC8", "reta0@0x0024B7C0"]
-# mixed example:
-stubs = ["printf", "sceCdRead@0x00123456", "SifLoadModule@0x00127890"] 
-```
-
-### Runtime
-
-To execute the recompiled code.
-
-`ps2xRuntime` currently provides:
-
-* Guest memory model and function dispatch table.
-* Some syscall dispatcher with common kernel IDs.
-* Basic GS/VU/file/system stubs.
-* Foundation to expand and port your game.
-
-### Game Override Hooks
-
-Game overrides are runtime-side, build-scoped patch modules.
- 
-A game override is C++ code that runs during `loadELF` and can replace function bindings by address for one specific game build. This is separate from recompilation output and separate from global runtime stubs/syscalls. 
- 
-API:
-
-* Header: `ps2xRuntime/include/game_overrides.h`
-* Register macro: `PS2_REGISTER_GAME_OVERRIDE(name, elfName, entry, crc32, applyFn)`
-* Direct bind helper: `ps2_game_overrides::bindAddressHandler(runtime, addr, "handler")`
-
-Use Game Override modules when:
-
-* You need per-game/per-build routing or patches without polluting global behavior.
-* You need to bind many addresses, or install custom replacement logic for a specific title.
-
-#### Recommended Iteration Loop
-
-1. Run with minimal config and no aggressive skipping.
-2. Fix hard blockers first (`function not found`, syscall TODO, critical IO stubs).
-3. Use temporary return stubs only to classify call importance.
-4. Promote temporary fixes to real implementations.
-5. Move per-game hacks into game overrides keyed by ELF metadata.
-6. Re-test from cold boot after each batch.
-
-### Limitations
-
-* Graphics Synthesizer and other hardware components need external implementation
-* VU1 microcode is not complete.
-* Hardware emulation is partial and many paths are stubbed.
-
-###  Acknowledgments
-
-* Inspired by N64Recomp
-* Uses ELFIO for ELF parsing
-* Uses toml11 for TOML parsing
-* Uses fmt for string formatting
+- Built on [ran-j/PS2Recomp](https://github.com/ran-j/PS2Recomp) — thank you!
+  Licensed GPL-3.0, as is this repository (see `LICENSE`).
+- *Dragon Ball Z: Budokai Tenkaichi 3* © Spike / Bandai Namco. This project is
+  not affiliated with or endorsed by them; it exists for preservation and
+  interoperability, and distributes no game content.
