@@ -18,8 +18,20 @@
 #include "raylib.h"
 #include "rlgl.h"
 
-// GL 1.4 core, exported by libGL; raylib/rlgl does not wrap constant-color blending.
+// GL 1.4 core; raylib/rlgl does not wrap constant-color blending. Linux libGL exports
+// it directly; Windows opengl32 only exports GL 1.1, so resolve it from the driver at
+// first use (x64 has a single calling convention, so the plain signature is fine).
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) void *__stdcall wglGetProcAddress(const char *name);
+static void glBlendColor(float red, float green, float blue, float alpha)
+{
+    typedef void (*PFN)(float, float, float, float);
+    static PFN p = reinterpret_cast<PFN>(wglGetProcAddress("glBlendColor"));
+    if (p) p(red, green, blue, alpha);
+}
+#else
 extern "C" void glBlendColor(float red, float green, float blue, float alpha);
+#endif
 extern "C" void glBindTexture(unsigned int target, unsigned int texture);
 extern "C" void glTexParameteri(unsigned int target, unsigned int pname, int param);
 // GS FRAME.FBMSK -> per-channel color write mask (rlgl has no wrapper).
