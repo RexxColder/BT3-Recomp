@@ -68,13 +68,12 @@ The same pipeline builds and boots natively on Windows with MSVC:
    `tar` for ISO extraction ships with Windows 10+.
 2. From a regular terminal:
    ```
-   python games\bt3\setup.py C:\path\to\bt3-usa.iso 4
+   python games\bt3\setup.py C:\path\to\bt3-usa.iso 6
    ```
 3. Run with the command it prints at the end.
 
-Notes: 12 GB+ RAM recommended for the build; adding the repo folder to Windows
-Defender's exclusions speeds compilation up dramatically. The Windows build is
-young — expect rough edges and please report issues.
+Notes: 12 GB+ RAM recommended for the build. The Windows build is young —
+expect rough edges and please report issues.
 
 ## Status
 
