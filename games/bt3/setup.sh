@@ -33,6 +33,8 @@ case "$SRC" in
         echo "ERROR: need bsdtar or 7z to extract the ISO"; exit 1
     fi
     [ -f "$ELF" ] || { echo "ERROR: SLUS_216.78 not found in ISO (is this the USA release?)"; exit 1; }
+    # ISO9660 files extract read-only; the game opens some (e.g. BIN/DBZP.BIN) read-write.
+    chmod -R u+w "$WORK"
     ;;
   *)
     cp -f "$SRC" "$ELF"
