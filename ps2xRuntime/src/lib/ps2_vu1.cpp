@@ -1,0 +1,2390 @@
+#include "runtime/ps2_vu1.h"
+#include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_gif_arbiter.h"
+#include "runtime/ps2_memory.h"
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <vector>
+#include <fstream>
+#include <atomic>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <map>
+#include <cstdlib>
+#include <iostream>
+
+// Shared with ps2_vif1_interpreter.cpp (PS2X_KICKHIST unpack-history ring).
+struct Vif1UnpackRec { uint32_t destQw, cnt, srcGuest, spr; uint64_t frame; };
+extern thread_local Vif1UnpackRec g_unpackRing[32];
+extern thread_local uint32_t g_unpackRingPos;
+extern bool g_unpackRingEnabled();
+namespace { thread_local const uint8_t *g_curVuCode = nullptr; thread_local uint32_t g_curCodeSize = 0;
+            thread_local VU1State g_entryStateShadow{}; }
+
+// [vuflags] diag (probe; remove when floor clipping fixed): which cull mechanism do the
+// fight microprograms use — CLIP+FCAND (implemented) or FMAND on MAC flags (mac never
+// written = gap)? Plus ADC census of XGKICK output: does any kicked vertex carry ADC=1?
+namespace {
+FILE *vuFlagsLog() { static FILE *f = std::fopen("/home/z3/Desktop/bt3/work/vuflags.txt", "w"); return f; }
+std::atomic<uint64_t> g_fcandN{0}, g_fcandNZ{0}, g_fmandN{0}, g_fmandNZ{0}, g_clipOpN{0};
+std::atomic<uint64_t> g_adcSet{0}, g_adcClr{0}, g_xyz3N{0}, g_kickN{0};
+std::atomic<bool> g_vuCodeDumpReq{false}, g_vuCodeDumped{false}; // set by FCAND probe; next run() dumps its microcode
+}
+
+// VU1 op profiler (env PS2X_VUPROF): counts upper (FMAC) + lower op frequency and
+// total instructions/sec, to target the interpreter optimization at the hot ops.
+namespace {
+    std::atomic<uint64_t> g_vuUpperHist[64];
+    std::atomic<uint64_t> g_vuTotalInstr{0};
+    const bool g_vuProf = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_VUPROF"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+    // PS2X_MTXSEQ VU-side tracer (see run()): classify qw0-3 per run; force XGKICK dumps after a
+    // valued matrix so we can see the transformed output the program actually emits.
+    const bool s_mtxSeqVu = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_MTXSEQ"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+    std::atomic<int> s_kickDump{0};
+    // PS2X_KICKSTAT: per-microprogram dot/real tally. Records the entry PC of the current run so
+    // doXgkick can attribute each kicked packet; a packet whose vertices are all identical is a
+    // "dot" (the spread=0% collapse). Identifies WHICH VU1 program emits the collapsed geometry.
+    const bool s_kickStat = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_KICKSTAT"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+    // PS2X_SPIKEKICK: flag kicks whose vertex bbox exceeds ~1500px (hair-spike geometry),
+    // attribute to the microprogram entry PC and dump the program's INPUT buffer (TOP..) —
+    // splits "garbage data arrived" from "microprogram computed garbage".
+    const bool g_spikeKick = [](){ const char *v = std::getenv("PS2X_SPIKEKICK"); return v && v[0] && v[0] != '0'; }();
+    // PS2X_BLINK: per-frame per-PC kicked-vertex tallies; log when a program's output
+    // collapses (>=10x drop or missing frames) — catches the character-blink frames.
+    const bool g_blinkProbe = [](){ const char *v = std::getenv("PS2X_BLINK"); return v && v[0] && v[0] != '0'; }();
+    uint32_t g_curStartPc = 0;
+    // PS2X_QPIPE (default ON, =0 restores instant-Q): emulate the VU1 Q-pipeline latency —
+    // DIV/SQRT deliver Q after 7 cycles, RSQRT after 13; WAITQ commits immediately.
+    const bool g_qPipe = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_QPIPE"); return s_env; }(); return !(v && v[0] == '0'); }();
+    // PS2X_CLIPPIPE (default ON, =0 disables): model the ~4-cycle latency of the CLIP
+    // instruction's flags (like the Q pipeline). Instant visibility let clipper microcode
+    // read flags for the WRONG vertex window — sporadic unclipped stage triangles (map-
+    // texture popups) + wrongly-culled ground triangles (holes).
+    const bool g_clipPipe = [](){ const char *v = std::getenv("PS2X_CLIPPIPE"); return !(v && v[0] == '0'); }();
+    // Thread-local pending slot (VU0-micro and VU1 share it per thread; VU0 microprograms
+    // don't use CLIP in BT3, so the collision is theoretical — promote to VU1State if kept).
+    thread_local uint32_t g_pendingClip = 0;
+    thread_local uint32_t g_clipWait = 0;
+    // PS2X_VUSTEP=N: trace the first N instructions of each run (replay debugging) —
+    // pc + lower/upper words, with CLIP inputs/flags and FCAND/FCOR/FCGET reads inline.
+    const uint32_t g_vuStep = [](){ const char *v = std::getenv("PS2X_VUSTEP"); return v ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
+    thread_local uint32_t g_vuStepN = 0;
+}
+
+// Instruction field extraction helpers
+static inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
+static inline uint8_t FT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
+static inline uint8_t FS(uint32_t i) { return (uint8_t)((i >> 11) & 0x1F); }
+static inline uint8_t FD(uint32_t i) { return (uint8_t)((i >> 6) & 0x1F); }
+static inline uint8_t BC(uint32_t i) { return (uint8_t)(i & 0x3); }
+
+// Lower instruction field helpers
+static inline uint8_t LIT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
+static inline uint8_t LIS(uint32_t i) { return (uint8_t)((i >> 11) & 0x1F); }
+static inline uint8_t LID(uint32_t i) { return (uint8_t)((i >> 6) & 0x1F); }
+static inline uint8_t VIT(uint32_t i) { return (uint8_t)((i >> 16) & 0xF); }
+static inline uint8_t VIS(uint32_t i) { return (uint8_t)((i >> 11) & 0xF); }
+static inline uint8_t VID(uint32_t i) { return (uint8_t)((i >> 6) & 0xF); }
+static inline int16_t IMM11(uint32_t i) { return (int16_t)(int32_t)((int32_t)(i << 21) >> 21); }
+static inline int16_t IMM15(uint32_t i)
+{
+    uint32_t lo11 = i & 0x7FF;
+    uint32_t hi4 = (i >> 21) & 0xF;
+    uint32_t raw = (hi4 << 11) | lo11;
+    return (int16_t)(int32_t)((int32_t)(raw << 17) >> 17);
+}
+
+
+static inline uint8_t vuUpperVfWriteReg(uint32_t upper)
+{
+    const uint8_t op = upper & 0x3Fu;
+    const uint8_t dest = DEST(upper);
+    const uint8_t ft = FT(upper);
+    const uint8_t fd = FD(upper);
+
+    if (dest == 0u)
+        return 0u;
+
+    if (op <= 0x2Fu)
+        return fd;
+
+    if (op >= 0x3Cu)
+    {
+        const uint8_t specialOp = static_cast<uint8_t>((upper & 0x3u) | ((upper >> 4) & 0x7Cu));
+        switch (specialOp)
+        {
+        // Upper special ops that write a VF register use FT as destination.
+        case 0x10: // ITOF0
+        case 0x11: // ITOF4
+        case 0x12: // ITOF12
+        case 0x13: // ITOF15
+        case 0x14: // FTOI0
+        case 0x15: // FTOI4
+        case 0x16: // FTOI12
+        case 0x17: // FTOI15
+        case 0x1D: // ABS
+            return ft;
+        default:
+            return 0u; // ACC/NOP/CLIP/etc.
+        }
+    }
+
+    return 0u;
+}
+
+static inline void vuSetRegBit(uint32_t &mask, uint8_t reg)
+{
+    if (reg != 0u && reg < 32u)
+        mask |= (1u << reg);
+}
+
+static inline void vuLowerVfReadWriteMasks(uint32_t lower, uint32_t &readMask, uint32_t &writeMask)
+{
+    readMask = 0u;
+    writeMask = 0u;
+
+    if (lower == 0u || lower == 0x8000033Cu)
+        return;
+
+    const uint8_t opHi = static_cast<uint8_t>((lower >> 25) & 0x7Fu);
+    const uint8_t it = LIT(lower);
+    const uint8_t is = LIS(lower);
+
+    if ((lower & 0x80000000u) != 0u)
+    {
+        const uint8_t funct = lower & 0x3Fu;
+        if (funct >= 0x3Cu && funct <= 0x3Fu)
+        {
+            const uint8_t specialOp = static_cast<uint8_t>((lower & 0x3u) | ((lower >> 4) & 0x7Cu));
+            switch (specialOp)
+            {
+            case 0x30: // MOVE
+            case 0x31: // MR32
+                vuSetRegBit(readMask, is);
+                vuSetRegBit(writeMask, it);
+                return;
+            case 0x34: // LQI
+            case 0x36: // LQD
+                vuSetRegBit(writeMask, it);
+                return;
+            case 0x35: // SQI
+            case 0x37: // SQD
+                vuSetRegBit(readMask, is);
+                return;
+            case 0x38: // DIV
+            case 0x3A: // RSQRT
+                vuSetRegBit(readMask, is);
+                vuSetRegBit(readMask, it);
+                return;
+            case 0x39: // SQRT
+                vuSetRegBit(readMask, it);
+                return;
+            case 0x3C: // MTIR
+            case 0x3E: // ILWR source base is integer, but field source is VF for MTIR only.
+                if (specialOp == 0x3C)
+                    vuSetRegBit(readMask, is);
+                return;
+            case 0x3D: // MFIR
+            case 0x64: // MFP
+                vuSetRegBit(writeMask, it);
+                return;
+            default:
+                return;
+            }
+        }
+        return;
+    }
+
+    switch (opHi)
+    {
+    case 0x00: // LQ
+        vuSetRegBit(writeMask, it);
+        return;
+    case 0x01: // SQ
+        vuSetRegBit(readMask, is);
+        return;
+    default:
+        return;
+    }
+}
+
+static inline bool vuLowerShouldRunBeforeUpper(uint32_t upper, uint32_t lower)
+{
+    const uint8_t upperWrite = vuUpperVfWriteReg(upper);
+    if (upperWrite == 0u)
+        return false;
+
+    uint32_t lowerReads = 0u;
+    uint32_t lowerWrites = 0u;
+    vuLowerVfReadWriteMasks(lower, lowerReads, lowerWrites);
+
+    const uint32_t upperBit = (1u << upperWrite);
+    return ((lowerReads | lowerWrites) & upperBit) != 0u;
+}
+
+
+VU1Interpreter::VU1Interpreter()
+{
+    reset();
+}
+
+void VU1Interpreter::reset()
+{
+    std::memset(&m_state, 0, sizeof(m_state));
+    m_state.vf[0][3] = 1.0f; // VF0.w = 1.0
+    m_state.q = 1.0f;
+}
+
+float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
+{
+    return vf[bc & 3];
+}
+
+void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
+{
+    if (dest & 0x8)
+        dst[0] = result[0]; // x
+    if (dest & 0x4)
+        dst[1] = result[1]; // y
+    if (dest & 0x2)
+        dst[2] = result[2]; // z
+    if (dest & 0x1)
+        dst[3] = result[3]; // w
+}
+
+// PS2 VU floats have NO NaN/Inf: exponent 255 is an ordinary (huge) number and results
+// saturate to +/-Fmax. Our IEEE math turns those into Inf/NaN, which survive into the
+// perspective divide and emit the giant SPS spike triangles. Clamp ARITHMETIC results
+// (and Q) to +/-FLT_MAX with the sign preserved; never applied to MAX/MINI selections,
+// ITOF/FTOI conversions or moves/loads, which must pass raw bit patterns through.
+// PS2X_VU_CLAMP=0 disables (diagnostic escape hatch).
+static inline bool vuClampEnabled()
+{
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_VU_CLAMP"); return !(v && v[0] == '0'); }();
+    return s_on;
+}
+
+static inline float vuClampFloat(float f)
+{
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    if ((u & 0x7F800000u) == 0x7F800000u) // IEEE Inf/NaN
+    {
+        u = (u & 0x80000000u) | 0x7F7FFFFFu; // +/-FLT_MAX, sign preserved
+        std::memcpy(&f, &u, 4);
+        // Diagnostic: how often IEEE NaN/Inf actually appears ([vuclamp] hits/s; no line
+        // = arithmetic never produced one, so spikes come from elsewhere). Only the taken
+        // branch pays for this.
+        static std::atomic<uint64_t> s_hits{0};
+        static std::atomic<int64_t> s_lastNs{0};
+        const uint64_t h = s_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t last = s_lastNs.load(std::memory_order_relaxed);
+        if (now - last > 1000000000ll && s_lastNs.compare_exchange_strong(last, now))
+            std::fprintf(stderr, "[vuclamp] total hits=%llu\n", (unsigned long long)h);
+    }
+    return f;
+}
+
+// PS2 FTOI saturates to INT32_MAX/INT32_MIN by sign; the x86 cast yields 0x80000000 for
+// ANY out-of-range/NaN input, which turns a huge POSITIVE coordinate into a giant
+// NEGATIVE one (worst-case SPS spike input).
+static inline int32_t vuFtoi(float f)
+{
+    if (!(f >= -2147483648.0f)) // NaN, or below INT32_MIN
+        return std::signbit(f) ? INT32_MIN : INT32_MAX;
+    if (f >= 2147483648.0f)
+        return INT32_MAX;
+    return static_cast<int32_t>(f);
+}
+
+void VU1Interpreter::applyDestClamped(float *dst, const float *result, uint8_t dest)
+{
+    // MAC/STATUS flag update — FMAC (arithmetic) results drive the Z/S flag nibbles that
+    // microprogram clippers read via FMAND/FSAND. These were NEVER WRITTEN before, so every
+    // MAC-flag-based clipper branched on constant zero (SPS spikes passing unclipped + culled
+    // holes). MAC layout: bits0-3 Z (x=bit3..w=bit0), bits4-7 S. Fields outside the dest mask
+    // are cleared (DobieStation semantics). STATUS: bit0=Z-any, bit1=S-any, bits6/7 sticky.
+    {
+        // PS2X_VU_MACFLAGS: 0=off (pre-fix behavior: mac stays 0), 1=x-in-bit3 layout
+        // (DobieStation-style, default), 2=x-in-bit0 layout (alternate documented order).
+        static const int s_mode = [](){ const char *v = std::getenv("PS2X_VU_MACFLAGS"); return v ? std::atoi(v) : 1; }();
+        if (s_mode != 0)
+        {
+            static const uint8_t rev4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+            const __m128 r = _mm_loadu_ps(result);
+            const uint32_t laneDest = rev4[dest & 0xFu]; // dest bit3=x -> movemask bit0=x
+            const uint32_t zm = (uint32_t)_mm_movemask_ps(_mm_cmpeq_ps(r, _mm_setzero_ps())) & laneDest;
+            const uint32_t sm = (uint32_t)_mm_movemask_ps(r) & laneDest & ~zm; // -0 is zero, not negative
+            if (s_mode == 2)
+                m_state.mac = zm | (sm << 4); // movemask order directly: x=bit0
+            else
+                m_state.mac = (uint32_t)rev4[zm] | ((uint32_t)rev4[sm] << 4); // x=bit3
+            const uint32_t zAny = zm ? 1u : 0u, sAny = sm ? 2u : 0u;
+            m_state.status = (m_state.status & ~0x3u) | zAny | sAny | (zAny << 6) | (sAny << 6);
+        }
+    }
+    if (!vuClampEnabled())
+    {
+        applyDest(dst, result, dest);
+        return;
+    }
+    if (dest & 0x8)
+        dst[0] = vuClampFloat(result[0]); // x
+    if (dest & 0x4)
+        dst[1] = vuClampFloat(result[1]); // y
+    if (dest & 0x2)
+        dst[2] = vuClampFloat(result[2]); // z
+    if (dest & 0x1)
+        dst[3] = vuClampFloat(result[3]); // w
+}
+
+void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
+{
+    applyDestClamped(m_state.acc, result, dest);
+}
+
+void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+                             uint8_t *vuData, uint32_t dataSize,
+                             GS &gs, PS2Memory *memory,
+                             uint32_t startPC, uint32_t top, uint32_t itop,
+                             uint32_t maxCycles)
+{
+    m_state.pc = startPC & 0x3FFFu;
+    m_state.ebit = false;
+    m_state.top = top;
+    m_state.itop = itop;
+    m_state.branchPending = false;
+    m_state.branchTarget = 0;
+    m_state.branchDelay = 0;
+    m_state.vf[0][0] = 0.0f;
+    m_state.vf[0][1] = 0.0f;
+    m_state.vf[0][2] = 0.0f;
+    m_state.vf[0][3] = 1.0f;
+    // EXPERIMENT (PS2X_FORCE_MVP): the battle's per-object MVP matrix at qw0-3 arrives
+    // ZERO (EE never produces it) -> vertex*0 -> geometry collapses to origin. If qw0-3 is
+    // all-zero, inject a plausible perspective-projection matrix (verts look view-space:
+    // clip=(vx,vy,vz,-vz), then divide, then the qw8-11 viewport scales to screen). This is
+    // a TEST to confirm qw0-3 is the only blocker and to actually SEE the 3D -- not a real fix.
+    {
+        // PS2X_INJECT_CONST=<file>: when qw0-3 is zero, inject a captured 256-byte VU1
+        // constant block (qw0-15) from a PCSX2 savestate dump -- validates our pipeline
+        // renders with the REAL matrix. Loaded once.
+        {
+            static const char *s_ic = [](){ static const char *s_env = std::getenv("PS2X_INJECT_CONST"); return s_env; }();
+            static std::vector<uint8_t> s_block = [](){
+                std::vector<uint8_t> b; const char *p = [](){ static const char *s_env = std::getenv("PS2X_INJECT_CONST"); return s_env; }();
+                if (p) { std::ifstream f(p, std::ios::binary); if (f) { b.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()); } }
+                return b; }();
+            if (s_ic && s_block.size() >= 256u && dataSize >= 256u)
+            {
+                bool zero = true;
+                for (uint32_t i = 0; i < 64u; ++i) if (vuData[i] != 0) { zero = false; break; }
+                if (zero) std::memcpy(vuData, s_block.data(), 256u);
+            }
+        }
+        // PS2X_PERSIST_MVP: the constant block (qw0-15) is valid on SETUP MSCALs but arrives
+        // ZERO on the GEOMETRY MSCALs that transform vertices. Cache the last non-zero block and
+        // restore it (only qw0-15, leaving the uploaded vertices at qw16+ intact) when a geometry
+        // call has a zero matrix. If this makes the 3D appear, the game's own matrix is correct and
+        // the bug is purely that the constants don't persist into the geometry pass.
+        {
+            static const bool s_pm = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_PERSIST_MVP"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+            if (s_pm && dataSize >= 256u)
+            {
+                static uint8_t s_cache[256]; static bool s_have = false;
+                bool blockZero = true;
+                for (uint32_t i = 0; i < 256u; ++i) if (vuData[i] != 0) { blockZero = false; break; }
+                bool mtxZero = true;
+                for (uint32_t i = 0; i < 64u; ++i) if (vuData[i] != 0) { mtxZero = false; break; }
+                if (!blockZero) { std::memcpy(s_cache, vuData, 256u); s_have = true; } // remember a valid const block
+                else if (s_have && mtxZero) { std::memcpy(vuData, s_cache, 256u); } // restore into geometry pass
+            }
+        }
+        // PS2X_VU1DUMP: is the vertex INPUT actually uploaded to VU1 memory? Summarize vuData beyond
+        // the qw0-15 constant block. Lots of varied data = geometry present (VU1 mistransforms it);
+        // near-empty = geometry never uploaded (upstream VIF/DMA/EE gap).
+        {
+            static const bool s_vd = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_VU1DUMP"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+            if (s_vd && dataSize >= 4096u) {
+                static int s_call = 0, s_n = 0;
+                if ((++s_call % 500) == 1 && s_n++ < 10) {
+                    uint32_t nzTotal = 0, nzVtx = 0; const float *f = reinterpret_cast<const float*>(vuData);
+                    for (uint32_t i = 0; i < dataSize; ++i) if (vuData[i]) ++nzTotal;
+                    for (uint32_t i = 256; i < dataSize; ++i) if (vuData[i]) ++nzVtx; // beyond constants
+                    std::fprintf(stderr, "[vu1dump] dataSize=%u nonzeroBytes total=%u beyond-qw16=%u | qw16=(%.3f,%.3f,%.3f,%.3f) qw20=(%.3f,%.3f,%.3f,%.3f) qw40=(%.3f,%.3f,%.3f,%.3f)\n",
+                                 dataSize, nzTotal, nzVtx, f[16],f[17],f[18],f[19], f[20],f[21],f[22],f[23], f[40],f[41],f[42],f[43]);
+                }
+            }
+        }
+        static const bool s_fm = [](){ static const char *s_env = std::getenv("PS2X_FORCE_MVP"); return s_env; }() != nullptr;
+        if (s_fm && dataSize >= 64u)
+        {
+            bool zero = true;
+            for (uint32_t i = 0; i < 64u; ++i) if (vuData[i] != 0) { zero = false; break; }
+            // The fight's MVP isn't zero -- it's DEGENERATE (tiny scale, no projection/translate terms).
+            // A valid MVP has large components (viewport scale ~1000s). Treat "max |component| < 8" as
+            // degenerate so the injection fires in the fight too. (PS2X_MVP_STRICT keeps the old zero-only.)
+            // PS2X_MVP_ID: reproduce the 7/10 hack — inject a near-identity matrix, and fire on the
+            // HUGE-degenerate MVP too (our current qw0-3 is max~3.26M, which the max<8 test misses).
+            static const bool s_mvpId = [](){ static const char *s_env = std::getenv("PS2X_MVP_ID"); return s_env; }() != nullptr;
+            if (!zero && [](){ static const char *s_env = std::getenv("PS2X_MVP_STRICT"); return s_env; }() == nullptr)
+            {
+                float mx = 0.0f; const float *mf = reinterpret_cast<const float *>(vuData);
+                for (int i = 0; i < 16; ++i) { float a = mf[i] < 0 ? -mf[i] : mf[i]; if (std::isfinite(a) && a > mx) mx = a; }
+                if (mx < 8.0f) zero = true;                 // degenerate -> inject
+                if (s_mvpId && mx > 100000.0f) zero = true; // huge projection-baked MVP -> replace too
+            }
+            {
+                static int s_z = 0, s_nz = 0;
+                if (zero) ++s_z; else ++s_nz;
+                static int s_log = 0;
+                if ((s_z + s_nz) % 2000 == 1 && s_log < 20) { ++s_log;
+                    std::fprintf(stderr, "[forcemvp] qw0-3 zero=%d nonzero=%d (this call zero=%d) dataSize=%u | first16B: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
+                                 s_z, s_nz, zero?1:0, dataSize,
+                                 vuData[0],vuData[1],vuData[2],vuData[3],vuData[4],vuData[5],vuData[6],vuData[7],
+                                 vuData[8],vuData[9],vuData[10],vuData[11],vuData[12],vuData[13],vuData[14],vuData[15]); }
+            }
+            if (zero)
+            {
+                // Perspective+viewport baked in: clip.x = vx*1754 + (-vz)*2048 (so after
+                // /clip.w=/-vz -> vx*1754/-vz + 2048 = screen). Same for y. clip.w=-vz.
+                // z -> constant mid-range depth. Tunable via PS2X_MVP_SX/SY/OX/OY.
+                auto envf = [](const char *n, float d){ const char *v=std::getenv(n); return v?(float)atof(v):d; };
+                const float sx = envf("PS2X_MVP_SX", 1754.57f), sy = envf("PS2X_MVP_SY", 2047.0f);
+                const float ox = envf("PS2X_MVP_OX", 2048.0f), oy = envf("PS2X_MVP_OY", 2048.0f);
+                // PS2X_MVP_ID -> the 7/10 near-identity matrix (1,0,0,0 / 0,1,0,0 / 0,0,1,-1); else viewport.
+                const float mId[16]  = { 1,0,0,0,  0,1,0,0,  0,0,1,-1,  0,0,0,0 };
+                const float mVp[16]  = { sx,0,0,0, 0,sy,0,0, -ox,-oy,-524288.0f,-1, 0,0,0,0 };
+                std::memcpy(vuData, s_mvpId ? mId : mVp, sizeof(mId));
+                // PS2X_MVP_ID: also clear qw4-15 (projection/constants) so the injected near-identity
+                // is the SOLE transform — reproduces the 7/10 all-zero-constant-region state. Guarded by
+                // PS2X_MVP_KEEPC to keep constants if this turns out to break it.
+                if (s_mvpId && dataSize >= 256u && [](){ static const char *s_env = std::getenv("PS2X_MVP_KEEPC"); return s_env; }() == nullptr)
+                    std::memset(vuData + 64, 0, 192u);
+            }
+        }
+    }
+    // PS2X_MVP_AMP=<f>: on the real per-object MVP (huge, not injected), amplify the rotation/scale
+    // columns qw0-2 by <f> while KEEPING the translation column qw3. Hypothesis: qw0-2 are ~1600x too
+    // small vs qw3, collapsing each object's internal geometry to a dot; amplifying them should spread
+    // each object AND keep per-object positioning. Drive nonDegenerate% up with this.
+    if ([](){ static const char *s_env = std::getenv("PS2X_MVP_AMP"); return s_env; }() && dataSize >= 64u)
+    {
+        float *m = reinterpret_cast<float *>(vuData);
+        float mx = 0.0f; for (int i = 0; i < 16; ++i) { float a = m[i] < 0 ? -m[i] : m[i]; if (std::isfinite(a) && a > mx) mx = a; }
+        if (mx > 100000.0f)
+        {
+            const float amp = static_cast<float>(atof([](){ static const char *s_env = std::getenv("PS2X_MVP_AMP"); return s_env; }()));
+            for (int i = 0; i < 12; ++i) m[i] *= amp; // qw0-2 = rot/scale; qw3 (m[12..15]) = translation, untouched
+        }
+    }
+    // PS2X_MVP_WFIX: the degeneracy is clip.x ∝ clip.w (X/W ratios all ~constant), so screen.x=clip.x/clip.w
+    // collapses. FORCE_MVP works because its clip.w=-vz (clean depth). Keep the real MVP's xy but REPLACE
+    // the W-row so clip.w = -vz: m[3]=m[7]=m[15]=0, m[11]=-1. (Optionally scale via PS2X_MVP_WSCALE.)
+    if ([](){ static const char *s_env = std::getenv("PS2X_MVP_WFIX"); return s_env; }() && dataSize >= 64u)
+    {
+        float *m = reinterpret_cast<float *>(vuData);
+        float mx = 0.0f; for (int i = 0; i < 16; ++i) { float a = m[i] < 0 ? -m[i] : m[i]; if (std::isfinite(a) && a > mx) mx = a; }
+        if (mx > 100000.0f)
+        {
+            const char *ws = [](){ static const char *s_env = std::getenv("PS2X_MVP_WSCALE"); return s_env; }();
+            const float wsc = ws ? static_cast<float>(atof(ws)) : 1.0f;
+            m[3] = 0.0f; m[7] = 0.0f; m[11] = -wsc; m[15] = 0.0f; // clip.w = -wsc*vz
+        }
+    }
+    // PS2X_MVP_T: transpose the real MVP. Row-major/column-major mismatch is the classic recompile bug
+    // and would make the transform comprehensively wrong (matching "no simple surgery fixes it").
+    if ([](){ static const char *s_env = std::getenv("PS2X_MVP_T"); return s_env; }() && dataSize >= 64u)
+    {
+        float *m = reinterpret_cast<float *>(vuData);
+        float mx = 0.0f; for (int i = 0; i < 16; ++i) { float a = m[i] < 0 ? -m[i] : m[i]; if (std::isfinite(a) && a > mx) mx = a; }
+        if (mx > 100000.0f)
+        {
+            auto sw = [&](int a, int b){ float t = m[a]; m[a] = m[b]; m[b] = t; };
+            sw(1,4); sw(2,8); sw(3,12); sw(6,9); sw(7,13); sw(11,14);
+        }
+    }
+    // [vuflags] one-shot microcode dump: after the FCAND probe fires, save this run's
+    // code image so the clip loop around pc=0x1d0 can be disassembled offline.
+    if (g_vuCodeDumpReq.load(std::memory_order_relaxed) &&
+        !g_vuCodeDumped.exchange(true, std::memory_order_relaxed) && vuCode && codeSize)
+    {
+        if (FILE *f = std::fopen("/home/z3/Desktop/bt3/work/vu1code.bin", "wb"))
+        {
+            std::fwrite(vuCode, 1, codeSize, f);
+            std::fclose(f);
+        }
+        if (FILE *f = vuFlagsLog())
+        { std::fprintf(f, "[vuflags] microcode dumped: %u bytes, startPC=0x%x\n", codeSize, m_state.pc); std::fflush(f); }
+    }
+    run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+}
+
+void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
+                            uint8_t *vuData, uint32_t dataSize,
+                            GS &gs, PS2Memory *memory,
+                            uint32_t top, uint32_t itop, uint32_t maxCycles)
+{
+    m_state.ebit = false;
+    m_state.top = top;
+    m_state.itop = itop;
+    run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+}
+
+void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                         uint8_t *vuData, uint32_t dataSize,
+                         GS &gs, PS2Memory *memory, uint32_t maxCycles)
+{
+    g_curStartPc = m_state.pc; // entry PC of this run (for PS2X_KICKSTAT attribution)
+    g_curVuCode = vuCode; g_curCodeSize = codeSize; // for the spike microcode snapshot
+    if (g_spikeKick)
+        g_entryStateShadow = m_state; // entry-state snapshot for exact spike replay
+    // PS2X_MTXSEQ (VU side): classify qw0-3 at every microprogram run — does the interpreter see
+    // the valued MVP the VIF just unpacked? When valued, force-dump the next XGKICKs (below) to
+    // see the transformed output. Skips boot noise by only logging once a valued matrix appears.
+    if (s_mtxSeqVu && dataSize >= 64u) {
+        const float *f = reinterpret_cast<const float*>(vuData);
+        float mx = 0; for (int i=0;i<16;i++){ float a=f[i]<0?-f[i]:f[i]; if(std::isfinite(a)&&a>mx)mx=a; }
+        static std::atomic<uint32_t> s_val{0}, s_deg{0}, s_mid{0};
+        static std::atomic<int> s_lines{0};
+        const char *cls = (mx > 100.f) ? "VALUED" : (mx < 8.f ? "DEGEN" : "mid");
+        if (mx > 100.f) { s_val.fetch_add(1); if (s_lines.load() < 40) s_kickDump.store(10); }
+        else if (mx < 8.f) s_deg.fetch_add(1);
+        else s_mid.fetch_add(1);
+        if (s_val.load() > 0 && s_lines.fetch_add(1) < 40)
+            std::fprintf(stderr, "[vurun] top=%u mx=%.0f %s q0=(%.2f %.2f %.2f %.2f) tally V=%u D=%u m=%u\n",
+                m_state.top, mx, cls, f[0], f[1], f[2], f[3], s_val.load(), s_deg.load(), s_mid.load());
+    }
+    if ([](){ static const char *s_env = std::getenv("PS2X_MTX"); return s_env; }() && dataSize >= 64u) {
+        static int mn = 0;
+        if (mn++ < 60) {
+            const float *f = reinterpret_cast<const float*>(vuData);
+            float mx = 0; for (int i=0;i<16;i++){ float a=f[i]<0?-f[i]:f[i]; if(std::isfinite(a)&&a>mx)mx=a; }
+            // per-row Y/W ratio: if ~equal across all 4 rows, the projection is Y-collapsed
+            // (every vertex lands at the same screen.y). Same for X/W.
+            auto yw=[&](int r){ float w=f[r*4+3]; return (w>1e-3f||w<-1e-3f)? f[r*4+1]/w : 0.0f; };
+            auto xw=[&](int r){ float w=f[r*4+3]; return (w>1e-3f||w<-1e-3f)? f[r*4+0]/w : 0.0f; };
+            std::fprintf(stderr, "[mtx] top=%u max=%.0f R0(%.1f,%.1f,%.1f,%.2f) R1(%.1f,%.1f,%.1f,%.2f) R2(%.1f,%.1f,%.1f,%.2f) R3(%.0f,%.0f,%.0f,%.1f) X/W[%.0f,%.0f,%.0f,%.0f] Y/W[%.0f,%.0f,%.0f,%.0f] %s\n",
+                m_state.top, mx,
+                f[0],f[1],f[2],f[3], f[4],f[5],f[6],f[7], f[8],f[9],f[10],f[11], f[12],f[13],f[14],f[15],
+                xw(0),xw(1),xw(2),xw(3), yw(0),yw(1),yw(2),yw(3), mx<8.0f?"DEGEN":"");
+        }
+    }
+    // PS2X_VU1FULL: dump the entire VU1 data memory (to compare region-by-region with a PCSX2
+    // savestate's vu1Memory.bin). Only snapshot geometry passes (qw0-3 has a real matrix) so we
+    // catch a moment with the projection constants loaded.
+    if ([](){ static const char *s_env = std::getenv("PS2X_VU1FULL"); return s_env; }() && dataSize >= 256u) {
+        const float *f = reinterpret_cast<const float*>(vuData);
+        float mx = 0; for (int i=0;i<16;i++){ float a=f[i]<0?-f[i]:f[i]; if(std::isfinite(a)&&a>mx)mx=a; }
+        static int fc = 0;
+        if (mx > 1000.0f && fc < 6) {
+            char path[128]; std::snprintf(path, sizeof(path), "/home/z3/Desktop/bt3/vu1full_%d.bin", fc);
+            FILE *fp = std::fopen(path, "wb");
+            if (fp) { std::fwrite(vuData, 1, dataSize, fp); std::fclose(fp); }
+            char mpath[128]; std::snprintf(mpath, sizeof(mpath), "/home/z3/Desktop/bt3/vu1micro_%d.bin", fc);
+            FILE *mp = std::fopen(mpath, "wb");
+            if (mp) { std::fwrite(vuCode, 1, codeSize, mp); std::fclose(mp); }
+            std::fprintf(stderr, "[vu1full] dumped %s + micro (%u bytes data, %u code, qw0-3 max=%.0f)\n", path, dataSize, codeSize, mx);
+            ++fc;
+        }
+    }
+    for (uint32_t cycle = 0; cycle < maxCycles; ++cycle)
+    {
+        // Q pipeline tick: commit the pending DIV/SQRT/RSQRT result once its latency elapses.
+        if (m_state.qWait > 0u && --m_state.qWait == 0u)
+            m_state.q = m_state.pendingQ;
+        // CLIP pipeline tick: flags become architecturally visible after their latency.
+        if (g_clipWait > 0u && --g_clipWait == 0u)
+            m_state.clip = g_pendingClip;
+
+        if (m_state.pc + 8 > codeSize)
+            break;
+
+        uint32_t lower, upper;
+        std::memcpy(&lower, vuCode + m_state.pc, 4);
+        std::memcpy(&upper, vuCode + m_state.pc + 4, 4);
+
+        const bool iBit = ((upper >> 31) & 1u) != 0u;
+        const bool eBit = ((upper >> 30) & 1u) != 0u;
+        const bool mBit = ((upper >> 29) & 1u) != 0u;
+        (void)mBit;
+
+        if (g_vuStep && g_vuStepN < g_vuStep)
+        {
+            ++g_vuStepN;
+            std::fprintf(stderr, "[vustep] pc=%4u lo=%08x hi=%08x clip=%06x pend=%06x wait=%u\n",
+                         m_state.pc / 8u, lower, upper, m_state.clip & 0xFFFFFFu, g_pendingClip & 0xFFFFFFu, g_clipWait);
+        }
+
+        if (g_vuProf)
+        {
+            g_vuUpperHist[upper & 0x3Fu].fetch_add(1, std::memory_order_relaxed);
+            uint64_t n = g_vuTotalInstr.fetch_add(1, std::memory_order_relaxed) + 1u;
+            if ((n & 0x1FFFFFu) == 0u) // every ~2M instrs
+            {
+                // top-10 upper ops
+                int idx[64]; for (int i = 0; i < 64; ++i) idx[i] = i;
+                std::sort(idx, idx + 64, [](int a, int b){ return g_vuUpperHist[a].load() > g_vuUpperHist[b].load(); });
+                std::cerr << "[vuprof] total=" << n << " topUpperOps:";
+                for (int k = 0; k < 10; ++k)
+                    std::cerr << " 0x" << std::hex << idx[k] << std::dec << "=" << g_vuUpperHist[idx[k]].load();
+                std::cerr << std::endl;
+            }
+        }
+
+        // LOI is controlled by the upper I-bit.  The lower word is the float immediate.
+        // DobieStation executes the upper instruction first, then commits lower into I.
+        const bool loi = iBit;
+        if (loi)
+        {
+            // LOI is special: the upper instruction sees the old I value, then LOI loads I.
+            execUpper(upper);
+            std::memcpy(&m_state.i, &lower, 4);
+        }
+        else if (vuLowerShouldRunBeforeUpper(upper, lower))
+        {
+            // VU upper/lower execute as a pair.  If the upper op writes a VF register
+            // that the lower op reads or also writes, Dobie runs the lower side first
+            // so it observes the old VF value and the upper write has priority.
+            execLower(lower, vuData, dataSize, gs, memory, upper);
+            execUpper(upper);
+        }
+        else
+        {
+            execUpper(upper);
+            execLower(lower, vuData, dataSize, gs, memory, upper);
+        }
+
+        // Enforce VF0 invariant
+        m_state.vf[0][0] = 0.0f;
+        m_state.vf[0][1] = 0.0f;
+        m_state.vf[0][2] = 0.0f;
+        m_state.vf[0][3] = 1.0f;
+        // Enforce VI0 invariant
+        m_state.vi[0] = 0;
+
+        uint32_t nextPC = m_state.pc + 8;
+        if (nextPC >= codeSize)
+            nextPC = 0;
+        m_state.pc = nextPC;
+
+        // VU branch/jump has a delay slot. Branch handlers set a pending target;
+        // we execute one sequential instruction before committing the branch.
+        if (m_state.branchPending)
+        {
+            if (m_state.branchDelay == 0)
+            {
+                m_state.pc = m_state.branchTarget & 0x3FFFu;
+                m_state.branchPending = false;
+            }
+            else
+            {
+                --m_state.branchDelay;
+            }
+        }
+
+        if (m_state.ebit)
+            break;
+
+        if (eBit)
+            m_state.ebit = true;
+    }
+}
+
+// ============================================================================
+// Upper instructions (FMAC pipeline)
+// ============================================================================
+void VU1Interpreter::execUpper(uint32_t instr)
+{
+    uint8_t dest = DEST(instr);
+    uint8_t ft = FT(instr);
+    uint8_t fs = FS(instr);
+    uint8_t fd = FD(instr);
+    uint8_t op = instr & 0x3F;
+
+    float *vd = m_state.vf[fd];
+    // VU vf0 is a hardwired read-only constant (0,0,0,1). Games use ops with fd=0 (e.g. dummy
+    // `vsub vf0`) purely to set MAC/status flags; the register write MUST be discarded. Without
+    // this, the write corrupts vf0's w=1 row and every matrix multiply that uses it collapses.
+    static float s_vf0Sink[4];
+    if (fd == 0u)
+        vd = s_vf0Sink;
+    const float *vs = m_state.vf[fs];
+    const float *vt = m_state.vf[ft];
+    float result[4];
+
+    // PS2X_VUTRACE: trace ops that WRITE the clip register vf25 (esp. the final matrix-multiply that
+    // sets clip.w). Shows op, dest mask, the ACC (accumulator) and operands -> is w masked out or is
+    // ACC.w already 0?
+    {
+        static const bool s_vt = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_VUTRACE"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+        if (s_vt && fd == 25) { static int shown = 0;
+            bool battle = (vs[2]>1.f||vs[2]<-1.f||m_state.acc[2]>1.f||m_state.acc[2]<-1.f);
+            if (battle && shown++ < 25) std::fprintf(stderr, "[wr25] op=0x%02x destMask=0x%x fs=%d ft=%d | ACC=(%.2f,%.2f,%.2f,w=%.4f) vs=(%.2f,%.2f,%.2f,w=%.4f) vt=(%.2f,%.2f,%.2f,w=%.4f)\n",
+                op, dest, fs, ft, m_state.acc[0],m_state.acc[1],m_state.acc[2],m_state.acc[3], vs[0],vs[1],vs[2],vs[3], vt[0],vt[1],vt[2],vt[3]); }
+    }
+
+    // Upper opcode decoding (bits 5:0 of upper word)
+    switch (op)
+    {
+    case 0x00:
+    case 0x01:
+    case 0x02:
+    case 0x03: // ADDbc
+    {
+        float bc = broadcast(vt, op & 3);
+        for (int c = 0; c < 4; c++)
+            result[c] = vs[c] + bc;
+        applyDestClamped(vd, result, dest);
+        return;
+    }
+    case 0x04:
+    case 0x05:
+    case 0x06:
+    case 0x07: // SUBbc
+    {
+        float bc = broadcast(vt, op & 3);
+        for (int c = 0; c < 4; c++)
+            result[c] = vs[c] - bc;
+        applyDestClamped(vd, result, dest);
+        return;
+    }
+    case 0x08:
+    case 0x09:
+    case 0x0A:
+    case 0x0B: // MADDbc
+    {
+        float bc = broadcast(vt, op & 3);
+        for (int c = 0; c < 4; c++)
+            result[c] = m_state.acc[c] + vs[c] * bc;
+        applyDestClamped(vd, result, dest);
+        return;
+    }
+    case 0x0C:
+    case 0x0D:
+    case 0x0E:
+    case 0x0F: // MSUBbc
+    {
+        float bc = broadcast(vt, op & 3);
+        for (int c = 0; c < 4; c++)
+            result[c] = m_state.acc[c] - vs[c] * bc;
+        applyDestClamped(vd, result, dest);
+        return;
+    }
+    case 0x10:
+    case 0x11:
+    case 0x12:
+    case 0x13: // MAXbc
+    {
+        float bc = broadcast(vt, op & 3);
+        for (int c = 0; c < 4; c++)
+            result[c] = (vs[c] > bc) ? vs[c] : bc;
+        applyDest(vd, result, dest);
+        return;
+    }
+    case 0x14:
+    case 0x15:
+    case 0x16:
+    case 0x17: // MINIbc
+    {
+        float bc = broadcast(vt, op & 3);
+        for (int c = 0; c < 4; c++)
+            result[c] = (vs[c] < bc) ? vs[c] : bc;
+        applyDest(vd, result, dest);
+        return;
+    }
+    case 0x18:
+    case 0x19:
+    case 0x1A:
+    case 0x1B: // MULbc
+    {
+        float bc = broadcast(vt, op & 3);
+        for (int c = 0; c < 4; c++)
+            result[c] = vs[c] * bc;
+        applyDestClamped(vd, result, dest);
+        return;
+    }
+    case 0x1C: // MULq
+        for (int c = 0; c < 4; c++)
+            result[c] = vs[c] * m_state.q;
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x1D: // MAXi
+        for (int c = 0; c < 4; c++)
+            result[c] = (vs[c] > m_state.i) ? vs[c] : m_state.i;
+        applyDest(vd, result, dest);
+        return;
+    case 0x1E: // MULi
+        for (int c = 0; c < 4; c++)
+            result[c] = vs[c] * m_state.i;
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x1F: // MINIi
+        for (int c = 0; c < 4; c++)
+            result[c] = (vs[c] < m_state.i) ? vs[c] : m_state.i;
+        applyDest(vd, result, dest);
+        return;
+    case 0x20: // ADDq
+        for (int c = 0; c < 4; c++)
+            result[c] = vs[c] + m_state.q;
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x21: // MADDq
+        for (int c = 0; c < 4; c++)
+            result[c] = m_state.acc[c] + vs[c] * m_state.q;
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x22: // ADDi
+        for (int c = 0; c < 4; c++)
+            result[c] = vs[c] + m_state.i;
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x23: // MADDi
+        for (int c = 0; c < 4; c++)
+            result[c] = m_state.acc[c] + vs[c] * m_state.i;
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x24: // SUBq
+        for (int c = 0; c < 4; c++)
+            result[c] = vs[c] - m_state.q;
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x25: // MSUBq
+        for (int c = 0; c < 4; c++)
+            result[c] = m_state.acc[c] - vs[c] * m_state.q;
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x26: // SUBi
+        for (int c = 0; c < 4; c++)
+            result[c] = vs[c] - m_state.i;
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x27: // MSUBi
+        for (int c = 0; c < 4; c++)
+            result[c] = m_state.acc[c] - vs[c] * m_state.i;
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x28: // ADD
+        for (int c = 0; c < 4; c++)
+            result[c] = vs[c] + vt[c];
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x29: // MADD
+        for (int c = 0; c < 4; c++)
+            result[c] = m_state.acc[c] + vs[c] * vt[c];
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x2A: // MUL
+        for (int c = 0; c < 4; c++)
+            result[c] = vs[c] * vt[c];
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x2B: // MAX
+        for (int c = 0; c < 4; c++)
+            result[c] = (vs[c] > vt[c]) ? vs[c] : vt[c];
+        applyDest(vd, result, dest);
+        return;
+    case 0x2C: // SUB
+        for (int c = 0; c < 4; c++)
+            result[c] = vs[c] - vt[c];
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x2D: // MSUB
+        for (int c = 0; c < 4; c++)
+            result[c] = m_state.acc[c] - vs[c] * vt[c];
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x2E: // OPMSUB
+        result[0] = m_state.acc[0] - vs[1] * vt[2];
+        result[1] = m_state.acc[1] - vs[2] * vt[0];
+        result[2] = m_state.acc[2] - vs[0] * vt[1];
+        result[3] = 0.0f;
+        applyDestClamped(vd, result, dest);
+        return;
+    case 0x2F: // MINI
+        for (int c = 0; c < 4; c++)
+            result[c] = (vs[c] < vt[c]) ? vs[c] : vt[c];
+        applyDest(vd, result, dest);
+        return;
+
+    // Upper special group (low op 0x3C..0x3F).
+    // Like lower1 special, the real selector is not just bits 5:0.  Dobie decodes:
+    //   op = (instr & 0x3) | ((instr >> 4) & 0x7C)
+    // Several instructions in this group also use FT as the destination, not FD.
+    case 0x3C:
+    case 0x3D:
+    case 0x3E:
+    case 0x3F:
+    {
+        const uint8_t specialOp = static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
+        float *vtDest = m_state.vf[ft];
+
+        // PS2X_VUTRACE: trace the matrix-multiply ACC ops (MULAbc 0x18-1B, MADDAbc 0x08-0B). Shows the
+        // matrix-row source (vs) + which vertex field is broadcast + the broadcast VALUE + resulting ACC.
+        {
+            static const bool s_vt2 = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_VUTRACE"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+            if (s_vt2 && ((specialOp>=0x18&&specialOp<=0x1B)||(specialOp>=0x08&&specialOp<=0x0B))) {
+                static int shown = 0; float bcv = broadcast(vt, specialOp & 3);
+                bool battle = (vt[0]>100.f||vt[0]<-100.f||vt[2]>100.f||vt[2]<-100.f); // vertex-scale operand
+                if (battle && shown++ < 30) std::fprintf(stderr, "[macc] sop=0x%02x %s dest=0x%x fs=%d(matrixRow=%.2f,%.2f,%.2f,%.2f) ft=%d bcField=%d bcVal=%.3f | ACCbefore=(%.1f,%.1f,%.1f,%.4f)\n",
+                    specialOp, (specialOp>=0x18?"MULA":"MADDA"), dest, fs, vs[0],vs[1],vs[2],vs[3], ft, specialOp&3, bcv, m_state.acc[0],m_state.acc[1],m_state.acc[2],m_state.acc[3]); }
+        }
+
+        switch (specialOp)
+        {
+        case 0x00:
+        case 0x01:
+        case 0x02:
+        case 0x03: // ADDAbc
+        {
+            float bc = broadcast(vt, specialOp & 3);
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] + bc;
+            applyDestAcc(result, dest);
+            return;
+        }
+        case 0x04:
+        case 0x05:
+        case 0x06:
+        case 0x07: // SUBAbc
+        {
+            float bc = broadcast(vt, specialOp & 3);
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] - bc;
+            applyDestAcc(result, dest);
+            return;
+        }
+        case 0x08:
+        case 0x09:
+        case 0x0A:
+        case 0x0B: // MADDAbc
+        {
+            float bc = broadcast(vt, specialOp & 3);
+            for (int c = 0; c < 4; c++)
+                result[c] = m_state.acc[c] + vs[c] * bc;
+            applyDestAcc(result, dest);
+            return;
+        }
+        case 0x0C:
+        case 0x0D:
+        case 0x0E:
+        case 0x0F: // MSUBAbc
+        {
+            float bc = broadcast(vt, specialOp & 3);
+            for (int c = 0; c < 4; c++)
+                result[c] = m_state.acc[c] - vs[c] * bc;
+            applyDestAcc(result, dest);
+            return;
+        }
+        case 0x10: // ITOF0
+            for (int c = 0; c < 4; c++)
+            {
+                int32_t iv;
+                std::memcpy(&iv, &vs[c], 4);
+                result[c] = static_cast<float>(iv);
+            }
+            applyDest(vtDest, result, dest);
+            return;
+        case 0x11: // ITOF4
+            for (int c = 0; c < 4; c++)
+            {
+                int32_t iv;
+                std::memcpy(&iv, &vs[c], 4);
+                result[c] = static_cast<float>(iv) / 16.0f;
+            }
+            applyDest(vtDest, result, dest);
+            return;
+        case 0x12: // ITOF12
+            for (int c = 0; c < 4; c++)
+            {
+                int32_t iv;
+                std::memcpy(&iv, &vs[c], 4);
+                result[c] = static_cast<float>(iv) / 4096.0f;
+            }
+            applyDest(vtDest, result, dest);
+            return;
+        case 0x13: // ITOF15
+            for (int c = 0; c < 4; c++)
+            {
+                int32_t iv;
+                std::memcpy(&iv, &vs[c], 4);
+                result[c] = static_cast<float>(iv) / 32768.0f;
+            }
+            applyDest(vtDest, result, dest);
+            return;
+        case 0x14: // FTOI0
+            for (int c = 0; c < 4; c++)
+            {
+                int32_t iv = vuFtoi(vs[c]);
+                std::memcpy(&result[c], &iv, 4);
+            }
+            applyDest(vtDest, result, dest);
+            return;
+        case 0x15: // FTOI4
+            {
+                static const bool s_vt = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_VUTRACE"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+                if (s_vt) { static int nz = 0, z = 0;
+                    bool nonzero = (vs[0]>0.5f||vs[0]<-0.5f||vs[1]>0.5f||vs[1]<-0.5f);
+                    if (nonzero && nz++ < 30) std::fprintf(stderr, "[ftoi4 NONZERO] in=(%.3f,%.3f,%.3f,%.3f) q=%.4f\n", vs[0],vs[1],vs[2],vs[3], m_state.q);
+                    else if (!nonzero && (++z % 100000) == 1) std::fprintf(stderr, "[ftoi4 zero] (count grows; sampled)\n"); }
+            }
+            for (int c = 0; c < 4; c++)
+            {
+                int32_t iv = vuFtoi(vs[c] * 16.0f);
+                std::memcpy(&result[c], &iv, 4);
+            }
+            applyDest(vtDest, result, dest);
+            return;
+        case 0x16: // FTOI12
+            for (int c = 0; c < 4; c++)
+            {
+                int32_t iv = vuFtoi(vs[c] * 4096.0f);
+                std::memcpy(&result[c], &iv, 4);
+            }
+            applyDest(vtDest, result, dest);
+            return;
+        case 0x17: // FTOI15
+            for (int c = 0; c < 4; c++)
+            {
+                int32_t iv = vuFtoi(vs[c] * 32768.0f);
+                std::memcpy(&result[c], &iv, 4);
+            }
+            applyDest(vtDest, result, dest);
+            return;
+        case 0x18:
+        case 0x19:
+        case 0x1A:
+        case 0x1B: // MULAbc
+        {
+            float bc = broadcast(vt, specialOp & 3);
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] * bc;
+            applyDestAcc(result, dest);
+            return;
+        }
+        case 0x1C: // MULAq
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] * m_state.q;
+            applyDestAcc(result, dest);
+            return;
+        case 0x1D: // ABS
+            for (int c = 0; c < 4; c++)
+                result[c] = std::fabs(vs[c]);
+            applyDest(vtDest, result, dest);
+            return;
+        case 0x1E: // MULAi
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] * m_state.i;
+            applyDestAcc(result, dest);
+            return;
+        case 0x1F: // CLIP
+        {
+            float w = std::fabs(vt[3]);
+            uint32_t flags = 0;
+            if (vs[0] > +w) flags |= 0x01;
+            if (vs[0] < -w) flags |= 0x02;
+            if (vs[1] > +w) flags |= 0x04;
+            if (vs[1] < -w) flags |= 0x08;
+            if (vs[2] > +w) flags |= 0x10;
+            if (vs[2] < -w) flags |= 0x20;
+            {
+                // Shift from the architectural FUTURE value (pending if one is in flight) so
+                // back-to-back CLIPs accumulate correctly; visibility is still delayed.
+                const uint32_t base = (g_clipWait > 0u) ? g_pendingClip : m_state.clip;
+                const uint32_t nv = ((base << 6) | flags) & 0xFFFFFFu;
+                if (g_clipPipe)
+                {
+                    if (g_clipWait > 0u)
+                        m_state.clip = g_pendingClip; // previous CLIP completes now
+                    g_pendingClip = nv;
+                    g_clipWait = 4u;
+                }
+                else
+                    m_state.clip = nv;
+            }
+            ++g_clipOpN; // [vuflags]
+            return;
+        }
+        case 0x20: // ADDAq
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] + m_state.q;
+            applyDestAcc(result, dest);
+            return;
+        case 0x21: // MADDAq
+            for (int c = 0; c < 4; c++)
+                result[c] = m_state.acc[c] + vs[c] * m_state.q;
+            applyDestAcc(result, dest);
+            return;
+        case 0x22: // ADDAi
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] + m_state.i;
+            applyDestAcc(result, dest);
+            return;
+        case 0x23: // MADDAi
+            for (int c = 0; c < 4; c++)
+                result[c] = m_state.acc[c] + vs[c] * m_state.i;
+            applyDestAcc(result, dest);
+            return;
+        case 0x24: // SUBAq
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] - m_state.q;
+            applyDestAcc(result, dest);
+            return;
+        case 0x25: // MSUBAq
+            for (int c = 0; c < 4; c++)
+                result[c] = m_state.acc[c] - vs[c] * m_state.q;
+            applyDestAcc(result, dest);
+            return;
+        case 0x26: // SUBAi
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] - m_state.i;
+            applyDestAcc(result, dest);
+            return;
+        case 0x27: // MSUBAi
+            for (int c = 0; c < 4; c++)
+                result[c] = m_state.acc[c] - vs[c] * m_state.i;
+            applyDestAcc(result, dest);
+            return;
+        case 0x28: // ADDA
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] + vt[c];
+            applyDestAcc(result, dest);
+            return;
+        case 0x29: // MADDA
+            for (int c = 0; c < 4; c++)
+                result[c] = m_state.acc[c] + vs[c] * vt[c];
+            applyDestAcc(result, dest);
+            return;
+        case 0x2A: // MULA
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] * vt[c];
+            applyDestAcc(result, dest);
+            return;
+        case 0x2C: // SUBA
+            for (int c = 0; c < 4; c++)
+                result[c] = vs[c] - vt[c];
+            applyDestAcc(result, dest);
+            return;
+        case 0x2D: // MSUBA
+            for (int c = 0; c < 4; c++)
+                result[c] = m_state.acc[c] - vs[c] * vt[c];
+            applyDestAcc(result, dest);
+            return;
+        case 0x2E: // OPMULA
+            result[0] = vs[1] * vt[2];
+            result[1] = vs[2] * vt[0];
+            result[2] = vs[0] * vt[1];
+            result[3] = 0.0f;
+            applyDestAcc(result, dest);
+            return;
+        case 0x2F:
+        case 0x30: // NOP
+            return;
+        default:
+            return;
+        }
+    }
+
+    case 0x30:
+    case 0x31:
+    case 0x32:
+    case 0x33:
+    default:
+        return;
+    }
+}
+
+// ============================================================================
+// Lower instructions
+// ============================================================================
+void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr)
+{
+    (void)upperInstr;
+    if (instr == 0x00000000 || instr == 0x8000033C) // NOP
+        return;
+
+    uint8_t opHi = (instr >> 25) & 0x7F;
+
+    // The lower instruction encoding uses bits 31:25 for the primary opcode
+    switch (opHi)
+    {
+    case 0x00: // LQ (Load Quadword from VU data memory)
+    {
+        uint8_t it = FT(instr);      // VF destination
+        uint8_t is = VIS(instr);    // VI base
+        uint8_t dest = (instr >> 21) & 0xF;
+        int16_t imm = IMM11(instr);
+        uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[is] + imm)) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize)
+        {
+            float tmp[4];
+            std::memcpy(tmp, vuData + addr, 16);
+            // PS2X_IDW: the world matrix at qw0-2 (and qw4-6) is loaded as ZERO (EE never wrote it) ->
+            // collapse. When such a load returns an all-zero quadword, substitute the matching IDENTITY
+            // row so 2D screen-space geometry (HUD/UI) passes through instead of collapsing to a point.
+            {
+                static const bool s_idw = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_IDW"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+                if (s_idw) {
+                    const uint32_t qw = addr >> 4;
+                    if (qw <= 6u) {
+                        static int s_seen = 0; if (s_seen++ < 40) std::fprintf(stderr, "[idw-lq] LOAD qw=%u vi%d=%d imm=%d -> vf%d vals=(%.3f,%.3f,%.3f,%.3f)\n",
+                                                                                qw, (int)is, (int)m_state.vi[is], (int)imm, (int)it, tmp[0],tmp[1],tmp[2],tmp[3]);
+                        if ((qw <= 2u || (qw >= 4u && qw <= 6u)) && tmp[0]==0.f && tmp[1]==0.f && tmp[2]==0.f && tmp[3]==0.f) {
+                            const uint32_t row = qw % 4u;
+                            if (row < 3u) tmp[row] = 1.0f;
+                        }
+                    }
+                }
+            }
+            applyDest(m_state.vf[it], tmp, dest);
+            // PS2X_LQ_DUMP: log LQ loads from LOW addresses (qw<20 = matrix/constant
+            // region) so we see exactly which addr VU1 reads its transform matrix from
+            // and whether the loaded values are a real matrix or zero.
+            static const bool s_lq = [](){ static const char *s_env = std::getenv("PS2X_LQ_DUMP"); return s_env; }() != nullptr;
+            if (s_lq && (addr >> 4) < 20u)
+            {
+                static std::atomic<uint32_t> s_n{0};
+                if ((s_n.fetch_add(1) % 4000u) < 12u)
+                    std::cerr << "[lq] qw=" << (addr >> 4) << " vi" << (int)is << "=" << m_state.vi[is]
+                              << " imm=" << imm << " -> vf" << (int)it
+                              << " vals=" << tmp[0] << "," << tmp[1] << "," << tmp[2] << "," << tmp[3] << std::endl;
+            }
+        }
+        return;
+    }
+    case 0x01: // SQ (Store Quadword to VU data memory)
+    {
+        uint8_t is = FS(instr);      // VF source
+        uint8_t it = VIT(instr);     // VI base
+        uint8_t dest = (instr >> 21) & 0xF;
+        int16_t imm = IMM11(instr);
+        uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[it] + imm)) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize)
+        {
+            float tmp[4];
+            std::memcpy(tmp, vuData + addr, 16);
+            if (dest & 0x8)
+                tmp[0] = m_state.vf[is][0];
+            if (dest & 0x4)
+                tmp[1] = m_state.vf[is][1];
+            if (dest & 0x2)
+                tmp[2] = m_state.vf[is][2];
+            if (dest & 0x1)
+                tmp[3] = m_state.vf[is][3];
+            std::memcpy(vuData + addr, tmp, 16);
+        }
+        return;
+    }
+    case 0x04: // ILW (Integer Load Word from VU data memory)
+    {
+        uint8_t it = VIT(instr);     // VI destination
+        uint8_t is = VIS(instr);     // VI base
+        uint8_t dest = (instr >> 21) & 0xF;
+        int16_t imm = IMM11(instr);
+        uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[is] + imm)) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize)
+        {
+            int comp = 0;
+            if (dest & 0x8)
+                comp = 0;
+            else if (dest & 0x4)
+                comp = 1;
+            else if (dest & 0x2)
+                comp = 2;
+            else
+                comp = 3;
+            uint32_t v;
+            std::memcpy(&v, vuData + addr + comp * 4, 4);
+            if (it != 0)
+                m_state.vi[it] = (int32_t)(int16_t)(v & 0xFFFF);
+        }
+        return;
+    }
+    case 0x05: // ISW (Integer Store Word to VU data memory)
+    {
+        uint8_t it = VIT(instr);     // VI source
+        uint8_t is = VIS(instr);     // VI base
+        uint8_t dest = (instr >> 21) & 0xF;
+        int16_t imm = IMM11(instr);
+        uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[is] + imm)) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize)
+        {
+            uint32_t val = (uint32_t)(uint16_t)(m_state.vi[it] & 0xFFFF);
+            if (dest & 0x8)
+                std::memcpy(vuData + addr + 0, &val, 4);
+            if (dest & 0x4)
+                std::memcpy(vuData + addr + 4, &val, 4);
+            if (dest & 0x2)
+                std::memcpy(vuData + addr + 8, &val, 4);
+            if (dest & 0x1)
+                std::memcpy(vuData + addr + 12, &val, 4);
+        }
+        return;
+    }
+    case 0x08: // IADDIU
+    {
+        uint8_t it = VIT(instr);
+        uint8_t is = VIS(instr);
+        int16_t imm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800);
+        if (it != 0)
+            m_state.vi[it] = (int16_t)(m_state.vi[is] + imm);
+        return;
+    }
+    case 0x09: // ISUBIU
+    {
+        uint8_t it = VIT(instr);
+        uint8_t is = VIS(instr);
+        int16_t imm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800);
+        if (it != 0)
+            m_state.vi[it] = (int16_t)(m_state.vi[is] - imm);
+        return;
+    }
+    case 0x10: // FCEQ
+    {
+        uint32_t imm24 = instr & 0xFFFFFF;
+        if (1 != 0)
+            m_state.vi[1] = ((m_state.clip & 0xFFFFFF) == imm24) ? 1 : 0;
+        return;
+    }
+    case 0x11: // FCSET
+    {
+        g_clipWait = 0; // direct write cancels any in-flight CLIP result
+        m_state.clip = instr & 0xFFFFFF;
+        return;
+    }
+    case 0x12: // FCAND
+    {
+        uint32_t imm24 = instr & 0xFFFFFF;
+        if (1 != 0)
+            m_state.vi[1] = ((m_state.clip & imm24) != 0) ? 1 : 0;
+        // [vuflags]
+        {
+            const uint64_t n = ++g_fcandN;
+            if (m_state.vi[1]) ++g_fcandNZ;
+            if (n <= 12)
+            {
+                if (FILE *f = vuFlagsLog())
+                { std::fprintf(f, "[fcand] pc=0x%x imm=0x%06x clip=0x%06x -> vi1=%d\n", m_state.pc, imm24, m_state.clip, (int)m_state.vi[1]); std::fflush(f); }
+            }
+            g_vuCodeDumpReq.store(true, std::memory_order_relaxed);
+        }
+        return;
+    }
+    case 0x13: // FCOR
+    {
+        uint32_t imm24 = instr & 0xFFFFFF;
+        if (1 != 0)
+            m_state.vi[1] = ((m_state.clip | imm24) == 0xFFFFFF) ? 1 : 0;
+        return;
+    }
+    case 0x14: // FSEQ
+    {
+        uint16_t imm12 = instr & 0xFFF;
+        if (1 != 0)
+            m_state.vi[1] = ((m_state.status & 0xFFF) == imm12) ? 1 : 0;
+        return;
+    }
+    case 0x15: // FSSET
+    {
+        m_state.status = (instr >> 6) & 0xFC0;
+        return;
+    }
+    case 0x16: // FSAND
+    {
+        uint16_t imm12 = instr & 0xFFF;
+        if (1 != 0)
+            m_state.vi[1] = (int32_t)(m_state.status & imm12);
+        return;
+    }
+    case 0x17: // FSOR
+    {
+        uint16_t imm12 = instr & 0xFFF;
+        if (1 != 0)
+            m_state.vi[1] = ((m_state.status | imm12) == 0xFFF) ? 1 : 0;
+        return;
+    }
+    // Real VU lower flag-op numbering (VU manual / DobieStation): 0x18=FMEQ, 0x1A=FMAND,
+    // 0x1B=FMOR, 0x1C=FCGET. This table previously had FMAND@0x18 / FMEQ@0x1A swapped and
+    // FMOR@0x1C shadowing FCGET — so the game's polygon clipper (FCGET vi1 to read the
+    // last two vertices' clip flags) always got 0 and never clipped -> exploding triangles
+    // on any frustum-crossing geometry (stage floor).
+    case 0x18: // FMEQ
+    {
+        uint8_t it = VIT(instr);
+        uint8_t is = VIS(instr);
+        if (it != 0)
+            m_state.vi[it] = ((m_state.mac & 0xFFFF) == (uint32_t)(uint16_t)m_state.vi[is]) ? 1 : 0;
+        return;
+    }
+    case 0x1A: // FMAND
+    {
+        uint8_t it = VIT(instr);
+        uint8_t is = VIS(instr);
+        if (it != 0)
+            m_state.vi[it] = (int32_t)(m_state.mac & (uint32_t)(uint16_t)m_state.vi[is]);
+        // [vuflags]
+        {
+            const uint64_t n = ++g_fmandN;
+            if (it != 0 && m_state.vi[it]) ++g_fmandNZ;
+            if (n <= 12)
+            {
+                if (FILE *f = vuFlagsLog())
+                { std::fprintf(f, "[fmand] pc=0x%x mask=0x%x mac=0x%x -> vi%d=%d\n", m_state.pc, (uint32_t)(uint16_t)m_state.vi[is], m_state.mac, (int)it, it ? (int)m_state.vi[it] : -1); std::fflush(f); }
+            }
+        }
+        return;
+    }
+    case 0x1B: // FMOR
+    {
+        uint8_t it = VIT(instr);
+        uint8_t is = VIS(instr);
+        if (it != 0)
+            m_state.vi[it] = (int32_t)(m_state.mac | (uint32_t)(uint16_t)m_state.vi[is]);
+        return;
+    }
+    case 0x1C: // FCGET - load low 12 bits of the clip flag register into VIt
+    {
+        uint8_t it = VIT(instr);
+        if (it != 0)
+            m_state.vi[it] = (int32_t)(m_state.clip & 0xFFFu);
+        return;
+    }
+    case 0x20: // B (unconditional branch)
+    {
+        int16_t imm = IMM11(instr);
+        uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
+        m_state.branchPending = true;
+        m_state.branchTarget = target;
+        m_state.branchDelay = 1;
+        return;
+    }
+    case 0x21: // BAL (Branch and link)
+    {
+        uint8_t it = VIT(instr);
+        int16_t imm = IMM11(instr);
+        uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
+        if (it != 0)
+            m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
+        m_state.branchPending = true;
+        m_state.branchTarget = target;
+        m_state.branchDelay = 1;
+        return;
+    }
+    case 0x24: // JR
+    {
+        uint8_t is = VIS(instr);
+        uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & 0x3FFF;
+        m_state.branchPending = true;
+        m_state.branchTarget = target;
+        m_state.branchDelay = 1;
+        return;
+    }
+    case 0x25: // JALR
+    {
+        uint8_t it = VIT(instr);
+        uint8_t is = VIS(instr);
+        uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & 0x3FFF;
+        if (it != 0)
+            m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
+        m_state.branchPending = true;
+        m_state.branchTarget = target;
+        m_state.branchDelay = 1;
+        return;
+    }
+    case 0x28: // IBEQ
+    {
+        uint8_t it = VIT(instr);
+        uint8_t is = VIS(instr);
+        int16_t imm = IMM11(instr);
+        if ((int16_t)m_state.vi[is] == (int16_t)m_state.vi[it])
+        {
+            uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
+            m_state.branchPending = true;
+        m_state.branchTarget = target;
+        m_state.branchDelay = 1;
+        }
+        return;
+    }
+    case 0x29: // IBNE
+    {
+        uint8_t it = VIT(instr);
+        uint8_t is = VIS(instr);
+        int16_t imm = IMM11(instr);
+        if ((int16_t)m_state.vi[is] != (int16_t)m_state.vi[it])
+        {
+            uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
+            m_state.branchPending = true;
+        m_state.branchTarget = target;
+        m_state.branchDelay = 1;
+        }
+        return;
+    }
+    case 0x2C: // IBLTZ
+    {
+        uint8_t is = VIS(instr);
+        int16_t imm = IMM11(instr);
+        if ((int16_t)m_state.vi[is] < 0)
+        {
+            uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
+            m_state.branchPending = true;
+        m_state.branchTarget = target;
+        m_state.branchDelay = 1;
+        }
+        return;
+    }
+    case 0x2D: // IBGTZ
+    {
+        uint8_t is = VIS(instr);
+        int16_t imm = IMM11(instr);
+        if ((int16_t)m_state.vi[is] > 0)
+        {
+            uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
+            m_state.branchPending = true;
+        m_state.branchTarget = target;
+        m_state.branchDelay = 1;
+        }
+        return;
+    }
+    case 0x2E: // IBLEZ
+    {
+        uint8_t is = VIS(instr);
+        int16_t imm = IMM11(instr);
+        if ((int16_t)m_state.vi[is] <= 0)
+        {
+            uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
+            m_state.branchPending = true;
+        m_state.branchTarget = target;
+        m_state.branchDelay = 1;
+        }
+        return;
+    }
+    case 0x2F: // IBGEZ
+    {
+        uint8_t is = VIS(instr);
+        int16_t imm = IMM11(instr);
+        if ((int16_t)m_state.vi[is] >= 0)
+        {
+            uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
+            m_state.branchPending = true;
+        m_state.branchTarget = target;
+        m_state.branchDelay = 1;
+        }
+        return;
+    }
+
+    case 0x40: // Lower1 / lower special. Bit31 set; low 6 bits select integer or special op.
+    {
+        const uint8_t funct = instr & 0x3Fu;
+        const uint8_t vfT = FT(instr);
+        const uint8_t vfS = FS(instr);
+        const uint8_t viT = VIT(instr);
+        const uint8_t viS = VIS(instr);
+        const uint8_t viD = VID(instr);
+        const uint8_t dest = (instr >> 21) & 0xF;
+
+        auto doXgkick = [&]()
+        {
+            if (!vuData || dataSize < 16u)
+                return;
+
+            auto wrapOffset = [&](uint32_t off) -> uint32_t
+            {
+                return off % dataSize;
+            };
+
+            auto read64Wrap = [&](uint32_t off) -> uint64_t
+            {
+                uint8_t bytes[8];
+                for (uint32_t i = 0; i < 8u; ++i)
+                {
+                    bytes[i] = vuData[wrapOffset(off + i)];
+                }
+                uint64_t value = 0;
+                std::memcpy(&value, bytes, sizeof(value));
+                return value;
+            };
+
+            uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
+            addr = wrapOffset(addr);
+            uint32_t pktOff = addr;
+            uint32_t totalBytes = 0u;
+            bool done = false;
+
+            for (int safety = 0; safety < 256 && !done; ++safety)
+            {
+                uint64_t tagLo = read64Wrap(pktOff);
+                uint32_t nloop = (uint32_t)(tagLo & 0x7FFFu);
+                uint8_t flg = (uint8_t)((tagLo >> 58) & 0x3u);
+                uint32_t nreg = (uint32_t)((tagLo >> 60) & 0xFu);
+                if (nreg == 0u)
+                    nreg = 16u;
+                bool eop = ((tagLo >> 15) & 0x1ull) != 0ull;
+
+                uint32_t pktSize = 16u;
+                if (flg == 0u)
+                {
+                    pktSize += nloop * nreg * 16u;
+                }
+                else if (flg == 1u)
+                {
+                    uint32_t regs = nloop * nreg;
+                    pktSize += regs * 8u;
+                    if ((regs & 1u) != 0u)
+                        pktSize += 8u;
+                }
+                else if (flg == 2u)
+                {
+                    pktSize += nloop * 16u;
+                }
+
+                if (pktSize == 0u)
+                    break;
+
+                totalBytes += pktSize;
+                pktOff = wrapOffset(pktOff + pktSize);
+                if (eop)
+                    done = true;
+            }
+
+            if (totalBytes == 0u)
+                return;
+
+            // [vuflags] ADC census: walk PACKED sub-packets, tally XYZ2/XYZF2 verts with the
+            // ADC (no-kick) bit set vs clear, plus XYZ3/XYZF3 descriptor uses. If ADC is never
+            // set and XYZ3 never appears, the clip path never suppresses a vertex.
+            {
+                uint32_t off = addr;
+                for (int sp = 0; sp < 256; ++sp)
+                {
+                    const uint64_t tagLo = read64Wrap(off);
+                    const uint64_t tagHi = read64Wrap(off + 8u);
+                    const uint32_t nloop = (uint32_t)(tagLo & 0x7FFFu);
+                    const uint8_t flg = (uint8_t)((tagLo >> 58) & 0x3u);
+                    uint32_t nreg = (uint32_t)((tagLo >> 60) & 0xFu);
+                    if (nreg == 0u) nreg = 16u;
+                    const bool eop = ((tagLo >> 15) & 0x1ull) != 0ull;
+                    uint32_t sz = 16u;
+                    if (flg == 0u)
+                    {
+                        for (uint32_t l = 0; l < nloop; ++l)
+                            for (uint32_t r = 0; r < nreg; ++r)
+                            {
+                                const uint8_t rd = (uint8_t)((tagHi >> (r * 4u)) & 0xFu);
+                                const uint32_t qOff = off + 16u + (l * nreg + r) * 16u;
+                                if (rd == 0x04u || rd == 0x05u)
+                                {
+                                    const uint64_t hi = read64Wrap(qOff + 8u);
+                                    if ((hi >> 47) & 1u) ++g_adcSet; else ++g_adcClr;
+                                }
+                                else if (rd == 0x0Cu || rd == 0x0Du)
+                                    ++g_xyz3N;
+                            }
+                        sz += nloop * nreg * 16u;
+                    }
+                    else if (flg == 1u)
+                    {
+                        const uint32_t regs = nloop * nreg;
+                        sz += regs * 8u + (((regs & 1u) != 0u) ? 8u : 0u);
+                    }
+                    else if (flg == 2u)
+                        sz += nloop * 16u;
+                    off = wrapOffset(off + sz);
+                    if (eop) break;
+                }
+                const uint64_t k = ++g_kickN;
+                if ((k % 500u) == 1u)
+                {
+                    if (FILE *f = vuFlagsLog())
+                    {
+                        std::fprintf(f, "[vuflags] kicks=%llu adcSet=%llu adcClr=%llu xyz3=%llu | clipOps=%llu fcand=%llu (vi1!=0: %llu) fmand=%llu (nz: %llu)\n",
+                                     (unsigned long long)k, (unsigned long long)g_adcSet.load(), (unsigned long long)g_adcClr.load(), (unsigned long long)g_xyz3N.load(),
+                                     (unsigned long long)g_clipOpN.load(), (unsigned long long)g_fcandN.load(), (unsigned long long)g_fcandNZ.load(),
+                                     (unsigned long long)g_fmandN.load(), (unsigned long long)g_fmandNZ.load());
+                        std::fflush(f);
+                    }
+                }
+            }
+
+            // PS2X_KICKSTAT: classify the ENTIRE kick — walk every GIF sub-packet, gather all
+            // XYZ2/XYZF2 vertex positions, count distinct XY values. verts>=3 with <=1 distinct
+            // position = DOT kick (collapses to a point). Tallied per microprogram entry PC and
+            // per prim type. (v1 only looked at the first sub-packet and missed the strip tags.)
+            if (s_kickStat || g_spikeKick || g_blinkProbe)
+            {
+                uint32_t off2 = addr, verts = 0, distinct = 0, primSeen = 99;
+                uint64_t seen[6]; uint64_t firstXy = 0;
+                uint32_t minX = 0xFFFFu, maxX = 0u, minY = 0xFFFFu, maxY = 0u;
+                for (int sf = 0; sf < 256; ++sf)
+                {
+                    const uint64_t tLo = read64Wrap(off2);
+                    const uint64_t tHi = read64Wrap(off2 + 8u);
+                    const uint32_t nl = (uint32_t)(tLo & 0x7FFFu);
+                    const uint32_t fg = (uint32_t)((tLo >> 58) & 0x3u);
+                    uint32_t nr = (uint32_t)((tLo >> 60) & 0xFu); if (!nr) nr = 16u;
+                    const bool ep = ((tLo >> 15) & 1u) != 0u;
+                    if (((tLo >> 46) & 1u) && primSeen == 99u) primSeen = (uint32_t)((tLo >> 47) & 0x7u);
+                    uint32_t sz = 16u;
+                    if (fg == 0u)
+                    {
+                        sz += nl * nr * 16u;
+                        for (uint32_t v = 0; v < nl; ++v)
+                            for (uint32_t r = 0; r < nr; ++r)
+                            {
+                                const uint32_t desc = (uint32_t)((tHi >> (r * 4u)) & 0xFu);
+                                if (desc != 4u && desc != 5u) continue;
+                                const uint64_t w01 = read64Wrap(off2 + 16u + (v * nr + r) * 16u);
+                                const uint64_t xy = w01 & 0xFFFF0000FFFFull;
+                                if (g_spikeKick)
+                                {
+                                    static const bool s_vl = [](){ const char *e = std::getenv("PS2X_SPIKEVERTS"); return e && e[0] && e[0] != '0'; }();
+                                    static std::atomic<uint32_t> s_vn{0};
+                                    if (s_vl && s_vn.fetch_add(1) < 400u)
+                                    {
+                                        const uint64_t w23 = read64Wrap(off2 + 16u + (v * nr + r) * 16u + 8u);
+                                        std::fprintf(stderr, "[skv] qw=%u v=%u px=(%.1f,%.1f) z=%u adc=%d wword=%04x\n",
+                                                     (off2 + 16u + (v * nr + r) * 16u) / 16u,
+                                                     verts, (float)(xy & 0xFFFFu) / 16.0f,
+                                                     (float)((xy >> 32) & 0xFFFFu) / 16.0f,
+                                                     (uint32_t)(w23 & 0xFFFFFFFFu),
+                                                     (int)((w23 >> 47) & 1u),
+                                                     (uint32_t)((w23 >> 32) & 0xFFFFu));
+                                    }
+                                }
+                                if (verts == 0) firstXy = xy;
+                                {
+                                    // Only DRAWN vertices (adc=0) count toward the spike bbox —
+                                    // ADC strip-restart vertices legitimately carry wild positions.
+                                    const uint64_t w23adc = read64Wrap(off2 + 16u + (v * nr + r) * 16u + 8u);
+                                    if (((w23adc >> 47) & 1u) == 0u)
+                                    {
+                                        const uint32_t vx = (uint32_t)(xy & 0xFFFFu);
+                                        const uint32_t vy = (uint32_t)((xy >> 32) & 0xFFFFu);
+                                        if (vx < minX) minX = vx;
+                                        if (vx > maxX) maxX = vx;
+                                        if (vy < minY) minY = vy;
+                                        if (vy > maxY) maxY = vy;
+                                    }
+                                }
+                                ++verts;
+                                bool nu = true;
+                                for (uint32_t k = 0; k < distinct; ++k) if (seen[k] == xy) { nu = false; break; }
+                                if (nu && distinct < 6u) seen[distinct++] = xy;
+                            }
+                    }
+                    else if (fg == 1u) { uint32_t rg = nl * nr; sz += rg * 8u + ((rg & 1u) ? 8u : 0u); }
+                    else if (fg == 2u) sz += nl * 16u;
+                    off2 = wrapOffset(off2 + sz);
+                    if (ep) break;
+                }
+                if (g_spikeKick && verts >= 3u)
+                {
+                    const uint32_t spreadPx = std::max(maxX - minX, maxY - minY) >> 4; // 12.4 -> px
+                    if (spreadPx > 1500u)
+                    {
+                        static std::atomic<uint32_t> s_sk{0};
+                        const uint32_t n = s_sk.fetch_add(1) + 1u;
+                        // One-shot: snapshot the exact microcode + data memory of the first
+                        // spike kick, for offline disassembly of the clip loop.
+                        {
+                            static std::atomic<bool> s_dumped{false};
+                            static const bool s_isReplay = [](){ const char *v = std::getenv("PS2X_REPLAY"); return v && v[0] && v[0] != '0'; }();
+                            bool expected = s_isReplay; // replay: never overwrite the snapshot
+                            if (s_dumped.compare_exchange_strong(expected, true))
+                            {
+                                FILE *mc = std::fopen("/home/z3/Desktop/bt3/work/spike_micro.bin", "wb");
+                                if (mc && g_curVuCode) { std::fwrite(g_curVuCode, 1, g_curCodeSize, mc); std::fclose(mc); }
+                                FILE *dm = std::fopen("/home/z3/Desktop/bt3/work/spike_data.bin", "wb");
+                                if (dm) { std::fwrite(vuData, 1, dataSize, dm); std::fclose(dm); }
+                                FILE *st = std::fopen("/home/z3/Desktop/bt3/work/spike_state.bin", "wb");
+                                if (st) { std::fwrite(&g_entryStateShadow, 1, sizeof(VU1State), st); std::fclose(st); }
+                                std::fprintf(stderr, "[spikekick] snapshot written (entryPc=%u kickTop=%u stateBytes=%zu)\n",
+                                             g_curStartPc, m_state.top & 0x3FFu, sizeof(VU1State));
+                            }
+                        }
+                        if (n <= 10 || (n % 256u) == 0u)
+                        {
+                            std::fprintf(stderr, "[spikekick] #%u pc=%u prim=%u verts=%u bboxPx x=[%u..%u] y=[%u..%u] top=%u | input floats:\n",
+                                         n, g_curStartPc, primSeen, verts, minX >> 4, maxX >> 4, minY >> 4, maxY >> 4, m_state.top & 0x3FFu);
+                            for (uint32_t q = 0; q < 12u; ++q)
+                            {
+                                const uint32_t qa = ((m_state.top & 0x3FFu) + q) & 0x3FFu;
+                                float f[4];
+                                std::memcpy(f, vuData + qa * 16u, 16);
+                                std::fprintf(stderr, "  in q%u(vu %u): %.4g %.4g %.4g %.4g\n", q, qa, f[0], f[1], f[2], f[3]);
+                            }
+                            // Constants candidates: absolute qw0-3.
+                            for (uint32_t q = 0; q < 4u; ++q)
+                            {
+                                float f[4];
+                                std::memcpy(f, vuData + q * 16u, 16);
+                                std::fprintf(stderr, "  abs q%u: %.4g %.4g %.4g %.4g\n", q, f[0], f[1], f[2], f[3]);
+                            }
+                            // Recent unpack history (PS2X_KICKHIST): which writes fed VU1 memory.
+                            {
+                                if (g_unpackRingEnabled())
+                                {
+                                    std::fprintf(stderr, "  unpack history (newest last):\n");
+                                    for (uint32_t k = 0; k < 16u; ++k)
+                                    {
+                                        const auto &r = g_unpackRing[(g_unpackRingPos + 16u + k) & 31u];
+                                        if (r.cnt)
+                                            std::fprintf(stderr, "    dest=%u cnt=%u src=%s0x%08x frame=%llu\n",
+                                                         r.destQw, r.cnt, r.spr == 0u ? "qwcEE:" : "EE:", r.srcGuest,
+                                                         (unsigned long long)r.frame);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (g_blinkProbe && verts >= 1u)
+                {
+                    extern std::atomic<uint64_t> g_bt3FrameCount;
+                    const uint64_t frame = g_bt3FrameCount.load(std::memory_order_relaxed);
+                    struct PcTally { uint64_t lastFrame = 0; uint32_t cur = 0; uint32_t prevFull = 0; };
+                    static std::map<uint32_t, PcTally> s_pcT; // XGKICK is single-threaded (kick worker or guest)
+                    auto &t = s_pcT[g_curStartPc];
+                    if (frame != t.lastFrame)
+                    {
+                        // Frame advanced for this pc: the tally for lastFrame is complete.
+                        if (t.prevFull >= 150u && t.cur < t.prevFull / 10u)
+                            std::fprintf(stderr, "[blinkdrop] pc=%u frame=%llu verts %u -> %u (COLLAPSE)\n",
+                                         g_curStartPc, (unsigned long long)t.lastFrame, t.prevFull, t.cur);
+                        if (frame > t.lastFrame + 1u && t.cur >= 150u)
+                            std::fprintf(stderr, "[blinkdrop] pc=%u frames %llu..%llu ZERO kicks (prev=%u)\n",
+                                         g_curStartPc, (unsigned long long)(t.lastFrame + 1u),
+                                         (unsigned long long)(frame - 1u), t.cur);
+                        t.prevFull = t.cur;
+                        t.cur = 0;
+                        t.lastFrame = frame;
+                    }
+                    t.cur += verts;
+                }
+                if (s_kickStat && verts >= 3u)
+                {
+                    const bool dotKick = distinct <= 1u;
+                    static std::map<uint64_t, std::pair<uint32_t,uint32_t>> s_tally; // (pc,prim) -> {dot, real}
+                    static std::atomic<uint32_t> s_k{0};
+                    auto &t = s_tally[((uint64_t)g_curStartPc << 8) | primSeen];
+                    if (dotKick) ++t.first; else ++t.second;
+                    if (dotKick)
+                    {
+                        static std::atomic<uint32_t> s_d{0};
+                        if ((s_d.fetch_add(1) % 3000u) < 3u)
+                            std::fprintf(stderr, "[dotkick] pc=%u prim=%u verts=%u xy=(%.1f,%.1f)\n",
+                                         g_curStartPc, primSeen, verts,
+                                         (float)(firstXy & 0xFFFFu) / 16.0f, (float)((firstXy >> 32) & 0xFFFFu) / 16.0f);
+                    }
+                    if ((s_k.fetch_add(1) % 5000u) == 4999u)
+                    {
+                        std::cerr << "[kickstat]";
+                        for (auto &kv : s_tally)
+                            std::cerr << " pc=" << (uint32_t)(kv.first >> 8) << "/p" << (uint32_t)(kv.first & 0xFFu)
+                                      << ":dot=" << kv.second.first << ",real=" << kv.second.second;
+                        std::cerr << std::endl;
+                    }
+                }
+            }
+
+            // VU1 output sanity dump (PS2X_XGKICK_DUMP): decode the first packets' GIFtag +
+            // packed XYZ2 vertex coords, to see if VU1's transformed geometry is in screen
+            // range (X/16,Y/16 in ~[0,640]x[0,448]) or garbage/offscreen (VU1 math bug).
+            {
+                static const bool s_xd = [](){ static const char *s_env = std::getenv("PS2X_XGKICK_DUMP"); return s_env; }() != nullptr;
+                const bool forceKick = s_mtxSeqVu && s_kickDump.load() > 0 && (s_kickDump.fetch_sub(1), true);
+                if (s_xd || forceKick)
+                {
+                    static std::atomic<int> s_n{0};
+                    int nn = s_n.fetch_add(1);
+                    if (forceKick || (nn % 30000) < 3) // rolling sample so BATTLE packets are captured too
+                    {
+                        const uint64_t tagLo = read64Wrap(addr);
+                        const uint64_t tagHi = read64Wrap(addr + 8u);
+                        const uint32_t nloop = (uint32_t)(tagLo & 0x7FFFu);
+                        const uint32_t flg = (uint32_t)((tagLo >> 58) & 0x3u);
+                        uint32_t nreg = (uint32_t)((tagLo >> 60) & 0xFu); if (!nreg) nreg = 16u;
+                        const uint32_t prim = (uint32_t)((tagLo >> 47) & 0x7FFu);
+                        const uint32_t pre = (uint32_t)((tagLo >> 46) & 1u);
+                        std::cerr << "[xgkick] #" << nn << " total=" << totalBytes
+                                  << " nloop=" << nloop << " flg=" << flg << " nreg=" << nreg
+                                  << " pre=" << pre << " prim=0x" << std::hex << prim
+                                  << " regs=0x" << tagHi << std::dec;
+                        if (flg == 0u) // PACKED: dump v0's raw registers (all nreg) as hex
+                        {
+                            for (uint32_t r = 0; r < nreg; ++r)
+                            {
+                                const uint32_t desc = (uint32_t)((tagHi >> (r * 4u)) & 0xFu);
+                                const uint32_t ro = addr + 16u + r * 16u; // vertex 0
+                                const uint64_t w01 = read64Wrap(ro);
+                                const uint64_t w23 = read64Wrap(ro + 8u);
+                                std::cerr << " | r" << r << "(d" << desc << ")=0x"
+                                          << std::hex << w23 << "_" << w01 << std::dec;
+                            }
+                        }
+                        std::cerr << std::endl;
+                        // ALL-VERTEX dump (PS2X_MTXSEQ forced kicks): print every vertex's XYZ2
+                        // screen coords. If v0==v1==v2 per triangle -> the strip collapses to a dot
+                        // (the spread=0% bug) even though vertex 0 alone looks plausible.
+                        if (forceKick && flg == 0u)
+                        {
+                            std::cerr << "[kickverts]";
+                            for (uint32_t v = 0; v < nloop && v < 8u; ++v)
+                            {
+                                for (uint32_t r = 0; r < nreg; ++r)
+                                {
+                                    const uint32_t desc = (uint32_t)((tagHi >> (r * 4u)) & 0xFu);
+                                    if (desc != 4u && desc != 5u) continue; // XYZF2 / XYZ2 only
+                                    const uint32_t ro = addr + 16u + (v * nreg + r) * 16u;
+                                    const uint64_t w01 = read64Wrap(ro);
+                                    const uint32_t xr = (uint32_t)(w01 & 0xFFFFu);
+                                    const uint32_t yr = (uint32_t)((w01 >> 32) & 0xFFFFu);
+                                    std::cerr << " v" << v << "=(" << (xr / 16.0f) << "," << (yr / 16.0f) << ")";
+                                }
+                            }
+                            std::cerr << std::endl;
+                        }
+                        // Once, on a textured-tristrip packet: dump the low VU1 data memory as
+                        // floats (the constant region usually holds the transform matrix) so we
+                        // can see if the matrix is zero (VIF UNPACK addressing bug) or present.
+                        if (prim == 0x5cu)
+                        {
+                            static std::atomic<int> s_md{0};
+                            if (s_md.fetch_add(1) < 3)
+                            {
+                                // Scan ALL of VU1 data memory; print only NON-ZERO qwords so we
+                                // see exactly what data is present (matrix? where?).
+                                std::cerr << "[vu1scan] dataSize=" << dataSize << " nonzero qwords:";
+                                int printed = 0;
+                                for (uint32_t q = 0; (q * 16u + 12u) < dataSize && printed < 90; ++q)
+                                {
+                                    uint64_t a = read64Wrap(q * 16u), b = read64Wrap(q * 16u + 8u);
+                                    if (a == 0 && b == 0) continue;
+                                    ++printed;
+                                    float f[4];
+                                    for (int c = 0; c < 4; ++c) { uint32_t bits = (uint32_t)(read64Wrap(q * 16u + (uint32_t)c * 4u) & 0xFFFFFFFFu); std::memcpy(&f[c], &bits, 4); }
+                                    std::cerr << " [" << q << "]" << f[0] << "," << f[1] << "," << f[2] << "," << f[3];
+                                }
+                                std::cerr << std::endl;
+                                // Dump the two double-buffer input regions (TOP=141 and 577)
+                                // where the UNPACK'd input vertices + per-object matrix live.
+                                auto dumpRange = [&](uint32_t q0, uint32_t q1, const char *tag){
+                                    std::cerr << "[vu1in " << tag << "] qw" << q0 << "..:";
+                                    for (uint32_t q = q0; q < q1 && (q * 16u + 12u) < dataSize; ++q)
+                                    {
+                                        float f[4];
+                                        for (int c = 0; c < 4; ++c) { uint32_t bits = (uint32_t)(read64Wrap(q * 16u + (uint32_t)c * 4u) & 0xFFFFFFFFu); std::memcpy(&f[c], &bits, 4); }
+                                        std::cerr << " [" << q << "]" << f[0] << "," << f[1] << "," << f[2] << "," << f[3];
+                                    }
+                                    std::cerr << std::endl;
+                                };
+                                dumpRange(136u, 164u, "TOP141");
+                                dumpRange(572u, 600u, "TOP577");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // PS2X_SKIP_DEGEN: validate the constants block (MVP at absolute qw0-3) AT KICK
+            // TIME — geometry transformed by a garbage matrix becomes the map-texture popup
+            // bursts (frame-correlated: popup bursts land exactly on degenerate-MVP frames).
+            // The old unpack-time toggle missed the window; this checks what the program
+            // actually used.
+            {
+                static const bool s_sd = [](){ const char *v = std::getenv("PS2X_SKIP_DEGEN"); return v && v[0] && v[0] != '0'; }();
+                if (s_sd && vuData)
+                {
+                    // Per-object constants live at TOP-relative qw0.. (the kicked buffer's
+                    // base), not absolute 0 — the [spikekick] input dumps showed denormal
+                    // garbage exactly there on popup kicks.
+                    const uint32_t base = (m_state.top & 0x3FFu) * 16u;
+                    float m[12];
+                    for (int q = 0; q < 3; ++q)
+                        std::memcpy(m + q * 4, vuData + ((base + (uint32_t)q * 16u) % PS2_VU1_DATA_SIZE), 16);
+                    float amax = 0.0f; bool bad = false;
+                    for (int i = 0; i < 12; ++i)
+                    {
+                        if (std::isnan(m[i])) { bad = true; break; }
+                        const float a = std::fabs(m[i]);
+                        if (a > amax) amax = a;
+                    }
+                    if (bad || amax < 1.0e-4f || amax > 1.0e7f)
+                    {
+                        static std::atomic<uint32_t> s_sup{0};
+                        const uint32_t n = s_sup.fetch_add(1) + 1u;
+                        if ((n % 512u) == 1u)
+                            std::fprintf(stderr, "[skipdegen] dropped %u kicks (pc=%u amax=%.3g nan=%d)\n", n, g_curStartPc, amax, bad ? 1 : 0);
+                        return;
+                    }
+                }
+            }
+            if (addr + totalBytes <= dataSize)
+            {
+                if (memory)
+                    memory->submitGifPacket(GifPathId::Path1, vuData + addr, totalBytes);
+                else
+                    gs.processGIFPacket(vuData + addr, totalBytes);
+            }
+            else
+            {
+                std::vector<uint8_t> wrappedPacket(totalBytes);
+                for (uint32_t i = 0; i < totalBytes; ++i)
+                {
+                    wrappedPacket[i] = vuData[wrapOffset(addr + i)];
+                }
+
+                if (memory)
+                    memory->submitGifPacket(GifPathId::Path1, wrappedPacket.data(), totalBytes);
+                else
+                    gs.processGIFPacket(wrappedPacket.data(), totalBytes);
+            }
+        };
+
+        switch (funct)
+        {
+        case 0x30: // IADD
+            if (viD != 0)
+                m_state.vi[viD] = (int16_t)(m_state.vi[viS] + m_state.vi[viT]);
+            return;
+        case 0x31: // ISUB
+            if (viD != 0)
+                m_state.vi[viD] = (int16_t)(m_state.vi[viS] - m_state.vi[viT]);
+            return;
+        case 0x32: // IADDI
+        {
+            int16_t imm5 = (int16_t)((int32_t)((instr >> 6) & 0x1F) << 27 >> 27);
+            if (viT != 0)
+                m_state.vi[viT] = (int16_t)(m_state.vi[viS] + imm5);
+            return;
+        }
+        case 0x34: // IAND
+            if (viD != 0)
+                m_state.vi[viD] = m_state.vi[viS] & m_state.vi[viT];
+            return;
+        case 0x35: // IOR
+            if (viD != 0)
+                m_state.vi[viD] = m_state.vi[viS] | m_state.vi[viT];
+            return;
+
+        case 0x3C:
+        case 0x3D:
+        case 0x3E:
+        case 0x3F: // Lower1 special. Dobie decodes this as (instr & 3) | ((instr >> 4) & 0x7C).
+        {
+            const uint8_t funct2 = (uint8_t)((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
+            switch (funct2)
+            {
+            case 0x30: // MOVE
+            {
+                float tmp[4];
+                std::memcpy(tmp, m_state.vf[vfS], 16);
+                applyDest(m_state.vf[vfT], tmp, dest);
+                return;
+            }
+            case 0x31: // MR32 (rotate right by 32 bits = shift xyzw -> yzwx)
+            {
+                float tmp[4] = {m_state.vf[vfS][1], m_state.vf[vfS][2], m_state.vf[vfS][3], m_state.vf[vfS][0]};
+                applyDest(m_state.vf[vfT], tmp, dest);
+                return;
+            }
+            case 0x34: // LQI (Load Quadword, post-increment)
+            {
+                uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
+                addr &= (dataSize - 1);
+                if (addr + 16 <= dataSize)
+                {
+                    float tmp[4];
+                    std::memcpy(tmp, vuData + addr, 16);
+                    applyDest(m_state.vf[vfT], tmp, dest);
+                }
+                if (viS != 0)
+                    m_state.vi[viS] = (int16_t)(m_state.vi[viS] + 1);
+                return;
+            }
+            case 0x35: // SQI (Store Quadword, post-increment)
+            {
+                uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viT]) * 16u;
+                addr &= (dataSize - 1);
+                if (addr + 16 <= dataSize)
+                {
+                    float tmp[4];
+                    std::memcpy(tmp, vuData + addr, 16);
+                    if (dest & 0x8)
+                        tmp[0] = m_state.vf[vfS][0];
+                    if (dest & 0x4)
+                        tmp[1] = m_state.vf[vfS][1];
+                    if (dest & 0x2)
+                        tmp[2] = m_state.vf[vfS][2];
+                    if (dest & 0x1)
+                        tmp[3] = m_state.vf[vfS][3];
+                    std::memcpy(vuData + addr, tmp, 16);
+                }
+                if (viT != 0)
+                    m_state.vi[viT] = (int16_t)(m_state.vi[viT] + 1);
+                return;
+            }
+            case 0x36: // LQD (Load Quadword, pre-decrement)
+            {
+                if (viS != 0)
+                    m_state.vi[viS] = (int16_t)(m_state.vi[viS] - 1);
+                uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
+                addr &= (dataSize - 1);
+                if (addr + 16 <= dataSize)
+                {
+                    float tmp[4];
+                    std::memcpy(tmp, vuData + addr, 16);
+                    applyDest(m_state.vf[vfT], tmp, dest);
+                }
+                return;
+            }
+            case 0x37: // SQD (Store Quadword, pre-decrement)
+            {
+                if (viT != 0)
+                    m_state.vi[viT] = (int16_t)(m_state.vi[viT] - 1);
+                uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viT]) * 16u;
+                addr &= (dataSize - 1);
+                if (addr + 16 <= dataSize)
+                {
+                    float tmp[4];
+                    std::memcpy(tmp, vuData + addr, 16);
+                    if (dest & 0x8)
+                        tmp[0] = m_state.vf[vfS][0];
+                    if (dest & 0x4)
+                        tmp[1] = m_state.vf[vfS][1];
+                    if (dest & 0x2)
+                        tmp[2] = m_state.vf[vfS][2];
+                    if (dest & 0x1)
+                        tmp[3] = m_state.vf[vfS][3];
+                    std::memcpy(vuData + addr, tmp, 16);
+                }
+                return;
+            }
+            case 0x38: // DIV
+            {
+                int fsf = (instr >> 21) & 0x3;
+                int ftf = (instr >> 23) & 0x3;
+                float num = m_state.vf[vfS][fsf];
+                float den = m_state.vf[vfT][ftf];
+                float res;
+                if (den != 0.0f)
+                    res = vuClampFloat(num / den); // PS2 Q never holds NaN/Inf
+                else
+                    res = (num >= 0.0f) ? std::numeric_limits<float>::max() : -std::numeric_limits<float>::max();
+                // Replay forensics: the clip-intersection DIV at instruction 350 (byte pc 2800).
+                if (g_vuStep && m_state.pc == 2800u)
+                {
+                    const float t = std::fabs(res);
+                    static std::atomic<uint32_t> s_dn{0};
+                    if (t > 1.0001f || s_dn.fetch_add(1) < 12u)
+                        std::fprintf(stderr, "[isectdiv] dA(vf25)=(%.4g %.4g %.4g %.4g) dBmA(vf27)=(%.4g %.4g %.4g %.4g) fsf=%d ftf=%d num=%.4g den=%.4g t=%.4g vi7=%d%s\n",
+                                     m_state.vf[25][0], m_state.vf[25][1], m_state.vf[25][2], m_state.vf[25][3],
+                                     m_state.vf[27][0], m_state.vf[27][1], m_state.vf[27][2], m_state.vf[27][3],
+                                     fsf, ftf, num, den, res, m_state.vi[7], t > 1.0001f ? " T-OUT-OF-RANGE" : "");
+                }
+                if (g_qPipe)
+                {
+                    if (m_state.qWait > 0u) m_state.q = m_state.pendingQ; // back-to-back: previous divide completes
+                    m_state.pendingQ = res;
+                    m_state.qWait = 7u;
+                }
+                else
+                    m_state.q = res;
+                {
+                    static const bool s_vt = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_VUTRACE"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+                    if (s_vt) { static int shown = 0;
+                        float cx = m_state.vf[vfT][0], cy = m_state.vf[vfT][1], cz = m_state.vf[vfT][2], cw = m_state.vf[vfT][3];
+                        bool battle = (cx>1.f||cx<-1.f||cy>1.f||cy<-1.f||cz>1.f||cz<-1.f); // nonzero clip xyz = real geometry
+                        if (battle && shown++ < 30) std::fprintf(stderr, "[div-battle] clip=vf%d=(%.2f,%.2f,%.2f, w=%.5f) num(vf0.w)=%.3f -> q=%.4g  [w SHOULD be nonzero]\n",
+                            vfT, cx, cy, cz, cw, num, res); }
+                }
+                return;
+            }
+            case 0x39: // SQRT
+            {
+                int ftf = (instr >> 23) & 0x3;
+                float val = m_state.vf[vfT][ftf];
+                const float res = vuClampFloat(std::sqrt(std::fabs(val))); // NaN operand -> +Fmax
+                if (g_qPipe)
+                {
+                    if (m_state.qWait > 0u) m_state.q = m_state.pendingQ;
+                    m_state.pendingQ = res;
+                    m_state.qWait = 7u;
+                }
+                else
+                    m_state.q = res;
+                return;
+            }
+            case 0x3A: // RSQRT
+            {
+                int fsf = (instr >> 21) & 0x3;
+                int ftf = (instr >> 23) & 0x3;
+                float num = m_state.vf[vfS][fsf];
+                float den = std::sqrt(std::fabs(m_state.vf[vfT][ftf]));
+                float res;
+                if (den != 0.0f)
+                    res = vuClampFloat(num / den); // PS2 Q never holds NaN/Inf
+                else
+                    res = std::numeric_limits<float>::max();
+                if (g_qPipe)
+                {
+                    if (m_state.qWait > 0u) m_state.q = m_state.pendingQ;
+                    m_state.pendingQ = res;
+                    m_state.qWait = 13u;
+                }
+                else
+                    m_state.q = res;
+                return;
+            }
+            case 0x3B: // WAITQ
+                if (m_state.qWait > 0u)
+                {
+                    m_state.q = m_state.pendingQ;
+                    m_state.qWait = 0u;
+                }
+                return;
+            case 0x3C: // MTIR (Move To Integer Register)
+            {
+                int comp = 0;
+                if (dest & 0x8)
+                    comp = 0;
+                else if (dest & 0x4)
+                    comp = 1;
+                else if (dest & 0x2)
+                    comp = 2;
+                else
+                    comp = 3;
+                uint32_t fval;
+                std::memcpy(&fval, &m_state.vf[vfS][comp], 4);
+                if (viT != 0)
+                    m_state.vi[viT] = (int32_t)(int16_t)(fval & 0xFFFF);
+                return;
+            }
+            case 0x3D: // MFIR (Move From Integer Register)
+            {
+                float result[4];
+                int32_t val = (int32_t)(int16_t)(m_state.vi[viS] & 0xFFFF);
+                std::memcpy(&result[0], &val, 4);
+                result[1] = result[0];
+                result[2] = result[0];
+                result[3] = result[0];
+                applyDest(m_state.vf[vfT], result, dest);
+                return;
+            }
+            case 0x3E: // ILWR - integer load word from address in VI[is]
+            {
+                uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
+                addr &= (dataSize - 1);
+                if (addr + 16 <= dataSize)
+                {
+                    int comp = 0;
+                    if (dest & 0x8)
+                        comp = 0;
+                    else if (dest & 0x4)
+                        comp = 1;
+                    else if (dest & 0x2)
+                        comp = 2;
+                    else
+                        comp = 3;
+                    uint32_t v;
+                    std::memcpy(&v, vuData + addr + comp * 4, 4);
+                    if (viT != 0)
+                        m_state.vi[viT] = (int32_t)(int16_t)(v & 0xFFFF);
+                }
+                return;
+            }
+            case 0x3F: // ISWR - integer store word to address in VI[is]
+            {
+                uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
+                addr &= (dataSize - 1);
+                if (addr + 16 <= dataSize)
+                {
+                    uint32_t val = (uint32_t)(uint16_t)(m_state.vi[viT] & 0xFFFF);
+                    if (dest & 0x8)
+                        std::memcpy(vuData + addr + 0, &val, 4);
+                    if (dest & 0x4)
+                        std::memcpy(vuData + addr + 4, &val, 4);
+                    if (dest & 0x2)
+                        std::memcpy(vuData + addr + 8, &val, 4);
+                    if (dest & 0x1)
+                        std::memcpy(vuData + addr + 12, &val, 4);
+                }
+                return;
+            }
+            case 0x40: // RNEXT
+                return;
+            case 0x41: // RGET
+                return;
+            case 0x42: // RINIT
+                return;
+            case 0x43: // RXOR
+                return;
+            case 0x64: // MFP (Move From P register)
+            {
+                float result[4] = {m_state.p, m_state.p, m_state.p, m_state.p};
+                applyDest(m_state.vf[vfT], result, dest);
+                return;
+            }
+            case 0x68: // XTOP - move current VIF1 TOP into VI register
+            {
+                if (viT != 0)
+                    m_state.vi[viT] = (int32_t)(m_state.top & 0x3FFu);
+                return;
+            }
+            case 0x69: // XITOP - move current VIF1 ITOP into VI register
+            {
+                if (viT != 0)
+                    m_state.vi[viT] = (int32_t)(m_state.itop & 0x3FFu);
+                return;
+            }
+            case 0x6C: // XGKICK - send GIF packet from VU1 data memory
+                doXgkick();
+                return;
+            case 0x70: // ESADD
+                return;
+            case 0x71: // ERSADD
+                return;
+            case 0x72: // ELENG
+            {
+                float s = m_state.vf[vfS][0] * m_state.vf[vfS][0] + m_state.vf[vfS][1] * m_state.vf[vfS][1] + m_state.vf[vfS][2] * m_state.vf[vfS][2];
+                m_state.p = std::sqrt(s);
+                return;
+            }
+            case 0x73: // ERLENG
+            {
+                float s = m_state.vf[vfS][0] * m_state.vf[vfS][0] + m_state.vf[vfS][1] * m_state.vf[vfS][1] + m_state.vf[vfS][2] * m_state.vf[vfS][2];
+                float len = std::sqrt(s);
+                m_state.p = (len != 0.0f) ? (1.0f / len) : std::numeric_limits<float>::max();
+                return;
+            }
+            case 0x7A: // ERCPR
+            {
+                int fsf = (instr >> 21) & 0x3;
+                float val = m_state.vf[vfS][fsf];
+                m_state.p = (val != 0.0f) ? (1.0f / val) : std::numeric_limits<float>::max();
+                return;
+            }
+            case 0x7B: // WAITP
+                return;
+            case 0x7D: // EATAN / EATANxy / EATANxz placeholder
+                return;
+            default:
+                return;
+            }
+        }
+        default:
+            return;
+        }
+    }
+    default:
+        break;
+    }
+}
