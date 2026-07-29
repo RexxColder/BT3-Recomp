@@ -178,7 +178,21 @@ def main() -> None:
     for h in ("ps2_recompiled_functions.h", "ps2_recompiled_stubs.h"):
         shutil.copyfile(out / h, rt / "include" / h)
 
-    # 7. Build the game (CONFIGURE_DEPENDS re-globs the runner sources on its own).
+    # 7. Build the game. CONFIGURE_DEPENDS re-globs on Makefile generators, but the
+    #    Visual Studio generator does not reliably pick up a changed source SET within
+    #    the same build invocation (fresh Windows builds linked without main/the
+    #    function tables). Reconfigure explicitly when the runner/overlay file set
+    #    changed since the last configure; content-only changes still skip it.
+    cache = BUILD / "CMakeCache.txt"
+    need_cfg = not cache.exists()
+    if not need_cfg:
+        ct = cache.stat().st_mtime
+        for d in (rt / "src" / "runner", rt / "src" / "runner_overlay"):
+            if d.exists() and d.stat().st_mtime > ct:
+                need_cfg = True
+                break
+    if need_cfg:
+        run(["cmake", "-S", ROOT, "-B", BUILD])
     print(f"== building ps2EntryRunner (-j{jobs}, this takes a while)")
     cmake_build("ps2EntryRunner", jobs)
     runner = find_binary("ps2EntryRunner")
