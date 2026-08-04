@@ -1569,7 +1569,11 @@ namespace
         GsDrawEnv1Mem draw0;
         GsClearMem clear0;
         GsGiftagMem giftag1;
-        GsDrawEnv1Mem draw1;
+        // libgs sceGsDBuff: the SECOND buffer's draw environment programs CONTEXT 2
+        // (FRAME_2/XYOFFSET_2/SCISSOR_2/TEST_2). Seeding it as context 1 left ctx2 at
+        // boot defaults (offset 0, 640px scissor) — every PRIM.CTXT=1 draw rendered
+        // unoffset/unscissored (the SPS wedge/blob artifacts in fights).
+        GsDrawEnv2Mem draw1;
         GsClearMem clear1;
     };
 

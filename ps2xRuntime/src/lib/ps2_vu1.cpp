@@ -24,6 +24,19 @@ extern bool g_unpackRingEnabled();
 namespace { thread_local const uint8_t *g_curVuCode = nullptr; thread_local uint32_t g_curCodeSize = 0;
             thread_local VU1State g_entryStateShadow{}; }
 
+// Exported current-XGKICK context for record-side probes (see doXgkick). The GS draw
+// recording runs synchronously beneath XGKICK on the same thread, so these are valid
+// whenever a recordSpriteGPU call originates from a VU1 kick.
+thread_local uint32_t g_xgkickEntryPc = 0;
+thread_local uint32_t g_xgkickTop = 0;
+thread_local uint32_t g_xgkickKickAddr = 0;
+thread_local const uint8_t *g_xgkickVuData = nullptr;
+thread_local uint32_t g_xgkickVuDataSize = 0;
+thread_local const uint8_t *g_xgkickVuCode = nullptr;
+thread_local uint32_t g_xgkickVuCodeSize = 0;
+thread_local const uint8_t *g_xgkickEntryStateBytes = nullptr;
+thread_local uint32_t g_xgkickEntryStateSize = 0;
+
 // [vuflags] diag (probe; remove when floor clipping fixed): which cull mechanism do the
 // fight microprograms use — CLIP+FCAND (implemented) or FMAND on MAC flags (mac never
 // written = gap)? Plus ADC census of XGKICK output: does any kicked vertex carry ADC=1?
@@ -348,12 +361,40 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
     applyDestClamped(m_state.acc, result, dest);
 }
 
+// PS2 VU FMACs round toward ZERO (truncate) and flush denormals; host default is
+// round-to-nearest. BT3's stage/water geometry rides the clip planes within ~0.4%
+// (verified: CLIPin z=140.627 vs w=141.226) — nearest-rounding flips such vertices
+// across planes, so the clipper builds different fans than hardware = the SPS
+// wedges/slivers present in BOTH renderers. Run VU1 under RZ+FTZ+DAZ like PCSX2's
+// default "VU Round Mode: Chop/Zero". PS2X_VUROUND=0 restores host rounding (A/B).
+namespace
+{
+    struct VuRoundScope
+    {
+        unsigned int saved;
+        bool active;
+        VuRoundScope()
+        {
+            static const bool s_on = [](){ const char *v = std::getenv("PS2X_VUROUND"); return !(v && v[0] == '0'); }();
+            active = s_on;
+            if (active)
+            {
+                saved = _mm_getcsr();
+                // RZ (round toward zero) | FTZ | DAZ
+                _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8040u);
+            }
+        }
+        ~VuRoundScope() { if (active) _mm_setcsr(saved); }
+    };
+}
+
 void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint8_t *vuData, uint32_t dataSize,
                              GS &gs, PS2Memory *memory,
                              uint32_t startPC, uint32_t top, uint32_t itop,
                              uint32_t maxCycles)
 {
+    VuRoundScope vuRound;
     m_state.pc = startPC & 0x3FFFu;
     m_state.ebit = false;
     m_state.top = top;
@@ -542,7 +583,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 {
     g_curStartPc = m_state.pc; // entry PC of this run (for PS2X_KICKSTAT attribution)
     g_curVuCode = vuCode; g_curCodeSize = codeSize; // for the spike microcode snapshot
-    if (g_spikeKick)
+    static const bool s_skyKickShadow = [](){ const char *v = std::getenv("PS2X_SKYKICK"); if (v && v[0] && v[0] != '0') return true;
+                                              const char *w = std::getenv("PS2X_WEDGEREC"); return w && w[0] && w[0] != '0'; }();
+    if (g_spikeKick || s_skyKickShadow)
         g_entryStateShadow = m_state; // entry-state snapshot for exact spike replay
     // PS2X_MTXSEQ (VU side): classify qw0-3 at every microprogram run — does the interpreter see
     // the valued MVP the VIF just unpacked? When valued, force-dump the next XGKICKs (below) to
@@ -617,8 +660,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (g_vuStep && g_vuStepN < g_vuStep)
         {
             ++g_vuStepN;
-            std::fprintf(stderr, "[vustep] pc=%4u lo=%08x hi=%08x clip=%06x pend=%06x wait=%u\n",
+            std::fprintf(stderr, "[vustep] pc=%4u lo=%08x hi=%08x clip=%06x pend=%06x wait=%u",
                          m_state.pc / 8u, lower, upper, m_state.clip & 0xFFFFFFu, g_pendingClip & 0xFFFFFFu, g_clipWait);
+            // CLIP: also print the judged vector (fs.xyz) and |ft.w| so the emitted 6 flag
+            // bits can be hand-verified against the actual clip-space coordinates.
+            if (((upper & 0x3Cu) == 0x3Cu) && (((upper & 0x3u) | ((upper >> 4) & 0x7Cu)) == 0x1Fu))
+            {
+                const uint8_t cfs = FS(upper), cft = FT(upper);
+                std::fprintf(stderr, " | CLIPin fs=vf%u (%.6g %.6g %.6g) w=|%.6g|",
+                             cfs, m_state.vf[cfs][0], m_state.vf[cfs][1], m_state.vf[cfs][2],
+                             m_state.vf[cft][3]);
+            }
+            std::fprintf(stderr, "\n");
         }
 
         if (g_vuProf)
@@ -1596,6 +1649,18 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             if (!vuData || dataSize < 16u)
                 return;
 
+            // Exported kick context: the GS record path (rasterizer) runs synchronously under
+            // this XGKICK, so record-side probes can attribute a draw to its VU1 kick.
+            g_xgkickEntryPc = g_curStartPc;
+            g_xgkickTop = m_state.top & 0x3FFu;
+            g_xgkickKickAddr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
+            g_xgkickVuData = vuData;
+            g_xgkickVuDataSize = dataSize;
+            g_xgkickVuCode = g_curVuCode;
+            g_xgkickVuCodeSize = g_curCodeSize;
+            g_xgkickEntryStateBytes = reinterpret_cast<const uint8_t *>(&g_entryStateShadow);
+            g_xgkickEntryStateSize = sizeof(VU1State);
+
             auto wrapOffset = [&](uint32_t off) -> uint32_t
             {
                 return off % dataSize;
@@ -1718,11 +1783,15 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             // XYZ2/XYZF2 vertex positions, count distinct XY values. verts>=3 with <=1 distinct
             // position = DOT kick (collapses to a point). Tallied per microprogram entry PC and
             // per prim type. (v1 only looked at the first sub-packet and missed the strip tags.)
-            if (s_kickStat || g_spikeKick || g_blinkProbe)
+            static const bool s_skyKick = [](){ const char *v = std::getenv("PS2X_SKYKICK"); return v && v[0] && v[0] != '0'; }();
+            if (s_kickStat || g_spikeKick || g_blinkProbe || s_skyKick)
             {
                 uint32_t off2 = addr, verts = 0, distinct = 0, primSeen = 99;
                 uint64_t seen[6]; uint64_t firstXy = 0;
                 uint32_t minX = 0xFFFFu, maxX = 0u, minY = 0xFFFFu, maxY = 0u;
+                bool skyTexSeen = false;
+                uint32_t badVerts = 0; // adc=0 verts with wrapped-negative z (mirror-junk class)
+                bool sawGuard = false, sawView = false; // wedge signature: guard-plane + in-viewport verts in one kick
                 for (int sf = 0; sf < 256; ++sf)
                 {
                     const uint64_t tLo = read64Wrap(off2);
@@ -1740,6 +1809,17 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                             for (uint32_t r = 0; r < nr; ++r)
                             {
                                 const uint32_t desc = (uint32_t)((tHi >> (r * 4u)) & 0xFu);
+                                // A+D TEX0_1/TEX0_2 write to the 1024x256 sky panorama
+                                // (tbp0=10752, tw=10) marks this as the SKY chunk's kick.
+                                if (desc == 0xEu && s_skyKick)
+                                {
+                                    const uint64_t aw = read64Wrap(off2 + 16u + (v * nr + r) * 16u);
+                                    const uint64_t ar = read64Wrap(off2 + 16u + (v * nr + r) * 16u + 8u);
+                                    const uint32_t ra = (uint32_t)(ar & 0xFFu);
+                                    if ((ra == 0x06u || ra == 0x07u) &&
+                                        (aw & 0x3FFFu) == 10752u && ((aw >> 26) & 0xFu) == 10u)
+                                        skyTexSeen = true;
+                                }
                                 if (desc != 4u && desc != 5u) continue;
                                 const uint64_t w01 = read64Wrap(off2 + 16u + (v * nr + r) * 16u);
                                 const uint64_t xy = w01 & 0xFFFF0000FFFFull;
@@ -1764,6 +1844,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                                     // Only DRAWN vertices (adc=0) count toward the spike bbox —
                                     // ADC strip-restart vertices legitimately carry wild positions.
                                     const uint64_t w23adc = read64Wrap(off2 + 16u + (v * nr + r) * 16u + 8u);
+                                    if (((w23adc >> 47) & 1u) == 0u &&
+                                        ((uint32_t)(w23adc & 0xFFFFFFFFu) >> 24) == 0xFFu)
+                                        ++badVerts;
                                     if (((w23adc >> 47) & 1u) == 0u)
                                     {
                                         const uint32_t vx = (uint32_t)(xy & 0xFFFFu);
@@ -1772,6 +1855,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                                         if (vx > maxX) maxX = vx;
                                         if (vy < minY) minY = vy;
                                         if (vy > maxY) maxY = vy;
+                                        const uint32_t pxv = vx >> 4, pyv = vy >> 4;
+                                        if (pxv < 1500u) sawGuard = true;
+                                        if (pxv >= 1792u && pxv <= 2304u && pyv >= 1824u && pyv <= 2272u) sawView = true;
                                     }
                                 }
                                 ++verts;
@@ -1785,10 +1871,95 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                     off2 = wrapOffset(off2 + sz);
                     if (ep) break;
                 }
+                // [skykick] SKY-chunk kick forensics: the fight sky collapses into a ~128x40px
+                // top-left corner patch (fdraw coverage map) — snapshot the kick + entry state
+                // and print its input qwords so the transform matrix can be judged offline.
+                // Discriminator: first input vertex (TOP+3) at panorama-ring radius 20K-40K —
+                // nothing else in a fight lives at that distance. (TEX0-in-kick never fired;
+                // the sky's TEX0 arrives outside the kick.)
+                bool skyInputSeen = false;
+                if (s_skyKick && dataSize >= 16u)
+                {
+                    float sv[4];
+                    const uint32_t va = (((m_state.top & 0x3FFu) + 3u) & 0x3FFu) * 16u;
+                    if (va + 16u <= dataSize)
+                    {
+                        std::memcpy(sv, vuData + va, 16);
+                        const float r2 = sv[0] * sv[0] + sv[2] * sv[2];
+                        skyInputSeen = r2 > 4.0e8f && r2 < 1.6e9f && sv[1] > -16000.0f && sv[1] < 4000.0f;
+                    }
+                }
+                // [wedgekick] the VISIBLE-wedge signature: one kick whose DRAWN verts include
+                // both a left-guard-plane vert (<1500px raw-abs) and an in-viewport vert —
+                // the clipper-fan triangles that span from offscreen into the screen.
+                // Snapshot continuously (overwrite) so quitting near the artifact keeps one.
+                if (s_skyKick && sawGuard && sawView)
+                {
+                    static std::atomic<uint32_t> s_bn{0};
+                    const uint32_t bn = s_bn.fetch_add(1);
+                    if ((bn % 16u) == 0u)
+                    {
+                        FILE *mc = std::fopen("/home/z3/Desktop/bt3/work/wedge_micro.bin", "wb");
+                        if (mc && g_curVuCode) { std::fwrite(g_curVuCode, 1, g_curCodeSize, mc); std::fclose(mc); }
+                        FILE *dm = std::fopen("/home/z3/Desktop/bt3/work/wedge_data.bin", "wb");
+                        if (dm) { std::fwrite(vuData, 1, dataSize, dm); std::fclose(dm); }
+                        FILE *st = std::fopen("/home/z3/Desktop/bt3/work/wedge_state.bin", "wb");
+                        if (st) { std::fwrite(&g_entryStateShadow, 1, sizeof(VU1State), st); std::fclose(st); }
+                        std::fprintf(stderr, "[wedgekick] #%u snapshot: pc=%u top=%u kickAddr=%u verts=%u bboxPx x=[%u..%u] y=[%u..%u]\n",
+                                     bn, g_curStartPc, m_state.top & 0x3FFu, addr, verts,
+                                     minX >> 4, maxX >> 4, minY >> 4, maxY >> 4);
+                    }
+                }
+                if (s_skyKick && skyInputSeen && verts >= 3u)
+                {
+                    static std::atomic<uint32_t> s_kn{0};
+                    const uint32_t n = s_kn.fetch_add(1) + 1u;
+                    {
+                        static std::atomic<bool> s_dumped{false};
+                        bool expected = false;
+                        if (s_dumped.compare_exchange_strong(expected, true))
+                        {
+                            FILE *mc = std::fopen("/home/z3/Desktop/bt3/work/sky_micro.bin", "wb");
+                            if (mc && g_curVuCode) { std::fwrite(g_curVuCode, 1, g_curCodeSize, mc); std::fclose(mc); }
+                            FILE *dm = std::fopen("/home/z3/Desktop/bt3/work/sky_data.bin", "wb");
+                            if (dm) { std::fwrite(vuData, 1, dataSize, dm); std::fclose(dm); }
+                            FILE *st = std::fopen("/home/z3/Desktop/bt3/work/sky_state.bin", "wb");
+                            if (st) { std::fwrite(&g_entryStateShadow, 1, sizeof(VU1State), st); std::fclose(st); }
+                            std::fprintf(stderr, "[skykick] snapshot written (entryPc=%u kickTop=%u)\n",
+                                         g_curStartPc, m_state.top & 0x3FFu);
+                        }
+                    }
+                    if (n <= 6u || (n % 512u) == 0u)
+                    {
+                        std::fprintf(stderr, "[skykick] #%u pc=%u prim=%u verts=%u bboxPx x=[%u..%u] y=[%u..%u] top=%u itop=%u\n",
+                                     n, g_curStartPc, primSeen, verts, minX >> 4, maxX >> 4, minY >> 4, maxY >> 4,
+                                     m_state.top & 0x3FFu, m_state.itop & 0x3FFu);
+                        if (n <= 2u)
+                            for (uint32_t q = 0; q < 8u; ++q)
+                            {
+                                float fa[4], ft[4];
+                                std::memcpy(fa, vuData + (q & 0x3FFu) * 16u, 16);
+                                std::memcpy(ft, vuData + (((m_state.top & 0x3FFu) + q) & 0x3FFu) * 16u, 16);
+                                std::fprintf(stderr, "[skykick]   qw%u abs=(%g,%g,%g,%g) top+%u=(%g,%g,%g,%g)\n",
+                                             q, fa[0], fa[1], fa[2], fa[3], q, ft[0], ft[1], ft[2], ft[3]);
+                            }
+                    }
+                }
                 if (g_spikeKick && verts >= 3u)
                 {
                     const uint32_t spreadPx = std::max(maxX - minX, maxY - minY) >> 4; // 12.4 -> px
-                    if (spreadPx > 1500u)
+                    // PS2X_SPIKEKICK_MIN: trigger threshold in px (default 1500 = hair spikes;
+                    // ~180 catches the saturated terrain-wedge kicks).
+                    static const uint32_t s_skMin = [](){ const char *v = std::getenv("PS2X_SPIKEKICK_MIN"); return v ? (uint32_t)std::strtoul(v, nullptr, 0) : 1500u; }();
+                    // PS2X_SPIKEKICK_MAX: upper bound — select a specific spread class (e.g.
+                    // MIN=180 MAX=300 snapshots the visible-wedge kicks, skipping the larger
+                    // offscreen guard-band sliver kicks that otherwise trigger first).
+                    static const uint32_t s_skMax = [](){ const char *v = std::getenv("PS2X_SPIKEKICK_MAX"); return v ? (uint32_t)std::strtoul(v, nullptr, 0) : 0xFFFFFFFFu; }();
+                    // PS2X_SPIKEKICK_XMAX (px, GS absolute): only trigger when the kick bbox
+                    // right edge is below this — selects IN-VIEWPORT kicks (visible wedges at
+                    // ~1700-2030px) instead of the offscreen guard-band slivers at ~3800px.
+                    static const uint32_t s_skXMax = [](){ const char *v = std::getenv("PS2X_SPIKEKICK_XMAX"); return v ? (uint32_t)std::strtoul(v, nullptr, 0) : 0xFFFFFFFFu; }();
+                    if (spreadPx > s_skMin && spreadPx < s_skMax && (maxX >> 4) < s_skXMax)
                     {
                         static std::atomic<uint32_t> s_sk{0};
                         const uint32_t n = s_sk.fetch_add(1) + 1u;
@@ -2024,6 +2195,31 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                         if ((n % 512u) == 1u)
                             std::fprintf(stderr, "[skipdegen] dropped %u kicks (pc=%u amax=%.3g nan=%d)\n", n, g_curStartPc, amax, bad ? 1 : 0);
                         return;
+                    }
+                }
+            }
+            // [skick] every XGKICK of a sky-signature run: which packets go out, at what
+            // size/nloop — decides whether the late-tag-patch protocol loses the strip
+            // packets (kicked while NLOOP=0) in the live game.
+            {
+                static const bool s_sk2 = [](){ const char *v = std::getenv("PS2X_SKYKICK"); return v && v[0] && v[0] != '0'; }();
+                if (s_sk2)
+                {
+                    float sv[4] = {0, 0, 0, 0};
+                    const uint32_t va = (((m_state.top & 0x3FFu) + 3u) & 0x3FFu) * 16u;
+                    if (va + 16u <= dataSize)
+                        std::memcpy(sv, vuData + va, 16);
+                    const float r2sig = sv[0] * sv[0] + sv[2] * sv[2];
+                    if (r2sig > 4.0e8f && r2sig < 1.6e9f && sv[1] > -16000.0f && sv[1] < 4000.0f)
+                    {
+                        const uint64_t t0 = read64Wrap(addr);
+                        static std::atomic<uint32_t> s_kn2{0};
+                        const uint32_t n2 = s_kn2.fetch_add(1);
+                        if (n2 < 120u)
+                            std::fprintf(stderr, "[skick] pc=%u kickAddr=%u(qw%u) bytes=%u nloop=%u eop=%llu top=%u\n",
+                                         m_state.pc, addr, addr / 16u, totalBytes,
+                                         (uint32_t)(t0 & 0x7FFFu), (unsigned long long)((t0 >> 15) & 1u),
+                                         m_state.top & 0x3FFu);
                     }
                 }
             }

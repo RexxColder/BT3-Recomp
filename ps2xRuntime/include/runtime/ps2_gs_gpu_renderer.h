@@ -70,6 +70,15 @@ public:
         uint8_t alphaFunc = 1;      // GS TEST.ATST (1 = ALWAYS)
         uint8_t alphaRef = 0;       // GS TEST.AREF (0-255, GS alpha units: 0x80 = 1.0)
         uint8_t alphaFail = 0;      // GS TEST.AFAIL (0 = KEEP: discard the fragment)
+        // GS TEST destination-alpha test (DATE bit14, DATM bit15): the fragment passes only
+        // where the FRAMEBUFFER alpha's bit7 == DATM. BT3's HUD bars: an alpha-only mask is
+        // written over the fill fraction, then the empty-look overlay is drawn DATE-gated —
+        // the mechanism behind partial health/blast-stock fills. GL has no dest-alpha test;
+        // the replay approximates it with dest-alpha lerp blend factors (exact for the 0/0x80
+        // binary masks these draws use).
+        bool dateEnable = false;    // GS TEST.DATE != 0
+        uint8_t dateMode = 0;       // GS TEST.DATM (pass where destA bit7 == DATM)
+        uint8_t fst = 0;            // GS PRIM.FST (1 = direct UV coords: 2D/HUD-class draw)
         // GS PRIM.ABE: alpha-blend enable. When false the primitive is opaque and must NOT
         // be alpha-blended (blending an opaque prim over a dark buffer darkens the scene).
         bool abe = false;
@@ -116,6 +125,15 @@ public:
     // hash the underlying span first and keep the cached decode if the bytes are unchanged.
     // Unrelated uploads land in shared 8KB pages constantly (fight effects/CLUT streams),
     // and a hash is ~10x cheaper than the decode+GL-upload a false invalidation costs.
+    // Content-versioned key resolution: BT3 STREAMS several materials through one VRAM
+    // slot (tbp 10752) between draw packets. A per-(regs+CLUT) key made them all collide
+    // on ONE cache entry/GL texture — the replay drew every pass with the LAST-uploaded
+    // material (flat dark-green terrain in GPU mode; SW samples VRAM live and was right).
+    // This folds the texel-span content hash into the key: each material version gets its
+    // own stable entry (decoded once ever, even for per-frame cycling). Returns the
+    // versioned key; needDecode=true when the caller must decode+putTexture under it.
+    uint64_t resolveTextureVersion(uint64_t baseKey, uint32_t pageLo, uint32_t pageHi,
+                                   const uint8_t *vram, uint32_t vramSize, bool &needDecode);
     bool revalidateTexture(uint64_t key, uint32_t pageLo, uint32_t pageHi,
                            const uint8_t *vram, uint32_t vramSize);
     void putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi);
@@ -168,6 +186,13 @@ private:
     // downsample time, strobing presents, empty light/shadow maps).
     std::vector<std::vector<DrawCmd>> m_pending;
     std::unordered_map<uint64_t, CachedTex> m_texCache;
+    struct TexVersion
+    {
+        uint32_t seqChecked = 0; // m_writeSeq when the span was last hashed/validated
+        uint64_t hash = 0;       // content hash of the texel span at that time
+        uint64_t verKey = 0;     // baseKey ^ mixed(hash); 0 = never resolved
+    };
+    std::unordered_map<uint64_t, TexVersion> m_texVersion; // baseKey -> current version
     uint32_t m_writeSeq = 0;                 // monotonically bumped per VRAM upload
     uint32_t m_pageSeq[kVramPages] = {};     // last write seq per VRAM page
     // Last write seq at which a draw/transfer RENDERED INTO each fbp. Indexed by fbp,

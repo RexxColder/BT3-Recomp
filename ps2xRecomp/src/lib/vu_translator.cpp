@@ -317,18 +317,23 @@ namespace ps2recomp
                     uint8_t field = inst.function & 0x3;
                     std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
 
+                    // Hardware semantics (mirrors the replay-verified VU1 interpreter):
+                    // compare fs.xyz against |ft.w| (ABS — negative w = behind camera is the
+                    // case that matters), flag bits are +x,-x,+y,-y,+z,-z in bits 0..5.
+                    // The old emission used signed w and swapped the +/- bits — the game's
+                    // trivial-reject then culled visible stage geometry (screen-sized holes)
+                    // and passed behind-camera triangles.
                     return fmt::format(
-                        "{{ __m128 fs = ctx->vu0_vf[{}]; "
-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
-                        "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
-                        "__m128 gt = _mm_cmpgt_ps(fs, ft); "
-                        "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "
-                        "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(gt); "
-                        "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(lt); "
-                        "uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | "
-                        "((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | "
-                        "((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); "
-                        "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | (flags & 0x3F)) & 0xFFFFFF; }}",
+                        "{{ __m128 fs4 = ctx->vu0_vf[{}]; "
+                        "const float fsx = _mm_cvtss_f32(fs4); "
+                        "const float fsy = _mm_cvtss_f32(_mm_shuffle_ps(fs4, fs4, _MM_SHUFFLE(1,1,1,1))); "
+                        "const float fsz = _mm_cvtss_f32(_mm_shuffle_ps(fs4, fs4, _MM_SHUFFLE(2,2,2,2))); "
+                        "const float cw = fabsf(_mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}))); "
+                        "uint32_t flags = 0; "
+                        "if (fsx > +cw) flags |= 0x01; if (fsx < -cw) flags |= 0x02; "
+                        "if (fsy > +cw) flags |= 0x04; if (fsy < -cw) flags |= 0x08; "
+                        "if (fsz > +cw) flags |= 0x10; if (fsz < -cw) flags |= 0x20; "
+                        "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | flags) & 0xFFFFFF; }}",
                         inst.rd, inst.rt, inst.rt, shuffle_pattern);
                 }
                 case VU0_S2_VNOP:

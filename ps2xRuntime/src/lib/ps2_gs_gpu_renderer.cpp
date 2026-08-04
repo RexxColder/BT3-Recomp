@@ -155,6 +155,7 @@ namespace
     unsigned int g_lastOutId = 0;                 // last presented texture id
     std::unordered_map<uint64_t, Texture2D> g_glTex;
     std::unordered_map<uint64_t, bool> g_texBlack; // texKey -> decoded texture is near-black (stale/empty region in GPU mode)
+    std::unordered_map<uint64_t, bool> g_texAlphaBinary; // texKey -> alpha channel is ~binary (0/255): DATE emulation is exact only for these
     // Fade lag: palettes animate under distinct content-keys, so a fade mints a new texKey
     // every frame -> without eviction m_texCache/g_glTex leak an entry/frame and every new
     // key pays a full LoadTextureFromImage (glGenTextures + glTexImage2D) alloc. Fix: LRU
@@ -402,6 +403,46 @@ bool GsGpuRenderer::hasTexture(uint64_t key, uint32_t pageLo, uint32_t pageHi)
     return true;
 }
 
+uint64_t GsGpuRenderer::resolveTextureVersion(uint64_t baseKey, uint32_t pageLo, uint32_t pageHi,
+                                              const uint8_t *vram, uint32_t vramSize, bool &needDecode)
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+    if (pageLo >= kVramPages) pageLo = kVramPages - 1;
+    if (pageHi >= kVramPages) pageHi = kVramPages - 1;
+    TexVersion &ve = m_texVersion[baseKey];
+    bool dirty = (ve.verKey == 0);
+    if (!dirty)
+        for (uint32_t p = pageLo; p <= pageHi; ++p)
+            if (m_pageSeq[p] > ve.seqChecked) { dirty = true; break; }
+    if (dirty)
+    {
+        uint64_t h = 1469598103934665603ull;
+        if (vram && vramSize)
+        {
+            uint64_t begin = static_cast<uint64_t>(pageLo) * 8192ull;
+            uint64_t end = (static_cast<uint64_t>(pageHi) + 1ull) * 8192ull;
+            if (begin < vramSize)
+            {
+                if (end > vramSize) end = vramSize;
+                const uint8_t *p8 = vram + begin;
+                uint64_t n = end - begin;
+                while (n >= 8) { uint64_t v; std::memcpy(&v, p8, 8); h = (h ^ v) * 1099511628211ull; p8 += 8; n -= 8; }
+                while (n--) { h = (h ^ *p8++) * 1099511628211ull; }
+            }
+        }
+        ve.seqChecked = m_writeSeq;
+        if (ve.verKey == 0 || h != ve.hash)
+        {
+            ve.hash = h;
+            ve.verKey = baseKey ^ ((h | 1ull) * 0x9E3779B97F4A7C15ull);
+            if (ve.verKey == 0) ve.verKey = 1;
+        }
+    }
+    auto it = m_texCache.find(ve.verKey);
+    needDecode = (it == m_texCache.end() || it->second.w <= 0);
+    return ve.verKey;
+}
+
 bool GsGpuRenderer::revalidateTexture(uint64_t key, uint32_t pageLo, uint32_t pageHi,
                                       const uint8_t *vram, uint32_t vramSize)
 {
@@ -478,6 +519,15 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
             if (v[i] > 14 || v[i + 1] > 14 || v[i + 2] > 14) { black = false; break; }
         g_texBlack[key] = black;
     }
+    // Binary-alpha classification for the DATE emulation: gradient-alpha textures (terrain
+    // crossfades, soft shadows) must NOT get the dest-alpha-lerp + discard treatment.
+    {
+        bool binA = true;
+        const std::vector<uint8_t> &v = ct.rgba;
+        for (size_t i = 3; i < v.size(); i += 64)
+            if (v[i] > 32 && v[i] < 224) { binA = false; break; }
+        g_texAlphaBinary[key] = binA;
+    }
 }
 
 // PS2X_SRCDIAG: once per second, print how textured draws resolved their source
@@ -525,6 +575,97 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
 {
     std::lock_guard<std::mutex> lk(m_mtx);
     DrawCmd c = cmd;
+    // [barbox] (PS2X_BARBOX): FULL state of every draw touching the P1 health-bar rect
+    // (x 60-230, y 15-35) — the layered fill recipe incl. fbmsk + alpha test, which the
+    // fdraw forensic lines omit. The fill mechanism is dest-alpha; this shows which
+    // writer/reader pass our FBO alpha pipeline mishandles.
+    {
+        static const bool s_bb = [](){ const char *v = std::getenv("PS2X_BARBOX"); return v && v[0] && v[0] != '0'; }();
+        if (s_bb && !c.isTransfer && (c.destFbp == 0u || c.destFbp == 112u) &&
+            c.srcTbp0 != 10752u && c.srcTbp0 != 12288u) // exclude scenery + intro-effect textures
+        {
+            float mnx, mxx, mny, mxy;
+            if (c.isTriangle)
+            {
+                mnx = mxx = c.tri[0].x; mny = mxy = c.tri[0].y;
+                for (int i = 1; i < 3; ++i)
+                {
+                    mnx = std::min(mnx, c.tri[i].x); mxx = std::max(mxx, c.tri[i].x);
+                    mny = std::min(mny, c.tri[i].y); mxy = std::max(mxy, c.tri[i].y);
+                }
+            }
+            else { mnx = std::min(c.dx0, c.dx1); mxx = std::max(c.dx0, c.dx1); mny = std::min(c.dy0, c.dy1); mxy = std::max(c.dy0, c.dy1); }
+            if (mxx >= 60.0f && mnx <= 230.0f && mxy >= 15.0f && mny <= 35.0f)
+            {
+                static uint32_t s_n = 0; // under m_mtx
+                const uint32_t n = s_n++;
+                if (n < 3000u)
+                {
+                    const uint8_t cr = c.isTriangle ? c.tri[0].r : c.r, cg2 = c.isTriangle ? c.tri[0].g : c.g;
+                    const uint8_t cb2 = c.isTriangle ? c.tri[0].b : c.b, ca2 = c.isTriangle ? c.tri[0].a : c.a;
+                    char uvs[96] = "";
+                    if (c.isTriangle)
+                        std::snprintf(uvs, sizeof(uvs), " uv=(%.2f,%.2f)(%.2f,%.2f)(%.2f,%.2f)",
+                                      c.tri[0].u, c.tri[0].v, c.tri[1].u, c.tri[1].v, c.tri[2].u, c.tri[2].v);
+                    else
+                        std::snprintf(uvs, sizeof(uvs), " uv=(%.1f,%.1f)-(%.1f,%.1f)", c.su0, c.sv0, c.su1, c.sv1);
+                    std::fprintf(stderr, "[barbox] #%u %s dest=%u src=%u tex=%dx%d box=(%.0f,%.0f)-(%.0f,%.0f) abe=%d bm=0x%02x fix=0x%02x fbmsk=%08x at=%d atst=%u aref=%u afail=%u DATE=%d datm=%u key=%04x c=(%u,%u,%u,%u) tcc=%d%s\n",
+                                 n, c.isTriangle ? "tri" : "spr", c.destFbp, c.srcTbp0, c.srcTexW, c.srcTexH,
+                                 mnx, mny, mxx, mxy, c.abe ? 1 : 0, c.blendMode, c.blendFix, c.fbmsk,
+                                 c.alphaTest ? 1 : 0, (unsigned)c.alphaFunc, (unsigned)c.alphaRef, (unsigned)c.alphaFail,
+                                 c.dateEnable ? 1 : 0, (unsigned)c.dateMode, (unsigned)(c.texKey & 0xFFFFu),
+                                 cr, cg2, cb2, ca2, (int)c.tcc, uvs);
+                }
+            }
+        }
+    }
+    // PS2X_BIGDRAW=N: log EVERY recorded command whose screen extent exceeds N px —
+    // sprites, triangles and transfers alike (the popup-triangle hunt showed screen-
+    // sized draws that never trip the triangle-branch spike probe). Counter is plain:
+    // we are under m_mtx.
+    {
+        static const float s_big = [](){ const char *v = std::getenv("PS2X_BIGDRAW"); return v ? (float)std::strtoul(v, nullptr, 0) : 0.0f; }();
+        if (s_big > 0.0f)
+        {
+            float ext = 0.0f;
+            if (c.isTransfer) ext = (float)std::max(c.xW, c.xH);
+            else if (c.isTriangle)
+            {
+                float mnx = c.tri[0].x, mxx = mnx, mny = c.tri[0].y, mxy = mny;
+                for (int i = 1; i < 3; ++i)
+                {
+                    mnx = std::min(mnx, c.tri[i].x); mxx = std::max(mxx, c.tri[i].x);
+                    mny = std::min(mny, c.tri[i].y); mxy = std::max(mxy, c.tri[i].y);
+                }
+                ext = std::max(mxx - mnx, mxy - mny) / 16.0f;
+            }
+            else ext = std::max(std::fabs(c.dx1 - c.dx0), std::fabs(c.dy1 - c.dy0));
+            if (ext > s_big)
+            {
+                static uint32_t s_n = 0;
+                const uint32_t n = ++s_n;
+                if (n <= 60 || (n % 256u) == 0u)
+                {
+                    if (c.isTriangle)
+                        std::fprintf(stderr, "[bigdraw] #%u tri ext=%.0f dest=%u src=%u tex=%dx%d abe=%d bm=0x%02x sc=[%d,%d %d,%d] "
+                                             "v0=(%.0f,%.0f) v1=(%.0f,%.0f) v2=(%.0f,%.0f) uv0=(%.2f,%.2f) uv1=(%.2f,%.2f) uv2=(%.2f,%.2f)\n",
+                                     n, ext, c.destFbp, c.srcTbp0, c.srcTexW, c.srcTexH, c.abe ? 1 : 0, c.blendMode,
+                                     c.sx, c.sy, c.sw, c.sh,
+                                     c.tri[0].x / 16, c.tri[0].y / 16, c.tri[1].x / 16, c.tri[1].y / 16, c.tri[2].x / 16, c.tri[2].y / 16,
+                                     c.tri[0].u, c.tri[0].v, c.tri[1].u, c.tri[1].v, c.tri[2].u, c.tri[2].v);
+                    else if (c.isTransfer)
+                        std::fprintf(stderr, "[bigdraw] #%u xfer %dx%d src fbp%u %d,%d -> fbp%u %d,%d\n",
+                                     n, c.xW, c.xH, c.xSrcFbp, c.xSX, c.xSY, c.xDstFbp, c.xDX, c.xDY);
+                    else
+                        std::fprintf(stderr, "[bigdraw] #%u spr ext=%.0f dest=%u src=%u tex=%dx%d abe=%d bm=0x%02x sc=[%d,%d %d,%d] "
+                                             "d=(%.0f,%.0f)-(%.0f,%.0f) s=(%.0f,%.0f)-(%.0f,%.0f)\n",
+                                     n, ext, c.destFbp, c.srcTbp0, c.srcTexW, c.srcTexH, c.abe ? 1 : 0, c.blendMode,
+                                     c.sx, c.sy, c.sw, c.sh,
+                                     c.dx0, c.dy0, c.dx1, c.dy1, c.su0, c.sv0, c.su1, c.sv1);
+                }
+            }
+        }
+    }
     // Upload-vs-RT precedence: if the sampled base page was uploaded to AFTER the last
     // draw that rendered into that fbp, the game is sampling the uploaded texture, not
     // framebuffer feedback. Uploads and draws both arrive here on the GIF thread, in GS
@@ -534,6 +675,17 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
         const uint32_t pg = c.srcTbp0 / 32u;
         if (pg < kVramPages && m_pageSeq[pg] > m_fbpRenderSeq[pg])
             c.srcUploaded = true;
+    }
+    // PS2X_STRIP_FBO (experiment): full-height narrow strips are the glow/feedback chain
+    // sampling a render target — they must read the FBO even when the aliased page was
+    // uploaded more recently (the stage-tile atlas shares fbp336's base page; the upload
+    // veto made the strips paint raw ATLAS COLUMNS over the arena = the wedges/bands).
+    if (c.srcUploaded && !c.isTriangle && !c.isTransfer)
+    {
+        static const bool s_sf = [](){ const char *v = std::getenv("PS2X_STRIP_FBO"); return v && v[0] && v[0] != '0'; }();
+        const float sdw = std::fabs(c.dx1 - c.dx0), sdh = std::fabs(c.dy1 - c.dy0);
+        if (s_sf && sdh >= 440.0f && sdw > 0.0f && sdw <= 64.0f)
+            c.srcUploaded = false;
     }
     // Stamp the destination AFTER the source check (a draw must not shadow its own source).
     const uint32_t dst = c.isTransfer ? c.xDstFbp : c.destFbp;
@@ -827,11 +979,23 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
 
     // PS2X_FORENSIC window decision (early, so ALL dump sites key off the same publishes):
     // 6 distinct publishes starting ~150 gens after the first big (fight) frame.
+    // PS2X_FORENSIC=key: arm on F9 instead — the artifacts are camera-moment-specific
+    // (intro pans, knockdowns), so the user triggers capture the instant they're visible.
     {
-        static const bool s_fo = [](){ const char *v = std::getenv("PS2X_FORENSIC"); return v && v[0] && v[0] != '0'; }();
+        static const char *s_fv = std::getenv("PS2X_FORENSIC");
+        static const bool s_fo = s_fv && s_fv[0] && s_fv[0] != '0';
+        static const bool s_keyArm = s_fo && std::strcmp(s_fv, "key") == 0;
         static uint32_t s_startGen = 0, s_lastGen = 0; static int s_count = 0;
         g_forensicThisFrame = false;
-        if (s_fo && cmds.size() > 4000 && s_startGen == 0) s_startGen = frameGen + 150;
+        if (s_keyArm)
+        {
+            if (IsKeyPressed(KEY_F9))
+            {
+                s_startGen = frameGen; s_count = 0;
+                std::fprintf(stderr, "[forensic] F9 — armed at gen=%u\n", frameGen);
+            }
+        }
+        else if (s_fo && cmds.size() > 4000 && s_startGen == 0) s_startGen = frameGen + 150;
         if (s_fo && s_startGen != 0 && frameGen >= s_startGen && frameGen != s_lastGen && s_count < 6)
         { s_lastGen = frameGen; ++s_count; g_forensicThisFrame = true; }
     }
@@ -1409,6 +1573,47 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     eq = 4;      // (Cs-Cd)*Ad+Cd = Cs*Ad + Cd*(1-Ad)
             }
         }
+        // GS DEST-ALPHA TEST (TEST.DATE/DATM): pass only where framebuffer alpha bit7 ==
+        // DATM. No GL equivalent; approximate with dest-alpha lerp factors — exact for the
+        // binary 0/0x80 masks the HUD bars use: DATM=1 -> out = Cs*Ad + Cd*(1-Ad) (draw
+        // lands only where the mask is set), DATM=0 -> mirrored. PS2X_DATE=0 disables.
+        {
+            static const bool s_date = [](){ const char *v = std::getenv("PS2X_DATE"); return !(v && v[0] == '0'); }();
+            // Scope: only draws whose SOURCE alpha actually paints (As>=0.5). DATE draws
+            // with a=0 (the alpha-zeroer quads, the additive damage-flash overlays) are RGB
+            // no-ops on hardware via As=0 — overriding their blend painted solid black/red
+            // over the HUD. They keep their original equation (still RGB no-ops here).
+            const uint8_t srcA = bc.isTriangle ? bc.tri[0].a : bc.a;
+            // Only textures with ~binary alpha (or untextured solid quads): the lerp+discard
+            // emulation is exact for those; gradient-alpha users (terrain crossfades, soft
+            // shadows) keep their original blend (DATE unemulated = previous good look).
+            bool binaryAlpha = (bc.texKey == 0);
+            if (!binaryAlpha)
+            {
+                auto abIt = g_texAlphaBinary.find(bc.texKey);
+                binaryAlpha = (abIt != g_texAlphaBinary.end() && abIt->second);
+            }
+            // fst==1 only: HUD/2D draws (direct UV). Terrain/3D STQ draws use DATE with
+            // dithered masks + vertex-alpha gradients — the lerp override wrecks those.
+            if (s_date && bc.dateEnable && bc.fst && srcA >= 128u && binaryAlpha)
+            {
+                abe = true;
+                eq = bc.dateMode ? 8 : 9;
+            }
+            // ADDITIVE + DATE (the sparking HUD flash: untextured navy quad a<128 over the
+            // gauge band, gated to the lightning shapes): keep additive semantics but gate
+            // the contribution by dest alpha. As folds out (mask is binary; slight over-
+            // bright inside the mask beats a screen-wide box).
+            // srcA>=32: the emulation folds As out, so draws that are ~no-ops on HW via
+            // tiny/zero As (the red flash twin quad at a=0) must keep their original
+            // additive blend (still ~no-ops) instead of painting at full dest-alpha gate.
+            else if (s_date && bc.dateEnable && ((bc.blendMode & 0x0Fu) == 0x08u) && srcA >= 32u &&
+                     (bc.texKey == 0 || (bc.fst && binaryAlpha)))
+            {
+                abe = true;
+                eq = bc.dateMode ? 10 : 11;
+            }
+        }
         // FIX-opaque: (Cs-Cd)*FIX+Cd with FIX>=0x70 is effectively src-only. The GL
         // constant-alpha path renders these fragments as src*0 through the rlgl batch
         // (PROVEN via the [samplertest] charBlend twin: same quad, blend-off = orange,
@@ -1469,6 +1674,22 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             {
                 srcRGB = 0x0304; dstRGB = F_ONE; // Cs*Ad + Cd (bm 0x58)
             }
+            else if (eq == 8)
+            {
+                srcRGB = 0x0304; dstRGB = 0x0305; // DATE DATM=1: Cs*Ad + Cd*(1-Ad)
+            }
+            else if (eq == 9)
+            {
+                srcRGB = 0x0305; dstRGB = 0x0304; // DATE DATM=0: Cs*(1-Ad) + Cd*Ad
+            }
+            else if (eq == 10)
+            {
+                srcRGB = 0x0304; dstRGB = F_ONE; // DATE DATM=1 additive: Cs*Ad + Cd
+            }
+            else if (eq == 11)
+            {
+                srcRGB = 0x0305; dstRGB = F_ONE; // DATE DATM=0 additive: Cs*(1-Ad) + Cd
+            }
             // rlgl GOTCHA: re-selecting the SAME custom mode without cycling does not re-apply
             // changed factors. Cycle through BLEND_ALPHA to force it.
             rlSetBlendMode(RL_BLEND_ALPHA);
@@ -1492,6 +1713,26 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         {
             atst = (float)tc.alphaFunc;
             aref = (float)tc.alphaRef / 128.0f; // shader alpha units: GS 0x80 = 1.0
+        }
+        // DATE-emulated draws (dest-alpha lerp override in applyBlend): the lerp factors
+        // drop the draw's own PER-TEXEL alpha term, so transparent texels painted their
+        // raw palette RGB (white HUD backgrounds, broken terrain crossfades). Restore the
+        // As term by discarding transparent texels — exact for the binary CLUT alphas
+        // these draws carry.
+        else if (!s_noAtest && tc.dateEnable)
+        {
+            const uint8_t dsa = tc.isTriangle ? tc.tri[0].a : tc.a;
+            bool binA = (tc.texKey == 0);
+            if (!binA)
+            {
+                auto abIt = g_texAlphaBinary.find(tc.texKey);
+                binA = (abIt != g_texAlphaBinary.end() && abIt->second);
+            }
+            if (dsa >= 128u && binA && tc.fst)
+            {
+                static const bool s_date2 = [](){ const char *v = std::getenv("PS2X_DATE"); return !(v && v[0] == '0'); }();
+                if (s_date2) { atst = 5.0f; aref = 0.25f; } // GEQUAL, ~quarter alpha
+            }
         }
         if (atst == curAtst && (atst < 0.0f || aref == curAref))
             return;
@@ -1595,6 +1836,107 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     for (size_t ci = 0; ci < DC.size(); ++ci)
     {
         const DrawCmd &c = DC[ci];
+        // PS2X_PROGDUMP: during forensic publishes, dump the scene buffers every 5% of
+        // the draw list — progressive frame construction for bisecting which draw range
+        // paints an artifact. Files overwrite per step; they show the LAST forensic publish.
+        {
+            static const bool s_pd = [](){ const char *v = std::getenv("PS2X_PROGDUMP"); return v && v[0] && v[0] != '0'; }();
+            if (s_pd && g_forensicThisFrame && DC.size() >= 20 && ci != 0 && ci % (DC.size() / 20) == 0)
+            {
+                const int step = (int)(ci / (DC.size() / 20));
+                for (uint32_t fb : {0u, 112u})
+                {
+                    auto fit = g_fbos.find(fb);
+                    if (fit != g_fbos.end() && fit->second.rt.texture.id != 0)
+                    {
+                        endMode();
+                        curFbp = 0xFFFFFFFFu; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;
+                        BeginTextureMode(fit->second.rt);
+                        char bp[160];
+                        std::snprintf(bp, sizeof bp, "/home/z3/Desktop/bt3/work/prog_%02d_f%u.ppm", step, fb);
+                        dumpBoundFbo(bp, 512, fit->second.h);
+                        EndTextureMode();
+                    }
+                }
+                std::fprintf(stderr, "[progdump] step=%d ci=%zu/%zu\n", step, ci, DC.size());
+            }
+        }
+        // PS2X_DRAWCUTS: comma-separated draw indices; during forensic publishes dump the
+        // scene buffers at each index — fine-grained bisection of WHICH draw paints an
+        // artifact (PROGDUMP showed everything forms in the first 5%, so cuts go there).
+        {
+            static const std::vector<size_t> s_cuts = []() {
+                std::vector<size_t> v;
+                if (const char *e = std::getenv("PS2X_DRAWCUTS"))
+                {
+                    const char *p = e;
+                    while (*p)
+                    {
+                        v.push_back(std::strtoull(p, nullptr, 10));
+                        while (*p && *p != ',') ++p;
+                        if (*p == ',') ++p;
+                    }
+                }
+                return v;
+            }();
+            if (!s_cuts.empty() && g_forensicThisFrame &&
+                std::find(s_cuts.begin(), s_cuts.end(), ci) != s_cuts.end())
+            {
+                for (uint32_t fb : {0u, 112u})
+                {
+                    auto fit = g_fbos.find(fb);
+                    if (fit != g_fbos.end() && fit->second.rt.texture.id != 0)
+                    {
+                        endMode();
+                        curFbp = 0xFFFFFFFFu; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;
+                        BeginTextureMode(fit->second.rt);
+                        char bp[160];
+                        std::snprintf(bp, sizeof bp, "/home/z3/Desktop/bt3/work/cut_%06zu_f%u.ppm", ci, fb);
+                        dumpBoundFbo(bp, 512, fit->second.h);
+                        EndTextureMode();
+                    }
+                }
+                std::fprintf(stderr, "[drawcut] ci=%zu/%zu dumped\n", ci, DC.size());
+            }
+        }
+        // PS2X_SKIP_FBTEX_TRI (experiment): triangles textured from tbp0=0 sample the
+        // FRAMEBUFFER on real hardware; our texture cache decodes them to a 1x1 white
+        // fallback and they paint FLAT WEDGES over the arena. Skip to confirm.
+        {
+            static const bool s_sft = [](){ const char *v = std::getenv("PS2X_SKIP_FBTEX_TRI"); return v && v[0] && v[0] != '0'; }();
+            if (s_sft && c.isTriangle && c.texKey != 0 && c.srcTbp0 == 0u)
+                continue;
+        }
+        // PS2X_FORENSIC rides along: dump EVERY draw of the forensic publishes so the
+        // present PNGs can be reconciled pixel-by-pixel against the draw list.
+        if (g_forensicThisFrame)
+        {
+            if (c.isTransfer)
+                std::fprintf(stderr, "[fdraw] %zu xfer %dx%d f%u(%d,%d)->f%u(%d,%d)\n",
+                             ci, c.xW, c.xH, c.xSrcFbp, c.xSX, c.xSY, c.xDstFbp, c.xDX, c.xDY);
+            else if (!c.isTriangle)
+                std::fprintf(stderr, "[fdraw] %zu spr dest=%u src=%u tex=%dx%d abe=%d bm=0x%02x fix=0x%02x dt=%d df=%u dw=%d DATE=%d/%u fst=%u msk=%08x "
+                                     "xy=(%.0f,%.0f)-(%.0f,%.0f) uv=(%.2f,%.2f)-(%.2f,%.2f) c=(%u,%u,%u,%u) z=%.4f\n",
+                             ci, c.destFbp, c.srcTbp0, c.srcTexW, c.srcTexH, c.abe ? 1 : 0, c.blendMode, c.blendFix,
+                             c.depthTest ? 1 : 0, (unsigned)c.depthFunc, c.depthWrite ? 1 : 0,
+                             c.dateEnable ? 1 : 0, (unsigned)c.dateMode, (unsigned)c.fst, c.fbmsk,
+                             c.dx0, c.dy0, c.dx1, c.dy1, c.su0, c.sv0, c.su1, c.sv1,
+                             c.r, c.g, c.b, c.a, c.z);
+            else if (c.isTriangle)
+                std::fprintf(stderr, "[fdraw] %zu tri dest=%u src=%u tex=%dx%d abe=%d bm=0x%02x fix=0x%02x dt=%d df=%u dw=%d "
+                                     "v=(%.0f,%.0f)(%.0f,%.0f)(%.0f,%.0f) z=(%.4f,%.4f,%.4f) uv=(%.2f,%.2f)(%.2f,%.2f)(%.2f,%.2f) c0=(%u,%u,%u,%u)\n",
+                             ci, c.destFbp, c.srcTbp0, c.srcTexW, c.srcTexH, c.abe ? 1 : 0, c.blendMode, c.blendFix,
+                             c.depthTest ? 1 : 0, (unsigned)c.depthFunc, c.depthWrite ? 1 : 0,
+                             c.tri[0].x, c.tri[0].y, c.tri[1].x, c.tri[1].y, c.tri[2].x, c.tri[2].y,
+                             c.tri[0].z, c.tri[1].z, c.tri[2].z,
+                             c.tri[0].u, c.tri[0].v, c.tri[1].u, c.tri[1].v, c.tri[2].u, c.tri[2].v,
+                             c.tri[0].r, c.tri[0].g, c.tri[0].b, c.tri[0].a);
+            else
+                std::fprintf(stderr, "[fdraw] %zu spr dest=%u src=%u tex=%dx%d abe=%d bm=0x%02x fix=0x%02x "
+                                     "d=(%.0f,%.0f)-(%.0f,%.0f) s=(%.0f,%.0f)-(%.0f,%.0f) col=(%u,%u,%u,%u)\n",
+                             ci, c.destFbp, c.srcTbp0, c.srcTexW, c.srcTexH, c.abe ? 1 : 0, c.blendMode, c.blendFix,
+                             c.dx0, c.dy0, c.dx1, c.dy1, c.su0, c.sv0, c.su1, c.sv1, c.r, c.g, c.b, c.a);
+        }
         // New published list (game frame) starts here: depth is per-frame state, so reset the
         // once-per-replay depth-clear tracking and force a full FBO rebind (the beginFbp
         // early-return path skips the depth clear when the FBO didn't change).
@@ -1941,6 +2283,16 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // textures are bottom-up, so flag a V-flip.
         Texture2D tex = g_white; bool vflip = false; bool fromFbo = false;
         const uint32_t sf = c.srcTbp0 ? tbp0ToFbp(c.srcTbp0) : 0u;
+        // DEST-ALPHA-coefficient draws (GS ALPHA C=Ad: bm 0x54/0x14/0x58...): these lerp/scale
+        // by the per-pixel alpha MASK the game built in the framebuffer (health/blast-stock bar
+        // fill, DOF focus mix). They are ALWAYS RT composites — the srcUploaded veto (stage
+        // tiles stream through the same base page) must not reroute them to the decoded atlas,
+        // and the postgate must not eat them: where the mask is 0 they are a no-op by
+        // construction, so letting them through is safe. PS2X_DESTALPHA=0 restores old gating.
+        static const bool s_destAlpha = [](){ const char *v = std::getenv("PS2X_DESTALPHA"); return !(v && v[0] == '0'); }();
+        const bool destAlphaLerp = s_destAlpha && c.abe && !c.isTransfer &&
+                                   (((c.blendMode >> 4) & 3u) == 1u) &&
+                                   c.srcTbp0 != 0u && (c.srcTbp0 == sf * 32u) && g_fbos.count(sf) != 0;
         const AtlasSlot *srcSlot = nullptr; // atlas mode: the source fbp's sub-rect (for UV remap)
         // Composite ONLY when srcTbp0 is EXACTLY a render-target's base (e.g. 10752=fbp336*32). An
         // OFFSET inside an RT region (e.g. 10760 = the font uploaded into fbp336's page) is a normal
@@ -1956,7 +2308,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             std::fprintf(stderr, "[srcdiag] cfg noff=%d atlas=%d\n", s_noff ? 1 : 0, s_atlas ? 1 : 0);
             if (FILE *f = srcDiagFile()) { std::fprintf(f, "[srcdiag] cfg noff=%d atlas=%d\n", s_noff ? 1 : 0, s_atlas ? 1 : 0); std::fflush(f); } } }
         const char *srcHow = "untex";
-        if (!s_noff && !c.srcIndexed && !c.srcUploaded && s_atlas && c.texKey != 0 && sf != c.destFbp && (c.srcTbp0 == sf * 32u) && g_atlasSlots.count(sf))
+        if (!s_noff && !c.srcIndexed && (!c.srcUploaded || destAlphaLerp) && s_atlas && c.texKey != 0 && sf != c.destFbp && (c.srcTbp0 == sf * 32u) && g_atlasSlots.count(sf))
         {
             // Composite: the source RT lives in the atlas at its slot. Sample g_atlas, remap UV/src
             // rect into that sub-rect (done in the sprite/triangle emit paths below).
@@ -1992,7 +2344,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             tex = g_white; // neutral: fully lit
             srcHow = "neutral";
         }
-        else if (!s_noff && !c.srcIndexed && !c.srcUploaded && c.texKey != 0 && sf != c.destFbp && (c.srcTbp0 == sf * 32u) && g_fbos.count(sf) && g_fbos[sf].rt.texture.id != 0)
+        else if (!s_noff && !c.srcIndexed && (!c.srcUploaded || destAlphaLerp) && c.texKey != 0 && sf != c.destFbp && (c.srcTbp0 == sf * 32u) && g_fbos.count(sf) && g_fbos[sf].rt.texture.id != 0)
         {
             // Read-after-write fix: for a BIG RT (rendered+sampled same frame), sample its stable
             // COPY (snapshot) instead of the live FBO texture -- sampling the live one corrupts GL.
@@ -2366,6 +2718,31 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             static const bool s_nosub = [](){ const char *v = std::getenv("PS2X_NOSUB"); return v && v[0] && v[0] != '0'; }();
             if (s_nosub && c.abe && ((c.blendMode & 3u) == 2u) && (((c.blendMode >> 4) & 3u) == 2u))
                 continue;
+            // PS2X_DARKCULL: diagnostic — skip LARGE dark-modulated far-z scene triangles
+            // (the ci=573935 class: terrain-textured, vc near-black, z~0, GEQUAL). On HW
+            // the ground depth rejects them; if the green patches vanish with this, our
+            // depth path fails for them and that is the real bug to fix.
+            static const bool s_darkcull = [](){ const char *v = std::getenv("PS2X_DARKCULL"); return v && v[0] && v[0] != '0'; }();
+            if (s_darkcull && c.isTriangle && c.abe && (c.destFbp == 0u || c.destFbp == 112u))
+            {
+                const int maxc = std::max({(int)c.tri[0].r, (int)c.tri[0].g, (int)c.tri[0].b});
+                const float maxz = std::max({c.tri[0].z, c.tri[1].z, c.tri[2].z});
+                float mnx = c.tri[0].x, mxx = mnx, mny = c.tri[0].y, mxy = mny;
+                for (int k = 1; k < 3; ++k)
+                {
+                    mnx = std::min(mnx, c.tri[k].x); mxx = std::max(mxx, c.tri[k].x);
+                    mny = std::min(mny, c.tri[k].y); mxy = std::max(mxy, c.tri[k].y);
+                }
+                if (maxc < 80 && maxz < 0.001f && (mxx - mnx) > 150.0f && (mxy - mny) > 150.0f)
+                    continue;
+            }
+            // PS2X_NO52: diagnostic — skip the dest-alpha darken passes (bm 0x52, Cd - Cs*Ad).
+            // On HW, Ad is a precise mask the game builds in framebuffer alpha; our FBO alpha
+            // is unmanaged junk, so the darkening can land wholesale (dark-green terrain
+            // patches suspect). Disappears with this flag -> implement real dest-alpha.
+            static const bool s_no52 = [](){ const char *v = std::getenv("PS2X_NO52"); return v && v[0] && v[0] != '0'; }();
+            if (s_no52 && c.abe && c.blendMode == 0x52)
+                continue;
             // PS2X_POSTFX (default OFF): fullscreen FBO->scene composites (the glow/heat-haze
             // overlay chain). Until the bloom intermediate passes are numerically right, these
             // paint the (black/degenerate) bloom result over the whole fight. Skip any LARGE
@@ -2388,13 +2765,72 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 // (HUD frame — srcUploaded set) OR the T8H framebuffer-readback posterize
                 // strips (tbp0=7168=fbp224 etc. — never uploaded, decode stale gray, and
                 // wallpaper the finished scene in 32px columns). Gate the never-uploaded ones.
+                // Column-strip shape veto override: the feedback chain paints the scene in
+                // full-height narrow strips. When the sampled RT base is ALSO a live upload
+                // page (stage tiles at 10752 alias fbp336), srcUploaded un-gates them and
+                // they wallpaper the fight in stretched stage-texture columns (the "giant
+                // map-textured triangles"). A full-height <=64px strip into the scene is
+                // always the chain, never a legit HUD/texture draw — gate it regardless.
+                const float gdw = c.isTriangle ? 0.0f : std::fabs(c.dx1 - c.dx0);
+                const float gdh = c.isTriangle ? 0.0f : std::fabs(c.dy1 - c.dy0);
+                const bool columnStrip = !c.isTriangle && gdh >= 440.0f && gdw > 0.0f && gdw <= 64.0f;
                 const bool rtBaseSample = c.srcTbp0 && (c.srcTbp0 == xsf * 32u) &&
                                           g_fbos.count(xsf) && xsf != c.destFbp &&
-                                          (!c.srcIndexed || !c.srcUploaded);
-                if (sceneDest && (fromFbo || rtBaseSample))
+                                          (!c.srcIndexed || !c.srcUploaded || columnStrip);
+                // [lerpchk] (PS2X_BARALPHA): at each dest-alpha lerp strip into the scene,
+                // flush and read back the bar rect's CURRENT dest alpha — is the HP mask
+                // still present when its consumer actually runs?
+                if (destAlphaLerp && sceneDest)
+                {
+                    static const bool s_lc = [](){ const char *v = std::getenv("PS2X_BARALPHA"); return v && v[0] && v[0] != '0'; }();
+                    static uint32_t s_ln = 0;
+                    if (s_lc && s_ln < 40u && curFbp == c.destFbp)
+                    {
+                        ++s_ln;
+                        rlDrawRenderBatchActive();
+                        auto fit2 = g_fbos.find(c.destFbp);
+                        if (fit2 != g_fbos.end())
+                        {
+                            const int fh3 = fit2->second.h;
+                            const int rx = 60, rw = 170, ryTop = 15, rh = 20;
+                            std::vector<uint8_t> pxv((size_t)rw * rh * 4);
+                            glReadPixels(rx, fh3 - (ryTop + rh), rw, rh, 0x1908, 0x1401, pxv.data());
+                            char prof[96];
+                            for (int x = 0; x < rw; x += 2)
+                            {
+                                uint8_t mxa = 0;
+                                for (int y = 0; y < rh; ++y) mxa = std::max(mxa, pxv[((size_t)y * rw + x) * 4 + 3]);
+                                prof[x / 2] = (mxa == 0) ? '.' : (mxa < 64) ? '1' : (mxa < 128) ? '5' : (mxa < 224) ? '8' : 'F';
+                            }
+                            prof[rw / 2] = 0;
+                            std::fprintf(stderr, "[lerpchk] #%u ci=%zu strip dest=%u src=%u bm=0x%02x d=(%.0f,%.0f)-(%.0f,%.0f) | barA: %s\n",
+                                         s_ln, ci, c.destFbp, c.srcTbp0, c.blendMode, c.dx0, c.dy0, c.dx1, c.dy1, prof);
+                        }
+                    }
+                }
+                if (sceneDest && !destAlphaLerp && (fromFbo || rtBaseSample))
                 {
                     if (s_srcDiag) srcDiagTally("postgate", c);
+                    if (g_forensicThisFrame) std::fprintf(stderr, "[fgate] %zu postgate\n", ci);
                     continue;
+                }
+                // PS2X_STRIPGATE=1 (experiment): gate ANY textured full-height narrow strip
+                // into the scene, no questions asked. If the wallpaper artifacts survive even
+                // this, they are not strips. [stripesc] logs strips the normal gate passed.
+                if (sceneDest && columnStrip && c.srcTbp0)
+                {
+                    static const bool s_sg = [](){ const char *v = std::getenv("PS2X_STRIPGATE"); return v && v[0] && v[0] != '0'; }();
+                    static uint32_t s_esc = 0;
+                    if (++s_esc <= 40 || (s_esc % 512u) == 0u)
+                        std::fprintf(stderr, "[stripesc] dest=%u src=%u xsf=%u fbo=%d idx=%d upl=%d fromFbo=%d bm=0x%02x d=(%.0f,%.0f)-(%.0f,%.0f) gated=%d\n",
+                                     c.destFbp, c.srcTbp0, xsf, g_fbos.count(xsf) ? 1 : 0,
+                                     c.srcIndexed ? 1 : 0, c.srcUploaded ? 1 : 0, fromFbo ? 1 : 0,
+                                     c.blendMode, c.dx0, c.dy0, c.dx1, c.dy1, s_sg ? 1 : 0);
+                    if (s_sg)
+                    {
+                        if (g_forensicThisFrame) std::fprintf(stderr, "[fgate] %zu stripgate\n", ci);
+                        continue;
+                    }
                 }
             }
         }
@@ -3018,6 +3454,41 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         dumpBoundFbo("/home/z3/Desktop/bt3/work/probefb_end.ppm", 512, fh);
         if (FILE *f = srcDiagFile()) { std::fprintf(f, "[endsnap] taken, lastFbp=%u\n", curFbp); std::fflush(f); }
     }
+    // [baralpha] (PS2X_BARALPHA): end-of-replay FBO ALPHA readback of the P1 health-bar rect
+    // (x 60..230, screen y 15..35) from the displayed scene buffer — an ASCII per-column
+    // max-alpha profile. Decides whether the game's HP alpha mask ever LANDS in our FBO
+    // (writers broken vs consumer missing). ~1/sec rate to keep readback stalls negligible.
+    {
+        static const bool s_ba = [](){ const char *v = std::getenv("PS2X_BARALPHA"); return v && v[0] && v[0] != '0'; }();
+        static std::chrono::steady_clock::time_point s_bt = std::chrono::steady_clock::now();
+        if (s_ba && std::chrono::duration<double>(std::chrono::steady_clock::now() - s_bt).count() >= 1.0)
+        {
+            s_bt = std::chrono::steady_clock::now();
+            auto fit = g_fbos.find(112u);
+            if (fit == g_fbos.end() || fit->second.rt.texture.id == 0) fit = g_fbos.find(0u);
+            if (fit != g_fbos.end() && fit->second.rt.texture.id != 0)
+            {
+                endMode();
+                BeginTextureMode(fit->second.rt);
+                const int fh2 = fit->second.h;
+                const int rx = 60, rw = 170, ryTop = 15, rh = 20;
+                const int ry = fh2 - (ryTop + rh); // FBO is bottom-up
+                std::vector<uint8_t> px((size_t)rw * rh * 4);
+                glReadPixels(rx, ry, rw, rh, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, px.data());
+                EndTextureMode();
+                char prof[176];
+                for (int x = 0; x < rw; x += 2)
+                {
+                    uint8_t mx = 0;
+                    for (int y = 0; y < rh; ++y)
+                        mx = std::max(mx, px[((size_t)y * rw + x) * 4 + 3]);
+                    prof[x / 2] = (mx == 0) ? '.' : (mx < 64) ? '1' : (mx < 128) ? '5' : (mx < 224) ? '8' : 'F';
+                }
+                prof[rw / 2] = 0;
+                std::fprintf(stderr, "[baralpha] fbp=%u x60..230 colMaxA: %s\n", fit->first, prof);
+            }
+        }
+    }
     if (curBlendOn == 0) rlEnableColorBlend(); // restore GL default (a trailing opaque prim left it off)
     if (curBlendEq >= 1) rlSetBlendMode(RL_BLEND_ALPHA); // restore from subtractive/constant
     endMode();
@@ -3184,6 +3655,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     // (Stride-remap experiment removed: the popup has the SAME draw512/display640 FBW
     // mismatch yet renders fine without re-striding, so a blanket re-stride is wrong and
     // breaks the popup. The logo's re-stride distinction is something more specific.)
+    // (TEXTURE_FIXES.md fix 5 — conditional drawFBW!=dispFBW re-stride — was tried here
+    // 2026-07-31 and reverted: broke rendering in testing, same as the blanket version.)
 
     // Diagnostic (PS2X_GPU_DIAG): dump the display FBO once at a settled frame.
     {

@@ -799,9 +799,16 @@ void GSRasterizer::drawPrimitive(GS *gs)
             {
                 static std::atomic<int> bc{0};
                 if (bc.fetch_add(1) < 50)
-                    std::fprintf(stderr, "[bigdraw] prim=%u tme=%u tbp0=%u psm=%u fbp=%u col0=(%u,%u,%u,a%u) bbox=(%d,%d)-(%d,%d) %dx%d\n",
-                        gs->m_prim.type, gs->m_prim.tme, ctx.tex0.tbp0, ctx.tex0.psm, ctx.frame.fbp,
-                        a.r, a.g, a.b, a.a, minx, miny, maxx, maxy, w, h);
+                    std::fprintf(stderr, "[bigdraw] prim=%u ctxt=%u tme=%u tbp0=%u psm=%u fbp=%u col0=(%u,%u,%u,a%u) bbox=(%d,%d)-(%d,%d) %dx%d "
+                                         "of1=(%u,%u) of2=(%u,%u) sc1=(%u..%u,%u..%u) sc2=(%u..%u,%u..%u)\n",
+                        gs->m_prim.type, gs->m_prim.ctxt ? 1u : 0u, gs->m_prim.tme, ctx.tex0.tbp0, ctx.tex0.psm, ctx.frame.fbp,
+                        a.r, a.g, a.b, a.a, minx, miny, maxx, maxy, w, h,
+                        (unsigned)(gs->m_ctx[0].xyoffset.ofx >> 4), (unsigned)(gs->m_ctx[0].xyoffset.ofy >> 4),
+                        (unsigned)(gs->m_ctx[1].xyoffset.ofx >> 4), (unsigned)(gs->m_ctx[1].xyoffset.ofy >> 4),
+                        (unsigned)gs->m_ctx[0].scissor.x0, (unsigned)gs->m_ctx[0].scissor.x1,
+                        (unsigned)gs->m_ctx[0].scissor.y0, (unsigned)gs->m_ctx[0].scissor.y1,
+                        (unsigned)gs->m_ctx[1].scissor.x0, (unsigned)gs->m_ctx[1].scissor.x1,
+                        (unsigned)gs->m_ctx[1].scissor.y0, (unsigned)gs->m_ctx[1].scissor.y1);
             }
         }
     }
@@ -1977,14 +1984,27 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         zTestEnable = ((test >> 16) & 1u) != 0u;      // bit16  ZTE
         zTestFunc = static_cast<uint8_t>((test >> 17) & 3u); // bits17-18 ZTST
         zWrite = !ctx.zbuf.zmask;                     // ZBUF.ZMSK==1 -> writes disabled
-        switch (ctx.zbuf.psm)                         // psm = ((v>>24)&0xF)|0x30 (see GS::writeRegister)
+        // The GS depth COMPARISON is on the raw 32-bit Z value regardless of ZBUF.psm
+        // (psm only truncates STORAGE). Normalizing per-psm re-scales passes by different
+        // constants, which INVERTS depth ordering between passes when a game mixes Z
+        // formats (BT3 fights: far backdrop normalized /2^24 came out "nearer" than
+        // ground normalized /2^32 — the arena wedge artifacts). Use one constant so the
+        // normalized ordering always matches the hardware's raw-integer ordering.
+        // PS2X_ZPSMNORM=1 restores the old per-psm behavior for A/B.
+        static const bool s_perPsm = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_ZPSMNORM"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+        if (s_perPsm)
         {
-        case GS_PSM_Z32: zMax = 4294967295.0; break;  // 2^32-1
-        case GS_PSM_Z24: zMax = 16777215.0; break;    // 2^24-1
-        case GS_PSM_Z16:
-        case GS_PSM_Z16S: zMax = 65535.0; break;      // 2^16-1
-        default: zMax = 4294967295.0; break;
+            switch (ctx.zbuf.psm)                     // psm = ((v>>24)&0xF)|0x30 (see GS::writeRegister)
+            {
+            case GS_PSM_Z32: zMax = 4294967295.0; break;  // 2^32-1
+            case GS_PSM_Z24: zMax = 16777215.0; break;    // 2^24-1
+            case GS_PSM_Z16:
+            case GS_PSM_Z16S: zMax = 65535.0; break;      // 2^16-1
+            default: zMax = 4294967295.0; break;
+            }
         }
+        else
+            zMax = 4294967295.0;
     }
     // GS Z is an integer where LARGER = NEARER. Normalize to [0,1]; the replay clears depth
     // to 0.0 (far) and uses GL_GREATER/GEQUAL so the larger value wins (stored directly).
@@ -2027,6 +2047,57 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         }
         texKey = h ? h : 1ull;
 
+        // PS2X_SKYKICK (record-side): the first SKY-panorama triangle (tbp0=10752 1024x256)
+        // dumps its originating VU1 kick — entry PC, TOP, kick addr, full VU data memory and
+        // microcode — for offline dissection of the collapsed sky transform.
+        {
+            static const bool s_sky = [](){ const char *v = std::getenv("PS2X_SKYKICK"); return v && v[0] && v[0] != '0'; }();
+            // Companion capture: a WORKING chunk (256x256 grass terrain, same program) from
+            // the same scene — diffing its matrix vs the sky's isolates the EE-side breakage.
+            if (s_sky && tex.tbp0 == 10752u && texW == 256 && texH == 256)
+            {
+                extern thread_local uint32_t g_xgkickEntryPc, g_xgkickTop, g_xgkickKickAddr;
+                extern thread_local const uint8_t *g_xgkickVuData;
+                extern thread_local uint32_t g_xgkickVuDataSize;
+                static std::atomic<bool> s_gDumped{false};
+                bool exp1 = false;
+                if (g_xgkickVuData && s_gDumped.compare_exchange_strong(exp1, true))
+                {
+                    FILE *dm = std::fopen("/home/z3/Desktop/bt3/work/ground_data.bin", "wb");
+                    if (dm) { std::fwrite(g_xgkickVuData, 1, g_xgkickVuDataSize, dm); std::fclose(dm); }
+                    std::fprintf(stderr, "[groundrec] snapshot written entryPc=%u top=%u kickAddr=%u\n",
+                                 g_xgkickEntryPc, g_xgkickTop, g_xgkickKickAddr);
+                }
+            }
+            if (s_sky && tex.tbp0 == 10752u && texW == 1024 && texH == 256)
+            {
+                extern thread_local uint32_t g_xgkickEntryPc, g_xgkickTop, g_xgkickKickAddr;
+                extern thread_local const uint8_t *g_xgkickVuData;
+                extern thread_local uint32_t g_xgkickVuDataSize;
+                extern thread_local const uint8_t *g_xgkickVuCode;
+                extern thread_local uint32_t g_xgkickVuCodeSize;
+                static std::atomic<uint32_t> s_n{0};
+                const uint32_t n = s_n.fetch_add(1);
+                if (n < 6u)
+                    std::fprintf(stderr, "[skyrec] #%u entryPc=%u top=%u kickAddr=%u vuData=%p prim=%u\n",
+                                 n, g_xgkickEntryPc, g_xgkickTop, g_xgkickKickAddr,
+                                 (const void *)g_xgkickVuData, gs->m_prim.type);
+                static std::atomic<bool> s_dumped{false};
+                bool exp0 = false;
+                if (g_xgkickVuData && s_dumped.compare_exchange_strong(exp0, true))
+                {
+                    FILE *dm = std::fopen("/home/z3/Desktop/bt3/work/sky_data.bin", "wb");
+                    if (dm) { std::fwrite(g_xgkickVuData, 1, g_xgkickVuDataSize, dm); std::fclose(dm); }
+                    if (g_xgkickVuCode)
+                    {
+                        FILE *mc = std::fopen("/home/z3/Desktop/bt3/work/sky_micro.bin", "wb");
+                        if (mc) { std::fwrite(g_xgkickVuCode, 1, g_xgkickVuCodeSize, mc); std::fclose(mc); }
+                    }
+                    std::fprintf(stderr, "[skyrec] snapshot written entryPc=%u top=%u kickAddr=%u dataBytes=%u\n",
+                                 g_xgkickEntryPc, g_xgkickTop, g_xgkickKickAddr, g_xgkickVuDataSize);
+                }
+            }
+        }
         // PS2X_3DPROBE: characterize 3D scene triangles (sizeable textures) — textured vs flat,
         // texture base/format, vertex color (silhouette = flat color), and texcoords present.
         {
@@ -2114,7 +2185,11 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 }
             }
         }
-        if (!r.revalidateTexture(texKey, texPageLo, texPageHi, gs->m_vram, gs->m_vramSize))
+        // Resolve the CONTENT-VERSIONED key (see resolveTextureVersion): streamed materials
+        // sharing one tbp0 get distinct cache entries instead of overwriting each other.
+        bool texNeedDecode = false;
+        texKey = r.resolveTextureVersion(texKey, texPageLo, texPageHi, gs->m_vram, gs->m_vramSize, texNeedDecode);
+        if (texNeedDecode)
         {
             ensureClutCache(gs);
             std::vector<uint8_t> rgba(static_cast<size_t>(texW) * texH * 4u);
@@ -2337,7 +2412,13 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         else if (tme) // MODULATE
         {
             cr = v.r; cg = v.g; cb = v.b;
-            ca = (tcc != 0u) ? 255u : static_cast<uint8_t>(std::min(255u, (v.a * 255u) >> 7));
+            // GS MODULATE alpha with TCC=1 is At*Av>>7 — BOTH texture AND vertex alpha.
+            // Passing 255 here dropped the vertex-alpha term, so per-vertex alpha fade
+            // gradients (the terrain material-blend zones) rendered at FULL strength:
+            // hard-edged dark-green patches where grass variants should crossfade.
+            // The shader multiplies t.a * fragColor.a, so this one factor restores it
+            // (va=0x80 -> 255 -> identical to before for the common opaque case).
+            ca = static_cast<uint8_t>(std::min(255u, (v.a * 255u) >> 7));
         }
         else // untextured flat
         {
@@ -2409,6 +2490,34 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             }
         }
     }
+    // [hpbar] (PS2X_HPBAR): full state of the health-bar fill draws (srcTbp0=10880) —
+    // psm/CLUT regs/CLUT alpha content/TEXA/scissor — the fill quad is always full-width,
+    // so the partial-fill mechanism must live in one of these.
+    {
+        static const bool s_hp = [](){ const char *v = std::getenv("PS2X_HPBAR"); return v && v[0] && v[0] != '0'; }();
+        if (s_hp && tme && ctx.tex0.tbp0 == 10880u)
+        {
+            static std::atomic<uint32_t> s_n{0};
+            const uint32_t n = s_n.fetch_add(1);
+            if (n < 20u || (n % 512u) == 0u)
+            {
+                ensureClutCache(gs);
+                char cl[220] = "";
+                if (gs->m_clutCacheKey != ~0ull)
+                {
+                    int o = 0;
+                    for (int i = 0; i < 32 && o < 200; i += 2)
+                        o += std::snprintf(cl + o, sizeof(cl) - o, "%02x,", (gs->m_clutCache[i] >> 24) & 0xFF);
+                }
+                std::fprintf(stderr, "[hpbar] #%u psm=%u tw=%u th=%u cbp=%u cpsm=%u csa=%u csm=%u cld=%u | texa ta0=%u aem=%d ta1=%u | sci=(%d,%d)-(%d,%d) | fst=%u prim=%u | clutA[0..30,2]=%s\n",
+                             n, ctx.tex0.psm, ctx.tex0.tw, ctx.tex0.th,
+                             ctx.tex0.cbp, ctx.tex0.cpsm, ctx.tex0.csa, ctx.tex0.csm, ctx.tex0.cld,
+                             gs->m_texa.ta0, gs->m_texa.aem ? 1 : 0, gs->m_texa.ta1,
+                             ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1,
+                             gs->m_prim.fst, gs->m_prim.type, cl);
+            }
+        }
+    }
     // GS scissor -> clip rect (top-left origin, framebuffer pixels). The GPU renderer
     // must respect this or full-width bands (e.g. the popup box) span the whole screen.
     cmd.sx = ctx.scissor.x0;
@@ -2430,6 +2539,10 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     cmd.alphaFunc = static_cast<uint8_t>((ctx.test >> 1) & 7u);
     cmd.alphaRef = static_cast<uint8_t>((ctx.test >> 4) & 0xFFu);
     cmd.alphaFail = static_cast<uint8_t>((ctx.test >> 12) & 3u);
+    // GS TEST.DATE/DATM (destination-alpha test) — the HUD bar partial-fill mechanism.
+    cmd.dateEnable = ((ctx.test >> 14) & 1u) != 0u;
+    cmd.dateMode = static_cast<uint8_t>((ctx.test >> 15) & 1u);
+    cmd.fst = static_cast<uint8_t>(gs->m_prim.fst & 1u);
 
     // GS PRIM.ABE: alpha-blend enable. Opaque prims (abe=0) must be drawn without blending
     // in the GPU renderer, matching the software rasterizer (which gates on m_prim.abe).
@@ -2450,6 +2563,25 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         cmd.wrapU = (wms == 1u || wms == 2u) ? 1u : 0u;
         cmd.wrapV = (wmt == 1u || wmt == 2u) ? 1u : 0u;
         cmd.tcc = tme ? static_cast<uint8_t>(ctx.tex0.tcc & 1u) : 1u;
+        // [regionrec] PS2X_REGIONREC=1: does the stage/backdrop class (tbp0=10752) use
+        // REGION_* wrap modes whose window params (MINU/MAXU/MINV/MAXV) we currently drop?
+        {
+            static const bool s_rr = [](){ const char *v = std::getenv("PS2X_REGIONREC"); return v && v[0] && v[0] != '0'; }();
+            // Log REGION-mode draws on ANY texture (window params are currently dropped by
+            // the GPU DrawCmd — the 2026-07-30 window-decode experiment was reverted after
+            // it caused 2D-screen flashing; the only in-fight user is the FB-copy 512x448).
+            if (s_rr && tme && (wms >= 2u || wmt >= 2u))
+            {
+                static std::atomic<uint32_t> s_rn{0};
+                const uint32_t n = s_rn.fetch_add(1);
+                if (n < 64u || (n % 4096u) == 0u)
+                    std::fprintf(stderr, "[regionrec] #%u tbp0=%u wms=%u wmt=%u minu=%u maxu=%u minv=%u maxv=%u tex=%ux%u prim=%u\n",
+                                 n, ctx.tex0.tbp0, wms, wmt,
+                                 (unsigned)((ctx.clamp >> 4) & 0x3FFu), (unsigned)((ctx.clamp >> 14) & 0x3FFu),
+                                 (unsigned)((ctx.clamp >> 24) & 0x3FFu), (unsigned)((ctx.clamp >> 34) & 0x3FFu),
+                                 1u << ctx.tex0.tw, 1u << ctx.tex0.th, gs->m_prim.type);
+            }
+        }
 
         // [clamprec] (default on, PS2X_SRCDIAG=0 disables): record-side CLAMP forensics for
         // the fight's character textures — the GPU DrawCmd drops the REGION_* parameters, so
@@ -2555,11 +2687,24 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 (gs->m_vtxQueue[0].z > 12000000.0 || gs->m_vtxQueue[1].z > 12000000.0 || gs->m_vtxQueue[2].z > 12000000.0))
                 return true; // drop this triangle
         }
+        // PS2X_QCULL (experiment): drop textured STQ triangles carrying a NEGATIVE q on any
+        // vertex — behind-camera vertices that escaped the VU1 near-plane clip project with
+        // w<0 (mirrored onto screen; the sky corner-patch / wedge class). Real hardware
+        // never receives these because its clipper culls them. Visual A/B for the mechanism.
+        {
+            static const bool s_qcull = [](){ const char *v = std::getenv("PS2X_QCULL"); return v && v[0] && v[0] != '0'; }();
+            if (s_qcull && tme && !fst &&
+                (gs->m_vtxQueue[0].q < 0.0f || gs->m_vtxQueue[1].q < 0.0f || gs->m_vtxQueue[2].q < 0.0f))
+                return true; // drop
+        }
         // Triangle -> rlgl (normalized UV, per-vertex color).
         cmd.isTriangle = true;
         for (int i = 0; i < 3; ++i)
         {
             const GSVertex &v = gs->m_vtxQueue[i];
+            // (2026-08-04: briefly kept the 12.4 sub-pixel fraction here so the game's
+            // half-million micro-triangles rasterize like SW — massive lag, no visible
+            // gain; the final image is replaced by the RT strip chain anyway. Reverted.)
             cmd.tri[i].x = static_cast<float>(static_cast<int>(v.x) - ofx);
             cmd.tri[i].y = static_cast<float>(static_cast<int>(v.y) - ofy);
             float u, tv; texelUV(v, u, tv);
@@ -2567,6 +2712,57 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             cmd.tri[i].v = tme ? (tv / static_cast<float>(texH)) : 0.0f;
             if (s_depthOn) cmd.tri[i].z = zNorm(v);
             colorBytes(v, cmd.tri[i].r, cmd.tri[i].g, cmd.tri[i].b, cmd.tri[i].a);
+        }
+        // [wedgerec2] (PS2X_WEDGEREC): THE intro-pan wedge signature nailed by the F9 capture
+        // (gen2687 ci=673-675 etc): a huge far-z terrain-textured clip-fan whose verts pin at
+        // BOTH guard clamps (x=-1499 left, ~2010 right-edge apex) with z<0.001. Dump the
+        // originating VU1 kick (data+micro+entry state) for offline replay.
+        {
+            static const bool s_wr = [](){ const char *v = std::getenv("PS2X_WEDGEREC"); return v && v[0] && v[0] != '0'; }();
+            if (s_wr && tme)
+            {
+                float mnx = cmd.tri[0].x, mxx = mnx, mxz = cmd.tri[0].z;
+                for (int i = 1; i < 3; ++i)
+                {
+                    mnx = std::min(mnx, cmd.tri[i].x); mxx = std::max(mxx, cmd.tri[i].x);
+                    mxz = std::max(mxz, cmd.tri[i].z);
+                }
+                if (mnx < -1400.0f && mxx > 1900.0f && mxz < 0.001f)
+                {
+                    extern thread_local uint32_t g_xgkickEntryPc, g_xgkickTop, g_xgkickKickAddr;
+                    extern thread_local const uint8_t *g_xgkickVuData;
+                    extern thread_local uint32_t g_xgkickVuDataSize;
+                    extern thread_local const uint8_t *g_xgkickVuCode;
+                    extern thread_local uint32_t g_xgkickVuCodeSize;
+                    static std::atomic<uint32_t> s_n{0};
+                    const uint32_t n = s_n.fetch_add(1);
+                    if (n < 12u)
+                        std::fprintf(stderr, "[wedgerec2] #%u entryPc=%u top=%u kickAddr=%u v0=(%.0f,%.0f) v1=(%.0f,%.0f) v2=(%.0f,%.0f)\n",
+                                     n, g_xgkickEntryPc, g_xgkickTop, g_xgkickKickAddr,
+                                     cmd.tri[0].x, cmd.tri[0].y, cmd.tri[1].x, cmd.tri[1].y, cmd.tri[2].x, cmd.tri[2].y);
+                    static std::atomic<bool> s_dumped{false};
+                    bool exp0 = false;
+                    if (g_xgkickVuData && s_dumped.compare_exchange_strong(exp0, true))
+                    {
+                        FILE *dm = std::fopen("/home/z3/Desktop/bt3/work/wedge2_data.bin", "wb");
+                        if (dm) { std::fwrite(g_xgkickVuData, 1, g_xgkickVuDataSize, dm); std::fclose(dm); }
+                        if (g_xgkickVuCode)
+                        {
+                            FILE *mc = std::fopen("/home/z3/Desktop/bt3/work/wedge2_micro.bin", "wb");
+                            if (mc) { std::fwrite(g_xgkickVuCode, 1, g_xgkickVuCodeSize, mc); std::fclose(mc); }
+                        }
+                        extern thread_local const uint8_t *g_xgkickEntryStateBytes;
+                        extern thread_local uint32_t g_xgkickEntryStateSize;
+                        if (g_xgkickEntryStateBytes)
+                        {
+                            FILE *st = std::fopen("/home/z3/Desktop/bt3/work/wedge2_state.bin", "wb");
+                            if (st) { std::fwrite(g_xgkickEntryStateBytes, 1, g_xgkickEntryStateSize, st); std::fclose(st); }
+                        }
+                        std::fprintf(stderr, "[wedgerec2] snapshot written entryPc=%u top=%u kickAddr=%u\n",
+                                     g_xgkickEntryPc, g_xgkickTop, g_xgkickKickAddr);
+                    }
+                }
+            }
         }
         // SPS spike triangles: 1-2 garbage vertices out of VU1 land far across the 4096px GS
         // space, making triangles that span thousands of px (screen diagonal is ~780px; the
@@ -2576,6 +2772,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         {
             static const bool s_spkLog = [](){ const char *v = std::getenv("PS2X_SPIKE"); return v && v[0] && v[0] != '0'; }();
             static const float s_spkCull = [](){ const char *v = std::getenv("PS2X_SPIKE_CULL"); return v ? (float)std::strtoul(v, nullptr, 0) : 0.0f; }();
+            // PS2X_SPIKE_MIN: log threshold in px (default 1200 = the classic VU1 SPS spikes;
+            // lower it to catch the moderate screen-sized popup triangles).
+            static const float s_spkMin = [](){ const char *v = std::getenv("PS2X_SPIKE_MIN"); return v ? (float)std::strtoul(v, nullptr, 0) : 1200.0f; }();
             if (s_spkLog || s_spkCull > 0.0f)
             {
                 float mnx = cmd.tri[0].x, mxx = mnx, mny = cmd.tri[0].y, mxy = mny;
@@ -2585,7 +2784,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     mny = std::min(mny, cmd.tri[i].y); mxy = std::max(mxy, cmd.tri[i].y);
                 }
                 const float ext = std::max(mxx - mnx, mxy - mny) / 16.0f; // 12.4 -> px
-                if (s_spkLog && ext > 1200.0f)
+                if (s_spkLog && ext > s_spkMin)
                 {
                     static std::atomic<uint32_t> s_sn{0};
                     uint32_t n = s_sn.fetch_add(1) + 1u;
@@ -2663,7 +2862,124 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 std::fprintf(stderr, "\n");
             }
         }
-        r.recordCmd(cmd);
+        // PERSPECTIVE-CORRECT TEXTURING (default ON, PS2X_PERSPFIX=0 disables): the GL
+        // replay draws screen-space triangles under an ORTHO projection (w=1), so UVs
+        // interpolate AFFINELY. Small triangles are fine; the big near-field terrain
+        // triangles smear their texture into streaks/flat color (the "dark green ground",
+        // and the banding family). GS STQ attributes are LINEAR in screen space, so
+        // subdividing large tris and re-dividing s/q,t/q per new vertex converges to the
+        // hardware's per-pixel perspective mapping.
+        {
+            static const bool s_pf = [](){ const char *v = std::getenv("PS2X_PERSPFIX"); return !(v && v[0] == '0'); }(); // default ON (error-driven, cheap)
+            bool subdivided = false;
+            if (s_pf && tme && !fst)
+            {
+                struct SV { float x, y, zn; float s, t, q; uint8_t r, g, b, a; };
+                SV sv[3];
+                bool qOk = true;
+                float qMin = 1e30f, qMax = -1e30f;
+                for (int i = 0; i < 3; ++i)
+                {
+                    const GSVertex &v = gs->m_vtxQueue[i];
+                    sv[i].x = cmd.tri[i].x; sv[i].y = cmd.tri[i].y; sv[i].zn = cmd.tri[i].z;
+                    sv[i].s = v.s; sv[i].t = v.t; sv[i].q = (v.q != 0.0f) ? v.q : 1.0f;
+                    sv[i].r = cmd.tri[i].r; sv[i].g = cmd.tri[i].g; sv[i].b = cmd.tri[i].b; sv[i].a = cmd.tri[i].a;
+                    if (!(sv[i].q > 0.0f)) qOk = false;
+                    qMin = std::min(qMin, sv[i].q); qMax = std::max(qMax, sv[i].q);
+                }
+                // Only bother when there is real perspective across the triangle AND it is
+                // large on screen — flat-q or small tris are exact enough affinely.
+                const float ex = std::max({sv[0].x, sv[1].x, sv[2].x}) - std::min({sv[0].x, sv[1].x, sv[2].x});
+                const float ey = std::max({sv[0].y, sv[1].y, sv[2].y}) - std::min({sv[0].y, sv[1].y, sv[2].y});
+                const float extent = std::max(ex, ey); // cmd coords are already PIXELS
+                // Error-driven gate: affine-vs-perspective UV divergence at the edge
+                // midpoints, in TEXELS. Only triangles whose smear would actually be
+                // visible (> ~3 texels) get subdivided — the overwhelming majority of
+                // draws skip this entirely (the blanket size gate was a slideshow).
+                float uvErrTexels = 0.0f;
+                if (qOk && extent > 24.0f && qMax > 1.01f * qMin)
+                {
+                    for (int e = 0; e < 3; ++e)
+                    {
+                        const SV &A = sv[e], &B = sv[(e + 1) % 3];
+                        const float qm = (A.q + B.q) * 0.5f;
+                        if (qm <= 0.0f) continue;
+                        const float uAff = (A.s / A.q + B.s / B.q) * 0.5f;
+                        const float vAff = (A.t / A.q + B.t / B.q) * 0.5f;
+                        const float uPer = ((A.s + B.s) * 0.5f) / qm;
+                        const float vPer = ((A.t + B.t) * 0.5f) / qm;
+                        const float du = std::fabs(uAff - uPer) * static_cast<float>(texW);
+                        const float dv = std::fabs(vAff - vPer) * static_cast<float>(texH);
+                        uvErrTexels = std::max({uvErrTexels, du, dv});
+                    }
+                }
+                if (qOk && uvErrTexels > 3.0f)
+                {
+                    auto emitTri = [&](const SV &a, const SV &b, const SV &c2)
+                    {
+                        const SV *vv[3] = {&a, &b, &c2};
+                        for (int i = 0; i < 3; ++i)
+                        {
+                            cmd.tri[i].x = vv[i]->x; cmd.tri[i].y = vv[i]->y; cmd.tri[i].z = vv[i]->zn;
+                            // texelUV normalization is u = (s/q)*texW / texW = s/q (atlas 0..1)
+                            cmd.tri[i].u = vv[i]->s / vv[i]->q;
+                            cmd.tri[i].v = vv[i]->t / vv[i]->q;
+                            cmd.tri[i].r = vv[i]->r; cmd.tri[i].g = vv[i]->g; cmd.tri[i].b = vv[i]->b; cmd.tri[i].a = vv[i]->a;
+                        }
+                        r.recordCmd(cmd);
+                    };
+                    auto mid = [](const SV &a, const SV &b)
+                    {
+                        SV m;
+                        m.x = (a.x + b.x) * 0.5f; m.y = (a.y + b.y) * 0.5f; m.zn = (a.zn + b.zn) * 0.5f;
+                        m.s = (a.s + b.s) * 0.5f; m.t = (a.t + b.t) * 0.5f; m.q = (a.q + b.q) * 0.5f;
+                        m.r = static_cast<uint8_t>((static_cast<int>(a.r) + b.r) >> 1); m.g = static_cast<uint8_t>((static_cast<int>(a.g) + b.g) >> 1);
+                        m.b = static_cast<uint8_t>((static_cast<int>(a.b) + b.b) >> 1); m.a = static_cast<uint8_t>((static_cast<int>(a.a) + b.a) >> 1);
+                        return m;
+                    };
+                    // Iterative 4-way subdivision, terminating per PIECE as soon as its own
+                    // affine error drops under the texel threshold (error shrinks ~4x per
+                    // level, so this converges in 1-3 levels; depth cap is a backstop).
+                    auto pieceErr = [&](const SV &a, const SV &b, const SV &c2) -> float
+                    {
+                        float err = 0.0f;
+                        const SV *pv[3] = {&a, &b, &c2};
+                        for (int e = 0; e < 3; ++e)
+                        {
+                            const SV &A = *pv[e], &B = *pv[(e + 1) % 3];
+                            const float qm = (A.q + B.q) * 0.5f;
+                            if (qm <= 0.0f) continue;
+                            const float du = std::fabs((A.s / A.q + B.s / B.q) * 0.5f - ((A.s + B.s) * 0.5f) / qm) * static_cast<float>(texW);
+                            const float dv = std::fabs((A.t / A.q + B.t / B.q) * 0.5f - ((A.t + B.t) * 0.5f) / qm) * static_cast<float>(texH);
+                            err = std::max({err, du, dv});
+                        }
+                        return err;
+                    };
+                    struct Item { SV a, b, c; int depth; };
+                    static thread_local std::vector<Item> s_work;
+                    s_work.clear();
+                    s_work.push_back({sv[0], sv[1], sv[2], 0});
+                    while (!s_work.empty())
+                    {
+                        Item it = s_work.back();
+                        s_work.pop_back();
+                        if (it.depth >= 5 || (it.depth > 0 && pieceErr(it.a, it.b, it.c) <= 3.0f))
+                        {
+                            emitTri(it.a, it.b, it.c);
+                            continue;
+                        }
+                        const SV ab = mid(it.a, it.b), bc = mid(it.b, it.c), ca = mid(it.c, it.a);
+                        s_work.push_back({it.a, ab, ca, it.depth + 1});
+                        s_work.push_back({ab, it.b, bc, it.depth + 1});
+                        s_work.push_back({ca, bc, it.c, it.depth + 1});
+                        s_work.push_back({ab, bc, ca, it.depth + 1});
+                    }
+                    subdivided = true;
+                }
+            }
+            if (!subdivided)
+                r.recordCmd(cmd);
+        }
     }
     return true;
 }

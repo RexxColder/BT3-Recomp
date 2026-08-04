@@ -776,6 +776,17 @@ bool PS2Runtime::syncCoreSubsystems()
 
 bool PS2Runtime::initialize(const char *title)
 {
+    // PS2X_GWATCH_LO/HI (hex): arm the guest write-watch on an arbitrary region from
+    // startup — reports every recompiled store into it as [camwrite] with pc/ra.
+    // Implies keep-zero-writes (the never-written-matrix hunts need them).
+    if (const char *lo = std::getenv("PS2X_GWATCH_LO"))
+    {
+        const char *hi = std::getenv("PS2X_GWATCH_HI");
+        g_ps2WatchLo.store((uint32_t)std::strtoul(lo, nullptr, 16) & 0x1FFFFFFFu, std::memory_order_relaxed);
+        g_ps2WatchHi.store(hi ? ((uint32_t)std::strtoul(hi, nullptr, 16) & 0x1FFFFFFFu) : 0x1FFFFFFFu, std::memory_order_relaxed);
+        g_ps2WatchAll.store(1u, std::memory_order_relaxed);
+        std::fprintf(stderr, "[gwatch] armed 0x%x..0x%x\n", g_ps2WatchLo.load(), g_ps2WatchHi.load());
+    }
     try
     {
         if (!m_memory.initialize())
@@ -836,6 +847,23 @@ bool PS2Runtime::initialize(const char *title)
                               m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                               m_gs, &m_memory, st.pc, st.top, st.itop, 262144);
                 std::fprintf(stderr, "[replay] done (end pc=%u)\n", m_vu1.state().pc);
+                // PS2X_REPLAY2: run the program a SECOND time (other double-buffer TOP) —
+                // its opening XGKICK delivers the packet the first run built. This is how the
+                // strip output actually reaches the GS in the live game.
+                if (const char *r2 = std::getenv("PS2X_REPLAY2"); r2 && r2[0] && r2[0] != '0')
+                {
+                    const uint32_t top2 = (st.top & 0x3FFu) == 577u ? 141u : 577u;
+                    m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                  m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                  m_gs, &m_memory, st.pc, top2, st.itop, 262144);
+                    std::fprintf(stderr, "[replay] second run done (end pc=%u)\n", m_vu1.state().pc);
+                }
+                if (FILE *de = std::fopen("/home/z3/Desktop/bt3/work/replay_data_end.bin", "wb"))
+                {
+                    std::fwrite(m_memory.getVU1Data(), 1, PS2_VU1_DATA_SIZE, de);
+                    std::fclose(de);
+                    std::fprintf(stderr, "[replay] end-state VU data dumped\n");
+                }
             }
             std::exit(0);
         }

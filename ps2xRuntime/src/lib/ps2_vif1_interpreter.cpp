@@ -32,6 +32,9 @@ bool g_unpackRingEnabled()
 // (non-float garbage), suppress the following XGKICKs until a sane block arrives. Kills
 // the garbage-matrix object's screen-covering triangles while the real writer is hunted.
 std::atomic<bool> g_degenSuppress{false};
+// [mvpdisp] correlation: set by the 13qw@addr0 unpack check (1 healthy / 2 degenerate),
+// consumed by the next MSCAL log. Same thread: VIF parsing is sequential per kick.
+thread_local uint32_t g_last13at0 = 0;
 namespace { std::atomic<uint64_t> g_vifUnpackNs{0}; std::atomic<uint64_t> g_vifUnpackVecs{0};
     std::atomic<uint64_t> g_vifMscalNs{0}; std::atomic<uint64_t> g_vifMscalN{0};
     std::atomic<uint64_t> g_vifMscntNs{0}; std::atomic<uint64_t> g_vifMscntN{0};
@@ -470,6 +473,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
             uint32_t startPC = (uint32_t)imm * 8u;
+            // [mvpdisp]: which microprogram consumes the last 13qw@addr0 unpack (healthy vs
+            // degenerate)? Same pc for both = one program, garbage input; different pc =
+            // packet families and the degenerate ones are misrouted.
+            {
+                extern thread_local uint32_t g_last13at0;
+                if (g_last13at0)
+                {
+                    static std::atomic<uint32_t> s_md{0};
+                    const bool deg = g_last13at0 == 2u;
+                    if (deg || s_md.fetch_add(1) < 10u)
+                        std::fprintf(stderr, "[mvpdisp] MSCAL pc=%u deg=%u top=%u\n",
+                                     startPC, deg ? 1u : 0u, vif1_regs.tops & 0x3FFu);
+                    g_last13at0 = 0u;
+                }
+            }
 
             // Values visible to the VU program for this MSCAL.
             // DobieStation semantics: ITOP = ITOPS; TOP = current TOPS;
@@ -519,6 +537,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         {
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
+            {
+                extern thread_local uint32_t g_last13at0;
+                if (g_last13at0)
+                {
+                    static std::atomic<uint32_t> s_mdc{0};
+                    const bool deg = g_last13at0 == 2u;
+                    if (deg || s_mdc.fetch_add(1) < 10u)
+                        std::fprintf(stderr, "[mvpdisp] MSCNT top=%u deg=%u\n", runTop, deg ? 1u : 0u);
+                    g_last13at0 = 0u;
+                }
+            }
             vif1_regs.top = runTop;
             vif1_regs.itop = runItop;
 
@@ -1101,6 +1130,33 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 r.frame = g_bt3FrameCount.load(std::memory_order_relaxed);
             }
 
+            // PS2X_VTXCHK: for the wedge-kick vertex buffer (vuAddr==577), dump the raw SOURCE
+            // qwords from the packet vs the qwords that LANDED in VU memory, with the cycle
+            // registers. Decides whether the duplicated vertices (q3==q9 in the snapshot) come
+            // from the game's RAM (EE builder) or from our unpack write placement.
+            {
+                static const bool s_vc = [](){ const char *v = std::getenv("PS2X_VTXCHK"); return v && v[0] && v[0] != '0'; }();
+                if (s_vc && vuAddr >= 577u && vuAddr <= 600u && m_vu1Data)
+                {
+                    static std::atomic<uint32_t> s_vn2{0};
+                    if (s_vn2.fetch_add(1) < 20u)
+                    {
+                        std::fprintf(stderr, "[vtxchk] vuAddr=%u num=%u srcVecs=%u cl=%u wl=%u mode=%u maskEn=%d bytes/vec=%u\n",
+                                     vuAddr, writeVectorCount, sourceVectorCount, cl, wl,
+                                     (unsigned)vif1_regs.mode, maskEnable ? 1 : 0, bytesPerVector);
+                        for (uint32_t q = 0; q < 14u && q < sourceVectorCount; ++q)
+                        {
+                            float f[4] = {0, 0, 0, 0};
+                            const uint32_t sb = q * bytesPerVector;
+                            if (pos + sb + bytesPerVector <= sizeBytes) std::memcpy(f, data + pos + sb, bytesPerVector > 16u ? 16u : bytesPerVector);
+                            float l[4];
+                            std::memcpy(l, m_vu1Data + ((vuAddr + q) & 0x3FFu) * 16u, 16);
+                            std::fprintf(stderr, "  q%-2u src=(%.4g %.4g %.4g %.4g) landed=(%.4g %.4g %.4g %.4g)\n",
+                                         q, f[0], f[1], f[2], f[3], l[0], l[1], l[2], l[3]);
+                        }
+                    }
+                }
+            }
             // PS2X_MVPCHK: validate what actually LANDED in VU1 memory (post-mask/mode) for the
             // two packet families that drive characters: the constants block (vuAddr=0, >=12qw:
             // MVP at qw0-3) and the bone-matrix block (34 vectors). Logs frame + EE source, so
@@ -1123,6 +1179,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     };
                     if (vuAddr == 0u && writeVectorCount >= 12u)
                     {
+                        extern thread_local uint32_t g_last13at0; // 1=healthy 2=degenerate
                         float m[16];
                         std::memcpy(m, m_vu1Data, 64);
                         float amax = 0.0f; bool bad = false;
@@ -1140,10 +1197,24 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                             if (n <= 40 || (n % 512u) == 0u)
                                 std::fprintf(stderr, "[mvpchk] #%u frame=%llu DEGENERATE mvp amax=%.3g nan=%d cnt=%u src=EE:0x%08x | row0: %.3g %.3g %.3g %.3g\n",
                                              n, (unsigned long long)frame, amax, bad ? 1 : 0, writeVectorCount, srcOf(0), m[0], m[1], m[2], m[3]);
+                            // First occurrences: dump the raw VIF stream around the unpack so we can
+                            // SEE whether the parser is in sync (sane codes before `|`) or desynced.
+                            if (n <= 6)
+                            {
+                                const uint32_t back = (pos >= 96u) ? 96u : pos;
+                                const uint32_t w0 = (pos - back) / 4u;
+                                const uint32_t total = sizeBytes / 4u;
+                                const uint32_t *ws = reinterpret_cast<const uint32_t *>(data);
+                                std::fprintf(stderr, "[mvpstream] pos=%u words:", pos);
+                                for (uint32_t i = w0; i < w0 + 40u && i < total; ++i)
+                                    std::fprintf(stderr, "%s%08x", (i * 4u == pos) ? " | " : " ", ws[i]);
+                                std::fprintf(stderr, "\n");
+                            }
                         }
                         static const bool s_skip = [](){ const char *v = std::getenv("PS2X_SKIP_DEGEN"); return v && v[0] && v[0] != '0'; }();
                         if (s_skip)
                             g_degenSuppress.store(degen, std::memory_order_relaxed);
+                        g_last13at0 = degen ? 2u : 1u;
                     }
                     else if (writeVectorCount == 34u)
                     {

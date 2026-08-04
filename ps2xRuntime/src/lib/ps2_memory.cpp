@@ -41,12 +41,16 @@ static inline void ps2xWatchStore(uint32_t address, const void *bytes, uint32_t 
     static const bool s_w = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_WATCH"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
     if (!s_w) return;
     const uint32_t va = address & 0x1FFFFFFFu; // physical
-    // Trigger on the projection value OR on a write into the transform-packet region [0x7c1900,0x7c1a00).
-    bool hit = (va >= 0x007c1900u && va < 0x007c1a00u);
-    if (!hit) { const uint32_t *w = reinterpret_cast<const uint32_t *>(bytes);
+    // Watch region: PS2X_WATCH_LO/PS2X_WATCH_HI (hex guest addrs) override the legacy
+    // defaults (transform-packet region + the projection-constant value trigger).
+    static const uint32_t s_lo = [](){ const char *v = std::getenv("PS2X_WATCH_LO"); return v ? (uint32_t)std::strtoul(v, nullptr, 16) : 0x007c1900u; }();
+    static const uint32_t s_hi = [](){ const char *v = std::getenv("PS2X_WATCH_HI"); return v ? (uint32_t)std::strtoul(v, nullptr, 16) : 0x007c1a00u; }();
+    static const bool s_custom = std::getenv("PS2X_WATCH_LO") != nullptr;
+    bool hit = (va >= s_lo && va < s_hi);
+    if (!hit && !s_custom) { const uint32_t *w = reinterpret_cast<const uint32_t *>(bytes);
         for (uint32_t i = 0; i < n / 4u; ++i) if (w[i] == 0x44db523du) { hit = true; break; } }
     if (!hit) return;
-    static int s_n = 0; if (s_n++ >= 10) return;
+    static int s_n = 0; if (s_n++ >= 60) return;
     const uint32_t *w = reinterpret_cast<const uint32_t *>(bytes);
     std::fprintf(stderr, "[watch] store EEva=0x%08x n=%u val0=0x%08x -- backtrace:\n", address, n, w[0]);
 #if !defined(_WIN32)
@@ -1292,6 +1296,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+                    // CHCR.TTE (bit 6): transfer the tag's upper 8 bytes to the peripheral as
+                    // two VIF codes. We used to do this UNCONDITIONALLY for inline-payload tags;
+                    // for TTE=0 chains whose tag uppers carry game bookkeeping (the fight's
+                    // terrain-chunk packet builder at 0x239e00 stores heap pointers there), the
+                    // injected junk shifted the VIF stream and the unpacker consumed DMA tags as
+                    // matrix rows -> saturated SPS wedges/slashes over the arena.
+                    const bool tteEnabled = (chcr & (1u << 6)) != 0u;
                     const int kMaxChainTags = 4096;
                     // Pre-size to the recent high-water mark: the chain assembly appends ~430
                     // tag payloads/kick and, starting from an empty vector, reallocated ~20x
@@ -1640,7 +1651,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         const bool compactVifLocalTag =
                             (channelBase == 0x10009000u || channelBase == 0x10008000u) &&
                             (id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
-                        if (compactVifLocalTag)
+                        if (compactVifLocalTag && tteEnabled)
                             appendCompactVif1TagData(currentTagAddr, 0u);
 
                         if (hasPayload)

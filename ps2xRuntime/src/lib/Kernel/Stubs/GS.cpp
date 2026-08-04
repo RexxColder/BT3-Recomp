@@ -1149,7 +1149,7 @@ namespace ps2_stubs
         db.giftag0 = {makeGiftagAplusD(14u), 0x0E0E0E0E0E0E0E0EULL};
         seedGsDrawEnv1(db.draw0, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
         db.giftag1 = db.giftag0;
-        seedGsDrawEnv1(db.draw1, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv2(db.draw1, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
 
         if (!writeGsDBuff(rdram, envAddr, db))
         {

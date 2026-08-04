@@ -408,11 +408,29 @@ GS::GS()
     reset();
 }
 
+static uint8_t *g_vramDumpPtr = nullptr;
+
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
     m_vram = vram;
     m_vramSize = vramSize;
     m_privRegs = privRegs;
+    if (std::getenv("PS2X_VRAM_DUMP") && !g_vramDumpPtr)
+    {
+        g_vramDumpPtr = vram;
+        std::fprintf(stderr, "[vram-dump] armed (vram=%p)\n", (void *)vram);
+        std::atexit([]() {
+            if (!g_vramDumpPtr)
+                return;
+            FILE *vf = std::fopen("/home/z3/Desktop/bt3/work/vram.bin", "wb");
+            if (vf)
+            {
+                std::fwrite(g_vramDumpPtr, 1, 4u * 1024u * 1024u, vf);
+                std::fclose(vf);
+                std::fprintf(stderr, "[vram-dump] wrote 4MB VRAM at exit\n");
+            }
+        });
+    }
     reset();
 }
 
@@ -909,6 +927,23 @@ bool GS::tryLatchHostPresentationFrame()
 
 void GS::latchHostPresentationFrameUnlocked()
 {
+    if (g_vramDumpPtr)
+    {
+        static uint32_t s_latchCount = 0;
+        ++s_latchCount;
+        if ((s_latchCount % 50u) == 0u)
+            std::fprintf(stderr, "[vram-dump] latch #%u\n", s_latchCount);
+        if (s_latchCount >= 200u && (s_latchCount % 100u) == 0u)
+        {
+            FILE *vf = std::fopen("/home/z3/Desktop/bt3/work/vram.bin", "wb");
+            if (vf)
+            {
+                std::fwrite(g_vramDumpPtr, 1, 4u * 1024u * 1024u, vf);
+                std::fclose(vf);
+                std::fprintf(stderr, "[vram-dump] wrote 4MB VRAM at latch #%u\n", s_latchCount);
+            }
+        }
+    }
     if (!m_privRegs || !m_vram || m_vramSize == 0u)
     {
         m_hostPresentationFrame.clear();
@@ -1358,6 +1393,21 @@ std::atomic<bool> g_ps2xGrassShadowValid{false};
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    if (g_vramDumpPtr)
+    {
+        static uint32_t s_pktCount = 0;
+        ++s_pktCount;
+        if (s_pktCount >= 25000u && (s_pktCount % 25000u) == 0u)
+        {
+            FILE *vf = std::fopen("/home/z3/Desktop/bt3/work/vram.bin", "wb");
+            if (vf)
+            {
+                std::fwrite(g_vramDumpPtr, 1, 4u * 1024u * 1024u, vf);
+                std::fclose(vf);
+                std::fprintf(stderr, "[vram-dump] wrote 4MB VRAM at gif pkt #%u\n", s_pktCount);
+            }
+        }
+    }
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_vram)
         return;
@@ -1531,6 +1581,42 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         uint32_t z = static_cast<uint32_t>((hi >> 4) & 0xFFFFFF);
         uint8_t f = static_cast<uint8_t>((hi >> 36) & 0xFF);
         bool adk = ((hi >> 47) & 1) != 0;
+        // [kickchk] (PS2X_WEDGEREC): beyond-guard-band vertices that arrive DRAW-ENABLED
+        // (adc=0) — the wedge-painting escapees. Uncapped tally, per-kick attribution, and
+        // a one-shot snapshot of the offending kick's VU data for offline dissection.
+        {
+            static const bool s_kc = [](){ const char *v = std::getenv("PS2X_WEDGEREC"); return v && v[0] && v[0] != '0'; }();
+            if (s_kc && !adk && (x < 4694u || x > 60842u))
+            {
+                extern thread_local uint32_t g_xgkickEntryPc, g_xgkickTop, g_xgkickKickAddr;
+                extern thread_local const uint8_t *g_xgkickVuData;
+                extern thread_local uint32_t g_xgkickVuDataSize;
+                extern thread_local const uint8_t *g_xgkickEntryStateBytes;
+                extern thread_local uint32_t g_xgkickEntryStateSize;
+                static std::atomic<uint32_t> s_n{0};
+                const uint32_t n = s_n.fetch_add(1);
+                if (n < 64u || (n % 1024u) == 0u)
+                    std::fprintf(stderr, "[kickchk] ESCAPEE #%u x=%.1f y=%.1f z=%#x prim=%u path=%u kickPc=%u top=%u kickAddr=%u hi=%016llx\n",
+                                 n, x / 16.0f - 1792.0f, y / 16.0f - 1824.0f, z,
+                                 (unsigned)m_prim.type, (unsigned)m_curSrcPath,
+                                 g_xgkickEntryPc, g_xgkickTop, g_xgkickKickAddr,
+                                 (unsigned long long)hi);
+                static std::atomic<bool> s_dumped{false};
+                bool exp0 = false;
+                if (m_curSrcPath == 1u && g_xgkickVuData && s_dumped.compare_exchange_strong(exp0, true))
+                {
+                    FILE *dm = std::fopen("/home/z3/Desktop/bt3/work/esc_data.bin", "wb");
+                    if (dm) { std::fwrite(g_xgkickVuData, 1, g_xgkickVuDataSize, dm); std::fclose(dm); }
+                    if (g_xgkickEntryStateBytes)
+                    {
+                        FILE *st = std::fopen("/home/z3/Desktop/bt3/work/esc_state.bin", "wb");
+                        if (st) { std::fwrite(g_xgkickEntryStateBytes, 1, g_xgkickEntryStateSize, st); std::fclose(st); }
+                    }
+                    std::fprintf(stderr, "[kickchk] escapee kick snapshot: pc=%u top=%u kickAddr=%u\n",
+                                 g_xgkickEntryPc, g_xgkickTop, g_xgkickKickAddr);
+                }
+            }
+        }
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
             if (debugIndex < 64u)
@@ -2277,6 +2363,14 @@ void GS::performLocalToLocalTransfer()
         g_uploadHash.erase(dbp);
     }
 
+    // Stamp the DESTINATION pages as uploaded: BT3 streams its stage materials into the
+    // atlas slot (tbp 10752, aliasing fbp336) via these local copies, and without the
+    // stamp the sampling draws had srcUploaded=false -> the replay's postgate classified
+    // them as RT-feedback and SKIPPED them (the flat dark-green terrain in GPU mode).
+    // The old reason not to stamp (100% texture re-decode churn) is gone: content-
+    // versioned texKeys re-decode only when the copied bytes actually changed.
+    ps2GpuRenderer().onVramUpload(dbp, static_cast<uint32_t>(dbw) * rrh);
+
     {
         static const bool s_l2l = [](){ const char *v = std::getenv("PS2X_TEX_PROBE"); return v && v[0] && v[0] != '0'; }();
         if (s_l2l)
@@ -2430,8 +2524,12 @@ void GS::vertexKick(bool drawing)
         }
     });
 
-    if (!drawing)
-        return;
+    // NOTE: `drawing` (ADC clear) decides ONLY whether this vertex's primitive is
+    // rasterized. The vertex-queue bookkeeping below (completion check + window slide)
+    // must run for EVERY kick — on hardware an ADC vertex advances the strip/fan window
+    // exactly like a drawing vertex. The old early-return here skipped the slide, so an
+    // ADC vertex mid-strip desynced the window and later draws assembled triangles from
+    // stale slots INCLUDING the ADC-marked junk verts (the fight-arena wedge artifacts).
 
     int needed = 0;
     switch (m_prim.type)
@@ -2463,6 +2561,9 @@ void GS::vertexKick(bool drawing)
 
     if (m_vtxCount < needed)
         return;
+
+    if (!drawing)
+        goto slideWindow; // ADC kick: no rasterization, but the window still advances
 
     {
         static const bool s_dp = [](){ const char *v = std::getenv("PS2X_DMAPROF"); return v && v[0] && v[0] != '0'; }();
@@ -2602,6 +2703,7 @@ void GS::vertexKick(bool drawing)
         }
     }
 
+slideWindow:
     switch (m_prim.type)
     {
     case GS_PRIM_LINE:
@@ -2940,11 +3042,14 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             {
                 static std::atomic<uint32_t> s_uc{0};
                 uint32_t uc = s_uc.fetch_add(1);
-                if (uc == 6000u && m_vram)
+                // Re-dump every 2000 uploads past the first 6000 (overwrite): the final
+                // file reflects VRAM at quit, not an arbitrary early moment.
+                static const uint32_t s_thr = [](){ const char *v = std::getenv("PS2X_VRAM_DUMP"); uint32_t n = v ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; return n > 1u ? n : 6000u; }();
+                if (uc >= s_thr && (uc % 500u) == 0u && m_vram)
                 {
                     FILE *vf = std::fopen("/home/z3/Desktop/bt3/work/vram.bin", "wb");
                     if (vf) { std::fwrite(m_vram, 1, 4u * 1024u * 1024u, vf); std::fclose(vf); }
-                    std::cerr << "[vram-dump] wrote 4MB VRAM after 6000 uploads" << std::endl;
+                    std::cerr << "[vram-dump] wrote 4MB VRAM at upload #" << uc << std::endl;
                 }
             }
             static std::mutex s_um;
