@@ -1970,6 +1970,24 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     const int ofx = ctx.xyoffset.ofx >> 4;
     const int ofy = ctx.xyoffset.ofy >> 4;
 
+    // EARLY ZERO-AREA CULL (default ON, PS2X_KEEPDOTS=1 keeps them): ~90% of fight
+    // triangles are collapsed micro-tris whose integer coords are identical after 12.4
+    // truncation — GL rasterizes nothing for them. Culling HERE (before the per-draw
+    // texture-cache resolution, CLUT checks and probe blocks, which all cost mutexes and
+    // hashing) removes the dominant per-draw overhead on the kick worker.
+    if (!isSprite)
+    {
+        static const bool s_keepDots = [](){ const char *v = std::getenv("PS2X_KEEPDOTS"); return v && v[0] && v[0] != '0'; }();
+        if (!s_keepDots)
+        {
+            const int x0 = static_cast<int>(gs->m_vtxQueue[0].x), y0 = static_cast<int>(gs->m_vtxQueue[0].y);
+            const int x1 = static_cast<int>(gs->m_vtxQueue[1].x), y1 = static_cast<int>(gs->m_vtxQueue[1].y);
+            const int x2 = static_cast<int>(gs->m_vtxQueue[2].x), y2 = static_cast<int>(gs->m_vtxQueue[2].y);
+            if ((x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0) == 0)
+                return true; // degenerate: draws no pixels
+        }
+    }
+
     // ---- GS depth (Z) capture, behind PS2X_GPU_DEPTH (default OFF) ----
     // When off, none of the DrawCmd depth fields are written (they keep their false/ALWAYS
     // defaults) and no vertex z is set, so the GPU replay path is byte-for-byte unchanged.
