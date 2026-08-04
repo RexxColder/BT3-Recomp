@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "MemoryCard.h"
+#include <cstdarg>
 
 namespace ps2_stubs
 {
@@ -80,6 +81,11 @@ namespace ps2_stubs
         {
             std::string currentDir = "/";
             bool formatted = true;
+            // libmc protocol: the FIRST sceMcGetInfo after boot (or card change) must
+            // return -1 ("card changed") — that result is what triggers the game's
+            // save-directory scan. Returning 0 ("same card") on the first query makes
+            // games keep their cached "no card" state (Continue grayed with a valid save).
+            bool infoQueried = false;
         };
 
         std::mutex g_mcStateMutex;
@@ -498,6 +504,19 @@ namespace ps2_stubs
         return snapshot;
     }
 
+    static void mcTrace(const char *fmt, ...)
+    {
+        static const bool s_ml = [](){ const char *v = std::getenv("PS2X_MCLOG"); return v && v[0] && v[0] != 0; }();
+        static int s_n = 0;
+        if (!s_ml || s_n >= 300) return;
+        ++s_n;
+        va_list ap; va_start(ap, fmt);
+        std::fprintf(stderr, "[mclog] ");
+        std::vfprintf(stderr, fmt, ap);
+        std::fprintf(stderr, "\n");
+        va_end(ap);
+    }
+
     void sceMcChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
@@ -685,8 +704,9 @@ namespace ps2_stubs
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
-        const int32_t maxEntries = static_cast<int32_t>(readStackU32(rdram, ctx, 16));
-        const uint32_t tableAddr = readStackU32(rdram, ctx, 20);
+        // EE ABI passes args 5-8 in $t0-$t3 (registers 8-11), NOT on the stack.
+        const int32_t maxEntries = static_cast<int32_t>(getRegU32(ctx, 8));
+        const uint32_t tableAddr = getRegU32(ctx, 9);
 
         std::vector<SceMcTblGetDir> entries;
         int32_t result = kMcResultNoEntry;
@@ -828,6 +848,22 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdGetDir, result);
         }
+        // [mclog] (PS2X_MCLOG): the save-detection conversation — what the game asks
+        // for and what we answer. Continue-grayed-with-valid-save debugging.
+        {
+            static const bool s_ml = [](){ const char *v = std::getenv("PS2X_MCLOG"); return v && v[0] && v[0] != '0'; }();
+            static int s_n = 0;
+            if (s_ml && s_n < 80)
+            {
+                ++s_n;
+                std::fprintf(stderr, "[mclog] GetDir port=%d slot=%d path='%s' maxent=%d table=0x%x -> result=%d entries=%zu\n",
+                             port, slot, rawPath.c_str(), maxEntries, tableAddr, result, entries.size());
+                for (size_t e = 0; e < entries.size() && e < 4; ++e)
+                    std::fprintf(stderr, "[mclog]   entry[%zu]='%s' attr=0x%x size=%u\n",
+                                 e, reinterpret_cast<const char *>(entries[e].EntryName),
+                                 entries[e].AttrFile, entries[e].FileSizeByte);
+            }
+        }
         setReturnS32(ctx, 0);
     }
 
@@ -842,7 +878,7 @@ namespace ps2_stubs
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const uint32_t typePtr = getRegU32(ctx, 6);
         const uint32_t freePtr = getRegU32(ctx, 7);
-        const uint32_t formatPtr = readStackU32(rdram, ctx, 16);
+        const uint32_t formatPtr = getRegU32(ctx, 8); // arg 5 in $t0 (EE ABI, not stack)
 
         int32_t cardType = 0;
         int32_t freeBlocks = 0;
@@ -858,7 +894,9 @@ namespace ps2_stubs
                 cardType = kMcTypePs2;
                 freeBlocks = kMcFreeClusters;
                 format = kMcFormatted;
-                result = kMcResultSucceed;
+                McPortState &state = g_mcPorts[static_cast<size_t>(port == 1 ? 1 : 0)];
+                result = state.infoQueried ? kMcResultSucceed : kMcResultChangedCard;
+                state.infoQueried = true;
             }
             else if (isValidMcPortSlot(port, slot))
             {
@@ -866,7 +904,11 @@ namespace ps2_stubs
                 cardType = kMcTypePs2;
                 freeBlocks = state.formatted ? kMcFreeClusters : 0;
                 format = state.formatted ? kMcFormatted : kMcUnformatted;
-                result = state.formatted ? kMcResultSucceed : kMcResultNoFormat;
+                if (!state.formatted)
+                    result = kMcResultNoFormat;
+                else
+                    result = state.infoQueried ? kMcResultSucceed : kMcResultChangedCard;
+                state.infoQueried = true;
             }
 
             setMcCommandResultLocked(kMcCmdGetInfo, result);
@@ -894,6 +936,7 @@ namespace ps2_stubs
             }
         }
 
+        mcTrace("GetInfo port=%d slot=%d -> type=%d free=%d format=%d result=%d", port, slot, cardType, freeBlocks, format, result);
         setReturnS32(ctx, 0);
     }
 
@@ -971,6 +1014,7 @@ namespace ps2_stubs
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
         const uint32_t flags = getRegU32(ctx, 7);
+        mcTrace("Open port=%d slot=%d path='%s' flags=0x%x", port, slot, path.c_str(), flags);
 
         int32_t result = kMcResultNoEntry;
         {
@@ -1202,6 +1246,7 @@ namespace ps2_stubs
             }
         }
 
+        mcTrace("Sync -> cmd=%d result=%d", cmd, result);
         // 1 = command finished in this runtime's immediate model.
         setReturnS32(ctx, 1);
     }
