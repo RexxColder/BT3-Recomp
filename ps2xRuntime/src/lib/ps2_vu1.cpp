@@ -1668,6 +1668,13 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
 
             auto read64Wrap = [&](uint32_t off) -> uint64_t
             {
+                // Fast path: no wrap (the overwhelmingly common case) = one memcpy.
+                if (off + 8u <= dataSize)
+                {
+                    uint64_t value;
+                    std::memcpy(&value, vuData + off, sizeof(value));
+                    return value;
+                }
                 uint8_t bytes[8];
                 for (uint32_t i = 0; i < 8u; ++i)
                 {
@@ -1726,6 +1733,10 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             // [vuflags] ADC census: walk PACKED sub-packets, tally XYZ2/XYZF2 verts with the
             // ADC (no-kick) bit set vs clear, plus XYZ3/XYZF3 descriptor uses. If ADC is never
             // set and XYZ3 never appears, the clip path never suppresses a vertex.
+            // PERF: this re-parses EVERY kicked packet (per-vertex 64-bit reads) purely for
+            // the diagnostic log — now gated (PS2X_VUFLAGS=1 enables).
+            static const bool s_vuFlagsCensus = [](){ const char *v = std::getenv("PS2X_VUFLAGS"); return v && v[0] && v[0] != '0'; }();
+            if (s_vuFlagsCensus)
             {
                 uint32_t off = addr;
                 for (int sp = 0; sp < 256; ++sp)
