@@ -34,6 +34,17 @@ REENTRY_LABELS = [
     (0x337680, "flash-player callback re-entry"),
     (0x3448A8, "P1-vs-COM jump-table target"),
     (0x354098, "duel-menu jump-table target"),
+    (0x37E1B8, "Ultimate Training entry jump-table target"),
+    (0x359870, "Ultimate Training menu jump-table target"),
+    (0x3599E8, "Ultimate Training menu jump-table target"),
+    (0x35ABB0, "Ultimate Training menu jump-table target"),
+    (0x3A9C18, "Data Center entry jump-table target"),
+    (0x3AB2D0, "Data Center menu jump-table target"),
+    (0x3AB2D8, "Data Center menu jump-table target"),
+    (0x39EC48, "Evolution Z menu jump-table target"),
+    (0x39F350, "Evolution Z menu jump-table target"),
+    (0x39A5E0, "Evolution Z callback return site"),
+    (0x39A7A0, "Evolution Z: last instruction before the f_39a7a4 truncation gap"),
 ]
 
 RENAMES = [
@@ -105,6 +116,8 @@ def insert_reentry_labels(lines: list) -> None:
         instr_i = next((i for i, l in enumerate(lines) if instr_pat.match(l)), None)
         if instr_i is None:
             sys.exit(f"ERROR: re-entry {lo}: instruction line not found (generator output changed?)")
+        if any(f"label_{addr:06x}:" in l for l in lines):
+            continue  # generator already emitted this label
         lines.insert(instr_i, f"label_{addr:06x}:\n")
         fn_i = next((i for i in range(instr_i, -1, -1)
                      if re.match(r"^void (f_[0-9a-f]+_0x[0-9a-f]+)\(", lines[i])), None)
@@ -113,8 +126,43 @@ def insert_reentry_labels(lines: list) -> None:
         sw_i = next((i for i in range(fn_i, fn_i + 8) if "switch (ctx->pc)" in lines[i]), None)
         if sw_i is None:
             sys.exit(f"ERROR: re-entry {lo}: no resume switch in containing function")
-        def_i = next(i for i in range(sw_i, sw_i + 200) if "default: break;" in lines[i])
+        def_i = next((i for i in range(sw_i, sw_i + 400) if "default: break;" in lines[i]), None)
+        if def_i is None:
+            def_i = sw_i + 1  # big switch without default in window: insert right after it
         lines.insert(def_i, f"        case 0x{addr:x}u: goto label_{addr:06x}; // {why}\n")
+
+
+def stitch_truncated_predecessors(lines: list, gaps_csv: Path) -> int:
+    """A function truncated at a gap boundary falls off its C++ end without
+    advancing ctx->pc -> the dispatcher re-enters at the same pc forever (black
+    screen). For each gap start G whose preceding instruction G-4 exists in the
+    main module, append `ctx->pc = G; return;` after that instruction so control
+    flows into the (range-registered) gap function."""
+    import csv as _csv
+    stitched = 0
+    with open(gaps_csv) as f:
+        for row in _csv.DictReader(f):
+            g = int(row["start"], 16)
+            prev = g - 4
+            pat = re.compile(rf"^\s*// 0x{prev:06x}: 0x")
+            ii = next((i for i, l in enumerate(lines) if pat.match(l)), None)
+            if ii is None:
+                continue  # predecessor not in the main module (gap follows another gap)
+            # find the end of this instruction's emitted statements: the next line that
+            # starts a new instruction comment, a label, or closes the function.
+            j = ii + 1
+            while j < len(lines) and not (
+                re.match(r"^\s*// 0x[0-9a-f]{6}: 0x", lines[j])
+                or lines[j].startswith("label_")
+                or lines[j].startswith("}")
+            ):
+                j += 1
+            marker = f"ctx->pc = 0x{g:x}u; // gap-boundary stitch"
+            if any(marker in l for l in lines[max(0, j - 3):j + 1]):
+                continue
+            lines.insert(j, f"    {marker}\n    return;\n")
+            stitched += 1
+    return stitched
 
 
 def containing_function(lines: list, addr: int) -> str:
@@ -172,6 +220,8 @@ def main() -> None:
     main_cpp = apply_renames(main_cpp)
     lines = main_cpp.splitlines(keepends=True)
     insert_reentry_labels(lines)
+    n_stitch = stitch_truncated_predecessors(lines, HERE / "dbzp_gaps.csv")
+    print(f"gap-boundary stitches applied: {n_stitch}")
 
     # Register file: renames + dense-table slots for each re-entry label.
     reg = apply_renames((outs["dbzp_funcs"] / "register_functions.cpp").read_text())
