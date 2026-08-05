@@ -21,6 +21,7 @@ namespace ps2_syscalls { bool bt3WakeThreadByEntry(uint32_t entry); }
 #include <iostream>
 #include <fstream>
 #include <algorithm>
+#include <vector>
 #include <array>
 #include <cctype>
 #include <cstring>
@@ -70,13 +71,20 @@ void ps2WatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_
     // the same address (e.g. the stage-load display-list build) always prints.
     static std::mutex s_cwMx;
     static std::unordered_set<uint64_t> s_cwSeen;
-    uint64_t k = 1469598103934665603ull;
-    for (uint64_t x : {(uint64_t)guestAddr, (uint64_t)(ctx ? ctx->pc : 0u), valueLo, valueHi})
-        k = (k ^ x) * 1099511628211ull;
+    // PS2X_GWATCH_NODEDUP=1: report EVERY write (no (addr,pc,value) dedup, no budget) —
+    // needed when the interesting event is a REPEAT write of the same value (re-arm vs
+    // first-arm of the same struct), which the dedup otherwise makes invisible.
+    static const bool s_noDedup = [](){ const char *v = std::getenv("PS2X_GWATCH_NODEDUP"); return v && v[0] && v[0] != '0'; }();
+    if (!s_noDedup)
     {
-        std::lock_guard<std::mutex> lk(s_cwMx);
-        if (s_cwSeen.size() < 400u && !s_cwSeen.insert(k).second) return;
-        if (s_cwSeen.size() >= 400u) return;
+        uint64_t k = 1469598103934665603ull;
+        for (uint64_t x : {(uint64_t)guestAddr, (uint64_t)(ctx ? ctx->pc : 0u), valueLo, valueHi})
+            k = (k ^ x) * 1099511628211ull;
+        {
+            std::lock_guard<std::mutex> lk(s_cwMx);
+            if (s_cwSeen.size() < 400u && !s_cwSeen.insert(k).second) return;
+            if (s_cwSeen.size() >= 400u) return;
+        }
     }
     std::fprintf(stderr, "[camwrite] #%u addr=0x%x sz=%u pc=0x%x ra=0x%x a1src=0x%x val=0x%016llx%016llx op=%s\n",
                  n, guestAddr, size, ctx ? ctx->pc : 0u, ra, a1,
@@ -1490,6 +1498,168 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+// ---- SUPER-TRACE (env PS2X_SUPERTRACE, F10 arms) ----
+// Diff-trace rig for the "2nd+ super explodes at caster" hunt: while armed, every
+// guest branch (except returns) records its target + (source->target) edge into
+// fixed lock-free tables; on window expiry the winner thread flushes them to
+// work/strace_<gen>.log. Capture one window around super #1 and one around super #2,
+// then diff the function sets to find where the second cast's path diverges.
+namespace
+{
+    constexpr uint32_t kStraceFnBits = 14, kStraceEdgeBits = 17;
+    struct StraceFn { std::atomic<uint32_t> pc{0}; std::atomic<uint32_t> n{0}; std::atomic<uint32_t> seq{0}; };
+    struct StraceEdge { std::atomic<uint64_t> key{0}; std::atomic<uint32_t> n{0}; };
+    StraceFn g_straceFn[1u << kStraceFnBits];
+    StraceEdge g_straceEdge[1u << kStraceEdgeBits];
+    std::atomic<uint64_t> g_straceUntilMs{0};
+    std::atomic<uint32_t> g_straceGen{0};
+    std::atomic<uint32_t> g_straceSeq{0};
+    std::atomic<uint32_t> g_straceFlushed{0};
+    std::atomic<uint32_t> g_straceDropFn{0}, g_straceDropEdge{0};
+
+    uint64_t straceNowMs()
+    {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void straceFlush()
+    {
+        const uint32_t gen = g_straceGen.load();
+        uint32_t expect = gen - 1u;
+        if (!g_straceFlushed.compare_exchange_strong(expect, gen))
+            return; // another thread is flushing (or already flushed) this gen
+        char path[64];
+        std::snprintf(path, sizeof(path), "work/strace_%u.log", gen);
+        FILE *f = std::fopen(path, "w");
+        if (!f)
+        {
+            std::snprintf(path, sizeof(path), "strace_%u.log", gen);
+            f = std::fopen(path, "w");
+        }
+        if (f)
+        {
+            std::vector<std::pair<uint32_t, std::pair<uint32_t, uint32_t>>> fns; // (seq,(pc,n))
+            for (auto &e : g_straceFn)
+            {
+                const uint32_t pc = e.pc.load();
+                if (pc) fns.push_back({e.seq.load(), {pc, e.n.load()}});
+            }
+            std::sort(fns.begin(), fns.end());
+            for (auto &e : fns)
+                std::fprintf(f, "F 0x%06x %u seq=%u\n", e.second.first, e.second.second, e.first);
+            for (auto &e : g_straceEdge)
+            {
+                const uint64_t k = e.key.load();
+                if (k) std::fprintf(f, "E 0x%06x 0x%06x %u\n", (uint32_t)(k >> 32), (uint32_t)k, e.n.load());
+            }
+            std::fclose(f);
+            std::fprintf(stderr, "[strace] flushed %s: %zu fns (dropFn=%u dropEdge=%u)\n",
+                         path, fns.size(), g_straceDropFn.load(), g_straceDropEdge.load());
+        }
+        for (auto &e : g_straceFn) { e.pc.store(0); e.n.store(0); e.seq.store(0); }
+        for (auto &e : g_straceEdge) { e.key.store(0); e.n.store(0); }
+        g_straceDropFn.store(0);
+        g_straceDropEdge.store(0);
+    }
+
+    void straceRecord(uint32_t targetPc, uint32_t sourcePc)
+    {
+        const uint64_t until = g_straceUntilMs.load(std::memory_order_relaxed);
+        if (until == 0u) return;
+        if (straceNowMs() > until)
+        {
+            g_straceUntilMs.store(0u);
+            straceFlush();
+            return;
+        }
+        {
+            constexpr uint32_t mask = (1u << kStraceFnBits) - 1u;
+            uint32_t h = ((targetPc >> 2) * 2654435761u) & mask;
+            bool done = false;
+            for (int i = 0; i < 64 && !done; ++i, h = (h + 1u) & mask)
+            {
+                const uint32_t cur = g_straceFn[h].pc.load(std::memory_order_relaxed);
+                if (cur == targetPc)
+                {
+                    g_straceFn[h].n.fetch_add(1, std::memory_order_relaxed);
+                    done = true;
+                }
+                else if (cur == 0u)
+                {
+                    uint32_t exp = 0u;
+                    if (g_straceFn[h].pc.compare_exchange_strong(exp, targetPc))
+                    {
+                        g_straceFn[h].seq.store(g_straceSeq.fetch_add(1u) + 1u);
+                        g_straceFn[h].n.fetch_add(1u);
+                        done = true;
+                    }
+                    else if (exp == targetPc) // lost the race to the same pc
+                    {
+                        g_straceFn[h].n.fetch_add(1, std::memory_order_relaxed);
+                        done = true;
+                    }
+                }
+            }
+            if (!done) g_straceDropFn.fetch_add(1, std::memory_order_relaxed);
+        }
+        {
+            constexpr uint32_t mask = (1u << kStraceEdgeBits) - 1u;
+            const uint64_t key = ((uint64_t)sourcePc << 32) | targetPc;
+            uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 40) & mask;
+            bool done = false;
+            for (int i = 0; i < 64 && !done; ++i, h = (h + 1u) & mask)
+            {
+                const uint64_t cur = g_straceEdge[h].key.load(std::memory_order_relaxed);
+                if (cur == key)
+                {
+                    g_straceEdge[h].n.fetch_add(1, std::memory_order_relaxed);
+                    done = true;
+                }
+                else if (cur == 0u)
+                {
+                    uint64_t exp = 0u;
+                    if (g_straceEdge[h].key.compare_exchange_strong(exp, key))
+                    {
+                        g_straceEdge[h].n.fetch_add(1u);
+                        done = true;
+                    }
+                    else if (exp == key)
+                    {
+                        g_straceEdge[h].n.fetch_add(1, std::memory_order_relaxed);
+                        done = true;
+                    }
+                }
+            }
+            if (!done) g_straceDropEdge.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+} // namespace
+
+// Frame tick for generated-code hooks (g_displaySwapCounter itself has internal linkage).
+uint64_t ps2xDisplaySwapCount()
+{
+    return g_displaySwapCounter.load(std::memory_order_relaxed);
+}
+
+void ps2xSuperTraceArm()
+{
+    static const uint64_t s_durMs = []() {
+        const char *v = std::getenv("PS2X_SUPERTRACE");
+        if (v) { const long n = std::atol(v); if (n > 1) return (uint64_t)n; }
+        return (uint64_t)6000;
+    }();
+    if (g_straceGen.load() != g_straceFlushed.load())
+    {
+        g_straceUntilMs.store(0u);
+        straceFlush(); // re-armed before the previous window flushed: flush it now
+    }
+    g_straceGen.fetch_add(1u);
+    g_straceUntilMs.store(straceNowMs() + s_durMs);
+    std::fprintf(stderr, "[strace] F10 — armed %llums, gen=%u\n",
+                 (unsigned long long)s_durMs, g_straceGen.load());
+}
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1500,6 +1670,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+
+    // SUPER-TRACE tap (PS2X_SUPERTRACE + F10): see the rig above dispatchGuestBranch.
+    {
+        static const bool s_stOn = []() { const char *v = std::getenv("PS2X_SUPERTRACE"); return v && v[0] && v[0] != '0'; }();
+        if (s_stOn && kind != GuestBranchKind::Return)
+            straceRecord(targetPc, sourcePc);
+    }
 
     // Hot-call cache: recent (targetPc -> recompiled fn), per thread. The game's tight
     // service/critical-section loops call a handful of static functions millions of times

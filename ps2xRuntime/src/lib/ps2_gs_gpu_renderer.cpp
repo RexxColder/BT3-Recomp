@@ -977,6 +977,16 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         cmds.swap(g_interpScratch);
     }
 
+    // PS2X_SUPERTRACE: F10 arms the guest-branch diff-trace (rig lives in ps2_runtime.cpp).
+    {
+        static const bool s_stOn = []() { const char *v = std::getenv("PS2X_SUPERTRACE"); return v && v[0] && v[0] != '0'; }();
+        if (s_stOn && IsKeyPressed(KEY_F10))
+        {
+            extern void ps2xSuperTraceArm();
+            ps2xSuperTraceArm();
+        }
+    }
+
     // PS2X_FORENSIC window decision (early, so ALL dump sites key off the same publishes):
     // 6 distinct publishes starting ~150 gens after the first big (fight) frame.
     // PS2X_FORENSIC=key: arm on F9 instead — the artifacts are camera-moment-specific
