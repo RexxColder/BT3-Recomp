@@ -81,4 +81,8 @@ namespace ps2_stubs
     void sceCdStStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdSyncS(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdTrayReq(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+
+    // Resolve a PS2 CD path to an extracted host file, assigning a pseudo-LBN.
+    // Used by the DVCI file-resolver when the ISO image is unavailable.
+    bool dvciFindExtractedFile(const char *ps2Path, uint32_t &lbnOut, uint32_t &sizeOut);
 }

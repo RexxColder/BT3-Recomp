@@ -10,6 +10,10 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_gpu_renderer.h"
+
+#if defined(__linux__)
+#include "runtime/pad_evdev_linux.h"
+#endif
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -1774,7 +1778,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         static thread_local uint64_t s_tickCounter = 0u;
         static thread_local bool s_pumping = false;
         // Pump interval: running the (expensive) tick FUN_0028a3b0 every 2048 branches
-        // is huge redundant overhead (the game calls it too). Default raised to 131072;
+        // is huge redundant overhead (the game calls it too). Default 1048576 (1M);
         // tunable via PS2X_TICKINTERVAL. Higher = faster main thread.
         static const uint64_t kTickPumpInterval = [](){ const char *v = std::getenv("PS2X_TICKINTERVAL"); uint64_t n = (v && v[0]) ? std::strtoull(v,nullptr,10) : 131072ull; return n < 256ull ? 256ull : n; }();
         if (s_tickPumpEnabled && !s_pumping && (++s_tickCounter % kTickPumpInterval) == 0u && hasFunction(0x0028a3b0u))
@@ -3792,6 +3796,10 @@ void PS2Runtime::run()
             UploadFrame(frameTex, this, presentWidth, presentHeight);
         }
 
+#if defined(__linux__)
+        // Refresh the native evdev reader for any Linux gamepad that GLFW cannot map.
+        ps2_stubs::PadEvdevLinux::instance().update();
+#endif
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
@@ -3835,7 +3843,10 @@ void PS2Runtime::run()
         // (g_ps2WatchLo/Hi) on that qword. The arena is rebuilt every frame, so the next
         // rewrite reports the writer's guest PC/RA via [camwrite] on stderr.
         {
-            static const bool s_txw = [](){ const char *v = std::getenv("PS2X_TEXWATCH"); return !(v && v[0] == '0'); }();
+            // Disabled by default — enable with PS2X_TEXWATCH=1.  The full 32MB
+            // per-frame scan is expensive and only needed to diagnose the
+            // corrupted floor TEX0 (tw=10).
+            static const bool s_txw = [](){ const char *v = std::getenv("PS2X_TEXWATCH"); return v && v[0] == '1'; }();
             static int s_txState = 0; // 0=scanning, 1=armed
             static std::chrono::steady_clock::time_point s_txLast{};
             static std::chrono::steady_clock::time_point s_txArmT{};
@@ -3966,7 +3977,7 @@ void PS2Runtime::run()
             // Wall-clock sample of the MAIN thread's PC (m_cpuContext.pc): shows where
             // the main loop actually spends TIME (incl. blocked in a syscall), immune
             // to side-thread branch-count pollution. Confirms the real fps gate.
-            static std::map<uint32_t, uint32_t> s_mainPcHist;
+            static std::unordered_map<uint32_t, uint32_t> s_mainPcHist;
             s_mainPcHist[m_cpuContext.pc & 0xFFFFFFF0u]++;
             auto nowT = std::chrono::steady_clock::now();
             double dt = std::chrono::duration<double>(nowT - s_fpsT).count();

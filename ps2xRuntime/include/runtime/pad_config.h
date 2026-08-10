@@ -1,0 +1,155 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <array>
+#include <string>
+#include <mutex>
+
+// Per-player virtual-pad configuration for the PS2X host layer.
+//
+// Replaces the old "merge every gamepad + keyboard into every pad" behaviour
+// with up to 4 independently configurable player profiles. Each profile binds
+// every PS2 action (D-pad, face buttons, L1..R2, L3/R3, Select/Start and both
+// analog sticks) to either a keyboard key or a gamepad button/axis, and picks
+// which physical device (if any) feeds that player. A player with no explicit
+// device still falls back to "any connected gamepad + keyboard", so existing
+// single-pad behaviour is preserved until devices are assigned.
+//
+// Persisted as a simple line-based file: PS2X_PAD_CONFIG env var, otherwise
+// <ELF dir>/pad.conf. Written atomically via temp+rename.
+namespace ps2_stubs
+{
+    enum class PadAction : uint8_t
+    {
+        Select = 0,
+        L3,
+        R3,
+        Start,
+        Up,
+        Right,
+        Down,
+        Left,
+        L2,
+        R2,
+        L1,
+        R1,
+        Triangle,
+        Circle,
+        Cross,
+        Square,
+        LStickXNeg,
+        LStickXPos,
+        LStickYNeg,
+        LStickYPos,
+        RStickXNeg,
+        RStickXPos,
+        RStickYNeg,
+        RStickYPos,
+        Count
+    };
+
+    enum class PadBindKind : uint8_t
+    {
+        None,
+        Key,
+        Button,
+        Axis
+    };
+
+    struct PadBind
+    {
+        PadBindKind kind = PadBindKind::None;
+        int value = -1;    // Key: raylib KEY_*, Button: gamepad button index, Axis: gamepad axis index
+        float sign = 1.0f; // Axis: direction (+1 / -1)
+        float deadzone = 0.15f;
+    };
+
+    enum class PadDeviceKind : uint8_t
+    {
+        None,     // any connected gamepad + keyboard (legacy behaviour)
+        Keyboard, // keyboard only
+        Gamepad   // one specific gamepad index, no keyboard
+    };
+
+    struct PadDevice
+    {
+        PadDeviceKind kind = PadDeviceKind::None;
+        int gamepad = -1;
+    };
+
+    struct PadPlayerConfig
+    {
+        PadDevice device;
+        std::array<PadBind, static_cast<size_t>(PadAction::Count)> binds{};
+    };
+
+    // Result of polling one player: active-low button word + analog bytes.
+    struct PadPacket
+    {
+        uint16_t buttons = 0xFFFFu; // active-low: 0 = pressed
+        uint8_t lx = 0x80u;
+        uint8_t ly = 0x80u;
+        uint8_t rx = 0x80u;
+        uint8_t ry = 0x80u;
+    };
+
+    class PadConfig
+    {
+    public:
+        static constexpr size_t kPlayerCount = 4;
+
+        static PadConfig &instance();
+
+        // Thread-safe snapshot / mutators (the guest thread reads via poll(), the
+        // configurator UI writes via these; both hold the internal mutex).
+        PadPlayerConfig snapshot(size_t p) const;
+        void setDevice(size_t p, const PadDevice &device);
+        void setBind(size_t p, PadAction action, const PadBind &bind);
+        void setPlayerDefaults(size_t p, PadDeviceKind kind);
+        void resetPlayer(size_t p);
+
+        void setDefaultDir(const std::string &elfDir);
+        std::string defaultPath() const;
+
+        bool load();  // load from defaultPath(); keeps current values on error
+        bool save() const;
+
+        bool loaded() const { return m_loaded; }
+
+        // Poll one player's live packet from the assigned device(s).
+        PadPacket poll(size_t player) const;
+
+    private:
+        PadConfig();
+        PadConfig(const PadConfig &) = delete;
+        PadConfig &operator=(const PadConfig &) = delete;
+
+        mutable std::mutex m_mutex;
+        std::array<PadPlayerConfig, kPlayerCount> m_players;
+        std::string m_dir;
+        bool m_loaded = false;
+    };
+
+    // Called once at runtime start with the ELF directory so defaults and the
+    // config file resolve to the game folder. Idempotent.
+    void padConfigInit(const std::string &elfDir);
+
+    // Poll a player (clamped to [0,3]).
+    PadPacket padPollPlayer(size_t player);
+
+    // Legacy helper used by game pad hooks (e.g. BT3 sceDbc): builds the packet
+    // for `player` and returns the active-low button word.
+    uint16_t ps2xLivePadButtons(int player, uint8_t &lx, uint8_t &ly, uint8_t &rx, uint8_t &ry);
+
+    // Map a kernel pad port/slot pair to a player profile (port 0/1, slot 0/1).
+    inline int padPlayerForPortSlot(int port, int slot)
+    {
+        return slot * 2 + port;
+    }
+
+    const char *padActionName(PadAction action);
+    const char *padBindKindName(PadBindKind kind);
+    std::string padBindDisplay(const PadBind &bind);
+    std::string padDeviceDisplay(const PadDevice &device);
+}

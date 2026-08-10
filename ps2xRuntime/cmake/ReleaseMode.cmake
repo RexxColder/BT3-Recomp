@@ -34,9 +34,11 @@ function(EnableFastReleaseMode TargetName)
         endif()
     endif()
 
-    if(IPO_SUPPORTED)
+    # GCC LTO is disabled: with 97 Unity TUs the linker spawns hundreds of
+    # lto1 processes that exhaust system RAM (observed OOM on 16GB box).
+    # -O3 already provides most of the speed; the real perf wins come from
+    # disabling PS2X_TEXWATCH (32MB per-frame scan) and using ccache.
+    if(MSVC AND IPO_SUPPORTED)
         set_property(TARGET ${TargetName} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
-    else()
-        message(WARNING "Interprocedural optimization not supported: ${ipo_error}")
     endif()
 endfunction()

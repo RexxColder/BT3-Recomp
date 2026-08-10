@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Pad.h"
+#include "runtime/pad_config.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -18,7 +19,19 @@ namespace ps2_stubs
         constexpr int32_t kPadStateExecCmd = 5;
         constexpr int32_t kPadStateStable = 6;
         constexpr size_t kPadPortCount = 2;
-        constexpr size_t kPadSlotCount = 1;
+        constexpr size_t kPadSlotCount = 2;
+
+        int firstAvailableGamepad()
+        {
+            for (int g = 0; g < 8; ++g)
+            {
+                if (IsGamepadAvailable(g))
+                {
+                    return g;
+                }
+            }
+            return -1;
+        }
 
         constexpr uint16_t kPadBtnSelect = 1u << 0;
         constexpr uint16_t kPadBtnL3 = 1u << 1;
@@ -70,208 +83,6 @@ namespace ps2_stubs
         PadInputState g_padOverrideState{};
         PadPortState g_padPorts[kPadPortCount]{};
         int g_padReadLogCount = 0;
-
-        uint8_t axisToByte(float axis)
-        {
-            axis = std::clamp(axis, -1.0f, 1.0f);
-            const float mapped = (axis + 1.0f) * 127.5f;
-            return static_cast<uint8_t>(std::lround(mapped));
-        }
-
-        void setButton(PadInputState &state, uint16_t mask, bool pressed)
-        {
-            if (pressed)
-            {
-                state.buttons = static_cast<uint16_t>(state.buttons & ~mask);
-            }
-        }
-
-        void applyGamepadState(PadInputState &state)
-        {
-            if (!IsWindowReady())
-            {
-                return;
-            }
-
-            // One-time: raylib's bundled GLFW controller database has NO mapping for the
-            // user's 8BitDo Ultimate (GUID 03000000c82d...), so the mapped gamepad API
-            // (IsGamepadButtonDown/GetGamepadAxisMovement) returned nothing while raw
-            // joystick events flowed fine. Register the standard xpad-layout mapping
-            // (verified live: glfwUpdateGamepadMappings accepts it -> isGamepad=1 and
-            // buttons deliver). Extra mappings can be appended via PS2X_PAD_MAPPINGS
-            // (a file in SDL_GameControllerDB format).
-            {
-                static bool s_mapped = false;
-                if (!s_mapped)
-                {
-                    s_mapped = true;
-                    SetGamepadMappings(
-                        "03000000c82d00000631000014010000,8BitDo Ultimate Wireless,platform:Linux,"
-                        "a:b0,b:b1,x:b2,y:b3,back:b6,start:b7,guide:b8,leftstick:b9,rightstick:b10,"
-                        "leftshoulder:b4,rightshoulder:b5,dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,"
-                        "leftx:a0,lefty:a1,rightx:a3,righty:a4,lefttrigger:a2,righttrigger:a5");
-                    if (const char *mf = std::getenv("PS2X_PAD_MAPPINGS"))
-                    {
-                        if (FILE *f = std::fopen(mf, "rb"))
-                        {
-                            std::fseek(f, 0, SEEK_END);
-                            long sz = std::ftell(f);
-                            std::fseek(f, 0, SEEK_SET);
-                            if (sz > 0 && sz < 4 * 1024 * 1024)
-                            {
-                                char *buf = static_cast<char *>(std::malloc(static_cast<size_t>(sz) + 1));
-                                if (buf && std::fread(buf, 1, static_cast<size_t>(sz), f) == static_cast<size_t>(sz))
-                                {
-                                    buf[sz] = '\0';
-                                    SetGamepadMappings(buf);
-                                }
-                                std::free(buf);
-                            }
-                            std::fclose(f);
-                        }
-                    }
-                }
-            }
-
-            // Merge ALL detected gamepads. On Linux, non-controller HID endpoints
-            // (keyboard media keys, headsets) also enumerate as GLFW "gamepads" and
-            // occupy the low indices — reading only the FIRST available pad polled the
-            // keyboard's volume knob while the real controller sat at index 3. Phantom
-            // endpoints never report gamepad buttons, so merging every index is safe.
-            // PS2X_PAD=N forces a single index.
-            static const int forcedPad = [](){ const char *v = std::getenv("PS2X_PAD"); return v ? std::atoi(v) : -1; }();
-            float lx = 0.0f, ly = 0.0f, rx = 0.0f, ry = 0.0f;
-            bool anyPad = false;
-            for (int gamepad = 0; gamepad < 8; ++gamepad)
-            {
-                if (forcedPad >= 0 && gamepad != forcedPad)
-                    continue;
-                if (!IsGamepadAvailable(gamepad))
-                    continue;
-                anyPad = true;
-
-                // Raylib mapping (PS2 -> raylib buttons/axes):
-                // D-Pad -> LEFT_FACE_*, Cross/Circle/Square/Triangle -> RIGHT_FACE_*
-                // L1/R1 -> TRIGGER_1, L2/R2 -> TRIGGER_2, L3/R3 -> THUMB
-                // Select/Start -> MIDDLE_LEFT/MIDDLE_RIGHT
-                auto mergeAxis = [&](float &dst, int axis)
-                {
-                    const float v = GetGamepadAxisMovement(gamepad, axis);
-                    if (std::fabs(v) > std::fabs(dst))
-                        dst = v;
-                };
-                mergeAxis(lx, GAMEPAD_AXIS_LEFT_X);
-                mergeAxis(ly, GAMEPAD_AXIS_LEFT_Y);
-                mergeAxis(rx, GAMEPAD_AXIS_RIGHT_X);
-                mergeAxis(ry, GAMEPAD_AXIS_RIGHT_Y);
-
-                setButton(state, kPadBtnUp, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_UP));
-                setButton(state, kPadBtnDown, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN));
-                setButton(state, kPadBtnLeft, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT));
-                setButton(state, kPadBtnRight, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT));
-
-                setButton(state, kPadBtnCross, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN));
-                setButton(state, kPadBtnCircle, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT));
-                setButton(state, kPadBtnSquare, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT));
-                setButton(state, kPadBtnTriangle, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP));
-
-                setButton(state, kPadBtnL1, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1));
-                setButton(state, kPadBtnR1, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1));
-                setButton(state, kPadBtnL2, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2));
-                setButton(state, kPadBtnR2, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2));
-
-                setButton(state, kPadBtnL3, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_THUMB));
-                setButton(state, kPadBtnR3, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_THUMB));
-
-                setButton(state, kPadBtnSelect, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT));
-                setButton(state, kPadBtnStart, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT));
-            }
-            if (anyPad)
-            {
-                state.lx = axisToByte(lx);
-                state.ly = axisToByte(ly);
-                state.rx = axisToByte(rx);
-                state.ry = axisToByte(ry);
-            }
-
-            // Pad diagnostic (temporary, remove once the 8BitDo is confirmed working):
-            // every ~300 polls dump the pads the game sees + first held button + the
-            // merged button word. File-backed — run logs often capture only stdout.
-            {
-                static FILE *s_padLog = std::fopen("/home/z3/Desktop/bt3/work/paddiag.txt", "w");
-                static unsigned s_poll = 0;
-                if (s_padLog && (s_poll++ % 300u) == 0u)
-                {
-                    std::fprintf(s_padLog, "poll=%u pads:", s_poll);
-                    for (int g = 0; g < 8; ++g)
-                    {
-                        if (!IsGamepadAvailable(g))
-                            continue;
-                        int down = -1;
-                        for (int b = 0; b < 32; ++b)
-                            if (IsGamepadButtonDown(g, b)) { down = b; break; }
-                        const char *nm = GetGamepadName(g);
-                        std::fprintf(s_padLog, " [%d]\"%s\" down=%d", g, nm ? nm : "?", down);
-                    }
-                    std::fprintf(s_padLog, " | btns=%04x lx=%d ly=%d\n", state.buttons, (int)state.lx - 128, (int)state.ly - 128);
-                    std::fflush(s_padLog);
-                }
-            }
-        }
-
-        void applyKeyboardState(PadInputState &state, bool allowAnalog)
-        {
-            if (!IsWindowReady())
-            {
-                return;
-            }
-
-            // Keyboard mapping (PS2 -> keys):
-            // D-Pad: arrows, Square/Cross/Circle/Triangle: Z/X/C/V
-            // L1/R1: Q/E, L2/R2: 1/3, Start/Select: Enter/RightShift
-            // L3/R3: LeftCtrl/RightCtrl, Analog left: WASD
-            setButton(state, kPadBtnUp, IsKeyDown(KEY_UP));
-            setButton(state, kPadBtnDown, IsKeyDown(KEY_DOWN));
-            setButton(state, kPadBtnLeft, IsKeyDown(KEY_LEFT));
-            setButton(state, kPadBtnRight, IsKeyDown(KEY_RIGHT));
-
-            setButton(state, kPadBtnSquare, IsKeyDown(KEY_Z));
-            setButton(state, kPadBtnCross, IsKeyDown(KEY_X));
-            setButton(state, kPadBtnCircle, IsKeyDown(KEY_C));
-            setButton(state, kPadBtnTriangle, IsKeyDown(KEY_V));
-
-            setButton(state, kPadBtnL1, IsKeyDown(KEY_Q));
-            setButton(state, kPadBtnR1, IsKeyDown(KEY_E));
-            setButton(state, kPadBtnL2, IsKeyDown(KEY_ONE));
-            setButton(state, kPadBtnR2, IsKeyDown(KEY_THREE));
-
-            setButton(state, kPadBtnStart, IsKeyDown(KEY_ENTER));
-            setButton(state, kPadBtnSelect, IsKeyDown(KEY_RIGHT_SHIFT));
-            setButton(state, kPadBtnL3, IsKeyDown(KEY_LEFT_CONTROL));
-            setButton(state, kPadBtnR3, IsKeyDown(KEY_RIGHT_CONTROL));
-
-            if (!allowAnalog)
-            {
-                return;
-            }
-
-            float ax = 0.0f;
-            float ay = 0.0f;
-            if (IsKeyDown(KEY_D))
-                ax += 1.0f;
-            if (IsKeyDown(KEY_A))
-                ax -= 1.0f;
-            if (IsKeyDown(KEY_S))
-                ay += 1.0f;
-            if (IsKeyDown(KEY_W))
-                ay -= 1.0f;
-
-            if (ax != 0.0f || ay != 0.0f)
-            {
-                state.lx = axisToByte(ax);
-                state.ly = axisToByte(ay);
-            }
-        }
 
         void resetPadStateLocked()
         {
@@ -391,8 +202,15 @@ namespace ps2_stubs
                 }
                 else
                 {
-                    applyGamepadState(state);
-                    applyKeyboardState(state, portState.analogMode);
+                    // Fallback: per-player profile poll (the backend readState below
+                    // uses the same mapping, so the two paths stay consistent).
+                    const int player = padPlayerForPortSlot(port, slot);
+                    const PadPacket pkt = padPollPlayer(static_cast<size_t>(player));
+                    state.buttons = pkt.buttons;
+                    state.rx = pkt.rx;
+                    state.ry = pkt.ry;
+                    state.lx = pkt.lx;
+                    state.ly = pkt.ly;
                 }
             }
 
@@ -725,7 +543,7 @@ namespace ps2_stubs
         PS2_IF_AGRESSIVE_LOGS({
             if (g_padReadLogCount < 48)
             {
-                const int gamepad = findFirstGamepad();
+                const int gamepad = firstAvailableGamepad();
                 const bool gamepadStartPressed =
                     (gamepad >= 0) && IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT);
                 const bool startPressed = (data[2] != 0xFFu || data[3] != 0xFFu ||
@@ -938,20 +756,5 @@ namespace ps2_stubs
         std::lock_guard<std::mutex> lock(g_padOverrideMutex);
         g_padOverrideEnabled = false;
         g_padOverrideState = PadInputState{};
-    }
-
-    // Live host input (keyboard + gamepad) as a 16-bit active-low PS2 pad button word,
-    // plus analog bytes. For game-specific pad-read overrides (e.g. BT3) that build
-    // their own packet and would otherwise report neutral input.
-    uint16_t ps2xLivePadButtons(uint8_t &lx, uint8_t &ly, uint8_t &rx, uint8_t &ry)
-    {
-        PadInputState st{};
-        applyGamepadState(st);
-        applyKeyboardState(st, true);
-        lx = st.lx;
-        ly = st.ly;
-        rx = st.rx;
-        ry = st.ry;
-        return st.buttons;
     }
 }

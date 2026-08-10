@@ -6,6 +6,7 @@
 #include "runtime/ps2_memory.h"
 #include "ps2_runtime.h"
 #include "Kernel/Syscalls/RPC.h"
+#include "Kernel/Stubs/CD.h"
 #include <fstream>
 #include <cstring>
 #include <string>
@@ -155,7 +156,14 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
 
             const std::string image = PS2Runtime::getIoPaths().cdImage.string();
             uint32_t lbn = 0, size = 0;
-            const bool ok = !image.empty() && iso9660Resolve(image, path, lbn, size);
+            bool ok = !image.empty() && iso9660Resolve(image, path, lbn, size);
+
+            // Fallback: if the ISO is missing or the path isn't in the
+            // ISO9660 tree, resolve from extracted files on disk.
+            if (!ok)
+            {
+                ok = ps2_stubs::dvciFindExtractedFile(path, lbn, size);
+            }
 
             static std::atomic<uint32_t> s_dvci{0};
             if (s_dvci.fetch_add(1) < 40u)

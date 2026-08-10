@@ -4,6 +4,7 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "ps2_log.h"
+#include "runtime/pad_config.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include <algorithm>
@@ -22,8 +23,12 @@
 #include <cstring>
 
 // Live host input (keyboard + gamepad) as a 16-bit active-low PS2 button word +
-// analog bytes. Defined in Kernel/Stubs/Pad.cpp.
-namespace ps2_stubs { uint16_t ps2xLivePadButtons(uint8_t &lx, uint8_t &ly, uint8_t &rx, uint8_t &ry); }
+// analog bytes. Defined in src/lib/pad_config.cpp. `player` selects the profile
+// (0..3); BT3 routes socket 0 -> player 0, socket 1 -> player 1.
+namespace ps2_stubs
+{
+    uint16_t ps2xLivePadButtons(int player, uint8_t &lx, uint8_t &ly, uint8_t &rx, uint8_t &ry);
+}
 
 // External-linkage game-frame counter (read by the [fps] line in ps2_runtime.cpp).
 std::atomic<uint64_t> g_bt3FrameCount{0};
@@ -322,11 +327,13 @@ namespace
     // BT3 gates its first in-game screen on the sceDbc pad reporting a connected,
     // ready controller AND returning valid pad packets. The IOP DBC/pad module is
     // not emulated. Rather than half-report "ready" (which destabilises init) or
-    // poke shared DBC state, replace the four pad-accessor functions with a
-    // consistent virtual controller: connected, ready, no buttons, sticks
-    // centered. This is a complete (if input-less) pad, so init and the boot
-    // wait both proceed cleanly. Wire real input here later.
-    void writeNeutralPadPacket(uint8_t *rdram, uint32_t bufAddr)
+    // poke shared DBC state, replace the pad-accessor functions with a
+    // consistent virtual controller: connected, ready, host input, sticks
+    // centered. This is a complete pad, so init and the boot wait both proceed
+    // cleanly. Per-player input is routed by socket index (a0): scePad2CreateSocket
+    // is overridden to return the descriptor's player byte (0/1), and each read
+    // accessor maps socket -> player profile from the host pad configurator.
+    void writeNeutralPadPacket(uint8_t *rdram, uint32_t bufAddr, uint32_t socket)
     {
         // TEST (env PS2X_SOUNDREADY): force the sound-ready flags that FUN_0026d9a0
         // sets (0x2c9fc8..0x2ca028, +0x10) so we can see if the game's progression
@@ -347,12 +354,11 @@ namespace
         {
             return;
         }
-        // Live host input (keyboard + gamepad) -> PS2 pad packet. buttons active-low
-        // (0xff = released); game does (hi<<8|lo) ^ 0xffff. Keyboard map (from Pad.cpp):
-        // arrows = D-pad, X=Cross C=Circle Z=Square V=Triangle, Enter=Start,
-        // Q/E=L1/R1, 1/3=L2/R2, RShift=Select, WASD=left analog; gamepad also works.
+        // Live host input (keyboard + gamepad) for the given socket/player ->
+        // PS2 pad packet. buttons active-low (0xff = released); game does
+        // (hi<<8|lo) ^ 0xffff.
         uint8_t lx = 0x80u, ly = 0x80u, rx = 0x80u, ry = 0x80u;
-        const uint16_t buttons = ps2_stubs::ps2xLivePadButtons(lx, ly, rx, ry);
+        const uint16_t buttons = ps2_stubs::ps2xLivePadButtons(static_cast<int>(socket & 3u), lx, ly, rx, ry);
         uint8_t b0 = static_cast<uint8_t>(buttons & 0xffu);
         uint8_t b1 = static_cast<uint8_t>((buttons >> 8) & 0xffu);
         // TEST (env PS2X_AUTOSTART): also tap START+CROSS periodically to auto-advance.
@@ -388,10 +394,28 @@ namespace
         ctx->pc = getRegU32(ctx, 31);
     }
 
+    // FUN_00295e58 scePad2CreateSocket. The IOP pad server would assign a distinct
+    // socket index per player; with it stubbed, every call returned the same index
+    // so both players read identical input. The caller stores the player id in the
+    // descriptor (byte at a0+4, set to 0/1 by the pad-init loop in sub_00122940),
+    // so hand that back directly as the socket index. The DBC read accessors then
+    // receive socket 0/1 in a0 and route to the matching player profile.
+    void bt3PadCreateSocket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00295e58
+    {
+        (void)runtime;
+        uint32_t player = 0u;
+        if (uint8_t *desc = getMemPtr(rdram, getRegU32(ctx, 4) + 4u))
+        {
+            player = (*desc) & 0xFFu;
+        }
+        setReturnS32(ctx, static_cast<int32_t>(player & 3u));
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
     void bt3PadRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00296090
     {
         (void)runtime;
-        writeNeutralPadPacket(rdram, getRegU32(ctx, 5)); // a1 = out buffer
+        writeNeutralPadPacket(rdram, getRegU32(ctx, 5), getRegU32(ctx, 4)); // a0 = socket, a1 = out buffer
         setReturnU32(ctx, 2u); // >= 0 so the pad state machine advances
         ctx->pc = getRegU32(ctx, 31);
     }
@@ -399,7 +423,7 @@ namespace
     void bt3PadGetState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00295fb8
     {
         (void)runtime;
-        writeNeutralPadPacket(rdram, getRegU32(ctx, 5)); // a1 = out buffer
+        writeNeutralPadPacket(rdram, getRegU32(ctx, 5), getRegU32(ctx, 4)); // a0 = socket, a1 = out buffer
         setReturnU32(ctx, 6u); // packet length
         ctx->pc = getRegU32(ctx, 31);
     }
@@ -3585,12 +3609,14 @@ namespace
         // Sound-driver lock/unlock callbacks corrupt the caller's stack; stub them.
         // (boundary fixed) 0x0026CB40
         // (boundary fixed) 0x0026CBC8
-        // Virtual controller: connected + ready + neutral input, consistently
-        // across all four sceDbc pad accessors (see notes above).
+        // Virtual controller: connected + ready + per-player input, consistently
+        // across all sceDbc pad accessors (see notes above).
+        ps2_stubs::padConfigInit(runtime.getIoPaths().elfDirectory.string());
         runtime.replaceFunction(0x00295160u, &bt3PadConnect);
         runtime.replaceFunction(0x00296160u, &bt3PadStatus);
         runtime.replaceFunction(0x00296090u, &bt3PadRead);
         runtime.replaceFunction(0x00295fb8u, &bt3PadGetState);
+        runtime.replaceFunction(0x00295e58u, &bt3PadCreateSocket);
     }
 
     // Dragon Ball Z: Budokai Tenkaichi 3 (SLUS_216.78): the PS2RNA sound engine

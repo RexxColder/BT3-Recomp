@@ -678,4 +678,16 @@ namespace ps2_stubs
         }
         setReturnS32(ctx, 1);
     }
+
+    bool dvciFindExtractedFile(const char *ps2Path, uint32_t &lbnOut, uint32_t &sizeOut)
+    {
+        CdFileEntry entry;
+        if (registerCdFile(ps2Path, entry))
+        {
+            lbnOut = entry.baseLbn;
+            sizeOut = entry.sizeBytes;
+            return true;
+        }
+        return false;
+    }
 }

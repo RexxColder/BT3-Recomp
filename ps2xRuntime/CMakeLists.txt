@@ -360,12 +360,18 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_iop_cl.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
+    src/lib/pad_config.cpp
     src/lib/ps2_runtime.cpp
     src/lib/ps2_interp.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/ps2_vu1.cpp
     src/lib/games_database.cpp
 )
+
+# Native Linux evdev reader for unmapped gamepads (xone driver).
+if(UNIX AND NOT APPLE)
+    target_sources(ps2_runtime PRIVATE src/lib/pad_evdev_linux.cpp)
+endif()
 
 # The emulator runtime is small (~25 files) and holds every hot loop (rasterizer,
 # GS, VIF, VU1, memory). Build it optimized even when the global flags stay at

@@ -8,7 +8,12 @@
 #include "Kernel/Stubs/CD.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Stubs/Pad.h"
+#include "runtime/pad_config.h"
 #include "runtime/ps2_iop.h"
+
+#if defined(__linux__)
+#include "runtime/pad_evdev_linux.h"
+#endif
 
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "imgui.h"
@@ -1453,6 +1458,335 @@ namespace
         ImGui::TextUnformatted("bits: Select,L3,R3,Start,Up,Right,Down,Left,L2,R2,L1,R1,Triangle,Circle,Cross,Square");
     }
 
+    void drawControllersTab(PS2Runtime &runtime, int &editPlayer, int &captureAction)
+    {
+        using namespace ps2_stubs;
+
+        // Keep the native evdev reader fresh for the configurator UI.
+#if defined(__linux__)
+        PadEvdevLinux::instance().update();
+#endif
+
+        PadConfig &cfg = PadConfig::instance();
+
+        ImGui::SeparatorText("Player profiles");
+        ImGui::TextWrapped("BT3 reads exactly two controllers (players 1-2); profiles 3-4 are kept for other games. "
+                           "A player on \"Auto\" merges every connected pad + keyboard (legacy behaviour). Assign a "
+                           "specific device to route that player to it alone, then remap the bindings below.");
+
+        if (editPlayer < 0 || editPlayer >= static_cast<int>(PadConfig::kPlayerCount))
+        {
+            editPlayer = 0;
+        }
+        const char *playerNames[] = {"Player 1", "Player 2", "Player 3", "Player 4"};
+        ImGui::Combo("Player", &editPlayer, playerNames, 4);
+
+        struct PadInfo
+        {
+            int index;
+            const char *name;
+        };
+        PadInfo pads[8]{};
+        int padCount = 0;
+        for (int g = 0; g < 8; ++g)
+        {
+            if (IsGamepadAvailable(g))
+            {
+                pads[padCount].index = g;
+                pads[padCount].name = GetGamepadName(g);
+                ++padCount;
+            }
+        }
+
+#if defined(__linux__)
+        PadEvdevLinux &native = PadEvdevLinux::instance();
+        const bool nativeAvailable = native.isAvailable();
+#endif
+
+        const PadPlayerConfig view = cfg.snapshot(static_cast<size_t>(editPlayer));
+        const PadDevice &dev = view.device;
+
+        // Device selector.
+        {
+            std::string preview;
+            switch (dev.kind)
+            {
+            case PadDeviceKind::Keyboard:
+                preview = "Keyboard";
+                break;
+            case PadDeviceKind::Gamepad:
+                preview = "Gamepad " + std::to_string(dev.gamepad);
+                if (dev.gamepad >= 0 && IsGamepadAvailable(dev.gamepad))
+                {
+                    const char *nm = GetGamepadName(dev.gamepad);
+                    preview += " (" + std::string(nm ? nm : "?") + ")";
+                }
+                else
+                {
+                    preview += " (not found)";
+                }
+                break;
+            default:
+                preview = "Auto (any pad + keyboard)";
+                break;
+            }
+            if (ImGui::BeginCombo("Device", preview.c_str()))
+            {
+                if (ImGui::Selectable("Auto (any pad + keyboard)", dev.kind == PadDeviceKind::None))
+                {
+                    cfg.resetPlayer(static_cast<size_t>(editPlayer));
+                }
+                if (ImGui::Selectable("Keyboard", dev.kind == PadDeviceKind::Keyboard))
+                {
+                    cfg.setPlayerDefaults(static_cast<size_t>(editPlayer), PadDeviceKind::Keyboard);
+                }
+                for (int i = 0; i < padCount; ++i)
+                {
+                    char label[128];
+                    std::snprintf(label, sizeof(label), "Gamepad %d (%s)", pads[i].index,
+                                  pads[i].name ? pads[i].name : "?");
+                    if (ImGui::Selectable(label,
+                                          dev.kind == PadDeviceKind::Gamepad && dev.gamepad == pads[i].index))
+                    {
+                        cfg.setPlayerDefaults(static_cast<size_t>(editPlayer), PadDeviceKind::Gamepad);
+                        cfg.setDevice(static_cast<size_t>(editPlayer), PadDevice{PadDeviceKind::Gamepad, pads[i].index});
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            if (dev.kind == PadDeviceKind::Gamepad && (dev.gamepad < 0 || !IsGamepadAvailable(dev.gamepad)))
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "Assigned gamepad is not connected.");
+            }
+#if defined(__linux__)
+            if (nativeAvailable && dev.kind == PadDeviceKind::Gamepad && dev.gamepad >= 0 &&
+                IsGamepadAvailable(dev.gamepad) && native.matchesName(GetGamepadName(dev.gamepad)))
+            {
+                ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f),
+                                   "Native evdev reader active: %s (%s)",
+                                   native.name().c_str(), native.node().c_str());
+            }
+            else if (nativeAvailable)
+            {
+                ImGui::TextDisabled("Native evdev: %s (%s)", native.name().c_str(), native.node().c_str());
+            }
+#endif
+            ImGui::TextWrapped("Device: %s", padDeviceDisplay(dev).c_str());
+        }
+
+        // Bindings table.
+        ImGui::SeparatorText("Bindings");
+        if (ImGui::BeginTable("pad_binds", 4,
+                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                  ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY,
+                              ImVec2(0, 420.0f)))
+        {
+            ImGui::TableSetupColumn("Action");
+            ImGui::TableSetupColumn("Binding");
+            ImGui::TableSetupColumn("");
+            ImGui::TableSetupColumn("");
+            ImGui::TableHeadersRow();
+            for (size_t a = 0; a < static_cast<size_t>(PadAction::Count); ++a)
+            {
+                const PadAction action = static_cast<PadAction>(a);
+                const bool capturing = (captureAction == static_cast<int>(a));
+                ImGui::PushID(static_cast<int>(a));
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(padActionName(action));
+                ImGui::TableNextColumn();
+                if (capturing)
+                {
+                    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "press a key / button / stick...");
+                }
+                else
+                {
+                    ImGui::TextUnformatted(padBindDisplay(view.binds[a]).c_str());
+                }
+                ImGui::TableNextColumn();
+                if (ImGui::Button(capturing ? "Cancel" : "Bind...", ImVec2(72.0f, 0.0f)))
+                {
+                    captureAction = capturing ? -1 : static_cast<int>(a);
+                }
+                ImGui::TableNextColumn();
+                if (view.binds[a].kind != PadBindKind::None)
+                {
+                    if (ImGui::SmallButton("clear"))
+                    {
+                        cfg.setBind(static_cast<size_t>(editPlayer), action, PadBind{});
+                    }
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+
+        // Capture: the next key/button/axis pressed on the player's device.
+        if (captureAction >= 0 && captureAction < static_cast<int>(PadAction::Count))
+        {
+            PadBind bind;
+            const int pressedKey = GetKeyPressed();
+            if (pressedKey != 0)
+            {
+                bind = PadBind{PadBindKind::Key, pressedKey, 1.0f, 0.0f};
+            }
+            else
+            {
+                int scan[8];
+                int scanCount = 0;
+                if (dev.kind == PadDeviceKind::Gamepad)
+                {
+                    if (IsGamepadAvailable(dev.gamepad))
+                    {
+                        scan[scanCount++] = dev.gamepad;
+                    }
+                }
+                else
+                {
+                    for (int g = 0; g < 8; ++g)
+                    {
+                        if (IsGamepadAvailable(g))
+                        {
+                            scan[scanCount++] = g;
+                        }
+                    }
+                }
+                for (int i = 0; i < scanCount && bind.kind == PadBindKind::None; ++i)
+                {
+                    const int g = scan[i];
+                    for (int b = 0; b < 32; ++b)
+                    {
+                        if (IsGamepadButtonPressed(g, b))
+                        {
+                            bind = PadBind{PadBindKind::Button, b, 1.0f, 0.15f};
+                            if (dev.kind == PadDeviceKind::None)
+                            {
+                                cfg.setDevice(static_cast<size_t>(editPlayer), PadDevice{PadDeviceKind::Gamepad, g});
+                            }
+                            break;
+                        }
+                    }
+#if defined(__linux__)
+                    if (bind.kind == PadBindKind::None && nativeAvailable &&
+                        native.matchesName(GetGamepadName(g)))
+                    {
+                        const int nativeBtnCount = native.buttonCount();
+                        for (int b = 0; b < nativeBtnCount; ++b)
+                        {
+                            if (native.isButtonPressed(b))
+                            {
+                                bind = PadBind{PadBindKind::Button, b, 1.0f, 0.15f};
+                                if (dev.kind == PadDeviceKind::None)
+                                {
+                                    cfg.setDevice(static_cast<size_t>(editPlayer), PadDevice{PadDeviceKind::Gamepad, g});
+                                }
+                                break;
+                            }
+                        }
+                    }
+#endif
+                    if (bind.kind == PadBindKind::None)
+                    {
+                        const int axisCount = GetGamepadAxisCount(g);
+                        for (int ax = 0; ax < axisCount; ++ax)
+                        {
+                            const float v = GetGamepadAxisMovement(g, ax);
+                            if (std::fabs(v) > 0.5f)
+                            {
+                                bind = PadBind{PadBindKind::Axis, ax, v > 0.0f ? 1.0f : -1.0f, 0.15f};
+                                if (dev.kind == PadDeviceKind::None)
+                                {
+                                    cfg.setDevice(static_cast<size_t>(editPlayer), PadDevice{PadDeviceKind::Gamepad, g});
+                                }
+                                break;
+                            }
+                        }
+                    }
+#if defined(__linux__)
+                    if (bind.kind == PadBindKind::None && nativeAvailable &&
+                        native.matchesName(GetGamepadName(g)))
+                    {
+                        const int nativeAxisCount = native.axisCount();
+                        for (int ax = 0; ax < nativeAxisCount; ++ax)
+                        {
+                            const float v = native.getAxis(ax);
+                            if (std::fabs(v) > 0.5f)
+                            {
+                                bind = PadBind{PadBindKind::Axis, ax, v > 0.0f ? 1.0f : -1.0f, 0.15f};
+                                if (dev.kind == PadDeviceKind::None)
+                                {
+                                    cfg.setDevice(static_cast<size_t>(editPlayer), PadDevice{PadDeviceKind::Gamepad, g});
+                                }
+                                break;
+                            }
+                        }
+                    }
+#endif
+                }
+            }
+            if (bind.kind != PadBindKind::None)
+            {
+                cfg.setBind(static_cast<size_t>(editPlayer), static_cast<PadAction>(captureAction), bind);
+                captureAction = -1;
+            }
+        }
+
+        // Live preview.
+        ImGui::SeparatorText("Live preview");
+        {
+            const PadPacket pkt = padPollPlayer(static_cast<size_t>(editPlayer));
+            ImGui::Text("buttons=0x%04X  lx=%u ly=%u rx=%u ry=%u", pkt.buttons, pkt.lx, pkt.ly, pkt.rx, pkt.ry);
+            ImGui::TextWrapped("pressed: %s", pressedPadButtons(pkt.buttons).c_str());
+        }
+
+#if defined(__linux__)
+        if (nativeAvailable)
+        {
+            ImGui::SeparatorText("Native evdev state");
+            ImGui::Text("node: %s", native.node().c_str());
+            const PadEvdevLinux::RawState raw = native.rawState();
+            ImGui::Text("raw codes (%d):", raw.downCount);
+            for (int i = 0; i < raw.downCount; ++i)
+            {
+                ImGui::SameLine(0.0f, 4.0f);
+                ImGui::Text("0x%02x", raw.downCodes[i]);
+            }
+            ImGui::Text("axes: lx=%.2f ly=%.2f rx=%.2f ry=%.2f lt=%.2f rt=%.2f hat=%.0f,%.0f",
+                        raw.x, raw.y, raw.rx, raw.ry, raw.lt, raw.rt, raw.hatX, raw.hatY);
+            ImGui::Text("logical buttons down:");
+            for (int b = 0; b < native.buttonCount(); ++b)
+            {
+                if (native.isButtonDown(b))
+                {
+                    ImGui::SameLine(0.0f, 4.0f);
+                    ImGui::Text("B%d", b);
+                }
+            }
+        }
+#endif
+
+        // Config file controls.
+        ImGui::SeparatorText("Config file");
+        ImGui::TextWrapped("path: %s", cfg.defaultPath().c_str());
+        if (ImGui::Button("Save"))
+        {
+            if (!cfg.save())
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "Save failed.");
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load"))
+        {
+            cfg.load();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset player"))
+        {
+            cfg.resetPlayer(static_cast<size_t>(editPlayer));
+        }
+    }
+
     void drawGsTab(PS2Runtime &runtime)
     {
         GSRegisters &regs = runtime.memory().gs();
@@ -2199,6 +2533,11 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
             if (ImGui::BeginTabItem("PAD"))
             {
                 drawPadTab();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Controllers"))
+            {
+                drawControllersTab(runtime, m_padEditPlayer, m_padCaptureAction);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("File/CD"))
