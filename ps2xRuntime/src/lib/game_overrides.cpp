@@ -1440,9 +1440,11 @@ namespace
         const uint32_t sendBuf = getRegU32(ctx, 7);
         // Only the SE service's payload send (from inside 0x123F48); rpcNum 9 is a per-frame
         // prepare and 0/3/7 are bind/init.
+        // Default ON, PS2X_SEPLAY=0 opts out -- must match the registration gate, or the hook is
+        // installed and then declines every command.
         static const bool s_on = []() {
             const char *v = std::getenv("PS2X_SEPLAY");
-            return v && v[0] && v[0] != '0';
+            return !(v && v[0] == '0');
         }();
         if (s_on && ra == 0x00123f9cu && rpcNum == 0x0Du && sendBuf)
         {
@@ -3218,8 +3220,17 @@ namespace
         }
         // The IOP-side ring consumer LIVES in the stream tick, so the hook has to be installed
         // whenever audio is on -- it is no longer just the [sndstream] diagnostic it started as.
-        const bool sndAudioOn = std::getenv("PS2X_SNDPLAY") || std::getenv("PS2X_SNDSTREAM") ||
-                                std::getenv("PS2X_SNDPUMP") || std::getenv("PS2X_SNDIOP");
+        // DEFAULT ON. Audio was opt-in while it was being built; now that the ring consumer and
+        // the SE path are working, a fresh clone should make sound without having to know a flag
+        // name. PS2X_SNDPLAY=0 opts out, matching how PS2X_SNDIOP already reads its value. The
+        // other three are legacy switches: setting any of them still forces audio on.
+        const bool sndAudioOn = []() {
+            const char *v = std::getenv("PS2X_SNDPLAY");
+            if (v && v[0] == '0')
+                return false;
+            return true;
+        }() || std::getenv("PS2X_SNDSTREAM") || std::getenv("PS2X_SNDPUMP") ||
+                                std::getenv("PS2X_SNDIOP");
         if (sndAudioOn)
         {
             g_orig28ae60 = runtime.lookupFunction(0x0028ae60u);
@@ -3259,8 +3270,14 @@ namespace
             if (g_orig281bb0) runtime.replaceFunction(0x00281bb0u, &bt3StreamGroupStart);
             else std::cerr << "[sndiop] 0x281bb0 (group start) not registered" << std::endl;
         }
-        // [se] system-SE playback: service the RPC the IOP would have handled.
-        if (std::getenv("PS2X_SEPLAY"))
+        // [se] sound effects: service the RPC the IOP would have handled. DEFAULT ON alongside
+        // the rest of audio; PS2X_SEPLAY=0 opts out. Gated on sndAudioOn too, so silencing audio
+        // silences effects with it rather than leaving them playing on their own.
+        const bool sePlayOn = sndAudioOn && []() {
+            const char *v = std::getenv("PS2X_SEPLAY");
+            return !(v && v[0] == '0');
+        }();
+        if (sePlayOn)
         {
             g_orig2b48f0 = runtime.lookupFunction(0x002b48f0u);
             if (g_orig2b48f0) runtime.replaceFunction(0x002b48f0u, &bt3SeRpcSend);

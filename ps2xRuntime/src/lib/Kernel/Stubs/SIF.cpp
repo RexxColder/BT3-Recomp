@@ -724,9 +724,12 @@ namespace ps2_stubs
                 // nesting it there (as PS2X_SNDDUMP is) silently disables audio unless the
                 // diagnostic flag also happens to be set.
                 {
+                    // Default ON; PS2X_SNDPLAY=0 opts out. Must agree with the registration gate
+                    // in game_overrides.cpp -- if this one stayed opt-in the hooks would install
+                    // and no PCM would ever reach the device.
                     static const bool s_play = []() {
                         const char *v = std::getenv("PS2X_SNDPLAY");
-                        return v && v[0] && v[0] != '0';
+                        return !(v && v[0] == '0');
                     }();
                     if (s_play && runtime && xfer.dest < 0x100000u)
                     {
