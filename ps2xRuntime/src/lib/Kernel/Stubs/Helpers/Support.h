@@ -1872,10 +1872,27 @@ namespace
         return true;
     }
 
+    // [asyncfence] Under PS2X_ASYNC_KICK the kick worker consumes VIF1/GIF packets
+    // off-thread; the sceGs* stubs below mutate or read GS state directly on the guest
+    // thread, which interleaves mid-packet with the worker's stream (a stomped FRAME/
+    // SCISSOR mid-frame sends queued draws into texture VRAM pages -> corrupted pages
+    // stick in the content-versioned texture cache: stretched ground, bare trees after
+    // cutscene-heavy streaming). Drain the queue first so direct access happens at a
+    // stream boundary, matching hardware where these calls imply the path is idle.
+    // PS2X_ASYNC_GSFENCE=0 disables (A/B kill-switch).
+    static void fenceAsyncKickForGsAccess(PS2Runtime *runtime)
+    {
+        static const bool s_off = [](){ const char *v = std::getenv("PS2X_ASYNC_GSFENCE"); return v && v[0] == '0'; }();
+        if (s_off || !runtime || !PS2Memory::asyncKickEnabled())
+            return;
+        runtime->memory().drainKickQueue();
+    }
+
     static void applyGsDispEnv(PS2Runtime *runtime, const GsDispEnvMem &env)
     {
         if (!runtime || !runtime->syncCoreSubsystems())
             return;
+        fenceAsyncKickForGsAccess(runtime);
         auto &regs = runtime->memory().gs();
         regs.pmode = env.pmode;
         regs.smode2 = env.smode2;
@@ -1890,6 +1907,7 @@ namespace
     {
         if (!runtime || !pairs || !runtime->syncCoreSubsystems())
             return;
+        fenceAsyncKickForGsAccess(runtime);
         for (size_t i = 0; i < pairCount; ++i)
         {
             runtime->gs().writeRegister(static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);

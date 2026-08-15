@@ -122,6 +122,7 @@ namespace ps2_stubs
                 return;
             }
 
+            fenceAsyncKickForGsAccess(runtime);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.testa.reg & 0xFFu), clear.testa.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.prim.reg & 0xFFu), clear.prim.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.rgbaq.reg & 0xFFu), clear.rgbaq.value);
@@ -906,6 +907,11 @@ namespace ps2_stubs
         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
         mem.processPendingTransfers();
 
+        // [asyncfence] Under async kick the transfer above was only ENQUEUED; the
+        // local->host readback buffer is filled by the worker when it reaches the
+        // TRXDIR write. Consuming immediately would return stale/empty data (the game
+        // then re-uploads that garbage later -> persistent VRAM texture corruption).
+        fenceAsyncKickForGsAccess(runtime);
         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
         runtime->guestFree(pktAddr);
 
@@ -1382,6 +1388,14 @@ namespace ps2_stubs
         if (mode == 0)
         {
             mem.processPendingTransfers();
+
+            // [asyncfence] The game asked to wait until the GIF/VIF1 path is idle.
+            // Under async kick the CHCR STR bits clear at enqueue time, so the spin
+            // loops below see an idle path while the worker still has a queue of
+            // uploads/draws in flight; whatever the game does "after sync" (buffer
+            // reuse, direct GS pokes, VRAM management) would race it. Honor the
+            // hardware contract and drain the queue.
+            fenceAsyncKickForGsAccess(runtime);
 
             uint32_t count = 0;
             constexpr uint32_t kTimeout = 0x1000000;
