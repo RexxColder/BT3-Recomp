@@ -4,6 +4,8 @@
 
 #include <map>
 
+void bt3NoteSeBankBlob(const uint8_t *data, uint32_t size);
+
 namespace ps2_stubs
 {
     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -759,6 +761,43 @@ namespace ps2_stubs
                             // returned and the ring would clog. Book them as consumed instead.
                             runtime->audioBackend().noteStreamGap(
                                 streamId, static_cast<uint32_t>(xfer.size));
+                        }
+                    }
+                }
+
+                // [sndbank] PS2X_SNDBANK=1. Capture the system-SE sample banks so their format
+                // can be decoded offline. Menu blips and hit sounds are played by the IOP out of
+                // these, driven by the RPC command (rpcNum 0xD) the EE sends per press -- that
+                // whole path is confirmed working; only the IOP side is missing. The banks arrive
+                // here as ordinary SIF DMA, so they can be grabbed without touching the 1.4 GB
+                // AFS: headers land at 0x1aa4800+ with byte-swapped "SCEI"/"Vers" magic, the
+                // sample data at 0x1a00000. Files are written next to the runner.
+                {
+                    static const bool s_bank = []() {
+                        const char *v = std::getenv("PS2X_SNDBANK");
+                        return v && v[0] && v[0] != '0';
+                    }();
+                    const uint32_t dst = static_cast<uint32_t>(xfer.dest);
+                    // Snapshot the SE sample blobs regardless of the capture flag: the staging
+                    // address is reused per bank, so reading them back later sees only the last
+                    // upload. Defined in game_overrides.cpp.
+                    if (dst == 0x01a00000u)
+                        if (const uint8_t *p = getConstMemPtr(rdram, xfer.src))
+                            bt3NoteSeBankBlob(p, static_cast<uint32_t>(xfer.size));
+                    if (s_bank && dst >= 0x01a00000u && dst < 0x01b00000u)
+                    {
+                        char path[64];
+                        std::snprintf(path, sizeof(path), "sndbank_%08x.bin", dst);
+                        if (const uint8_t *p = getConstMemPtr(rdram, xfer.src))
+                        {
+                            // Append: the same destination can be written more than once.
+                            if (std::FILE *f = std::fopen(path, "ab"))
+                            {
+                                std::fwrite(p, 1, static_cast<size_t>(xfer.size), f);
+                                std::fclose(f);
+                            }
+                            std::fprintf(stderr, "[sndbank] captured dst=0x%x size=%u -> %s\n",
+                                         dst, static_cast<uint32_t>(xfer.size), path);
                         }
                     }
                 }

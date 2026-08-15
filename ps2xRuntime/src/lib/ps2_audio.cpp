@@ -302,6 +302,32 @@ namespace
     }
 } // namespace
 
+void PS2AudioBackend::onStreamPcmMix(uint32_t streamId, const int16_t *samples,
+                                     uint32_t sampleCount, uint32_t sampleRate)
+{
+    if (!samples || sampleCount == 0u)
+        return;
+
+    std::lock_guard<std::mutex> lock(m_streamMutex);
+    StreamState &st = m_streams[streamId];
+    if (sampleRate)
+        st.sampleRate = sampleRate;
+
+    // ring[0] is the next sample the device will take, so mixing from index 0 starts this
+    // effect immediately rather than behind whatever is still queued.
+    if (st.ring.size() < sampleCount)
+        st.ring.resize(sampleCount, 0);
+    for (uint32_t i = 0; i < sampleCount; ++i)
+    {
+        int32_t v = static_cast<int32_t>(st.ring[i]) + static_cast<int32_t>(samples[i]);
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        st.ring[i] = static_cast<int16_t>(v);
+    }
+    ps2xStreamGrew(streamId);
+    ps2xStreamLevel(streamId, samples, sampleCount);
+}
+
 void PS2AudioBackend::onStreamPcm(uint32_t streamId, const int16_t *samples, uint32_t sampleCount,
                                   uint32_t sampleRate)
 {

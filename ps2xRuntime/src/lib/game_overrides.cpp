@@ -1011,6 +1011,357 @@ namespace
                          sink, s.streamId, (unsigned long long)flushed, dropped, kept);
     }
 
+    // ================== SYSTEM-SE PLAYBACK (menu blips, hit sounds) =====================
+    //
+    // The EE side is complete and verified: a keypress queues a command, the per-frame flush
+    // copies it to 0x300EC0 and sends it with sceSifCallRpc rpcNum 0xD. Only the IOP end is
+    // missing, so implement it here.
+    //
+    // Command payload (0x184 bytes at the send buffer):
+    //     +0x00 u32 count, then `count` entries of 12 bytes:
+    //     +0 u8 zero | +1 u8 t1 | +2 u16 seq | +4 u8 ID | +5 u8 a1 | +6 u8 VOL | +7 u8 PAN
+    //     +8 u32 param
+    //
+    // Sample banks arrive by SIF DMA and our SIF layer copies them into guest RAM, so they can
+    // simply be read back: chunked Sony sound-data format, big-endian FourCCs stored as LE
+    // words -- `SCEI`+`Vers`/`Head`/`Vagi`/`Setb`. The Vagi chunk is
+    //     payload: u32 count, u32 offsets[count] (relative to the payload),
+    //              then per-sample 8-byte records { u16 sampleRate, u16 flags, u32 dataOffset }
+    // dataOffset indexes the raw ADPCM blob uploaded to 0x1A00000. Observed rate 0x3e80 = 16000.
+    // Both sample blobs are DMA'd to the SAME address (0x1A00000): that is a STAGING buffer the
+    // IOP relocates into SPU2 RAM, so on hardware the banks coexist at different SPU2 addresses.
+    // Reading samples back from the staging address only ever sees the LAST upload -- bank A's
+    // 35 KB is overwritten by bank B's 656 KB -- which is why a correct index still produced the
+    // wrong sound. Snapshot each blob as it arrives instead, in upload order.
+    std::mutex g_seBlobM;
+    std::vector<std::vector<uint8_t>> g_seBlobs;
+
+    uint32_t seBlobCount()
+    {
+        std::lock_guard<std::mutex> lk(g_seBlobM);
+        return static_cast<uint32_t>(g_seBlobs.size());
+    }
+    // Read a byte out of snapshot `idx`; returns false past the end.
+    bool seBlobByte(uint32_t idx, uint32_t off, uint8_t &out)
+    {
+        std::lock_guard<std::mutex> lk(g_seBlobM);
+        if (idx >= g_seBlobs.size() || off >= g_seBlobs[idx].size())
+            return false;
+        out = g_seBlobs[idx][off];
+        return true;
+    }
+
+    constexpr uint32_t kSeBankData = 0x01a00000u;
+    constexpr uint32_t kSeBankHdrA = 0x01aa4800u; //  8 samples
+    constexpr uint32_t kSeBankHdrB = 0x01aa4c40u; // 79 samples
+    constexpr uint32_t kSeStreamId = 0xF0u;       // reserved backend stream for one-shot SE
+
+}  // namespace
+
+// Called from SIF.cpp for every DMA into the SE sample staging area. Each upload is snapshotted
+// in order, because the staging address is REUSED: without this, bank B's 656 KB overwrites
+// bank A's 35 KB and every bank-A sample decodes from the wrong bytes.
+void bt3NoteSeBankBlob(const uint8_t *data, uint32_t size)
+{
+    if (!data || !size)
+        return;
+    std::lock_guard<std::mutex> lk(g_seBlobM);
+    if (g_seBlobs.size() >= 8u)
+        return;
+    g_seBlobs.emplace_back(data, data + size);
+    std::fprintf(stderr, "[se] bank blob %zu captured (%u bytes)\n", g_seBlobs.size() - 1u, size);
+}
+
+namespace
+{
+    // Locate the Vagi chunk in a bank header and return {payloadAddr, count}.
+    bool seFindVagi(uint8_t *rdram, uint32_t hdr, uint32_t &payloadOut, uint32_t &countOut)
+    {
+        uint32_t o = hdr;
+        for (int guard = 0; guard < 16; ++guard)
+        {
+            const uint32_t magic = sndRd32(rdram, o);
+            if (magic != 0x53434549u) // 'SCEI'
+                return false;
+            const uint32_t tag = sndRd32(rdram, o + 4u);
+            const uint32_t size = sndRd32(rdram, o + 8u);
+            if (!size)
+                return false;
+            if (tag == 0x56616769u) // 'Vagi'
+            {
+                payloadOut = o + 12u;
+                countOut = sndRd32(rdram, payloadOut);
+                return true;
+            }
+            o += size;
+        }
+        return false;
+    }
+
+    // Sony 4-bit ADPCM, 16-byte blocks: [shift|filter][flags][14 data bytes].
+    // Headerless -- the bank stores raw blocks, unlike a .VAG file which our ps2_vag::decode
+    // expects to start with a 'VAGp' magic.
+    void seDecodeAdpcm(uint32_t blob, uint32_t addr, std::vector<int16_t> &out, uint32_t maxBlocks)
+    {
+        static const int kF0[5] = {0, 60, 115, 98, 122};
+        static const int kF1[5] = {0, 0, -52, -55, -60};
+        int32_t s1 = 0, s2 = 0;
+        uint8_t blk[16];
+        for (uint32_t b = 0; b < maxBlocks; ++b)
+        {
+            bool ok = true;
+            for (int j = 0; j < 16 && ok; ++j)
+                ok = seBlobByte(blob, addr + b * 16u + static_cast<uint32_t>(j), blk[j]);
+            if (!ok)
+                return;
+            uint32_t shift = blk[0] & 0x0Fu;
+            uint32_t filter = (blk[0] >> 4) & 0x07u;
+            if (shift > 12u) shift = 9u;
+            if (filter > 4u) filter = 0u;
+            const uint8_t flags = blk[1];
+            if (flags == 7u) // end marker
+                return;
+            for (int i = 0; i < 28; ++i)
+            {
+                const uint8_t byte = blk[2 + (i >> 1)];
+                int32_t nib = (i & 1) ? (byte >> 4) : (byte & 0x0F);
+                if (nib > 7) nib -= 16;
+                int32_t s = (nib << 12) >> shift;
+                s += (s1 * kF0[filter] + s2 * kF1[filter]) >> 6;
+                if (s > 32767) s = 32767;
+                if (s < -32768) s = -32768;
+                out.push_back(static_cast<int16_t>(s));
+                s2 = s1;
+                s1 = s;
+            }
+            if (flags & 1u) // loop/end of this sample
+                return;
+        }
+    }
+
+    // Locate one of the two UNLISTED samples parked at the front of a bank's ADPCM body.
+    //
+    // The Vagi table does not describe the whole body. Every bank stores two samples ahead of
+    // the first Vagi-referenced one -- in bank A the Vagi records start at 0x2870 and leave the
+    // preceding 10352 bytes unaccounted for; bank B leaves 9968 bytes the same way. Those two
+    // samples are the game's ids 0 and 1, which is the whole reason ids are two ahead of Vagi
+    // indices. Walking the block flags is the only way to find them: nothing points at them.
+    //
+    // Layout is plain Sony ADPCM framing -- blocks run until one sets flag bit 0 (end), then a
+    // single flags==7 block terminates, then the next sample begins.
+    bool seHeadSampleOffset(uint32_t blob, uint32_t want, uint32_t &offOut)
+    {
+        uint32_t sample = 0u, start = 0u;
+        for (uint32_t b = 0; b < 8192u; ++b)
+        {
+            uint8_t flags = 0u;
+            if (!seBlobByte(blob, b * 16u + 1u, flags))
+                return false;
+            if (flags == 7u) // terminator block; the next block opens the following sample
+            {
+                start = (b + 1u) * 16u;
+                continue;
+            }
+            if (flags & 1u) // end of the current sample
+            {
+                if (sample == want)
+                {
+                    offOut = start;
+                    return true;
+                }
+                ++sample;
+                start = (b + 1u) * 16u;
+            }
+        }
+        return false;
+    }
+
+    // PS2X_SELOG=1 -- log every sound effect the game asks for, uncapped, including the ones
+    // we decline. A silently dropped command looks exactly like a command that was never sent,
+    // which is what hid the menu cursor for so long, so misses are logged as loudly as hits.
+    bool seLogEnabled()
+    {
+        static const bool on = []() {
+            const char *v = std::getenv("PS2X_SELOG");
+            return v && v[0] && v[0] != '0';
+        }();
+        return on;
+    }
+
+    // Names for the effects identified by ear, so the log reads as sounds rather than numbers.
+    const char *seName(uint32_t bank, uint32_t idx)
+    {
+        if (bank == 1u)
+        {
+            if (idx == 0u) return " cursor";
+            if (idx == 1u) return " confirm";
+            if (idx == 4u) return " popup-open";
+            if (idx == 5u) return " popup-close";
+        }
+        return "";
+    }
+
+    void seDrop(uint32_t bank, uint32_t idx, const char *why)
+    {
+        if (seLogEnabled())
+            std::fprintf(stderr, "[se] bank%u id%u%s DROPPED -- %s\n",
+                         bank, idx, seName(bank, idx), why);
+    }
+
+    // Play one SE command entry.
+    void sePlay(uint8_t *rdram, PS2Runtime *runtime, uint32_t bank, uint32_t idx,
+                uint32_t vol, uint32_t pan)
+    {
+        if (!runtime)
+            return;
+        // Header <-> snapshot pairing follows UPLOAD ORDER: bank A's header (8 samples) arrives
+        // with the first blob, bank B's (79) with the second. Bank A is the small system set --
+        // menu cursor/confirm/cancel -- so try it first.
+        // Command entry +4 selects the BANK (1 = bank A / 8 samples, 2 = bank B / 79) and +5 is
+        // the sample index within it. Reading +4 as the sound id is why every menu action played
+        // the same sample: +4 barely varies, +5 is the real selector.
+        const uint32_t nblobs = seBlobCount();
+        const struct { uint32_t hdr; uint32_t blob; } banks[2] = {
+            {kSeBankHdrA, 0u}, {kSeBankHdrB, nblobs > 1u ? 1u : 0u}};
+        if (bank < 1u || bank > 2u)
+        {
+            seDrop(bank, idx, "bank out of range (only 1 and 2 are uploaded)");
+            return;
+        }
+        {
+            const auto &bk = banks[bank - 1u];
+            uint32_t pay = 0u, cnt = 0u;
+            if (bk.blob >= nblobs)
+            {
+                seDrop(bank, idx, "bank data not captured yet");
+                return;
+            }
+            // A bank's body holds TWO MORE samples than its Vagi table describes, sitting ahead
+            // of every Vagi-referenced one, and the game numbers all of them from zero. So:
+            //
+            //     id 0, 1   -> the two unlisted head samples (seHeadSampleOffset)
+            //     id 2+     -> Vagi entry (id - 2)
+            //
+            // That is where the -2 comes from -- not an off-by-one, just two samples the table
+            // never mentions. Confirmed by ear on disc-decoded audio: in bank A id 0 is the menu
+            // cursor and id 1 the confirm, while ids 4 and 5 are the popup open/close, which are
+            // Vagi entries 2 and 3. Bank B is built identically, so the same rule serves its
+            // ids (e.g. the observed 55/56).
+            //
+            // Do NOT "simplify" this to an identity map. Sesq, Setb and Vagi are each internally
+            // an identity map, and reasoning from that alone once led to exactly that mistake --
+            // the shift lives in the body layout, not in any of those tables.
+            uint32_t rate = 16000u;
+            uint32_t dataOff = 0u;
+            const bool head = (idx < 2u);
+            if (head)
+            {
+                if (!seHeadSampleOffset(bk.blob, idx, dataOff))
+                {
+                    seDrop(bank, idx, "head sample not found walking block flags");
+                    return;
+                }
+                // No Vagi record means no stored rate; the listed samples of both banks lead
+                // with 16 kHz, so follow entry 0 rather than hardcoding.
+                if (seFindVagi(rdram, bk.hdr, pay, cnt) && cnt)
+                {
+                    const uint32_t r0 = sndRd32(rdram, pay + 4u);
+                    const uint32_t v = sndRd32(rdram, pay + r0) & 0xFFFFu;
+                    if (v)
+                        rate = v;
+                }
+            }
+            else
+            {
+                const uint32_t sampleIdx = idx - 2u;
+                if (!seFindVagi(rdram, bk.hdr, pay, cnt) || sampleIdx >= cnt)
+                {
+                    seDrop(bank, idx, cnt ? "Vagi index past end of table" : "no Vagi chunk");
+                    return;
+                }
+                const uint32_t recOff = sndRd32(rdram, pay + 4u + sampleIdx * 4u);
+                const uint32_t rec = pay + recOff;
+                rate = sndRd32(rdram, rec) & 0xFFFFu;
+                dataOff = sndRd32(rdram, rec + 4u);
+            }
+            std::vector<int16_t> pcm;
+            pcm.reserve(4096);
+            seDecodeAdpcm(bk.blob, dataOff, pcm, 1024u);
+            if (pcm.empty())
+            {
+                seDrop(bank, idx, "decoded to zero samples (empty slot?)");
+                return;
+            }
+            const float g = static_cast<float>(vol) / 127.0f;
+            if (g < 0.99f)
+                for (auto &sm : pcm)
+                    sm = static_cast<int16_t>(static_cast<float>(sm) * g);
+            // MIX, don't append: effects overlap on the real SPU. Appending made rapid cursor
+            // presses queue and play one after another, falling further behind the menu with
+            // every press.
+            runtime->audioBackend().onStreamPcmMix(kSeStreamId, pcm.data(),
+                                                   static_cast<uint32_t>(pcm.size()),
+                                                   rate ? rate : 16000u);
+            static std::atomic<uint32_t> n{0};
+            const uint32_t k = n.fetch_add(1);
+            if (seLogEnabled() || k < 12u)
+            {
+                const uint32_t r = rate ? rate : 16000u;
+                std::fprintf(stderr, "[se] #%-4u bank%u id%-3u%-12s %-4s %5zu smp %4ums @%5uHz "
+                                     "vol=%-3u pan=%-3u dataOff=0x%x\n",
+                             k, bank, idx, seName(bank, idx), head ? "head" : "vagi",
+                             pcm.size(), static_cast<uint32_t>(pcm.size() * 1000u / r), r,
+                             vol, pan, dataOff);
+            }
+            return;
+        }
+        static std::atomic<uint32_t> miss{0};
+        if (miss.fetch_add(1) < 8u)
+            std::fprintf(stderr, "[se] bank%u sample%u NOT FOUND (blobs=%u)\n", bank, idx, nblobs);
+    }
+
+    // Hook on sceSifCallRpc: service the SE command the IOP would have handled.
+    PS2Runtime::RecompiledFunction g_orig2b48f0 = nullptr;
+    void bt3SeRpcSend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // 0x2b48f0
+    {
+        const uint32_t rpcNum = getRegU32(ctx, 5);
+        const uint32_t ra = getRegU32(ctx, 31);
+        const uint32_t sendBuf = getRegU32(ctx, 7);
+        // Only the SE service's payload send (from inside 0x123F48); rpcNum 9 is a per-frame
+        // prepare and 0/3/7 are bind/init.
+        static const bool s_on = []() {
+            const char *v = std::getenv("PS2X_SEPLAY");
+            return v && v[0] && v[0] != '0';
+        }();
+        if (s_on && ra == 0x00123f9cu && rpcNum == 0x0Du && sendBuf)
+        {
+            const uint32_t count = sndRd32(rdram, sendBuf);
+            for (uint32_t i = 0; i < count && i < 32u; ++i)
+            {
+                const uint32_t e = sendBuf + 4u + i * 12u;
+                const uint32_t bank = sndRd8(rdram, e + 4u);
+                const uint32_t idx = sndRd8(rdram, e + 5u);
+                const uint32_t vol = sndRd8(rdram, e + 6u);
+                const uint32_t pan = sndRd8(rdram, e + 7u);
+                // Log EVERY command, including ones sePlay declines -- a silently dropped
+                // command is indistinguishable from a missing request, and that hid what the
+                // menu cursor actually sends.
+                static std::atomic<uint32_t> cn{0};
+                const uint32_t ci = cn.fetch_add(1);
+                if (seLogEnabled() || ci < 40u)
+                {
+                    const uint32_t b0 = sndRd8(rdram, e + 0u), b1 = sndRd8(rdram, e + 1u);
+                    const uint32_t p8 = sndRd32(rdram, e + 8u);
+                    std::fprintf(stderr, "[secmd] #%u bank=%u idx=%u vol=%u pan=%u "
+                                         "| +0=%u +1=%u +8=0x%x\n",
+                                 ci, bank, idx, vol, pan, b0, b1, p8);
+                }
+                sePlay(rdram, runtime, bank, idx, vol, pan);
+            }
+        }
+        if (g_orig2b48f0) g_orig2b48f0(rdram, ctx, runtime);
+    }
+
     // [sndse] PS2X_SNDSE=1. Where do punch/explosion SFX actually go?
     //
     // Measured: they are NOT streamed PCM. Rings 4 and 10 each receive ONE ~250ms burst at
@@ -2796,6 +3147,14 @@ namespace
             g_orig281bb0 = runtime.lookupFunction(0x00281bb0u);
             if (g_orig281bb0) runtime.replaceFunction(0x00281bb0u, &bt3StreamGroupStart);
             else std::cerr << "[sndiop] 0x281bb0 (group start) not registered" << std::endl;
+        }
+        // [se] system-SE playback: service the RPC the IOP would have handled.
+        if (std::getenv("PS2X_SEPLAY"))
+        {
+            g_orig2b48f0 = runtime.lookupFunction(0x002b48f0u);
+            if (g_orig2b48f0) runtime.replaceFunction(0x002b48f0u, &bt3SeRpcSend);
+            std::fprintf(stderr, "[se] system-SE playback %s\n",
+                         g_orig2b48f0 ? "ARMED" : "FAILED (0x2b48f0 not registered)");
         }
         // [sndse] sound-engine lifecycle probe: what happens when a punch should sound?
         if (std::getenv("PS2X_SNDSE"))

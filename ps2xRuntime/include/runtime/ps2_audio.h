@@ -27,6 +27,14 @@ public:
     // AudioStream by serviceStreams(), which must be called from the render thread.
     void onStreamPcm(uint32_t streamId, const int16_t *samples, uint32_t sampleCount,
                      uint32_t sampleRate);
+    // One-shot SFX variant: MIXES into what is already queued instead of appending after it.
+    // Sound effects are not a stream -- on the real SPU each one takes its own voice and they
+    // overlap. Appending makes rapid effects (menu cursor spam) queue up and play one after the
+    // other, drifting further behind the action with every press. Mixing from the head of the
+    // buffer starts each effect at the next device chunk, so they overlap and the backlog can
+    // never grow past the longest single effect.
+    void onStreamPcmMix(uint32_t streamId, const int16_t *samples, uint32_t sampleCount,
+                        uint32_t sampleRate);
     void serviceStreams();
     // Backlog awaiting the device for ONE stream, in samples. The buffer-return pump uses this
     // to self-clock: hand a buffer back only when that stream has drained enough, so the guest
