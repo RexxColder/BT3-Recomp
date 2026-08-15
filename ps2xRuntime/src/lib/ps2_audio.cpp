@@ -458,7 +458,11 @@ void PS2AudioBackend::serviceStreams()
     {
         StreamState &L = itL->second;
         StreamState &R = itR->second;
-        if (!L.opened)
+        // Key the "already opened?" test on the PAIR stream, not on L.opened. They are not the
+        // same question: if the left side was ever seen alone it would have been opened as a
+        // mono stream, setting L.opened, and this block would then be skipped forever -- taking
+        // a reference to a default-constructed AudioStream below and playing into nothing.
+        if (m_impl->streams.find(kPairKey) == m_impl->streams.end())
         {
             SetAudioStreamBufferSizeDefault(static_cast<int>(kStreamChunkFrames));
             m_impl->streams[kPairKey] = LoadAudioStream(L.sampleRate, 16, 2);
@@ -561,7 +565,12 @@ void PS2AudioBackend::serviceStreams()
     {
         const uint32_t id = entry.first;
         StreamState &st = entry.second;
-        if (paired && (id == kLeftId || id == kRightId))
+        // Reserve the BGM pair for the pair path UNCONDITIONALLY, not just once both sides have
+        // arrived. Their first DMAs land microseconds apart, so a serviceStreams call landing
+        // between them would otherwise open the left channel as a lone MONO stream -- after
+        // which the pair can never form and the BGM is silent for the rest of the run. That is
+        // a pure startup race: it depends only on which side's first transfer wins.
+        if (!s_noPair && (id == kLeftId || id == kRightId))
             continue; // handled above as one stereo stream
 
         // PS2X_SNDCHANNELS: how to interpret the payload. If the game is actually sending
