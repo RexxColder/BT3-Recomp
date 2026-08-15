@@ -2313,7 +2313,11 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         static const bool s_noff = [](){ const char *v = std::getenv("PS2X_NOFROMFBO"); return v && v[0] && v[0] != '0'; }();
         // Default ON while the fight-texture bug is live (opt out with PS2X_SRCDIAG=0);
         // remove the whole diag once resolved.
-        static const bool s_srcDiag = [](){ const char *v = std::getenv("PS2X_SRCDIAG"); return !(v && v[0] == '0'); }();
+        // OPT-IN. This path is not just logging: the snapshot code below calls
+        // flushBatchCounted() and dumpBoundFbo(), a synchronous glReadPixels of the bound
+        // FBO, at twelve draw-count marks -- forced batch flushes plus blocking GPU
+        // readbacks mid-render. It also writes probefb_*.ppm files unprompted.
+        static const bool s_srcDiag = [](){ const char *v = std::getenv("PS2X_SRCDIAG"); return v && v[0] == '1'; }();
         if (s_srcDiag) { static bool s_once = false; if (!s_once) { s_once = true;
             std::fprintf(stderr, "[srcdiag] cfg noff=%d atlas=%d\n", s_noff ? 1 : 0, s_atlas ? 1 : 0);
             if (FILE *f = srcDiagFile()) { std::fprintf(f, "[srcdiag] cfg noff=%d atlas=%d\n", s_noff ? 1 : 0, s_atlas ? 1 : 0); std::fflush(f); } } }
