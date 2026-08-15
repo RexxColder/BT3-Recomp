@@ -21,6 +21,11 @@ FetchContent_Declare(
     toml11
     GIT_REPOSITORY https://github.com/ToruNiina/toml11.git
     GIT_TAG v4.4.0
+    GIT_SHALLOW TRUE
+    # toml11 carries its test suite in a submodule. Without this, configuring a fresh clone
+    # recursively inits it and sits on the network with no output -- which reads as a hang.
+    # Nothing here builds toml11's tests.
+    GIT_SUBMODULES ""
 )
 FetchContent_MakeAvailable(toml11)
 
