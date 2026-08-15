@@ -67,6 +67,9 @@ else()
         GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
         GIT_TAG "5.5" # we will migrate to 4.2.0 later, trust me it will be better
         GIT_PROGRESS TRUE
+        # Without this, a fresh clone pulls raylib's whole history: 60794 objects, ~350 MiB, for
+        # a pinned tag we only ever build one revision of. Depth 1 fetches a fraction of that.
+        GIT_SHALLOW TRUE
     )
     FetchContent_MakeAvailable(raylib)
 
