@@ -939,6 +939,28 @@ namespace
             return;
         if (sndRd32(rdram, sink + kSinkList1) == 0u)
             return; // nothing queued: the ring is already whole, leave it alone
+
+        // NEVER reset a ring whose audio is still playing. A reset only makes sense when the
+        // previous sound is genuinely over; doing it on every START breaks one-shot SFX, which
+        // restart constantly (measured: 57 stream 8 start/stops in one menu session):
+        //   drop the tail  -> the blip is discarded before the device ever plays it
+        //   keep the tail  -> the flush still hands the guest a whole 16KB free ring while we
+        //                     hold the old audio, so each restart injects another 8192 samples
+        //                     and the backlog grew to 113664 samples (~4.7s) and climbing
+        // Neither is right, because the ring did not need clearing at all. Leave it alone and
+        // let the IOP consumer drain it at the device's rate: the guest refills as space comes
+        // back, latency stays bounded, and nothing is thrown away.
+        if (runtime)
+        {
+            std::lock_guard<std::mutex> lk(g_iopSinkM);
+            auto it = g_iopSinks.find(sink);
+            if (it != g_iopSinks.end() && it->second.streamId != 0xFFFFFFFFu)
+            {
+                const auto prog = runtime->audioBackend().streamProgress(it->second.streamId);
+                if (prog.pending > 0u)
+                    return; // still audible: this is a retrigger, not a fresh stream
+            }
+        }
         std::lock_guard<std::mutex> lk(g_iopSinkM);
         auto it = g_iopSinks.find(sink);
         if (it == g_iopSinks.end())
