@@ -5,6 +5,7 @@
 #include <map>
 
 void bt3NoteSeBankBlob(const uint8_t *data, uint32_t size);
+void bt3NoteSeBankHeader(uint32_t dst, const uint8_t *data, uint32_t size);
 
 namespace ps2_stubs
 {
@@ -782,8 +783,37 @@ namespace ps2_stubs
                     // address is reused per bank, so reading them back later sees only the last
                     // upload. Defined in game_overrides.cpp.
                     if (dst == 0x01a00000u)
+                    {
                         if (const uint8_t *p = getConstMemPtr(rdram, xfer.src))
                             bt3NoteSeBankBlob(p, static_cast<uint32_t>(xfer.size));
+                    }
+                    else if (dst > 0x01a00000u && dst < 0x01b00000u)
+                    {
+                        // Bank headers land above the sample staging area, one per bank ahead of
+                        // its blob, so recording them keeps bank slot N paired with blob N.
+                        if (const uint8_t *p = getConstMemPtr(rdram, xfer.src))
+                            bt3NoteSeBankHeader(dst, p, static_cast<uint32_t>(xfer.size));
+                    }
+                    // [se] PS2X_SELOG=1 -- log EVERY transfer into the IOP sound region, not
+                    // just the one staging address we snapshot. Only two banks load at boot, so
+                    // sePlay maps bank 1/2 onto those two blobs; if fight effects live in banks
+                    // loaded later (or at a different staging address) this is what shows it.
+                    // Also flags whether a transfer looks like a SCEI bank header.
+                    {
+                        static const bool s_selog = []() {
+                            const char *v = std::getenv("PS2X_SELOG");
+                            return v && v[0] && v[0] != '0';
+                        }();
+                        if (s_selog && dst >= 0x01a00000u && dst < 0x01b00000u)
+                        {
+                            const uint8_t *p = getConstMemPtr(rdram, xfer.src);
+                            const bool scei = p && xfer.size >= 4u && p[0] == 'I' && p[1] == 'E' &&
+                                              p[2] == 'C' && p[3] == 'S';
+                            std::fprintf(stderr, "[se] sound-region upload dst=0x%x size=%u%s\n",
+                                         dst, static_cast<uint32_t>(xfer.size),
+                                         scei ? "  <- SCEI header" : "");
+                        }
+                    }
                     if (s_bank && dst >= 0x01a00000u && dst < 0x01b00000u)
                     {
                         char path[64];

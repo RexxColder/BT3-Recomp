@@ -1052,9 +1052,51 @@ namespace
     }
 
     constexpr uint32_t kSeBankData = 0x01a00000u;
-    constexpr uint32_t kSeBankHdrA = 0x01aa4800u; //  8 samples
-    constexpr uint32_t kSeBankHdrB = 0x01aa4c40u; // 79 samples
-    constexpr uint32_t kSeStreamId = 0xF0u;       // reserved backend stream for one-shot SE
+    constexpr uint32_t kSeStreamId = 0xF0u; // reserved backend stream for one-shot SE
+
+    // Bank header addresses, in upload order, so slot N pairs with blob N.
+    //
+    // The command's "bank" field is a BITMASK, not an index: observed values are 1, 2, 4, 8, 16
+    // and 32, i.e. slot = ctz(bank). A fight loads SIX banks, not the two present at boot:
+    //     slot 0  bank 1   AFS[330]   8 samples   menu/system
+    //     slot 1  bank 2   AFS[331]  79           system SE
+    //     slot 2  bank 4   AFS[329]  84           common fight SFX (punches, explosions)
+    //     slot 3  bank 8   a 10-sample bank
+    //     slot 4  bank 16  AFS[3194] 56           per-character
+    //     slot 5  bank 32  AFS[3207] 56           per-character
+    // Hardcoding two banks is why no hit ever sounded: every fight command was declined as
+    // "bank out of range". Headers are uploaded ahead of their sample blob, each bank as a
+    // (Vagi header, sequence) pair, so counting only Vagi-bearing uploads keeps slot == blob.
+    // Headers are SNAPSHOTTED, not read back from the IOP address they were sent to. Reading
+    // them back works for the two banks loaded at boot but not for the four a fight adds, which
+    // parse as having no Vagi chunk even though the bytes we saw on the way past plainly had
+    // one. Keeping our own copy sidesteps the question entirely, the same way blob snapshots
+    // already sidestep the reuse of the sample staging address.
+    struct SeBank
+    {
+        uint32_t addr = 0u;
+        std::vector<uint8_t> hdr;
+    };
+    std::vector<SeBank> g_seBankHdrs;
+    constexpr size_t kSeMaxBanks = 32u;
+
+    // Little-endian scalar reads out of a snapshot.
+    uint32_t seRd32(const std::vector<uint8_t> &b, uint32_t off)
+    {
+        if (off + 4u > b.size())
+            return 0u;
+        uint32_t v;
+        std::memcpy(&v, b.data() + off, 4);
+        return v;
+    }
+    uint32_t seRd16(const std::vector<uint8_t> &b, uint32_t off)
+    {
+        if (off + 2u > b.size())
+            return 0u;
+        uint16_t v;
+        std::memcpy(&v, b.data() + off, 2);
+        return v;
+    }
 
 }  // namespace
 
@@ -1066,14 +1108,71 @@ void bt3NoteSeBankBlob(const uint8_t *data, uint32_t size)
     if (!data || !size)
         return;
     std::lock_guard<std::mutex> lk(g_seBlobM);
-    if (g_seBlobs.size() >= 8u)
+    if (g_seBlobs.size() >= kSeMaxBanks)
         return;
     g_seBlobs.emplace_back(data, data + size);
     std::fprintf(stderr, "[se] bank blob %zu captured (%u bytes)\n", g_seBlobs.size() - 1u, size);
 }
 
+// Called from SIF.cpp for every DMA into the IOP sound region. A bank's header is uploaded
+// before its sample blob, so recording the Vagi-bearing ones in order keeps header slot N
+// paired with blob N. Sequence (Sequ/Sesq) uploads share the SCEI container but carry no Vagi
+// chunk, and must not be counted or every slot after the first would be off by one.
+void bt3NoteSeBankHeader(uint32_t dst, const uint8_t *data, uint32_t size)
+{
+    if (!data || size < 24u)
+        return;
+    bool hasVagi = false;
+    for (uint32_t o = 0, guard = 0; o + 12u <= size && guard < 16u; ++guard)
+    {
+        uint32_t magic, tag, len;
+        std::memcpy(&magic, data + o, 4);
+        std::memcpy(&tag, data + o + 4, 4);
+        std::memcpy(&len, data + o + 8, 4);
+        if (magic != 0x53434549u || !len) // 'SCEI'
+            break;
+        if (tag == 0x56616769u) // 'Vagi'
+        {
+            hasVagi = true;
+            break;
+        }
+        o += len;
+    }
+    if (!hasVagi)
+        return;
+    std::lock_guard<std::mutex> lk(g_seBlobM);
+    if (g_seBankHdrs.size() >= kSeMaxBanks)
+        return;
+    g_seBankHdrs.push_back(SeBank{dst, std::vector<uint8_t>(data, data + size)});
+    std::fprintf(stderr, "[se] bank header slot %zu at 0x%x (%u bytes)\n",
+                 g_seBankHdrs.size() - 1u, dst, size);
+}
+
 namespace
 {
+    // Locate the Vagi chunk in a SNAPSHOTTED bank header; offsets are snapshot-relative.
+    bool seFindVagiSnap(const std::vector<uint8_t> &h, uint32_t &payloadOut, uint32_t &countOut)
+    {
+        uint32_t o = 0u;
+        for (int guard = 0; guard < 16; ++guard)
+        {
+            if (seRd32(h, o) != 0x53434549u) // 'SCEI'
+                return false;
+            const uint32_t tag = seRd32(h, o + 4u);
+            const uint32_t size = seRd32(h, o + 8u);
+            if (!size)
+                return false;
+            if (tag == 0x56616769u) // 'Vagi'
+            {
+                payloadOut = o + 12u;
+                countOut = seRd32(h, payloadOut);
+                return true;
+            }
+            o += size;
+        }
+        return false;
+    }
+
     // Locate the Vagi chunk in a bank header and return {payloadAddr, count}.
     bool seFindVagi(uint8_t *rdram, uint32_t hdr, uint32_t &payloadOut, uint32_t &countOut)
     {
@@ -1221,15 +1320,27 @@ namespace
         // the sample index within it. Reading +4 as the sound id is why every menu action played
         // the same sample: +4 barely varies, +5 is the real selector.
         const uint32_t nblobs = seBlobCount();
-        const struct { uint32_t hdr; uint32_t blob; } banks[2] = {
-            {kSeBankHdrA, 0u}, {kSeBankHdrB, nblobs > 1u ? 1u : 0u}};
-        if (bank < 1u || bank > 2u)
+        // `bank` is a bitmask -- one bit per loaded bank slot.
+        if (bank == 0u || (bank & (bank - 1u)) != 0u)
         {
-            seDrop(bank, idx, "bank out of range (only 1 and 2 are uploaded)");
+            seDrop(bank, idx, "bank is not a single slot bit");
             return;
         }
+        const uint32_t slot = static_cast<uint32_t>(__builtin_ctz(bank));
         {
-            const auto &bk = banks[bank - 1u];
+            std::vector<uint8_t> hdrSnap;
+            uint32_t hdrAddr = 0u;
+            {
+                std::lock_guard<std::mutex> lk(g_seBlobM);
+                if (slot >= g_seBankHdrs.size())
+                {
+                    seDrop(bank, idx, "no header captured for this slot");
+                    return;
+                }
+                hdrSnap = g_seBankHdrs[slot].hdr;
+                hdrAddr = g_seBankHdrs[slot].addr;
+            }
+            const struct { uint32_t hdr; uint32_t blob; } bk{hdrAddr, slot};
             uint32_t pay = 0u, cnt = 0u;
             if (bk.blob >= nblobs)
             {
@@ -1263,10 +1374,10 @@ namespace
                 }
                 // No Vagi record means no stored rate; the listed samples of both banks lead
                 // with 16 kHz, so follow entry 0 rather than hardcoding.
-                if (seFindVagi(rdram, bk.hdr, pay, cnt) && cnt)
+                if (seFindVagiSnap(hdrSnap, pay, cnt) && cnt)
                 {
-                    const uint32_t r0 = sndRd32(rdram, pay + 4u);
-                    const uint32_t v = sndRd32(rdram, pay + r0) & 0xFFFFu;
+                    const uint32_t r0 = seRd32(hdrSnap, pay + 4u);
+                    const uint32_t v = seRd16(hdrSnap, pay + r0);
                     if (v)
                         rate = v;
                 }
@@ -1274,15 +1385,15 @@ namespace
             else
             {
                 const uint32_t sampleIdx = idx - 2u;
-                if (!seFindVagi(rdram, bk.hdr, pay, cnt) || sampleIdx >= cnt)
+                if (!seFindVagiSnap(hdrSnap, pay, cnt) || sampleIdx >= cnt)
                 {
                     seDrop(bank, idx, cnt ? "Vagi index past end of table" : "no Vagi chunk");
                     return;
                 }
-                const uint32_t recOff = sndRd32(rdram, pay + 4u + sampleIdx * 4u);
+                const uint32_t recOff = seRd32(hdrSnap, pay + 4u + sampleIdx * 4u);
                 const uint32_t rec = pay + recOff;
-                rate = sndRd32(rdram, rec) & 0xFFFFu;
-                dataOff = sndRd32(rdram, rec + 4u);
+                rate = seRd16(hdrSnap, rec);
+                dataOff = seRd32(hdrSnap, rec + 4u);
             }
             std::vector<int16_t> pcm;
             pcm.reserve(4096);
@@ -1307,9 +1418,9 @@ namespace
             if (seLogEnabled() || k < 12u)
             {
                 const uint32_t r = rate ? rate : 16000u;
-                std::fprintf(stderr, "[se] #%-4u bank%u id%-3u%-12s %-4s %5zu smp %4ums @%5uHz "
-                                     "vol=%-3u pan=%-3u dataOff=0x%x\n",
-                             k, bank, idx, seName(bank, idx), head ? "head" : "vagi",
+                std::fprintf(stderr, "[se] #%-4u slot%u(bank%-2u) id%-3u%-12s %-4s %5zu smp "
+                                     "%4ums @%5uHz vol=%-3u pan=%-3u dataOff=0x%x\n",
+                             k, slot, bank, idx, seName(bank, idx), head ? "head" : "vagi",
                              pcm.size(), static_cast<uint32_t>(pcm.size() * 1000u / r), r,
                              vol, pan, dataOff);
             }
