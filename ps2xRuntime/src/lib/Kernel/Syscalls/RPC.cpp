@@ -1632,6 +1632,10 @@ namespace ps2_syscalls
                                                      << " stk=(" << sendSizeStk << "," << recvBufStk << "," << recvSizeStk << "," << endFuncStk << "," << endParamStk << ")"
                                                      << " plausible=(" << (regPackPlausible ? 1 : 0) << "," << (stackPackPlausible ? 1 : 0) << ")"
                                                      << " force34=" << (forceStackForDtxCreate34 ? 1 : 0)
+                                                     // guest return address: identifies WHICH guest
+                                                     // function issues each sound URPC, so the call
+                                                     // graph can be walked up to the game-facing API.
+                                                     << " ra=0x" << std::hex << getRegU32(ctx, 31)
                                                      << std::dec << std::endl);
             ++dtxAbiLogCount;
         }

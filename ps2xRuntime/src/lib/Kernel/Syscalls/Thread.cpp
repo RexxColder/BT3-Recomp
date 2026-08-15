@@ -211,6 +211,17 @@ namespace ps2_syscalls
             g_threads[id] = info;
         }
 
+        // [threadlog] PS2X_THREADLOG=1: which guest threads exist and where they start.
+        // Needed for the audio work: BT3's sound service thread (entry 0x26d070) must run
+        // for the preload-completion handler to fire on the right thread. RUNTIME_LOG is
+        // compile-time gated and far too noisy, so log just this, opt-in.
+        {
+            static const bool s_tl = [](){ const char *v = std::getenv("PS2X_THREADLOG"); return v && v[0] == '1'; }();
+            if (s_tl)
+                std::cerr << "[threadlog] CreateThread id=" << id << " entry=0x" << std::hex
+                          << info->entry << " gp=0x" << info->gp << std::dec
+                          << " prio=" << info->priority << std::endl;
+        }
         RUNTIME_LOG("[CreateThread] id=" << id
                                          << " entry=0x" << std::hex << info->entry
                                          << " stack=0x" << info->stack
@@ -385,6 +396,12 @@ namespace ps2_syscalls
             SET_GPR_U32(threadCtx, 4, info->arg);
             SET_GPR_U32(threadCtx, 31, 0);
             threadCtx->pc = info->entry;
+            {   // [threadlog] a thread actually being dispatched (not merely created)
+                static const bool s_tl = [](){ const char *v = std::getenv("PS2X_THREADLOG"); return v && v[0] == '1'; }();
+                if (s_tl)
+                    std::cerr << "[threadlog] StartThread id=" << tid << " entry=0x" << std::hex
+                              << info->entry << std::dec << std::endl;
+            }
 
             g_currentThreadId = tid;
 
@@ -679,6 +696,28 @@ namespace ps2_syscalls
         setReturnS32(ctx, KE_OK);
     }
 
+    // The EE kernel returns the THREAD ID (not 0) from SuspendThread/ResumeThread on
+    // success. BT3's sound middleware depends on it: the sound service thread (tid6) is
+    // created, started, then suspended, and its only waker is
+    //     FUN_0026e160:  if (sub_0026D338(tid6) == tid6) FUN_0026d2d0(tid6);
+    //     sub_0026D338:  if (status == THS_SUSPEND || status == THS_WAITSUSPEND)
+    //                        return ResumeThread(tid);        // must yield tid
+    //                    return 0;
+    // Returning KE_OK(0) made that guard dead code AND consumed the suspend on the first
+    // kick, leaving tid6 in plain THS_WAIT(4) so every later kick short-circuited before
+    // even calling ResumeThread -> the sound thread slept forever, its slot-6 handler was
+    // never registered, the preload completion never ran, and the game never requested a
+    // single sound. Four independent call sites use the `== tid` idiom, so this is the ABI.
+    // Set PS2X_THIDRET=0 to restore the old KE_OK returns.
+    static bool thidRetEnabled()
+    {
+        static const bool s_on = []() {
+            const char *v = std::getenv("PS2X_THIDRET");
+            return !(v && v[0] == '0');
+        }();
+        return s_on;
+    }
+
     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
@@ -731,7 +770,7 @@ namespace ps2_syscalls
             }
         }
 
-        setReturnS32(ctx, KE_OK);
+        setReturnS32(ctx, thidRetEnabled() ? tid : KE_OK);
     }
 
     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -773,7 +812,7 @@ namespace ps2_syscalls
             }
         }
         info->cv.notify_all();
-        setReturnS32(ctx, KE_OK);
+        setReturnS32(ctx, thidRetEnabled() ? tid : KE_OK);
     }
 
     void GetThreadId(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

@@ -471,6 +471,1108 @@ namespace
     // run the original, and when it returns 0 (NOT ready) log the id + the resource's +0x58
     // state -> exactly which fight resource never becomes ready (the stuck load).
     PS2Runtime::RecompiledFunction g_orig252d78 = nullptr;
+    // [sndspin] PS2X_SNDREG=1 also counts iterations of the sound thread's dispatch call
+    // FUN_00286240 (which tail-calls FUN_00286050(slot=6)). The slot-6 table is empty, so
+    // the in-handler flag never sets and the table dump alone cannot tell us whether the
+    // thread is even running. If this count stays 0, the thread started but never gets
+    // scheduled — a completely different problem from an unregistered handler.
+    PS2Runtime::RecompiledFunction g_orig286240 = nullptr;
+    void bt3SoundDispatchCount(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00286240
+    {
+        static std::atomic<uint64_t> n{0};
+        const uint64_t k = n.fetch_add(1) + 1;
+        if (k == 1 || (k % 2000ull) == 0ull)
+            std::fprintf(stderr, "[sndspin] sound-thread dispatch iterations=%llu\n", (unsigned long long)k);
+        if (g_orig286240) g_orig286240(rdram, ctx, runtime);
+    }
+
+    // [sndwake] PS2X_SNDWAKE=1. The sound service thread (tid6, entry 0x26d070) does ONE
+    // loop pass, calls SleepThread at 0x26d15c, and is never woken again -- WakeupThread is
+    // called with target 1/4/5 but NEVER 6. Its waker is FUN_0026e160 (main thread), which
+    // gates the wake behind:
+    //     if (sub_0026D338(tid6) == tid6) FUN_0026d2d0(tid6);
+    // and sub_0026D338(tid) is
+    //     status = ReferThreadStatus(tid).status;
+    //     if (status == THS_SUSPEND(8) || status == THS_WAITSUSPEND(0xC))
+    //         return ResumeThread(tid);      // game expects this to yield tid
+    //     return 0;
+    // A thread parked in SleepThread reports THS_WAIT(4), so the guard returns 0 and the
+    // wake is skipped forever. Log (tid -> ret) at the decision point and count the waker's
+    // calls, so we can tell "guard never passes" from "waker never runs".
+    PS2Runtime::RecompiledFunction g_orig26d338 = nullptr;
+    void bt3SndResumeIfSusp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // sub_0026D338
+    {
+        const uint32_t tid = getRegU32(ctx, 4); // a0
+        if (g_orig26d338) g_orig26d338(rdram, ctx, runtime);
+        const uint32_t ret = getRegU32(ctx, 2); // v0
+        static std::atomic<uint32_t> n{0};
+        const uint32_t k = n.fetch_add(1);
+        if (k < 40u || (k % 500u) == 0u)
+            std::fprintf(stderr, "[sndwake] resumeIfSusp(tid=%u) -> %u  %s\n",
+                         tid, ret, (ret == tid && tid != 0) ? "WAKE" : "skip");
+    }
+    PS2Runtime::RecompiledFunction g_orig26e160 = nullptr;
+    void bt3SndKickProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_0026e160
+    {
+        static std::atomic<uint32_t> n{0};
+        const uint32_t k = n.fetch_add(1);
+        if (k < 4u || (k % 500u) == 0u)
+            std::fprintf(stderr, "[sndwake] kicker FUN_0026e160 calls=%u\n", k + 1u);
+        if (g_orig26e160) g_orig26e160(rdram, ctx, runtime);
+    }
+
+    // [sndcnt] PS2X_SNDCNT=1. The sound-ready handshake is a refcount at 0x2C9F14:
+    //   FUN_0026d810  ends with cnt++            (enqueue a pending sound operation)
+    //   sub_0026D9F0  does  cnt--; if(!cnt) FUN_0026d9a0()   (completion -> set ready)
+    //   FUN_0026e628  same decrement idiom, but NOTHING calls it (callback-table only)
+    //   sub_0026E290  the service routine; calls both, and gates its completion block on
+    //                 `bnel cnt,0` at 0x26e464 -- with cnt!=0 the whole block is skipped.
+    // cnt sticks at 1 forever: one enqueue, no matching completion. Count each stage so we
+    // can see which half runs.
+    std::atomic<uint32_t> g_sndSvc{0}, g_sndEnq{0}, g_sndDec{0};
+    PS2Runtime::RecompiledFunction g_orig26e290 = nullptr, g_orig26d810 = nullptr, g_orig26d9f0 = nullptr;
+    void bt3SndSvc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // sub_0026E290
+    {
+        g_sndSvc.fetch_add(1);
+        if (g_orig26e290) g_orig26e290(rdram, ctx, runtime);
+    }
+    void bt3SndEnq(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_0026d810
+    {
+        const uint32_t k = g_sndEnq.fetch_add(1);
+        if (k < 8u)
+            std::fprintf(stderr, "[sndcnt] ENQUEUE cnt++ #%u (a0=0x%x) ra=0x%x\n",
+                         k + 1u, getRegU32(ctx, 4), getRegU32(ctx, 31));
+        if (g_orig26d810) g_orig26d810(rdram, ctx, runtime);
+    }
+    void bt3SndDec(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // sub_0026D9F0
+    {
+        const uint32_t k = g_sndDec.fetch_add(1);
+        if (k < 8u)
+            std::fprintf(stderr, "[sndcnt] COMPLETE cnt-- #%u ra=0x%x\n", k + 1u, getRegU32(ctx, 31));
+        if (g_orig26d9f0) g_orig26d9f0(rdram, ctx, runtime);
+    }
+
+    // [sndapi] PS2X_SNDAPI=1. The game issues its 41 DTX URPCs at boot and then NEVER sends
+    // another sound command (no chunk/stream traffic, menu included). Is that because the
+    // game never asks, or because the engine swallows the ask? These are the game's
+    // most-called sound-wrapper entry points (ELF call-graph: functions in 0x264000-0x26c000
+    // called from outside it, ranked by distinct callers) -- 0x267ac8/0x267b00 are called
+    // from the menu/UI code at 0x217xxx-0x22xxxx. If these fire while the RPC count stays
+    // frozen, the request dies INSIDE the sound engine; if they never fire, the trigger is
+    // upstream game logic.
+    // Slots 0-2 are the game-facing wrapper API; 3-5 walk the URPC SEND chain, so we can see
+    // how far a request travels before it dies:
+    //   3 = 0x272d90  mid-level sound command  (callers 0x272930/0x272d60/0x272f90)
+    //   4 = 0x26ecd0  -> 0x281908 URPC command wrapper
+    //   5 = 0x27b998  the URPC sender itself (bottoms out in sceSifCallRpc; 41 calls at boot)
+    // Broad net over the game's sound-wrapper API: every entry point in 0x264000-0x26c000
+    // that the wider game calls, ranked by distinct callers (ELF call graph), plus the URPC
+    // sender at the bottom. The title screen HAS music on PCSX2, so at least one of these
+    // must fire there -- whichever does (or doesn't) tells us where the BGM request dies.
+    constexpr uint32_t kSndApiAddr[] = {
+        0x00267ac8u, // 26 callers (menu/UI)
+        0x00267b00u, // 17 callers (menu/UI)
+        0x002651c0u, //  8 callers -- the only one seen firing (4x, resource open)
+        0x00267ab8u, //  6
+        0x00265f40u, //  6
+        0x00265f70u, //  5
+        0x00265728u, //  5
+        0x002654a0u, //  5
+        0x00267958u, //  4
+        0x00265298u, //  4
+        0x00265108u, //  4
+        0x0027b998u, // the URPC sender (bottoms out in sceSifCallRpc)
+        // 12-19: the 8 DTX command wrappers that call the sender. If a post-init sound
+        // request reaches any of these, the break is below them (wrapper -> sender);
+        // if none is ever entered after init, the request dies higher up in the engine.
+        0x00280730u, 0x00280de8u, 0x00280eb0u, 0x00281908u,
+        0x00284bf8u, 0x00284da8u, 0x00284e00u, 0x00284fe0u,
+        // 20-23: menu/UI functions that CALL the sfx API 0x267ac8. That API has 132 call sites
+        // and was never invoked once during a full menu navigation, yet the call at 0x217374
+        // (inside 0x217200) is straight-line with NO guard -- so if the function runs, the
+        // sound fires. Therefore these functions must not be running at all. Hook them to
+        // confirm, and to find which code actually drives the menu instead.
+        0x00217200u, 0x002184a0u, 0x00219710u, 0x0021bb50u,
+        // 24-25: the stream class START and STOP methods.
+        //   0x28b428 START: pos[+0x3C]=0; state[+1]=1   (3 instructions)
+        //   0x28b438 STOP : state[+1]=0; then cancels the in-flight DMA
+        // The BGM goes state 1->0 at the title->menu transition and never returns to 1, with
+        // or without our pump. If START is never called again, the menu never asks for a
+        // stream at all; if it IS called and the stream still does not run, the fault is
+        // inside the start path.
+        0x0028b428u, 0x0028b438u,
+        // 26-27: the stream-manager methods that call START/STOP. 0x281bb0 has no direct jal
+        // callers (dispatched by pointer), so log its guest ra to get the next hop up the BGM
+        // chain: ? -> 0x281bb0 -> 0x28b428(START). If whatever calls it for the title track
+        // never runs at the menu, that caller is where the menu's BGM request dies.
+        0x00281bb0u, 0x00281870u,
+    };
+    constexpr int kSndApiCount = 28;
+    std::atomic<uint32_t> g_sndApi[kSndApiCount]{};
+    PS2Runtime::RecompiledFunction g_origSndApi[kSndApiCount] = {};
+    template <int N>
+    void bt3SndApiProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t k = g_sndApi[N].fetch_add(1);
+        const bool trace = (k < 6u) || (k % 500u) == 0u;
+        if (trace)
+            std::fprintf(stderr, "[sndapi] api%d call #%u ENTER a0=0x%x a1=0x%x ra=0x%x\n",
+                         N, k + 1u, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 31));
+        if (g_origSndApi[N]) g_origSndApi[N](rdram, ctx, runtime);
+        // sub_002651C0 opens with `do { h = func_2654D8(id); } while (!h);` -- an unbounded
+        // retry on a resource lookup. If an ENTER has no matching LEAVE, we are wedged in
+        // that spin and every later sound request is unreachable.
+        if (trace)
+            std::fprintf(stderr, "[sndapi] api%d call #%u LEAVE v0=0x%x\n", N, k + 1u, getRegU32(ctx, 2));
+    }
+
+    // Sink -> the IOP ring buffers observed on its free list, learned by the pump while the
+    // list is still armed. Hoisted to namespace scope because the STOP hook needs it too: it
+    // maps a stream object to its audio stream id (bufferPtr >> 14) so it can ask the backend
+    // whether that stream has actually drained.
+    struct SinkRing { std::vector<std::pair<uint32_t, uint32_t>> bufs; size_t next = 0; };
+    std::mutex g_sinkRingM;
+    std::map<uint32_t, SinkRing> g_sinkRings;
+    // The two sinks whose audio stream ids are 0 and 1 -- i.e. the L/R halves of the BGM.
+    uint32_t g_pairSink[2] = {0u, 0u};
+    uint64_t g_pairReturns[2] = {0u, 0u}; // buffers handed to each side, for balance
+
+    // ===================== IOP-side ring consumer (honest playback progress) =============
+    //
+    // BT3 moves streamed PCM through two instances of one linked-list buffer class: a SOURCE
+    // (the EE decoder's output) and a SINK (the IOP's ring). For both, list 0 is FREE SPACE
+    // and list 1 is FILLED DATA, and both lists live at [obj + 0x18 + mode*4]:
+    //
+    //   vtbl+0x18  take(mode, max, &out)   sub_002842F8 -- pop up to `max` bytes off list
+    //                                      `mode`; a full take unlinks the node and recycles
+    //                                      it onto [obj+0x14], a partial take trims in place
+    //   vtbl+0x1C  untake(mode, &desc)     hand an unused remainder back
+    //   vtbl+0x20  append(mode, &desc)     sub_00284498 -- append to list `mode`, MERGING with
+    //                                      the tail when it ends where the block starts
+    //                                      (only if [obj+5] == 1), else taking a pool node
+    //   node layout: +0 next, +8 ptr, +0xC len
+    //
+    // The stream tick sub_0028AE60 takes data from the source's list 1 and space from the
+    // sink's list 0, DMAs source -> sink, then appends the written region to the sink's
+    // list 1. On hardware the IOP closes the loop: it plays the sink's list 1 and returns
+    // that space to list 0. Since this build issues no URPC after init, that return is the
+    // ONLY playback-progress signal the EE ever receives -- it is simultaneously how the game
+    // paces its streaming, how it knows how much has been played, and how it decides a sound
+    // has drained.
+    //
+    // So emulate that consumer honestly: every tick, move exactly as many bytes from list 1
+    // to list 0 as the host device has really played, using the same list surgery the game
+    // performs itself. Nothing is invented -- no synthesised descriptors, no round-robined
+    // stale lengths, no node reuse -- so the structures only ever hold states the game could
+    // have produced, and the guest's own start/stop lifecycle stays in charge.
+    constexpr uint32_t kSinkRecycler = 0x14u; // node pool head
+    constexpr uint32_t kSinkList0 = 0x18u;    // free space
+    constexpr uint32_t kSinkList1 = 0x1Cu;    // filled data
+    constexpr uint32_t kSinkMerge = 0x05u;    // "may merge contiguous descriptors" flag
+    constexpr uint32_t kNodeNext = 0x00u, kNodePtr = 0x08u, kNodeLen = 0x0Cu;
+
+    inline uint32_t sndRd32(uint8_t *rdram, uint32_t addr)
+    {
+        const uint8_t *p = getMemPtr(rdram, addr & 0x1FFFFFFFu);
+        return p ? *reinterpret_cast<const uint32_t *>(p) : 0u;
+    }
+    inline void sndWr32(uint8_t *rdram, uint32_t addr, uint32_t val)
+    {
+        if (uint8_t *p = getMemPtr(rdram, addr & 0x1FFFFFFFu))
+            *reinterpret_cast<uint32_t *>(p) = val;
+    }
+    inline uint8_t sndRd8(uint8_t *rdram, uint32_t addr)
+    {
+        const uint8_t *p = getMemPtr(rdram, addr & 0x1FFFFFFFu);
+        return p ? *p : 0u;
+    }
+
+    // Append {ptr,len} to one of the object's lists exactly as sub_00284498 does. Returns
+    // false only when a node is needed and the pool is empty (the game raises its own error
+    // callback in that case; we leave the caller to undo and retry).
+    bool sndListAppend(uint8_t *rdram, uint32_t obj, uint32_t list, uint32_t ptr, uint32_t len)
+    {
+        if (!ptr || !len)
+            return true;
+        uint32_t link = obj + list; // slot the new node gets stored into
+        uint32_t tail = 0u;
+        for (uint32_t n = sndRd32(rdram, link); n; n = sndRd32(rdram, link))
+        {
+            tail = n;
+            link = n + kNodeNext;
+        }
+        if (tail && sndRd8(rdram, obj + kSinkMerge) == 1u &&
+            sndRd32(rdram, tail + kNodePtr) + sndRd32(rdram, tail + kNodeLen) == ptr)
+        {
+            sndWr32(rdram, tail + kNodeLen, sndRd32(rdram, tail + kNodeLen) + len);
+            return true; // merged -- costs no node, which is why the ring never leaks any
+        }
+        const uint32_t node = sndRd32(rdram, obj + kSinkRecycler);
+        if (!node)
+            return false;
+        sndWr32(rdram, obj + kSinkRecycler, sndRd32(rdram, node + kNodeNext));
+        sndWr32(rdram, node + kNodePtr, ptr);
+        sndWr32(rdram, node + kNodeLen, len);
+        sndWr32(rdram, node + kNodeNext, 0u);
+        sndWr32(rdram, link, node);
+        return true;
+    }
+
+    // Total bytes sitting in one of the object's lists.
+    uint64_t sndListBytes(uint8_t *rdram, uint32_t obj, uint32_t list)
+    {
+        uint64_t total = 0u;
+        uint32_t n = sndRd32(rdram, obj + list);
+        for (int guard = 0; n && guard < 256; ++guard)
+        {
+            total += sndRd32(rdram, n + kNodeLen);
+            n = sndRd32(rdram, n + kNodeNext);
+        }
+        return total;
+    }
+
+    struct IopSink
+    {
+        uint32_t streamId = 0xFFFFFFFFu;
+        uint64_t returnedBytes = 0u; // played bytes already handed back as free space
+        uint64_t heldBytes = 0u;     // bytes queued but not yet played (diagnostics)
+        bool wallClock = false;      // no host audio for this stream: fall back to a timer
+        std::chrono::steady_clock::time_point wallBase{};
+        uint64_t wallBaseBytes = 0u;
+        bool ringFullIdle = false;   // ring full but the device has not started playing
+        std::chrono::steady_clock::time_point ringFullSince{};
+    };
+    std::mutex g_iopSinkM;
+    std::map<uint32_t, IopSink> g_iopSinks;
+
+    bool sndIopEnabled()
+    {
+        static const bool s_on = []() {
+            const char *v = std::getenv("PS2X_SNDIOP");
+            return !(v && v[0] == '0'); // default ON; PS2X_SNDIOP=0 reverts to the old pump
+        }();
+        return s_on;
+    }
+    uint32_t sndDeclaredRate()
+    {
+        static const uint32_t s_rate = []() -> uint32_t {
+            if (const char *v = std::getenv("PS2X_SNDRATE"))
+            {
+                const long n = std::strtol(v, nullptr, 10);
+                if (n > 0) return static_cast<uint32_t>(n);
+            }
+            return 24000u; // same default SIF.cpp declares to the backend
+        }();
+        return s_rate;
+    }
+    bool sndIopLog()
+    {
+        static const bool s_on = []() {
+            const char *v = std::getenv("PS2X_SNDIOPLOG");
+            return v && v[0] && v[0] != '0';
+        }();
+        return s_on;
+    }
+
+    // Learn (or re-learn) which host audio stream a sink feeds. SIF.cpp splits streams by
+    // `dst >> 14`, and the stream object records the IOP destination of its last DMA at
+    // [obj+0x20], so the mapping comes straight from the transfer rather than a guess. The
+    // free-list head is the fallback for the very first tick, before any DMA has been queued.
+    void sndNoteSinkStream(uint8_t *rdram, PS2Runtime *runtime, uint32_t sink, uint32_t iopAddr)
+    {
+        if (!sink || !iopAddr || !runtime)
+            return;
+        // Resolve against the registered ring spans, never `iopAddr >> 14`: the rings are
+        // 0x100-staggered, so a DMA into the tail of one ring would otherwise re-map its sink
+        // onto the NEXT stream id and scramble that sink's accounting mid-playback.
+        const uint32_t id = runtime->audioBackend().streamIdForAddress(iopAddr);
+        std::lock_guard<std::mutex> lk(g_iopSinkM);
+        IopSink &s = g_iopSinks[sink];
+        if (s.streamId == id)
+            return;
+        // A fresh mapping must start from the CURRENT play count, not from zero -- otherwise
+        // the stream's whole history would be credited as free space in one go.
+        s.streamId = id;
+        s.returnedBytes = 0u;
+        s.wallClock = false;
+        s.ringFullIdle = false;
+        if (runtime)
+        {
+            const auto prog = runtime->audioBackend().streamProgress(id);
+            if (prog.known)
+                s.returnedBytes = (prog.consumedSamples + prog.gapSamples) * 2ull;
+        }
+        if (sndIopLog())
+            std::fprintf(stderr, "[sndiop] sink 0x%x -> stream %u (iop 0x%x)\n", sink, id, iopAddr);
+    }
+
+    // Hand back exactly the space the host device has finished playing.
+    void bt3SndIopConsume(uint8_t *rdram, PS2Runtime *runtime, uint32_t sink)
+    {
+        if (!sink || !runtime)
+            return;
+        std::lock_guard<std::mutex> lk(g_iopSinkM);
+        auto it = g_iopSinks.find(sink);
+        if (it == g_iopSinks.end() || it->second.streamId == 0xFFFFFFFFu)
+            return;
+        IopSink &s = it->second;
+        const uint64_t queued = sndListBytes(rdram, sink, kSinkList1);
+        s.heldBytes = queued;
+
+        uint64_t playedBytes = 0u;
+        const auto prog = runtime->audioBackend().streamProgress(s.streamId);
+        if (prog.known)
+        {
+            s.wallClock = false;
+            if (!prog.started)
+            {
+                // Still building the device's start cushion: genuinely nothing has played, so
+                // no space may be returned. But if the guest has filled its ring it cannot
+                // supply any more, and a cushion target above what the ring holds would then
+                // deadlock -- no playback, no returns, no more data, forever. Give the normal
+                // cushion a generous head start, then start with whatever is there.
+                const bool ringFull = queued && sndRd32(rdram, sink + kSinkList0) == 0u;
+                const auto now = std::chrono::steady_clock::now();
+                if (!ringFull)
+                {
+                    s.ringFullIdle = false;
+                }
+                else
+                {
+                    if (!s.ringFullIdle)
+                    {
+                        s.ringFullIdle = true;
+                        s.ringFullSince = now;
+                    }
+                    else if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now - s.ringFullSince).count() >= 500)
+                    {
+                        runtime->audioBackend().requestStreamStart(s.streamId);
+                    }
+                }
+                return;
+            }
+            s.ringFullIdle = false;
+            // gapSamples: guest PCM that never reached the device. It occupied ring space all
+            // the same, so it counts as consumed -- otherwise it is never returned and the ring
+            // loses that much capacity permanently.
+            playedBytes = (prog.consumedSamples + prog.gapSamples) * 2ull;
+        }
+        else
+        {
+            // Nothing is rendering this stream (PS2X_SNDPLAY off, or an id the DMA path never
+            // feeds). Advance on a wall clock at the declared rate so the guest's sound engine
+            // still runs instead of wedging on a ring that never drains.
+            const auto now = std::chrono::steady_clock::now();
+            if (!s.wallClock)
+            {
+                s.wallClock = true;
+                s.wallBase = now;
+                s.wallBaseBytes = s.returnedBytes;
+            }
+            const uint64_t ms = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - s.wallBase).count());
+            playedBytes = s.wallBaseBytes + (ms * sndDeclaredRate() * 2ull) / 1000ull;
+        }
+        if (playedBytes <= s.returnedBytes)
+            return;
+
+        uint64_t want = playedBytes - s.returnedBytes;
+        while (want)
+        {
+            const uint32_t head = sndRd32(rdram, sink + kSinkList1);
+            if (!head)
+                break; // the device is ahead of the guest; the credit stays banked
+            const uint32_t ptr = sndRd32(rdram, head + kNodePtr);
+            const uint32_t len = sndRd32(rdram, head + kNodeLen);
+            if (!ptr || !len)
+                break;
+            const uint32_t take = static_cast<uint32_t>(std::min<uint64_t>(want, len));
+            if (take == len)
+            {
+                sndWr32(rdram, sink + kSinkList1, sndRd32(rdram, head + kNodeNext));
+                sndWr32(rdram, head + kNodeNext, sndRd32(rdram, sink + kSinkRecycler));
+                sndWr32(rdram, sink + kSinkRecycler, head); // full take recycles the node
+            }
+            else
+            {
+                sndWr32(rdram, head + kNodePtr, ptr + take);
+                sndWr32(rdram, head + kNodeLen, len - take);
+            }
+            if (!sndListAppend(rdram, sink, kSinkList0, ptr, take))
+            {
+                // Only reachable after a partial take, since a full take recycles the very node
+                // the append would need. Undo it and try again next tick.
+                sndWr32(rdram, head + kNodePtr, ptr);
+                sndWr32(rdram, head + kNodeLen, len);
+                break;
+            }
+            s.returnedBytes += take;
+            want -= take;
+        }
+
+        if (sndIopLog())
+        {
+            static std::atomic<uint32_t> n{0};
+            const uint32_t k = n.fetch_add(1);
+            if (k < 8u || (k % 400u) == 0u)
+                std::fprintf(stderr,
+                             "[sndiop] #%u sink=0x%x stream=%u played=%llu returned=%llu "
+                             "queued=%llu free=%llu pend=%zu merge=%u pool=%s%s\n",
+                             k + 1u, sink, s.streamId, (unsigned long long)playedBytes,
+                             (unsigned long long)s.returnedBytes, (unsigned long long)queued,
+                             (unsigned long long)sndListBytes(rdram, sink, kSinkList0),
+                             prog.pending, sndRd8(rdram, sink + kSinkMerge),
+                             sndRd32(rdram, sink + kSinkRecycler) ? "ok" : "EMPTY",
+                             s.wallClock ? " [wallclock]" : "");
+        }
+    }
+
+    // A stream restart must find the ring exactly as the game left it at creation: the whole
+    // buffer free, nothing queued. 0x281bb0 asserts on that (it takes the sink's entire free
+    // list and infinite-loops at 0x281cf0 if the length is not the expected prefill), and the
+    // IOP resets its ring on start too. So flush anything still filled back to the free list
+    // and drop the matching host-side audio, then rebase the play clock.
+    void bt3SndIopResetSink(uint8_t *rdram, PS2Runtime *runtime, uint32_t sink)
+    {
+        if (!sink)
+            return;
+        if (sndRd32(rdram, sink + kSinkList1) == 0u)
+            return; // nothing queued: the ring is already whole, leave it alone
+        std::lock_guard<std::mutex> lk(g_iopSinkM);
+        auto it = g_iopSinks.find(sink);
+        if (it == g_iopSinks.end())
+            return;
+        IopSink &s = it->second;
+        uint64_t flushed = 0u;
+        for (int guard = 0; guard < 256; ++guard)
+        {
+            const uint32_t head = sndRd32(rdram, sink + kSinkList1);
+            if (!head)
+                break;
+            const uint32_t ptr = sndRd32(rdram, head + kNodePtr);
+            const uint32_t len = sndRd32(rdram, head + kNodeLen);
+            sndWr32(rdram, sink + kSinkList1, sndRd32(rdram, head + kNodeNext));
+            sndWr32(rdram, head + kNodeNext, sndRd32(rdram, sink + kSinkRecycler));
+            sndWr32(rdram, sink + kSinkRecycler, head);
+            if (!sndListAppend(rdram, sink, kSinkList0, ptr, len))
+                break;
+            flushed += len;
+        }
+        // What to do with audio the previous stream queued but the device has not reached yet.
+        // Hardware discards it -- the IOP resets its ring on start -- and our backend queue is
+        // that ring's shadow, so dropping is the faithful model and keeps the two in step.
+        // PS2X_SNDKEEPTAIL=1 instead lets the tail play out and simply refuses to credit it as
+        // free space; use that if a legitimate line ever gets clipped at its end.
+        static const bool s_keepTail = []() {
+            const char *v = std::getenv("PS2X_SNDKEEPTAIL");
+            return v && v[0] && v[0] != '0';
+        }();
+        size_t dropped = 0u, kept = 0u;
+        if (runtime && s.streamId != 0xFFFFFFFFu)
+        {
+            if (!s_keepTail)
+                dropped = runtime->audioBackend().dropStreamPending(s.streamId);
+            const auto prog = runtime->audioBackend().streamProgress(s.streamId);
+            kept = prog.pending;
+            // Rebase the play clock. `pending` is audio already counted into the ring we just
+            // flushed, so it must not be credited a second time as it drains.
+            s.returnedBytes = prog.known
+                                  ? (prog.consumedSamples + prog.gapSamples + prog.pending) * 2ull
+                                  : 0u;
+        }
+        s.wallClock = false;
+        s.ringFullIdle = false;
+        if (flushed || dropped || kept)
+            std::fprintf(stderr,
+                         "[sndiop] reset sink=0x%x stream=%u flushed=%llu bytes | tail dropped=%zu kept=%zu samples\n",
+                         sink, s.streamId, (unsigned long long)flushed, dropped, kept);
+    }
+
+    // [sndse] PS2X_SNDSE=1. Where do punch/explosion SFX actually go?
+    //
+    // Measured: they are NOT streamed PCM. Rings 4 and 10 each receive ONE ~250ms burst at
+    // fight load and nothing per hit, so the "SE are EE-rendered like the BGM" theory is dead.
+    // The open question is which path a hit sound takes instead, and the way to answer it is to
+    // watch the sound engine's own lifecycle while someone punches:
+    //   0x272930  create streamed-sound player (16 slots x 200 bytes at 0x2c9288)
+    //   0x273030  player START   (sets state [player+1] = 1)
+    //   0x2733a0  player STOP
+    //   0x28b310  allocate a stream object (a0 = source, a1 = sink)
+    //   0x2654a0  load/play-by-id -- the entry the overlay menu code uses (a0 = resource id)
+    //   0x265728  the 6-slot wait/drain loop
+    // If a hit produces player creates/starts, SE go through the streaming engine and the fault
+    // is downstream of it. If it produces nothing, the request leaves the EE some other way and
+    // the next place to look is the SIF DMA / RPC traffic that accompanies it.
+    constexpr uint32_t kSndSeAddr[] = {0x00272930u, 0x00273030u, 0x002733a0u,
+                                       0x0028b310u, 0x002654a0u, 0x00265728u};
+    constexpr const char *kSndSeName[] = {"playerCreate", "playerSTART", "playerSTOP",
+                                          "streamAlloc", "loadById", "waitSlots"};
+    constexpr int kSndSeCount = 6;
+    std::atomic<uint32_t> g_sndSe[kSndSeCount]{};
+    PS2Runtime::RecompiledFunction g_origSndSe[kSndSeCount] = {};
+
+    template <int N>
+    void bt3SndSeProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t k = g_sndSe[N].fetch_add(1);
+        // Every call for the first few, then sparse: a hit sound is a RATE question, so the
+        // early ones are what matter and a flood would hide them.
+        if (k < 24u || (k % 50u) == 0u)
+            std::fprintf(stderr, "[sndse] %s #%u a0=0x%x a1=0x%x a2=0x%x ra=0x%x\n",
+                         kSndSeName[N], k + 1u, getRegU32(ctx, 4), getRegU32(ctx, 5),
+                         getRegU32(ctx, 6), getRegU32(ctx, 31));
+        if (g_origSndSe[N]) g_origSndSe[N](rdram, ctx, runtime);
+    }
+
+    // 0x281bb0 START-WHEN-READY, run every frame for each stream group whose start flag
+    // [group+0x58] is 1. Before it calls 0x28b428 it ASSERTS on the ring being whole: for each
+    // channel it takes the sink's entire free list and infinite-loops at 0x281cf0 unless the
+    // length equals the group's prefill [group+0x2C]. That check runs BEFORE the start method,
+    // so the ring has to be reset here rather than in the 0x28b428 hook -- otherwise a restart
+    // that finds anything still queued hangs the sound thread in that loop.
+    // Group layout: [+0x52] channel count, [+0x10 + i*4] the stream objects (sink at [obj+8]).
+    PS2Runtime::RecompiledFunction g_orig281bb0 = nullptr;
+    void bt3StreamGroupStart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // 0x281bb0
+    {
+        if (sndIopEnabled())
+        {
+            const uint32_t group = getRegU32(ctx, 4);
+            const uint8_t *req = getMemPtr(rdram, (group + 0x58u) & 0x1FFFFFFFu);
+            const uint8_t *cnt = getMemPtr(rdram, (group + 0x52u) & 0x1FFFFFFFu);
+            if (req && *req == 1u && cnt)
+            {
+                const int channels = static_cast<int8_t>(*cnt);
+                for (int i = 0; i < channels && i < 8; ++i)
+                {
+                    const uint32_t so = sndRd32(rdram, group + 0x10u + static_cast<uint32_t>(i) * 4u);
+                    if (!so || sndRd8(rdram, so + 1u) == 1u)
+                        continue; // already running -- this loop is not its start
+                    bt3SndIopResetSink(rdram, runtime, sndRd32(rdram, so + 8u));
+                }
+            }
+        }
+        if (g_orig281bb0) g_orig281bb0(rdram, ctx, runtime);
+    }
+
+    // [sndstream] PS2X_SNDSTREAM=1. sub_0028AE60(streamObj) is the audio-stream tick that
+    // pushes PCM to the IOP by SIF DMA (its sceSifSetDma call returns to 0x28b13c). Layout:
+    //   [+1]    stream state   (must be 1 or the tick exits immediately)
+    //   [+2]    "DMA in flight" flag; set after a push, cleared on the poll path
+    //   [+0x10] bytes the IOP reports consumed this poll
+    //   [+0x3C] accumulated playback position (+= [+0x10])
+    // Each destination got exactly ONE transfer, so either this tick stops running or the
+    // consumed count stays 0 (nothing drains the buffer) and it never queues the next block.
+    PS2Runtime::RecompiledFunction g_orig28ae60 = nullptr;
+    void bt3SndStreamTick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // sub_0028AE60
+    {
+        const uint32_t obj = getRegU32(ctx, 4);
+        auto rd8 = [&](uint32_t off) -> uint32_t {
+            const uint8_t *p = getMemPtr(rdram, (obj + off) & 0x1FFFFFFFu);
+            return p ? *p : 0xFFu; };
+        auto rd32 = [&](uint32_t off) -> uint32_t {
+            const uint8_t *p = getMemPtr(rdram, (obj + off) & 0x1FFFFFFFu);
+            return p ? *reinterpret_cast<const uint32_t *>(p) : 0u; };
+        static std::atomic<uint32_t> n{0};
+        const uint32_t k = n.fetch_add(1);
+        const uint32_t state = rd8(1);
+        // NOTE: a plain "every Nth tick" sample aliases badly here -- the tick cycles over
+        // ~10 stream objects, so k%300 lands on the SAME object forever and hides the others.
+        // Log whenever a stream is actually ACTIVE (state!=0), which is the case of interest,
+        // plus the first few ticks for layout confirmation.
+        // Log every STATE TRANSITION per stream object, plus a periodic sample while active.
+        // A flat "first N active ticks" cap only covers the opening seconds -- precisely the
+        // window BEFORE the ~2s cutout -- so it can never show what changes AT the cutout.
+        // If state flips 1 -> 0 there, the game stopped the stream itself (scene/state change)
+        // and the pump is innocent; if it stays 1 while transfers dry up, we are starving it.
+        static std::mutex s_stM;
+        static std::map<uint32_t, uint32_t> s_lastState;
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lk(s_stM);
+            auto it = s_lastState.find(obj);
+            if (it == s_lastState.end() || it->second != state)
+            {
+                changed = true;
+                s_lastState[obj] = state;
+            }
+        }
+        // This hook is now installed whenever audio is on, so every diagnostic in it has to
+        // sit behind PS2X_SNDSTREAM -- an unconditional fprintf here runs on the sound thread
+        // thousands of times a second.
+        static const bool s_streamLog = []() {
+            const char *v = std::getenv("PS2X_SNDSTREAM");
+            return v && v[0] && v[0] != '0';
+        }();
+        static std::atomic<uint32_t> act{0};
+        if (s_streamLog && (k < 10u || changed || (state != 0u && (act.fetch_add(1) % 120u) == 0u)))
+        {
+            // Resolve the two virtual calls that report playback progress:
+            //   0x28aea8: [obj+4]->vtbl[+0x20](this, 0, &obj[+0x0C])
+            //   0x28aec8: [obj+8]->vtbl[+0x20](this, 1, &obj[+0x14])
+            // Their OUT param lands in [+0x10] (bytes consumed). Whichever function backs
+            // vtbl+0x20 is what must report drain progress for the refill gate to reopen.
+            const uint32_t o4 = rd32(4), o8 = rd32(8);
+            auto deref = [&](uint32_t addr, uint32_t off) -> uint32_t {
+                const uint8_t *p = getMemPtr(rdram, (addr + off) & 0x1FFFFFFFu);
+                return p ? *reinterpret_cast<const uint32_t *>(p) : 0u; };
+            const uint32_t vt4 = o4 ? deref(o4, 0) : 0u;
+            const uint32_t vt8 = o8 ? deref(o8, 0) : 0u;
+            // The refill gate is `blezl $s1` at 0x28b000, where s1 = the SINK's free space.
+            // That space comes from a linked list of buffer descriptors at [sink+0x18+mode*4]
+            // (mode 0 here): sub_002842F8 returns 0 when the list head is null (0x28438c),
+            // and each pop recycles the node onto sink->freelist at [sink+0x14] (0x2843d8).
+            // If freeList goes null while freeNodes accumulates, the ring drained into the
+            // recycler and nothing ever hands buffers back -- that is the whole bug.
+            std::fprintf(stderr,
+                         "[sndstream] tick#%u obj=0x%x state=%u inflight=%u resid=%u pos=%u "
+                         "| src=0x%x fn=0x%x | sink=0x%x fn=0x%x freeList[+0x18]=0x%x recycler[+0x14]=0x%x\n",
+                         k + 1u, obj, state, rd8(2), rd32(0x10), rd32(0x3C),
+                         o4, vt4 ? deref(vt4, 0x20) : 0u,
+                         o8, vt8 ? deref(vt8, 0x20) : 0u,
+                         o8 ? deref(o8, 0x18) : 0u, o8 ? deref(o8, 0x14) : 0u);
+        }
+        // ---- IOP-side ring consumer (default) ----------------------------------------
+        // Return exactly the space the host device has played. Runs before the game's own
+        // tick, on the same thread that drains the ring, and for stopped-but-allocated
+        // streams too so a tail left queued at STOP still drains away.
+        if (sndIopEnabled())
+        {
+            const uint32_t sink = rd32(8);
+            if (sink)
+            {
+                // Ring GEOMETRY. Whenever a sink is idle its free list is exactly one node
+                // spanning the whole ring, so that node is {base, size} -- and the geometry is
+                // what makes `iopAddr -> stream id` correct at the ring ends. Keep trying on
+                // every idle tick rather than only the first one: registerStreamRing dedupes,
+                // and a sink first seen mid-flight would otherwise never register at all and
+                // would fall back to the broken shift split for the rest of the run.
+                {
+                    const uint32_t head = sndRd32(rdram, sink + kSinkList0);
+                    if (head && runtime &&
+                        sndRd32(rdram, head + kNodeNext) == 0u &&
+                        sndRd32(rdram, sink + kSinkList1) == 0u)
+                    {
+                        runtime->audioBackend().registerStreamRing(sndRd32(rdram, head + kNodePtr),
+                                                                   sndRd32(rdram, head + kNodeLen));
+                    }
+                    // Then the sink -> stream mapping, if it does not have one yet. The DMA
+                    // destination recorded at [obj+0x20] is the authoritative source; the
+                    // free-list head only covers the ticks before the first transfer.
+                    bool known = false;
+                    {
+                        std::lock_guard<std::mutex> lk(g_iopSinkM);
+                        auto it = g_iopSinks.find(sink);
+                        known = (it != g_iopSinks.end() && it->second.streamId != 0xFFFFFFFFu);
+                    }
+                    if (!known && head)
+                        sndNoteSinkStream(rdram, runtime, sink, sndRd32(rdram, head + kNodePtr));
+                }
+                bt3SndIopConsume(rdram, runtime, sink);
+            }
+            if (g_orig28ae60) g_orig28ae60(rdram, ctx, runtime);
+            // A queued transfer records its IOP destination at [obj+0x20]; that is the exact
+            // same address SIF.cpp splits streams by, so take the mapping from the transfer
+            // rather than inferring it.
+            if (rd8(2) == 1u)
+                sndNoteSinkStream(rdram, runtime, rd32(8), rd32(0x20));
+            return;
+        }
+
+        // ---- PS2X_SNDPUMP=1: LEGACY. Superseded by the consumer above; kept behind
+        // PS2X_SNDIOP=0 as a rollback path only. It fabricates buffer returns from cached
+        // {ptr,len} descriptors on a backlog clock, which is what created the permanent L/R
+        // one-buffer offset and forced the blanket stop suppression. Do not extend it.
+        // On hardware the IOP hands each streaming buffer back once SPU2 has played it, which
+        // re-arms the sink's free list at [sink+0x18]. With no IOP the list drains into the
+        // recycler at [sink+0x14] and the refill gate (`blezl $s1` at 0x28b000) shuts forever
+        // -- the game stops streaming after filling the ring once.
+        //
+        // A recycled node still describes its own buffer: sub_002842F8 pops it by rewriting
+        // ONLY the two heads and node->next (0x2843c8/0x2843d0/0x2843d8) and never touches the
+        // {ptr,len} pair at node+8/+0xC. So giving a buffer back is a pure relink -- no address
+        // has to be invented. Layout: node+0 = next, node+8 = ptr, node+0xC = len.
+        //
+        // Only ever acts when the free list is EMPTY, so a list the game is actively using is
+        // never touched, and only from inside the stream tick (the same thread that drains it).
+        // Rate-limited to roughly playback speed; PS2X_SNDPUMP_MS overrides the per-buffer
+        // interval (default 50ms ~= 4864 bytes of 16-bit mono at ~48kHz).
+        static const bool s_pump = []() {
+            const char *v = std::getenv("PS2X_SNDPUMP");
+            return v && v[0] && v[0] != '0';
+        }();
+        if (s_pump && state == 1u)
+        {
+            static const long s_ms = []() -> long {
+                if (const char *v = std::getenv("PS2X_SNDPUMP_MS"))
+                {
+                    const long n = std::strtol(v, nullptr, 10);
+                    if (n > 0) return n;
+                }
+                return 50;
+            }();
+            const uint32_t sink = rd32(8);
+            auto peek = [&](uint32_t addr, uint32_t off) -> uint32_t {
+                const uint8_t *p = getMemPtr(rdram, (addr + off) & 0x1FFFFFFFu);
+                return p ? *reinterpret_cast<const uint32_t *>(p) : 0u; };
+            auto poke = [&](uint32_t addr, uint32_t off, uint32_t val) {
+                if (uint8_t *p = getMemPtr(rdram, (addr + off) & 0x1FFFFFFFu))
+                    *reinterpret_cast<uint32_t *>(p) = val; };
+
+            // The recycler at [sink+0x14] is a general node pool: it holds popped nodes AND
+            // virgin ones with {ptr,len} = {0,0}. Handing back a virgin node is useless -- the
+            // query returns len 0, the gate stays shut, and the node cycles back to us forever.
+            // So learn the real ring buffers by watching the free list while it is still
+            // armed, then write those {ptr,len} into whatever node we hand back.
+            const uint32_t head = sink ? peek(sink, 0x18) : 0u;
+            if (head)
+            {
+                const uint32_t bp = peek(head, 0x08), bl = peek(head, 0x0C);
+                if (bp && bl)
+                {
+                    std::lock_guard<std::mutex> lk(g_sinkRingM);
+                    auto &ring = g_sinkRings[sink];
+                    bool known = false;
+                    for (const auto &e : ring.bufs)
+                        if (e.first == bp) { known = true; break; }
+                    if (!known && ring.bufs.size() < 16u)
+                        ring.bufs.emplace_back(bp, bl);
+                    const uint32_t sid = bp >> 14;
+                    if (sid < 2u) g_pairSink[sid] = sink;
+                }
+            }
+
+            // NODE POOL EXHAUSTION (the ~2s cutout): popping a node off the recycler on every
+            // return drains the pool -- measured recycler 0x2db570 -> 0x590 -> 0x5c0 -> 0x620
+            // -> 0x0, after which the pump has nothing to hand over and the stream starves
+            // while state stays 1. Not all nodes come back through the recycler, so this is a
+            // one-way leak. Once the pool is dry, reuse the node we last handed over instead:
+            // the empty free list proves the game has already taken it, and the empty recycler
+            // proves it is not queued there, so it is unlinked and safe to re-arm.
+            static std::mutex s_nodeM;
+            static std::map<uint32_t, uint32_t> s_lastNode;
+            // STEREO LOCKSTEP: only advance a pair sink when its PARTNER is starved too.
+            // Otherwise one side can receive a buffer the other does not; the game then writes
+            // ~2432 extra samples into that channel and L[i]/R[i] refer to source times ~100ms
+            // apart FOREVER after -- heard as one ear suddenly lagging and staying behind.
+            // Gating both on the same backlog threshold (done earlier) equalises WHEN they are
+            // due, but not WHETHER each is starved, so it cannot prevent this on its own.
+            // Keep the two channels BALANCED rather than synchronised. Requiring both sides to
+            // be starved at the same instant deadlocks: if one side's free list stays armed,
+            // neither is ever fed, both run dry and the music cuts out. Instead just refuse to
+            // let either channel get more than one buffer ahead of the other -- that is all
+            // that is needed to stop a permanent L/R offset from forming, and it can never
+            // stall, because the lagging side is always allowed to catch up.
+            // NOTE: two attempts at enforcing L/R lockstep here were REVERTED --
+            //   (a) "both sinks must be starved" deadlocked whenever one side stayed armed:
+            //       neither got a buffer, both ran dry, BGM cut out;
+            //   (b) "never let one side get more than one ahead" stopped the pair being fed.
+            // The stereo offset is real, but it must be fixed WITHOUT gating the pump on the
+            // partner's state. See notes before trying again.
+            const bool pairReady = true;
+            const int pairIdx = -1;
+
+            if (sink && head == 0u && pairReady) // free list empty -> starved
+            {
+                uint32_t node = peek(sink, 0x14); // recycler head
+                bool reused = false;
+                if (!node)
+                {
+                    std::lock_guard<std::mutex> lk(s_nodeM);
+                    auto it = s_lastNode.find(sink);
+                    if (it != s_lastNode.end()) { node = it->second; reused = true; }
+                }
+                if (node)
+                {
+                    // SELF-CLOCKING: when the audio backend is consuming this stream, pace the
+                    // buffer return by its backlog rather than a wall clock. A fixed interval
+                    // has to guess the true sample rate; guess high and the backlog grows until
+                    // samples are dropped, guess low and the device underruns -- either way it
+                    // glitches. Gating on backlog makes the guest produce exactly as fast as
+                    // audio is consumed, whatever the real rate turns out to be.
+                    // PS2X_SNDPUMP_MS still applies as a fallback when nothing is consuming.
+                    // Pick the buffer FIRST: its address identifies which audio stream this
+                    // return feeds (streamId = ptr >> 14, same split SIF.cpp uses), so the
+                    // backlog gate can be per-stream instead of global.
+                    uint32_t bp = 0u, bl = 0u;
+                    {
+                        std::lock_guard<std::mutex> lk(g_sinkRingM);
+                        auto it = g_sinkRings.find(sink);
+                        if (it != g_sinkRings.end() && !it->second.bufs.empty())
+                        {
+                            auto &ring = it->second;
+                            const auto &e = ring.bufs[ring.next % ring.bufs.size()];
+                            bp = e.first;
+                            bl = e.second;
+                        }
+                    }
+
+                    bool due = false;
+                    size_t backlog = 0u;
+                    if (runtime && bp)
+                    {
+                        const uint32_t sid = bp >> 14;
+                        if (sid == 0u || sid == 1u)
+                        {
+                            // Stereo pair: gate BOTH sides on the same value so buffers are
+                            // handed back in lockstep and neither source position runs ahead.
+                            backlog = std::min(runtime->audioBackend().streamBacklog(0u),
+                                               runtime->audioBackend().streamBacklog(1u));
+                        }
+                        else
+                        {
+                            backlog = runtime->audioBackend().streamBacklog(sid);
+                        }
+                    }
+                    if (backlog > 0u)
+                    {
+                        static const size_t s_target = []() -> size_t {
+                            if (const char *v = std::getenv("PS2X_SNDBACKLOG"))
+                            {
+                                const long n = std::strtol(v, nullptr, 10);
+                                if (n > 0) return static_cast<size_t>(n);
+                            }
+                            return 8192;  // known-good. MUST exceed the start cushion
+                                          // (2 x kStreamChunkFrames = 4096) or playback never
+                                          // starts. 16384 was ~680ms of audible lag behind the
+                                          // game -- that latency is what "BGM desynced" was.
+                        }();
+                        due = backlog < s_target;
+                    }
+                    else
+                    {
+                        static std::mutex s_m;
+                        static std::map<uint32_t, std::chrono::steady_clock::time_point> s_last;
+                        const auto now = std::chrono::steady_clock::now();
+                        std::lock_guard<std::mutex> lk(s_m);
+                        auto it = s_last.find(sink);
+                        if (it == s_last.end() ||
+                            std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count() >= s_ms)
+                        {
+                            s_last[sink] = now;
+                            due = true;
+                        }
+                    }
+                    // Why did a starved stream NOT get a buffer back? Each guess costs a full
+                    // build+boot to test, so record the actual reason instead.
+                    if (!(due && bp && bl))
+                    {
+                        static std::atomic<uint32_t> dn{0};
+                        const uint32_t d = dn.fetch_add(1);
+                        if (d < 10u || (d % 2000u) == 0u)
+                            std::fprintf(stderr,
+                                         "[sndpump] DECLINE #%u sink=0x%x node=0x%x reused=%d due=%d "
+                                         "bp=0x%x bl=%u backlog=%zu\n",
+                                         d + 1u, sink, node, reused ? 1 : 0, due ? 1 : 0, bp, bl, backlog);
+                    }
+                    if (due && bp && bl)
+                    {
+                        {   // consume this ring slot only once the return actually happens
+                            std::lock_guard<std::mutex> lk(g_sinkRingM);
+                            auto it = g_sinkRings.find(sink);
+                            if (it != g_sinkRings.end()) it->second.next++;
+                        }
+                        if (!reused)
+                            poke(sink, 0x14, peek(node, 0x00)); // pop node off the recycler
+                        {   // remember it so we can re-arm with it once the pool runs dry
+                            std::lock_guard<std::mutex> lk(s_nodeM);
+                            s_lastNode[sink] = node;
+                        }
+                        poke(node, 0x00, 0u);               // node->next = null (single entry)
+                        poke(node, 0x08, bp);               // describe a real ring buffer
+                        poke(node, 0x0C, bl);
+                        poke(sink, 0x18, node);             // arm the free list with it
+                        if (pairIdx >= 0) g_pairReturns[pairIdx]++;
+                        static std::atomic<uint32_t> ret{0};
+                        const uint32_t r = ret.fetch_add(1);
+                        if (r < 8u || (r % 200u) == 0u)
+                            std::fprintf(stderr,
+                                         "[sndpump] returned buffer #%u to sink=0x%x node=0x%x ptr=0x%x len=%u\n",
+                                         r + 1u, sink, node, bp, bl);
+                    }
+                }
+            }
+        }
+
+        if (g_orig28ae60) g_orig28ae60(rdram, ctx, runtime);
+    }
+
+    // 0x28b428 STREAM START (`pos[+0x3C] = 0; state[+1] = 1`). The IOP resets its ring when a
+    // stream starts, and the game asserts on that: 0x281bb0 takes the sink's ENTIRE free list
+    // and infinite-loops at 0x281cf0 unless the length is the expected prefill. So put the ring
+    // back to "all free, nothing queued" here and drop the host-side tail that belonged to the
+    // previous stream, otherwise the leftovers would be credited to the new one.
+    //
+    // The timestamp is only used by the legacy PS2X_SNDNOSTOP=drain mode.
+    std::mutex g_streamStartM;
+    std::map<uint32_t, std::chrono::steady_clock::time_point> g_streamStart;
+    PS2Runtime::RecompiledFunction g_orig28b428 = nullptr;
+    void bt3StreamStartNote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // 0x28b428
+    {
+        const uint32_t obj = getRegU32(ctx, 4);
+        {
+            std::lock_guard<std::mutex> lk(g_streamStartM);
+            g_streamStart[obj] = std::chrono::steady_clock::now();
+        }
+        if (sndIopEnabled())
+        {
+            const uint32_t sink = sndRd32(rdram, obj + 8u);
+            bt3SndIopResetSink(rdram, runtime, sink);
+        }
+        if (g_orig28b428) g_orig28b428(rdram, ctx, runtime);
+    }
+
+    // [sndnostop] 0x28b438 STREAM STOP. RETIRED -- default is now plain pass-through.
+    //
+    // Suppression was only ever load-bearing because the ring never drained on its own: with
+    // no playback progress the game saw every sound as finished the moment it started and tore
+    // the stream down, so refusing the stop was the only way to keep a voice alive. It bought
+    // that at the cost of the game's cleanup never running, which is what made it re-trigger
+    // lines it believed had ended -- heard as fragments of a line playing over itself. With the
+    // IOP consumer reporting real playback progress the lifecycle is the game's again, so the
+    // stop is honoured; the streams keep ticking while stopped, so any tail still queued drains
+    // away instead of being cut.
+    //
+    // Kept only as a rollback path:
+    //   PS2X_SNDNOSTOP=blanket|1|2  suppress every stop (the old default)
+    //   PS2X_SNDNOSTOP=drain        suppress only while the backend still has samples
+    //   unset / off                 pass through (default)
+    PS2Runtime::RecompiledFunction g_orig28b438 = nullptr;
+    void bt3StreamStopSuppress(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // 0x28b438
+    {
+        const uint32_t obj = getRegU32(ctx, 4);
+
+        // Suppress ONLY the BGM pair by default. Blanket suppression also blocks the VOICE
+        // streams, which legitimately stop and restart between lines -- ignoring those leaves
+        // stale stream state and is heard as voice acting glitching mid-sentence. It also lets
+        // the game reconfigure one half of the BGM pair without the other, which desyncs the
+        // stereo image in a way the symmetric trim cannot repair.
+        //   PS2X_SNDNOSTOP=1  -> BGM pair only (default, recommended)
+        //   PS2X_SNDNOSTOP=2  -> suppress every stream stop (the old blunt behaviour)
+        // The pair addresses have been stable across every run this session;
+        // PS2X_SNDBGMOBJ=<hex>,<hex> overrides if a build ever moves them.
+        // DRAIN CHECK (the proper fix, replacing blanket suppression).
+        //
+        // Our engine reports every sound "finished" the instant it starts, so the game tears
+        // each stream down immediately -- that is why voices were silent until stops were
+        // suppressed, and why suppressing them unconditionally makes the game re-trigger lines
+        // it thinks already ended (heard as voice acting glitching mid-sentence).
+        //
+        // So: allow the stop only once the audio for that stream has ACTUALLY been consumed by
+        // the device. While samples are still queued, the sound is genuinely still playing and
+        // the teardown is premature, so suppress it. Once drained, let the game stop it exactly
+        // as it intends -- lines end cleanly and are not re-triggered on top of themselves.
+        //
+        // Object -> stream id: the stream object holds its sink at [obj+8]; the pump has cached
+        // that sink's ring buffers, and the audio stream id is bufferPtr >> 14 (same split
+        // SIF.cpp uses when feeding).
+        //   PS2X_SNDNOSTOP=blanket|1|2 -> old unconditional suppression (rollback only)
+        //   PS2X_SNDNOSTOP=drain       -> suppress while the backend still holds samples
+        //   unset / off                -> pass through (default, now that progress is honest)
+        static const int s_mode = []() -> int {
+            const char *v = std::getenv("PS2X_SNDNOSTOP");
+            if (!v || !v[0]) return 0;
+            if (v[0] == 'd') return 1;                       // drain check + grace
+            if (v[0] == 'b' || v[0] == '1' || v[0] == '2') return 2; // blanket
+            return 0;                                        // off / anything else
+        }();
+        if (s_mode == 0)
+        {
+            if (g_orig28b438) g_orig28b438(rdram, ctx, runtime);
+            return;
+        }
+
+        bool stillPlaying = false;
+        if (s_mode == 2)
+        {
+            stillPlaying = true; // blanket fallback
+        }
+        else if (runtime)
+        {
+            uint32_t sink = 0u;
+            if (const uint8_t *p = getMemPtr(rdram, (obj + 8u) & 0x1FFFFFFFu))
+                sink = *reinterpret_cast<const uint32_t *>(p);
+            uint32_t bufPtr = 0u;
+            if (sink)
+            {
+                std::lock_guard<std::mutex> lk(g_sinkRingM);
+                auto it = g_sinkRings.find(sink);
+                if (it != g_sinkRings.end() && !it->second.bufs.empty())
+                    bufPtr = it->second.bufs.front().first;
+            }
+            if (bufPtr)
+            {
+                // One sub-buffer of slack: below that it is effectively done.
+                const size_t backlog = runtime->audioBackend().streamBacklog(bufPtr >> 14);
+                stillPlaying = backlog > 2048u;
+            }
+            else
+            {
+                // No mapping for this object: assume it IS still playing. Allowing the stop
+                // here silences voices completely.
+                stillPlaying = true;
+            }
+
+            // GRACE WINDOW: refuse any teardown that arrives right after the start, whatever
+            // the backlog says. This is the case that kept killing the voice lines -- the stop
+            // lands before the stream has produced a single sample, so the backlog is 0 and
+            // looks "drained". PS2X_SNDGRACE_MS overrides (default 3000).
+            if (!stillPlaying)
+            {
+                static const long s_graceMs = []() -> long {
+                    if (const char *v = std::getenv("PS2X_SNDGRACE_MS"))
+                    {
+                        const long n = std::strtol(v, nullptr, 10);
+                        if (n >= 0) return n;
+                    }
+                    return 3000;
+                }();
+                std::lock_guard<std::mutex> lk(g_streamStartM);
+                auto it = g_streamStart.find(obj);
+                if (it != g_streamStart.end())
+                {
+                    const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - it->second).count();
+                    if (age < s_graceMs)
+                        stillPlaying = true;
+                }
+            }
+        }
+
+        if (stillPlaying)
+        {
+            static std::atomic<uint32_t> n{0};
+            const uint32_t k = n.fetch_add(1);
+            if (k < 12u || (k % 200u) == 0u)
+                std::fprintf(stderr, "[sndnostop] deferred STOP #%u obj=0x%x (still draining)\n",
+                             k + 1u, obj);
+            setReturnS32(ctx, 0); // not finished yet -- refuse the premature teardown
+            return;
+        }
+
+        // Everything else (voice, SE) stops normally.
+        if (g_orig28b438) g_orig28b438(rdram, ctx, runtime);
+    }
+
+    // [sndreg] PS2X_SNDREG=1: log every handler registration into the per-slot dispatch
+    // table at 0x3215A0 + slot*72. FUN_00286050(slot) walks 6 entries of 12 bytes there and
+    // calls each non-null fn; the sound service thread (tid6, entry 0x26d070) dispatches
+    // slot 6, whose table is EMPTY — so it loops forever doing nothing and the sound-preload
+    // completion never runs. This shows which slots DO get handlers, and whether anything
+    // ever tries to register one for slot 6.
+    PS2Runtime::RecompiledFunction g_orig285c50 = nullptr;
+    void bt3SoundRegProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00285c28
+    {
+        const uint32_t slot = getRegU32(ctx, 4);   // a0
+        const uint32_t fn   = getRegU32(ctx, 5);   // a1 -> [entry+0]
+        const uint32_t arg  = getRegU32(ctx, 6);   // a2 -> [entry+4]
+        static std::atomic<uint32_t> n{0};
+        if (n.fetch_add(1) < 64u)
+            std::fprintf(stderr, "[sndreg] register slot=%u fn=0x%x arg=0x%x  ra=0x%x\n",
+                         slot, fn, arg, getRegU32(ctx, 31));
+        if (g_orig285c50) g_orig285c50(rdram, ctx, runtime);
+    }
+
     void bt3ResReadyProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00252d78
     {
         const uint32_t id = getRegU32(ctx, 4); // a0 = resource id
@@ -1630,6 +2732,103 @@ namespace
                 if (g_orig1dac78) runtime.replaceFunction(0x001dac78u, &bt3CamEnableForce);
             }
         }
+        // The IOP-side ring consumer LIVES in the stream tick, so the hook has to be installed
+        // whenever audio is on -- it is no longer just the [sndstream] diagnostic it started as.
+        const bool sndAudioOn = std::getenv("PS2X_SNDPLAY") || std::getenv("PS2X_SNDSTREAM") ||
+                                std::getenv("PS2X_SNDPUMP") || std::getenv("PS2X_SNDIOP");
+        if (sndAudioOn)
+        {
+            g_orig28ae60 = runtime.lookupFunction(0x0028ae60u);
+            if (g_orig28ae60) runtime.replaceFunction(0x0028ae60u, &bt3SndStreamTick);
+            else std::cerr << "[sndstream] 0x28ae60 not registered" << std::endl;
+        }
+        // [sndapi] game-facing sound API call counters.
+        if (std::getenv("PS2X_SNDAPI"))
+        {
+            const PS2Runtime::RecompiledFunction probes[kSndApiCount] = {
+                &bt3SndApiProbe<0>, &bt3SndApiProbe<1>, &bt3SndApiProbe<2>, &bt3SndApiProbe<3>,
+                &bt3SndApiProbe<4>, &bt3SndApiProbe<5>, &bt3SndApiProbe<6>, &bt3SndApiProbe<7>,
+                &bt3SndApiProbe<8>, &bt3SndApiProbe<9>, &bt3SndApiProbe<10>, &bt3SndApiProbe<11>,
+                &bt3SndApiProbe<12>, &bt3SndApiProbe<13>, &bt3SndApiProbe<14>, &bt3SndApiProbe<15>,
+                &bt3SndApiProbe<16>, &bt3SndApiProbe<17>, &bt3SndApiProbe<18>, &bt3SndApiProbe<19>,
+                &bt3SndApiProbe<20>, &bt3SndApiProbe<21>, &bt3SndApiProbe<22>, &bt3SndApiProbe<23>,
+                &bt3SndApiProbe<24>, &bt3SndApiProbe<25>, &bt3SndApiProbe<26>, &bt3SndApiProbe<27>};
+            std::string got;
+            for (int i = 0; i < kSndApiCount; ++i)
+            {
+                g_origSndApi[i] = runtime.lookupFunction(kSndApiAddr[i]);
+                if (g_origSndApi[i]) runtime.replaceFunction(kSndApiAddr[i], probes[i]);
+                got += (g_origSndApi[i] ? '1' : '0');
+            }
+            std::fprintf(stderr, "[sndapi] hooks %s\n", got.c_str());
+        }
+        // STREAM START (0x28b428): resets the sink ring so a restart finds it whole. Registered
+        // AFTER the api probes so it overrides the plain counter probe on the same address.
+        if (sndAudioOn)
+        {
+            g_orig28b428 = runtime.lookupFunction(0x0028b428u);
+            if (g_orig28b428) runtime.replaceFunction(0x0028b428u, &bt3StreamStartNote);
+            else std::cerr << "[sndiop] 0x28b428 (stream START) not registered" << std::endl;
+            // 0x281bb0 asserts the ring is whole BEFORE calling 0x28b428, so the reset has to
+            // happen here or a restart hangs in the 0x281cf0 error loop.
+            g_orig281bb0 = runtime.lookupFunction(0x00281bb0u);
+            if (g_orig281bb0) runtime.replaceFunction(0x00281bb0u, &bt3StreamGroupStart);
+            else std::cerr << "[sndiop] 0x281bb0 (group start) not registered" << std::endl;
+        }
+        // [sndse] sound-engine lifecycle probe: what happens when a punch should sound?
+        if (std::getenv("PS2X_SNDSE"))
+        {
+            const PS2Runtime::RecompiledFunction probes[kSndSeCount] = {
+                &bt3SndSeProbe<0>, &bt3SndSeProbe<1>, &bt3SndSeProbe<2>,
+                &bt3SndSeProbe<3>, &bt3SndSeProbe<4>, &bt3SndSeProbe<5>};
+            std::string got;
+            for (int i = 0; i < kSndSeCount; ++i)
+            {
+                g_origSndSe[i] = runtime.lookupFunction(kSndSeAddr[i]);
+                if (g_origSndSe[i]) runtime.replaceFunction(kSndSeAddr[i], probes[i]);
+                got += (g_origSndSe[i] ? '1' : '0');
+            }
+            std::fprintf(stderr, "[sndse] hooks %s (%s)\n", got.c_str(),
+                         "playerCreate/START/STOP,streamAlloc,loadById,waitSlots");
+        }
+        // [sndnostop] RETIRED. Only hooked when explicitly asked for, as a rollback path.
+        if (std::getenv("PS2X_SNDNOSTOP"))
+        {
+            g_orig28b438 = runtime.lookupFunction(0x0028b438u);
+            if (g_orig28b438) runtime.replaceFunction(0x0028b438u, &bt3StreamStopSuppress);
+            std::fprintf(stderr, "[sndnostop] stream STOP suppression %s\n",
+                         g_orig28b438 ? "ARMED" : "FAILED (0x28b438 not registered)");
+        }
+        // [sndcnt] sound-ready refcount stage counters.
+        if (std::getenv("PS2X_SNDCNT"))
+        {
+            g_orig26e290 = runtime.lookupFunction(0x0026e290u);
+            if (g_orig26e290) runtime.replaceFunction(0x0026e290u, &bt3SndSvc);
+            g_orig26d810 = runtime.lookupFunction(0x0026d810u);
+            if (g_orig26d810) runtime.replaceFunction(0x0026d810u, &bt3SndEnq);
+            g_orig26d9f0 = runtime.lookupFunction(0x0026d9f0u);
+            if (g_orig26d9f0) runtime.replaceFunction(0x0026d9f0u, &bt3SndDec);
+            std::fprintf(stderr, "[sndcnt] hooks svc=%d enq=%d dec=%d\n",
+                         g_orig26e290 != nullptr, g_orig26d810 != nullptr, g_orig26d9f0 != nullptr);
+        }
+        // [sndwake] sound-thread wake-guard probe.
+        if (std::getenv("PS2X_SNDWAKE"))
+        {
+            g_orig26d338 = runtime.lookupFunction(0x0026d338u);
+            if (g_orig26d338) runtime.replaceFunction(0x0026d338u, &bt3SndResumeIfSusp);
+            else std::cerr << "[sndwake] 0x26d338 not registered" << std::endl;
+            g_orig26e160 = runtime.lookupFunction(0x0026e160u);
+            if (g_orig26e160) runtime.replaceFunction(0x0026e160u, &bt3SndKickProbe);
+            else std::cerr << "[sndwake] 0x26e160 not registered" << std::endl;
+        }
+        // Battle-ready wait probe/force (PS2X_BATTLEPROBE or PS2X_FORCEBATTLE).
+        if (std::getenv("PS2X_BATTLEPROBE") || std::getenv("PS2X_FORCEBATTLE"))
+        {
+            g_orig12ab10 = runtime.lookupFunction(0x0012ab10u);
+            if (g_orig12ab10) runtime.replaceFunction(0x0012ab10u, &bt3BattleWaitProbe);
+        }
+        // Sound-ready probe / fight-load-only gate hooks (PS2X_SNDPROBE or
+        // PS2X_FIGHTSNDGATE; passthrough otherwise).
         // Battle-ready wait probe/force (PS2X_BATTLEPROBE or PS2X_FORCEBATTLE).
         if (std::getenv("PS2X_BATTLEPROBE") || std::getenv("PS2X_FORCEBATTLE"))
         {

@@ -1,7 +1,13 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <vector>
 
 namespace
@@ -69,6 +75,13 @@ namespace ps2_vag
                 std::vector<int16_t> &outPcm, uint32_t &outSampleRate);
 }
 
+// Frames per raylib AudioStream sub-buffer. Feeds are aligned to this exactly (see
+// serviceStreams): a partial feed leaves the rest of the sub-buffer unfilled and is heard as
+// rapid pause/unpause stutter. At 24kHz this is ~85ms; raylib double-buffers, so it gives ~170ms
+// of slack -- enough to ride out a dropped frame without underrunning (the reported "stereo goes
+// out of sync when I lose fps").
+static constexpr size_t kStreamChunkFrames = 1024;
+
 struct PS2AudioBackend::Impl
 {
     struct TrackedSound
@@ -77,6 +90,8 @@ struct PS2AudioBackend::Impl
         uint32_t sampleKey;
     };
     std::vector<TrackedSound> activeSounds;
+    // Open raylib AudioStreams for the streaming-PCM path, keyed by streamId.
+    std::unordered_map<uint32_t, AudioStream> streams;
 };
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
@@ -224,6 +239,463 @@ void PS2AudioBackend::play(uint32_t sampleAddr, float pitch, float volume, uint3
 
     const bool isBgm = (sampleToPlay->pcm.size() > static_cast<size_t>(sampleToPlay->sampleRate * 5));
     playDecodedSample(sampleKey, *sampleToPlay, pitch, volume, isBgm);
+}
+
+namespace
+{
+    // Kept out of StreamState (and therefore out of the header) on purpose: both are pure
+    // instrumentation/heuristics for the streaming path, and touching ps2_audio.h forces a
+    // near-full rebuild of the runner. Always called with m_streamMutex held.
+    std::map<uint32_t, std::chrono::steady_clock::time_point> g_streamGrew;
+
+    void ps2xStreamGrew(uint32_t streamId)
+    {
+        g_streamGrew[streamId] = std::chrono::steady_clock::now();
+    }
+
+    // Milliseconds since this stream last received data. A stream that has stopped growing is
+    // never going to reach a start cushion, whatever the cushion is set to.
+    long ps2xStreamIdleMs(uint32_t streamId)
+    {
+        auto it = g_streamGrew.find(streamId);
+        if (it == g_streamGrew.end())
+            return 0;
+        return static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - it->second).count());
+    }
+
+    // [sndlevel] PS2X_SNDLEVEL=1. Per-stream RMS and peak of the PCM the guest actually sends.
+    // The PS2 mixes all 12 IOP rings through SPU2 with per-voice volume; we play each ring as
+    // its own host stream at unity gain. If one ring comes out too loud, this says whether its
+    // payload is genuinely hot (so the missing piece is an attenuation the IOP would apply) or
+    // level-matched to the others (so the fault is on our side).
+    struct StreamLevel { double sumSq = 0.0; uint64_t n = 0; int32_t peak = 0; };
+    std::map<uint32_t, StreamLevel> g_streamLevel;
+
+    void ps2xStreamLevel(uint32_t streamId, const int16_t *samples, uint32_t count)
+    {
+        static const bool s_on = []() {
+            const char *v = std::getenv("PS2X_SNDLEVEL");
+            return v && v[0] && v[0] != '0';
+        }();
+        if (!s_on)
+            return;
+        StreamLevel &lv = g_streamLevel[streamId];
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const int32_t s = samples[i];
+            lv.sumSq += static_cast<double>(s) * static_cast<double>(s);
+            if (std::abs(s) > lv.peak)
+                lv.peak = std::abs(s);
+        }
+        lv.n += count;
+        static std::atomic<uint32_t> k{0};
+        if ((k.fetch_add(1) % 400u) == 0u)
+        {
+            std::fprintf(stderr, "[sndlevel]");
+            for (const auto &e : g_streamLevel)
+                std::fprintf(stderr, " s%u:rms=%.0f/peak=%d", e.first,
+                             e.second.n ? std::sqrt(e.second.sumSq / static_cast<double>(e.second.n)) : 0.0,
+                             e.second.peak);
+            std::fprintf(stderr, "\n");
+        }
+    }
+} // namespace
+
+void PS2AudioBackend::onStreamPcm(uint32_t streamId, const int16_t *samples, uint32_t sampleCount,
+                                  uint32_t sampleRate)
+{
+    if (!samples || sampleCount == 0u)
+        return;
+
+    std::lock_guard<std::mutex> lock(m_streamMutex);
+    StreamState &st = m_streams[streamId];
+    if (sampleRate)
+        st.sampleRate = sampleRate;
+
+    {
+        static std::atomic<uint32_t> n{0};
+        const uint32_t k = n.fetch_add(1);
+        if (k < 6u || (k % 100u) == 0u)
+            std::fprintf(stderr, "[sndplay] recv #%u stream=%u samples=%u rate=%u backlog=%zu\n",
+                         k + 1u, streamId, sampleCount, st.sampleRate, st.ring.size());
+    }
+
+    // Accept everything here. Trimming is done in serviceStreams instead, because dropping
+    // per-stream independently breaks stereo alignment: if L overflows and R does not, the
+    // two sides lose sync permanently. Dropping the OLDEST samples is also heard directly as
+    // audio "jumping forward", so the cap must be generous and any trim symmetric.
+    st.ring.insert(st.ring.end(), samples, samples + sampleCount);
+    ps2xStreamGrew(streamId);
+    ps2xStreamLevel(streamId, samples, sampleCount);
+}
+
+size_t PS2AudioBackend::streamBacklog(uint32_t streamId)
+{
+    std::lock_guard<std::mutex> lock(m_streamMutex);
+    auto it = m_streams.find(streamId);
+    return (it == m_streams.end()) ? 0u : it->second.ring.size();
+}
+
+PS2AudioBackend::StreamProgress PS2AudioBackend::streamProgress(uint32_t streamId)
+{
+    StreamProgress p;
+    std::lock_guard<std::mutex> lock(m_streamMutex);
+    auto it = m_streams.find(streamId);
+    if (it == m_streams.end())
+        return p;
+    p.known = true;
+    p.started = it->second.started;
+    p.consumedSamples = it->second.fed;
+    p.gapSamples = it->second.gap;
+    p.pending = it->second.ring.size();
+    return p;
+}
+
+void PS2AudioBackend::registerStreamRing(uint32_t base, uint32_t size)
+{
+    if (!base || !size)
+        return;
+    std::lock_guard<std::mutex> lock(m_streamMutex);
+    // Reject anything that lies INSIDE a ring we already know. The caller offers the sink's
+    // free-list head whenever the list is a single node with nothing queued, and that is only
+    // the whole ring while the stream is idle -- mid-playback it can legitimately be a partial
+    // node (e.g. 0x1440..0x4140 out of ring 0's 0x140..0x4140). Registering those would shadow
+    // the real spans, and a partial node starting in a ring's TAIL would resolve to the next
+    // stream id and misroute its audio -- the exact bug the ring map exists to prevent.
+    {
+        auto hit = m_streamRings.upper_bound(base);
+        if (hit != m_streamRings.begin())
+        {
+            --hit;
+            if (base - hit->first < hit->second.first)
+                return; // inside a known ring
+        }
+    }
+    auto it = m_streamRings.find(base);
+    if (it != m_streamRings.end() && it->second.first >= size)
+        return;
+    // The id stays `base >> 14` so it matches every id already in use; only the ADDRESS
+    // resolution changes, and only for the tail bytes that used to land in the next bucket.
+    m_streamRings[base] = {size, base >> 14};
+    std::fprintf(stderr, "[sndplay] ring stream=%u 0x%x..0x%x (%u bytes)\n",
+                 base >> 14, base, base + size, size);
+}
+
+uint32_t PS2AudioBackend::streamIdForAddress(uint32_t iopAddr)
+{
+    std::lock_guard<std::mutex> lock(m_streamMutex);
+    auto it = m_streamRings.upper_bound(iopAddr);
+    if (it != m_streamRings.begin())
+    {
+        --it;
+        if (iopAddr - it->first < it->second.first)
+            return it->second.second;
+    }
+    return iopAddr >> 14; // no ring registered yet: the old split is the best guess
+}
+
+void PS2AudioBackend::noteStreamGap(uint32_t streamId, uint32_t bytes)
+{
+    std::lock_guard<std::mutex> lock(m_streamMutex);
+    auto it = m_streams.find(streamId);
+    if (it != m_streams.end())
+        it->second.gap += bytes / 2u; // 16-bit samples
+}
+
+void PS2AudioBackend::requestStreamStart(uint32_t streamId)
+{
+    std::lock_guard<std::mutex> lock(m_streamMutex);
+    auto it = m_streams.find(streamId);
+    if (it != m_streams.end())
+        it->second.forceStart = true;
+}
+
+size_t PS2AudioBackend::dropStreamPending(uint32_t streamId)
+{
+    std::lock_guard<std::mutex> lock(m_streamMutex);
+    auto it = m_streams.find(streamId);
+    if (it == m_streams.end())
+        return 0u;
+    const size_t n = it->second.ring.size();
+    it->second.ring.clear();
+    it->second.dropped += n;
+    return n;
+}
+
+void PS2AudioBackend::serviceStreams()
+{
+#if defined(PLATFORM_VITA)
+    return;
+#else
+    {
+        static std::atomic<uint32_t> svc{0};
+        const uint32_t s = svc.fetch_add(1);
+        if (s == 0u)
+            std::fprintf(stderr, "[sndplay] serviceStreams live, audioReady=%d\n", m_audioReady ? 1 : 0);
+    }
+    if (!m_audioReady)
+        return;
+
+    std::lock_guard<std::mutex> lock(m_streamMutex);
+
+    // ---- STEREO PAIRING -------------------------------------------------------------
+    // Streams 0 and 1 are the LEFT and RIGHT halves of one stereo source. Playing them as
+    // two independent mono AudioStreams lets each drift on its own clock; two correlated
+    // copies offset by tens of ms is heard as the music playing "twice over each other"
+    // with a hollow, low-quality (comb-filtered) tone. Interleaving them into ONE 2-channel
+    // stream keeps them sample-locked by construction. Other ids (SE banks) stay mono.
+    // PS2X_SNDNOPAIR=1 restores the old independent-mono behaviour.
+    constexpr uint32_t kLeftId = 0u, kRightId = 1u, kPairKey = 0xFFFF0000u;
+    static const bool s_noPair = []() {
+        const char *v = std::getenv("PS2X_SNDNOPAIR");
+        return v && v[0] && v[0] != '0';
+    }();
+    auto itL = m_streams.find(kLeftId);
+    auto itR = m_streams.find(kRightId);
+    const bool paired = !s_noPair && itL != m_streams.end() && itR != m_streams.end();
+    if (paired)
+    {
+        StreamState &L = itL->second;
+        StreamState &R = itR->second;
+        if (!L.opened)
+        {
+            SetAudioStreamBufferSizeDefault(static_cast<int>(kStreamChunkFrames));
+            m_impl->streams[kPairKey] = LoadAudioStream(L.sampleRate, 16, 2);
+            L.opened = R.opened = true;
+            std::fprintf(stderr, "[sndplay] opened STEREO PAIR (streams 0+1) rate=%u\n", L.sampleRate);
+        }
+        AudioStream &s = m_impl->streams[kPairKey];
+
+        // Both sides must have a full sub-buffer; the pair advances in lockstep or not at all.
+        if (!L.started)
+        {
+            // forceStart: the guest has filled its ring and cannot queue more, so this is the
+            // largest cushion this stream will ever have. Waiting past that point deadlocks --
+            // no playback means no buffer returns means no further data.
+            const size_t have = std::min(L.ring.size(), R.ring.size());
+            const bool forced = (L.forceStart || R.forceStart) && have >= kStreamChunkFrames;
+            if (have >= kStreamChunkFrames * 4u || forced)
+            {
+                PlayAudioStream(s);
+                L.started = R.started = true;
+                if (forced)
+                    std::fprintf(stderr, "[sndplay] pair force-start with %zu frames cushion\n", have);
+            }
+        }
+        // REPAIR L/R IMBALANCE AT THE FEED (safe place -- gating the pump on the partner's
+        // state deadlocked it twice). Measured: the pump can hand one sink a buffer the other
+        // never gets, so that channel gains exactly one buffer (~2432 samples) and every later
+        // interleave pairs samples ~100ms apart -- "one ear suddenly lags, then stays behind".
+        // Both rings are consumed from the FRONT, so the fronts remain aligned; the unmatched
+        // audio is the TAIL of the longer ring. Drop that tail: one channel loses a slice of
+        // its newest audio (a brief blemish) instead of the pair being offset permanently.
+        // MEASURED: the imbalance is CONTINUOUS, not a one-off -- rebalancing every frame
+        // discarded 2000-4000 samples at a time, which sounds worse than the drift it fixes.
+        // The two sinks genuinely receive different amounts of data over time, so this is the
+        // wrong layer to correct it. Left in, default OFF, as a diagnostic: PS2X_SNDREBAL=1.
+        static const bool s_rebal = []() {
+            const char *v = std::getenv("PS2X_SNDREBAL");
+            return v && v[0] && v[0] != '0';
+        }();
+        if (s_rebal && L.ring.size() != R.ring.size())
+        {
+            const size_t lo = std::min(L.ring.size(), R.ring.size());
+            const size_t excess = std::max(L.ring.size(), R.ring.size()) - lo;
+            if (L.ring.size() > lo) L.ring.resize(lo);
+            else                    R.ring.resize(lo);
+            static std::atomic<uint32_t> rb{0};
+            const uint32_t k = rb.fetch_add(1);
+            if (k < 8u || (k % 100u) == 0u)
+                std::fprintf(stderr, "[sndplay] pair rebalance #%u dropped %zu tail samples (now %zu/%zu)\n",
+                             k + 1u, excess, L.ring.size(), R.ring.size());
+        }
+
+        if (L.started)
+        {
+            std::vector<int16_t> inter(kStreamChunkFrames * 2u);
+            while (IsAudioStreamProcessed(s) &&
+                   std::min(L.ring.size(), R.ring.size()) >= kStreamChunkFrames)
+            {
+                for (size_t i = 0; i < kStreamChunkFrames; ++i)
+                {
+                    inter[i * 2u] = L.ring[i];
+                    inter[i * 2u + 1u] = R.ring[i];
+                }
+                UpdateAudioStream(s, inter.data(), static_cast<int>(kStreamChunkFrames));
+                L.ring.erase(L.ring.begin(), L.ring.begin() + static_cast<long>(kStreamChunkFrames));
+                R.ring.erase(R.ring.begin(), R.ring.begin() + static_cast<long>(kStreamChunkFrames));
+                L.fed += kStreamChunkFrames;
+                R.fed += kStreamChunkFrames;
+                static std::atomic<uint32_t> pf{0};
+                const uint32_t k = pf.fetch_add(1);
+                if (k < 4u || (k % 300u) == 0u)
+                    std::fprintf(stderr, "[sndplay] pair fed #%u frames=%zu Lback=%zu Rback=%zu\n",
+                                 k + 1u, kStreamChunkFrames, L.ring.size(), R.ring.size());
+            }
+
+            // SYMMETRIC trim. A frame-rate dip means serviceStreams runs less often and the
+            // rings grow; if they are ever trimmed by different amounts the stereo image
+            // desyncs for good. Always drop the SAME count from both sides, and only once the
+            // backlog is genuinely excessive, since dropping is audible as a forward jump.
+            constexpr size_t kMaxBacklog = 192000; // ~8s at 24kHz -- generous on purpose
+            const size_t worst = std::max(L.ring.size(), R.ring.size());
+            if (worst > kMaxBacklog)
+            {
+                const size_t excess = worst - kMaxBacklog;
+                const size_t trim = std::min(excess, std::min(L.ring.size(), R.ring.size()));
+                if (trim)
+                {
+                    L.ring.erase(L.ring.begin(), L.ring.begin() + static_cast<long>(trim));
+                    R.ring.erase(R.ring.begin(), R.ring.begin() + static_cast<long>(trim));
+                    L.dropped += trim;
+                    R.dropped += trim;
+                    std::fprintf(stderr, "[sndplay] pair trim %zu samples (backlog was %zu)\n",
+                                 trim, worst);
+                }
+            }
+        }
+    }
+
+    for (auto &entry : m_streams)
+    {
+        const uint32_t id = entry.first;
+        StreamState &st = entry.second;
+        if (paired && (id == kLeftId || id == kRightId))
+            continue; // handled above as one stereo stream
+
+        // PS2X_SNDCHANNELS: how to interpret the payload. If the game is actually sending
+        // STEREO INTERLEAVED frames and we play them as mono, playback runs exactly 2x fast
+        // -- one octave up, the classic "chipmunk" symptom. Switching to 2 fixes both the
+        // pitch and the stereo image, so this is the first thing to try when pitch is wrong.
+        static const uint32_t s_channels = []() -> uint32_t {
+            if (const char *v = std::getenv("PS2X_SNDCHANNELS"))
+            {
+                const long n = std::strtol(v, nullptr, 10);
+                if (n == 1 || n == 2) return static_cast<uint32_t>(n);
+            }
+            return 1u;
+        }();
+
+        if (!st.opened)
+        {
+            // raylib refills an AudioStream in fixed-size sub-buffers. Feeding fewer frames
+            // than a whole sub-buffer leaves the remainder unfilled, which is heard as rapid
+            // dropouts (~10/sec) that sound like pause/unpause stutter. Pin the sub-buffer
+            // size and always hand over exactly that many frames.
+            SetAudioStreamBufferSizeDefault(static_cast<int>(kStreamChunkFrames));
+            AudioStream s = LoadAudioStream(st.sampleRate, 16, s_channels);
+            m_impl->streams[id] = s;
+            st.opened = true;
+            std::fprintf(stderr, "[sndplay] opened stream=%u rate=%u channels=%u\n",
+                         id, st.sampleRate, s_channels);
+        }
+        AudioStream &s = m_impl->streams[id];
+
+        // Wait for a little cushion before starting so the first buffers do not underrun.
+        // ---- ONE-SHOT SOUNDS (punches, explosions, menu blips) --------------------------
+        // These arrive as a single short burst -- a punch is well under the 256ms start
+        // cushion -- so the stream would sit below the threshold FOREVER and never play a
+        // sample. Measured directly: streams 4 and 10 were opened during a fight and fed
+        // exactly nothing. Once a stream has stopped receiving data it is not going to reach
+        // any cushion, so treat "gone quiet" as "this sound is complete": pad it up to a whole
+        // sub-buffer with silence and let it play.
+        //
+        // Padding to a WHOLE sub-buffer matters -- raylib leaves the remainder of a partly
+        // filled one unplayed, which is the ~10/sec pause-unpause stutter. It is also what
+        // rescues the tail of every sound, since the last <1024 samples could never be fed.
+        //
+        // Continuously-fed streams (BGM, voice) never go idle, so they keep the normal cushion.
+        static const long s_idleMs = []() -> long {
+            if (const char *v = std::getenv("PS2X_SNDIDLE_MS"))
+            {
+                const long n = std::strtol(v, nullptr, 10);
+                if (n > 0) return n;
+            }
+            return 100;
+        }();
+        if (!st.ring.empty() && (st.ring.size() % (kStreamChunkFrames * s_channels)) != 0u &&
+            ps2xStreamIdleMs(id) >= s_idleMs)
+        {
+            const size_t chunk = kStreamChunkFrames * s_channels;
+            const size_t padded = ((st.ring.size() + chunk - 1u) / chunk) * chunk;
+            static std::atomic<uint32_t> p{0};
+            const uint32_t k = p.fetch_add(1);
+            if (k < 8u || (k % 100u) == 0u)
+                std::fprintf(stderr, "[sndplay] stream=%u one-shot complete: %zu -> %zu samples\n",
+                             id, st.ring.size(), padded);
+            st.ring.resize(padded, 0);
+        }
+
+        if (!st.started)
+        {
+            // Build several whole sub-buffers before starting, so the first refills never run
+            // dry. Reported symptom: the first word or two of every VOICE line is glitched and
+            // the rest is clean -- a textbook startup underrun. A voice line arrives as a burst,
+            // so 4 sub-buffers (~170ms) was not enough of a head start; raylib drains both
+            // sub-buffers immediately on play and then runs dry while the pump catches up.
+            // 6 sub-buffers (~256ms at 24kHz) gives that head start.
+            // The cushion MUST stay BELOW the pump's backlog target (PS2X_SNDBACKLOG, default
+            // 8192) or the two deadlock: the pump stops handing buffers back once it reaches
+            // the target, a larger start threshold is then never reached, and the stream never
+            // plays at all. 6 x 1024 = 6144 < 8192.
+            static const size_t s_cushion = []() -> size_t {
+                if (const char *v = std::getenv("PS2X_SNDCUSHION"))
+                {
+                    const long n = std::strtol(v, nullptr, 10);
+                    if (n > 0) return static_cast<size_t>(n);
+                }
+                return kStreamChunkFrames * 6u;
+            }();
+            // forceStart: see the pair path -- once the guest's ring is full the cushion can
+            // only shrink, so holding out for a bigger one would stall the stream for good.
+            // The idle case is the one-shot above: the sound is already complete, so the
+            // cushion has no underrun to protect against and waiting for it means silence.
+            const bool complete = ps2xStreamIdleMs(id) >= s_idleMs;
+            const size_t need = (st.forceStart || complete) ? kStreamChunkFrames * s_channels
+                                                            : s_cushion * s_channels;
+            if (st.ring.size() < need)
+                continue;
+            PlayAudioStream(s);
+            st.started = true;
+            if (st.forceStart)
+                std::fprintf(stderr, "[sndplay] stream=%u force-start with %zu samples cushion\n",
+                             id, st.ring.size());
+        }
+
+        // raylib refills in fixed-size chunks; feed while it has room and we have data.
+        while (IsAudioStreamProcessed(s) && !st.ring.empty())
+        {
+            // Only ever hand over a COMPLETE sub-buffer; a short feed is what causes the
+            // stutter. If we do not have a full one yet, leave it for the next frame.
+            const size_t chunk = kStreamChunkFrames * s_channels;
+            if (st.ring.size() < chunk)
+                break;
+            // UpdateAudioStream counts FRAMES, not samples.
+            UpdateAudioStream(s, st.ring.data(), static_cast<int>(kStreamChunkFrames));
+            st.ring.erase(st.ring.begin(), st.ring.begin() + static_cast<long>(chunk));
+            st.fed += chunk;
+            static std::atomic<uint32_t> f{0};
+            const uint32_t k = f.fetch_add(1);
+            if (k < 6u || (k % 200u) == 0u)
+                std::fprintf(stderr, "[sndplay] fed #%u stream=%u chunk=%zu total=%llu backlog=%zu dropped=%llu\n",
+                             k + 1u, id, chunk, (unsigned long long)st.fed, st.ring.size(),
+                             (unsigned long long)st.dropped);
+        }
+
+        // Same generous cap for mono streams (the voice lines). Dropping the oldest samples
+        // is heard as the voice skipping/jumping forward, which is why the previous 96000-
+        // sample cap in onStreamPcm was audible -- only trim when truly excessive.
+        constexpr size_t kMaxBacklogMono = 192000;
+        if (st.ring.size() > kMaxBacklogMono)
+        {
+            const size_t excess = st.ring.size() - kMaxBacklogMono;
+            st.ring.erase(st.ring.begin(), st.ring.begin() + static_cast<long>(excess));
+            st.dropped += excess;
+            std::fprintf(stderr, "[sndplay] stream=%u trim %zu samples\n", id, excess);
+        }
+    }
+#endif
 }
 
 void PS2AudioBackend::pruneFinishedSounds()

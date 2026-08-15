@@ -709,6 +709,159 @@ namespace ps2_stubs
                     xfer.src,
                     xfer.dest,
                     static_cast<uint32_t>(xfer.size));
+
+                // PS2X_SNDPLAY=1: feed the streamed PCM to the host audio device. BT3 sends
+                // already-decoded 16-bit mono PCM to the IOP in double-buffered slots, so there
+                // is no libsd voice command to intercept -- this is the only place the audio
+                // actually passes through. streamId = dst >> 14 cleanly separates the two stereo
+                // banks (0x140..0x3a40 -> 0, 0x4240..0x7b40 -> 1) and keeps unrelated streams
+                // (0x20940+) apart. Requires the PS2X_SNDPUMP buffer return, or the game only
+                // ever sends one buffer per slot.
+                // NOTE: this is a FEATURE, so it must sit OUTSIDE the PS2X_SIFDMA debug gate --
+                // nesting it there (as PS2X_SNDDUMP is) silently disables audio unless the
+                // diagnostic flag also happens to be set.
+                {
+                    static const bool s_play = []() {
+                        const char *v = std::getenv("PS2X_SNDPLAY");
+                        return v && v[0] && v[0] != '0';
+                    }();
+                    if (s_play && runtime && xfer.dest < 0x100000u)
+                    {
+                        static const uint32_t s_rate = []() -> uint32_t {
+                            if (const char *v = std::getenv("PS2X_SNDRATE"))
+                            {
+                                const long n = std::strtol(v, nullptr, 10);
+                                if (n > 0) return static_cast<uint32_t>(n);
+                            }
+                            return 24000u; // confirmed by ear; PS2X_SNDRATE overrides
+                        }();
+                        // NOT `dest >> 14`: the rings are 16KB but 0x100-staggered, so each
+                        // one's tail falls in the next bucket and its audio would be spliced
+                        // into the neighbouring stream. Resolve against the registered spans.
+                        const uint32_t streamId = runtime->audioBackend().streamIdForAddress(
+                            static_cast<uint32_t>(xfer.dest));
+                        const uint8_t *p = (xfer.size >= 256)
+                                               ? getConstMemPtr(rdram, xfer.src)
+                                               : nullptr;
+                        if (p)
+                        {
+                            runtime->audioBackend().onStreamPcm(
+                                streamId,
+                                reinterpret_cast<const int16_t *>(p),
+                                static_cast<uint32_t>(xfer.size) / 2u,
+                                s_rate);
+                        }
+                        else
+                        {
+                            // Skipped payload still occupied a slot in the guest's ring. The
+                            // IOP-side consumer hands ring space back at the rate the DEVICE
+                            // plays it, so bytes that never reach the device would never be
+                            // returned and the ring would clog. Book them as consumed instead.
+                            runtime->audioBackend().noteStreamGap(
+                                streamId, static_cast<uint32_t>(xfer.size));
+                        }
+                    }
+                }
+
+                // [sifother] PS2X_SIFOTHER=1. Combat SFX have been measured NOT to be streamed
+                // PCM (rings 4/10 get one burst at fight load and nothing per hit) and NOT to
+                // touch the streamed-sound player (zero lifecycle events during a punch burst).
+                // So either a hit emits a command on some other channel, or nothing leaves the
+                // EE at all -- and those two answers need completely different work. The ring
+                // transfers are the bulk of SIF traffic and are already understood, so log
+                // everything EXCEPT them: whatever accompanies a punch will stand out.
+                {
+                    static const bool s_other = []() {
+                        const char *v = std::getenv("PS2X_SIFOTHER");
+                        return v && v[0] && v[0] != '0';
+                    }();
+                    if (s_other && runtime)
+                    {
+                        const uint32_t dst = static_cast<uint32_t>(xfer.dest);
+                        // A ring transfer is one whose destination resolves to a registered
+                        // ring; streamIdForAddress falls back to the shift split, so also
+                        // require the low-memory range the rings live in.
+                        const bool isRing = dst < 0x40000u;
+                        if (!isRing)
+                        {
+                            static std::atomic<uint32_t> s_o{0};
+                            const uint32_t k = s_o.fetch_add(1);
+                            if (k < 400u)
+                            {
+                                char sig[52] = {0};
+                                if (const uint8_t *p = getConstMemPtr(rdram, xfer.src))
+                                    for (int i = 0; i < 16; ++i)
+                                        std::snprintf(sig + i * 3, 4, "%02x ", p[i]);
+                                std::fprintf(stderr, "[sifother] #%u dst=0x%x size=%u src=0x%x [%s]\n",
+                                             k + 1u, dst, static_cast<uint32_t>(xfer.size),
+                                             xfer.src, sig);
+                            }
+                        }
+                    }
+                }
+
+                // [sifdma] PS2X_SIFDMA=1. BT3's EE sound engine runs play requests to
+                // completion but emits no URPC after init; DTX's other IOP channel is SIF
+                // DMA, so log the traffic to see whether audio commands/data go out this
+                // way instead. Cheap counter + first-N detail.
+                static const bool s_dmaLog = []() {
+                    const char *v = std::getenv("PS2X_SIFDMA");
+                    return v && v[0] && v[0] != '0';
+                }();
+                if (s_dmaLog)
+                {
+                    static std::atomic<uint32_t> s_n{0};
+                    const uint32_t k = s_n.fetch_add(1);
+                    if (k < 24u || (k % 500u) == 0u)
+                    {
+                        // Transfers to a small destination are SPU2-side voice memory. Sample
+                        // the payload and test it for PS2 ADPCM (VAG) structure: 16-byte
+                        // blocks where byte1 is a loop-flag in 0..7. If that holds, this is
+                        // the audio the game is streaming, and rendering it is what silence
+                        // actually needs.
+                        char sig[80] = {0};
+                        int adpcmBlocks = 0, testedBlocks = 0;
+                        if (const uint8_t *p = getConstMemPtr(rdram, xfer.src))
+                        {
+                            const uint32_t n = std::min<uint32_t>(static_cast<uint32_t>(xfer.size), 512u);
+                            for (uint32_t b = 0; b + 16u <= n; b += 16u)
+                            {
+                                ++testedBlocks;
+                                if (p[b + 1u] <= 7u) ++adpcmBlocks;
+                            }
+                            for (int i = 0; i < 16 && static_cast<uint32_t>(i) < n; ++i)
+                                std::snprintf(sig + i * 3, 4, "%02x ", p[i]);
+                        }
+                        std::fprintf(stderr, "[sifdma] #%u src=0x%x dst=0x%x size=%u adpcm=%d/%d ra=0x%x [%s]\n",
+                                     k + 1u, xfer.src, xfer.dest,
+                                     static_cast<uint32_t>(xfer.size), adpcmBlocks, testedBlocks,
+                                     getRegU32(ctx, 31), sig);
+                    }
+
+                    // PS2X_SNDDUMP=1: append the payload of each streaming transfer (small
+                    // IOP destination = the double-buffered audio slots) to one raw file per
+                    // destination, so the captured stream can be auditioned as PCM. Proves
+                    // whether the audio content is intact before building live playback.
+                    static const bool s_dump = []() {
+                        const char *v = std::getenv("PS2X_SNDDUMP");
+                        return v && v[0] && v[0] != '0';
+                    }();
+                    if (s_dump && xfer.dest < 0x100000u && xfer.size >= 256)
+                    {
+                        if (const uint8_t *p = getConstMemPtr(rdram, xfer.src))
+                        {
+                            char path[256];
+                            std::snprintf(path, sizeof(path),
+                                          "/home/z3/Desktop/bt3/work/snddump_%06x.raw",
+                                          xfer.dest);
+                            if (FILE *f = std::fopen(path, "ab"))
+                            {
+                                std::fwrite(p, 1, static_cast<size_t>(xfer.size), f);
+                                std::fclose(f);
+                            }
+                        }
+                    }
+                }
             }
         }
 

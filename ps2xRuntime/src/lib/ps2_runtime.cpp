@@ -3823,6 +3823,11 @@ void PS2Runtime::run()
         }
         EndDrawing();
 
+        // Drain any streaming PCM into the audio device. Must run on the render thread --
+        // raylib's AudioStream calls are not safe to make from the guest threads that
+        // produce the data (see PS2AudioBackend::onStreamPcm / serviceStreams).
+        audioBackend().serviceStreams();
+
         // PS2X_TEXWATCH (default ON, =0 disables): find the recompiled-EE writer of the
         // CORRUPTED floor TEX0 (tw=10 where real HW authors tw=8 — the stage-texture root
         // cause). Every ~2s, scan EE RAM for a TEX0-shaped qword with tbp0=10752, psm=19,
