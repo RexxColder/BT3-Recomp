@@ -17,18 +17,12 @@ namespace ps2_syscalls
         constexpr uint32_t kSoundDriverStatusAlignment = 0x100u;
         constexpr uint32_t kSoundDriverAddrTableAlignment = 0x100u;
         constexpr uint32_t kSoundDriverStorageAlignment = 0x1000u;
-        // The sound driver's guest pool used to be hardcoded at [0x120000, 0x200000) -- INSIDE the
-        // game's own loaded image (the recompiled function table spans 0x100008..0x2bf69c). It
-        // zeroed and then filled ~376 KB there, destroying live guest code: RAM at 0x122f80 held
-        // `jal 0x0c0a93b0` at boot and read back zero later, while PCSX2 keeps that instruction for
-        // the whole session. Take the pool from the guest heap instead, which the ELF loader places
-        // above the loaded image, so it can never overlap the game. kSoundDriverPoolFallbackBase is
-        // used only if the heap cannot satisfy the request; it sits above the heap's hard limit and
-        // below the async callback stacks, so it is still outside the game image.
-        constexpr uint32_t kSoundDriverPoolAlignment = 0x1000u;
-        constexpr uint32_t kSoundDriverPoolFallbackBase = 0x01F00000u;
-        constexpr uint32_t kSoundDriverPoolFallbackLimit = 0x01F80000u;
-
+        // The sound driver's pool models the working memory of a resident IOP sound module. It
+        // used to be hardcoded at [0x120000, 0x200000) -- INSIDE the game's own code image (the
+        // recompiled function table spans 0x100008..0x2bf69c) -- where it zeroed and then filled
+        // ~376 KB of live guest code. It briefly moved to the guest heap, which stopped the damage
+        // but still spent EE RAM on memory the EE never owns. It now lives in IOP RAM; see
+        // kSoundDriverPoolBase below.
         SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx)
         {
             SifRpcDebugEvent event{};
@@ -168,6 +162,78 @@ namespace ps2_syscalls
             return (value + (alignment - 1u)) & ~(alignment - 1u);
         }
 
+        // ---- sound driver pool: IOP-side memory ----------------------------------------------
+        // Nothing ever returns these addresses to the guest, so this is purely internal emulation
+        // state and has no business in guest EE RAM. It lives in IOP RAM, which is what it models.
+        // Layout: the streaming rings occupy the low region (to ~0x18640) and the SIF heap starts
+        // at kIopHeapBase (0x80000), so the pool sits between them.
+        constexpr uint32_t kIopRamBytes = 0x00200000u;
+        constexpr uint32_t kSoundDriverPoolBase = 0x00020000u;
+        constexpr uint32_t kSoundDriverPoolEnd = 0x00080000u; // == kIopHeapBase
+
+        PS2Runtime *soundDriverRuntimeUnlocked()
+        {
+            return reinterpret_cast<PS2Runtime *>(g_soundDriverRpcState.ownerRuntime);
+        }
+
+        uint8_t *sndPoolPtr(uint32_t addr, uint32_t size)
+        {
+            PS2Runtime *rt = soundDriverRuntimeUnlocked();
+            uint8_t *base = rt ? rt->memory().getIOPRAM() : nullptr;
+            const uint32_t a = addr & 0x1FFFFFFFu;
+            if (!base || size == 0u || a >= kIopRamBytes || size > (kIopRamBytes - a))
+            {
+                return nullptr;
+            }
+            return base + a;
+        }
+
+        void sndPoolZero(uint32_t addr, uint32_t size)
+        {
+            if (uint8_t *q = sndPoolPtr(addr, size))
+                std::memset(q, 0, size);
+        }
+
+        bool sndPoolWrite32(uint32_t addr, uint32_t value)
+        {
+            uint8_t *q = sndPoolPtr(addr, sizeof(value));
+            if (!q) return false;
+            std::memcpy(q, &value, sizeof(value));
+            return true;
+        }
+
+        bool sndPoolRead16(uint32_t addr, uint16_t &value)
+        {
+            const uint8_t *q = sndPoolPtr(addr, sizeof(value));
+            if (!q) return false;
+            std::memcpy(&value, q, sizeof(value));
+            return true;
+        }
+
+        bool sndPoolWrite16(uint32_t addr, uint16_t value)
+        {
+            uint8_t *q = sndPoolPtr(addr, sizeof(value));
+            if (!q) return false;
+            std::memcpy(q, &value, sizeof(value));
+            return true;
+        }
+
+        bool sndPoolReadS16(uint32_t addr, int16_t &value)
+        {
+            const uint8_t *q = sndPoolPtr(addr, sizeof(value));
+            if (!q) return false;
+            std::memcpy(&value, q, sizeof(value));
+            return true;
+        }
+
+        bool sndPoolWriteS16(uint32_t addr, int16_t value)
+        {
+            uint8_t *q = sndPoolPtr(addr, sizeof(value));
+            if (!q) return false;
+            std::memcpy(q, &value, sizeof(value));
+            return true;
+        }
+
         void resetSoundDriverRpcStateUnlocked()
         {
             const PS2SoundDriverCompatLayout compat = g_soundDriverCompatLayout;
@@ -196,32 +262,16 @@ namespace ps2_syscalls
 
             if (g_soundDriverRpcState.statusAddr == 0u)
             {
-                // Worst-case span, computed with the same alignment steps applied below so the
-                // block cannot come out undersized.
-                const uint32_t poolSize =
+                // Reserve the whole layout in one fixed IOP block. Worst-case span, computed with
+                // the same alignment steps applied below so it cannot come out undersized.
+                constexpr uint32_t poolSize =
                     kSoundDriverStatusAlignment + kSoundDriverStatusSize +
                     kSoundDriverAddrTableAlignment + (kSoundDriverAddrTableEntries * sizeof(uint32_t)) +
                     (3u * kSoundDriverStorageAlignment) +
                     kSoundDriverHdRegionSize + kSoundDriverSqRegionSize + kSoundDriverDataRegionSize;
-                uint32_t poolBase = runtime->guestMalloc(poolSize, kSoundDriverPoolAlignment);
-                if (poolBase == 0u)
-                {
-                    if (poolSize > (kSoundDriverPoolFallbackLimit - kSoundDriverPoolFallbackBase))
-                    {
-                        std::cerr << "[sounddriver] no room for pool (" << poolSize
-                                  << " bytes); sound driver RPC disabled" << std::endl;
-                        return false;
-                    }
-                    poolBase = kSoundDriverPoolFallbackBase;
-                    static bool warned = false;
-                    if (!warned)
-                    {
-                        warned = true;
-                        std::cerr << "[sounddriver] guestMalloc(" << poolSize
-                                  << ") failed; using reserved pool at 0x" << std::hex
-                                  << kSoundDriverPoolFallbackBase << std::dec << std::endl;
-                    }
-                }
+                static_assert(kSoundDriverPoolBase + poolSize <= kSoundDriverPoolEnd,
+                              "sound driver pool must fit between the IOP stream rings and the SIF heap");
+                const uint32_t poolBase = kSoundDriverPoolBase;
 
                 const uint32_t statusAddr = alignUp(poolBase, kSoundDriverStatusAlignment);
                 const uint32_t addrTableAddr =
@@ -231,7 +281,7 @@ namespace ps2_syscalls
                 const uint32_t sqBaseAddr = alignUp(hdBaseAddr + kSoundDriverHdRegionSize, kSoundDriverStorageAlignment);
                 const uint32_t dataBaseAddr = alignUp(sqBaseAddr + kSoundDriverSqRegionSize, kSoundDriverStorageAlignment);
                 const uint32_t storageEnd = dataBaseAddr + kSoundDriverDataRegionSize;
-                if (storageEnd > poolBase + poolSize)
+                if (storageEnd > kSoundDriverPoolEnd)
                 {
                     return false;
                 }
@@ -255,14 +305,13 @@ namespace ps2_syscalls
 
             if (!g_soundDriverRpcState.initialized)
             {
-                rpcZeroRdram(rdram, g_soundDriverRpcState.statusAddr, kSoundDriverStatusSize);
-                rpcZeroRdram(rdram,
-                             g_soundDriverRpcState.addrTableAddr,
-                             kSoundDriverAddrTableEntries * sizeof(uint32_t));
-                rpcZeroRdram(rdram, g_soundDriverRpcState.storageBaseAddr, g_soundDriverRpcState.storageSize);
-                (void)writeGuestU32(rdram, g_soundDriverRpcState.addrTableAddr + (0u * sizeof(uint32_t)), g_soundDriverRpcState.hdBaseAddr);
-                (void)writeGuestU32(rdram, g_soundDriverRpcState.addrTableAddr + (1u * sizeof(uint32_t)), g_soundDriverRpcState.sqBaseAddr);
-                (void)writeGuestU32(rdram, g_soundDriverRpcState.addrTableAddr + (2u * sizeof(uint32_t)), g_soundDriverRpcState.dataBaseAddr);
+                sndPoolZero(g_soundDriverRpcState.statusAddr, kSoundDriverStatusSize);
+                sndPoolZero(g_soundDriverRpcState.addrTableAddr,
+                            kSoundDriverAddrTableEntries * sizeof(uint32_t));
+                sndPoolZero(g_soundDriverRpcState.storageBaseAddr, g_soundDriverRpcState.storageSize);
+                (void)sndPoolWrite32(g_soundDriverRpcState.addrTableAddr + (0u * sizeof(uint32_t)), g_soundDriverRpcState.hdBaseAddr);
+                (void)sndPoolWrite32(g_soundDriverRpcState.addrTableAddr + (1u * sizeof(uint32_t)), g_soundDriverRpcState.sqBaseAddr);
+                (void)sndPoolWrite32(g_soundDriverRpcState.addrTableAddr + (2u * sizeof(uint32_t)), g_soundDriverRpcState.dataBaseAddr);
                 g_soundDriverRpcState.initialized = true;
             }
 
@@ -337,7 +386,7 @@ namespace ps2_syscalls
 
             const uint8_t *selectedSe = getConstMemPtr(rdram, seBase);
             const uint8_t *selectedMidi = getConstMemPtr(rdram, midiBase);
-            uint8_t *status = getMemPtr(rdram, g_soundDriverRpcState.statusAddr);
+            uint8_t *status = sndPoolPtr(g_soundDriverRpcState.statusAddr, kSoundDriverStatusSize);
             if (!selectedSe || !selectedMidi || !status)
             {
                 return;
@@ -348,9 +397,8 @@ namespace ps2_syscalls
                 for (uint32_t slot = 0u; slot < slotCount; ++slot)
                 {
                     int16_t liveValue = 0;
-                    if (!readGuestS16(rdram,
-                                      g_soundDriverRpcState.statusAddr + statusOffset + (slot * sizeof(int16_t)),
-                                      liveValue))
+                    if (!sndPoolReadS16(g_soundDriverRpcState.statusAddr + statusOffset + (slot * sizeof(int16_t)),
+                                        liveValue))
                     {
                         continue;
                     }
@@ -367,9 +415,8 @@ namespace ps2_syscalls
                         continue;
                     }
 
-                    (void)writeGuestS16(rdram,
-                                        g_soundDriverRpcState.statusAddr + statusOffset + (slot * sizeof(int16_t)),
-                                        compatValue);
+                    (void)sndPoolWriteS16(g_soundDriverRpcState.statusAddr + statusOffset + (slot * sizeof(int16_t)),
+                                          compatValue);
                 }
             };
 
@@ -472,18 +519,18 @@ namespace ps2_syscalls
             {
                 const uint32_t port = cmd[1] & 0x0Fu;
                 uint16_t midiInfo = 0u;
-                (void)readGuestU16(rdram, g_soundDriverRpcState.statusAddr + kSoundDriverMidiInfoOffset, midiInfo);
+                (void)sndPoolRead16(g_soundDriverRpcState.statusAddr + kSoundDriverMidiInfoOffset, midiInfo);
                 midiInfo = static_cast<uint16_t>(midiInfo | static_cast<uint16_t>(1u << port));
-                (void)writeGuestU16(rdram, g_soundDriverRpcState.statusAddr + kSoundDriverMidiInfoOffset, midiInfo);
+                (void)sndPoolWrite16(g_soundDriverRpcState.statusAddr + kSoundDriverMidiInfoOffset, midiInfo);
                 break;
             }
             case 0x21u: // SdrBgmStop
             {
                 const uint32_t port = cmd[1] & 0x0Fu;
                 uint16_t midiInfo = 0u;
-                (void)readGuestU16(rdram, g_soundDriverRpcState.statusAddr + kSoundDriverMidiInfoOffset, midiInfo);
+                (void)sndPoolRead16(g_soundDriverRpcState.statusAddr + kSoundDriverMidiInfoOffset, midiInfo);
                 midiInfo = static_cast<uint16_t>(midiInfo & ~static_cast<uint16_t>(1u << port));
-                (void)writeGuestU16(rdram, g_soundDriverRpcState.statusAddr + kSoundDriverMidiInfoOffset, midiInfo);
+                (void)sndPoolWrite16(g_soundDriverRpcState.statusAddr + kSoundDriverMidiInfoOffset, midiInfo);
                 break;
             }
             case 0x28u: // SdrHDDataSet
@@ -515,7 +562,7 @@ namespace ps2_syscalls
                 break;
             }
             case 0x10u: // SdrSeAllStop
-                rpcZeroRdram(rdram, g_soundDriverRpcState.statusAddr + kSoundDriverSeInfoOffset, 6u * sizeof(uint16_t));
+                sndPoolZero(g_soundDriverRpcState.statusAddr + kSoundDriverSeInfoOffset, 6u * sizeof(uint16_t));
                 break;
             default:
                 break;
