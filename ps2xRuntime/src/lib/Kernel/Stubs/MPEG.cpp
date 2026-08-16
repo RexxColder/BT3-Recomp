@@ -2067,6 +2067,7 @@ namespace ps2_stubs
         uint32_t height = kStubMovieHeight;
         uint32_t frameCount = 0u;
         bool haveFrame = false;
+        size_t framesBuffered = 0u;
         MpegDecodedFrame frame;
         {
             PS2Runtime::GuestExecutionReleaseScope releaseGuestExecution(runtime);

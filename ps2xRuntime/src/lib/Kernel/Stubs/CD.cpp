@@ -203,13 +203,6 @@ namespace ps2_stubs
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             noteAdxHeaderIfPresent(rdram, a2, a1);
             setReturnS32(ctx, 1); // command accepted/success
-            // [cdcb] Signal completion. The read already finished synchronously here, but the game
-            // models it as async: it sleeps until the registered callback runs (which signals its
-            // semaphore). Without this the FMV streaming loop stops after its first few chunks.
-            // PS2X_CDCB=0 disables.
-            static const bool s_cb = [](){ const char *v = std::getenv("PS2X_CDCB"); return !(v && v[0] == '0'); }();
-            if (s_cb)
-                invokeCdCallback(rdram, runtime, 1u /* sceCdFuncRead */);
             return;
         }
 
