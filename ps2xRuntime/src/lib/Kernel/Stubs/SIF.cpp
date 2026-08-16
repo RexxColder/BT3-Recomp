@@ -701,10 +701,25 @@ namespace ps2_stubs
             for (uint32_t i = 0; i < pendingCount; ++i)
             {
                 const Ps2SifDmaTransfer &xfer = pending[i];
-                if (!copyGuestByteRange(rdram, xfer.dest, xfer.src, static_cast<uint32_t>(xfer.size)))
+                // sceSifSetDma is EE -> IOP: `dest` is an IOP address, and IOP RAM is 2 MB. A
+                // destination at or above 0x200000 is therefore not IOP memory at all, and copying
+                // it into EE RAM (what this did unconditionally) overwrites whatever the EE has
+                // there. BT3 stages sound banks at 0x1a00000..0x1aac080 -- one transfer is 671,808
+                // bytes at 0x1a00000 -- while the game's own allocator hands out objects in that
+                // same range; on hardware there is no conflict, because the EE never owns those
+                // addresses. The collision filled a live object with junk whose pointers were then
+                // used as write targets, corrupting saved return addresses and crashing dispatch
+                // with "No exact recompiled function" (0x1ad100 / 0xa / 0x28ae00) during the
+                // campaign character switch. Nothing depends on the EE-side copy: the sound bank
+                // snapshots further down read from xfer.SRC, not from the destination.
+                const uint32_t destPhys = xfer.dest & 0x1FFFFFFFu;
+                if (destPhys < 0x200000u)
                 {
-                    ok = false;
-                    break;
+                    if (!copyGuestByteRange(rdram, xfer.dest, xfer.src, static_cast<uint32_t>(xfer.size)))
+                    {
+                        ok = false;
+                        break;
+                    }
                 }
 
                 ps2_syscalls::noteDtxSifDmaTransfer(
