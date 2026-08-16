@@ -196,6 +196,59 @@ def range_registrar(struct_name: str, csv_path: Path, comment: str) -> str:
     )
 
 
+# Mid-function entry points the recompiler does not register on its own.
+#
+# A loop whose body starts inside one generated function but whose back-edge lands in the
+# NEXT one cannot be compiled as a `goto` -- the generator emits `ctx->pc = <target>; return;`
+# and leaves the dispatcher to resume there. That only works if <target> is a registered
+# entry, and a plain mid-sequence instruction never is, so dispatch dies with
+# "No exact recompiled function for guest PC <target>".
+#
+# 0x341358: `addiu $s0, $s1, 0x1`, the head of a loop inside f_3412e8 (which ends at
+# 0x341380) whose `bnez` back-edge sits at 0x341444, inside f_341380. Hit by surrendering
+# a fight.
+MID_FUNCTION_ENTRIES = (0x341358,)
+
+
+def register_mid_function_entries(lines: list, reg: str, addrs) -> tuple:
+    """Give each address a label, a resume-switch case, and an overlay table entry."""
+    base = 0x334C00  # overlay table base: index = (addr - base) / 4
+    for addr in addrs:
+        lo = f"0x{addr:06x}"
+        instr = re.compile(rf"^\s*// {lo}: 0x")
+        i = next((n for n, l in enumerate(lines) if instr.match(l)), None)
+        if i is None:
+            raise SystemExit(f"gen_overlay: no instruction line for {lo}; "
+                             "the overlay layout changed and MID_FUNCTION_ENTRIES needs review")
+        label = f"label_{addr:06x}:"
+        if not any(label in l for l in lines):
+            lines.insert(i, label + "\n")
+            i += 1
+        fn = None
+        for n in range(i, -1, -1):
+            m = re.match(r"^void (f_[0-9a-f]+_0x[0-9a-f]+)\(", lines[n])
+            if m:
+                fn = m.group(1)
+                sw = next((k for k in range(n, n + 8) if "switch (ctx->pc)" in lines[k]), None)
+                break
+        if fn is None or sw is None:
+            raise SystemExit(f"gen_overlay: no containing function/switch for {lo}")
+        case = f"        case 0x{addr:x}u: goto label_{addr:06x}; // mid-function entry\n"
+        if not any(f"case 0x{addr:x}u:" in lines[k] for k in range(sw, sw + 64)):
+            end = next((k for k in range(sw, sw + 400) if "default: break;" in lines[k]), sw + 1)
+            lines.insert(end, case)
+        idx = (addr - base) // 4
+        if f"[{idx}]" not in reg:
+            anchor = re.search(rf"g_ps2OverlayFunctionTable\[\d+\] = {fn};[^\n]*\n", reg)
+            if not anchor:
+                raise SystemExit(f"gen_overlay: no anchor registration for {fn} ({lo})")
+            reg = (reg[:anchor.end()]
+                   + f"        g_ps2OverlayFunctionTable[{idx}] = {fn}; // {lo} mid-function entry\n"
+                   + reg[anchor.end():])
+        print(f"registered mid-function entry {lo} -> {fn} (idx {idx})")
+    return lines, reg
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--recomp", required=True, type=Path)
@@ -255,6 +308,8 @@ def main() -> None:
         # recompiling these (one of them is a 487K-line TU).
         if not path.is_file() or path.read_text() != text:
             path.write_text(text)
+
+    lines, reg = register_mid_function_entries(lines, reg, MID_FUNCTION_ENTRIES)
 
     dst = args.runtime / "src" / "runner_overlay"
     dst.mkdir(parents=True, exist_ok=True)
