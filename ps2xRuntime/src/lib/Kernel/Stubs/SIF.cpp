@@ -9,6 +9,8 @@ void bt3NoteSeBankHeader(uint32_t dst, const uint8_t *data, uint32_t size);
 
 namespace ps2_stubs
 {
+    // [adxrate] Set in CD.cpp from the ADX file header; 0 until a stream declares its rate.
+    extern std::atomic<uint32_t> g_detectedAdxRate;
     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         TODO_NAMED("sceSifCmdIntrHdlr", rdram, ctx, runtime);
@@ -792,14 +794,25 @@ namespace ps2_stubs
                     // split stays correct wherever the heap lives.
                     if (s_play && runtime && xfer.dest < kIopHeapBase)
                     {
-                        static const uint32_t s_rate = []() -> uint32_t {
+                        // [adxrate] Prefer what the stream's own ADX header declared (see
+                        // noteAdxHeaderIfPresent in CD.cpp). The old fixed 24000 was half the
+                        // opening movie's real 48000, so its song played an octave low at half
+                        // speed and dragged the FMV video down with it. Falls back to 24000 for
+                        // any stream we never saw a header for, so nothing that already sounded
+                        // right changes. PS2X_SNDRATE still forces a value for A/B testing.
+                        static const uint32_t s_rateOverride = []() -> uint32_t {
                             if (const char *v = std::getenv("PS2X_SNDRATE"))
                             {
                                 const long n = std::strtol(v, nullptr, 10);
                                 if (n > 0) return static_cast<uint32_t>(n);
                             }
-                            return 24000u; // confirmed by ear; PS2X_SNDRATE overrides
+                            return 0u;
                         }();
+                        uint32_t s_rate = s_rateOverride;
+                        if (s_rate == 0u)
+                            s_rate = g_detectedAdxRate.load(std::memory_order_relaxed);
+                        if (s_rate == 0u)
+                            s_rate = 24000u;
                         // NOT `dest >> 14`: the rings are 16KB but 0x100-staggered, so each
                         // one's tail falls in the next bucket and its audio would be spliced
                         // into the neighbouring stream. Resolve against the registered spans.

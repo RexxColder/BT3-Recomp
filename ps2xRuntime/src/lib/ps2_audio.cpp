@@ -488,11 +488,30 @@ void PS2AudioBackend::serviceStreams()
         // same question: if the left side was ever seen alone it would have been opened as a
         // mono stream, setting L.opened, and this block would then be skipped forever -- taking
         // a reference to a default-constructed AudioStream below and playing into nothing.
+        // The device is opened at whatever rate the first PCM declared and used to keep that
+        // rate for the rest of the run. Streams do not all share one rate -- the opening movie's
+        // ADX is 48000 while in-game BGM is 24000 -- so a stuck device plays every later stream
+        // at the wrong speed (BGM at double speed after the 48 kHz movie). Reopen when the rate
+        // actually changes; st.sampleRate is already tracked per stream, only the device was
+        // sticky.
+        static uint32_t s_pairOpenRate = 0u;
+        auto pairIt = m_impl->streams.find(kPairKey);
+        if (pairIt != m_impl->streams.end() && L.sampleRate != 0u && L.sampleRate != s_pairOpenRate)
+        {
+            std::fprintf(stderr, "[sndplay] pair rate %u -> %u, reopening device\n",
+                         s_pairOpenRate, L.sampleRate);
+            StopAudioStream(pairIt->second);
+            UnloadAudioStream(pairIt->second);
+            m_impl->streams.erase(pairIt);
+            L.started = R.started = false;
+            L.opened = R.opened = false;
+        }
         if (m_impl->streams.find(kPairKey) == m_impl->streams.end())
         {
             SetAudioStreamBufferSizeDefault(static_cast<int>(kStreamChunkFrames));
             m_impl->streams[kPairKey] = LoadAudioStream(L.sampleRate, 16, 2);
             L.opened = R.opened = true;
+            s_pairOpenRate = L.sampleRate;
             std::fprintf(stderr, "[sndplay] opened STEREO PAIR (streams 0+1) rate=%u\n", L.sampleRate);
         }
         AudioStream &s = m_impl->streams[kPairKey];

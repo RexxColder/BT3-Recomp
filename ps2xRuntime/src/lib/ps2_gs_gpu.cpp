@@ -41,6 +41,14 @@ namespace {
 #include <iostream>
 #include <sstream>
 
+// [fmvblit] Defined further down; forward-declared so maybeEmitFmvBlit (in the anonymous
+// namespace below) can see them.
+extern std::atomic<uint32_t> g_ps2FmvActive;
+extern std::atomic<uint32_t> g_fmvPendingFbp;
+extern std::atomic<uint32_t> g_fmvPendingBw;
+class GS;
+extern GS *g_fmvGs;
+
 namespace
 {
     // Redundant-upload dedup: hash of the last IMAGE bytes uploaded to each dest block.
@@ -56,6 +64,105 @@ namespace
     static constexpr uint32_t kDefaultDisplayHeight = 448u;
     static constexpr uint32_t kHostFrameWidth = 640u;
     static constexpr uint32_t kHostFrameHeight = 512u;
+
+    // [flippub] Under PS2X_ASYNC_KICK, publish the GPU command list at the DISPFB flip
+    // (which for BT3 arrives as a GIF A+D 0x59/0x5b write processed by the kick worker,
+    // i.e. HERE, stream-ordered) instead of at the render kick — the kick fires one flip
+    // earlier in the stream, so published frames were presented against the PREVIOUS
+    // frame's display hint (inverted 0<->112 during Kaioken cutscenes = white scenes).
+    // Deduped on fbp change so DISPFB1+DISPFB2 double-writes publish once per real flip.
+    // PS2X_FLIP_PUBLISH=0 reverts to the render-kick publish.
+    bool flipPublishEnabled()
+    {
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_FLIP_PUBLISH"); return !(v && v[0] == '0'); }();
+        return s_on && PS2Memory::asyncKickEnabled();
+    }
+    // [fmvblit] Emit the fullscreen blit the FMV never issues. Called at the flip, BEFORE the
+    // publish, so the synthetic sprite is part of the list that gets rendered. Decodes the movie
+    // buffer straight out of VRAM (that is where the macroblock uploads put it) and hands it to
+    // the renderer as an ordinary textured sprite, which the existing present path then shows.
+    void maybeEmitFmvBlit(GS *gs, uint32_t newFbp)
+    {
+        if (!GsGpuRenderer::enabled() || !gs)
+            return;
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_FMVBLIT"); return !(v && v[0] == '0'); }();
+        {   // why does this not fire? log the inputs, capped
+            static std::atomic<uint32_t> s_d{0};
+            if (s_d.fetch_add(1) < 20u)
+                std::fprintf(stderr, "[fmvblit:why] flip->fbp=%u fmvActive=%u pendingFbp=%u bw=%u\n",
+                             newFbp, ::g_ps2FmvActive.load(std::memory_order_relaxed),
+                             ::g_fmvPendingFbp.load(std::memory_order_relaxed),
+                             ::g_fmvPendingBw.load(std::memory_order_relaxed));
+        }
+        if (!s_on || ::g_ps2FmvActive.load(std::memory_order_relaxed) == 0u)
+            return;
+        if (::g_fmvPendingFbp.load(std::memory_order_relaxed) != newFbp)
+            return; // the buffer being scanned out is not the one the movie filled
+
+        const uint32_t bw = std::max(1u, ::g_fmvPendingBw.load(std::memory_order_relaxed));
+        const uint32_t w = bw * 64u;
+        const uint32_t h = 448u; // BT3's display height; the movie fills the visible field
+        const uint32_t bp = newFbp * 32u;
+
+        std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4u);
+        for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                const uint32_t px = gs->ReadVram(0u /*PSMCT32*/, bp, bw, x, y);
+                uint8_t *o = rgba.data() + (static_cast<size_t>(y) * w + x) * 4u;
+                o[0] = static_cast<uint8_t>(px & 0xFFu);
+                o[1] = static_cast<uint8_t>((px >> 8) & 0xFFu);
+                o[2] = static_cast<uint8_t>((px >> 16) & 0xFFu);
+                o[3] = 0xFFu; // scan-out ignores alpha
+            }
+
+        const uint64_t key = 0xF00D0000ull | newFbp;
+        ps2GpuRenderer().putTexture(key, std::move(rgba), (int)w, (int)h, newFbp, newFbp + 1u);
+
+        GsGpuRenderer::DrawCmd c{};
+        c.texKey = key;
+        c.isTriangle = false;
+        c.destFbp = newFbp;
+        c.destFbw = bw;
+        c.srcTexW = (int)w; c.srcTexH = (int)h;
+        c.sx = 0; c.sy = 0; c.sw = (int)w; c.sh = (int)h;
+        c.dx0 = 0.0f; c.dy0 = 0.0f; c.dx1 = (float)w; c.dy1 = (float)h;
+        c.su0 = 0.0f; c.sv0 = 0.0f; c.su1 = (float)w; c.sv1 = (float)h;
+        c.r = 128; c.g = 128; c.b = 128; c.a = 128; // PS2 neutral modulate
+        ps2GpuRenderer().recordCmd(c);
+
+        ::g_fmvPendingFbp.store(0xFFFFFFFFu, std::memory_order_relaxed);
+        static std::atomic<uint32_t> s_n{0};
+        if (s_n.fetch_add(1) < 4u)
+            std::fprintf(stderr, "[fmvblit] movie buffer fbp=%u %ux%u -> synthetic fullscreen blit\n",
+                         newFbp, w, h);
+    }
+
+    uint32_t s_lastFbpDbg = 0xFFFFFFFFu;
+    void maybePublishOnFlip(uint32_t fbp)
+    {
+        s_lastFbpDbg = fbp;
+        if (!flipPublishEnabled())
+            return;
+        // Publish ONLY on a real flip (scanned-out fbp CHANGE). BT3 rewrites DISPFB
+        // every vsync with an unchanged fbp during fights (frame pacing there comes from
+        // the render-kick marker, which stays active); publishing on every write emitted
+        // a half-frame publish at the mid-frame vsync — doubled present workload (lag)
+        // and visibly half-drawn frames. The fbp only changes during display-buffer
+        // alternation (Kaioken cutscene scenes), which is exactly where the in-stream
+        // publish + hint snapshot must be frame-accurate.
+        {
+            static std::atomic<uint32_t> s_f{0};
+            if (::g_ps2FmvActive.load(std::memory_order_relaxed) && s_f.fetch_add(1) < 20u)
+                std::fprintf(stderr, "[fmvblit:flip] DISPFB write fbp=%u (last=%u)\n", fbp, s_lastFbpDbg);
+        }
+        static uint32_t s_lastFbp = 0xFFFFFFFFu;
+        if (fbp == s_lastFbp)
+            return;
+        s_lastFbp = fbp;
+        maybeEmitFmvBlit(::g_fmvGs, fbp); // [fmvblit] before the publish, so it joins this list
+        ps2GpuRenderer().swapFrame();
+    }
 
     uint16_t encodeFramePixelPSMCT16(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
     {
@@ -1384,6 +1491,13 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 // Set by the rasterizer (PS2X_TEX3D [maphash] block) once a 3D map draw has been seen;
 // PS2X_CWATCH_FIGHT uses it to hold upload-content dumps until fight-era streaming starts.
 std::atomic<bool> g_ps2xMapDrawSeen{false};
+
+// [fmvphase] Set by sceMpegGetPicture; lets the VRAM probes filter to the actual movie.
+std::atomic<uint32_t> g_ps2FmvActive{0u};
+// [fmvblit] framebuffer currently being filled by movie macroblocks, and its FBW.
+std::atomic<uint32_t> g_fmvPendingFbp{0xFFFFFFFFu};
+std::atomic<uint32_t> g_fmvPendingBw{0u};
+GS *g_fmvGs = nullptr; // [fmvblit] set on the first image upload; the emitter reads VRAM via it
 
 // PS2X_GRASSHACK shared state (see processImageData tail + GSRasterizer::drawPrimitive):
 // shadow of the 10752 slot captured when the mountains+grass image is resident.
@@ -3459,7 +3573,25 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         std::memcpy(g_ps2xGrassShadow, m_vram + 10752u * 256u, 131072u);
         g_ps2xGrassShadowValid.store(true, std::memory_order_release);
     }
+
+    // [fmvblit] FMVs are presented straight out of VRAM. Measured: the movie arrives as 16x16
+    // MACROBLOCK uploads (psm=PSMCT32, bw=8 -> 512 wide) into the BACK buffer (fbp 0 while the
+    // display is on 112), and the game then flips -- it issues no primitives at all for the movie
+    // (prims/sec=0). Software presents by reading VRAM so it shows the picture; GPU mode composites
+    // FBOs and picks the display buffer from those that RECEIVED DRAWS, so there is nothing to
+    // present and the screen is black.
+    //
+    // Record which framebuffer the macroblocks are filling. The blit itself is emitted once, at the
+    // flip that makes this buffer the display (see maybeEmitFmvBlit) -- emitting per upload would
+    // mean ~800 fullscreen blits per frame.
+    if (GsGpuRenderer::enabled() && m_vram && dpsm == 0u && dbw >= 8u)
+    {
+        g_fmvGs = this;
+        g_fmvPendingFbp.store(dbp / 32u, std::memory_order_relaxed);
+        g_fmvPendingBw.store(dbw, std::memory_order_relaxed);
+    }
 }
+
 
 void GS::performLocalToHostToBuffer()
 {
@@ -3552,4 +3684,61 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
     std::memcpy(dst, m_localToHostBuffer.data() + m_localToHostReadPos, toCopy);
     m_localToHostReadPos += toCopy;
     return static_cast<uint32_t>(toCopy);
+}
+
+
+// [fmvblit] Drive the movie from the decoder, not from the display registers.
+//
+// Measured: during an FMV the game writes the picture into VRAM as 16x16 macroblocks and issues
+// NO primitives and NO DISPFB writes, so nothing in GPU mode ever records a draw or publishes a
+// frame -- the renderer sits idle and the screen is black, while software presents by reading
+// VRAM and shows the movie. sceMpegGetPicture is the one event that happens exactly once per
+// movie frame, so emit the fullscreen blit there and publish it ourselves.
+void ps2GsEmitFmvFrame()
+{
+    if (!GsGpuRenderer::enabled())
+        return;
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_FMVBLIT"); return !(v && v[0] == '0'); }();
+    if (!s_on)
+        return;
+    GS *gs = g_fmvGs;
+    const uint32_t fbp = g_fmvPendingFbp.load(std::memory_order_relaxed);
+    if (!gs || fbp == 0xFFFFFFFFu)
+        return;
+
+    const uint32_t bw = std::max(1u, g_fmvPendingBw.load(std::memory_order_relaxed));
+    const uint32_t w = bw * 64u;
+    const uint32_t h = 448u;
+
+    std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4u);
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x)
+        {
+            const uint32_t px = gs->ReadVram(0u, fbp * 32u, bw, x, y);
+            uint8_t *o = rgba.data() + (static_cast<size_t>(y) * w + x) * 4u;
+            o[0] = (uint8_t)(px & 0xFFu);
+            o[1] = (uint8_t)((px >> 8) & 0xFFu);
+            o[2] = (uint8_t)((px >> 16) & 0xFFu);
+            o[3] = 0xFFu;
+        }
+
+    const uint64_t key = 0xF00D0000ull | fbp;
+    ps2GpuRenderer().putTexture(key, std::move(rgba), (int)w, (int)h, fbp, fbp + 1u);
+
+    GsGpuRenderer::DrawCmd c{};
+    c.texKey = key;
+    c.isTriangle = false;
+    c.destFbp = fbp;
+    c.destFbw = bw;
+    c.srcTexW = (int)w; c.srcTexH = (int)h;
+    c.sx = 0; c.sy = 0; c.sw = (int)w; c.sh = (int)h;
+    c.dx0 = 0.0f; c.dy0 = 0.0f; c.dx1 = (float)w; c.dy1 = (float)h;
+    c.su0 = 0.0f; c.sv0 = 0.0f; c.su1 = (float)w; c.sv1 = (float)h;
+    c.r = 128; c.g = 128; c.b = 128; c.a = 128;
+    ps2GpuRenderer().recordCmd(c);
+    ps2GpuRenderer().swapFrame(); // nothing else publishes during a movie
+
+    static std::atomic<uint32_t> s_n{0};
+    if (s_n.fetch_add(1) < 4u)
+        std::fprintf(stderr, "[fmvblit] frame blit fbp=%u %ux%u published\n", fbp, w, h);
 }

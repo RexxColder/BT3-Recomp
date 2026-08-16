@@ -48,6 +48,42 @@ namespace ps2_stubs
         return snapshot;
     }
 
+    // [adxrate] The streaming-PCM rate used to be one hardcoded 24000 "confirmed by ear", which is
+    // exactly half of what the opening movie's ZS3USOP.ADX declares -- so its song played an octave
+    // low at half speed, and because the movie sequencer paces the video to the audio clock, the
+    // FMV ran slow with it. ADX is self-describing, so read the rate off the file instead of
+    // guessing: magic 0x8000, then sample rate as a big-endian u32 at +0x08 (channels at +0x07).
+    // A sector read whose destination begins with a valid ADX header is the start of a stream;
+    // remember what it said and let the audio path use it. Anything we never see a header for
+    // keeps the previous default, so this cannot regress streams that were already correct.
+    std::atomic<uint32_t> g_detectedAdxRate{0u};
+    std::atomic<uint32_t> g_detectedAdxChannels{0u};
+
+    void noteAdxHeaderIfPresent(const uint8_t *rdram, uint32_t dest, uint32_t sectors)
+    {
+        if (sectors == 0u)
+            return;
+        const uint32_t offset = dest & PS2_RAM_MASK;
+        if (static_cast<uint64_t>(offset) + 16u > PS2_RAM_SIZE)
+            return;
+        const uint8_t *p = rdram + offset;
+        if (p[0] != 0x80u || p[1] != 0x00u) // ADX magic
+            return;
+
+        const uint8_t channels = p[7];
+        const uint32_t rate = (static_cast<uint32_t>(p[8]) << 24) | (static_cast<uint32_t>(p[9]) << 16) |
+                              (static_cast<uint32_t>(p[10]) << 8) | static_cast<uint32_t>(p[11]);
+        // Guard against a random block that merely starts 0x8000.
+        if (channels == 0u || channels > 2u || rate < 8000u || rate > 48000u)
+            return;
+
+        const uint32_t prev = g_detectedAdxRate.exchange(rate);
+        g_detectedAdxChannels.store(channels);
+        if (prev != rate)
+            std::cerr << "[adxrate] ADX header: " << rate << " Hz, " << static_cast<int>(channels)
+                      << " ch (was " << (prev ? prev : 0u) << ")" << std::endl;
+    }
+
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
@@ -165,7 +201,15 @@ namespace ps2_stubs
         if (ok)
         {
             g_cdStreamingLbn = selected.lbn + selected.sectors;
+            noteAdxHeaderIfPresent(rdram, a2, a1);
             setReturnS32(ctx, 1); // command accepted/success
+            // [cdcb] Signal completion. The read already finished synchronously here, but the game
+            // models it as async: it sleeps until the registered callback runs (which signals its
+            // semaphore). Without this the FMV streaming loop stops after its first few chunks.
+            // PS2X_CDCB=0 disables.
+            static const bool s_cb = [](){ const char *v = std::getenv("PS2X_CDCB"); return !(v && v[0] == '0'); }();
+            if (s_cb)
+                invokeCdCallback(rdram, runtime, 1u /* sceCdFuncRead */);
             return;
         }
 

@@ -3638,9 +3638,53 @@ namespace
         ps2_syscalls::setDtxCompatLayout(layout);
     }
 
+    // [mpegcb] The config lists every sceMpeg entry point as a stub, but only the ones Ghidra
+    // recognised as functions got a generated thunk -- sceMpegAddCallback (0x297DD0) and
+    // sceMpegAddStrCallback (0x29C250) did not. A `jal` to an unregistered address falls into
+    // PS2Runtime's interpreter fallback, which happily runs the game's OWN libmpeg code, so the
+    // movie player's callbacks were filed inside a library that never executes. Everything else
+    // in the path (Init/DemuxPssRing/GetPicture/Reset/Flush) IS our stub, so the callbacks were
+    // registered in one world and needed in the other, and the opening FMV froze about two
+    // seconds in with a full ring nobody drained. Register the two registration entry points so
+    // the callbacks land in the stub registry that sceMpegGetPicture actually dispatches from.
+    // Deliberately narrow: sceMpegCreate and friends stay interpreted, because the guest library
+    // builds the mpeg object our GetPicture stub writes through.
+    // PS2X_MPEGCB=0 disables the dispatch side and makes this registration inert.
+    template <void (*Stub)(uint8_t *, R5900Context *, PS2Runtime *)>
+    void bt3MpegStubThunk(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t entryPc = ctx->pc;
+        Stub(rdram, ctx, runtime);
+        if (ctx->pc == entryPc)
+            ctx->pc = getRegU32(ctx, 31);
+    }
+
+    void applyBt3MpegCallbackStubs(PS2Runtime &runtime)
+    {
+        struct MpegStubEntry
+        {
+            uint32_t address;
+            PS2Runtime::RecompiledFunction fn;
+            const char *name;
+        };
+        static const MpegStubEntry kEntries[] = {
+            {0x00297DD0u, &bt3MpegStubThunk<&ps2_stubs::sceMpegAddCallback>, "sceMpegAddCallback"},
+            {0x0029C250u, &bt3MpegStubThunk<&ps2_stubs::sceMpegAddStrCallback>, "sceMpegAddStrCallback"},
+        };
+        for (const MpegStubEntry &entry : kEntries)
+        {
+            if (runtime.hasFunction(entry.address))
+                continue; // already generated -- leave it alone
+            if (runtime.replaceFunction(entry.address, entry.fn))
+                std::cerr << "[game_overrides] BT3: registered " << entry.name << " stub at 0x"
+                          << std::hex << entry.address << std::dec << std::endl;
+        }
+    }
+
     PS2_REGISTER_GAME_OVERRIDE("RECVX sound-driver compat", "slus_201.84", 0u, 0u, &applyRecvxSoundDriverCompat);
     PS2_REGISTER_GAME_OVERRIDE("RECVX DTX compat", "slus_201.84", 0u, 0u, &applyRecvxDtxCompat);
     PS2_REGISTER_GAME_OVERRIDE("LotR sound RPC compat", "SLUS_205.78", 0u, 0u, &applyLotrSoundRpcCompat);
     PS2_REGISTER_GAME_OVERRIDE("BT3 sound init bypass", "SLUS_216.78", 0u, 0u, &applyBt3SoundInitBypass);
     PS2_REGISTER_GAME_OVERRIDE("BT3 DTX sound URPC compat", "SLUS_216.78", 0u, 0u, &applyBt3DtxCompat);
+    PS2_REGISTER_GAME_OVERRIDE("BT3 sceMpeg callback stubs", "SLUS_216.78", 0u, 0u, &applyBt3MpegCallbackStubs);
 }

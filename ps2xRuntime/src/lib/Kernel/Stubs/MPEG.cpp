@@ -16,6 +16,9 @@ extern "C"
 
 #include "Syscalls/Helpers/State.h"
 
+extern std::atomic<uint32_t> g_ps2FmvActive; // [fmvphase] defined in ps2_gs_gpu.cpp
+void ps2GsEmitFmvFrame();                   // [fmvblit] defined in ps2_gs_gpu.cpp
+
 namespace ps2_stubs
 {
     namespace
@@ -1600,10 +1603,139 @@ namespace ps2_stubs
         setReturnS32(ctx, static_cast<int32_t>(copied));
     }
 
+    // [mpegcb] Non-stream callbacks registered through sceMpegAddCallback were being recorded and
+    // never invoked -- only sceMpegAddStrCallback's stream callbacks were ever dispatched. BT3's
+    // movie player registers three of them (types 1, 4 and 0 -> guest 0x1260A8, 0x1261D8,
+    // 0x125F98) and drives ALL of its input from them: the type-4 handler feeds the demuxer from
+    // the filled ring slots and then issues the next sceCdRead. The game primes four 512 KB chunks
+    // itself and hands over to the callbacks, so with them silent the movie froze about two
+    // seconds in with a full, never-drained ring. `gp` has to be captured at registration time --
+    // the callbacks address their globals gp-relative.
+    uint32_t g_mpegCallbackGp = 0u;
+    uint32_t g_mpegCallbackStackTop = 0u;
+
+    // One 512 KB PSS chunk decodes to ~12 pictures, so refilling below this backlog asks for
+    // roughly one chunk at a time -- see the rate discussion in sceMpegGetPicture.
+    constexpr size_t kMpegRefillLowWaterFrames = 12u;
+    // Re-entering a callback parked in a guest wait loop: spin cheaply first, then back off.
+    constexpr uint32_t kMpegCallbackSpinYields = 2000u;
+    constexpr uint32_t kMpegCallbackMaxSpins = 20000u;
+
+    // `ctx` is the CALLING guest thread's context and the callback runs on it, borrowing its
+    // stack below the current frame -- exactly as if the stub had called the function itself.
+    // A synthetic context does not work: reads submitted from one are accepted by func_26AE60
+    // (the request is stored) but the file server never dispatches them, because the wake-up
+    // path is keyed to a real registered guest thread. Reads issued from the game's own
+    // func_126510 on a real thread dispatch fine, which is what isolates it.
+    void invokeMpegCallbacks(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t mpegAddr, uint32_t type)
+    {
+        static const bool s_enabled = [](){ const char *v = std::getenv("PS2X_MPEGCB"); return !(v && v[0] == '0'); }();
+        if (!s_enabled || !runtime)
+            return;
+
+        struct PendingCallback { uint32_t func; uint32_t data; };
+        std::vector<PendingCallback> pending;
+        uint32_t gp = 0u;
+        uint32_t stackTop = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            gp = g_mpegCallbackGp;
+            stackTop = g_mpegCallbackStackTop;
+            auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
+            if (it == g_mpeg_stub_state.callbacksByMpeg.end())
+                return;
+            for (const MpegRegisteredCallback &callback : it->second)
+            {
+                if (!callback.stream && callback.type == type && callback.func != 0u)
+                    pending.push_back(PendingCallback{callback.func, callback.data});
+            }
+        }
+        if (pending.empty())
+            return;
+
+        (void)stackTop;
+
+        // Run outside every mutex: the callback re-enters sceMpegDemuxPssRing, which takes
+        // g_mpeg_stub_mutex itself.
+        for (const PendingCallback &callback : pending)
+        {
+            if (!runtime->hasFunction(callback.func))
+                continue;
+            const R5900Context saved = *ctx;
+            try
+            {
+                if (gp != 0u)
+                    SET_GPR_U32(ctx, 28, gp);
+                SET_GPR_U32(ctx, 31, 0u);
+                SET_GPR_U32(ctx, 4, mpegAddr);
+                SET_GPR_U32(ctx, 5, callback.data);
+                ctx->pc = callback.func;
+                const char *exitReason = "returned";
+                uint32_t steps = 0u;
+                uint32_t spins = 0u;
+                while (ctx->pc != 0u && !runtime->isStopRequested())
+                {
+                    auto step = runtime->lookupFunction(ctx->pc);
+                    if (!step)
+                    {
+                        exitReason = "NO-FUNCTION";
+                        break;
+                    }
+                    const uint32_t before = ctx->pc;
+                    step(rdram, ctx, runtime);
+                    ++steps;
+                    if (ctx->pc != before)
+                    {
+                        spins = 0u;
+                        continue;
+                    }
+
+                    // pc unchanged is NOT "stuck": recompiled code returns with pc parked on the
+                    // loop head whenever it reaches a preemption point, and the caller is
+                    // expected to re-dispatch -- that is how the runtime's own dispatch loop
+                    // works. The type-4 callback ends up in BT3's CDVD wait (around 0x27e974)
+                    // spinning for the very read it just queued, so bailing out here abandoned
+                    // it mid-wait with [stream+8] still set and wedged the file server for the
+                    // rest of the movie. Re-enter, standing aside so the file-server thread can
+                    // actually make that read complete. Bounded, since a genuinely stuck wait
+                    // must not hang the movie thread forever.
+                    if (++spins > kMpegCallbackMaxSpins)
+                    {
+                        exitReason = "SPIN-TIMEOUT";
+                        break;
+                    }
+                    // Hand the token over and take it straight back. A fixed sleep here is far
+                    // longer than the read actually needs and shows up directly as choppy
+                    // playback, so only fall back to sleeping if the wait really is dragging.
+                    PS2Runtime::GuestExecutionReleaseScope letOtherThreadsRun(runtime);
+                    if (spins <= kMpegCallbackSpinYields)
+                        std::this_thread::yield();
+                    else
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+                // A callback that does not run to completion would leave the guest's lock /
+                // interrupt-disable bracket (func_2892C0 .. func_2892D8 in func_26AE60)
+                // unbalanced and wedge the file server, so say so rather than failing quietly.
+                if (exitReason[0] == 'N' || exitReason[0] == 'S')
+                {
+                    static std::atomic<uint32_t> s_n{0};
+                    if (s_n.fetch_add(1u) < 8u)
+                        std::fprintf(stderr, "[mpegcb] callback 0x%x did not complete: %s (steps=%u spins=%u)\n",
+                                     callback.func, exitReason, steps, spins);
+                }
+            }
+            catch (...)
+            {
+                // A guest callback that throws must not take the MPEG stub down.
+            }
+            *ctx = saved;
+        }
+
+    }
+
     void sceMpegAddCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
 
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t callbackType = getRegU32(ctx, 5);
@@ -1613,6 +1745,10 @@ namespace ps2_stubs
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         g_mpeg_stub_state.initialized = true;
         (void)getPlaybackState(mpegAddr);
+
+        g_mpegCallbackGp = getRegU32(ctx, 28);
+        if (g_mpegCallbackStackTop == 0u && runtime)
+            g_mpegCallbackStackTop = runtime->reserveAsyncCallbackStack(0x8000u, 16u);
 
         const uint32_t handle = g_mpeg_stub_state.nextCallbackHandle++;
         g_mpeg_stub_state.callbacksByMpeg[mpegAddr].push_back(
@@ -1677,6 +1813,13 @@ namespace ps2_stubs
 
     void sceMpegCreate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // [mpegtrace] Is the FMV path reached at all? The opening movie is black while its ADX
+        // audio plays, and no [MPEG] diagnostic fires -- but those are error-gated, so silence does
+        // not distinguish "never called" from "called and fine". Capped, unconditional.
+        {
+            static std::atomic<uint32_t> n{0};
+            if (n.fetch_add(1) < 4u) std::fprintf(stderr, "[mpegtrace] %s\n", __func__);
+        }
         const uint32_t param_1 = getRegU32(ctx, 4); // a0
         const uint32_t param_2 = getRegU32(ctx, 5); // a1
         const uint32_t param_3 = getRegU32(ctx, 6); // a2
@@ -1846,6 +1989,17 @@ namespace ps2_stubs
         }
         g_mpeg_cv.notify_all();
 
+        // [mpegtrace] avail/consumed/decoded, unconditional and capped: the aggressive-log build
+        // is off, so the numbers that say whether PSS data is actually arriving were invisible.
+        {
+            static std::atomic<uint32_t> n{0};
+            const uint32_t nd = n.fetch_add(1);
+            if (nd < 12u || (nd % 30u) == 0u)
+                std::fprintf(stderr,
+                             "[mpegtrace] DemuxPssRing avail=%u consumed=%zu decoded=%zu"
+                             " data=0x%x ring=0x%x ringSize=%u\n",
+                             availableBytes, consumed, decodedCount, dataAddr, ringBaseAddr, ringSize);
+        }
         if (traceIdx < 32u)
         {
             PS2_IF_AGRESSIVE_LOGS({
@@ -2059,6 +2213,24 @@ namespace ps2_stubs
                 height = playback.height;
                 frameCount = playback.picturesServed;
             }
+
+            framesBuffered = getPlaybackState(mpegAddr).decodedFrames.size();
+        }
+
+        // [fmvphase] Mark the FMV as live so the VRAM-write probes can filter to the movie.
+        // Everything before this (Sofdec logo screen, menus) looks deceptively similar in the
+        // draw logs, and attributing those to the movie has already cost several hours.
+        ::g_ps2FmvActive.store(1u, std::memory_order_relaxed);
+        ::ps2GsEmitFmvFrame(); // publish the movie frame currently in VRAM
+
+        // [mpegtrace] Did a decoded frame actually come back, and at what size? Distinguishes
+        // "decoder produced nothing" from "frame produced but not displayed". Capped.
+        {
+            static std::atomic<uint32_t> n{0};
+            const uint32_t nn = n.fetch_add(1);
+            if (nn < 12u || (nn % 30u) == 0u)
+                std::fprintf(stderr, "[mpegtrace] GetPicture haveFrame=%d %ux%u frame=%u image=0x%x\n",
+                             haveFrame ? 1 : 0, width, height, frameCount, imageAddr);
         }
 
         mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
@@ -2088,6 +2260,28 @@ namespace ps2_stubs
         }
 
         setReturnS32(ctx, 0);
+
+        // [mpegcb] Ask the game for more input only when we are actually short of it. The type-4
+        // handler feeds the demuxer from any filled ring slot and then issues the next disc read,
+        // so its rate has to match consumption: one 512 KB chunk decodes to ~12 frames, and firing
+        // it once per served picture requested ~30 chunks/sec against ~2 consumed. The game's
+        // stream object only carries ONE outstanding request, so the surplus reads came back as
+        // func_26B000 == -1, and func_126328 stores that unchecked as (-1 << 11) -- the slot ends
+        // up with len=0xFFFFF800 and the ring is poisoned. Gating on the decoded-frame backlog
+        // keeps exactly one read in flight, which is the cadence the hardware library produces.
+        //
+        // Two conditions, both needed. Only ask when the decoder is actually dry: one chunk is
+        // ~12 pictures, so a backlog means the input we already have has not been consumed yet.
+        // And never ask twice in quick succession: the game's stream object carries exactly ONE
+        // outstanding request, and func_126328 does not check func_26B000's return, so a second
+        // ask while the first read is still in flight comes back -1 and gets stored as
+        // (-1 << 11) = 0xFFFFF800 -- a poisoned slot the ring never recovers from. The file
+        // server keeps running throughout (it services other streams the whole time), so the
+        // read does land; it just needs to be given the time hardware would have given it.
+        if (framesBuffered < kMpegRefillLowWaterFrames)
+        {
+            invokeMpegCallbacks(rdram, ctx, runtime, mpegAddr, 4u);
+        }
     }
 
     void sceMpegGetPictureRAW8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2102,6 +2296,13 @@ namespace ps2_stubs
 
     void sceMpegInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // [mpegtrace] Is the FMV path reached at all? The opening movie is black while its ADX
+        // audio plays, and no [MPEG] diagnostic fires -- but those are error-gated, so silence does
+        // not distinguish "never called" from "called and fine". Capped, unconditional.
+        {
+            static std::atomic<uint32_t> n{0};
+            if (n.fetch_add(1) < 4u) std::fprintf(stderr, "[mpegtrace] %s\n", __func__);
+        }
         (void)rdram;
         (void)runtime;
 
