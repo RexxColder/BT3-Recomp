@@ -17,8 +17,17 @@ namespace ps2_syscalls
         constexpr uint32_t kSoundDriverStatusAlignment = 0x100u;
         constexpr uint32_t kSoundDriverAddrTableAlignment = 0x100u;
         constexpr uint32_t kSoundDriverStorageAlignment = 0x1000u;
-        constexpr uint32_t kSoundDriverGuestPoolBase = 0x00120000u;
-        constexpr uint32_t kSoundDriverGuestPoolLimit = 0x00200000u;
+        // The sound driver's guest pool used to be hardcoded at [0x120000, 0x200000) -- INSIDE the
+        // game's own loaded image (the recompiled function table spans 0x100008..0x2bf69c). It
+        // zeroed and then filled ~376 KB there, destroying live guest code: RAM at 0x122f80 held
+        // `jal 0x0c0a93b0` at boot and read back zero later, while PCSX2 keeps that instruction for
+        // the whole session. Take the pool from the guest heap instead, which the ELF loader places
+        // above the loaded image, so it can never overlap the game. kSoundDriverPoolFallbackBase is
+        // used only if the heap cannot satisfy the request; it sits above the heap's hard limit and
+        // below the async callback stacks, so it is still outside the game image.
+        constexpr uint32_t kSoundDriverPoolAlignment = 0x1000u;
+        constexpr uint32_t kSoundDriverPoolFallbackBase = 0x01F00000u;
+        constexpr uint32_t kSoundDriverPoolFallbackLimit = 0x01F80000u;
 
         SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx)
         {
@@ -187,7 +196,34 @@ namespace ps2_syscalls
 
             if (g_soundDriverRpcState.statusAddr == 0u)
             {
-                const uint32_t statusAddr = alignUp(kSoundDriverGuestPoolBase, kSoundDriverStatusAlignment);
+                // Worst-case span, computed with the same alignment steps applied below so the
+                // block cannot come out undersized.
+                const uint32_t poolSize =
+                    kSoundDriverStatusAlignment + kSoundDriverStatusSize +
+                    kSoundDriverAddrTableAlignment + (kSoundDriverAddrTableEntries * sizeof(uint32_t)) +
+                    (3u * kSoundDriverStorageAlignment) +
+                    kSoundDriverHdRegionSize + kSoundDriverSqRegionSize + kSoundDriverDataRegionSize;
+                uint32_t poolBase = runtime->guestMalloc(poolSize, kSoundDriverPoolAlignment);
+                if (poolBase == 0u)
+                {
+                    if (poolSize > (kSoundDriverPoolFallbackLimit - kSoundDriverPoolFallbackBase))
+                    {
+                        std::cerr << "[sounddriver] no room for pool (" << poolSize
+                                  << " bytes); sound driver RPC disabled" << std::endl;
+                        return false;
+                    }
+                    poolBase = kSoundDriverPoolFallbackBase;
+                    static bool warned = false;
+                    if (!warned)
+                    {
+                        warned = true;
+                        std::cerr << "[sounddriver] guestMalloc(" << poolSize
+                                  << ") failed; using reserved pool at 0x" << std::hex
+                                  << kSoundDriverPoolFallbackBase << std::dec << std::endl;
+                    }
+                }
+
+                const uint32_t statusAddr = alignUp(poolBase, kSoundDriverStatusAlignment);
                 const uint32_t addrTableAddr =
                     alignUp(statusAddr + kSoundDriverStatusSize, kSoundDriverAddrTableAlignment);
                 const uint32_t hdBaseAddr =
@@ -195,7 +231,7 @@ namespace ps2_syscalls
                 const uint32_t sqBaseAddr = alignUp(hdBaseAddr + kSoundDriverHdRegionSize, kSoundDriverStorageAlignment);
                 const uint32_t dataBaseAddr = alignUp(sqBaseAddr + kSoundDriverSqRegionSize, kSoundDriverStorageAlignment);
                 const uint32_t storageEnd = dataBaseAddr + kSoundDriverDataRegionSize;
-                if (storageEnd > kSoundDriverGuestPoolLimit)
+                if (storageEnd > poolBase + poolSize)
                 {
                     return false;
                 }
