@@ -245,6 +245,47 @@ namespace ps2_stubs
             return true;
         }
 
+        // EE -> IOP transfer. sceSifSetDma's destination is an IOP address, which lives in its own
+        // 2 MB space (PS2Memory::getIOPRAM()) and overlaps EE RAM numerically -- so it must never
+        // be written through `rdram`. The role of the parameter, not its value, is what identifies
+        // it: ::src is always EE, ::dest is always IOP.
+        bool copyEeToIop(uint8_t *rdram, uint8_t *iopRam, uint32_t dstIop, uint32_t srcEe, uint32_t sizeBytes)
+        {
+            if (sizeBytes == 0u)
+            {
+                return true;
+            }
+            if (!rdram || !iopRam)
+            {
+                return false;
+            }
+
+            const uint32_t dst = dstIop & 0x1FFFFFFFu;
+            if (dst >= kIopRamSize || sizeBytes > (kIopRamSize - dst))
+            {
+                return false; // outside IOP RAM: a bad descriptor, not something to write anywhere
+            }
+
+            const uint32_t src = srcEe & 0x1FFFFFFFu;
+            if (src < PS2_RAM_SIZE && sizeBytes <= (PS2_RAM_SIZE - src))
+            {
+                std::memcpy(iopRam + dst, rdram + src, sizeBytes); // main RAM: contiguous
+                return true;
+            }
+
+            // Scratchpad or any other mapped source: fall back to the per-byte accessor.
+            for (uint32_t i = 0; i < sizeBytes; ++i)
+            {
+                const uint8_t *q = getConstMemPtr(rdram, srcEe + i);
+                if (!q)
+                {
+                    return false;
+                }
+                iopRam[dst + i] = *q;
+            }
+            return true;
+        }
+
         bool copyGuestByteRange(uint8_t *rdram, uint32_t dstAddr, uint32_t srcAddr, uint32_t sizeBytes)
         {
             if (!canCopyGuestByteRange(rdram, dstAddr, srcAddr, sizeBytes))
@@ -701,25 +742,22 @@ namespace ps2_stubs
             for (uint32_t i = 0; i < pendingCount; ++i)
             {
                 const Ps2SifDmaTransfer &xfer = pending[i];
-                // sceSifSetDma is EE -> IOP: `dest` is an IOP address, and IOP RAM is 2 MB. A
-                // destination at or above 0x200000 is therefore not IOP memory at all, and copying
-                // it into EE RAM (what this did unconditionally) overwrites whatever the EE has
-                // there. BT3 stages sound banks at 0x1a00000..0x1aac080 -- one transfer is 671,808
-                // bytes at 0x1a00000 -- while the game's own allocator hands out objects in that
-                // same range; on hardware there is no conflict, because the EE never owns those
-                // addresses. The collision filled a live object with junk whose pointers were then
-                // used as write targets, corrupting saved return addresses and crashing dispatch
-                // with "No exact recompiled function" (0x1ad100 / 0xa / 0x28ae00) during the
-                // campaign character switch. Nothing depends on the EE-side copy: the sound bank
-                // snapshots further down read from xfer.SRC, not from the destination.
-                const uint32_t destPhys = xfer.dest & 0x1FFFFFFFu;
-                if (destPhys < 0x200000u)
+                // EE -> IOP. The destination lives in IOP RAM, a separate 2 MB space; writing it
+                // through `rdram` (as this did) lands on unrelated EE memory, which is how the
+                // game's sound-bank uploads used to overwrite its own live heap objects.
+                if (!copyEeToIop(rdram,
+                                 runtime ? runtime->memory().getIOPRAM() : nullptr,
+                                 xfer.dest,
+                                 xfer.src,
+                                 static_cast<uint32_t>(xfer.size)))
                 {
-                    if (!copyGuestByteRange(rdram, xfer.dest, xfer.src, static_cast<uint32_t>(xfer.size)))
-                    {
-                        ok = false;
-                        break;
-                    }
+                    static std::atomic<uint32_t> bad{0};
+                    if (bad.fetch_add(1) < 8u)
+                        std::fprintf(stderr,
+                                     "[sifdma] transfer rejected: dest=0x%x (IOP) src=0x%x size=%d\n",
+                                     xfer.dest, xfer.src, (int)xfer.size);
+                    ok = false;
+                    break;
                 }
 
                 ps2_syscalls::noteDtxSifDmaTransfer(
@@ -746,7 +784,13 @@ namespace ps2_stubs
                         const char *v = std::getenv("PS2X_SNDPLAY");
                         return !(v && v[0] == '0');
                     }();
-                    if (s_play && runtime && xfer.dest < 0x100000u)
+                    // Streaming PCM goes to the fixed low ring area; anything from the IOP HEAP is a
+                    // bank/sequence upload, not audio. This used to test `dest < 0x100000`, which
+                    // only worked because the heap sat at 0x1a00000 -- once the heap moved to real
+                    // IOP addresses the bank uploads fell inside that window and got played as raw
+                    // PCM (35 KB of ADPCM straight to the device). Gate on the heap boundary so the
+                    // split stays correct wherever the heap lives.
+                    if (s_play && runtime && xfer.dest < kIopHeapBase)
                     {
                         static const uint32_t s_rate = []() -> uint32_t {
                             if (const char *v = std::getenv("PS2X_SNDRATE"))
@@ -800,12 +844,12 @@ namespace ps2_stubs
                     // Snapshot the SE sample blobs regardless of the capture flag: the staging
                     // address is reused per bank, so reading them back later sees only the last
                     // upload. Defined in game_overrides.cpp.
-                    if (dst == 0x01a00000u)
+                    if (dst == kIopHeapBase)
                     {
                         if (const uint8_t *p = getConstMemPtr(rdram, xfer.src))
                             bt3NoteSeBankBlob(p, static_cast<uint32_t>(xfer.size));
                     }
-                    else if (dst > 0x01a00000u && dst < 0x01b00000u)
+                    else if (dst > kIopHeapBase && dst < kIopHeapBase + 0x100000u)
                     {
                         // Bank headers land above the sample staging area, one per bank ahead of
                         // its blob, so recording them keeps bank slot N paired with blob N.
@@ -822,7 +866,7 @@ namespace ps2_stubs
                             const char *v = std::getenv("PS2X_SELOG");
                             return v && v[0] && v[0] != '0';
                         }();
-                        if (s_selog && dst >= 0x01a00000u && dst < 0x01b00000u)
+                        if (s_selog && dst >= kIopHeapBase && dst < kIopHeapBase + 0x100000u)
                         {
                             const uint8_t *p = getConstMemPtr(rdram, xfer.src);
                             const bool scei = p && xfer.size >= 4u && p[0] == 'I' && p[1] == 'E' &&
@@ -832,7 +876,7 @@ namespace ps2_stubs
                                          scei ? "  <- SCEI header" : "");
                         }
                     }
-                    if (s_bank && dst >= 0x01a00000u && dst < 0x01b00000u)
+                    if (s_bank && dst >= kIopHeapBase && dst < kIopHeapBase + 0x100000u)
                     {
                         char path[64];
                         std::snprintf(path, sizeof(path), "sndbank_%08x.bin", dst);

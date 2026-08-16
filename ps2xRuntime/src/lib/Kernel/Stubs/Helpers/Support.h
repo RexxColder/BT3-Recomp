@@ -29,8 +29,19 @@ namespace
     uint32_t g_cdStreamingEndLbn = 0xFFFFFFFFu;
     bool g_cdInitialized = false;
 
-    constexpr uint32_t kIopHeapBase = 0x01A00000;
-    constexpr uint32_t kIopHeapLimit = 0x01F00000;
+    // IOP memory is a SEPARATE 2 MB address space, backed by PS2Memory::getIOPRAM(). It is not
+    // part of EE RAM and the two overlap numerically, so an IOP address can only be recognised by
+    // the ROLE it plays -- SifDmaTransfer_t::dest is IOP, ::src is EE -- never by its value.
+    //
+    // This heap used to hand out 0x01A00000..0x01F00000, i.e. EE addresses. The game then DMA'd
+    // its sound banks to the block it was given and the SIF stub wrote EE RAM there, landing on
+    // whatever the game's own EE allocator had put in that range -- which is how a live object at
+    // 0x1a06160 filled with junk and the campaign character switch died with "No exact recompiled
+    // function". Hand out real IOP addresses instead; the low part of IOP RAM belongs to its
+    // kernel and the resident modules, so the heap starts above that.
+    constexpr uint32_t kIopRamSize = 0x00200000;   // 2 MB, matches PS2Memory::getIOPRAM()
+    constexpr uint32_t kIopHeapBase = 0x00080000;  // 512 KB reserved for IOP kernel + modules
+    constexpr uint32_t kIopHeapLimit = kIopRamSize;
     constexpr uint32_t kIopHeapAlign = 64;
     uint32_t g_iopHeapNext = kIopHeapBase;
 
