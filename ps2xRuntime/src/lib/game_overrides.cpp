@@ -1308,8 +1308,116 @@ namespace
     }
 
     // Play one SE command entry.
+    // ===================== SE VOICES =====================
+    //
+    // Effects are held as ACTIVE VOICES and mixed incrementally, instead of decoding straight
+    // into the backend and forgetting them. That is required for correctness, not tidiness: the
+    // command queue has a THIRD entry type (producer 0x124248) that carries no bank and no index,
+    // only the u16 at +2 -- which is the serial the type-0 producer wrote there and RETURNED to
+    // its caller (`lhu $v0, 0x2($a0)` at 0x1241e0). So the game takes a handle when it starts a
+    // sound and later stops it by that handle.
+    //
+    // Fire-and-forget playback has nothing to stop, so every effect ran to its full length. Short
+    // ones finish before the stop arrives and sound correct (dash, hits); long ones do not -- the
+    // teleport is a 2.54s sample the game cuts to ~1.36s, which is why it alone sounded wrong
+    // while nothing in the bank distinguished it (mapping, decode, rate and head-sample count are
+    // all verified identical to its neighbours).
+    constexpr uint32_t kSeMixRate = 22050u;   // one rate for the shared stream
+    constexpr size_t kSeChunk = 512;          // samples generated per top-up step
+    constexpr size_t kSeTargetPending = 3072; // keep ~140ms queued ahead of the device
+
+    struct SeVoice
+    {
+        uint32_t serial = 0xFFFFFFFFu; // 0xFFFFFFFF = untracked (cannot be stopped)
+        std::vector<int16_t> pcm;
+        size_t pos = 0;
+    };
+    std::mutex g_seVoiceM;
+    std::vector<SeVoice> g_seVoices;
+
+    void seAddVoice(uint32_t serial, std::vector<int16_t> &&pcm)
+    {
+        if (pcm.empty())
+            return;
+        std::lock_guard<std::mutex> lk(g_seVoiceM);
+        if (g_seVoices.size() >= 32u) // SPU2 has 24 voices; a cap keeps a runaway bounded
+            g_seVoices.erase(g_seVoices.begin());
+        SeVoice v;
+        v.serial = serial;
+        v.pcm = std::move(pcm);
+        g_seVoices.push_back(std::move(v));
+    }
+
+    void seStopVoice(uint32_t serial)
+    {
+        std::lock_guard<std::mutex> lk(g_seVoiceM);
+        for (size_t i = 0; i < g_seVoices.size(); ++i)
+        {
+            if (g_seVoices[i].serial == serial)
+            {
+                if (seLogEnabled())
+                    std::fprintf(stderr, "[se] STOP serial=%u (%zu/%zu samples played)\n",
+                                 serial, g_seVoices[i].pos, g_seVoices[i].pcm.size());
+                g_seVoices.erase(g_seVoices.begin() + static_cast<long>(i));
+                return;
+            }
+        }
+        if (seLogEnabled())
+            std::fprintf(stderr, "[se] STOP serial=%u -- already finished\n", serial);
+    }
+
+    // Per-frame: top the backend up from the active voices. Generating incrementally is what
+    // makes a stop possible -- the tail of a stopped voice is simply never produced.
+    void seServiceVoices(PS2Runtime *runtime)
+    {
+        if (!runtime)
+            return;
+        for (int guard = 0; guard < 64; ++guard)
+        {
+            {
+                std::lock_guard<std::mutex> lk(g_seVoiceM);
+                if (g_seVoices.empty())
+                    return;
+            }
+            const auto prog = runtime->audioBackend().streamProgress(kSeStreamId);
+            if (prog.pending >= kSeTargetPending)
+                return;
+            int32_t acc[kSeChunk];
+            std::memset(acc, 0, sizeof(acc));
+            size_t used = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_seVoiceM);
+                for (auto it = g_seVoices.begin(); it != g_seVoices.end();)
+                {
+                    const size_t avail = it->pcm.size() - it->pos;
+                    const size_t n = avail < kSeChunk ? avail : kSeChunk;
+                    for (size_t i = 0; i < n; ++i)
+                        acc[i] += it->pcm[it->pos + i];
+                    it->pos += n;
+                    if (n > used) used = n;
+                    if (it->pos >= it->pcm.size())
+                        it = g_seVoices.erase(it);
+                    else
+                        ++it;
+                }
+            }
+            if (!used)
+                return;
+            int16_t out[kSeChunk];
+            for (size_t i = 0; i < used; ++i)
+            {
+                int32_t v = acc[i];
+                if (v > 32767) v = 32767;
+                if (v < -32768) v = -32768;
+                out[i] = static_cast<int16_t>(v);
+            }
+            runtime->audioBackend().onStreamPcm(kSeStreamId, out,
+                                                static_cast<uint32_t>(used), kSeMixRate);
+        }
+    }
+
     void sePlay(uint8_t *rdram, PS2Runtime *runtime, uint32_t bank, uint32_t idx,
-                uint32_t vol, uint32_t pan)
+                uint32_t vol, uint32_t pan, uint32_t serial)
     {
         if (!runtime)
             return;
@@ -1394,6 +1502,30 @@ namespace
                 const uint32_t rec = pay + recOff;
                 rate = seRd16(hdrSnap, rec);
                 dataOff = seRd32(hdrSnap, rec + 4u);
+                // A sample's playback rate lives in the NEXT Vagi record, not its own.
+                //
+                // Found via the teleport (bank 4 id32 = vag30): stored at 11000, correct at
+                // ~24000 by ear, and the only 24000 in that 84-sample bank is record 31 -- the
+                // one immediately after it. The record itself looks self-consistent (8-byte
+                // stride, rate and dataOffset together), so this was tested as a falsifiable
+                // hypothesis rather than assumed: the shift changes 41 of 84 samples in the
+                // fight bank, 29 of 78 in bank 2 and 2 of 8 in the menu bank, so if it were
+                // wrong a pile of well-known effects would break at once. User-verified: with
+                // it on, menu and fight audio are correct throughout.
+                // PS2X_SERATESHIFT=0 reverts to using each record's own rate.
+                {
+                    static const bool s_shift = []() {
+                        const char *v = std::getenv("PS2X_SERATESHIFT");
+                        return !(v && v[0] == '0');
+                    }();
+                    if (s_shift && sampleIdx + 1u < cnt)
+                    {
+                        const uint32_t nextOff = seRd32(hdrSnap, pay + 4u + (sampleIdx + 1u) * 4u);
+                        const uint32_t nr = seRd16(hdrSnap, pay + nextOff);
+                        if (nr)
+                            rate = nr;
+                    }
+                }
             }
             std::vector<int16_t> pcm;
             pcm.reserve(4096);
@@ -1407,20 +1539,72 @@ namespace
             if (g < 0.99f)
                 for (auto &sm : pcm)
                     sm = static_cast<int16_t>(static_cast<float>(sm) * g);
-            // MIX, don't append: effects overlap on the real SPU. Appending made rapid cursor
-            // presses queue and play one after another, falling further behind the menu with
-            // every press.
-            runtime->audioBackend().onStreamPcmMix(kSeStreamId, pcm.data(),
-                                                   static_cast<uint32_t>(pcm.size()),
-                                                   rate ? rate : 16000u);
+            // A stored rate of 11000 does not mean 11000 Hz. It is the ONLY non-standard value
+            // anywhere in the SE banks -- across the six banks a fight loads, the 292 samples
+            // carry 11000 (x65), 11025 (x31), 16000 (x194) and 24000 (x2), and 11025/16000/24000
+            // are all real PS2 rates while 11000 is not. Samples carrying it play an octave low
+            // at face value: the teleport effect (bank 4 id32) is 2.51s against a 1.36s console
+            // reference, i.e. 1.84x too slow, and is correct at 22050 by ear. An 11025 sample in
+            // the SAME bank (id72) is correct as stored, so this is not a per-bank factor -- and
+            // nothing in the bank data encodes a per-sample one (the Vagi +2 field is a constant
+            // 0xff00, tone templates are byte-identical across all five banks, and the sequences
+            // are all the same single NoteOn). Map it to the standard rate nearest 2x.
+            // PS2X_SERATE11K=0 disables, to A/B if this ever looks wrong.
+            if (rate == 11000u)
+            {
+                // DEFAULT OFF: this was WRONG. It fixes the teleport (bank 4 id32) but makes
+                // dash and hit effects play too fast -- user-verified. So 11000 being the only
+                // non-standard stored rate is NOT the discriminator, and id32's length is not a
+                // rate problem: its decode is correct (997 blocks, proper end flag, genuinely
+                // 2.54s at 11000). The likely explanation is that the ENGINE stops the voice
+                // early -- samples shorter than some gate play whole (dash/hits, correct as
+                // stored) while longer ones are cut (id32: 2.54s stored vs ~1.36s on console).
+                // Doubling the rate only coincidentally matched that cut length.
+                // PS2X_SERATE11K=1 re-enables for experiments.
+                static const bool s_on = []() {
+                    const char *v = std::getenv("PS2X_SERATE11K");
+                    return v && v[0] == '1';
+                }();
+                if (s_on)
+                    rate = 22050u;
+            }
+            // All effects share ONE backend stream, so they must share ONE sample rate: the
+            // stream carries a single rate and the last writer would otherwise set it for
+            // everything already queued. Menu effects are nearly all 16 kHz so that went
+            // unnoticed, but fight banks mix 11000/11025/16000 and the rate flips per effect,
+            // replaying queued audio at the wrong speed -- audibly wrong pitch. Resample each
+            // effect to a fixed rate first. 22050 is exactly 2x the common 11025 and upsamples
+            // 16000 without loss of the original band.
+            const uint32_t srcRate = rate ? rate : 16000u;
+            if (srcRate != kSeMixRate && !pcm.empty())
+            {
+                const size_t outN = static_cast<size_t>(
+                    (static_cast<uint64_t>(pcm.size()) * kSeMixRate) / srcRate);
+                std::vector<int16_t> rs;
+                rs.reserve(outN);
+                for (size_t i = 0; i < outN; ++i)
+                {
+                    // Linear interpolation; plenty for short one-shot effects.
+                    const double srcPos = (static_cast<double>(i) * srcRate) / kSeMixRate;
+                    const size_t i0 = static_cast<size_t>(srcPos);
+                    const size_t i1 = (i0 + 1 < pcm.size()) ? i0 + 1 : i0;
+                    const double frac = srcPos - static_cast<double>(i0);
+                    rs.push_back(static_cast<int16_t>(pcm[i0] + (pcm[i1] - pcm[i0]) * frac));
+                }
+                pcm.swap(rs);
+            }
+            // Hand it to a voice; seServiceVoices() mixes the active voices incrementally so
+            // a later stop-by-serial can cut the tail. Overlap still works -- voices sum.
+            seAddVoice(serial, std::move(pcm));
+            seServiceVoices(runtime);
             static std::atomic<uint32_t> n{0};
             const uint32_t k = n.fetch_add(1);
             if (seLogEnabled() || k < 12u)
             {
-                const uint32_t r = rate ? rate : 16000u;
-                std::fprintf(stderr, "[se] #%-4u slot%u(bank%-2u) id%-3u%-12s %-4s %5zu smp "
+                const uint32_t r = kSeMixRate; // post-resample: pcm.size() is in THIS rate
+                std::fprintf(stderr, "[se] #%-4u ser=%-5u slot%u(bank%-2u) id%-3u%-12s %-4s %5zu smp "
                                      "%4ums @%5uHz vol=%-3u pan=%-3u dataOff=0x%x\n",
-                             k, slot, bank, idx, seName(bank, idx), head ? "head" : "vagi",
+                             k, serial, slot, bank, idx, seName(bank, idx), head ? "head" : "vagi",
                              pcm.size(), static_cast<uint32_t>(pcm.size() * 1000u / r), r,
                              vol, pan, dataOff);
             }
@@ -1452,10 +1636,16 @@ namespace
             for (uint32_t i = 0; i < count && i < 32u; ++i)
             {
                 const uint32_t e = sendBuf + 4u + i * 12u;
+                const uint32_t type = sndRd8(rdram, e + 0u);
                 const uint32_t bank = sndRd8(rdram, e + 4u);
                 const uint32_t idx = sndRd8(rdram, e + 5u);
                 const uint32_t vol = sndRd8(rdram, e + 6u);
                 const uint32_t pan = sndRd8(rdram, e + 7u);
+                // +2 is the u16 handle: the type-0 producer (0x124150) writes an
+                // auto-incrementing serial there and returns it to its caller; the type-2
+                // producer (0x124248) writes ONLY that field, to name the voice to stop.
+                const uint32_t serial = static_cast<uint32_t>(sndRd8(rdram, e + 2u)) |
+                                        (static_cast<uint32_t>(sndRd8(rdram, e + 3u)) << 8);
                 // Log EVERY command, including ones sePlay declines -- a silently dropped
                 // command is indistinguishable from a missing request, and that hid what the
                 // menu cursor actually sends.
@@ -1465,14 +1655,120 @@ namespace
                 {
                     const uint32_t b0 = sndRd8(rdram, e + 0u), b1 = sndRd8(rdram, e + 1u);
                     const uint32_t p8 = sndRd32(rdram, e + 8u);
-                    std::fprintf(stderr, "[secmd] #%u bank=%u idx=%u vol=%u pan=%u "
-                                         "| +0=%u +1=%u +8=0x%x\n",
-                                 ci, bank, idx, vol, pan, b0, b1, p8);
+                    std::fprintf(stderr, "[secmd] #%u type=%u serial=%u bank=%u idx=%u "
+                                         "vol=%u pan=%u | +1=%u +8=0x%x\n",
+                                 ci, type, serial, bank, idx, vol, pan, b1, p8);
                 }
-                sePlay(rdram, runtime, bank, idx, vol, pan);
+                // Type 2 = stop the voice with this handle. Types 0 and 1 start one (0 from
+                // 0x124150 with vol/pan/pitch, 1 from 0x1241F0 with just bank+index).
+                if (type == 2u)
+                    seStopVoice(serial);
+                else
+                    sePlay(rdram, runtime, bank, idx, vol, pan, serial);
             }
         }
         if (g_orig2b48f0) g_orig2b48f0(rdram, ctx, runtime);
+    }
+
+    // [sndhit] PS2X_SNDHIT=1. WHICH sound entry does a menu cursor move actually call?
+    //
+    // Do not guess this from disassembly -- three guesses in a row were wrong (0x267ac8 is a
+    // float initialiser, 0x264d90 is `jr $ra; nop`, 0x269130 is a field setter). And 0x265CC8,
+    // the obvious candidate, fired only TWICE during a whole cursor-spam session, so it is not
+    // the movement sound either.
+    //
+    // These are every sound-API address the OVERLAY (menu) code calls, ranked by call sites
+    // from the dispatchGuestBranch dump. Pure counters, no logging in the hook; the per-frame
+    // poll prints whichever changed. Move the cursor N times and the entry whose count rises by
+    // N is the one to trace.
+    // RETARGETED onto the SE PLAY PATH. Scanning the ELF for every j/jal into the play entry
+    // 0x265850 gives exactly five wrappers, each supplying a different slot:
+    //     0x265C98 slot 0 (public entry 0x265CC8)   0x265D68 slot 1
+    //     0x265E38 slot+4 with hashing (0xcc32/0x8d4e = variation), public entry 0x265E98
+    //     0x265EB8 slot+4                            0x265FA0 slot+2
+    // The first counter sweep hooked none of 0x265E98 / 0x265FB8 / 0x265FA0, which are exactly
+    // the overlay-called ones that could be the movement blip. Voice lines already work and run
+    // on slot 4 (player4 -> stream 8), so the blip is a DIFFERENT slot -- watch which wrapper
+    // fires per keypress. The remaining entries here are the overlay-called sound functions the
+    // first sweep never covered.
+    constexpr uint32_t kSndHitAddr[] = {
+        // *** THE MENU SE BANK IS NEVER LOADED ***
+        // Only TWO sample banks are ever uploaded: bank A (8 samples, verified by ear as the
+        // intro sounds) and bank B (79, verified as battle/ability sounds). Neither contains the
+        // menu cursor blip, so no id mapping could ever have worked -- the sample is not in
+        // memory. That matches the community tip that menu SFX live in a SEPARATE SE_System.pak.
+        // The bank LOAD path is what to watch:
+        //   0x1011B8 = the SIF-DMA-to-IOP helper (all 6 bank transfers return to 0x1011E8)
+        //   0x1248A0 (3 of them) and 0x124A70 (1) call it
+        //   0x124B50 / 0x124C38 call 0x1248A0; both are called from 0x127278
+        //   0x124F68/0x124F88 are the play path, 0x1252D8 the voice allocator
+        // If a third load is attempted and fails, it shows up here; if it is never attempted,
+        // the gap is upstream in whatever should request SE_System.
+        0x001011b8u, 0x001248a0u, 0x00124a70u, 0x00124b50u,
+        0x00124c38u, 0x00127278u, 0x00124e60u, 0x00124938u};
+    constexpr int kSndHitCount = 8;
+    std::atomic<uint32_t> g_sndHit[kSndHitCount]{};
+    PS2Runtime::RecompiledFunction g_origSndHit[kSndHitCount] = {};
+
+    template <int N>
+    void bt3SndHitProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t k = g_sndHit[N].fetch_add(1, std::memory_order_relaxed);
+        // Log the ARGUMENTS for the first few calls of each entry. The blip and the voice both
+        // appear to land on slot 4, and 0x275F90 stops the object before playing -- so whichever
+        // request arrives second discards the first. Seeing each wrapper's slot and id settles
+        // whether that collision is real or whether the mapping is wrong.
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6);
+        const uint32_t ra = getRegU32(ctx, 31);
+        // What does the FLUSH actually see? 0x1242F0 reads the queue count and then
+        // memsets the whole 0x184-byte region UNCONDITIONALLY, so a push that lands
+        // between the read and the wipe is destroyed. rpcNum 0xD (the payload send) never
+        // fires, yet the frame-kick poll observes count==1 -- so log the count exactly at
+        // flush entry. Never non-zero here while the poll sees 1 => ordering/race, not a
+        // wrong address.
+        if (kSndHitAddr[N] == 0x001242f0u)
+        {
+            const uint32_t gp = getRegU32(ctx, 28);
+            uint32_t qb = 0u, cnt = 0u;
+            if (const uint8_t *p = getMemPtr(rdram, (gp - 0x50e8u) & 0x1FFFFFFFu))
+                qb = *reinterpret_cast<const uint32_t *>(p);
+            if (qb)
+                if (const uint8_t *p = getMemPtr(rdram, (qb + 0x68u) & 0x1FFFFFFFu))
+                    cnt = *reinterpret_cast<const uint32_t *>(p);
+            static std::atomic<uint32_t> nz{0};
+            if (cnt != 0u && nz.fetch_add(1) < 20u)
+                std::fprintf(stderr, "[sndflush] entry count=%u (queue=0x%x) -- WILL SEND\n",
+                             cnt, qb);
+        }
+        if (g_origSndHit[N]) g_origSndHit[N](rdram, ctx, runtime);
+        // The RETURN value is the point: these feed 0x124150's range checks.
+        // sceSifCallRpc fires ~4500x a run (mostly the file server from ra=0x2a3a80), so a
+        // plain first-N cap only ever captures BOOT traffic. The SE sends come from inside
+        // 0x123F48, i.e. ra == 0x123F9C -- filter on that and the menu presses become visible.
+        const bool seRpc = (kSndHitAddr[N] == 0x002b48f0u && ra == 0x00123f9cu);
+        if (k < 8u || seRpc)
+        {
+            if (!seRpc)
+            std::fprintf(stderr, "[sndhit] 0x%x #%u a0=0x%x a1=0x%x a2=0x%x a3=0x%x ra=0x%x -> v0=0x%x\n",
+                         kSndHitAddr[N], k + 1u, a0, a1, a2, getRegU32(ctx, 7), ra,
+                         getRegU32(ctx, 2));
+            // sceSifCallRpc(client, rpcNum, mode, sendBuf, sendSize, recvBuf, recvSize, ...)
+            // The client structure holds the SERVER ID; dump it plus the head of the payload,
+            // which for the SE service is {count, 32 x 12-byte entries: +4 id, +6 vol, +7 pan}.
+            if (seRpc)
+            {
+                uint32_t sid = 0u;
+                if (const uint8_t *p = getMemPtr(rdram, (a0 + 4u) & 0x1FFFFFFFu))
+                    sid = *reinterpret_cast<const uint32_t *>(p);
+                const uint32_t sendBuf = getRegU32(ctx, 7);
+                std::string hex;
+                char b[8];
+                if (const uint8_t *p = getMemPtr(rdram, sendBuf & 0x1FFFFFFFu))
+                    for (int i = 0; i < 24; ++i) { std::snprintf(b, sizeof(b), "%02x ", p[i]); hex += b; }
+                std::fprintf(stderr, "[sndrpc]   sid=0x%x rpcNum=0x%x sendBuf=0x%x [%s]\n",
+                             sid, a1, sendBuf, hex.c_str());
+            }
+        }
     }
 
     // [sndse] PS2X_SNDSE=1. Where do punch/explosion SFX actually go?
@@ -2735,6 +3031,10 @@ namespace
 
     void bt3FrameKick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00100ab8
     {
+        // Keep the SE stream fed from the active voices. Effects are produced incrementally so
+        // a stop-by-serial can cut a voice's tail; without a per-frame top-up a long effect
+        // would only advance when the next SE command happened to arrive.
+        seServiceVoices(runtime);
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
         // ***** PER-FRAME CD FILE-SERVER PUMP (PS2X_CDPUMP, default ON) *****
         // The in-fight STAGE-CHUNK streaming (near-LOD terrain, collision) polls its
