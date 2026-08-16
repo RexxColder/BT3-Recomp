@@ -152,4 +152,12 @@ namespace ps2_stubs
     const char *padBindKindName(PadBindKind kind);
     std::string padBindDisplay(const PadBind &bind);
     std::string padDeviceDisplay(const PadDevice &device);
+
+    // Is gamepad slot `g` an actual controller worth offering to the player?
+    //
+    // Not everything GLFW hands a joystick slot is a controller: udev sets
+    // ID_INPUT_JOYSTICK=1 on keyboards that expose System Control / Consumer Control HID
+    // pages, and a DualSense additionally publishes separate "Motion Sensors" and "Touchpad"
+    // joysticks. Shared so the config UI and the input path agree on what counts.
+    bool padSlotIsController(int g);
 }

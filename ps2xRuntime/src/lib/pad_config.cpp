@@ -135,21 +135,90 @@ namespace ps2_stubs
             }
         }
 
+        // Declared here rather than including GLFW/glfw3.h, which clashes with raylib.h.
+        extern "C" int glfwJoystickIsGamepad(int jid);
+        extern "C" const float *glfwGetJoystickAxes(int jid, int *count);
+        extern "C" const unsigned char *glfwGetJoystickButtons(int jid, int *count);
+        extern "C" const char *glfwGetJoystickName(int jid);
+        bool slotLooksLikeGamepad(int g); // defined below
+
+        // [padlog] PS2X_PADLOG=1: what does raylib actually see? The Device dropdown is built
+        // from IsGamepadAvailable(), which only reports pads that have a GAMEPAD MAPPING -- a
+        // controller the kernel exposes fine but GLFW has no mapping for never appears. That is
+        // what happened to the 8BitDo (hence the hardcoded SetGamepadMappings above). Print
+        // every slot once so a missing pad can be told apart from a mis-mapped one.
+        void logGamepadSlotsOnce()
+        {
+            static const bool s_on = [](){ const char *v = std::getenv("PS2X_PADLOG"); return v && v[0] == '1'; }();
+            static bool s_done = false;
+            if (!s_on || s_done)
+                return;
+            // Only latch once a pad has actually appeared: GLFW enumerates joysticks during the
+            // first frames, so logging at the very first call reports an empty list and hides
+            // whatever turns up a moment later.
+            bool any = false;
+            for (int g = 0; g < 16 && !any; ++g) any = IsGamepadAvailable(g);
+            if (!any)
+                return;
+            s_done = true;
+            for (int g = 0; g < 16; ++g)
+            {
+                const bool avail = IsGamepadAvailable(g);
+                const char *nm = avail ? glfwGetJoystickName(g) : nullptr; // raylib's buffer overflows
+                if (avail)
+                    std::fprintf(stderr, "[padlog] slot %d: AVAILABLE name='%s' axes=%d listed=%d\n",
+                                 g, nm ? nm : "?", GetGamepadAxisCount(g),
+                                 slotLooksLikeGamepad(g) ? 1 : 0);
+                else
+                    std::fprintf(stderr, "[padlog] slot %d: not available (no mapping, or empty)\n", g);
+            }
+        }
+
+        // GLFW knows what is a controller; raylib does not expose it.
+        //
+        // raylib reports MAX_GAMEPAD_AXIS for every slot, so its axis count cannot tell a
+        // DualSense from a keyboard -- both come back as 6. GLFW reports the truth: 1 axis for
+        // the "KBDFans System Control"/"Consumer Control" devices that udev mislabels with
+        // ID_INPUT_JOYSTICK, 6 for a real pad. It also knows whether a slot has an SDL gamepad
+        // mapping. raylib links GLFW statically, so query it directly.
+        //
+        // A slot is offered if it has a gamepad mapping OR enough real axes to be a controller.
+        // The mapping test alone is not enough: pads whose GUID is missing from the database
+        // (the 8BitDo Ultimate here) report no mapping yet are perfectly usable once bound.
+        bool slotLooksLikeGamepad(int g)
+        {
+            if (!IsGamepadAvailable(g))
+                return false;
+            static const bool s_all = [](){ const char *v = std::getenv("PS2X_PAD_ALLDEV"); return v && v[0] == '1'; }();
+            if (s_all) // escape hatch if this ever rejects a legitimate pad
+                return true;
+            if (glfwJoystickIsGamepad(g))
+                return true;
+            // Axes alone are not enough: a DualSense also publishes separate "Motion Sensors"
+            // and "Touchpad" joysticks that report 6 axes each. Buttons separate them -- those
+            // have 0 and 4, a real pad has 15-17, and the mislabelled keyboards have 1-2 axes.
+            int nAxes = 0, nButtons = 0;
+            glfwGetJoystickAxes(g, &nAxes);
+            glfwGetJoystickButtons(g, &nButtons);
+            return nAxes >= 4 && nButtons >= 8;
+        }
+
         std::vector<int> availableGamepads()
         {
+            logGamepadSlotsOnce();
             static const int s_forcedPad = []()
             {
                 const char *v = std::getenv("PS2X_PAD");
                 return v ? std::atoi(v) : -1;
             }();
             std::vector<int> pads;
-            for (int g = 0; g < 8; ++g)
+            for (int g = 0; g < 16; ++g)
             {
                 if (s_forcedPad >= 0 && g != s_forcedPad)
                 {
                     continue;
                 }
-                if (IsGamepadAvailable(g))
+                if (slotLooksLikeGamepad(g))
                 {
                     pads.push_back(g);
                 }
@@ -215,10 +284,16 @@ namespace ps2_stubs
             key(PadAction::R3, KEY_RIGHT_CONTROL);
             key(PadAction::Select, KEY_RIGHT_SHIFT);
             key(PadAction::Start, KEY_ENTER);
-            key(PadAction::LStickXNeg, KEY_A);
-            key(PadAction::LStickXPos, KEY_D);
-            key(PadAction::LStickYNeg, KEY_W);
-            key(PadAction::LStickYPos, KEY_S);
+            // Stick-direction keys need a SIGN: the Neg actions must contribute -1 to the
+            // axis sum (both W and S pushed the stick the same way with the flat +1 default).
+            auto stickKey = [&cfg](PadAction a, int k, float sign)
+            {
+                cfg.binds[static_cast<size_t>(a)] = PadBind{PadBindKind::Key, k, sign, 0.0f};
+            };
+            stickKey(PadAction::LStickXNeg, KEY_A, -1.0f);
+            stickKey(PadAction::LStickXPos, KEY_D, 1.0f);
+            stickKey(PadAction::LStickYNeg, KEY_W, -1.0f);
+            stickKey(PadAction::LStickYPos, KEY_S, 1.0f);
         }
 
         PadPlayerConfig makeDefaultPlayer()
@@ -308,9 +383,13 @@ namespace ps2_stubs
                 pkt.ry = floatToByte(ry);
             }
 
+            // PS2X_NOKB=1: ignore the keyboard entirely for pad input. Needed when a
+            // remote-streaming host (Sunshine "Keyboard passthrough") injects gamepad-
+            // as-keyboard events — its X spam maps to Cross and skip-mashes cutscenes.
+            static const bool s_noKb = [](){ const char *v = std::getenv("PS2X_NOKB"); return v && v[0] == '1'; }();
             auto key = [&pkt](PadAction a, int key)
             {
-                if (IsKeyDown(key))
+                if (!s_noKb && IsKeyDown(key))
                 {
                     pkt.buttons = static_cast<uint16_t>(pkt.buttons & ~buttonMaskForAction(a));
                 }
@@ -828,7 +907,8 @@ namespace ps2_stubs
         {
             pads.push_back(cfg.device.gamepad);
         }
-        const bool keyboardAllowed = cfg.device.kind != PadDeviceKind::Gamepad;
+        static const bool s_noKb2 = [](){ const char *v = std::getenv("PS2X_NOKB"); return v && v[0] == '1'; }();
+        const bool keyboardAllowed = !s_noKb2 && cfg.device.kind != PadDeviceKind::Gamepad;
 
 #if defined(__linux__)
         const PadEvdevLinux &native = PadEvdevLinux::instance();
@@ -960,4 +1040,9 @@ namespace ps2_stubs
         }
         return pkt;
     }
+}
+
+bool ps2_stubs::padSlotIsController(int g)
+{
+    return slotLooksLikeGamepad(g);
 }

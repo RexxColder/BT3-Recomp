@@ -1,3 +1,8 @@
+// raylib stores gamepad names in a fixed 64-byte buffer; the DualSense publishes names
+// longer than that, which overflow into the next slot and show as merged strings. GLFW owns
+// the real string, so ask it directly.
+extern "C" const char *glfwGetJoystickName(int jid);
+
 #include "ps2_debug_panel.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -1486,14 +1491,17 @@ namespace
             int index;
             const char *name;
         };
-        PadInfo pads[8]{};
+        // 16 slots, not 8: on Linux the low slots fill with devices udev mislabels as
+        // joysticks (keyboard System/Consumer Control pages), so a real pad can sit well past
+        // index 4. padSlotIsController() filters those out -- see pad_config.h.
+        PadInfo pads[16]{};
         int padCount = 0;
-        for (int g = 0; g < 8; ++g)
+        for (int g = 0; g < 16; ++g)
         {
-            if (IsGamepadAvailable(g))
+            if (ps2_stubs::padSlotIsController(g))
             {
                 pads[padCount].index = g;
-                pads[padCount].name = GetGamepadName(g);
+                pads[padCount].name = glfwGetJoystickName(g);
                 ++padCount;
             }
         }
@@ -1518,7 +1526,7 @@ namespace
                 preview = "Gamepad " + std::to_string(dev.gamepad);
                 if (dev.gamepad >= 0 && IsGamepadAvailable(dev.gamepad))
                 {
-                    const char *nm = GetGamepadName(dev.gamepad);
+                    const char *nm = glfwGetJoystickName(dev.gamepad);
                     preview += " (" + std::string(nm ? nm : "?") + ")";
                 }
                 else
@@ -1625,7 +1633,17 @@ namespace
         if (captureAction >= 0 && captureAction < static_cast<int>(PadAction::Count))
         {
             PadBind bind;
-            const int pressedKey = GetKeyPressed();
+            // NOTE: GetKeyPressed() is unusable here — rlImGui drains raylib's key queue
+            // every frame to feed ImGui, so it always returned 0 ("pressing a key does
+            // nothing" while binding). IsKeyPressed() is state-based and unaffected.
+            int pressedKey = 0;
+            for (int k = 32; k <= 348 && pressedKey == 0; ++k)
+            {
+                if (IsKeyPressed(k))
+                {
+                    pressedKey = k;
+                }
+            }
             if (pressedKey != 0)
             {
                 bind = PadBind{PadBindKind::Key, pressedKey, 1.0f, 0.0f};
@@ -1726,7 +1744,16 @@ namespace
             }
             if (bind.kind != PadBindKind::None)
             {
-                cfg.setBind(static_cast<size_t>(editPlayer), static_cast<PadAction>(captureAction), bind);
+                // Keys/buttons bound to stick DIRECTIONS need the action's sign (Neg = -1);
+                // axis binds keep the sign captured from the stick's actual deflection.
+                const PadAction act = static_cast<PadAction>(captureAction);
+                const bool negStick = act == PadAction::LStickXNeg || act == PadAction::LStickYNeg ||
+                                      act == PadAction::RStickXNeg || act == PadAction::RStickYNeg;
+                const bool posStick = act == PadAction::LStickXPos || act == PadAction::LStickYPos ||
+                                      act == PadAction::RStickXPos || act == PadAction::RStickYPos;
+                if ((negStick || posStick) && bind.kind != PadBindKind::Axis)
+                    bind.sign = negStick ? -1.0f : 1.0f;
+                cfg.setBind(static_cast<size_t>(editPlayer), act, bind);
                 captureAction = -1;
             }
         }

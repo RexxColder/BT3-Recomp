@@ -73,6 +73,25 @@ else()
     )
     FetchContent_MakeAvailable(raylib)
 
+    # raylib defaults to MAX_GAMEPADS=4, and on Linux those four slots are not necessarily
+    # controllers: udev sets ID_INPUT_JOYSTICK=1 on plenty of things that are not, notably
+    # keyboards exposing System Control / Consumer Control HID pages. On a machine with such a
+    # keyboard the four slots fill with junk and a REAL pad plugged in afterwards lands at
+    # index >= 4, where IsGamepadAvailable() can never see it -- the pad simply does not exist
+    # as far as the game is concerned. Raise the ceiling so every connected device is at least
+    # addressable; PadConfig then filters the list down to things that look like gamepads.
+    # NOTE: a -DMAX_GAMEPADS=16 compile definition does NOT work. rcore.c includes raylib's
+    # own config.h (whenever EXTERNAL_CONFIG_FLAGS is undefined, which is our case) and that
+    # header redefines MAX_GAMEPADS unconditionally, so it silently wins -- and -w hides the
+    # macro-redefinition warning that would have said so. Patch the fetched header instead;
+    # this re-applies on every configure, so a fresh clone gets it too.
+    if(EXISTS "${raylib_SOURCE_DIR}/src/config.h")
+        file(READ "${raylib_SOURCE_DIR}/src/config.h" _rl_cfg)
+        string(REGEX REPLACE "#define[ \t]+MAX_GAMEPADS[ \t]+4"
+                             "#define MAX_GAMEPADS                   16" _rl_cfg "${_rl_cfg}")
+        file(WRITE "${raylib_SOURCE_DIR}/src/config.h" "${_rl_cfg}")
+    endif()
+
     FetchContent_Declare(
         imgui
         GIT_REPOSITORY https://github.com/ocornut/imgui.git
