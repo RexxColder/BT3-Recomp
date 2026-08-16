@@ -178,6 +178,13 @@ namespace
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
+    // The main thread's stack starts at PS2_RAM_SIZE-0x10 and grows DOWN. The async callback stack
+    // allocator used to start its bump pointer at PS2_RAM_SIZE as well, so the very first
+    // reserveAsyncCallbackStack() handed a callback the same top-of-RAM address the main thread was
+    // already running on -- a vsync/alarm handler then pushed its frames straight over the main
+    // thread's live saved registers. Keep the top of RAM for the main thread and carve callback
+    // stacks below it.
+    constexpr uint32_t kMainThreadStackReserve = 0x40000u; // 256 KiB
 
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
@@ -675,7 +682,7 @@ PS2Runtime::PS2Runtime()
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
     m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackTop = PS2_RAM_SIZE - kMainThreadStackReserve;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -1110,7 +1117,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
         const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
         m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        m_asyncCallbackStackTop = PS2_RAM_SIZE - kMainThreadStackReserve;
     }
 
     LoadedModule module;
