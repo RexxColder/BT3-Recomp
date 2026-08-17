@@ -440,13 +440,43 @@ namespace
     // pump this tick inline; the guard prevents nested double-ticking when the pump
     // itself reaches the other hooked poll.
     thread_local bool s_bt3CdTicking = false;
+    // RAII, because the flag used to be set and cleared by hand around a loop that runs GUEST
+    // code -- and guest code here throws (ThreadExitException). One throw left the flag stuck
+    // true on that thread forever, after which every poll skipped the pump, the partition state
+    // byte never left 2 ("reading"), and the main thread span in the poll for good: the
+    // intermittent ~3fps first screen / infinite loading screen, with 0x26b900 measured 94% hot.
+    struct Bt3CdTickGuard
+    {
+        bool engaged = false;
+        Bt3CdTickGuard()
+        {
+            if (!s_bt3CdTicking)
+            {
+                s_bt3CdTicking = true;
+                engaged = true;
+            }
+        }
+        ~Bt3CdTickGuard() { if (engaged) s_bt3CdTicking = false; }
+        Bt3CdTickGuard(const Bt3CdTickGuard &) = delete;
+        Bt3CdTickGuard &operator=(const Bt3CdTickGuard &) = delete;
+    };
+    // If the pump is ever skipped for a long unbroken run of polls we are wedged again; say so
+    // once rather than spinning silently.
+    inline void bt3NoteCdTickSkipped(bool skipped, const char *site)
+    {
+        static thread_local uint32_t s_skips = 0u;
+        if (!skipped) { s_skips = 0u; return; }
+        if (++s_skips == 10000u)
+            std::fprintf(stderr, "[bt3cdtick] %s: pump skipped %u polls in a row -- reentrancy "
+                                 "guard stuck? state byte cannot advance\n", site, s_skips);
+    }
     void bt3CdReadStatePoll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00270dd0
     {
-        bool &s_inTick = s_bt3CdTicking;
         const uint32_t handle = getRegU32(ctx, 4); // a0 = read handle
-        if (!s_inTick && handle != 0u && runtime->hasFunction(0x0028a3b0u))
+        Bt3CdTickGuard tickGuard;
+        bt3NoteCdTickSkipped(!tickGuard.engaged, "cdReadStatePoll");
+        if (tickGuard.engaged && handle != 0u && runtime->hasFunction(0x0028a3b0u))
         {
-            s_inTick = true;
             R5900Context tctx = *ctx;          // inherit gp/sp
             setReturnU32(&tctx, 0u);            // (harmless)
             tctx.r[31] = _mm_setzero_si128();   // ra = 0 => run until return
@@ -461,7 +491,6 @@ namespace
                 }
                 step(rdram, &tctx, runtime);
             }
-            s_inTick = false;
         }
         uint32_t state = 0u;
         if (const uint8_t *p = getMemPtr(rdram, handle + 1u))
@@ -2412,13 +2441,107 @@ namespace
     // which pumps the same tick for the func_270dd0 poll): on each AFS-status poll, pump
     // FUN_0028a3b0 inline so the partition read advances, then return the real state byte.
     // Confined to AFS status checks (func_26B900), so other phases are untouched.
+
+    // [cdstate] One "done" observation per submitted read. Keyed on the SUBMIT, because the
+    // previous value the guest saw is useless here: the wedge shows the device going 3 (previous
+    // read) -> 1 with no 2 or 3 observed for the new read at all, so any rule based on the last
+    // polled value cannot see it.
+    struct Bt3DevDone { std::atomic<uint32_t> dev{0u}; std::atomic<uint32_t> reported{1u};
+                        std::atomic<uint32_t> stream{0u}; std::atomic<uint32_t> idleWait{0u}; };
+    inline Bt3DevDone *bt3DevSlot(uint32_t dev)
+    {
+        static Bt3DevDone s_slots[8];
+        for (Bt3DevDone &c : s_slots)
+        {
+            const uint32_t h = c.dev.load(std::memory_order_relaxed);
+            if (h == dev) return &c;
+            if (h == 0u)
+            {
+                uint32_t expected = 0u;
+                if (c.dev.compare_exchange_strong(expected, dev, std::memory_order_relaxed) ||
+                    c.dev.load(std::memory_order_relaxed) == dev)
+                    return &c;
+            }
+        }
+        return nullptr;
+    }
+
+    PS2Runtime::RecompiledFunction g_orig270dd0 = nullptr;
+    void bt3CdStateEdge(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t handle = getRegU32(ctx, 4); // a0 = device object
+        if (!g_orig270dd0)
+            return;
+        g_orig270dd0(rdram, ctx, runtime);
+        uint32_t state = getRegU32(ctx, 2); // $v0 = device read-state byte
+
+        // The wedge, expressed purely in state we can observe: the device reports idle (1) while
+        // the stream it serves still says busy (state 2) with a request pending. Healthy operation
+        // never looks like that -- the device reads 2, then 3.
+        if (state == 1u)
+        {
+            if (Bt3DevDone *ds = bt3DevSlot(handle))
+            {
+                const uint32_t stream = ds->stream.load(std::memory_order_relaxed);
+                bool waiting = false;
+                if (stream)
+                {
+                    const uint8_t *st = getConstMemPtr(rdram, stream + 1u);
+                    const uint8_t *pend = getConstMemPtr(rdram, stream + 8u);
+                    uint32_t pendVal = 0u;
+                    if (pend) std::memcpy(&pendVal, pend, sizeof(pendVal));
+                    waiting = st && (*st == 2u) && (pendVal != 0u);
+                }
+                // Act on the FIRST such poll. There is never a second: the guest stores this
+                // return into its stream state, and a 1 closes the gate at 0x26b2e0 (`bnel $v0,2`)
+                // so func_26B2C0 never polls again -- which is exactly why every version of this
+                // latch that waited for repetition could never fire. The gate also guarantees the
+                // caller is mid-read, so a device reporting idle here cannot still be reading it.
+                // PS2X_CDEDGE=0 keeps this hook installed (so its timing cost is unchanged) but
+                // stops it substituting the value -- the A/B that says whether the fix is the
+                // substitution or just the extra frame per poll shifting the race.
+                static const bool s_edgeFix = [](){ const char *v = std::getenv("PS2X_CDEDGE"); return !(v && v[0] == '0'); }();
+                if (waiting && s_edgeFix)
+                {
+                    state = 3u;
+                    static std::atomic<uint32_t> s_n{0};
+                    const uint32_t k = s_n.fetch_add(1u);
+                    if (k < 8u || (k % 200u) == 0u)
+                        std::fprintf(stderr, "[cdstate] #%u dev=0x%x reported idle while stream 0x%x"
+                                             " still waits on it; reporting 3 instead\n", k, handle, stream);
+                }
+                else if (waiting)
+                {
+                    static std::atomic<uint32_t> s_seen{0};
+                    const uint32_t k = s_seen.fetch_add(1u);
+                    if (k < 8u)
+                        std::fprintf(stderr, "[cdstate] WEDGE CONDITION dev=0x%x stream=0x%x "
+                                             "(substitution disabled -- expect a stall)\n", handle, stream);
+                }
+            }
+        }
+
+        setReturnU32(ctx, state);
+    }
+
     PS2Runtime::RecompiledFunction g_orig26b900 = nullptr;
     void bt3AfsStatusPoll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_0026b900
     {
         const uint32_t handle = getRegU32(ctx, 4); // a0 = adxf partition handle
-        if (!s_bt3CdTicking && handle != 0u && runtime->hasFunction(0x0028a3b0u))
+        // Remember which device this stream drives; the read-state hook only gets the device and
+        // needs the stream to see whether a read is still outstanding.
+        if (const uint8_t *pdev = getConstMemPtr(rdram, handle + 4u))
         {
-            s_bt3CdTicking = true;
+            uint32_t dev = 0u;
+            std::memcpy(&dev, pdev, sizeof(dev));
+            if (dev)
+                if (Bt3DevDone *slot = bt3DevSlot(dev))
+                    slot->stream.store(handle, std::memory_order_relaxed);
+        }
+        Bt3CdTickGuard tickGuard;
+        bt3NoteCdTickSkipped(!tickGuard.engaged, "afsStatusPoll");
+        if (tickGuard.engaged && handle != 0u && runtime->hasFunction(0x0028a3b0u))
+        {
             R5900Context tctx = *ctx;             // inherit gp/sp
             tctx.r[31] = _mm_setzero_si128();     // ra = 0 => run until return
             tctx.pc = 0x0028a3b0u;                // CD file-server tick
@@ -2970,9 +3093,9 @@ namespace
         // on the IOP; pump it once per game frame here — same established tick pattern.
         {
             static const bool s_pump = [](){ const char *v = std::getenv("PS2X_CDPUMP"); return !(v && v[0] == '0'); }();
-            if (s_pump && !s_bt3CdTicking && runtime->hasFunction(0x0028a3b0u))
+            Bt3CdTickGuard tickGuard;
+            if (s_pump && tickGuard.engaged && runtime->hasFunction(0x0028a3b0u))
             {
-                s_bt3CdTicking = true;
                 R5900Context tctx = *ctx;           // inherit gp/sp
                 tctx.r[31] = _mm_setzero_si128();   // ra = 0 => run until return
                 tctx.pc = 0x0028a3b0u;              // CD file-server tick
@@ -3681,10 +3804,22 @@ namespace
         }
     }
 
+    // THE FIX -- see bt3CdStateEdge. PS2X_CDEDGE=0 keeps the hook installed but stops it
+    // substituting the value, which is the A/B that attributes the fix to the substitution
+    // rather than to the hook's timing.
+    void applyBt3CdStateEdge(PS2Runtime &runtime)
+    {
+        g_orig270dd0 = runtime.lookupFunction(0x00270dd0u);
+        if (g_orig270dd0 && runtime.replaceFunction(0x00270dd0u, &bt3CdStateEdge))
+            std::cerr << "[game_overrides] BT3: CD read-state completion edge guard on func_270DD0"
+                      << std::endl;
+    }
+
     PS2_REGISTER_GAME_OVERRIDE("RECVX sound-driver compat", "slus_201.84", 0u, 0u, &applyRecvxSoundDriverCompat);
     PS2_REGISTER_GAME_OVERRIDE("RECVX DTX compat", "slus_201.84", 0u, 0u, &applyRecvxDtxCompat);
     PS2_REGISTER_GAME_OVERRIDE("LotR sound RPC compat", "SLUS_205.78", 0u, 0u, &applyLotrSoundRpcCompat);
     PS2_REGISTER_GAME_OVERRIDE("BT3 sound init bypass", "SLUS_216.78", 0u, 0u, &applyBt3SoundInitBypass);
     PS2_REGISTER_GAME_OVERRIDE("BT3 DTX sound URPC compat", "SLUS_216.78", 0u, 0u, &applyBt3DtxCompat);
     PS2_REGISTER_GAME_OVERRIDE("BT3 sceMpeg callback stubs", "SLUS_216.78", 0u, 0u, &applyBt3MpegCallbackStubs);
+    PS2_REGISTER_GAME_OVERRIDE("BT3 CD read-state edge guard", "SLUS_216.78", 0u, 0u, &applyBt3CdStateEdge);
 }
