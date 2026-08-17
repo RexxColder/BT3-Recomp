@@ -249,17 +249,116 @@ static inline bool vuUpperIsNop(uint32_t upper)
     return sub == 0x2Fu || sub == 0x30u;
 }
 
+// Phase 1 of the upper-slot translator.  execUpper() re-derives, on EVERY instruction, five bit
+// fields, three operand pointers and the vf0-sink branch -- all of which are constant for a given
+// PC -- and then walks a two-level switch of ~100 cases to reach a 4-element loop.  At ~47M VU
+// instructions/sec that dominates the fight-mode profile (execUpper 14.3%, applyDestClamped 13.1%).
+//
+// The fields are decoded once per PC slot into the existing validated cache and the ten hottest
+// opcodes get a direct handler, so the hot path becomes "load record -> jump table -> arithmetic".
+// Ten opcodes cover ~94% of executions; everything else keeps falling through to execUpper(), so
+// this is a pure fast path and not a reimplementation of the ISA.  PS2X_VUFAST=0 bypasses it.
 namespace
 {
+    enum : uint8_t
+    {
+        VU_UP_FALLBACK = 0,
+        // special (funct >= 0x3C) -- these write ACC, not vd
+        VU_UP_MADDAbc,
+        VU_UP_MSUBAbc,
+        VU_UP_MULAbc,
+        // plain funct -- these write vd
+        VU_UP_ADDbc,
+        VU_UP_SUBbc,
+        VU_UP_MADDbc,
+        VU_UP_MULbc,
+        VU_UP_ADD,
+        VU_UP_SUB,
+        VU_UP_MULq,
+    };
+
     struct VuDecodeEntry
     {
         uint32_t lower = 1u; // 1 with upper==0 is never a real pair -> empty slot
         uint32_t upper = 0u;
         bool lowerFirst = false;
         bool upperNop = false;
+        uint8_t upKind = VU_UP_FALLBACK;
+        uint8_t upDest = 0u;
+        uint8_t upBc = 0u;
+        uint8_t upFs = 0u;
+        uint8_t upFt = 0u;
+        uint8_t upFd = 0u;
     };
     constexpr uint32_t kVuDecodeSlots = 2048u; // 16KB microcode / 8 bytes per instruction
     thread_local VuDecodeEntry g_vuDecode[kVuDecodeSlots];
+
+    // Plain thread-local scalars, never atomics: at ~47M instructions/sec an atomic increment per
+    // instruction costs ~200ms/sec and inverted the result of the first VU1 A/B run.
+    thread_local uint64_t g_vuFastHits = 0;
+    thread_local uint64_t g_vuFastMisses = 0;
+    thread_local uint64_t g_vuFastNs = 0;
+
+    // Lane-select masks for the dest field, so the commit is a branchless blend instead of the
+    // four predicated scalar stores applyDest*/applyDestClamped do. dest bit3=x=lane0 .. bit0=w=lane3.
+    alignas(16) const uint32_t kDestBlend[16][4] = {
+        {0u, 0u, 0u, 0u},                 // ----
+        {0u, 0u, 0u, ~0u},                // ---w
+        {0u, 0u, ~0u, 0u},                // --z-
+        {0u, 0u, ~0u, ~0u},               // --zw
+        {0u, ~0u, 0u, 0u},                // -y--
+        {0u, ~0u, 0u, ~0u},               // -y-w
+        {0u, ~0u, ~0u, 0u},               // -yz-
+        {0u, ~0u, ~0u, ~0u},              // -yzw
+        {~0u, 0u, 0u, 0u},                // x---
+        {~0u, 0u, 0u, ~0u},               // x--w
+        {~0u, 0u, ~0u, 0u},               // x-z-
+        {~0u, 0u, ~0u, ~0u},              // x-zw
+        {~0u, ~0u, 0u, 0u},               // xy--
+        {~0u, ~0u, 0u, ~0u},              // xy-w
+        {~0u, ~0u, ~0u, 0u},              // xyz-
+        {~0u, ~0u, ~0u, ~0u},             // xyzw
+    };
+
+    // Mirrors execUpper()'s dispatch exactly; anything not listed stays VU_UP_FALLBACK.
+    inline void vuDecodeUpper(uint32_t instr, VuDecodeEntry &e)
+    {
+        e.upKind = VU_UP_FALLBACK;
+        e.upDest = DEST(instr);
+        e.upFt = FT(instr);
+        e.upFs = FS(instr);
+        e.upFd = FD(instr);
+
+        const uint32_t op = instr & 0x3Fu;
+        if (op >= 0x3Cu)
+        {
+            const uint32_t sop = (instr & 0x3u) | ((instr >> 4) & 0x7Cu);
+            e.upBc = (uint8_t)(sop & 3u);
+            if (sop >= 0x08u && sop <= 0x0Bu)
+                e.upKind = VU_UP_MADDAbc;
+            else if (sop >= 0x0Cu && sop <= 0x0Fu)
+                e.upKind = VU_UP_MSUBAbc;
+            else if (sop >= 0x18u && sop <= 0x1Bu)
+                e.upKind = VU_UP_MULAbc;
+            return;
+        }
+
+        e.upBc = (uint8_t)(op & 3u);
+        if (op <= 0x03u)
+            e.upKind = VU_UP_ADDbc;
+        else if (op <= 0x07u)
+            e.upKind = VU_UP_SUBbc;
+        else if (op <= 0x0Bu)
+            e.upKind = VU_UP_MADDbc;
+        else if (op >= 0x18u && op <= 0x1Bu)
+            e.upKind = VU_UP_MULbc;
+        else if (op == 0x1Cu)
+            e.upKind = VU_UP_MULq;
+        else if (op == 0x28u)
+            e.upKind = VU_UP_ADD;
+        else if (op == 0x2Cu)
+            e.upKind = VU_UP_SUB;
+    }
 }
 
 static inline bool vuLowerShouldRunBeforeUpper(uint32_t upper, uint32_t lower)
@@ -619,6 +718,30 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
+    // PS2X_VUFASTSTATS: fps is useless for grading this change -- hand-played A/B arms differ in
+    // stage, camera and character count, and that workload variance (13% in prims/sec between two
+    // runs) swamps a few-percent effect. Time the interpreter directly and divide by the op count
+    // instead: ns-per-upper-op is a property of the code, not of how the fight went. Clocked per
+    // run() call (a few thousand/sec), never per instruction.
+    struct VuTimeScope
+    {
+        std::chrono::steady_clock::time_point t0;
+        bool on;
+        VuTimeScope(bool enabled) : on(enabled)
+        {
+            if (on)
+                t0 = std::chrono::steady_clock::now();
+        }
+        ~VuTimeScope()
+        {
+            if (on)
+                g_vuFastNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - t0).count();
+        }
+    };
+    static const bool s_vuTime = [](){ const char *v = std::getenv("PS2X_VUFASTSTATS"); return v && v[0] && v[0] != '0'; }();
+    VuTimeScope vuTimeScope(s_vuTime);
+
     g_curStartPc = m_state.pc; // entry PC of this run (for PS2X_KICKSTAT attribution)
     g_curVuCode = vuCode; g_curCodeSize = codeSize; // for the spike microcode snapshot
     static const bool s_skyKickShadow = [](){ const char *v = std::getenv("PS2X_SKYKICK"); if (v && v[0] && v[0] != '0') return true;
@@ -674,6 +797,133 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             ++fc;
         }
     }
+    // Direct handlers for the ten hottest upper opcodes, running off the pre-decoded record so
+    // no field extraction, pointer setup or ISA switch happens per instruction.  Defined here (as
+    // a lambda in a member function) purely so it can reach the private applyDest* helpers without
+    // a header change, which would force a near-full rebuild.  Returns false -> caller falls back.
+    // VUTRACE instruments the special ops inside execUpper(), so the fast path yields when it is on.
+    static const bool s_vuFast = [](){
+        const char *v = std::getenv("PS2X_VUFAST");
+        if (v && v[0] == '0') return false;
+        const char *t = std::getenv("PS2X_VUTRACE");
+        return !(t && t[0] && t[0] != '0');
+    }();
+    // PS2X_VUFASTSTATS=1: report how much of the upper stream the translator actually covers, which
+    // is what decides whether specialising more opcodes in a later pass is worth anything.
+    {
+        static const bool s_stats = [](){ const char *v = std::getenv("PS2X_VUFASTSTATS"); return v && v[0] && v[0] != '0'; }();
+        if (s_stats)
+        {
+            static thread_local uint32_t s_calls = 0;
+            if ((++s_calls & 511u) == 0u)
+            {
+                const uint64_t tot = g_vuFastHits + g_vuFastMisses;
+                if (tot)
+                    std::fprintf(stderr, "[vufast] %.1f%% fast | %.2f ns/op (%llu ops, %.2f s in VU1)\n",
+                                 100.0 * (double)g_vuFastHits / (double)tot,
+                                 (double)g_vuFastNs / (double)tot,
+                                 (unsigned long long)tot, (double)g_vuFastNs / 1e9);
+            }
+        }
+    }
+    // Commit a result vector: MAC/STATUS flags, PS2 Inf/NaN saturation, then a masked write.
+    // Replaces applyDestClamped()'s four predicated scalar stores and its per-lane clamp (which
+    // memcpy'd each float in and out) with branchless SIMD -- that helper alone was 13.1% of the
+    // fight profile. Flags are taken from the UNCLAMPED result, matching applyDestClamped's order.
+    auto commitFast = [this](float *dst, __m128 r, uint8_t dest)
+    {
+        {
+            static const int s_mode = [](){ const char *v = std::getenv("PS2X_VU_MACFLAGS"); return v ? std::atoi(v) : 1; }();
+            if (s_mode != 0)
+            {
+                static const uint8_t rev4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+                const uint32_t laneDest = rev4[dest & 0xFu];
+                const uint32_t zm = (uint32_t)_mm_movemask_ps(_mm_cmpeq_ps(r, _mm_setzero_ps())) & laneDest;
+                const uint32_t sm = (uint32_t)_mm_movemask_ps(r) & laneDest & ~zm;
+                if (s_mode == 2)
+                    m_state.mac = zm | (sm << 4);
+                else
+                    m_state.mac = (uint32_t)rev4[zm] | ((uint32_t)rev4[sm] << 4);
+                const uint32_t zAny = zm ? 1u : 0u, sAny = sm ? 2u : 0u;
+                m_state.status = (m_state.status & ~0x3u) | zAny | sAny | (zAny << 6) | (sAny << 6);
+            }
+        }
+
+        static const bool s_clamp = vuClampEnabled();
+        if (s_clamp)
+        {
+            const __m128i ui = _mm_castps_si128(r);
+            const __m128i expAll = _mm_set1_epi32(0x7F800000);
+            const __m128i infNan = _mm_cmpeq_epi32(_mm_and_si128(ui, expAll), expAll);
+            if (_mm_movemask_ps(_mm_castsi128_ps(infNan)))
+            {
+                // Rare enough to be worth nothing in the common path: hand the lanes to the scalar
+                // helper so saturation semantics and the [vuclamp] diagnostic stay byte-identical.
+                alignas(16) float tmp[4];
+                _mm_store_ps(tmp, r);
+                for (int c = 0; c < 4; ++c)
+                    tmp[c] = vuClampFloat(tmp[c]);
+                r = _mm_load_ps(tmp);
+            }
+        }
+
+        const uint8_t d = dest & 0xFu;
+        if (d == 0xFu) // by far the most common mask: full write, no read-modify-write needed
+        {
+            _mm_storeu_ps(dst, r);
+            return;
+        }
+        if (d == 0u)
+            return;
+        const __m128 m = _mm_load_ps((const float *)kDestBlend[d]);
+        _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(m, r), _mm_andnot_ps(m, _mm_loadu_ps(dst))));
+    };
+
+    auto execUpperFast = [this, &commitFast](const VuDecodeEntry &e) -> bool
+    {
+        if (e.upKind == VU_UP_FALLBACK)
+            return false;
+
+        // Separate _mm_mul_ps/_mm_add_ps rather than an FMA: the multiply-then-add rounds twice,
+        // which is what the scalar interpreter path does. BT3 geometry rides the clip planes to
+        // within ~0.4%, so a single-rounded FMA could reshape clipper output (the SPS class).
+        const __m128 vs = _mm_loadu_ps(m_state.vf[e.upFs]);
+        const float *vtp = m_state.vf[e.upFt];
+        const __m128 bcv = _mm_set1_ps(vtp[e.upBc]);
+        __m128 r;
+        bool toAcc = false;
+
+        switch (e.upKind)
+        {
+        case VU_UP_MADDAbc: r = _mm_add_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, bcv)); toAcc = true; break;
+        case VU_UP_MSUBAbc: r = _mm_sub_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, bcv)); toAcc = true; break;
+        case VU_UP_MULAbc:  r = _mm_mul_ps(vs, bcv);                                        toAcc = true; break;
+        case VU_UP_ADDbc:   r = _mm_add_ps(vs, bcv); break;
+        case VU_UP_SUBbc:   r = _mm_sub_ps(vs, bcv); break;
+        case VU_UP_MADDbc:  r = _mm_add_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, bcv)); break;
+        case VU_UP_MULbc:   r = _mm_mul_ps(vs, bcv); break;
+        case VU_UP_ADD:     r = _mm_add_ps(vs, _mm_loadu_ps(vtp)); break;
+        case VU_UP_SUB:     r = _mm_sub_ps(vs, _mm_loadu_ps(vtp)); break;
+        case VU_UP_MULq:    r = _mm_mul_ps(vs, _mm_set1_ps(m_state.q)); break;
+        default: return false;
+        }
+
+        float *dst;
+        if (toAcc)
+        {
+            dst = m_state.acc;
+        }
+        else
+        {
+            // vf0 is a hardwired read-only constant; a write targeting it must be discarded or
+            // every matrix built from it collapses -- see the vf0-transform-collapse fix.
+            static thread_local float s_vf0Sink[4];
+            dst = (e.upFd == 0u) ? s_vf0Sink : m_state.vf[e.upFd];
+        }
+        commitFast(dst, r, e.upDest);
+        return true;
+    };
+
     for (uint32_t cycle = 0; cycle < maxCycles; ++cycle)
     {
         // Q pipeline tick: commit the pending DIV/SQRT/RSQRT result once its latency elapses.
@@ -733,6 +983,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         const bool loi = iBit;
         bool lowerFirst;
         bool upperNop;
+        const VuDecodeEntry *decoded = nullptr;
         {
             static const bool s_useCache = [](){ const char *v = std::getenv("PS2X_VUDECODE"); return !(v && v[0] == '0'); }();
             const uint32_t slot = (m_state.pc >> 3) & (kVuDecodeSlots - 1u);
@@ -741,6 +992,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             {
                 lowerFirst = e.lowerFirst;
                 upperNop = e.upperNop;
+                decoded = &e;
             }
             else
             {
@@ -750,15 +1002,27 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 {
                     e.lower = lower; e.upper = upper;
                     e.lowerFirst = lowerFirst; e.upperNop = upperNop;
+                    vuDecodeUpper(upper, e);
+                    decoded = &e;
                 }
             }
         }
+        // Upper-slot dispatch: the pre-decoded handler when this PC has one, ISA switch otherwise.
+        auto runUpper = [&]() {
+            const bool fast = s_vuFast && decoded && execUpperFast(*decoded);
+            // Counters only when asked for: two thread-local increments per instruction is ~94M/sec
+            // in a fight, which is not free and would otherwise be charged to the shipping path.
+            if (s_vuTime)
+                (fast ? g_vuFastHits : g_vuFastMisses) += 1u;
+            if (!fast)
+                execUpper(upper);
+        };
 
         if (loi)
         {
             // LOI is special: the upper instruction sees the old I value, then LOI loads I.
             if (!upperNop)
-                execUpper(upper);
+                runUpper();
             std::memcpy(&m_state.i, &lower, 4);
         }
         else if (lowerFirst)
@@ -768,12 +1032,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             // so it observes the old VF value and the upper write has priority.
             execLower(lower, vuData, dataSize, gs, memory, upper);
             if (!upperNop)
-                execUpper(upper);
+                runUpper();
         }
         else
         {
             if (!upperNop)
-                execUpper(upper);
+                runUpper();
             execLower(lower, vuData, dataSize, gs, memory, upper);
         }
 
