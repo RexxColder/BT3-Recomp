@@ -440,6 +440,12 @@ uint64_t GsGpuRenderer::resolveTextureVersion(uint64_t baseKey, uint32_t pageLo,
     }
     auto it = m_texCache.find(ve.verKey);
     needDecode = (it == m_texCache.end() || it->second.w <= 0);
+    // Claim the key for the LRU here, where the recorder decides a draw will reference it -- when
+    // needDecode is false it emits that draw without touching the cache again.  Eviction otherwise
+    // refreshes timestamps only from the list being rendered, so a draw published after m_pending
+    // was drained but before the eviction pass is invisible to the LRU.  Runs under m_mtx, as the
+    // eviction pass does.
+    g_texLastUse[ve.verKey] = g_texUseGen;
     return ve.verKey;
 }
 
@@ -943,14 +949,53 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             for (const DrawCmd &c : cmds)
                 if (c.texKey) g_texLastUse[c.texKey] = g_texUseGen;
             constexpr uint32_t GRACE = 3;
-            if (g_texUseGen > GRACE)
+            // Evict under MEMORY PRESSURE, not on a 3-frame timer.  The old policy dropped any
+            // texture unused for 3 frames even with the cache nearly empty; a camera cutscene stops
+            // the arena being drawn for far longer than that, so an ultimate evicted the whole stage
+            // set for being briefly off-screen (measured: 150 cached textures down to 93 across one
+            // cutscene).  That is not recoverable: GPU mode never writes rendered pixels back to
+            // VRAM, so a texture whose source region is a render target cannot be re-decoded once
+            // dropped and comes back wrong -- the "cutscene attacks wreck the arena" bug (stretched
+            // grass, bare trees, missing eyes, recoloured pants).  Bounding by size still reclaims
+            // the fade keys eviction was added for (a fade mints a key per frame, so it blows past
+            // any budget), while textures that merely went off-screen survive.  GRACE remains a
+            // floor so nothing referenced in the last few frames is ever a candidate.
+            //
+            // Budget BYTES, not entries: entries run from 4KB (32x32) to 1MB (512x512 RGBA), so an
+            // entry count bounds the wrong resource.  PS2X_TEXCACHEMB overrides the default 192MB.
+            //
+            // NOTE this is a fix at the cache layer over an unfixed one underneath: the real repair
+            // is FBO->VRAM writeback (or sub-rect RT readback) for INDEXED sources, which is also
+            // the documented real fix for the Kaioken-white bug.  Non-indexed RT sampling already
+            // works; the gap is T4/T8+CLUT, where an FBO holds colours but the texture wants
+            // palette indices.  Until then, correctness depends on the cache staying under budget.
+            static const size_t s_cacheBytes = [](){ const char *v = std::getenv("PS2X_TEXCACHEMB");
+                                                     const int n = v ? std::atoi(v) : 0;
+                                                     return (size_t)(n > 0 ? n : 192) * 1024u * 1024u; }();
+            size_t cacheBytes = 0;
+            for (const auto &kv : m_texCache) cacheBytes += kv.second.rgba.size();
+            if (g_texUseGen > GRACE && cacheBytes > s_cacheBytes)
             {
-                std::vector<uint64_t> dead;
+                // Oldest-first, and only far enough to get back under budget.
+                std::vector<std::pair<uint32_t, uint64_t>> aged;
+                aged.reserve(m_texCache.size());
                 for (auto &kv : m_texCache)
                 {
                     auto u = g_texLastUse.find(kv.first);
                     uint32_t last = (u == g_texLastUse.end()) ? 0u : u->second;
-                    if (last + GRACE < g_texUseGen) dead.push_back(kv.first);
+                    if (last + GRACE < g_texUseGen) aged.push_back({last, kv.first});
+                }
+                std::sort(aged.begin(), aged.end(),
+                          [](const auto &l, const auto &r){ return l.first < r.first; });
+                size_t toFree = cacheBytes - s_cacheBytes;
+                std::vector<uint64_t> dead;
+                for (size_t di = 0; di < aged.size() && toFree > 0; ++di)
+                {
+                    auto ci = m_texCache.find(aged[di].second);
+                    if (ci == m_texCache.end()) continue;
+                    const size_t sz = ci->second.rgba.size();
+                    dead.push_back(aged[di].second);
+                    toFree = (sz >= toFree) ? 0 : (toFree - sz);
                 }
                 for (uint64_t k : dead)
                 {
