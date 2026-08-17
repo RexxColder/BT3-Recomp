@@ -224,6 +224,44 @@ static inline void vuLowerVfReadWriteMasks(uint32_t lower, uint32_t &readMask, u
     }
 }
 
+// [vuopt] Per-PC decode cache + upper-NOP skip.
+//
+// BT3 retires ~47 MILLION VU1 instructions/sec in a fight, so anything done per instruction is
+// expensive. Two things were done on every one of them and neither depends on runtime state:
+//
+//  * vuLowerShouldRunBeforeUpper() runs two multi-level switches over the instruction words to
+//    decide whether the lower op must execute first.
+//  * ~47% of upper slots are NOP (VU instructions are upper/lower pairs and most of this
+//    microcode has an empty upper slot), yet each still called execUpper(), which extracts five
+//    fields, sets up three pointers and runs a two-level switch just to reach `case 0x2F: return`.
+//
+// Both are pure functions of (upper, lower), so decode once per PC slot and validate by comparing
+// the two words already loaded -- no invalidation hook needed, since a microprogram upload changes
+// the words and the entry simply misses. PS2X_VUDECODE=0 bypasses it.
+static inline bool vuUpperIsNop(uint32_t upper)
+{
+    const uint32_t funct = upper & 0x3Fu;
+    if (funct < 0x3Cu)
+        return false;
+    const uint32_t sub = (upper & 0x3u) | ((upper >> 4) & 0x7Cu);
+    // Only the explicit NOP sub-ops, NOT the switch's `default: return` cases, so an
+    // unimplemented opcode still reaches the switch instead of being silently swallowed.
+    return sub == 0x2Fu || sub == 0x30u;
+}
+
+namespace
+{
+    struct VuDecodeEntry
+    {
+        uint32_t lower = 1u; // 1 with upper==0 is never a real pair -> empty slot
+        uint32_t upper = 0u;
+        bool lowerFirst = false;
+        bool upperNop = false;
+    };
+    constexpr uint32_t kVuDecodeSlots = 2048u; // 16KB microcode / 8 bytes per instruction
+    thread_local VuDecodeEntry g_vuDecode[kVuDecodeSlots];
+}
+
 static inline bool vuLowerShouldRunBeforeUpper(uint32_t upper, uint32_t lower)
 {
     const uint8_t upperWrite = vuUpperVfWriteReg(upper);
@@ -693,31 +731,56 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         // LOI is controlled by the upper I-bit.  The lower word is the float immediate.
         // DobieStation executes the upper instruction first, then commits lower into I.
         const bool loi = iBit;
+        bool lowerFirst;
+        bool upperNop;
+        {
+            static const bool s_useCache = [](){ const char *v = std::getenv("PS2X_VUDECODE"); return !(v && v[0] == '0'); }();
+            const uint32_t slot = (m_state.pc >> 3) & (kVuDecodeSlots - 1u);
+            VuDecodeEntry &e = g_vuDecode[slot];
+            if (s_useCache && e.lower == lower && e.upper == upper)
+            {
+                lowerFirst = e.lowerFirst;
+                upperNop = e.upperNop;
+            }
+            else
+            {
+                lowerFirst = vuLowerShouldRunBeforeUpper(upper, lower);
+                upperNop = s_useCache && vuUpperIsNop(upper);
+                if (s_useCache)
+                {
+                    e.lower = lower; e.upper = upper;
+                    e.lowerFirst = lowerFirst; e.upperNop = upperNop;
+                }
+            }
+        }
+
         if (loi)
         {
             // LOI is special: the upper instruction sees the old I value, then LOI loads I.
-            execUpper(upper);
+            if (!upperNop)
+                execUpper(upper);
             std::memcpy(&m_state.i, &lower, 4);
         }
-        else if (vuLowerShouldRunBeforeUpper(upper, lower))
+        else if (lowerFirst)
         {
             // VU upper/lower execute as a pair.  If the upper op writes a VF register
             // that the lower op reads or also writes, Dobie runs the lower side first
             // so it observes the old VF value and the upper write has priority.
             execLower(lower, vuData, dataSize, gs, memory, upper);
-            execUpper(upper);
+            if (!upperNop)
+                execUpper(upper);
         }
         else
         {
-            execUpper(upper);
+            if (!upperNop)
+                execUpper(upper);
             execLower(lower, vuData, dataSize, gs, memory, upper);
         }
 
-        // Enforce VF0 invariant
-        m_state.vf[0][0] = 0.0f;
-        m_state.vf[0][1] = 0.0f;
-        m_state.vf[0][2] = 0.0f;
-        m_state.vf[0][3] = 1.0f;
+        // Enforce VF0 invariant. One 16-byte store rather than four scalar ones: this runs on
+        // EVERY instruction, so at ~47M instructions/sec four stores is ~190M stores/sec.
+        // Unaligned store because VU1State's alignment is not guaranteed.
+        _mm_storeu_ps(m_state.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f));
         // Enforce VI0 invariant
         m_state.vi[0] = 0;
 
