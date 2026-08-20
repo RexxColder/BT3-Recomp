@@ -414,6 +414,10 @@ private:
     GSTexaReg m_texa{0u, false, 0u};
     GSTexClutReg m_texclut{0u, 0u, 0u};
 
+    // GS COLCLAMP: 1 = clamp over-range blend results to 0..255, 0 = WRAP (mask to 8 bits).
+    // Needed by the palette-arena blend below, which must match the GS bit-for-bit.
+    bool m_colclamp = true;
+
     // Per-primitive CLUT (palette) cache. Paletted textures (T4/T8, e.g. UI text)
     // otherwise re-fetch a swizzled palette entry from VRAM for every pixel. We
     // decode the palette to a flat RGBA table once per texture-state and index it

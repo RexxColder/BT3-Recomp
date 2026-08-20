@@ -1320,6 +1320,62 @@ void GSRasterizer::drawPrimitive(GS *gs)
         default:
             break; // points: not yet (rare in BT3 UI)
         }
+        // [cpuclut] PCSX2-style "CPU CLUT Render" (default ON, PS2X_CPUCLUT=0 disables):
+        // draws that RENDER INTO the char-palette arena (fbp 480 — e.g. the Kaioken buff's
+        // 64x64 tint sprite, blend (Cs-Cd)*FIX/128+Cd with an animated FIX) apply to guest
+        // VRAM at RECORD time with exact GS integer blending. Palettes are DATA the CPU-side
+        // texture decoder consumes — a GPU render would need a same-frame readback (a hard
+        // sync stall; and our record runs a full list ahead, so late readbacks get clobbered
+        // by the game's per-frame palette re-upload — measured). ~4096 flat pixels/frame:
+        // a palette operation, not scene rasterization. Resolution-independent (upscale-safe).
+        {
+            static const bool s_cclut = [](){ const char *v = std::getenv("PS2X_CPUCLUT"); return !(v && v[0] == '0'); }();
+            if (s_cclut && ctx.frame.fbp == 480u && gs->m_prim.type == 6u && gs->m_prim.tme == 0)
+            {
+                const int cofx = ctx.xyoffset.ofx >> 4, cofy = ctx.xyoffset.ofy >> 4;
+                const GSVertex &q0 = gs->m_vtxQueue[0], &q1 = gs->m_vtxQueue[1];
+                int cx0 = (int)q0.x - cofx, cy0 = (int)q0.y - cofy;
+                int cx1 = (int)q1.x - cofx, cy1 = (int)q1.y - cofy;
+                if (cx1 < cx0) std::swap(cx0, cx1);
+                if (cy1 < cy0) std::swap(cy0, cy1);
+                cx0 = std::max(cx0, (int)ctx.scissor.x0); cy0 = std::max(cy0, (int)ctx.scissor.y0);
+                cx1 = std::min(cx1, (int)ctx.scissor.x1 + 1); cy1 = std::min(cy1, (int)ctx.scissor.y1 + 1);
+                const uint32_t cbw = ctx.frame.fbw ? (uint32_t)ctx.frame.fbw : 1u;
+                const uint32_t cbase = ctx.frame.fbp * 32u;
+                const uint32_t cmsk = ctx.frame.fbmsk;
+                const bool cabe = gs->m_prim.abe != 0;
+                const uint32_t alw = (uint32_t)(ctx.alpha & 0xFFu);
+                const uint32_t selA = alw & 3u, selB = (alw >> 2) & 3u, selC = (alw >> 4) & 3u, selD = (alw >> 6) & 3u;
+                const int cfix = (int)((ctx.alpha >> 32) & 0xFFu);
+                // GS sprites take the flat color from the SECOND vertex.
+                const int csr = q1.r, csg = q1.g, csb = q1.b, csa = q1.a;
+                const bool cclamp = gs->m_colclamp;
+                for (int py = cy0; py < cy1; ++py)
+                    for (int px = cx0; px < cx1; ++px)
+                    {
+                        const uint32_t dpx = GSMem::ReadCT32(gs->m_vram, cbase, cbw, (uint32_t)px, (uint32_t)py);
+                        const int ddr = dpx & 0xFF, ddg = (dpx >> 8) & 0xFF, ddb = (dpx >> 16) & 0xFF, dda = (dpx >> 24) & 0xFF;
+                        int orr, org, orb;
+                        if (!cabe) { orr = csr; org = csg; orb = csb; }
+                        else
+                        {
+                            const int Cc = (selC == 0u) ? csa : (selC == 1u) ? dda : cfix;
+                            auto cterm = [&](uint32_t sel, int sv, int dv) -> int { return sel == 0u ? sv : (sel == 1u ? dv : 0); };
+                            auto cblend = [&](int sv, int dv) -> int {
+                                int r = (((cterm(selA, sv, dv) - cterm(selB, sv, dv)) * Cc) >> 7) + cterm(selD, sv, dv);
+                                if (cclamp) r = r < 0 ? 0 : (r > 255 ? 255 : r); else r &= 0xFF;
+                                return r;
+                            };
+                            orr = cblend(csr, ddr); org = cblend(csg, ddg); orb = cblend(csb, ddb);
+                        }
+                        uint32_t outw = (uint32_t)orr | ((uint32_t)org << 8) | ((uint32_t)orb << 16) | ((uint32_t)csa << 24);
+                        outw = (outw & ~cmsk) | (dpx & cmsk); // FBMSK: masked bits keep dest
+                        GSMem::WriteCT32(gs->m_vram, cbase, cbw, (uint32_t)px, (uint32_t)py, outw);
+                    }
+                ps2GpuRenderer().onVramUpload(cbase, 64u); // 2 pages: re-key the palette decodes
+                return; // applied in place; nothing else to do for this draw
+            }
+        }
         return;
     }
 

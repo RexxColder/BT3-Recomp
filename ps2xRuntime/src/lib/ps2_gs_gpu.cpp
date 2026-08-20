@@ -2298,12 +2298,16 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case GS_REG_PABE:
         m_pabe = (value & 1u) != 0u;
         break;
+    case GS_REG_COLCLAMP:
+        // COLCLAMP was ignored (we always clamped, like GL). The GS WRAPS over-range blend
+        // results when this is 0, and the palette-arena blend below must match it bit-for-bit.
+        m_colclamp = (value & 1u) != 0u;
+        break;
     case GS_REG_TEXFLUSH:
     case GS_REG_SCANMSK:
     case GS_REG_FOGCOL:
     case GS_REG_DIMX:
     case GS_REG_DTHE:
-    case GS_REG_COLCLAMP:
     case GS_REG_MIPTBP1_1:
     case GS_REG_MIPTBP1_2:
     case GS_REG_MIPTBP2_1:
