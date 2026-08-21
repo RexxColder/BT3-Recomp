@@ -2518,6 +2518,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     cmd.destFbp = ctx.frame.fbp;
     cmd.destFbw = ctx.frame.fbw;
     cmd.destPsm = static_cast<uint8_t>(ctx.frame.psm);
+    cmd.bilinear = ((ctx.tex1 >> 5) & 1u) != 0u;   // GS TEX1.MMAG
     cmd.srcTbp0 = tme ? ctx.tex0.tbp0 : 0u;
     cmd.srcTexW = tme ? texW : 0;
     cmd.srcTexH = tme ? texH : 0;

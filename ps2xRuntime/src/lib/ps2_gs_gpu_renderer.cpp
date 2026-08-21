@@ -105,6 +105,22 @@ namespace
     // render targets each get their own FBO, so a game that renders into VRAM and samples
     // it back (render-to-texture) works. Keyed by fbp.
     struct Fbo { RenderTexture2D rt{}; int w = 0, h = 0; };
+    // [bilinear] GS TEX1.MMAG per-draw filter. The GS filters magnified textures bilinearly
+    // when MMAG is set (BT3 sets it on 99.4% of draws, with no mipmaps -- MXL is 0), so
+    // forcing every texture to GL_NEAREST reads back blocky. It shows most where the game
+    // stretches something small over a large area: the effect gradients, and the low-res
+    // buffers the post chain composites back over the scene.
+    // PS2X_BILINEAR=0 restores the old always-POINT behaviour.
+    std::unordered_map<unsigned, bool> g_texFilterState;   // last filter applied, per GL texture id
+    void ps2xApplyTexFilter(Texture2D &t, bool bilinear)
+    {
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_BILINEAR"); return !(v && v[0] == '0'); }();
+        if (!s_on || t.id == 0) return;
+        auto it = g_texFilterState.find(t.id);
+        if (it != g_texFilterState.end() && it->second == bilinear) return;   // don't thrash GL state
+        SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+        g_texFilterState[t.id] = bilinear;
+    }
     std::unordered_map<uint32_t, Fbo> g_fbos;
     // Read-after-write fix: snapshot copies of render targets that are both rendered AND sampled
     // in the same frame (the big RTs fbp224/336). Sampling the LIVE FBO texture we draw into
@@ -3125,7 +3141,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 {
                     if (c.srcTbp0 >= 13000u && c.srcTbp0 < 14100u) g_charMergeN += 2;
                     applyDepth(c.depthTest, c.depthFunc, c.depthWrite);
-                    rlSetTexture(tex.id);
+                    ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
                     rlBegin(RL_QUADS);
                     for (int k = 0; k < 4; ++k)
@@ -3178,7 +3194,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                                      tex.id, tex.width, tex.height, (tex.id==g_white.id)?1:0, fromFbo?1:0, u0, v0, u1, v1, sprDepth?1:0, (double)c.z);
                     }
                 }
-                rlSetTexture(tex.id);
+                ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
                 rlBegin(RL_QUADS);
                 rlColor4ub(c.r, c.g, c.b, c.a);
                 rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -3246,6 +3262,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                                  src.x, src.y, src.width, src.height, dst.x, dst.y, dst.width, dst.height);
                 }
             }
+            ps2xApplyTexFilter(tex, c.bilinear);
             DrawTexturePro(tex, src, dst, Vector2{0, 0}, 0.0f, Color{c.r, c.g, c.b, c.a});
             }
         }
@@ -3327,7 +3344,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 if (s_tt2 && c.texKey != 0 && tex.id != g_white.id && s_lastGen != frameGen && c.isTriangle)
                 {
                     s_lastGen = frameGen;
-                    rlSetTexture(tex.id);
+                    ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
                     rlBegin(RL_QUADS);
                     rlColor4ub(255, 255, 255, 255);
@@ -3340,7 +3357,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 }
             }
             if (c.texKey != 0 && c.srcTbp0 >= 13000u && c.srcTbp0 < 14100u) ++g_charSingleN;
-            rlSetTexture(tex.id);
+            ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
             rlCheckRenderBatchLimit(4);
             rlBegin(RL_QUADS);
             const int quad[4] = {0, 1, 2, 2};
@@ -3482,7 +3499,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                         glBindTexture(0x0DE1, (unsigned)prevBind);
                         rlDrawRenderBatchActive();
                         rlDisableColorBlend();
-                        rlSetTexture(tex.id);
+                        ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -3494,7 +3511,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                         // Twin quad with NEGATIVE V (like the real char draws) at (30,10):
                         // GL REPEAT should wrap -0.75 -> 0.25 and give the same color as the
                         // positive twin. If this one is black, negative UVs are the killer.
-                        rlSetTexture(tex.id);
+                        ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -3509,7 +3526,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                         // Third twin at (50,10): drawn under the CHAR DRAW'S OWN blend state
                         // (constant-alpha k=FIX/128 was just applied for this very cmd) — the
                         // last remaining state difference vs the real draws.
-                        rlSetTexture(tex.id);
+                        ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(128, 128, 128, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);

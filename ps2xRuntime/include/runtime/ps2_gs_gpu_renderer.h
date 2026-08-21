@@ -53,6 +53,9 @@ public:
         // surface -- and one RGBA8 FBO per address cannot express that, so the renderer needs
         // to know which view a draw belongs to.
         uint8_t destPsm = 0;
+        // GS TEX1.MMAG (bit 5): magnification filter, 1 = bilinear. BT3 sets it on nearly
+        // every draw; sampling those GL_NEAREST is what leaves stretched content blocky.
+        bool bilinear = false;
         int srcTexW = 0, srcTexH = 0;   // source texture dims (for render-target FBO size)
         int sx, sy, sw, sh;         // GS scissor rect (top-left origin, framebuffer px)
         // sprite quad (isTriangle == false):
