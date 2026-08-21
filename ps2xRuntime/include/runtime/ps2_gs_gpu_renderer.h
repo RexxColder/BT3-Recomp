@@ -48,6 +48,11 @@ public:
         // to route draws to per-fbp FBOs and to sample a render-target framebuffer back
         // as a texture (render-to-texture) instead of stale VRAM.
         uint32_t destFbp = 0, destFbw = 0, srcTbp0 = 0;
+        // GS FRAME.PSM of the destination. BT3 re-views one framebuffer address at two bit
+        // depths inside a single frame -- fbp0 is both the 32-bit scene and a 512x896 PSMCT16
+        // surface -- and one RGBA8 FBO per address cannot express that, so the renderer needs
+        // to know which view a draw belongs to.
+        uint8_t destPsm = 0;
         int srcTexW = 0, srcTexH = 0;   // source texture dims (for render-target FBO size)
         int sx, sy, sw, sh;         // GS scissor rect (top-left origin, framebuffer px)
         // sprite quad (isTriangle == false):

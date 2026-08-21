@@ -1284,6 +1284,7 @@ void GSRasterizer::drawPrimitive(GS *gs)
             lbase.isTriangle = true;
             lbase.destFbp = lctx.frame.fbp;
             lbase.destFbw = lctx.frame.fbw;
+            lbase.destPsm = static_cast<uint8_t>(lctx.frame.psm);
             lbase.srcTbp0 = 0u;
             lbase.sx = lctx.scissor.x0;
             lbase.sy = lctx.scissor.y0;
@@ -2516,6 +2517,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     // render-to-texture (sampling a framebuffer that was rendered to).
     cmd.destFbp = ctx.frame.fbp;
     cmd.destFbw = ctx.frame.fbw;
+    cmd.destPsm = static_cast<uint8_t>(ctx.frame.psm);
     cmd.srcTbp0 = tme ? ctx.tex0.tbp0 : 0u;
     cmd.srcTexW = tme ? texW : 0;
     cmd.srcTexH = tme ? texH : 0;

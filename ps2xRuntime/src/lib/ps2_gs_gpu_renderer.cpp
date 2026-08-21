@@ -1154,10 +1154,21 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     // The display buffer is the drawn-to fbp with the most coverage that ISN'T sampled.
     std::unordered_set<uint32_t> sourceFbps;
     std::unordered_map<uint32_t, int> rtTexW, rtTexH, destFbwById;
+    std::unordered_map<uint64_t, double> viewArea;   // (fbp<<8 | FRAME.PSM) -> area drawn through that view
     std::unordered_map<uint32_t, double> destArea;
     for (const DrawCmd &c : cmds)
     {
         if (c.destFbw) destFbwById[c.destFbp] = static_cast<int>(c.destFbw);
+        {   // area per (fbp, psm) view -- see the buffer re-view note below
+            double va;
+            if (c.isTriangle) {
+                float vx0 = c.tri[0].x, vx1 = c.tri[0].x, vy0 = c.tri[0].y, vy1 = c.tri[0].y;
+                for (int i = 1; i < 3; ++i) { vx0 = std::min(vx0, c.tri[i].x); vx1 = std::max(vx1, c.tri[i].x);
+                                              vy0 = std::min(vy0, c.tri[i].y); vy1 = std::max(vy1, c.tri[i].y); }
+                va = static_cast<double>(vx1 - vx0) * (vy1 - vy0);
+            } else va = static_cast<double>(c.dx1 - c.dx0) * (c.dy1 - c.dy0);
+            viewArea[(static_cast<uint64_t>(c.destFbp) << 8) | c.destPsm] += std::abs(va);
+        }
         double area;
         if (c.isTriangle) {
             float x0 = c.tri[0].x, x1 = c.tri[0].x, y0 = c.tri[0].y, y1 = c.tri[0].y;
@@ -1172,6 +1183,37 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             if (c.srcTexH > rtTexH[sf]) rtTexH[sf] = c.srcTexH;
         }
     }
+    // ---- Buffer re-view (bit-depth aliasing) ----------------------------------------
+    // BT3 draws into one address through two FRAME views in the same frame. The one that
+    // shows is fbp0: the scene is PSMCT32 512x448, and a depth pass re-views the SAME memory
+    // as PSMCT16 512x896, writing 32 columns 8px wide through a partial FBMSK (0x3fff) while
+    // sampling the Z buffer as PSMZ16. On hardware those bits land in masked parts of the
+    // 16-bit view and the displayed image is untouched -- PCSX2's own screenshot of the frame
+    // has no columns in it. We keep one RGBA8 FBO per address, so drawing them literally
+    // painted 8-on/8-off vertical stripes across the whole frame with green and blue zeroed
+    // (glColorMask can only mask whole channels).
+    // Keyed on bit DEPTH, not psm equality: PSMCT32 and PSMCT24 are the same 32-bit surface.
+    std::unordered_map<uint32_t, uint8_t> primaryPsm;   // fbp -> psm of its largest-area view
+    {
+        std::unordered_map<uint32_t, double> best;
+        for (auto &kv : viewArea)
+        {
+            const uint32_t fbp = static_cast<uint32_t>(kv.first >> 8);
+            const uint8_t psm = static_cast<uint8_t>(kv.first & 0xFF);
+            if (!best.count(fbp) || kv.second > best[fbp]) { best[fbp] = kv.second; primaryPsm[fbp] = psm; }
+        }
+    }
+    auto psmBits = [](uint8_t psm) -> int {
+        switch (psm) {
+            case 0x00: case 0x01: return 32;   // PSMCT32 / PSMCT24
+            case 0x02: case 0x0A: return 16;   // PSMCT16 / PSMCT16S
+            case 0x30: case 0x31: return 32;   // PSMZ32 / PSMZ24
+            case 0x32: case 0x3A: return 16;   // PSMZ16 / PSMZ16S
+            default: return 32;
+        }
+    };
+    static const bool s_aliasSkip = [](){ const char *v = std::getenv("PS2X_ALIASSKIP"); return !(v && v[0] == '0'); }();
+
     static const bool s_atlas = [](){ const char *v = std::getenv("PS2X_ATLAS"); return v && v[0] && v[0] != '0'; }();
     uint32_t displayFbp = 0; double bestArea = -1.0; bool found = false;
     for (auto &kv : destArea) { if (sourceFbps.count(kv.first)) continue; if (kv.second > bestArea) { bestArea = kv.second; displayFbp = kv.first; found = true; } }
@@ -1891,6 +1933,29 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     for (size_t ci = 0; ci < DC.size(); ++ci)
     {
         const DrawCmd &c = DC[ci];
+        // A secondary bit-depth view of a buffer we hold as one RGBA8 FBO, writing through a
+        // mask we cannot express either. Narrow on purpose: a bit-depth re-view ALONE is not
+        // enough to drop a draw -- fbp336 is legitimately rendered through both a 256x256
+        // PSMCT32 view and a 512x448 PSMCT16 one, and skipping the 32-bit half collapses the
+        // frame into noise. What we skip is the re-view that ALSO carries a partial FBMSK (a
+        // byte that is neither "keep all" nor "write all"), because hardware puts those bits
+        // somewhere our FBO has no room for -- so the only faithful rendering of them is none.
+        // PS2X_ALIASSKIP=0 restores the old literal painting.
+        if (s_aliasSkip && !c.isTransfer)
+        {
+            auto pit = primaryPsm.find(c.destFbp);
+            if (pit != primaryPsm.end() && psmBits(c.destPsm) != psmBits(pit->second))
+            {
+                bool partialMask = false;
+                for (int by = 0; by < 4 && !partialMask; ++by)
+                {
+                    const uint32_t mb = (c.fbmsk >> (8 * by)) & 0xFFu;
+                    if (mb != 0x00u && mb != 0xFFu) partialMask = true;
+                }
+                if (partialMask) continue;
+            }
+        }
+
         // PS2X_PROGDUMP: during forensic publishes, dump the scene buffers every 5% of
         // the draw list — progressive frame construction for bisecting which draw range
         // paints an artifact. Files overwrite per step; they show the LAST forensic publish.
