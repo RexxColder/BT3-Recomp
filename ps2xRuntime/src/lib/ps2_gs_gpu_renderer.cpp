@@ -18,6 +18,14 @@
 #include "raylib.h"
 #include "rlgl.h"
 
+// GS texel-corner vs GL texel-centre addressing. 0.5 texel, or 0 with PS2X_HALFTEXEL=0.
+static float ps2xHalfTexel()
+{
+    static const float s_half = [](){ const char *v = std::getenv("PS2X_HALFTEXEL");
+                                      return (v && v[0] == '0') ? 0.0f : 0.5f; }();
+    return s_half;
+}
+
 // GL 1.4 core; raylib/rlgl does not wrap constant-color blending. Linux libGL exports
 // it directly; Windows opengl32 only exports GL 1.1, so resolve it from the driver at
 // first use (x64 has a single calling convention, so the plain signature is fine).
@@ -2948,7 +2956,15 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                         }
                     }
                 }
-                if (sceneDest && !destAlphaLerp && (fromFbo || rtBaseSample))
+                // ...except additive ones. This gate exists to stop a render target being
+                // sampled back into the scene before it holds anything, which produced a black
+                // stage. An ADDITIVE pass cannot darken, so it cannot cause that failure -- and
+                // BT3's depth-of-field composite arrives this way, sampling the blur pyramid
+                // (f336/f224/f343) back over the frame. Skipping it left the whole far field
+                // sharp; console softens it. PS2X_BLOOM=0 restores the blanket skip.
+                const bool additivePass = c.abe && (c.blendMode == 0x48 || c.blendMode == 0x68);
+                static const bool s_bloom = [](){ const char *v = std::getenv("PS2X_BLOOM"); return !(v && v[0] == '0'); }();
+                if (sceneDest && !destAlphaLerp && (fromFbo || rtBaseSample) && !(s_bloom && additivePass))
                 {
                     if (s_srcDiag) srcDiagTally("postgate", c);
                     if (g_forensicThisFrame) std::fprintf(stderr, "[fgate] %zu postgate\n", ci);
@@ -3182,7 +3198,11 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 const float tw = tex.width > 0 ? (float)tex.width : 1.0f;
                 const float th = tex.height > 0 ? (float)tex.height : 1.0f;
                 float u0, v0, u1, v1;
-                if (c.texKey != 0 || fromFbo) { u0 = c.su0 / tw; u1 = c.su1 / tw; v0 = c.sv0 / th; v1 = c.sv1 / th; if (fromFbo) { v0 = 1.0f - v0; v1 = 1.0f - v1; } }
+                // Half-texel: see the same-size note at the fromFbo branch below.
+                const float swA = std::fabs(c.su1 - c.su0), dwA = std::fabs(c.dx1 - c.dx0);
+                const float hoA = (fromFbo && c.bilinear && dwA > 0.0f && std::fabs(swA - dwA) <= 0.51f)
+                                ? ps2xHalfTexel() : 0.0f;
+                if (c.texKey != 0 || fromFbo) { u0 = (c.su0 - hoA) / tw; u1 = (c.su1 - hoA) / tw; v0 = (c.sv0 - hoA) / th; v1 = (c.sv1 - hoA) / th; if (fromFbo) { v0 = 1.0f - v0; v1 = 1.0f - v1; } }
                 else { u0 = 0; v0 = 0; u1 = 1; v1 = 1; }
                 {
                     static const bool s_hop = [](){ const char *v = std::getenv("PS2X_HOP336"); return v && v[0] && v[0] != '0'; }();
@@ -3241,10 +3261,24 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             }
             else if (fromFbo) // su/sv are framebuffer pixels == FBO pixels
             {
+                // The GS addresses texel CORNERS, so a same-size copy averages a 2x2
+                // neighbourhood. GL maps destination pixel centres onto source texel centres and
+                // returns each texel exactly. BT3 builds its depth-of-field blur by ping-ponging
+                // a 64x64 buffer through TEN such copies: on hardware that accumulates into a
+                // wide blur, for us it was ten pixel-perfect copies and the blur never happened
+                // (measured |f502-f504| = 0.00, now 2.45).
+                // ONLY for same-size copies. On a 2x downsample the offset does the opposite --
+                // it shifts sampling onto exact texel centres, so GL_LINEAR returns one texel
+                // instead of averaging four and the reduction keeps every speckle it should have
+                // removed (mountain face 12.95 applied everywhere vs 8.34 without, PCSX2 7.90).
+                const float swB = std::fabs(c.su1 - c.su0), dwB = std::fabs(c.dx1 - c.dx0);
+                const bool sameSize = (dwB > 0.0f) && std::fabs(swB - dwB) <= 0.51f;
+                const float hoB = (c.bilinear && sameSize) ? ps2xHalfTexel() : 0.0f;
+                const float sx0 = c.su0 - hoB, sx1 = c.su1 - hoB;
                 if (s_fsOld)
-                    src = Rectangle{c.su0, c.sv0, c.su1 - c.su0, -(c.sv1 - c.sv0)};
+                    src = Rectangle{sx0, c.sv0, sx1 - sx0, -(c.sv1 - c.sv0)};
                 else
-                    src = Rectangle{c.su0, (float)tex.height - std::max(c.sv0, c.sv1), c.su1 - c.su0, -(c.sv1 - c.sv0)};
+                    src = Rectangle{sx0, (float)tex.height - std::max(c.sv0, c.sv1) + hoB, sx1 - sx0, -(c.sv1 - c.sv0)};
             }
             else if (c.texKey != 0)
                 src = Rectangle{c.su0, c.sv0, c.su1 - c.su0, c.sv1 - c.sv0};
