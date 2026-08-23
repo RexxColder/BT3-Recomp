@@ -2463,12 +2463,25 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             tex = g_atlas.texture; srcSlot = &g_atlasSlots[sf]; vflip = true; fromFbo = true;
             srcHow = "atlas";
         }
-        // PS2X_RTNEUTRAL (default ON, stopgap): triangles sampling the small render-target maps
-        // (light/shadow/env chain) draw NEUTRAL WHITE instead of RT content. Our RT chain content
-        // isn't right yet in EITHER renderer; sampling it paints the stage black in GPU mode.
-        // White = fully lit / no glow. PS2X_RTNEUTRAL=0 to work on the real chain.
+        // PS2X_RTNEUTRAL (default OFF since 2026-08-24): triangles sampling the small
+        // render-target maps (light/shadow/env chain) draw NEUTRAL WHITE instead of RT content.
+        // It was a 2026-07-16 stopgap for a black stage, and it costs far more than it buys:
+        //
+        //   BT3 shades characters with a second pass over the same mesh that samples the 64x64
+        //   blurred-scene buffer (fbp502). Console kicks 10055 of them -- exactly matching the
+        //   diffuse pass -- at screen x[155..268] y[165..282], vertex colour 0x80808080, CLAMP
+        //   REPEAT, t/q in [-1,0]; our UVs for that class are identical to console's. Drawing
+        //   that mesh flat WHITE is the mid-field "white blob", and the same substitution on the
+        //   shadow-decal class is what painted the dark quads across the grass.
+        //
+        // Measured against the screenshots embedded in the console .gs dumps (RMSE):
+        //   ref_native 28.74 -> 22.16 (blob region 67.83 -> 17.69), buffglow 31.19 -> 24.64,
+        //   cell 65.36 -> 65.93, kaio_hw 91.48 -> 91.53. The last two are noise -- those frames
+        //   are far off for unrelated reasons -- and both lose the blob and the dark ground quads
+        //   on screen, which is what the RMSE there does not capture.
+        // PS2X_RTNEUTRAL=1 restores the old stopgap.
         else if ([&]{
-            static const bool s_rn = [](){ const char *v = std::getenv("PS2X_RTNEUTRAL"); return !(v && v[0] == '0'); }();
+            static const bool s_rn = [](){ const char *v = std::getenv("PS2X_RTNEUTRAL"); return v && v[0] && v[0] != '0'; }();
             // NOTE: no srcUploaded veto here. Indexed (CLUT) tile draws are already excluded
             // by srcIndexed; the remaining base-exact non-indexed triangles are framebuffer-
             // feedback samples (water/postfx). The veto misrouted them to DECODE, which served
@@ -2814,10 +2827,18 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             }
         }
 
-        // Honor GS CLAMP wrap modes for decoded textures: REPEAT (tiling) vs CLAMP. Textures are
-        // created CLAMP; stage/sky triangles use negative / >1 STQ coords with REPEAT — leaving
-        // them clamped collapsed whole triangles to texel(0,0) (flat gray/black 3D scene).
-        if (!fromFbo && c.texKey != 0 && tex.id != 0 && tex.id != g_white.id)
+        // Honor GS CLAMP wrap modes: REPEAT (tiling) vs CLAMP. Textures are created CLAMP;
+        // stage/sky triangles use negative / >1 STQ coords with REPEAT — leaving them clamped
+        // collapsed whole triangles to texel(0,0) (flat gray/black 3D scene).
+        //
+        // This used to skip RENDER-TARGET sources (!fromFbo), so every draw sampling an FBO was
+        // silently force-clamped no matter what CLAMP said. BT3's character shading pass samples
+        // fbp502 with WMS=WMT=REPEAT and t/q in [-1,0]; clamped, all of it collapses onto one
+        // edge row of the blur buffer. Small but consistent: ref_native RMSE 22.38 -> 22.16 and
+        // buffglow 24.87 -> 24.64 (cell 65.84 -> 65.93). PS2X_FBOWRAP=0 restores clamping.
+        static const bool s_fboWrap = [](){ const char *v = std::getenv("PS2X_FBOWRAP");
+                                            return !(v && v[0] == '0'); }();
+        if ((!fromFbo || s_fboWrap) && c.texKey != 0 && tex.id != 0 && tex.id != g_white.id)
         {
             static std::unordered_map<unsigned int, uint8_t> s_wrapState; // tex.id -> (wrapU<<1)|wrapV
             const uint8_t want = static_cast<uint8_t>((c.wrapU << 1) | c.wrapV);
