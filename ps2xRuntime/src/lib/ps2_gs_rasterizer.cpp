@@ -2779,11 +2779,30 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         for (int i = 0; i < 3; ++i)
         {
             const GSVertex &v = gs->m_vtxQueue[i];
-            // (2026-08-04: briefly kept the 12.4 sub-pixel fraction here so the game's
-            // half-million micro-triangles rasterize like SW — massive lag, no visible
-            // gain; the final image is replaced by the RT strip chain anyway. Reverted.)
-            cmd.tri[i].x = static_cast<float>(static_cast<int>(v.x) - ofx);
-            cmd.tri[i].y = static_cast<float>(static_cast<int>(v.y) - ofy);
+            // PS2X_SUBPIXEL (default ON): keep the GS 12.4 sub-pixel fraction instead of
+            // truncating. Console puts 99.5% of BT3's character vertices on a FRACTIONAL
+            // coordinate, so truncating snapped every silhouette edge inward to a pixel boundary.
+            //
+            // This was tried once (2026-08-04) and reverted for "massive lag, no visible gain;
+            // the final image is replaced by the RT strip chain anyway". Both halves are now
+            // false: the RT strip chain no longer replaces the image (PS2X_RTNEUTRAL is default
+            // OFF since 2026-08-24), and the lag came from sub-pixel coords defeating the integer
+            // zero-area cull above, so every micro-triangle survived. That cull is left on its
+            // integer test -- only the POSITION handed to GL gains precision, so the surviving
+            // triangle count is bit-identical and a live in-fight A/B measured no cost
+            // (30.00 -> 29.98 fps, 1,008,500 -> 1,006,787 prims/sec). PS2X_SUBPIXEL=0 disables.
+            static const bool s_subpx = [](){ const char *v = std::getenv("PS2X_SUBPIXEL");
+                                              return !(v && v[0] == '0'); }();
+            if (s_subpx)
+            {
+                cmd.tri[i].x = v.x - static_cast<float>(ofx);
+                cmd.tri[i].y = v.y - static_cast<float>(ofy);
+            }
+            else
+            {
+                cmd.tri[i].x = static_cast<float>(static_cast<int>(v.x) - ofx);
+                cmd.tri[i].y = static_cast<float>(static_cast<int>(v.y) - ofy);
+            }
             float u, tv; texelUV(v, u, tv);
             cmd.tri[i].u = tme ? (u / static_cast<float>(texW)) : 0.0f;
             cmd.tri[i].v = tme ? (tv / static_cast<float>(texH)) : 0.0f;

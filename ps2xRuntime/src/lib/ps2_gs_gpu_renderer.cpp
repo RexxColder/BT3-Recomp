@@ -2401,6 +2401,21 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (c.destFbp != curFbp) { beginFbp(c.destFbp); curBlendOn = -1; curBlendEq = -1; /* beginFbp re-enabled BLEND_ALPHA */ }
         applyBlend(c); // GS ALPHA-reg-aware: opaque / standard-alpha / FIX-opaque / subtractive
         applyAlphaTest(c); // GS TEST.ATE shader discard (alpha-keyed cutouts/overlays)
+        {   // PS2X_TRIHALF (default ON): the GS addresses texel CORNERS, GL centres. We already
+            // correct that for same-size FBO copies (the shipped blur fix) but never did for
+            // ordinary DECODED textures sampled bilinearly -- which is every character draw.
+            // Pairs with PS2X_SUBPIXEL in the rasterizer: a half-TEXEL correction only lands
+            // correctly once vertex positions carry their true sub-pixel fraction, which is why
+            // this regressed one dump on its own (buffglow +0.29) and improves all four with it.
+            // PS2X_TRIHALF=0 disables.
+            static const bool s_th = [](){ const char *v = std::getenv("PS2X_TRIHALF"); return !(v && v[0] == '0'); }();
+            if (s_th && c.isTriangle && c.bilinear && c.texKey != 0 && c.srcTexW > 0 && c.srcTexH > 0)
+            {
+                DrawCmd &m = const_cast<DrawCmd &>(c);
+                const float du = 0.5f / (float)c.srcTexW, dv = 0.5f / (float)c.srcTexH;
+                for (int i = 0; i < 3; ++i) { m.tri[i].u -= du; m.tri[i].v -= dv; }
+            }
+        }
         applyFbmsk(c.fbmsk); // GS FRAME.FBMSK -> color write mask (Z/dest-alpha-only passes)
         // Atlas mode: draws render into fbp's sub-rect -> offset all destination coords by the slot
         // origin (explicit, so it's independent of rlgl's transform-stack state).
