@@ -2037,11 +2037,108 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         static const bool s_keepDots = [](){ const char *v = std::getenv("PS2X_KEEPDOTS"); return v && v[0] && v[0] != '0'; }();
         if (!s_keepDots)
         {
+            // PS2X_SUBPIXCULL (default ON): do the zero-area test at the GS's own 12.4 sub-pixel
+            // precision instead of on truncated whole pixels.
+            //
+            // The integer test's premise -- "GL rasterizes nothing for them" -- held only while
+            // the POSITIONS handed to GL were truncated too. PS2X_SUBPIXEL (default ON since
+            // 2026-08-24) now passes the fractional coords through, so a triangle whose three
+            // vertices merely land inside the SAME pixel can still have real sub-pixel area and
+            // still cover a pixel centre. Truncating first collapses it to zero and drops it.
+            // Distant characters are almost entirely such micro-triangles, so the further the
+            // opponent is the more of them are culled and the more the model breaks up -- an
+            // artifact console does not have, because the GS rasterizes at 1/16 pixel.
+            // Measured on ref_native: the old test culled 39.2% of all triangles, a correct
+            // sub-pixel test culls 24.9%, so 14.3% of every triangle in the scene was being
+            // thrown away wrongly.
+            //
+            // vtx.x is raw12_4/16.0f and 16 is a power of two, so x*16 recovers the ORIGINAL
+            // 12.4 integer exactly; the cross product is then exact integer math in int64 (terms
+            // reach ~65535^2). Only genuinely degenerate triangles -- real lines and points --
+            // are culled now. PS2X_SUBPIXCULL=0 restores the truncating test.
+            static const bool s_subCull = [](){ const char *v = std::getenv("PS2X_SUBPIXCULL");
+                                                return !(v && v[0] == '0'); }();
+            if (s_subCull)
+            {
+                const long long x0 = std::lround(gs->m_vtxQueue[0].x * 16.0f);
+                const long long y0 = std::lround(gs->m_vtxQueue[0].y * 16.0f);
+                const long long x1 = std::lround(gs->m_vtxQueue[1].x * 16.0f);
+                const long long y1 = std::lround(gs->m_vtxQueue[1].y * 16.0f);
+                const long long x2 = std::lround(gs->m_vtxQueue[2].x * 16.0f);
+                const long long y2 = std::lround(gs->m_vtxQueue[2].y * 16.0f);
+                const long long area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+                // SLIVER GUARD (regression fix): a triangle collapses to zero INTEGER area in two
+                // different ways -- (a) it is genuinely tiny, all three vertices inside one pixel,
+                // which is the distant-character case worth rescuing, and (b) it is a long thin
+                // SLIVER whose vertices merely truncate collinear. Rescuing (b) as well made the
+                // full-power explosion paint large dark opaque slashes. Only trust the sub-pixel
+                // area for compact triangles; anything spanning more than a few pixels falls back
+                // to the old truncating test, which historically suppressed that class.
+                const long long bw = std::max({x0, x1, x2}) - std::min({x0, x1, x2});
+                const long long bh = std::max({y0, y1, y2}) - std::min({y0, y1, y2});
+                static const long long s_slivMax = [](){ const char *v = std::getenv("PS2X_SLIVERPX");
+                                                         return v && v[0] ? (long long)std::atoll(v) * 16 : 64LL; }();
+                const bool compact = (bw <= s_slivMax && bh <= s_slivMax);   // 12.4 units: 64 = 4 px
+                if (!compact)
+                {
+                    const int ix0 = static_cast<int>(gs->m_vtxQueue[0].x), iy0 = static_cast<int>(gs->m_vtxQueue[0].y);
+                    const int ix1 = static_cast<int>(gs->m_vtxQueue[1].x), iy1 = static_cast<int>(gs->m_vtxQueue[1].y);
+                    const int ix2 = static_cast<int>(gs->m_vtxQueue[2].x), iy2 = static_cast<int>(gs->m_vtxQueue[2].y);
+                    if (((ix1 - ix0) * (iy2 - iy0) - (iy1 - iy0) * (ix2 - ix0)) == 0)
+                        return true;   // non-compact and integer-degenerate: the sliver class
+                }
+                // [cullstat] PS2X_CULLSTAT=1: how many triangles the two tests disagree on, i.e.
+                // how many the old test was throwing away. Reported every 200k triangles.
+                static const bool s_cs = [](){ const char *v = std::getenv("PS2X_CULLSTAT");
+                                               return v && v[0] && v[0] != '0'; }();
+                if (s_cs)
+                {
+                    const int ix0 = static_cast<int>(gs->m_vtxQueue[0].x), iy0 = static_cast<int>(gs->m_vtxQueue[0].y);
+                    const int ix1 = static_cast<int>(gs->m_vtxQueue[1].x), iy1 = static_cast<int>(gs->m_vtxQueue[1].y);
+                    const int ix2 = static_cast<int>(gs->m_vtxQueue[2].x), iy2 = static_cast<int>(gs->m_vtxQueue[2].y);
+                    const bool oldCull = ((ix1 - ix0) * (iy2 - iy0) - (iy1 - iy0) * (ix2 - ix0)) == 0;
+                    static std::atomic<unsigned long> s_tot{0}, s_old{0}, s_new{0}, s_saved{0};
+                    const unsigned long n = s_tot.fetch_add(1) + 1;
+                    if (oldCull) s_old.fetch_add(1);
+                    if (area == 0) s_new.fetch_add(1);
+                    if (oldCull && area != 0) s_saved.fetch_add(1);
+                    if ((n % 200000ul) == 0ul)
+                        std::fprintf(stderr, "[cullstat] tris=%lu  old-test culled=%lu (%.1f%%)  "
+                                             "subpixel culled=%lu (%.1f%%)  RESCUED=%lu (%.1f%%)\n",
+                                     n, s_old.load(), 100.0 * s_old.load() / n,
+                                     s_new.load(), 100.0 * s_new.load() / n,
+                                     s_saved.load(), 100.0 * s_saved.load() / n);
+                }
+                {   // PS2X_CULLRAMP=1: cull rate for BT3's cel/outline pass specifically.
+                    // Console's own stream has 1936 exactly-degenerate triangles out of 8067
+                    // for this pass (24.0%), so a faithful renderer should cull about that many
+                    // and no more. Anything above that is outline geometry we are throwing away.
+                    static const bool s_cr = [](){ const char *v = std::getenv("PS2X_CULLRAMP");
+                                                   return v && v[0] && v[0] != '0'; }();
+                    if (s_cr && ctx.tex0.tbp0 == 15680u)
+                    {
+                        static unsigned long nSeen = 0, nCull = 0, nSliv = 0;
+                        ++nSeen; if (area == 0) ++nCull;
+                        if (!compact) ++nSliv;
+                        if ((nSeen % 8000ul) == 0ul)
+                            std::fprintf(stderr, "[cullramp] tbp15680 tris=%lu  zero-area culled=%lu "
+                                                 "(%.1f%%)  non-compact=%lu (%.1f%%)   "
+                                                 "(console: 24.0%% degenerate)\n",
+                                         nSeen, nCull, 100.0 * nCull / nSeen,
+                                         nSliv, 100.0 * nSliv / nSeen);
+                    }
+                }
+                if (area == 0)
+                    return true; // genuinely degenerate: a line or a point
+            }
+            else
+            {
             const int x0 = static_cast<int>(gs->m_vtxQueue[0].x), y0 = static_cast<int>(gs->m_vtxQueue[0].y);
             const int x1 = static_cast<int>(gs->m_vtxQueue[1].x), y1 = static_cast<int>(gs->m_vtxQueue[1].y);
             const int x2 = static_cast<int>(gs->m_vtxQueue[2].x), y2 = static_cast<int>(gs->m_vtxQueue[2].y);
             if ((x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0) == 0)
                 return true; // degenerate: draws no pixels
+            }
         }
     }
 
