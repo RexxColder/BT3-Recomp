@@ -366,6 +366,13 @@ public:
     inline void WriteVram(u32 psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
     inline u32 ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const;
 
+    uint8_t *vramData() { return m_vram; }
+    uint32_t vramSize() const { return m_vramSize; }
+
+    // Invalidate the decoded-palette cache. A barrier writeback can change a palette that
+    // lives in VRAM (BT3 RENDERS its outline CLUTs), and the cache key folds in this counter.
+    void bumpTexUploadGen() { ++m_texUploadGen; }
+
 private:
     void snapshotVRAM();
     void writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi);

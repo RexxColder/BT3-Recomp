@@ -1236,9 +1236,501 @@ void GSRasterizer::drawPrimitive(GS *gs)
         }
     }
 
+    // PS2X_SWALIAS=1: run BT3's scene-alpha REBUILD pass in the SOFTWARE rasterizer.
+    // That pass reads the Z buffer as PSMZ16 and writes it into the scene buffer RE-VIEWED as
+    // PSMCT16, through a partial FBMSK (0x00003fff) -- 8-px columns that together tile the whole
+    // buffer. An FBO-per-address renderer cannot express "same bytes, other bit depth, partial
+    // mask", so the GPU path can only drop it (leaving the scene alpha empty, which starves the
+    // outline and the shadows) or paint it literally (visible columns). The software rasterizer
+    // already implements FBMSK and the aliased views exactly, and it works in VRAM -- where the
+    // barrier has just put our depth, and where the downstream PSMT8H composites read from.
+    {   // PS2X_FBPTALLY=<n>: every n draws, tally the DESTINATION fbp as the stream states it,
+        // at rasterizer entry. Console draws vsync-3's scene into f112 and runs the whole outline
+        // chain there; our f112 FBO measures near-black (RGB 1.9/6.8/20.5) with a uniform 255
+        // alpha, while the scene sits in fbp0. This says whether the stream really asks for f112
+        // (so we are dropping/redirecting those draws) or whether we are reading FRAME wrong.
+        static const int s_ft = [](){ const char *v = std::getenv("PS2X_FBPTALLY");
+                                      return (v && v[0]) ? std::atoi(v) : 0; }();
+        if (s_ft > 0)
+        {
+            static std::map<uint32_t, unsigned long> tally;
+            static unsigned long n = 0;
+            ++tally[gs->activeContext().frame.fbp];
+            if ((++n % (unsigned long)s_ft) == 0ul)
+            {
+                std::fprintf(stderr, "[fbptally] after %lu draws:", n);
+                for (auto &kv : tally) std::fprintf(stderr, "  f%u=%lu", kv.first, kv.second);
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
+    {   // PS2X_F336ALL: every draw that targets page 336, whatever route it ends up taking.
+        static const bool s_fa = [](){ const char *v = std::getenv("PS2X_F336ALL");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (s_fa && gs->activeContext().frame.fbp == 336u)
+        {   // No first-N cap: the first draws to any page are frame-1 warm-up, and reading
+            // them as representative has misled this investigation twice. Emit every one and
+            // let the caller aggregate.
+            const auto &a = gs->activeContext();
+            std::fprintf(stderr, "[f336all] fbmsk=%08x dpsm=%02x spsm=%02x tbp=%u tme=%u prim=%u abe=%u ctxt=%u\n",
+                         a.frame.fbmsk, a.frame.psm, a.tex0.psm, a.tex0.tbp0,
+                         gs->m_prim.tme, gs->m_prim.type, gs->m_prim.abe, gs->m_prim.ctxt);
+        }
+    }
+    {   // PS2X_EDGEUSE=1: census of every draw that SAMPLES the outline edge map (tbp 10752),
+        // logged here at the rasterizer entry so it is directly comparable with the same census
+        // taken off the console stream -- before any GPU/SW routing decision can hide one.
+        // Console runs SEVEN classes; the visible dark outline is the bm0x54 pass (lerp by DEST
+        // alpha), gated by two alpha-only passes that read fbp336 as CT16 tbw8 with alpha-test
+        // NOTEQUAL 0. The additive bm0x68 pass alone cannot darken anything.
+        static const bool s_eu = [](){ const char *v = std::getenv("PS2X_EDGEUSE");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (s_eu && !gs->m_prim.tme
+            && (gs->activeContext().frame.fbp == 0u || gs->activeContext().frame.fbp == 112u))
+        {   // The DARKENER: an UNTEXTURED bm0x52 sprite (Cd - Cs*Ad) with vertex colour ~100.
+            // It is what actually paints BT3's outline: the CT16/TEXA passes set the scene's
+            // ALPHA wherever the fbp336 edge map is non-zero, and this pass subtracts 100*Ad
+            // from the colour there. Without it the edge map can be perfect and nothing darkens.
+            const auto &a = gs->activeContext();
+            const uint64_t al = a.alpha;
+            const unsigned bm = (unsigned)((((al>>6)&3)<<6)|(((al>>4)&3)<<4)|(((al>>2)&3)<<2)|(al&3));
+            if (bm == 0x52u)
+            {
+                static std::map<uint32_t, unsigned long> n;
+                if ((++n[a.frame.fbp] % 16ul) == 1ul)
+                    std::fprintf(stderr, "[dark52] dest f%u UNTEXTURED bm0x52 fix%u fbmsk%08x rgba%08x\n",
+                                 a.frame.fbp, (unsigned)((al>>32)&0xFF), a.frame.fbmsk,
+                                 (unsigned)(gs->m_vtxQueue[0].r | (gs->m_vtxQueue[0].g << 8) |
+                                            (gs->m_vtxQueue[0].b << 16) | (gs->m_vtxQueue[0].a << 24)));
+            }
+        }
+        if (s_eu && gs->m_prim.tme && gs->activeContext().tex0.tbp0 == 10752u
+            && (gs->activeContext().tex0.psm == 0u || gs->activeContext().tex0.psm == 1u
+                || gs->activeContext().tex0.psm == 2u))
+        {
+            const auto &a = gs->activeContext();
+            const uint64_t al = a.alpha; const uint64_t te = a.test;
+            std::fprintf(stderr, "[edgeuse] dest f%u fbmsk%08x tpsm%u tbw%u tcc%u tfx%u "
+                                 "bm0x%02x fix%u ate%u/atst%u/aref%u prim%u TA0=%u TA1=%u AEM=%u\n",
+                         a.frame.fbp, a.frame.fbmsk, a.tex0.psm, a.tex0.tbw, a.tex0.tcc, a.tex0.tfx,
+                         (unsigned)((((al>>6)&3)<<6)|(((al>>4)&3)<<4)|(((al>>2)&3)<<2)|(al&3)),
+                         (unsigned)((al>>32)&0xFF),
+                         (unsigned)(te & 1u), (unsigned)((te >> 1) & 7u), (unsigned)((te >> 4) & 0xFFu),
+                         (unsigned)gs->m_prim.type,
+                         (unsigned)gs->m_texa.ta0, (unsigned)gs->m_texa.ta1,
+                         (unsigned)(gs->m_texa.aem ? 1u : 0u));
+            if (a.tex0.psm == 2u)
+            {   // The OUTLINE consumer. Dump VRAM page 336 in the CT16 view it samples, AT THE
+                // MOMENT IT READS -- the generator wrote a real contour there earlier in the
+                // frame, so if this comes back empty the content is gone by read time (the
+                // second generator run's clear) rather than never having existed.
+                extern void ps2xReadbackFromVram(uint32_t, uint32_t, uint32_t, int, int, uint32_t *);
+                static int rn = 0;
+                if (rn < 40)
+                {
+                    std::vector<uint32_t> px((size_t)512 * 448, 0u);
+                    ps2xReadbackFromVram(336u, 8u, 0x02u, 512, 448, px.data());
+                    size_t nz = 0; for (uint32_t v : px) if (v & 0x00FFFFFFu) ++nz;
+                    std::fprintf(stderr, "[edgeread] #%d page336 CT16 at READ time: non-black %.3f%%\n",
+                                 rn, 100.0 * (double)nz / (double)px.size());
+                    const char *dr = std::getenv("PS2X_GS_REPLAY_OUT");
+                    char q[256];
+                    std::snprintf(q, sizeof(q), "%s/edgeread_%03d.raw", dr ? dr : ".", rn);
+                    if (FILE *qf = std::fopen(q, "wb"))
+                    { int hh[2] = { 512, 448 }; std::fwrite(hh, sizeof(hh), 1, qf);
+                      std::fwrite(px.data(), 4, px.size(), qf); std::fclose(qf); }
+                    ++rn;
+                }
+            }
+        }
+    }
+    bool aliasZPass = false;
+    // Fires when this draw returns, after the software rasterizer has written the pixels.
+    struct AliasNotify {
+        uint32_t page = 0; bool armed = false;
+        ~AliasNotify() {
+            if (!armed) return;
+            ps2GpuRenderer().onVramWriteback(page * 32u, 512u * 448u * 4u / 256u);
+        }
+    } s_aliasNotify;
+    // Disarms the software dirty mask when this draw returns, whichever path it took.
+    struct DirtyDisarm { ~DirtyDisarm() {
+        extern bool g_swDirtyActive; g_swDirtyActive = false;
+        extern bool g_swoCelZSnap; g_swoCelZSnap = false;
+        extern bool g_swoDiffOnly; g_swoDiffOnly = false; } } s_dirtyDisarm;
+    {
+        static const bool s_swAlias = [](){ const char *v = std::getenv("PS2X_SWALIAS");
+                                            return v && v[0] && v[0] != '0'; }();
+        if (s_swAlias && GsGpuRenderer::enabled())
+        {
+            const auto &actx = gs->activeContext();
+            const uint32_t dpsm = actx.frame.psm, spsm = actx.tex0.psm, msk = actx.frame.fbmsk;
+            bool partial = false;
+            for (int by = 0; by < 4 && !partial; ++by)
+            { const uint32_t mb = (msk >> (8 * by)) & 0xFFu; if (mb != 0x00u && mb != 0xFFu) partial = true; }
+            // dest re-viewed as PSMCT16, source is a Z format, and the write is partially masked
+            aliasZPass = gs->m_prim.tme && (dpsm == 0x02u) &&
+                         (spsm == 0x30u || spsm == 0x31u || spsm == 0x32u) && partial;
+            // SECOND class, same problem: BT3's outline/shadow edge detector writes into fbp336
+            // RE-VIEWED as PSMCT16 through BYTE masks (ffffff00 / ffff00ff / ff000000) while
+            // sampling the mask as PSMT8H. We hold fbp336 as one RGBA8 FBO, so a CT32-style byte
+            // colour-mask lands on the wrong channels of a 16-bit pixel -- which is what makes
+            // that pass stripe (high-frequency energy 7.07 vs 2.97 without it). The software
+            // rasterizer addresses the CT16 view and its FBMSK exactly.
+            const bool byteMask = (msk == 0xFFFFFF00u || msk == 0xFFFF00FFu || msk == 0xFF000000u);
+            if (!aliasZPass && gs->m_prim.tme && dpsm == 0x02u && spsm == 0x1Bu && byteMask)
+                aliasZPass = true;
+            // THIRD class: the CLEAR that opens the chain. Those three masked passes are only
+            // three of FOUR -- BT3 first clears the page with an UNTEXTURED, unmasked, opaque
+            // sprite (fbmsk=0, tme=0, blend 0x64 with FIX=128, so the result is just the vertex
+            // colour, which is 0). Because it carries no texture it failed the tme requirement
+            // above and went to the GPU, which split the chain across two copies of page 336:
+            // the clear landed in the FBO, the gradient in VRAM, and the readback's barrier
+            // then flushed the cleared FBO straight over the gradient. That is what made
+            // fbp336 read back as EXACTLY zero -- 0 of 229376 pixels non-zero in every channel
+            // -- even though the passes ran and consumed real data.
+            //
+            // Tightly scoped on purpose: across the whole frame the only untextured, unmasked
+            // draws to a CT16-viewed destination are these 32 clear sprites. The other CT16
+            // destinations (fbp0 and fbp336's own masked passes) are all textured and masked.
+            if (!aliasZPass && !gs->m_prim.tme && dpsm == 0x02u && msk == 0u) aliasZPass = true;
+            // PS2X_SWOUTLINE=1: run BT3's cel/OUTLINE pass in the software rasterizer.
+            //
+            // It is drawn as triangle strips of sub-pixel SLIVERS -- console's own geometry
+            // has a MEDIAN of one covered pixel per triangle and 39.9% cover no pixel centre
+            // at all -- and GL's top-left fill rule is exclusive on right/bottom edges, so it
+            // drops them. Measured against a CPU rasterization of the console stream: we cover
+            // 11629 of its 16438 effective pixels (70.7%) and the loss is graded by the toon
+            // ramp coordinate -- 7.5% of the u=0.19-0.44 band, 32.0% of 0.44-0.81, and 55.8%
+            // of u>0.81, which is the silhouette rim itself. That is the whole missing outline;
+            // every other ratio agrees (rim darkening 31.6 vs console 44.8 = 70.5%).
+            //
+            // The software rasterizer uses an inclusive edge test (kEdgeEpsilon) and covers
+            // them. It writes VRAM, so swOutlineBegin/End bracket the run to hand the scene
+            // page down and bring it back.
+            // Mode 1 routes ONLY the 0x62 pass; that is 994 separate runs per frame because the
+            // three cel passes interleave per body part, and each run would need its own
+            // page round trip. Mode 2 routes all THREE character passes as one class, which
+            // collapses to 3 runs per frame (only 1.0% of the kicks inside the character phase
+            // belong to anything else) and keeps them in stream order inside one VRAM domain,
+            // so the 0x62 subtract still lands between its neighbours exactly as on console.
+            static const int s_swOutline = [](){ const char *v = std::getenv("PS2X_SWOUTLINE");
+                                                 return v && v[0] ? std::atoi(v) : 0; }();
+            const uint8_t bmNow = static_cast<uint8_t>(actx.alpha & 0xFFu);
+            // All three character passes are TSTRIP with a distinct TCC/TFX pair, and with
+            // those constraints each matches EXACTLY the console stream's 10055 kicks -- an
+            // unscoped "0x44 + CT32" also swept up terrain decals, which the software path
+            // then painted as pale quads over the grass.
+            const bool celStrip = gs->m_prim.tme && gs->m_prim.abe &&
+                                  gs->m_prim.type == 4 /* TSTRIP */;
+            const bool celOutline = celStrip && actx.tex0.tbp0 == 15680u && bmNow == 0x62u &&
+                                    actx.tex0.tcc == 1u && actx.tex0.tfx == 1u;
+            const bool celOther   = celStrip &&
+                                    ((bmNow == 0x64u && actx.tex0.psm == 0x14u &&
+                                      actx.tex0.tcc == 1u && actx.tex0.tfx == 0u) ||
+                                     (bmNow == 0x44u && actx.tex0.psm == 0x00u &&
+                                      actx.tex0.tcc == 0u && actx.tex0.tfx == 0u));
+            // Scope to the SCENE pages: these passes only ever target the frame buffer BT3 is
+            // drawing into, and an unscoped match pulled the fbp336 edge-detect chain in too.
+            const bool celDest = (actx.frame.fbp == 0u || actx.frame.fbp == 112u);
+            // Mode 5: route ONLY the 0x62 subtract, and hold ONE bracket across the whole
+            // character phase. Modes 1/2 both had to close the bracket on every foreign draw
+            // because the blit rewrote the whole page; the per-pixel dirty mask removes that
+            // constraint, so GPU draws in between survive untouched. Keeping 0x64 and 0x44 on
+            // the GPU also keeps writing the character's DEPTH there -- routing them away is
+            // what left bright quads on the ground, since later GPU draws then depth-tested
+            // against a buffer with no character in it.
+            const bool inCelPhase = celOutline || celOther;
+            // Bisect which pass carries the ground brightening:
+            //   7 = 0x62 + 0x64 (the PSMT4 base), leaving the 0x44 PSMCT32 pass on the GPU
+            //   8 = 0x62 + 0x44, leaving the 0x64 PSMT4 pass on the GPU
+            const bool cel64 = celStrip && bmNow == 0x64u && actx.tex0.psm == 0x14u &&
+                               actx.tex0.tcc == 1u && actx.tex0.tfx == 0u;
+            const bool cel44 = celStrip && bmNow == 0x44u && actx.tex0.psm == 0x00u &&
+                               actx.tex0.tcc == 0u && actx.tex0.tfx == 0u;
+            const bool isOutline = !celDest ? false
+                                 : (s_swOutline == 1 || s_swOutline == 5) ? celOutline
+                                 : (s_swOutline == 2 || s_swOutline == 3) ? inCelPhase
+                                 : (s_swOutline == 7) ? (celOutline || cel64)
+                                 : (s_swOutline == 8) ? (celOutline || cel44)
+                                 // Mode 9 -- DIFFERENCE coverage: the 0x62 pass stays on the
+                                 // GPU exactly as in the control config (its broad interior
+                                 // shading is what mode 2's routing REMOVED -- the real-fight
+                                 // whole-frame wash), and the software pass adds ONLY the
+                                 // pixels GL's fill rule drops (the sliver rim). No
+                                 // double-draw: SW skips strictly-interior pixels.
+                                 : (s_swOutline == 9) ? celOutline
+                                 : false;
+            {   // PS2X_SWOCENSUS=1: how many draws we route per class. Console sends exactly
+                // 10055 kicks for each of the three, so a larger count here means the predicate
+                // is sweeping in extra geometry (the ground shadow decals share the 0x44 state).
+                static const bool s_sc2 = [](){ const char *v = std::getenv("PS2X_SWOCENSUS");
+                                                return v && v[0] && v[0] != '0'; }();
+                if (s_sc2 && (celOutline || celOther))
+                {
+                    static unsigned long n62 = 0, n64 = 0, n44 = 0;
+                    if (celOutline) ++n62;
+                    else if (bmNow == 0x64u) ++n64; else ++n44;
+                    static std::map<uint32_t, unsigned long> destPage;
+                    ++destPage[actx.frame.fbp];
+                    if (((n62 + n64 + n44) % 10000ul) == 0ul)
+                    {
+                        std::fprintf(stderr, "[swocensus] cel draws by DEST PAGE:");
+                        for (auto &kv : destPage) std::fprintf(stderr, " f%u=%lu", kv.first, kv.second);
+                        std::fprintf(stderr, "\n");
+                    }
+                    if (((n62 + n64 + n44) % 10000ul) == 0ul)
+                        std::fprintf(stderr, "[swocensus] routed 0x62=%lu 0x64=%lu 0x44=%lu"
+                                             "   (console: 10055 each)\n", n62, n64, n44);
+                }
+            }
+            if (s_swOutline == 6 && celDest && inCelPhase)
+                return;   // CONTROL: drop the cel class from BOTH paths. If the ground quads
+                          // are bright here too, the cel class is what darkens them and the
+                          // software path is simply failing to draw them; if they stay dark,
+                          // something else darkens them and the routing broke that instead.
+            if (s_swOutline == 4 && (celOutline || celOther))
+            {   // IDENTITY TEST: bracket the page and immediately hand it back, routing
+                // NOTHING to software. VRAM equals the FBO and no software draw happens in
+                // between, so the blit must be a no-op. Any artifact under mode 4 belongs to
+                // the round trip itself, not to software rasterization.
+                static uint32_t lastFbp = 0xFFFFFFFFu;
+                if (lastFbp != actx.frame.fbp)
+                {
+                    lastFbp = actx.frame.fbp;
+                    ps2GpuRenderer().swOutlineBegin(actx.frame.fbp);
+                    ps2GpuRenderer().swOutlineEnd();
+                }
+            }
+            else if (isOutline)
+            {
+                {
+                    extern bool g_swoCelZSnap;
+                    g_swoCelZSnap = celOutline;   // cleared by s_dirtyDisarm alongside the mask
+                }
+                {   // The ramp CLUTs are RENDER TARGETS (pages 499-500, animated per frame).
+                    // The routed pass's decode reads them from VRAM, but only the TEXTURE page
+                    // was ever barrier-flushed -- the CLUT page was not, so the SW ramp came
+                    // from stale VRAM: at u~0.74 console's ramp subtracts ~0, ours 25-50 (the
+                    // interior wireframe). Flush the CLUT page before the decode.
+                    // NOTE: needs the page in PS2X_BARONLY to pass the gate (add 499,500).
+                    if (celOutline && actx.tex0.cbp != 0u)
+                        ps2GpuRenderer().barrierBeforeRead(actx.tex0.cbp, false, false);
+                }
+                {   // Mark the dirty mask ONLY while a routed cel draw is rasterizing. Arming
+                    // it for the whole bracket was wrong: BT3's other software passes (the CT16
+                    // alpha rebuild and the fbp336 edge chain, kicks 15179..41599) run inside
+                    // the character phase, and their writePixel calls marked scene coordinates
+                    // dirty -- so the blit then uploaded CT16-aliased VRAM into the scene as
+                    // RGB. That is what put bright quads on the ground (measured 116.7 where
+                    // console is 78.6 and dropping the cel class entirely gives 79.4).
+                    extern bool g_swDirtyActive;
+                    g_swDirtyActive = true;
+                }
+                {   // Depth-only companion: the software path takes the colour, but this draw
+                    // also writes Z on the GS, so record it to the GPU with the colour mask
+                    // off so the depth buffer still sees the character.
+                    // Mode 9: FULL record instead -- the GPU keeps drawing the pass exactly as
+                    // control; the SW half only adds the difference pixels.
+                    extern bool g_recordDepthOnly;
+                    extern bool g_swoDiffOnly;
+                    static const bool s_zc = [](){ const char *v = std::getenv("PS2X_SWODEPTH");
+                                                   return !(v && v[0] == '0'); }();
+                    if (s_swOutline == 9)
+                    {
+                        g_swoDiffOnly = true;
+                        if (GsGpuRenderer::enabled()) recordSpriteGPU(gs);
+                    }
+                    else if (s_zc && GsGpuRenderer::enabled())
+                    {
+                        g_recordDepthOnly = true;
+                        recordSpriteGPU(gs);
+                        g_recordDepthOnly = false;
+                    }
+                }
+                // BT3 double-buffers the scene, and the cel passes switch between fbp0 and
+                // fbp112. A bracket tracks ONE page, so a mid-run switch would flush and blit
+                // the wrong one -- close the current bracket and open the new page's.
+                if (ps2GpuRenderer().swOutlineActive() &&
+                    ps2GpuRenderer().swOutlinePage() != actx.frame.fbp)
+                    ps2GpuRenderer().swOutlineEnd();
+                if (!ps2GpuRenderer().swOutlineActive())
+                    ps2GpuRenderer().swOutlineBegin(actx.frame.fbp);
+                aliasZPass = true;
+            }
+            else if (ps2GpuRenderer().swOutlineActive() &&
+                     !(s_swOutline == 5 && celDest && inCelPhase))
+            {
+                // The run has ended: fold the software result back into the FBO before this
+                // draw renders on top of it. In mode 5 the other two cel passes do NOT end it.
+                ps2GpuRenderer().swOutlineEnd();
+            }
+            if (aliasZPass)
+            {
+                // The GPU record path is what normally raises the read barrier; this draw skips
+                // it, so ask for the flush here or the decode below reads stale VRAM.
+                //
+                // A PSMT8H source takes its palette index from the page's ALPHA byte. That alpha
+                // lives in the FBO and is invisible to the barrier's write tracking, which only
+                // records draws whose DESTINATION is the page -- so the default gating returned
+                // early here and the decode read stale VRAM every time. BT3's fbp336 outline
+                // generator is exactly such a reader: it samples the fbp224 character mask as
+                // PSMT8H, writes a base ramp through CLUT16012, then SUBTRACTS the same ramp
+                // sampled one texel over (two 0x62 passes, byte-masked to R and to G). Fed a
+                // CONSTANT index those three passes cancel exactly, which is why the edge map
+                // measured 0 of 229376 non-zero while the passes demonstrably ran.
+                // Same fix, same reason, as the wantsAlphaAsData argument at the texture-resolve
+                // call site below.
+                // PS2X_ALIASBAR=1 restores the unconditional alpha-as-data flush. It is OFF by
+                // default because `wantsAlphaAsData` BYPASSES the write-tracking guard, so page
+                // 224 was re-flushed on all 128 of the generator's alias passes -- each one
+                // overwriting the good VRAM mask with the FBO's current content. Measured: the
+                // mask is 20 levels at pass 31 and a uniform 255 by pass 64, after which the
+                // base ramp writes nothing and the second batch's clear leaves fbp336 empty for
+                // the consumer. The destination of the mask build IS page 224, so ordinary dirty
+                // tracking already flushes it exactly once, when it changes.
+                static const bool s_aliasBar = [](){ const char *v = std::getenv("PS2X_ALIASBAR");
+                                                     return v && v[0] && v[0] != '0'; }();
+                if (gs->m_prim.tme)
+                    ps2GpuRenderer().barrierBeforeRead(actx.tex0.tbp0, true,
+                                                       s_aliasBar && spsm == 0x1Bu);
+                // The scene-alpha rebuild is about to write VRAM page 0 directly. Hand the
+                // GPU's own scene alpha over first: it carries the characters' FBA-forced
+                // MSB, which is what gives them a silhouette in the mask the outline and
+                // shadow composites read. Once per frame; a no-op unless PS2X_ASEED=1.
+                if (actx.frame.fbp == 0u && gs->m_prim.tme &&
+                    (spsm == 0x30u || spsm == 0x31u || spsm == 0x32u))
+                    ps2GpuRenderer().seedSceneAlphaForRebuild(0u);
+                ps2GpuRenderer().reportFboAlpha(actx.frame.fbp, "at-rebuild");
+                static int n = 0;
+                static const bool s_d = [](){ const char *v = std::getenv("PS2X_BARDIAG");
+                                              return v && v[0] && v[0] != '0'; }();
+                if (s_d && n++ < 400)
+                    std::fprintf(stderr, "[swalias] SW pass dest fbp=%u psm=%02x fbmsk=%08x src tbp=%u psm=%02x\n",
+                                 actx.frame.fbp, dpsm, msk, actx.tex0.tbp0, spsm);
+                // The software path writes VRAM directly, which does NOT bump the texture
+                // cache's content sequence -- so the composites that read this buffer back a
+                // few draws later would decode the copy from BEFORE the rebuild. Notify on the
+                // way out of this draw, once the pixels are actually written.
+                {   static const bool s_fp = [](){ const char *v = std::getenv("PS2X_F336PRE");
+                                                  return v && v[0] && v[0] != '0'; }();
+                    if (s_fp && actx.frame.fbp == 336u)
+                    {   static int n = 0;
+                        if (n < 6)
+                        { extern void ps2xVramCt16Stats(uint32_t, uint32_t, const char *);
+                          char lbl[48]; std::snprintf(lbl, sizeof(lbl), "before pass fbmsk=%08x", actx.frame.fbmsk);
+                          ps2xVramCt16Stats(336u, actx.frame.fbw ? actx.frame.fbw : 8u, lbl); ++n; } }
+                }
+                {   // [rebuildcen] PS2X_REBUILDCEN=1: the scene-alpha rebuild (dest fbp0/112
+                    // CT16 view, fbmsk 00003fff, src Z-as-PSMZ16). Census, at each pass entry,
+                    // BOTH sides in VRAM: how much CT16 alpha the dest page already carries and
+                    // how much nonzero Z the source page offers. fr0 reads snapshot (console) Z;
+                    // fr1 reads our own depth writeback -- if fr1's source is degenerate the
+                    // whole outline chain starves from here.
+                    static const bool s_rc = [](){ const char *v = std::getenv("PS2X_REBUILDCEN");
+                                                   return v && v[0] && v[0] != '0'; }();
+                    if (s_rc && (actx.frame.fbp == 0u || actx.frame.fbp == 112u)
+                        && (spsm == 0x30u || spsm == 0x31u || spsm == 0x32u))
+                    {
+                        static int rn = 0;
+                        if (rn < 140)
+                        {
+                            ++rn;
+                            extern void ps2xReadbackFromVram(uint32_t, uint32_t, uint32_t, int, int, uint32_t *);
+                            // FULL CT16 view: the re-cut has 896 rows; the character's rows sit
+                            // at ~360-880, so a 448-row window missed nearly all of them.
+                            std::vector<uint32_t> sc((size_t)512 * 896, 0u);
+                            ps2xReadbackFromVram(actx.frame.fbp, 8u, 0x02u, 512, 896, sc.data());
+                            size_t anz = 0;
+                            // ReadVram(psm 0x02) returns RAW 16-bit CT16 texels: the alpha bit
+                            // is bit15, NOT an expanded 0xFF000000 byte (checking the byte made
+                            // this census read 0.00% while a read-after-write probe showed the
+                            // rebuild landing 26.7% alpha bits -- a blind instrument, not a
+                            // broken rebuild).
+                            for (uint32_t v2 : sc) if (v2 & 0x8000u) ++anz;
+                            std::vector<uint32_t> zz((size_t)512 * 448, 0u);
+                            ps2xReadbackFromVram(actx.tex0.tbp0 / 32u, 8u, 0x30u, 512, 448, zz.data());
+                            size_t znz = 0, lowNz = 0; uint32_t zmx = 0;
+                            for (uint32_t v2 : zz)
+                            { if (v2) { ++znz; if (v2 > zmx) zmx = v2; if (v2 & 0xFFu) ++lowNz; } }
+                            static int lonce = 0;
+                            if (lonce++ < 4)
+                                std::fprintf(stderr, "[rebuildcen] RAW Z32 words: nz=%zu zmax=%u lowbyte!=0 on %zu (%.1f%%) -> %s\n",
+                                             znz, zmx, lowNz, znz ? 100.0 * (double)lowNz / (double)znz : 0.0,
+                                             (znz && lowNz * 10 < znz) ? "QUANTIZED (D24-era)" : "exact-ish");
+                            std::fprintf(stderr, "[rebuildcen] #%d dest=f%u msk=%08x destA!=0 %.2f%% | srcZpage=%u Znz %.2f%% zmax24=%u\n",
+                                         rn, actx.frame.fbp, actx.frame.fbmsk,
+                                         100.0 * (double)anz / (double)sc.size(),
+                                         actx.tex0.tbp0 / 32u,
+                                         100.0 * (double)znz / (double)zz.size(), zmx);
+                        }
+                    }
+                }
+                {   // PS2X_F336VDUMP=1: dump VRAM page 336 AFTER each alias pass, in the CT32
+                    // view the downstream composite actually samples (tbp10752, fbw 4). The
+                    // GPU-side texture dump reads a different copy of this page, so it showed
+                    // "exactly zero" while VRAM measurably held content -- dump the bytes the
+                    // generator really wrote instead of inferring from the consumer.
+                    static const bool s_vd = [](){ const char *v = std::getenv("PS2X_F336VDUMP");
+                                                   return v && v[0] && v[0] != '0'; }();
+                    if (s_vd && actx.frame.fbp == 336u)
+                    {
+                        extern void ps2xReadbackFromVram(uint32_t, uint32_t, uint32_t, int, int, uint32_t *);
+                        static int dn = 0;
+                        if (dn < 200)
+                        {
+                            // Read it in the view the GENERATOR writes (PSMCT16, fbw 8 = 512px),
+                            // not the CT32 view the consumer uses -- a CT32 window over CT16
+                            // bytes packs two pixels into one word and the shape is unreadable.
+                            const char *dir = std::getenv("PS2X_GS_REPLAY_OUT");
+                            const int w = 512, h = 448;
+                            std::vector<uint32_t> px((size_t)w * h, 0u);
+                            ps2xReadbackFromVram(336u, 8u, 0x02u, w, h, px.data());
+                            {   // Dump the SOURCE the base pass reads (page 224, whose ALPHA is
+                                // the PSMT8H index) alongside the destination. The generator runs
+                                // more than once per frame and only some runs produce content;
+                                // this says whether the dead runs are fed a saturated mask rather
+                                // than failing in the passes themselves.
+                                std::vector<uint32_t> mk((size_t)512 * 448, 0u);
+                                ps2xReadbackFromVram(224u, 8u, 0x00u, 512, 448, mk.data());
+                                char mp[256];
+                                std::snprintf(mp, sizeof(mp), "%s/f224src_%03d_msk%08x.raw",
+                                              dir ? dir : ".", dn, actx.frame.fbmsk);
+                                if (FILE *mf = std::fopen(mp, "wb"))
+                                { int mh[2] = { 512, 448 }; std::fwrite(mh, sizeof(mh), 1, mf);
+                                  std::fwrite(mk.data(), 4, mk.size(), mf); std::fclose(mf); }
+                            }
+                            char pth[256];
+                            std::snprintf(pth, sizeof(pth), "%s/f336vram_%03d_msk%08x.raw",
+                                          dir ? dir : ".", dn, actx.frame.fbmsk);
+                            if (FILE *df = std::fopen(pth, "wb"))
+                            { int hd[2] = { w, h }; std::fwrite(hd, sizeof(hd), 1, df);
+                              std::fwrite(px.data(), 4, px.size(), df); std::fclose(df); }
+                            ++dn;
+                        }
+                    }
+                }
+                {   // Mode 9 (difference-only outline): do NOT arm the writeback notify.
+                    // It fires onVramWriteback on the SCENE page after every routed draw,
+                    // invalidating every live texture decode of pages 0/112 -- the DoF and
+                    // composite chain then re-decodes the scene from one-frame-old VRAM,
+                    // which was the whole-frame wash (constant MAE ~77.6 through five other
+                    // attribution toggles). The blit carries the SW pixels explicitly; no
+                    // consumer needs a VRAM re-decode of the scene page for this mode.
+                    extern bool g_swoDiffOnly;
+                    if (!g_swoDiffOnly)
+                    {
+                        s_aliasNotify.page = actx.frame.fbp;
+                        s_aliasNotify.armed = true;
+                    }
+                }
+            }
+        }
+    }
+
     // GPU mode: record to the hardware renderer instead of software-rasterizing.
     // Stage 1 handles sprites (98% of the menu); other primitives are skipped for now.
-    if (GsGpuRenderer::enabled())
+    if (GsGpuRenderer::enabled() && !aliasZPass)
     {
         switch (gs->m_prim.type)
         {
@@ -1610,8 +2102,30 @@ void GSRasterizer::drawPrimitive(GS *gs)
     }
 }
 
-void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+// Set while a run of draws is being handed to the software rasterizer (PS2X_SWOUTLINE), so
+// the pixels it actually touches can be blitted back INDIVIDUALLY. A whole-page blit is not
+// safe: BT3's CT16 alias passes write into the same words of page 0, so VRAM's RGB legitimately
+// differs from the FBO's and uploading all of it imports those aliased writes as visible colour
+// (measured: an identity round trip alone costs MAE 11.96 -> 14.26).
+bool g_recordDepthOnly = false;
+bool g_swDirtyActive = false;
+std::vector<uint8_t> g_swDirty;
+int g_swDirtyW = 0, g_swDirtyH = 0;
+// [swozsnap] pre-bracket VRAM z snapshot: the routed 0x62 outline class z-tests against THIS
+// instead of live z, because the routed base pass's own z-writes are what reject the ink
+// ((cf): float z interpolation diverges between strip topologies by thousands of ints on
+// edge-on triangles). Base/shading classes keep live z, so self-occlusion is preserved.
+std::vector<uint32_t> g_swoZSnap;
+int g_swoZSnapW = 0, g_swoZSnapH = 0;
+bool g_swoZSnapValid = false;
+bool g_swoCelZSnap = false;   // set while a routed 0x62 outline draw is rasterizing
+bool g_swoDiffOnly = false;   // mode 9: SW writes only the pixels GL's fill rule drops
+float *g_umapPtr = nullptr;   // [umap] per-pixel ramp-u dump buffer
+
+void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, bool widened)
 {
+    if (g_swDirtyActive && x >= 0 && y >= 0 && x < g_swDirtyW && y < g_swDirtyH)
+        g_swDirty[(size_t)y * g_swDirtyW + x] = 255u;
     const auto &ctx = gs->activeContext();
 
     // PS2X_SCIFIX=1: the fight ground mesh draws on context 2 whose scissor reads
@@ -1637,7 +2151,19 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     const u32 fbp  = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
     const u32 fbw  = std::max<u32>(ctx.frame.fbw, 1u);
     const u32 fpsm = ctx.frame.psm;
-    const u32 fmsk = ctx.frame.fbmsk;
+    u32 fmsk = ctx.frame.fbmsk;
+    {   // A routed cel draw must NOT write VRAM's scene ALPHA. On the GPU path that byte is
+        // protected on every flush by PS2X_BARKEEPA, because it is not our alpha to own -- it
+        // is the field BT3's own masked passes rebuild and the outline/shadow composites read
+        // back as a PSMT8H index. The software rasterizer writes VRAM directly and so bypasses
+        // that protection entirely, repainting the scene alpha with the character's alpha and
+        // feeding the mask chain different data. That is what changed the ground, not the blit
+        // (whose draw measures as an exact no-op: ratio 1.000, 0.00% of pixels differing).
+        extern bool g_swDirtyActive;
+        static const bool s_ka = [](){ const char *v = std::getenv("PS2X_SWOKEEPA");
+                                       return !(v && v[0] == '0'); }();
+        if (s_ka && g_swDirtyActive) fmsk |= 0xFF000000u;
+    }
     const u32 zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
     const u32 zpsm = ctx.zbuf.psm;
 
@@ -1690,10 +2216,54 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     // PROHIBITED setting on the GS, so a TEST reg left at 0 must not cull every
     // pixel — treat both cases as "pass" (this is why untested font sprites, which
     // have TEST=0, were being fully culled).
-    const bool ztest_enabled = ((ctx.test >> 16) & 1u) != 0u;
+    bool ztest_enabled = ((ctx.test >> 16) & 1u) != 0u;
     uint ztest_method = (ctx.test >> 17) & 3;
 
     bool zpass = false;
+    {   // PS2X_SWONOZ=1: drop the depth test for draws currently routed to the software
+        // rasterizer. Their Z comes from a GPU depth buffer round-tripped through VRAM, and
+        // near-coplanar geometry (the character's ground shadow) is exactly what a small
+        // error there rejects. If this recovers the shadow, the round trip is the problem.
+        extern bool g_swDirtyActive;
+        static const bool s_nz = [](){ const char *v = std::getenv("PS2X_SWONOZ");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (s_nz && g_swDirtyActive) { ztest_enabled = false; }
+    }
+    // [swozeps] PS2X_SWOZEPS=<n>: GEQUAL tie tolerance for draws routed to the software
+    // rasterizer (g_swDirtyActive). BT3's cel/outline passes re-draw the SAME mesh as the base
+    // pass and pass GEQUAL on console by exact fixed-point z equality; our float interpolation
+    // differs per strip topology, so ties break and ~40% of routed pixels are rejected within a
+    // <=4096-int margin ([swozstat]) while the >4096 rejects are legitimate hidden surfaces.
+    // The epsilon passes the former and keeps the latter -- same spirit as kEdgeEpsilon for
+    // coverage. Scoped strictly to routed draws; 0 (default) = exact GS compare everywhere.
+    uint32_t zeps = 0u;
+    bool widenedFree = false;
+    {
+        extern bool g_swDirtyActive;
+        static const uint32_t s_zeps = [](){ const char *v = std::getenv("PS2X_SWOZEPS");
+                                             return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
+        if (s_zeps && g_swDirtyActive) zeps = s_zeps;
+        // PS2X_WIDENZ=1 (default OFF -- MEASURED WORSE, rim -6.1 / MAE 17.0): widened
+        // pixels of routed draws skip z-test + z-write. Kept only as an A/B: its failure
+        // proves the INK sits on INTERIOR sliver pixels rejected against the body's own z,
+        // not on the widened ring.
+        static const bool s_wz = [](){ const char *v = std::getenv("PS2X_WIDENZ");
+                                       return v && v[0] && v[0] != '0'; }();
+        widenedFree = s_wz && widened && g_swDirtyActive;
+    }
+    // PS2X_WIDENZW=1: the SPLIT variant -- widened pixels skip only the z-WRITE (so the base
+    // pass cannot poison the field with fabricated near z at contour-adjacent pixels) but KEEP
+    // the z-test (background passes at the contour = the ink; interior widened pixels are
+    // correctly rejected by the adjacent face). WIDENZ bundled both exemptions and failed.
+    bool widenedNoZW = false;
+    {
+        extern bool g_swDirtyActive;
+        static const bool s_wzw = [](){ const char *v = std::getenv("PS2X_WIDENZW");
+                                        return v && v[0] && v[0] != '0'; }();
+        widenedNoZW = s_wzw && widened && g_swDirtyActive;
+    }
+    if (widenedFree)
+        ztest_enabled = false;
     if (!ztest_enabled)
     {
         zpass = true;
@@ -1708,13 +2278,58 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         zpass = true;
         break;
     case 2:
-        zpass = z >= gs->ReadVram(zpsm, zbp, fbw, x, y);
-        break;
     case 3:
-        zpass = z > gs->ReadVram(zpsm, zbp, fbw, x, y);
+    {
+        uint32_t zb;
+        extern std::vector<uint32_t> g_swoZSnap; extern int g_swoZSnapW, g_swoZSnapH;
+        extern bool g_swoZSnapValid, g_swoCelZSnap;
+        static const bool s_zsnap = [](){ const char *v = std::getenv("PS2X_SWOZSNAP");
+                                          return !(v && v[0] == '0'); }();
+        if (s_zsnap && g_swoCelZSnap && g_swoZSnapValid &&
+            x >= 0 && y >= 0 && x < g_swoZSnapW && y < g_swoZSnapH)
+            zb = g_swoZSnap[(size_t)y * g_swoZSnapW + x];
+        else
+            zb = gs->ReadVram(zpsm, zbp, fbw, x, y);
+        zpass = (ztest_method == 2) ? ((uint32_t)z + zeps >= zb)
+                                    : ((uint32_t)z + zeps > zb);
         break;
     }
+    }
 
+    {   // PS2X_SWOZSTAT=1: z-test outcome for the draws currently routed to software
+        // (g_swDirtyActive marks the bracket). The character renders but its ground shadow
+        // does not, and the shadow is near-coplanar with the ground, so a slightly wrong Z
+        // in VRAM would reject exactly that.
+        extern bool g_swDirtyActive;
+        static const bool s_zs = [](){ const char *v = std::getenv("PS2X_SWOZSTAT");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (s_zs && g_swDirtyActive)
+        {
+            static unsigned long nPass = 0, nFail = 0; static double sumZ = 0.0, sumB = 0.0;
+            static unsigned long m16 = 0, m256 = 0, m4k = 0, mBig = 0;
+            const uint32_t zb = gs->ReadVram(zpsm, zbp, fbw, x, y);
+            if (zpass) ++nPass; else {
+                ++nFail;
+                const uint32_t margin = zb - (uint32_t)z;   // reject => zb > z
+                if (margin <= 16u) ++m16; else if (margin <= 256u) ++m256;
+                else if (margin <= 4096u) ++m4k; else ++mBig;
+            }
+            sumZ += (double)z; sumB += (double)zb;
+            const unsigned long n = nPass + nFail;
+            if ((n % 40000ul) == 0ul)
+                std::fprintf(stderr, "[swozstat] software cel pixels: pass %lu fail %lu (%.1f%% rejected)"
+                                     "   mean z=%.0f  mean zbuffer=%.0f  zte=%d ztst=%u"
+                                     "  | reject margin: <=16:%lu <=256:%lu <=4096:%lu >4096:%lu\n",
+                             nPass, nFail, 100.0 * (double)nFail / (double)n,
+                             sumZ / n, sumB / n, (int)ztest_enabled, ztest_method,
+                             m16, m256, m4k, mBig);
+            if ((n % 40000ul) == 0ul)
+            {   extern uint32_t g_zwbBp, g_zwbPsm, g_zwbBw; extern double g_zwbZMax;
+                std::fprintf(stderr, "[swozstat]   SW reads zbp=%u zpsm=%02x fbw=%u |"
+                                     " writeback used g_zwbBp=%u g_zwbPsm=%02x g_zwbBw=%u zMax=%.0f\n",
+                             zbp, zpsm, fbw, g_zwbBp, g_zwbPsm, g_zwbBw, g_zwbZMax); }
+        }
+    }
     // PS2X_ZKILL: why doesn't the grass ground show? Tally z-test outcomes for the stage
     // textures (tbp0 13400-14000 = the grass/rock CLUT family) and sample z vs buffer z.
     {
@@ -1808,6 +2423,22 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         }
     }
 
+    {   // PS2X_REBSTAT=1: does the software alpha-rebuild actually cover the full CT16 view?
+        // Its draws span y 0..896 with SCISSOR [0..511]x[0..895], so if anything clamps to the
+        // 448-row framebuffer we lose half of every strip -- which would explain the field
+        // ending 97.4% zero despite the CT16 mapping covering every pixel's alpha byte.
+        static const bool s_rs = [](){ const char *v = std::getenv("PS2X_REBSTAT");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (s_rs && ctx.frame.psm == 0x02u && ctx.frame.fbmsk == 0x00003fffu)
+        {
+            static long n = 0; static int ymin = 1 << 30, ymax = -1, xmin = 1 << 30, xmax = -1;
+            ++n; if (y < ymin) ymin = y; if (y > ymax) ymax = y;
+            if (x < xmin) xmin = x; if (x > xmax) xmax = x;
+            if ((n % 5000L) == 1L)
+                std::fprintf(stderr, "[rebstat] rebuild wrote %ld px  x %d..%d  y %d..%d\n",
+                             n, xmin, xmax, ymin, ymax);
+        }
+    }
     u32 fbmask = ctx.frame.fbmsk;
     bool zmask = ctx.zbuf.zmask;
 
@@ -1820,7 +2451,45 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
 
     u32 pixel = pack32(r, g, b, a);
 
-    if (fbmask != 0)
+    // FBMSK is applied in the DESTINATION's own pixel format. For PSMCT16/CT16S that is the
+    // 16-bit pixel, not the expanded 32-bit RGBA form. BT3's outline edge-detect writes fbp336
+    // with fbmsk=0xffff00ff, whose low half leaves bits 8-15 writable -- and bit 15 IS the CT16
+    // alpha. Masking in 32-bit space instead sourced alpha from bits 24-31, which that mask
+    // protects, so the alpha bit was never set: fbp336 read back 99.1% alpha-zero and the
+    // outline readback (96 draws/frame) wrote zeros into the scene instead of ink.
+    // PS2X_FBMSK32=1: apply FBMSK in the EXPANDED 32-bit RGBA space even for 16-bit targets.
+    // 0x00003fff then writes G[6:7] + all of B + all of A, which for the high-half CT16 pixel
+    // reaches CT32 alpha bits 2-7 -- 6 bits, 64 levels -- instead of the 2 bits (4 levels) the
+    // 16-bit-space reading gives. Console's field has 256 levels, so 4 is far too coarse for
+    // the edge detect to make contours from.
+    static const bool s_fbmsk32 = [](){ const char *v = std::getenv("PS2X_FBMSK32");
+                                        return v && v[0] && v[0] != '0'; }();
+    bool packed16 = false;
+    if (fbmask != 0 && bitsPerPixel(fpsm) == 16 && !s_fbmsk32)
+    {
+        const u16 m16 = static_cast<u16>(fbmask & 0xFFFFu);
+        const u16 s16 = Rgba8888ToRgba5551(pixel);
+        const u16 d16 = Rgba8888ToRgba5551(fbrgba);
+        pixel = static_cast<u32>(static_cast<u16>((s16 & static_cast<u16>(~m16)) | (d16 & m16)));
+        packed16 = true;
+        {   // PS2X_WPROBE=<fbp>: the ACTUAL runtime values of the CT16 masked write. Every
+            // inference about why fbp336's alpha bit never lands has checked out on paper, so
+            // log the numbers instead of reasoning about them.
+            static const int s_wpr = [](){ const char *v = std::getenv("PS2X_WPROBE");
+                                           return v && v[0] ? std::atoi(v) : -1; }();
+            if (s_wpr >= 0 && (int)ctx.frame.fbp == s_wpr)
+            {
+                static int n = 0;
+                if (n++ < 200000 && (n % 5000) == 1)
+                    std::fprintf(stderr, "[wprobe] fbp%u fbmsk=%08x m16=%04x | a=%u (in rgba %08x) "
+                                         "s16=%04x d16=%04x -> out=%04x  bit15 s=%d d=%d out=%d\n",
+                                 ctx.frame.fbp, fbmask, m16, (unsigned)a, pack32(r, g, b, a),
+                                 s16, d16, (unsigned)(pixel & 0xFFFFu),
+                                 (s16 >> 15) & 1, (d16 >> 15) & 1, (int)((pixel >> 15) & 1));
+            }
+        }
+    }
+    else if (fbmask != 0)
     {
         pixel = (pixel & ~fbmask) | (fbrgba & fbmask);
     }
@@ -1925,13 +2594,47 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     else
     {
         // format conversion
-        if (bitsPerPixel(fpsm) == 16)
+        if (bitsPerPixel(fpsm) == 16 && !packed16)
         {
             pixel = Rgba8888ToRgba5551(pixel);
         }
         gs->WriteVram(fpsm, fbp, fbw, x, y, pixel);
+        {   // [wverify] PS2X_WVERIFY=1: read-after-write for the scene-alpha rebuild. The pass
+            // samples 26.6% bit15 texels and writes ~410k px, yet the dest census reads 0%
+            // alpha -- so verify the byte actually written at this (x,y), through the same
+            // ReadVram the census path uses.
+            static const bool s_wv = [](){ const char *v = std::getenv("PS2X_WVERIFY");
+                                           return v && v[0] && v[0] != '0'; }();
+            if (s_wv && ctx.frame.fbmsk == 0x00003fffu && fpsm == 0x02u)
+            {
+                static std::atomic<uint64_t> nW{0}, nA{0}, nMatch{0}, nRbA{0};
+                const uint64_t n = nW.fetch_add(1) + 1;
+                const bool aw = (pixel & 0x8000u) != 0u;
+                if (aw) nA.fetch_add(1);
+                const uint32_t rb = gs->ReadVram(fpsm, fbp, fbw, x, y);
+                if ((rb & 0xFFFFu) == (pixel & 0xFFFFu)) nMatch.fetch_add(1);
+                if (rb & 0x8000u) nRbA.fetch_add(1);
+                if ((n % 100000ull) == 1ull && n > 1)
+                    std::fprintf(stderr, "[wverify] %llu rebuild writes: bit15-written %.2f%%  readback==written %.2f%%"
+                                         "  readback-bit15 %.2f%%  last w=%04x rb=%04x @(%d,%d)\n",
+                                 (unsigned long long)n, 100.0 * (double)nA.load() / (double)n,
+                                 100.0 * (double)nMatch.load() / (double)n,
+                                 100.0 * (double)nRbA.load() / (double)n,
+                                 pixel & 0xFFFFu, rb & 0xFFFFu, x, y);
+            }
+        }
     }
 
+    if (widenedFree || widenedNoZW) zmask = true;   // widened pixels write no z
+    {   // PS2X_SWONOZW=1: NO z-writes for the whole routed bracket -- the cel passes then
+        // z-test against the PRE-BRACKET buffer (GL scene z, which the character beats).
+        // Discriminator: rim ~-17.9 here => our routed base pass's z-writes at silhouette
+        // pixels are what rejects the ink; rim still bad => the scene z itself rejects it.
+        extern bool g_swDirtyActive;
+        static const bool s_nzw = [](){ const char *v = std::getenv("PS2X_SWONOZW");
+                                        return v && v[0] && v[0] != '0'; }();
+        if (s_nzw && g_swDirtyActive) zmask = true;
+    }
     if (!zmask)
     {
         // PS2X_ZKILL: who writes NEAR-MAX z (>16M)? Those walls are what z-kills the stage.
@@ -1964,6 +2667,36 @@ uint32_t GSRasterizer::lookupCLUT(GS *gs,
     const uint32_t clutY = static_cast<uint32_t>(gs->m_texclut.cov) + (clutIndex >> 4);
 
 
+    {   // PS2X_CLUTDUMP=<cbp>: one-shot dump of the palette AS THIS CODE PATH RESOLVES IT, so it
+        // can be diffed against the palette read straight out of the .gs. The fbp336 outline
+        // generator fetched entry rotl5(i,2) instead of entry i for every level measured
+        // (1->4, 3->12, 5->20, 7->28, 11->13, 13->21, 23->30), which collapses the ramp and is
+        // why the edge map came out ~14x too sparse.
+        static const int s_cd = [](){ const char *v = std::getenv("PS2X_CLUTDUMP");
+                                      return (v && v[0]) ? std::atoi(v) : -1; }();
+        static bool s_done = false;
+        if (s_cd >= 0 && !s_done && (uint32_t)s_cd == cbp && cpsm == GS_PSM_CT32)
+        {
+            s_done = true;
+            const char *dr = std::getenv("PS2X_GS_REPLAY_OUT");
+            char q[256]; std::snprintf(q, sizeof(q), "%s/clutdump_%u.raw", dr ? dr : ".", cbp);
+            if (FILE *qf = std::fopen(q, "wb"))
+            {
+                for (uint32_t i = 0; i < 256u; ++i)
+                {
+                    const uint32_t ci = resolveClutIndex((uint8_t)i, csm, csa, sourcePsm);
+                    const uint32_t cx = (uint32_t)gs->m_texclut.cou + (ci & 0x0Fu);
+                    const uint32_t cy = (uint32_t)gs->m_texclut.cov + (ci >> 4);
+                    uint32_t val = GSMem::ReadCT32(gs->m_vram, cbp, clutWidth, cx, cy);
+                    std::fwrite(&val, 4, 1, qf);
+                }
+                std::fclose(qf);
+            }
+            std::fprintf(stderr, "[clutdump] cbp=%u csm=%u csa=%u srcpsm=%u clutWidth=%u cou=%u cov=%u\n",
+                         cbp, (unsigned)csm, (unsigned)csa, (unsigned)sourcePsm, clutWidth,
+                         (unsigned)gs->m_texclut.cou, (unsigned)gs->m_texclut.cov);
+        }
+    }
     switch (cpsm)
     {
     case GS_PSM_CT32:
@@ -2014,6 +2747,108 @@ void GSRasterizer::ensureClutCache(GS *gs)
     for (int i = 0; i < count; ++i)
         gs->m_clutCache[i] = lookupCLUT(gs, static_cast<uint8_t>(i), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
     gs->m_clutCacheKey = key;
+    {   // PS2X_CLUTDUMP=<cbp>: print the whole decoded palette once, to diff against a
+        // console-derived palette (index -> colour read straight off a PCSX2 texture dump).
+        static const int s_cd = [](){ const char *v = std::getenv("PS2X_CLUTDUMP");
+                                      return v && v[0] ? std::atoi(v) : -1; }();
+        if (s_cd >= 0 && (int)tex.cbp == s_cd)
+        {
+            static int done = 0;
+            if (done++ < 1)
+            {
+                std::fprintf(stderr, "[clutdump] cbp=%u cpsm=%u csm=%u csa=%u srcpsm=%u count=%d\n",
+                             tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm, count);
+                for (int i = 0; i < count; ++i)
+                {
+                    const uint32_t v = gs->m_clutCache[i];
+                    std::fprintf(stderr, "%u:%u,%u,%u,%u%s", i, v & 0xFFu, (v >> 8) & 0xFFu,
+                                 (v >> 16) & 0xFFu, (v >> 24) & 0xFFu, ((i & 7) == 7) ? "\n" : "  ");
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
+
+    {   // [vramdump] PS2X_VRAMDUMP="<startBlock>,<bytes>": write a raw VRAM range to
+        // work/vramdump_<block>.bin. Comparing raw bytes against a console .gs rebuilt with
+        // work/gsreplay_vram.py needs NO swizzle knowledge on either side, which is how the
+        // toon-ramp CLUT was cleared: BT3 uploads its indexed textures as PSMCT32 and reads
+        // them back as T8/T4, so the upload replay only ever needs addr32.
+        static const char *s_vd = std::getenv("PS2X_VRAMDUMP");
+        if (s_vd && s_vd[0])
+        {
+            // Optional 3rd field = wait this many calls before dumping. A dump on the FIRST
+            // paletted draw catches whatever was resident before the frame's own uploads land,
+            // which reads as a texture mismatch that is really a timing mismatch.
+            static unsigned long s_wait = [](){ unsigned long b=0,n=0,w=0;
+                const char *v = std::getenv("PS2X_VRAMDUMP");
+                if (v && std::sscanf(v, "%lu,%lu,%lu", &b, &n, &w) == 3) return w;
+                return 0ul; }();
+            static unsigned long s_seen = 0;
+            static bool done = false;
+            if (!done && ++s_seen > s_wait)
+            {
+                done = true;
+                unsigned long blk = 0, nb = 0;
+                if (std::sscanf(s_vd, "%lu,%lu", &blk, &nb) == 2 && nb)
+                {
+                    char pth[192];
+                    std::snprintf(pth, sizeof pth, "/home/z3/Desktop/bt3/work/vramdump_%lu.bin", blk);
+                    const size_t off = (size_t)blk * 256;
+                    if (off + nb <= gs->m_vramSize)
+                        if (FILE *f = std::fopen(pth, "wb"))
+                        {
+                            std::fwrite(gs->m_vram + off, 1, nb, f);
+                            std::fclose(f);
+                            std::fprintf(stderr, "[vramdump] block %lu (+%lu bytes) -> %s\n", blk, nb, pth);
+                        }
+                }
+            }
+        }
+    }
+    {   // [clutdump] PS2X_CLUTDUMP=<cbp>: write this palette AND the raw VRAM bytes it was
+        // built from to work/clutdump_<cbp>.bin. Lets an independent decoder (work/psmt8.py
+        // against the console .gs) diff the palette in isolation from the index map -- the
+        // two error sources otherwise mask each other.
+        static const int s_cd = [](){ const char *v = std::getenv("PS2X_CLUTDUMP");
+                                      return v && v[0] ? std::atoi(v) : -1; }();
+        if (s_cd >= 0 && (int)tex.cbp == s_cd)
+        {
+            {   // Track how many DISTINCT palettes we actually build for this cbp. BT3 reuses
+                // one CBP for several materials inside a single frame, so a cache that misses a
+                // re-upload silently serves the previous character's colours.
+                uint32_t ph = 2166136261u;
+                for (int i = 0; i < count; ++i) ph = (ph ^ gs->m_clutCache[i]) * 16777619u;
+                static std::set<uint32_t> seen; static unsigned long calls = 0, rebuilds = 0;
+                ++rebuilds;
+                const bool isNew = seen.insert(ph).second;
+                if (isNew || (rebuilds % 200) == 0)
+                    std::fprintf(stderr, "[clutdump] cbp=%u rebuild #%lu distinct-palettes=%zu%s\n",
+                                 tex.cbp, rebuilds, seen.size(), isNew ? "  (NEW)" : "");
+                (void)calls;
+            }
+            static bool done = false;
+            if (!done)
+            {
+                done = true;
+                char pth[192];
+                std::snprintf(pth, sizeof pth,
+                              "/home/z3/Desktop/bt3/work/clutdump_%u.bin", tex.cbp);
+                if (FILE *f = std::fopen(pth, "wb"))
+                {
+                    uint32_t hdr[4] = {tex.cbp, tex.cpsm, tex.csm, tex.csa};
+                    std::fwrite(hdr, 4, 4, f);
+                    std::fwrite(gs->m_clutCache, 4, 256, f);          // our decoded palette
+                    const size_t off = (size_t)tex.cbp * 256;         // raw VRAM behind it
+                    if (off + 1024 <= gs->m_vramSize)
+                        std::fwrite(gs->m_vram + off, 1, 1024, f);
+                    std::fclose(f);
+                    std::fprintf(stderr, "[clutdump] cbp=%u cpsm=%u csm=%u csa=%u -> %s\n",
+                                 tex.cbp, tex.cpsm, tex.csm, tex.csa, pth);
+                }
+            }
+        }
+    }
 }
 
 // Records a SPRITE (as 2 triangles) or a TRIANGLE (1 triangle) to the GPU renderer.
@@ -2026,6 +2861,13 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
 
     const int ofx = ctx.xyoffset.ofx >> 4;
     const int ofy = ctx.xyoffset.ofy >> 4;
+    // XYOFFSET is 12.4 FIXED POINT and `>> 4` throws the fraction away. BT3's outline edge
+    // detect is built out of exactly that fraction: the three fbp224 -> fbp336 passes are the
+    // same image at XYOFFSET (1792.000, 1824.000), then subtracted at (1793.000, 1824.000)
+    // -- a whole pixel in x, which survives -- and at (1792.000, **1824.500**), half a pixel
+    // in y, which did not. The vertices are integral; the SHIFT LIVES IN THE OFFSET.
+    const float ofxF = static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
+    const float ofyF = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
 
     // EARLY ZERO-AREA CULL (default ON, PS2X_KEEPDOTS=1 keeps them): ~90% of fight
     // triangles are collapsed micro-tris whose integer coords are identical after 12.4
@@ -2079,7 +2921,15 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 static const long long s_slivMax = [](){ const char *v = std::getenv("PS2X_SLIVERPX");
                                                          return v && v[0] ? (long long)std::atoll(v) * 16 : 64LL; }();
                 const bool compact = (bw <= s_slivMax && bh <= s_slivMax);   // 12.4 units: 64 = 4 px
-                if (!compact)
+                // The sliver guard exists to suppress the full-power-explosion slashes, but the
+                // routed cel/outline pass IS the long-thin-sliver class by construction -- 40%
+                // of its triangles are non-compact -- and truncating their coordinates to whole
+                // pixels declares them degenerate when they have real sub-pixel area. Trust the
+                // exact 12.4 area for them; the conservative edge test below then covers them.
+                extern bool g_swDirtyActive;
+                static const bool s_keepSliv = [](){ const char *v = std::getenv("PS2X_SWOSLIVER");
+                                                     return !(v && v[0] == '0'); }();
+                if (!compact && !(s_keepSliv && g_swDirtyActive))
                 {
                     const int ix0 = static_cast<int>(gs->m_vtxQueue[0].x), iy0 = static_cast<int>(gs->m_vtxQueue[0].y);
                     const int ix1 = static_cast<int>(gs->m_vtxQueue[1].x), iy1 = static_cast<int>(gs->m_vtxQueue[1].y);
@@ -2109,6 +2959,25 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                      s_new.load(), 100.0 * s_new.load() / n,
                                      s_saved.load(), 100.0 * s_saved.load() / n);
                 }
+                {   // PS2X_CULLRAMP=1: cull rate for BT3's cel/outline pass specifically.
+                    // Console's own stream has 1936 exactly-degenerate triangles out of 8067
+                    // for this pass (24.0%), so a faithful renderer should cull about that many
+                    // and no more. Anything above that is outline geometry we are throwing away.
+                    static const bool s_cr = [](){ const char *v = std::getenv("PS2X_CULLRAMP");
+                                                   return v && v[0] && v[0] != '0'; }();
+                    if (s_cr && ctx.tex0.tbp0 == 15680u)
+                    {
+                        static unsigned long nSeen = 0, nCull = 0, nSliv = 0;
+                        ++nSeen; if (area == 0) ++nCull;
+                        if (!compact) ++nSliv;
+                        if ((nSeen % 8000ul) == 0ul)
+                            std::fprintf(stderr, "[cullramp] tbp15680 tris=%lu  zero-area culled=%lu "
+                                                 "(%.1f%%)  non-compact=%lu (%.1f%%)   "
+                                                 "(console: 24.0%% degenerate)\n",
+                                         nSeen, nCull, 100.0 * nCull / nSeen,
+                                         nSliv, 100.0 * nSliv / nSeen);
+                    }
+                }
                 if (area == 0)
                     return true; // genuinely degenerate: a line or a point
             }
@@ -2120,8 +2989,6 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             if ((x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0) == 0)
                 return true; // degenerate: draws no pixels
             }
-        }
-    }
         }
     }
 
@@ -2163,8 +3030,18 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     }
     // GS Z is an integer where LARGER = NEARER. Normalize to [0,1]; the replay clears depth
     // to 0.0 (far) and uses GL_GREATER/GEQUAL so the larger value wins (stored directly).
+    // PS2X_ZSCALE=<f> (default 1): spread the normalized depth over more of the buffer.
+    // BT3's raw Z here is ~112,000 out of 2^32, so the whole scene lands in the bottom
+    // 0.0026% of [0,1] and adjacent draws differ by ~1e-8 -- a fraction of ONE bucket in a
+    // 24-bit depth buffer. They quantize together, and wherever the cel/outline pass rounds
+    // one bucket below the body it fails GEQUAL and the line is dropped (measured: 25% of
+    // outline runs missing; disabling depth entirely recovers them). The GS compares RAW
+    // integers, so any monotonic rescale preserves ordering.
+    static const double s_zScale = [](){ const char *v = std::getenv("PS2X_ZSCALE");
+                                         const double f = v ? std::atof(v) : 0.0;
+                                         return (f > 0.0) ? f : 1.0; }();
     auto zNorm = [&](const GSVertex &v) -> float {
-        double d = v.z / zMax;
+        double d = (v.z / zMax) * s_zScale;
         if (d < 0.0) d = 0.0; else if (d > 1.0) d = 1.0;
         return static_cast<float>(d);
     };
@@ -2175,6 +3052,61 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     if (tme)
     {
         const auto &tex = ctx.tex0;
+        // Read-after-write barrier (PS2X_BARRIER, GPU path): if an earlier draw of this frame
+        // wrote the page we are about to sample, its pixels are still sitting in an FBO and
+        // VRAM holds stale bytes. Render what is built so far and push that page back to VRAM
+        // first, so the decode below sees what the GS would have seen. Must happen BEFORE the
+        // key/decode -- afterwards is too late for the very draw that needed it.
+        if (GsGpuRenderer::enabled())
+        {
+            {   static const bool s_gi = [](){ const char *v = std::getenv("PS2X_GSID");
+                                               return v && v[0] && v[0] != '0'; }();
+                if (s_gi && tex.psm == GS_PSM_T8H) { static int n = 0; if (n++ < 3)
+                    std::fprintf(stderr, "[gsid] PSMT8H decode gs=%p tbp0=%u tbw=%u tw=%d th=%d\n",
+                                 (void*)gs, tex.tbp0, tex.tbw, 1<<tex.tw, 1<<tex.th); } }
+            // "Wants this page's ALPHA as data" is not a PSMT8H-only property. BT3 builds its
+            // mask TWICE per frame from the same scene page: cycle 1 reads it as PSMT8H (kicks
+            // 15051..15082, before any character is drawn) and cycle 2 as PSMCT32 (kicks
+            // 35501..35532, after all 10055 character kicks). Only the first was flagged, so
+            // PS2X_BARKEEPA protected the alpha on the cycle-2 flush and the character
+            // silhouette -- which by then sits in the scene FBO's alpha -- never reached VRAM.
+            // The mask, and the outline built from it, therefore held terrain depth only.
+            // A PSMCT32 sample reads all four channels by definition, so withholding alpha
+            // hands it data that is wrong by construction.
+            static const bool s_ct32a = [](){ const char *v = std::getenv("PS2X_CT32ALPHA");
+                                              return v && v[0] && v[0] != '0'; }();
+            const bool wantsAlpha = (tex.psm == GS_PSM_T8H) ||
+                                    (s_ct32a && tex.psm == GS_PSM_CT32);
+            ps2GpuRenderer().barrierBeforeRead(tex.tbp0, true, wantsAlpha);
+            // The PALETTE too. BT3's outline/shadow CLUTs live in pages 499-500, which the game
+            // RENDERS into -- so their VRAM copy is stale and every composite decoded a dead
+            // palette (129 distinct indices collapsing to 1 alpha). The CLUT base is not
+            // page-aligned, so flush the page that contains it.
+            const uint32_t p2 = tex.psm;
+            if (p2 == GS_PSM_T8 || p2 == GS_PSM_T8H || p2 == GS_PSM_T4 ||
+                p2 == GS_PSM_T4HL || p2 == GS_PSM_T4HH)
+                ps2GpuRenderer().barrierBeforeRead(tex.cbp, false);
+        }
+        {   // PS2X_RAMPCLUT=1: which CLUT do we select for BT3's cel/outline ramp? Console
+            // drives tbp 15680 with SIX different palettes -- 15620/15628/15632/15640/15616/
+            // 15624 -- of very different amplitude (max luminance 61/28/71/49/36/24), one per
+            // material. Collapsing them onto one palette would shade every material with the
+            // same ramp. Census what we actually pick, to compare against the stream.
+            static const bool s_rc = [](){ const char *v = std::getenv("PS2X_RAMPCLUT");
+                                           return v && v[0] && v[0] != '0'; }();
+            if (s_rc && tex.tbp0 == 15680u)
+            {
+                static std::map<uint32_t, unsigned long> seen;
+                static unsigned long n = 0;
+                ++seen[tex.cbp];
+                if ((++n % 4000ul) == 1ul)
+                {
+                    std::fprintf(stderr, "[rampclut] n=%lu  cbp:", n);
+                    for (auto &kv : seen) std::fprintf(stderr, " %u=%lu", kv.first, kv.second);
+                    std::fprintf(stderr, "\n");
+                }
+            }
+        }
         texW = 1 << tex.tw; texH = 1 << tex.th;
         if (texW <= 0) texW = 1;
         if (texH <= 0) texH = 1;
@@ -2378,6 +3310,12 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 const uint32_t bw = ctx.tex0.tbw;
                 const int W = texW;
                 uint8_t *dst = rgba.data();
+                // The fastT4 / fastT8 decoders expanded alpha (At * 255/128) UNCONDITIONALLY
+                // while the generic path honours PS2X_RAWTEXA. That inconsistency is why
+                // RAWTEXA appeared to have no effect on BT3's character textures -- they take
+                // the fast path. Same flag here so all three decode paths agree.
+                static const bool s_rawA4 = [](){ const char *v = std::getenv("PS2X_RAWTEXA");
+                                                  return v && v[0] && v[0] != '0'; }();
                 parallelRows(0, texH - 1, [&](int ty)
                 {
                     for (int tx = 0; tx < W; ++tx)
@@ -2389,6 +3327,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                         size_t o = (static_cast<size_t>(ty) * W + tx) * 4u;
                         dst[o + 0] = texel & 0xFF; dst[o + 1] = (texel >> 8) & 0xFF;
                         dst[o + 2] = (texel >> 16) & 0xFF;
+                        // NOTE: expansion is UNCONDITIONAL here on purpose. Alpha feeds
+                        // BLENDING, where a GS 128 must map to 255; honouring PS2X_RAWTEXA on
+                        // this path wrecks the frame (measured MAE 11.96 -> 55.3).
                         dst[o + 3] = static_cast<uint8_t>(std::min(255u, ((texel >> 24) & 0xFFu) * 255u / 128u));
                     }
                 });
@@ -2430,7 +3371,34 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     rgba[o + 2] = (texel >> 16) & 0xFF;
                     // PS2 texture/CLUT alpha is 0..128 (0x80 = fully opaque). Scale to
                     // 0..255 for the GL texture so blending isn't ~2x too transparent.
-                    rgba[o + 3] = static_cast<uint8_t>(std::min(255u, ((texel >> 24) & 0xFFu) * 255u / 128u));
+                    //
+                    // PS2X_RAWTEXA=1: keep the RAW byte instead. That expansion CLAMPS, and a
+                    // CLUT used as DATA spans the full 0..255 -- BT3's mask palette is exactly
+                    // `255 - i`, so every index <= 127 saturated to 255 and the mask collapsed
+                    // to 2 distinct values (measured: mean 127.5, uniq 2, vs console's 189).
+                    // With this on, blending must take its factor from aBlend (PS2X_DUALSRC).
+                    static const bool s_rawA = [](){ const char *v = std::getenv("PS2X_RAWTEXA");
+                                                     return v && v[0] && v[0] != '0'; }();
+                    // PS2X_RAWTEXA exists for CLUT-AS-DATA reads: BT3's mask palette is literally
+                    // `255 - i`, so expanding it would clamp every index <= 127 to 255. That only
+                    // applies to INDEXED sources. For a DIRECT-COLOUR source the alpha is a blend
+                    // COEFFICIENT -- the GS divides Ad by 128, GL by 255 -- so keeping the raw byte
+                    // makes every such blend run at half strength. That is exactly what hid BT3's
+                    // outline: the CT16 edge pass stores TEXA's TA0=48 raw, so the untextured
+                    // bm0x52 darkener (Cd - Cs*Ad) subtracted 100*48/255 = 19 instead of
+                    // 100*48/128 = 37. PS2X_TEXAEXP=0 restores the old behaviour.
+                    static const bool s_texaExp = [](){ const char *v = std::getenv("PS2X_TEXAEXP");
+                                                        return v && v[0] && v[0] != '0'; }();
+                    const uint32_t dpsm2 = ctx.tex0.psm;
+                    // Scoped to PSMCT16 only. Expanding every non-indexed source also hits the
+                    // CT32 alpha writers feeding the mask chain, and measured alpha at the
+                    // darkener then fell 0.550% -> 0.000%. CT16 is the one format whose alpha is
+                    // purely TEXA-derived and purely a blend coefficient.
+                    const bool ct16Src = (dpsm2 == GS_PSM_CT16 || dpsm2 == GS_PSM_CT16S);
+                    const bool keepRaw = s_rawA && !(s_texaExp && ct16Src);
+                    rgba[o + 3] = keepRaw
+                        ? static_cast<uint8_t>((texel >> 24) & 0xFFu)
+                        : static_cast<uint8_t>(std::min(255u, ((texel >> 24) & 0xFFu) * 255u / 128u));
                 }
             // Self-check (PS2X_GPU_DIAG): the fast T4/T8 paths bypass sampleTexture, so
             // verify a subsample matches the authoritative per-texel path. Catches a
@@ -2542,6 +3510,81 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     }
                 }
             }
+            {   // PS2X_TEXCENSUS=<psm>: what did this decode actually produce? For the mask
+                // chain the answer that matters is how many DISTINCT values came back -- an
+                // indexed read of a live buffer that returns one value is a flat wash, and
+                // looks identical to "the pass never ran".
+                static const int s_tc = [](){ const char *v = std::getenv("PS2X_TEXCENSUS");
+                                              return v && v[0] ? (int)std::strtol(v, nullptr, 16) : -1; }();
+                if (s_tc >= 0 && (int)ctx.tex0.psm == s_tc)
+                {
+                    static int n = 0;
+                    if (n++ < 400)
+                    {
+                        unsigned uniqA = 0, uniqRGB = 0;
+                        bool seenA[256] = {false};
+                        std::set<uint32_t> rgbSet;
+                        for (size_t i = 0; i + 3 < rgba.size(); i += 4)
+                        {
+                            if (!seenA[rgba[i + 3]]) { seenA[rgba[i + 3]] = true; ++uniqA; }
+                            if (rgbSet.size() < 64)
+                                rgbSet.insert((uint32_t)rgba[i] | ((uint32_t)rgba[i+1] << 8) | ((uint32_t)rgba[i+2] << 16));
+                        }
+                        uniqRGB = (unsigned)rgbSet.size();
+                        // For an ADDITIVE composite (blend 0x48) the number that decides
+                        // "outline strokes" vs "wash over the whole frame" is how much of the
+                        // decoded texture is BLACK: adding 0 is a no-op, adding anything else
+                        // brightens. Same for alpha-blended passes with alpha 0.
+                        size_t nBlack = 0, nZeroA = 0, npx = 0;
+                        unsigned long sr = 0, sg = 0, sb = 0, sa2 = 0;
+                        for (size_t i = 0; i + 3 < rgba.size(); i += 4)
+                        {
+                            ++npx;
+                            if (!rgba[i] && !rgba[i+1] && !rgba[i+2]) ++nBlack;
+                            if (!rgba[i+3]) ++nZeroA;
+                            sr += rgba[i]; sg += rgba[i+1]; sb += rgba[i+2];
+                            sa2 += rgba[i+3];
+                        }
+                        std::fprintf(stderr, "[texcensus] psm=%02x tbp=%u cbp=%u %dx%d -> distinct alpha=%u rgb=%u%s"
+                                             " | black %.1f%%  a==0 %.1f%%  mean rgb=(%.0f,%.0f,%.0f) meanA=%.1f\n",
+                                     ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.cbp, texW, texH,
+                                     uniqA, uniqRGB, uniqRGB >= 64 ? "+" : "",
+                                     100.0 * (double)nBlack / (double)npx,
+                                     100.0 * (double)nZeroA / (double)npx,
+                                     (double)sr / npx, (double)sg / npx, (double)sb / npx,
+                                     (double)sa2 / npx);
+                    }
+                }
+            }
+            {   // PS2X_TEXDUMP=<psm>: write each decode of that PSM as raw RGBA (w,h header).
+                // For a PSMT8H read through CLUT 16000 (which is exactly 255-i) the decoded
+                // ALPHA is 255 minus the source index, so this shows precisely what the mask
+                // composites see when they sample the scene.
+                static const int s_td = [](){ const char *v = std::getenv("PS2X_TEXDUMP");
+                                              return v && v[0] ? (int)std::strtol(v, nullptr, 16) : -1; }();
+                if (s_td >= 0 && (int)ctx.tex0.psm == s_td)
+                {
+                    // Keep the LAST decodes, not the first: the first are frame-1 warm-up,
+                    // before the alpha rebuild has run, and reading them as representative sent
+                    // this investigation off twice.
+                    static int s_i = 0;
+                    if (s_i < 400)
+                    {
+                        char path[256];
+                        const char *dir = std::getenv("PS2X_GS_REPLAY_OUT");
+                        std::snprintf(path, sizeof(path), "%s/texlast_tbp%u_cbp%u.raw",
+                                      dir ? dir : ".", ctx.tex0.tbp0, ctx.tex0.cbp);
+                        ++s_i;
+                        if (FILE *f = std::fopen(path, "wb"))
+                        {
+                            int hdr[2] = { texW, texH };
+                            std::fwrite(hdr, sizeof(hdr), 1, f);
+                            std::fwrite(rgba.data(), 1, rgba.size(), f);
+                            std::fclose(f);
+                        }
+                    }
+                }
+            }
             r.putTexture(texKey, std::move(rgba), texW, texH, texPageLo, texPageHi);
         }
     }
@@ -2590,12 +3633,27 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         else { float q = (v.q != 0.0f) ? v.q : 1.0f; u = (v.s / q) * texW; tv = (v.t / q) * texH; }
     };
 
+    {   // PS2X_ZWB: publish the frame's ZBUF so the renderer can write our depth buffer back
+        // into VRAM at the right address/format. BT3 READS that address as a texture (fbp224 IS
+        // the Z buffer), and once the bytes are in VRAM every aliased view of them decodes
+        // correctly for free -- which is the only way to express the CT16/CT32 dual view.
+        extern uint32_t g_zwbBp, g_zwbPsm, g_zwbBw;
+        g_zwbBp  = ctx.zbuf.zbp;
+        g_zwbPsm = (uint32_t)(((ctx.zbuf.psm) & 0xFu) | 0x30u);
+        g_zwbBw  = ctx.frame.fbw ? ctx.frame.fbw : 1u;
+        // Publish the zMax actually used by zNorm, so the renderer derives the GS Z byte scale
+        // from it instead of a fitted constant. It depends on PS2X_ZPSMNORM: with it off every
+        // ZBUF normalises by 2^32, with it on a PSMZ24 buffer normalises by 2^24-1.
+        extern double g_zwbZMax;
+        g_zwbZMax = zMax;
+    }
     GsGpuRenderer &r = ps2GpuRenderer();
     GsGpuRenderer::DrawCmd cmd{};
     cmd.texKey = texKey;
     // Destination framebuffer + source texture base: route to per-fbp FBOs and enable
     // render-to-texture (sampling a framebuffer that was rendered to).
     cmd.destFbp = ctx.frame.fbp;
+    cmd.fba = ((ctx.fba & 1ull) != 0ull) && ctx.frame.psm != GS_PSM_CT24;
     cmd.destFbw = ctx.frame.fbw;
     cmd.destPsm = static_cast<uint8_t>(ctx.frame.psm);
     cmd.bilinear = ((ctx.tex1 >> 5) & 1u) != 0u;   // GS TEX1.MMAG
@@ -2689,6 +3747,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         cmd.depthFunc = zTestFunc;
         cmd.depthWrite = zWrite;
     }
+    { extern bool g_recordDepthOnly; cmd.depthOnly = g_recordDepthOnly; }
 
     // GS TEST alpha-test state: ATE bit0, ATST bits 1-3, AREF bits 4-11, AFAIL bits 12-13.
     // The GPU replay discards failing fragments in its shader (AFAIL=0 KEEP case).
@@ -2719,6 +3778,11 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         const uint32_t wmt = static_cast<uint32_t>((ctx.clamp >> 2) & 3u);
         cmd.wrapU = (wms == 1u || wms == 2u) ? 1u : 0u;
         cmd.wrapV = (wmt == 1u || wmt == 2u) ? 1u : 0u;
+        cmd.wms = static_cast<uint8_t>(wms); cmd.wmt = static_cast<uint8_t>(wmt);
+        cmd.minu = static_cast<uint16_t>((ctx.clamp >> 4) & 0x3FFu);
+        cmd.maxu = static_cast<uint16_t>((ctx.clamp >> 14) & 0x3FFu);
+        cmd.minv = static_cast<uint16_t>((ctx.clamp >> 24) & 0x3FFu);
+        cmd.maxv = static_cast<uint16_t>((ctx.clamp >> 34) & 0x3FFu);
         cmd.tcc = tme ? static_cast<uint8_t>(ctx.tex0.tcc & 1u) : 1u;
         // [regionrec] PS2X_REGIONREC=1: does the stage/backdrop class (tbp0=10752) use
         // REGION_* wrap modes whose window params (MINU/MAXU/MINV/MAXV) we currently drop?
@@ -2772,6 +3836,27 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     if (tme) {
         const uint32_t p = ctx.tex0.psm;
         cmd.srcIndexed = (p == 19u || p == 20u || p == 27u || p == 36u || p == 44u);
+        // Carry the palette base for indexed sources: the renderer needs it to tell whether the
+        // CLUT was RENDERED (unrecoverable) rather than uploaded.
+        if (cmd.srcIndexed) cmd.srcClutTbp = ctx.tex0.cbp;
+        // Publish the decoded palette for PSMT8H sources so the renderer can look it up.
+        // Only T8H: that is the alpha-as-index read BT3 uses to filter the scene buffer, and it
+        // is the only class allowed to sample a live FBO (see PS2X_IDXRT in the renderer).
+        if (cmd.srcIndexed && p == 27u)
+        {
+            ensureClutCache(gs);
+            uint64_t h2 = 1469598103934665603ull;
+            for (int i = 0; i < 256; ++i) h2 = (h2 ^ gs->m_clutCache[i]) * 1099511628211ull;
+            cmd.srcClutKey = h2 ? h2 : 1ull;
+            extern void ps2xPublishClut(uint64_t key, const uint32_t *pal);
+            ps2xPublishClut(cmd.srcClutKey, gs->m_clutCache);
+        }
+        cmd.srcPsm = static_cast<uint8_t>(ctx.tex0.psm);
+        cmd.tfx = static_cast<uint8_t>(ctx.tex0.tfx);
+        // GS TEXA -> GPU path (the SW/decode path applies it in applyTexa()).
+        cmd.texaTa0 = static_cast<uint8_t>(gs->m_texa.ta0);
+        cmd.texaTa1 = static_cast<uint8_t>(gs->m_texa.ta1);
+        cmd.texaAem = gs->m_texa.aem;
     }
 
     {
@@ -2807,12 +3892,57 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         cmd.isTriangle = false;
         const GSVertex &v0 = gs->m_vtxQueue[0];
         const GSVertex &v1 = gs->m_vtxQueue[1];
-        float x0 = static_cast<float>(static_cast<int>(v0.x) - ofx);
-        float y0 = static_cast<float>(static_cast<int>(v0.y) - ofy);
-        float x1 = static_cast<float>(static_cast<int>(v1.x) - ofx);
-        float y1 = static_cast<float>(static_cast<int>(v1.y) - ofy);
+        // GSVertex x/y are PIXELS WITH A FRACTION. Truncating to int here throws the fraction
+        // away, and BT3's outline composite is built out of exactly such offsets: its three
+        // fbp224 -> fbp336 passes are the same image written at y=0.000, then SUBTRACTED at
+        // y=-0.500 (R channel) and x=-1.000 (G channel). The -1.0 survives truncation, the
+        // -0.5 does not -- so the R subtraction lands exactly on top of the base write and
+        // cancels it, which is why our composite came out at 0.2% coverage against console's
+        // ~2.6% and produced no edge. PS2X_SUBPIXSPR=1 keeps the fraction.
+        static const bool s_subSpr = [](){ const char *v = std::getenv("PS2X_SUBPIXSPR");
+                                           return v && v[0] && v[0] != '0'; }();
+        float x0, y0, x1, y1;
+        if (s_subSpr)
+        {
+            x0 = v0.x - ofxF; y0 = v0.y - ofyF;
+            x1 = v1.x - ofxF; y1 = v1.y - ofyF;
+        }
+        else
+        {
+            x0 = static_cast<float>(static_cast<int>(v0.x) - ofx);
+            y0 = static_cast<float>(static_cast<int>(v0.y) - ofy);
+            x1 = static_cast<float>(static_cast<int>(v1.x) - ofx);
+            y1 = static_cast<float>(static_cast<int>(v1.y) - ofy);
+        }
         float u0, tv0, u1, tv1;
         texelUV(v0, u0, tv0); texelUV(v1, u1, tv1);
+        {   // [subspr] is the sub-pixel offset actually arriving here?
+            static const bool s_sd = [](){ const char *v = std::getenv("PS2X_SUBPIXDBG");
+                                           return v && v[0] && v[0] != '0'; }();
+            if (s_sd)
+            {
+                static std::atomic<uint32_t> nFrac{0}, nAll{0};
+                const bool frac = (v0.y != std::floor(v0.y)) || (v0.x != std::floor(v0.x));
+                uint32_t a = nAll.fetch_add(1) + 1u;
+                if (frac)
+                {
+                    uint32_t f = nFrac.fetch_add(1) + 1u;
+                    if (f <= 6)
+                        std::fprintf(stderr, "[subspr] FRACTIONAL vtx: v0=(%.3f,%.3f) v1=(%.3f,%.3f) ofx=%d ofy=%d -> y0=%.3f  fbp=%u tbp=%u\n",
+                                     v0.x, v0.y, v1.x, v1.y, ofx, ofy, y0, ctx.frame.fbp, ctx.tex0.tbp0);
+                }
+                if (ctx.frame.fbp == 336u && ctx.tex0.tbp0 == 7168u)
+                {
+                    static std::atomic<uint32_t> nOut{0};
+                    uint32_t o2 = nOut.fetch_add(1) + 1u;
+                    if (o2 <= 6)
+                        std::fprintf(stderr, "[subspr] OUTLINE #%u v0=(%.4f,%.4f) v1=(%.4f,%.4f) ofx=%d ofy=%d fbmsk=%08x -> y0=%.4f\n",
+                                     o2, v0.x, v0.y, v1.x, v1.y, ofx, ofy, ctx.frame.fbmsk, y0);
+                }
+                if ((a % 5000u) == 0u)
+                    std::fprintf(stderr, "[subspr] sprites with a fractional vertex: %u / %u\n", nFrac.load(), a);
+            }
+        }
         if (x0 > x1) { std::swap(x0, x1); std::swap(u0, u1); }
         if (y0 > y1) { std::swap(y0, y1); std::swap(tv0, tv1); }
         cmd.dx0 = x0; cmd.dy0 = y0; cmd.dx1 = x1; cmd.dy1 = y1;
@@ -2840,6 +3970,17 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         // garbage wedges over the whole scene in draw order.
         {
             static const bool s_zsat = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_ZSAT"); return s_env; }(); return !(v && v[0] == '0'); }();
+            {   // [zsatcount] how often does this cull actually fire? The .gs has ~2960 far
+                // terrain verts/frame and our DrawCmd census sees ZERO far triangles, so either
+                // this drops them or something upstream does.
+                static const bool s_zsc = [](){ const char *v = std::getenv("PS2X_ZSATCOUNT"); return v && v[0] && v[0] != '0'; }();
+                if (s_zsc) { static unsigned long nn=0, dd=0;
+                    const bool farTri = (gs->m_vtxQueue[0].z > 12000000.0 || gs->m_vtxQueue[1].z > 12000000.0 || gs->m_vtxQueue[2].z > 12000000.0);
+                    ++nn; if (farTri) ++dd;
+                    if ((nn % 20000ul) == 0ul)
+                        std::fprintf(stderr, "[zsatcount] tris reaching ZSAT=%lu  with a far vertex=%lu (%.2f%%)  zsat_on=%d\n",
+                                     nn, dd, 100.0*dd/nn, s_zsat ? 1 : 0); }
+            }
             if (s_zsat &&
                 (gs->m_vtxQueue[0].z > 12000000.0 || gs->m_vtxQueue[1].z > 12000000.0 || gs->m_vtxQueue[2].z > 12000000.0))
                 return true; // drop this triangle
@@ -2856,27 +3997,80 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         }
         // Triangle -> rlgl (normalized UV, per-vertex color).
         cmd.isTriangle = true;
+        // Per-pixel S/Q is only valid when q is well behaved across the whole triangle. Console
+        // q for tbp10752 runs -4.06 .. +2.30 -- it CROSSES ZERO -- so a per-pixel divide there
+        // explodes (that is what flattened the sky and ground at PS2X_PERSPQ=2). The GS clips
+        // such triangles before rasterising; we do not, so guard instead: all three q the same
+        // sign and comfortably away from zero, otherwise fall back to the per-vertex quotient.
+        bool perspSafe = false;
+        if (tme && !fst)
+        {
+            {   // [qcensus] PS2X_QCENSUS=1: OUR per-source q range, to compare against the same
+                // census taken from the .gs stream.
+                static const bool s_qc = [](){ const char *e = std::getenv("PS2X_QCENSUS");
+                                               return e && e[0] && e[0] != '0'; }();
+                if (s_qc)
+                {
+                    static std::map<uint32_t, std::array<double,4>> st;  // min,max,sum,count
+                    static unsigned long n = 0;
+                    for (int k2 = 0; k2 < 3; ++k2)
+                    {
+                        const float q2 = gs->m_vtxQueue[k2].q;
+                        if (!(q2 == q2)) continue;
+                        auto &e2 = st[ctx.tex0.tbp0];
+                        if (e2[3] == 0) { e2[0] = e2[1] = q2; }
+                        e2[0] = std::min(e2[0], (double)q2); e2[1] = std::max(e2[1], (double)q2);
+                        e2[2] += q2; e2[3] += 1;
+                    }
+                    if ((++n % 40000ul) == 0ul)
+                    {
+                        std::fprintf(stderr, "[qcensus] OUR q per source:\n");
+                        std::vector<std::pair<double,uint32_t>> ord;
+                        for (auto &kv : st) ord.push_back({-kv.second[3], kv.first});
+                        std::sort(ord.begin(), ord.end());
+                        for (size_t i2 = 0; i2 < ord.size() && i2 < 8; ++i2)
+                        {
+                            auto &e2 = st[ord[i2].second];
+                            std::fprintf(stderr, "   tbp%-6u n=%-7.0f q min %.4f max %.4f mean %.4f\n",
+                                         ord[i2].second, e2[3], e2[0], e2[1], e2[2]/e2[3]);
+                        }
+                    }
+                }
+            }
+            const float qa = gs->m_vtxQueue[0].q, qb = gs->m_vtxQueue[1].q, qc = gs->m_vtxQueue[2].q;
+            const float amin = std::min(std::min(std::fabs(qa), std::fabs(qb)), std::fabs(qc));
+            perspSafe = (amin > 1e-4f) && ((qa > 0.0f) == (qb > 0.0f)) && ((qb > 0.0f) == (qc > 0.0f));
+        }
         for (int i = 0; i < 3; ++i)
         {
             const GSVertex &v = gs->m_vtxQueue[i];
-            // PS2X_SUBPIXEL (default ON): keep the GS 12.4 sub-pixel fraction instead of
-            // truncating. Console puts 99.5% of BT3's character vertices on a FRACTIONAL
-            // coordinate, so truncating snapped every silhouette edge inward to a pixel boundary.
+            // PS2X_SUBPIXEL (default ON): keep the GS 12.4 sub-pixel fraction instead of truncating.
+            // Console puts 99.5% of BT3's character vertices on a fractional coordinate, so
+            // truncating snaps every silhouette edge inwards to a pixel boundary and eats the
+            // outermost texel row -- which is where the cel texture's dark outline lives.
             //
-            // This was tried once (2026-08-04) and reverted for "massive lag, no visible gain;
-            // the final image is replaced by the RT strip chain anyway". Both halves are now
-            // false: the RT strip chain no longer replaces the image (PS2X_RTNEUTRAL is default
-            // OFF since 2026-08-24), and the lag came from sub-pixel coords defeating the integer
-            // zero-area cull above, so every micro-triangle survived. That cull is left on its
-            // integer test -- only the POSITION handed to GL gains precision, so the surviving
-            // triangle count is bit-identical and a live in-fight A/B measured no cost
+            // This was tried once before (2026-08-04) and reverted for "massive lag, no visible
+            // gain; the final image is replaced by the RT strip chain anyway". Both halves of
+            // that have changed: the RT strip chain no longer replaces the image (PS2X_RTNEUTRAL
+            // is default OFF since 2026-08-24), and the lag came from sub-pixel coords defeating
+            // the integer zero-area cull above, so every micro-triangle survived. The cull is
+            // left on its integer test here -- only the POSITION handed to GL gains precision, so
+            // surviving-triangle count is bit-identical and a live in-fight A/B measured no cost
             // (30.00 -> 29.98 fps, 1,008,500 -> 1,006,787 prims/sec). PS2X_SUBPIXEL=0 disables.
             static const bool s_subpx = [](){ const char *v = std::getenv("PS2X_SUBPIXEL");
                                               return !(v && v[0] == '0'); }();
+            // PS2X_PIXCENTER="dx,dy" (default off): shift triangle positions by a constant.
+            // The GS addresses pixel CORNERS while GL samples at pixel CENTRES, which would be a
+            // uniform half-pixel bias. Cross-correlating our frame against the console screenshot
+            // over the CHARACTER (the only high-frequency region, so the only well-constrained
+            // one) puts the optimum at exactly half a pixel diagonally.
+            static const std::array<float,2> s_pc = [](){ std::array<float,2> r{0.0f,0.0f};
+                if (const char *v = std::getenv("PS2X_PIXCENTER")) std::sscanf(v, "%f,%f", &r[0], &r[1]);
+                return r; }();
             if (s_subpx)
             {
-                cmd.tri[i].x = v.x - static_cast<float>(ofx);
-                cmd.tri[i].y = v.y - static_cast<float>(ofy);
+                cmd.tri[i].x = v.x - static_cast<float>(ofx) + s_pc[0];
+                cmd.tri[i].y = v.y - static_cast<float>(ofy) + s_pc[1];
             }
             else
             {
@@ -2886,6 +4080,54 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             float u, tv; texelUV(v, u, tv);
             cmd.tri[i].u = tme ? (u / static_cast<float>(texW)) : 0.0f;
             cmd.tri[i].v = tme ? (tv / static_cast<float>(texH)) : 0.0f;
+            // PS2X_PERSPQ=1: hand the shader RAW s,t and q instead of the per-vertex quotient,
+            // so the divide happens per pixel the way the GS does it.
+            static const bool s_perspQ = [](){ const char *e = std::getenv("PS2X_PERSPQ");
+                                               return e && e[0] && e[0] != '0'; }();
+            // Scope: PS2X_PERSPQ=1 applies ONLY to the cel/outline ramp (tbp 15680), which is
+            // what needs it. Applied to every FST=0 draw it also re-samples the sky and terrain,
+            // whose large quads visibly lose detail. PS2X_PERSPQ=2 = all FST=0 draws (A/B).
+            static const int s_perspMode = [](){ const char *e = std::getenv("PS2X_PERSPQ");
+                                                 return e && e[0] ? std::atoi(e) : 0; }();
+            // 1 = cel ramp only (tbp 15680); 3 = characters + ramp (tbp 10752 is the character
+            // texture staging base, tbp 13xxx is terrain/sky and is what visibly degrades);
+            // 2 = every FST=0 draw, which is the faithful GS behaviour but exposes bad q on the
+            // background geometry.
+            // Mode 4 = every FST=0 source EXCEPT tbp10752. Our q census matches console exactly
+            // for 15680/13440/13672/13840/16064, but tbp10752 does NOT (ours 0.0000..0.3806 vs
+            // console -4.0635..2.2991) -- console clips those triangles and we keep them, so a
+            // per-pixel divide there uses a q we got wrong and wrecks the sky.
+            const bool perspThis = s_perspQ &&
+                (s_perspMode == 4 ? (ctx.tex0.tbp0 != 10752u)
+                 : s_perspMode == 3 ? (ctx.tex0.tbp0 == 10752u || ctx.tex0.tbp0 == 15680u)
+                 : s_perspMode == 2 ? true
+                 : ctx.tex0.tbp0 == 15680u);
+            if (perspThis && perspSafe)
+            {
+                cmd.tri[i].u = v.s;
+                cmd.tri[i].v = v.t;
+                cmd.tri[i].q = v.q;
+            }
+            else cmd.tri[i].q = 1.0f;
+            // [stq] PS2X_STQ=<tbp>: the RAW per-vertex S/T/Q the runtime holds, next to the u we
+            // derive from them. The .gs stream says this class's u splits ~49/51 either side of
+            // the ramp's step at u=0.5; if our histogram is not that, the ST/Q the runtime
+            // latched differ from the ones the stream actually sent.
+            {
+                static const int s_stq = [](){ const char *e = std::getenv("PS2X_STQ");
+                                               return e && e[0] ? std::atoi(e) : -1; }();
+                if (s_stq >= 0 && tme && (int)ctx.tex0.tbp0 == s_stq)
+                {
+                    static unsigned long n = 0, lo = 0, hi = 0, zero = 0;
+                    const float uu = cmd.tri[i].u;
+                    ++n; if (uu < 0.5f) ++lo; else ++hi;
+                    if (uu < 0.004f) ++zero;
+                    if (n <= 4 || (n % 20000ul) == 0ul)
+                        std::fprintf(stderr, "[stq] #%lu s=%.6f t=%.6f q=%.6f -> u=%.4f v=%.4f | u<0.5: %.1f%%  u>=0.5: %.1f%%  u~0: %.1f%%  (texW=%d fst=%u)\n",
+                                     n, v.s, v.t, v.q, cmd.tri[i].u, cmd.tri[i].v,
+                                     100.0*lo/n, 100.0*hi/n, 100.0*zero/n, texW, (unsigned)fst);
+                }
+            }
             if (s_depthOn) cmd.tri[i].z = zNorm(v);
             colorBytes(v, cmd.tri[i].r, cmd.tri[i].g, cmd.tri[i].b, cmd.tri[i].a);
         }
@@ -3164,6 +4406,20 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
 {
     const auto &ctx = gs->activeContext();
     const auto &tex = ctx.tex0;
+    {   // PS2X_UVLOG=1: the edge detect subtracts a +1-TEXEL-SHIFTED sample from an unshifted
+        // one. If both passes sample the same texel the difference is zero everywhere, which is
+        // exactly the all-black fbp336 we measure. Log (u,v) per pass at a fixed screen column.
+        static const bool s_uv = [](){ const char *e = std::getenv("PS2X_UVLOG");
+                                       return e && e[0] && e[0] != '0'; }();
+        if (s_uv && ctx.frame.fbp == 336u && gs->m_prim.fst)
+        {
+            static std::map<uint32_t, int> s_seen;
+            const uint32_t key = ctx.frame.fbmsk;
+            if (s_seen[key]++ < 3)
+                std::fprintf(stderr, "[uvlog] fbmsk=%08x  u=%.2f v=%.2f  (fst raw u=%u v=%u)\n",
+                             key, u / 16.0f, v / 16.0f, (unsigned)u, (unsigned)v);
+        }
+    }
 
     // PS2X_TEXHL=<tbp0>[,<tw>]: paint every pixel sampled from that texture base (and,
     // if given, that log2-width — e.g. "10752,10" = only the 1024-wide sky panorama)
@@ -3248,7 +4504,29 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
         case GS_PSM_CT16S:
         case GS_PSM_Z16:
         case GS_PSM_Z16S:
-            return applyTexa(gs->m_texa, tex.psm, Rgba5551ToRgba8888(out));
+        {
+            const uint32_t rgba = applyTexa(gs->m_texa, tex.psm, Rgba5551ToRgba8888(out));
+            {   // [z16spy] PS2X_Z16SPY=1: the scene-alpha rebuild samples the Z page as PSMZ16
+                // and its output alpha bit == sampled bit15 (TEXA 0/128). It writes ~410k px
+                // yet the dest census reads 0% alpha -- so census the SAMPLED texels here.
+                static const bool s_zs2 = [](){ const char *v = std::getenv("PS2X_Z16SPY");
+                                                return v && v[0] && v[0] != '0'; }();
+                if (s_zs2 && (tex.psm == GS_PSM_Z16 || tex.psm == GS_PSM_Z16S))
+                {
+                    static std::atomic<uint64_t> nS{0}, nBit{0}, nRaw0{0};
+                    const uint64_t n = nS.fetch_add(1) + 1;
+                    if (out & 0x8000u) nBit.fetch_add(1);
+                    if ((out & 0xFFFFu) == 0u) nRaw0.fetch_add(1);
+                    if ((n % 200000ull) == 1ull && n > 1)
+                        std::fprintf(stderr, "[z16spy] sampled %llu Z16 texels: bit15 set %.2f%%  raw==0 %.2f%%"
+                                             "  last raw=%04x uv=(%d,%d) tbp0=%u tbw=%u\n",
+                                     (unsigned long long)n, 100.0 * (double)nBit.load() / (double)n,
+                                     100.0 * (double)nRaw0.load() / (double)n,
+                                     out & 0xFFFFu, sampleU, sampleV, tex.tbp0, tex.tbw);
+                }
+            }
+            return rgba;
+        }
         case GS_PSM_T8:
         case GS_PSM_T8H:
         case GS_PSM_T4:
@@ -3261,6 +4539,82 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
             uint32_t rgba = (gs->m_clutCacheKey != ~0ull)
                                 ? gs->m_clutCache[static_cast<u8>(out)]
                                 : lookupCLUT(gs, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+            {   // [rampspy] PS2X_RAMPSPY=1: what does the routed 0x62 toon pass actually sample?
+                // Interior slivers subtract ~21 where console subtracts <12 -- either the u
+                // lands on the wrong ramp step or the CLUT decode is wrong (the ramp CLUTs are
+                // render targets and ANIMATE). Histogram index + final subtract magnitude.
+                static const bool s_rsp = [](){ const char *v = std::getenv("PS2X_RAMPSPY");
+                                                return v && v[0] && v[0] != '0'; }();
+                extern bool g_swoCelZSnap;
+                {   // [shadeclut] same census for the 0x64 PSMT4 SHADING class: console's
+                    // shadow side is ~60 darker than ours -- if this CLUT decodes all-bright,
+                    // the toon shadow bands never render (GL path suffers the same symptom).
+                    extern bool g_swDirtyActive;
+                    if (s_rsp && g_swDirtyActive && !g_swoCelZSnap && tex.psm == GS_PSM_T4)
+                    {
+                        static std::set<uint64_t> dumped2;
+                        static std::mutex dm2;
+                        static std::atomic<uint64_t> n2{0}, hist2[16];
+                        {
+                            std::lock_guard<std::mutex> lk(dm2);
+                            if (gs->m_clutCacheKey != ~0ull && dumped2.insert(gs->m_clutCacheKey).second && dumped2.size() <= 10)
+                            {
+                                std::fprintf(stderr, "[shadeclut] tbp=%u cbp=%u csa=%u maxRGB@idx0-15:",
+                                             tex.tbp0, tex.cbp, tex.csa);
+                                for (int i = 0; i < 16; ++i)
+                                {
+                                    const uint32_t c2 = gs->m_clutCache[i];
+                                    std::fprintf(stderr, " %u", std::max({c2 & 0xFFu, (c2 >> 8) & 0xFFu, (c2 >> 16) & 0xFFu}));
+                                }
+                                std::fprintf(stderr, "\n");
+                            }
+                        }
+                        hist2[out & 0xFu].fetch_add(1);
+                        const uint64_t k2 = n2.fetch_add(1) + 1;
+                        if ((k2 % 300000ull) == 1ull && k2 > 1)
+                        {
+                            std::fprintf(stderr, "[shadeidx] %llu samples idx0-15:", (unsigned long long)k2);
+                            for (int i = 0; i < 16; ++i) std::fprintf(stderr, " %llu", (unsigned long long)hist2[i].load());
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
+                }
+                if (s_rsp && g_swoCelZSnap && tex.tbp0 == 15680u)
+                {
+                    {   // one-shot ramp dump per distinct CLUT cache: subtract magnitude at 16
+                        // index steps, plus cbp/csa -- compared against console's empirical
+                        // curve (subtract ~0 through u=0.74, dark only at the top step).
+                        static std::set<uint64_t> dumped;
+                        static std::mutex dm;
+                        std::lock_guard<std::mutex> lk(dm);
+                        if (gs->m_clutCacheKey != ~0ull && dumped.insert(gs->m_clutCacheKey).second && dumped.size() <= 12)
+                        {
+                            std::fprintf(stderr, "[rampclut] cbp=%u csa=%u cpsm=%u key=%llx maxRGB@idx:",
+                                         tex.cbp, tex.csa, tex.cpsm, (unsigned long long)gs->m_clutCacheKey);
+                            for (int i = 0; i < 256; i += 16)
+                            {
+                                const uint32_t c2 = gs->m_clutCache[i];
+                                std::fprintf(stderr, " %u", std::max({c2 & 0xFFu, (c2 >> 8) & 0xFFu, (c2 >> 16) & 0xFFu}));
+                            }
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
+                    static std::atomic<uint64_t> n{0};
+                    static std::atomic<uint64_t> idxH[16], magH[16];
+                    const unsigned ix = (unsigned)(out & 0xFFu) >> 4;
+                    const unsigned mg = std::max({rgba & 0xFFu, (rgba >> 8) & 0xFFu, (rgba >> 16) & 0xFFu});
+                    idxH[ix].fetch_add(1); magH[mg >> 4].fetch_add(1);
+                    const uint64_t k = n.fetch_add(1) + 1;
+                    if ((k % 100000ull) == 1ull && k > 1)
+                    {
+                        std::fprintf(stderr, "[rampspy] %llu samples idx16:", (unsigned long long)k);
+                        for (int i = 0; i < 16; ++i) std::fprintf(stderr, " %llu", (unsigned long long)idxH[i].load());
+                        std::fprintf(stderr, "  | subtractMag16:");
+                        for (int i = 0; i < 16; ++i) std::fprintf(stderr, " %llu", (unsigned long long)magH[i].load());
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+            }
             static const bool s_tp = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_TEXEL_PROBE"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
             if (s_tp && tex.psm == GS_PSM_T4)
             {
@@ -3539,12 +4893,60 @@ void GSRasterizer::drawTriangle(GS *gs)
     maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
 
     float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
+    {   // Mode 9: only SLIVER triangles (the geometry GL's rasterizer actually drops --
+        // console median coverage is ONE pixel and 39.9% cover no centre) contribute
+        // difference pixels. Large triangles are fully handled by GL, and their edge
+        // shells are covered by neighbouring triangles.
+        extern bool g_swoDiffOnly;
+        if (g_swoDiffOnly && std::fabs(denom) > 32.0f)  // |denom| = 2*area; skip area > 16px^2 (long thin outline strips pass; real interior triangles are 100s of px^2)
+            return;
+    }
     if (std::fabs(denom) < 0.001f)
         return;
 
     const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
     const float invAbsDenom = 1.0f / std::fabs(denom);
     constexpr float kEdgeEpsilon = 1.0e-4f;
+
+    // CONSERVATIVE RASTERIZATION for the routed cel/outline pass (PS2X_SWOCONS, default ON
+    // while a routed draw is rasterizing). BT3 draws its outline as triangle strips of
+    // sub-pixel SLIVERS -- console's own geometry has a MEDIAN of one covered pixel per
+    // triangle and 39.9% cover no pixel centre at all. Whether such a triangle lights a pixel
+    // is then decided by whether a centre happens to fall inside, and kEdgeEpsilon (1e-4 in
+    // BARYCENTRIC units) is far too small to change that. The GS rasterizes at 1/16 pixel and
+    // lights more of them, which is why our silhouette contour is only 65.0% continuous
+    // against console's 82.6%.
+    //
+    // Widen each edge outward by half a pixel. w_i is the distance to the opposite edge
+    // normalised by that edge's height h_i = |denom| / len_i, so half a pixel is
+    //     d_i = 0.5 / h_i = 0.5 * len_i / |denom|
+    // in barycentric units. Large triangles get a negligible d_i, so this is self-limiting:
+    // it only affects geometry thin enough for the fill rule to be deciding coverage.
+    float eps0 = kEdgeEpsilon, eps1 = kEdgeEpsilon, eps2 = kEdgeEpsilon;
+    {
+        extern bool g_swDirtyActive;
+        // PS2X_SWOCONS = the widening in PIXELS (default 0.5 = exact half-pixel conservative
+        // coverage); 0 disables. Larger values trade a thicker contour for more continuity.
+        static const float s_cons = [](){ const char *v = std::getenv("PS2X_SWOCONS");
+                                          return (v && v[0]) ? (float)std::atof(v) : 0.5f; }();
+        // Widen ONLY the 0x62 sliver class -- widening the SHADING classes painted
+        // edge-clamped texels along every interior mesh edge (the pants "wireframe";
+        // attribution overlay work/wzw_attrib.png, blue population).
+        extern bool g_swoCelZSnap;
+        if (s_cons > 0.0f && g_swoCelZSnap)
+        {
+            auto elen = [](float ax, float ay, float bx, float by) {
+                const float dx = ax - bx, dy = ay - by;
+                return std::sqrt(dx * dx + dy * dy);
+            };
+            const float l12 = elen(fx1, fy1, fx2, fy2);   // edge opposite vertex 0
+            const float l20 = elen(fx2, fy2, fx0, fy0);   // opposite vertex 1
+            const float l01 = elen(fx0, fy0, fx1, fy1);   // opposite vertex 2
+            eps0 = std::max(kEdgeEpsilon, s_cons * l12 * invAbsDenom);
+            eps1 = std::max(kEdgeEpsilon, s_cons * l20 * invAbsDenom);
+            eps2 = std::max(kEdgeEpsilon, s_cons * l01 * invAbsDenom);
+        }
+    }
 
     g_rasterPixelCount.fetch_add((uint64_t)std::max(0, maxX - minX + 1) * (uint64_t)std::max(0, maxY - minY + 1) / 2u, std::memory_order_relaxed);
 
@@ -3559,10 +4961,36 @@ void GSRasterizer::drawTriangle(GS *gs)
             float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
             float w2 = 1.0f - w0 - w1;
 
-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+            if (w0 < -eps0 || w1 < -eps1 || w2 < -eps2)
                 continue;
+            {   // Mode 9 difference coverage: only pixels GL's fill rule misses. The strict-
+                // interior skip alone is NOT enough -- interior triangles' edge shells are
+                // covered by their NEIGHBOURS on GL (shared edges), which a per-triangle test
+                // cannot see, and admitting them wireframed the whole mesh. The area gate
+                // below this loop restricts the pass to sliver triangles; here we addition-
+                // ally skip strictly-interior pixels (GL covers those even on slivers).
+                extern bool g_swoDiffOnly;
+                if (g_swoDiffOnly && w0 > 1.0e-4f && w1 > 1.0e-4f && w2 > 1.0e-4f)
+                    continue;
+            }
 
             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            {   // Interpolated attributes must stay inside the vertex range. The conservative
+                // widening admits pixels whose barycentrics lie OUTSIDE [0,1] -- for sliver
+                // triangles eps is huge in barycentric units, so z EXTRAPOLATES far past the
+                // vertex z (measured: the routed cel/outline pixels rejected GEQUAL with
+                // >4096-int margins while console tie-passes them). GS fixed-point
+                // interpolation can never leave the vertex range; clamp to it. A no-op for
+                // interior pixels (convex combination). PS2X_ZCLAMP=0 restores.
+                static const bool s_zclamp = [](){ const char *v = std::getenv("PS2X_ZCLAMP");
+                                                   return v && v[0] && v[0] != '0'; }();   // opt-in
+                if (s_zclamp)
+                {
+                    const double zvMin = std::min({(double)v0.z, (double)v1.z, (double)v2.z});
+                    const double zvMax = std::max({(double)v0.z, (double)v1.z, (double)v2.z});
+                    if (z < zvMin) z = zvMin; else if (z > zvMax) z = zvMax;
+                }
+            }
 
             uint8_t r, g, b, a;
             if (gs->m_prim.iip)
@@ -3603,11 +5031,67 @@ void GSRasterizer::drawTriangle(GS *gs)
                     iq = (std::fabs(invQ) > 1.0e-8f) ? (1.0f / invQ) : 1.0f;
                     is = sOverQ * iq;
                     it = tOverQ * iq;
+                    {   // Same vertex-range rule as the z clamp: perspective-correct S/T at any
+                        // TRUE interior pixel is a convex combination of the vertex S/T ("is" at
+                        // vertex i is exactly v.s_i), so it can never leave [min,max]. Widened
+                        // pixels EXTRAPOLATE -- on the 0x62 ramp slivers that lands on the dark
+                        // top steps and painted the whole mesh edge network as a wireframe.
+                        // PS2X_STCLAMP=0 restores.
+                        static const bool s_stc = [](){ const char *v = std::getenv("PS2X_STCLAMP");
+                                                        return v && v[0] && v[0] != '0'; }();   // opt-in
+                        if (s_stc)
+                        {
+                            const float sMin = std::min({v0.s, v1.s, v2.s}), sMax = std::max({v0.s, v1.s, v2.s});
+                            const float tMin = std::min({v0.t, v1.t, v2.t}), tMax = std::max({v0.t, v1.t, v2.t});
+                            if (is < sMin) is = sMin; else if (is > sMax) is = sMax;
+                            if (it < tMin) it = tMin; else if (it > tMax) it = tMax;
+                        }
+                    }
                     iu = 0;
                     iv = 0;
                 }
 
+                {   // [stqspy] PS2X_UMAP=1 also prints raw vertex STQ for the first few 0x62
+                    // triangles: our per-pixel u is ~0.02 where console's is 0.24-0.88 (30x off)
+                    // -- a scale or double-divide bug lives in these inputs.
+                    static const bool s_um2 = [](){ const char *v = std::getenv("PS2X_UMAP");
+                                                    return v && v[0] && v[0] != '0'; }();
+                    extern bool g_swoCelZSnap;
+                    if (s_um2 && g_swoCelZSnap && ctx.tex0.tbp0 == 15680u)
+                    {
+                        static int n = 0;
+                        if (n < 12 && x == minX && y == minY)
+                        {
+                            ++n;
+                            std::fprintf(stderr, "[stqspy] #%d v0(s=%.6f t=%.6f q=%.6f) v1(s=%.6f q=%.6f) v2(s=%.6f q=%.6f) fst=%d | pix is=%.6f iq=%.6f\n",
+                                         n, v0.s, v0.t, v0.q, v1.s, v1.q, v2.s, v2.q,
+                                         gs->m_prim.fst ? 1 : 0, is, iq);
+                        }
+                    }
+                }
                 uint32_t texel = sampleTexture(gs, is, it, iq, iu, iv);
+                {   // [umap] PS2X_UMAP=1: per-pixel ramp u of the routed 0x62 pass, dumped for
+                    // a direct diff against console's own u map (work/console_umap.npy).
+                    static const bool s_um = [](){ const char *v = std::getenv("PS2X_UMAP");
+                                                   return v && v[0] && v[0] != '0'; }();
+                    extern bool g_swoCelZSnap;
+                    if (s_um && g_swoCelZSnap && ctx.tex0.tbp0 == 15680u &&
+                        x >= 0 && y >= 0 && x < 512 && y < 448)
+                    {
+                        static float *um = [](){
+                            float *m = new float[512 * 448];
+                            for (int i = 0; i < 512 * 448; ++i) m[i] = -1.0f;
+                            std::atexit([](){
+                                extern float *g_umapPtr;
+                                if (FILE *f = std::fopen("/home/z3/Desktop/bt3/work/ours_umap.raw", "wb"))
+                                { std::fwrite(g_umapPtr, 4, 512 * 448, f); std::fclose(f); }
+                            });
+                            extern float *g_umapPtr; g_umapPtr = m;
+                            return m;
+                        }();
+                        um[(size_t)y * 512 + x] = is / std::max(1e-8f, std::fabs(iq));   // sampled u = S/Q
+                    }
+                }
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
@@ -3627,7 +5111,12 @@ void GSRasterizer::drawTriangle(GS *gs)
                 a = color.a;
             }
 
-            writePixel(gs, x, y, static_cast<u32>(z + 0.5), r, g, b, a);
+            // A pixel admitted only by the conservative widening lies OUTSIDE the true
+            // triangle: the GS never generated it, so it must not fight the z-buffer -- it
+            // carries edge color for coverage, writes no z, and is not z-rejected (its
+            // interpolated z is fabricated). Interior pixels keep the exact GS z-test.
+            const bool widened = (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f);
+            writePixel(gs, x, y, static_cast<u32>(z + 0.5), r, g, b, a, widened);
         }
     });
 }
