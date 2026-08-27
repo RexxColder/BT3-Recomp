@@ -348,6 +348,7 @@ namespace
         {   // LQ: the two env-gated diagnostics inside the interpreter case must keep working
             static const bool s_diag = [](){ return std::getenv("PS2X_IDW") != nullptr || std::getenv("PS2X_LQ_DUMP") != nullptr; }();
             if (s_diag) return;
+            if (FT(instr) == 0u) return;   // [vu0reset] a write to vf0 needs the interpreter's post-instruction reset
             e.loKind = VU_LO_LQ; e.loA = FT(instr); e.loB = VIS(instr); e.loDest = dest; e.loImm = IMM11(instr); return;
         }
         case 0x01: e.loKind = VU_LO_SQ; e.loA = FS(instr); e.loB = VIT(instr); e.loDest = dest; e.loImm = IMM11(instr); return;
@@ -378,14 +379,14 @@ namespace
                 const uint8_t funct2 = (uint8_t)((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
                 switch (funct2)
                 {
-                case 0x30: e.loKind = VU_LO_MOVE; e.loA = vfT; e.loB = vfS; e.loDest = dest; return;
-                case 0x31: e.loKind = VU_LO_MR32; e.loA = vfT; e.loB = vfS; e.loDest = dest; return;
-                case 0x34: e.loKind = VU_LO_LQI; e.loA = vfT; e.loB = viS; e.loDest = dest; return;
+                case 0x30: if (vfT == 0u) return; e.loKind = VU_LO_MOVE; e.loA = vfT; e.loB = vfS; e.loDest = dest; return;
+                case 0x31: if (vfT == 0u) return; e.loKind = VU_LO_MR32; e.loA = vfT; e.loB = vfS; e.loDest = dest; return;
+                case 0x34: if (vfT == 0u) return; e.loKind = VU_LO_LQI; e.loA = vfT; e.loB = viS; e.loDest = dest; return;
                 case 0x35: e.loKind = VU_LO_SQI; e.loA = vfS; e.loB = viT; e.loDest = dest; return;
-                case 0x36: e.loKind = VU_LO_LQD; e.loA = vfT; e.loB = viS; e.loDest = dest; return;
+                case 0x36: if (vfT == 0u) return; e.loKind = VU_LO_LQD; e.loA = vfT; e.loB = viS; e.loDest = dest; return;
                 case 0x37: e.loKind = VU_LO_SQD; e.loA = vfS; e.loB = viT; e.loDest = dest; return;
                 case 0x3C: e.loKind = VU_LO_MTIR; e.loA = viT; e.loB = vfS; e.loDest = dest; return;
-                case 0x3D: e.loKind = VU_LO_MFIR; e.loA = vfT; e.loB = viS; e.loDest = dest; return;
+                case 0x3D: if (vfT == 0u) return; e.loKind = VU_LO_MFIR; e.loA = vfT; e.loB = viS; e.loDest = dest; return;
                 default: return;
                 }
             }
@@ -1098,13 +1099,16 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             }
         }
         // Upper-slot dispatch: the pre-decoded handler when this PC has one, ISA switch otherwise.
+        bool anyFallback = false;   // [vu0reset]
         auto runLower = [&]() {   // [vulower]
             const bool fast = s_vuFast && decoded && execLowerFast(m_state, *decoded, vuData, dataSize);
+            if (!fast) anyFallback = true;
             if (s_vuTime) (fast ? g_vuLoFastHits : g_vuLoFastMisses) += 1u;
             if (!fast) execLower(lower, vuData, dataSize, gs, memory, upper);
         };
         auto runUpper = [&]() {
             const bool fast = s_vuFast && decoded && execUpperFast(*decoded);
+            if (!fast) anyFallback = true;   // [vu0reset]
             // Counters only when asked for: two thread-local increments per instruction is ~94M/sec
             // in a fight, which is not free and would otherwise be charged to the shipping path.
             if (s_vuTime)
@@ -1142,9 +1146,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         // Enforce VF0 invariant. One 16-byte store rather than four scalar ones: this runs on
         // EVERY instruction, so at ~47M instructions/sec four stores is ~190M stores/sec.
         // Unaligned store because VU1State's alignment is not guaranteed.
-        _mm_storeu_ps(m_state.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f));
-        // Enforce VI0 invariant
-        m_state.vi[0] = 0;
+        // [vu0reset] The translated fast paths never write vf0/vi0 (integer writes guard the index, vector
+        // writes with dest vf0 decode as fallback), so the per-instruction reset (14% of run() in the
+        // annotate) is only needed after an interpreter fallback or an I-bit load. PS2X_VU0RESET=1 = always.
+        static const bool s_alwaysReset = [](){ const char *v = std::getenv("PS2X_VU0RESET"); return v && v[0] && v[0] != '0'; }();
+        if (s_alwaysReset || anyFallback || loi)
+        {
+            _mm_storeu_ps(m_state.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f));
+            m_state.vi[0] = 0;
+        }
 
         uint32_t nextPC = m_state.pc + 8;
         if (nextPC >= codeSize)

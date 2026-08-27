@@ -2447,7 +2447,8 @@ namespace
     // read) -> 1 with no 2 or 3 observed for the new read at all, so any rule based on the last
     // polled value cannot see it.
     struct Bt3DevDone { std::atomic<uint32_t> dev{0u}; std::atomic<uint32_t> reported{1u};
-                        std::atomic<uint32_t> stream{0u}; std::atomic<uint32_t> idleWait{0u}; };
+                        std::atomic<uint32_t> stream{0u}; std::atomic<uint32_t> idleWait{0u};
+                        std::atomic<uint32_t> activeReq{0u}; };   // [cdedge2] pending request ([stream+8]) the device was seen busy/done for
     inline Bt3DevDone *bt3DevSlot(uint32_t dev)
     {
         static Bt3DevDone s_slots[8];
@@ -2501,7 +2502,19 @@ namespace
                 // stops it substituting the value -- the A/B that says whether the fix is the
                 // substitution or just the extra frame per poll shifting the race.
                 static const bool s_edgeFix = [](){ const char *v = std::getenv("PS2X_CDEDGE"); return !(v && v[0] == '0'); }();
-                if (waiting && s_edgeFix)
+                static const bool s_edge2 = [](){ const char *v = std::getenv("PS2X_CDEDGE2"); return !(v && v[0] == '0'); }();
+                uint32_t pendNow = 0u;
+                if (stream) { if (const uint8_t *pp = getConstMemPtr(rdram, stream + 8u)) std::memcpy(&pendNow, pp, sizeof(pendNow)); }
+                if (waiting && s_edgeFix && s_edge2 && ds->activeReq.load(std::memory_order_relaxed) != pendNow)
+                {   // [cdedge2] the device has not been seen working on THIS request: it is queued, not done.
+                    // Hardware never shows idle here (the IOP starts the read at submission) -> report busy.
+                    state = 2u;
+                    static std::atomic<uint32_t> s_b{0};
+                    const uint32_t k = s_b.fetch_add(1u);
+                    if (k < 8u || (k % 200u) == 0u)
+                        std::fprintf(stderr, "[cdstate] #%u dev=0x%x idle before request 0x%x was started (stream 0x%x); reporting BUSY, not done\n", k, handle, pendNow, stream);
+                }
+                else if (waiting && s_edgeFix)
                 {
                     state = 3u;
                     static std::atomic<uint32_t> s_n{0};
@@ -2524,6 +2537,45 @@ namespace
         setReturnU32(ctx, state);
     }
 
+    // Run the CD file-server tick (FUN_0028a3b0) inline on the calling guest thread.
+    static void bt3RunCdTickInline(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        R5900Context tctx = *ctx;             // inherit gp/sp
+        tctx.r[31] = _mm_setzero_si128();     // ra = 0 => run until return
+        tctx.pc = 0x0028a3b0u;                // CD file-server tick
+        uint32_t steps = 0u;
+        while (tctx.pc != 0u && steps++ < 2000000u)
+        {
+            PS2Runtime::RecompiledFunction step = runtime->lookupFunction(tctx.pc);
+            if (!step) break;
+            step(rdram, &tctx, runtime);
+        }
+    }
+    // [spinpump] Called by the dispatch loop when a guest thread has re-dispatched at the same pc for
+    // thousands of iterations (a busy-poll). The CD file server only advances from the read-poll hook,
+    // so a thread polling MEMORY for a load result (the walkers at 0x1149a0 / 0x1134a0 / 0x256e00 with
+    // every loader thread blocked) deadlocks: nothing ticks the server, no completion, no populate.
+    // Hardware preempts the poller with the IOP completion. Emulate it: tick the server here, then
+    // yield the guest token so a woken loader thread can run. PS2X_SPINPUMP=0 disables.
+    extern "C" void *ps2xGuestWaitBegin();
+    extern "C" void ps2xGuestWaitEnd(void *);
+    extern "C" void ps2xSpinPump(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_SPINPUMP"); return !(v && v[0] == '0'); }();
+        if (!s_on || !runtime || !runtime->hasFunction(0x0028a3b0u)) return;
+        {
+            Bt3CdTickGuard tickGuard;
+            if (tickGuard.engaged) { bt3RunCdTickInline(rdram, ctx, runtime); s_bt3CdTicking = false; }
+        }
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t k = s_n.fetch_add(1u);
+        if (k < 6u || (k % 5000u) == 0u)
+            std::fprintf(stderr, "[spinpump] guest thread spinning at pc 0x%x: ticked the CD server + yielded (x%u)\n", ctx->pc, k + 1u);
+        void *scope = ps2xGuestWaitBegin();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ps2xGuestWaitEnd(scope);
+    }
+
     PS2Runtime::RecompiledFunction g_orig26b900 = nullptr;
     void bt3AfsStatusPoll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_0026b900
     {
@@ -2540,19 +2592,29 @@ namespace
         }
         Bt3CdTickGuard tickGuard;
         bt3NoteCdTickSkipped(!tickGuard.engaged, "afsStatusPoll");
+        // [cdedge2] which request is the device working on? Snapshot the pending request and the
+        // device read-state around the tick; if the device is busy/done at either end, that request
+        // has genuinely been started -- the only case in which "idle" later means "completed".
+        uint32_t cdDev = 0u, pendBefore = 0u, stBefore = 1u;
+        { if (const uint8_t *pdev = getConstMemPtr(rdram, handle + 4u)) std::memcpy(&cdDev, pdev, sizeof(cdDev));
+          if (const uint8_t *pp = getConstMemPtr(rdram, handle + 8u)) std::memcpy(&pendBefore, pp, sizeof(pendBefore)); }
+        auto devState = [&](uint32_t dev) -> uint32_t {
+            if (!g_orig270dd0 || dev == 0u) return 1u;
+            R5900Context t = *ctx; t.r[4] = _mm_set_epi64x(0, (int64_t)(int32_t)dev); t.r[31] = _mm_setzero_si128(); t.pc = 0x00270dd0u;
+            g_orig270dd0(rdram, &t, runtime);
+            return getRegU32(&t, 2);
+        };
+        if (tickGuard.engaged && cdDev) stBefore = devState(cdDev);
         if (tickGuard.engaged && handle != 0u && runtime->hasFunction(0x0028a3b0u))
         {
-            R5900Context tctx = *ctx;             // inherit gp/sp
-            tctx.r[31] = _mm_setzero_si128();     // ra = 0 => run until return
-            tctx.pc = 0x0028a3b0u;                // CD file-server tick
-            uint32_t steps = 0u;
-            while (tctx.pc != 0u && steps++ < 2000000u)
-            {
-                PS2Runtime::RecompiledFunction step = runtime->lookupFunction(tctx.pc);
-                if (!step) break;
-                step(rdram, &tctx, runtime);
-            }
+            bt3RunCdTickInline(rdram, ctx, runtime);
             s_bt3CdTicking = false;
+            if (cdDev && pendBefore)
+            {
+                const uint32_t stAfter = devState(cdDev);
+                if (stBefore == 2u || stBefore == 3u || stAfter == 2u || stAfter == 3u)
+                    if (Bt3DevDone *slot = bt3DevSlot(cdDev)) slot->activeReq.store(pendBefore, std::memory_order_relaxed);
+            }
         }
         if (g_orig26b900)
             g_orig26b900(rdram, ctx, runtime); // returns int8 *(handle+1) (now advanced)
@@ -3828,25 +3890,66 @@ namespace
     // next-offset 0 loops forever ([stallprobe]: pc 0x1149a0, t6=0, all reads 0). Returning
     // immediately is the hardware outcome (nothing patched). PS2X_NULLPKT=0 disables.
     PS2Runtime::RecompiledFunction g_orig114860 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig113478 = nullptr;
+    extern "C" void *ps2xGuestWaitBegin();
+    extern "C" void ps2xGuestWaitEnd(void *);
+    // Wait (yielding the guest execution token so the loader threads can run) until the 32-bit
+    // field at `addr` becomes non-zero. Returns the value (0 after the cap).
+    static uint32_t bt3WaitFieldNonZero(uint8_t *rdram, uint32_t addr, const char *what, uint32_t pc)
+    {
+        static const int s_capMs = [](){ const char *v = std::getenv("PS2X_NULLPKT_WAITMS"); return v ? std::atoi(v) : 1000; }();
+        auto rd = [&]() -> uint32_t { uint32_t v = 0; if (const uint8_t *q = getConstMemPtr(rdram, addr)) std::memcpy(&v, q, 4); return v; };
+        uint32_t v = rd();
+        if (v != 0u) return v;
+        static unsigned long n = 0; const unsigned long id = ++n;
+        const auto t0 = std::chrono::steady_clock::now();
+        int waited = 0;
+        while (v == 0u && waited < s_capMs)
+        {
+            void *scope = ps2xGuestWaitBegin();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            ps2xGuestWaitEnd(scope);
+            waited += 2;
+            v = rd();
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (id <= 12) std::cerr << "[nullpkt] " << what << " at pc 0x" << std::hex << pc << " was NULL; waited " << std::dec << (int)ms
+                                << " ms -> " << (v ? "populated, continuing" : "STILL NULL, skipping") << " (x" << id << ")" << std::endl;
+        return v;
+    }
     void bt3NullPacketGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         static const bool s_on = [](){ const char *v = std::getenv("PS2X_NULLPKT"); return !(v && v[0] == '0'); }();
-        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5);
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), ra = getRegU32(ctx, 31);
         if (s_on && a0 == 0u && a1 == 0u)
         {
-            static unsigned long n = 0;
-            if (++n <= 8) std::cerr << "[nullpkt] func_114860 called with a NULL packet list (ra=0x" << std::hex << getRegU32(ctx, 31)
-                                    << std::dec << ") -- skipped (x" << n << ")" << std::endl;
-            ctx->pc = getRegU32(ctx, 31);
-            return;
+            // The known caller (0x1133ac) loads a1 from [s0+0x2C]; s0 is still live in the context.
+            uint32_t v = 0u;
+            if (ra == 0x1133b4u) v = bt3WaitFieldNonZero(rdram, getRegU32(ctx, 16) + 0x2Cu, "func_114860 packet list [s0+0x2C]", 0x114860u);
+            if (v == 0u) { ctx->pc = ra; return; }
+            ctx->r[5] = _mm_set_epi64x(0, (int64_t)(int32_t)v);   // low 64 bits = sign-extended 32-bit value, upper zero
         }
         if (g_orig114860) g_orig114860(rdram, ctx, runtime);
+    }
+    void bt3NullListGuard113478(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_NULLPKT"); return !(v && v[0] == '0'); }();
+        const uint32_t a0 = getRegU32(ctx, 4);
+        if (s_on && a0 != 0u)
+        {
+            const uint32_t v = bt3WaitFieldNonZero(rdram, a0 + 0x44u, "sub_113478 list [a0+0x44]", 0x113478u);
+            if (v == 0u) { ctx->pc = getRegU32(ctx, 31); return; }
+        }
+        if (g_orig113478) g_orig113478(rdram, ctx, runtime);
     }
     void applyBt3NullPacketGuard(PS2Runtime &runtime)
     {
         g_orig114860 = runtime.lookupFunction(0x00114860u);
         if (g_orig114860 && runtime.replaceFunction(0x00114860u, &bt3NullPacketGuard))
-            std::cerr << "[game_overrides] BT3: NULL packet-list guard on func_114860" << std::endl;
+            std::cerr << "[game_overrides] BT3: NULL packet-list guard on func_114860 (waits for the loader)" << std::endl;
+        g_orig113478 = runtime.lookupFunction(0x00113478u);
+        if (g_orig113478 && runtime.replaceFunction(0x00113478u, &bt3NullListGuard113478))
+            std::cerr << "[game_overrides] BT3: NULL list guard on sub_113478 (waits for the loader)" << std::endl;
     }
     PS2_REGISTER_GAME_OVERRIDE("BT3 NULL packet-list guard", "SLUS_216.78", 0u, 0u, &applyBt3NullPacketGuard);
     PS2_REGISTER_GAME_OVERRIDE("BT3 CD read-state edge guard", "SLUS_216.78", 0u, 0u, &applyBt3CdStateEdge);

@@ -432,6 +432,8 @@ namespace
     }
 }
 
+extern "C" void ps2xSpinPump(uint8_t *, R5900Context *, PS2Runtime *);   // [spinpump] game_overrides.cpp
+
 PS2Runtime::GuestExecutionScope::GuestExecutionScope(PS2Runtime *runtime) noexcept
     : m_runtime(runtime)
 {
@@ -3099,6 +3101,10 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
                              pc, samePcCount, (ctx == &m_cpuContext) ? "main" : "thread", R(31), t6, rd16(t6 + 8u), rd32(t6), rd32(t6 + 4u), rd32(t6 + 0xCu),
                              R(4), R(5), R(6), R(7), R(2), R(16), R(17), R(18), R(15), R(24));
             }
+            if ((samePcCount % 2000u) == 0u)
+            {   // [spinpump] a busy-poll: advance the CD file server and let other guest threads run (see game_overrides)
+                ps2xSpinPump(rdram, ctx, this);
+            }
             if ((samePcCount % kSamePcYieldInterval) == 0u)
             {
                 PS2_IF_AGRESSIVE_LOGS({
@@ -3835,6 +3841,19 @@ void PS2Runtime::run()
 #endif
         if (gpuMode) ps2GpuRenderer().serviceBlockingBarriers();   // [barblock]
         BeginDrawing();
+        {   // [presentstate] pre-render chunks and barrier services run GL work between presents and
+            // leave the GS emulation state behind (blend off / GS blend factors, scissor, colour mask,
+            // custom shader, texture unit). The frame blit and the ImGui overlay assume raylib's
+            // defaults: the overlay's glyph quads drawn with blending off are solid white rectangles.
+            rlDrawRenderBatchActive();
+            rlDisableScissorTest();
+            rlDisableDepthTest();
+            rlEnableColorBlend();
+            rlSetBlendMode(RL_BLEND_ALPHA);
+            rlColorMask(true, true, true, true);
+            rlActiveTextureSlot(0);
+            rlDisableShader();
+        }
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
