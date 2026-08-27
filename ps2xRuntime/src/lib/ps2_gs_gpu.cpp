@@ -1626,7 +1626,8 @@ void ps2xVramReadBackT8H(uint32_t fbp, uint32_t tbw)
 // (guest) stream position. Runs the SAME writeback functions with staging off.
 unsigned long g_ps2xWbGen = 0;
 unsigned long g_wbPixelsWritten = 0;   // [shstat]
-const std::pair<int,int> *g_wbRowRange = nullptr;   // [flushrows] per-row [x0,x1) to write, or null   // [hashmemo] bumped by every VRAM writeback (WBSTAMP is off by default, so m_contentSeq does not see them)
+const std::pair<int,int> *g_wbRowRange = nullptr;   // [flushrows] per-row [x0,x1) to write, or null
+int g_wbFlipY = 0;   // [noflip] 1 = px rows are bottom-up (buffer row for VRAM row y is h-1-y)   // [hashmemo] bumped by every VRAM writeback (WBSTAMP is off by default, so m_contentSeq does not see them)
 
 void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
                                const uint32_t *px, uint32_t fbmsk);
@@ -1911,6 +1912,7 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
     const int ry0 = (g_wbRectY0 >= 0) ? std::max(0, g_wbRectY0) : 0, ry1 = (g_wbRectY0 >= 0) ? std::min(h, g_wbRectY1) : h;
     const int rx0 = (g_wbRectY0 >= 0) ? std::max(0, g_wbRectX0) : 0, rx1 = (g_wbRectY0 >= 0) ? std::min(w, g_wbRectX1) : w;
     const auto &wfn = gs->writeVramFn(psm); const auto &rfn = gs->readVramFn(psm);   // [wbhoist]
+    auto PROW = [&](int y) -> size_t { return (size_t)(g_wbFlipY ? (h - 1 - y) : y) * (size_t)w; };   // [noflip]
     int wrY0 = 1 << 30, wrY1 = -1;   // [flushdiff] rows actually written
     for (int y = ry0; y < ry1; ++y)
     {
@@ -1922,7 +1924,7 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
         }
         if (psm == 0u && fbmsk == 0u && !g_wbAlphaFillOnly && !s_rawFlush)
         {   // [rowct32] unmasked CT32 (the scene / mask page flushes): bulk row write
-            const u32 n = GSMem::WriteRowCT32(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, px + (size_t)y * w,
+            const u32 n = GSMem::WriteRowCT32(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, px + PROW(y),
                                               g_wbSkipMask ? g_wbSkipMask + (size_t)y * w : nullptr);
             if (n) { if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y; g_wbPixelsWritten += n; }
             continue;
@@ -1930,7 +1932,7 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
         if ((psm == 0x02u || psm == 0x0Au) && fbmsk == 0u && !g_wbAlphaFillOnly && !s_rawFlush)
         {   // [rowct16] unmasked CT16/CT16S (the edge page f336): pack the row, then bulk write
             static std::vector<uint16_t> row16; if (row16.size() < (size_t)w) row16.resize((size_t)w);
-            const uint32_t *srow = px + (size_t)y * w;
+            const uint32_t *srow = px + PROW(y);
             for (int x = xs; x < xe; ++x) row16[(size_t)x] = (uint16_t)(s_wbPack16 ? wbPack16(srow[x]) : srow[x]);
             const u32 n = (psm == 0x02u)
                 ? GSMem::WriteRowCT16(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, row16.data(), g_wbSkipMask ? g_wbSkipMask + (size_t)y * w : nullptr)
@@ -1943,7 +1945,7 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
             if (g_wbSkipMask && !g_wbSkipMask[(size_t)y * w + x]) continue;
             if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y;
             ++g_wbPixelsWritten;
-            const uint32_t nv = cvA(px[(size_t)y * w + x]);
+            const uint32_t nv = cvA(px[PROW(y) + x]);
             if (g_wbAlphaFillOnly)
             {   // RGB per the caller's mask (the previous version wrote it unconditionally,
                 // which is what regressed the frame); ALPHA only where VRAM has none yet, so

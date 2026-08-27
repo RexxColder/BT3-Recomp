@@ -1021,6 +1021,10 @@ void GsGpuRenderer::flushRecentPagesToVram(int minVsync)
 }
 void GsGpuRenderer::flushPageToVram(uint32_t fbp)
 {
+    // [noflip] PS2X_NOFLIP (default on, =0 old behaviour): keep the readback in GL (bottom-up) row
+    // order instead of swapping 917 KB of rows per flush; consumers map VRAM row y -> buffer row
+    // h-1-y (PR()), the shadow is stored in the same order, the writeback gets g_wbFlipY.
+    static const bool s_noflip = [](){ const char *v = std::getenv("PS2X_NOFLIP"); return !(v && v[0] == '0'); }();
     struct FlTot { std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
                    ~FlTot() { extern double g_flTot; g_flTot += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } flTot;   // [secstat]
     if (m_glInit && !ps2xOnGlThread())
@@ -1248,7 +1252,10 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
         static std::vector<uint32_t> tmp; tmp.assign((size_t)rw * rh, 0u);
         glReadPixels(rX0, it->second.h - rY1, rw, rh, 0x1908, 0x1401, tmp.data());
         for (int y = 0; y < rh; ++y)   // bottom-up -> top-down into px
-            std::memcpy(px.data() + (size_t)(rY0 + y) * w + rX0, tmp.data() + (size_t)(rh - 1 - y) * rw, (size_t)rw * 4u);
+        {
+            if (s_noflip) std::memcpy(px.data() + (size_t)(h - rY1 + y) * w + rX0, tmp.data() + (size_t)y * rw, (size_t)rw * 4u);   // [noflip] straight copy
+            else          std::memcpy(px.data() + (size_t)(rY0 + y) * w + rX0, tmp.data() + (size_t)(rh - 1 - y) * rw, (size_t)rw * 4u);
+        }
         static const bool s_frc = [](){ const char *v = std::getenv("PS2X_FLUSHRECTCHK"); return v && v[0] && v[0] != '0'; }();
         if (s_frc)
         {   // differential: does the FBO differ from VRAM anywhere OUTSIDE the rect?
@@ -1274,10 +1281,11 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
                          it->second.w, it->second.h, w, h);
     }
     rlDisableFramebuffer();
-    if (!rectUsed)
+    if (!rectUsed && !s_noflip)
     for (int y = 0; y < h / 2; ++y)   // glReadPixels is bottom-up; VRAM rows are top-down
         std::swap_ranges(px.begin() + (size_t)y * w, px.begin() + (size_t)(y + 1) * w,
                          px.begin() + (size_t)(h - 1 - y) * w);
+    auto PR = [&](int y) -> size_t { return (size_t)(s_noflip ? (h - 1 - y) : y) * (size_t)w; };   // [noflip] buffer row offset for VRAM row y
     {   // [bardiag] PS2X_BARDIAG=1: is the barrier flushing CONTENT, or zeros? A flush of an
         // empty FBO is indistinguishable from no barrier at all downstream, and that is the
         // failure mode this whole chain has hit before (the mask buffer rendering black).
@@ -1571,7 +1579,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
                 const int dy0 = rectUsed ? rY0 : 0, dy1 = rectUsed ? rY1 : h, dx0 = rectUsed ? rX0 : 0, dx1 = rectUsed ? rX1 : w;
                 for (int y = dy0; y < dy1; ++y)
                 {
-                    const uint32_t *a = px.data() + (size_t)y * w + dx0, *b = sh.px.data() + (size_t)y * w + dx0;
+                    const uint32_t *a = px.data() + PR(y) + dx0, *b = sh.px.data() + PR(y) + dx0;
                     const int n = dx1 - dx0; if (n <= 0) continue;
                     if (anyForce && s_rowForce[(size_t)y])
                     {   // [shbands] forced row: whole window, and (if masking) every pixel enabled
@@ -1602,7 +1610,9 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
             }
         }
     { extern double g_flWrite; const auto tw = std::chrono::steady_clock::now();
+    { extern int g_wbFlipY; g_wbFlipY = s_noflip ? 1 : 0; }
     ps2xWritebackToVramMasked(fbp, fit->second.fbw, fit->second.psm, w, h, px.data(), wbMask);
+    { extern int g_wbFlipY; g_wbFlipY = 0; }
       g_flWrite += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count(); }
         { extern const uint8_t *g_wbSkipMask; g_wbSkipMask = nullptr; }
         g_wbRowRange = nullptr;
@@ -1621,7 +1631,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
             {   // rect flush: patch the rect rows; a row becomes known only when written full-width
                 for (int y = rY0; y < rY1; ++y)
                 {
-                    std::memcpy(sh.px.data() + (size_t)y * w + rX0, px.data() + (size_t)y * w + rX0, (size_t)(rX1 - rX0) * 4u);
+                    std::memcpy(sh.px.data() + PR(y) + rX0, px.data() + PR(y) + rX0, (size_t)(rX1 - rX0) * 4u);
                     const bool forced = rebuilt || (anyForce && s_rowForce[(size_t)y]);
                     if (forced) sh.unk[(size_t)y] = fullWidth ? 0u : 1u;
                 }
@@ -1795,7 +1805,7 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
         // 368 = the fbp336 two-stride alias, 224 = the mask page (both byte-identical when skipped).
         // Live: 2460 -> 780 barriers per stat interval, 12 -> 15 fps. PS2X_BARSKIP=- skips nothing.
         static const std::unordered_set<uint32_t> s_skip = [](){ std::unordered_set<uint32_t> r; const char *v = std::getenv("PS2X_BARSKIP");
-            if (!v) v = "502,504,368,224";
+            if (!v) v = "502,504,368";   // NOT 224: rig frame 2002 was byte-identical with it skipped, but live it kills the ink (A/B SK1/SK2/SK3, dark-pixel metric 8.37 -> 6.77)
             if (v[0] == '-' || (v[0] == 'n' && v[1] == 'o')) return r;
             { const char *q = v; while (*q) { char *e = nullptr; long n = std::strtol(q, &e, 10); if (e == q) break; r.insert((uint32_t)n); q = (*e == ',') ? e + 1 : e; } } return r; }();
         if (s_skip.count(page)) { extern unsigned long g_bbSkipped; ++g_bbSkipped; return; }
