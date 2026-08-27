@@ -3821,5 +3821,33 @@ namespace
     PS2_REGISTER_GAME_OVERRIDE("BT3 sound init bypass", "SLUS_216.78", 0u, 0u, &applyBt3SoundInitBypass);
     PS2_REGISTER_GAME_OVERRIDE("BT3 DTX sound URPC compat", "SLUS_216.78", 0u, 0u, &applyBt3DtxCompat);
     PS2_REGISTER_GAME_OVERRIDE("BT3 sceMpeg callback stubs", "SLUS_216.78", 0u, 0u, &applyBt3MpegCallbackStubs);
+    // [nullpkt] The infinite-loading freeze: func_114860 (texture-packet address patcher) is
+    // called with a NULL packet list (a1 = [obj+0x2C] not populated yet) and walks it as a
+    // linked list from address 0 -- on hardware address 0 aliases the kernel's exception-vector
+    // code, so the walk stumbles through non-zero garbage and exits; our RAM there is zeros, so
+    // next-offset 0 loops forever ([stallprobe]: pc 0x1149a0, t6=0, all reads 0). Returning
+    // immediately is the hardware outcome (nothing patched). PS2X_NULLPKT=0 disables.
+    PS2Runtime::RecompiledFunction g_orig114860 = nullptr;
+    void bt3NullPacketGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_NULLPKT"); return !(v && v[0] == '0'); }();
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5);
+        if (s_on && a0 == 0u && a1 == 0u)
+        {
+            static unsigned long n = 0;
+            if (++n <= 8) std::cerr << "[nullpkt] func_114860 called with a NULL packet list (ra=0x" << std::hex << getRegU32(ctx, 31)
+                                    << std::dec << ") -- skipped (x" << n << ")" << std::endl;
+            ctx->pc = getRegU32(ctx, 31);
+            return;
+        }
+        if (g_orig114860) g_orig114860(rdram, ctx, runtime);
+    }
+    void applyBt3NullPacketGuard(PS2Runtime &runtime)
+    {
+        g_orig114860 = runtime.lookupFunction(0x00114860u);
+        if (g_orig114860 && runtime.replaceFunction(0x00114860u, &bt3NullPacketGuard))
+            std::cerr << "[game_overrides] BT3: NULL packet-list guard on func_114860" << std::endl;
+    }
+    PS2_REGISTER_GAME_OVERRIDE("BT3 NULL packet-list guard", "SLUS_216.78", 0u, 0u, &applyBt3NullPacketGuard);
     PS2_REGISTER_GAME_OVERRIDE("BT3 CD read-state edge guard", "SLUS_216.78", 0u, 0u, &applyBt3CdStateEdge);
 }

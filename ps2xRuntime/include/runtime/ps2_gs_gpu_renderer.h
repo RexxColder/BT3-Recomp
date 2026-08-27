@@ -226,6 +226,7 @@ public:
     // remembered (m_segFrom), so the end-of-frame render resumes rather than redrawing them
     // -- redrawing would blend every prior command a second time.
     void renderRange(int fbWidth, int fbHeight);
+    bool prerenderChunk();   // [prerender] GL thread: draw already-recorded commands ahead of the next barrier
 
     // Read-time barrier: if the page behind srcTbp0 has been drawn into since its last flush,
     // render what is built so far and push that page to VRAM, so the decode about to run reads
@@ -314,6 +315,11 @@ private:
     bool   m_seedAlphaOnce = false;
     bool   m_flushAlphaNow = false;
     bool   m_segMode   = false;
+    // [prerender] chunk mode: cmds is a COPY of m_building[m_chunkBase, m_chunkBase + cmds.size())
+    // taken under m_mtx, so the guest keeps recording while the GL thread draws.
+    bool   m_chunkMode = false;
+    size_t m_chunkBase = 0;
+    std::vector<DrawCmd> m_chunk;
     bool   m_segActive = false;
     size_t m_segFrom   = 0;
     std::unordered_set<uint32_t> m_segDepthCleared;

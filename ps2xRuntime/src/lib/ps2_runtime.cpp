@@ -3087,6 +3087,18 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
         if (pc == lastPc)
         {
             ++samePcCount;
+            if (samePcCount == 2000u || samePcCount == 20000u || samePcCount == 200000u || samePcCount == 2000000u)
+            {   // [stallprobe] the infinite-loading freeze re-dispatches at one pc forever (0x1149a0,
+                // func_114860 spinning on a halfword at [$t6+8]). Name what it spins on.
+                auto R = [&](int i) { return static_cast<uint32_t>(_mm_extract_epi32(ctx->r[i], 0)); };
+                const uint32_t t6 = R(14);
+                const uint8_t *rd = m_memory.getRDRAM();
+                auto rd16 = [&](uint32_t va) -> uint32_t { uint16_t v = 0; std::memcpy(&v, rd + ((va & 0x1FFFFFFFu) & PS2_RAM_MASK), 2); return v; };
+                auto rd32 = [&](uint32_t va) -> uint32_t { uint32_t v = 0; std::memcpy(&v, rd + ((va & 0x1FFFFFFFu) & PS2_RAM_MASK), 4); return v; };
+                std::fprintf(stderr, "[stallprobe] pc=0x%x x%u %s ra=0x%x | t6=0x%x [t6+8]=0x%x [t6+0]=0x%08x [t6+4]=0x%08x [t6+c]=0x%08x | a0=0x%x a1=0x%x a2=0x%x a3=0x%x v0=0x%x s0=0x%x s1=0x%x s2=0x%x t7=0x%x t8=0x%x\n",
+                             pc, samePcCount, (ctx == &m_cpuContext) ? "main" : "thread", R(31), t6, rd16(t6 + 8u), rd32(t6), rd32(t6 + 4u), rd32(t6 + 0xCu),
+                             R(4), R(5), R(6), R(7), R(2), R(16), R(17), R(18), R(15), R(24));
+            }
             if ((samePcCount % kSamePcYieldInterval) == 0u)
             {
                 PS2_IF_AGRESSIVE_LOGS({
@@ -3869,6 +3881,8 @@ void PS2Runtime::run()
             {
                 if (!ps2GpuRenderer().serviceBlockingBarriers())
                 {
+                    if (ps2GpuRenderer().prerenderChunk()) continue;   // [prerender] draw ahead while the guest records
+
                     const auto left = std::chrono::duration_cast<std::chrono::microseconds>(s_next - now).count();
                     ps2GpuRenderer().waitForBlockingBarrierRequest((int)std::max<long long>(1, left));   // cv-driven: wakes on a request, else sleeps to the frame deadline
                 }

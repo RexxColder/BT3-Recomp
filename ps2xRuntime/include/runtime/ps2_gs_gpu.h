@@ -491,6 +491,12 @@ private:
 
     std::array<ReadVramFunc, 0x3F> m_read_vram_funcs{ };
     std::array<WriteVramFunc, 0x3F> m_write_vram_funcs{ };
+public:
+    // [wbhoist] direct access to the per-format VRAM accessors so bulk writers can hoist the
+    // std::function dispatch out of their per-pixel loops.
+    const ReadVramFunc &readVramFn(u32 psm) const { return m_read_vram_funcs[psm & 0x3F]; }
+    const WriteVramFunc &writeVramFn(u32 psm) const { return m_write_vram_funcs[psm & 0x3F]; }
+private:
 };
 
 inline u32 GS::ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const

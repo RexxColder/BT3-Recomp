@@ -46,9 +46,14 @@ static std::vector<uint32_t> g_barPending;       // pages needing a render+flush
 // [barblock] PS2X_BARBLOCK=1: the guest thread BLOCKS on a barrier until the GL thread has
 // rendered the in-progress list up to this point and flushed the page -- the replay rig's
 // synchronous semantics, across threads. Replaces the one-frame-late staging ([livesync]).
-struct BarBlockReq { uint32_t page; bool alpha; };
+struct BarBlockReq { uint32_t page; bool alpha;
+    std::chrono::steady_clock::time_point tPost{};   // [bbstat]
+};
 static std::mutex g_bbMx;
 static std::condition_variable g_bbCv;
+static std::atomic<bool> g_preReady{false};   // [prerender] recordCmd raised: a chunk is waiting
+static int prerenderK() { static const int k = [](){ const char *v = std::getenv("PS2X_PRERENDER"); return v ? std::atoi(v) : 64; }(); return k; }   // 0 = off
+unsigned long g_preChunks = 0, g_preCmds = 0;   // [prerender] stats
 static std::deque<BarBlockReq> g_bbQueue;
 static uint64_t g_bbPosted = 0, g_bbServed = 0;
 static std::atomic<bool> g_bbAbort{false};
@@ -305,6 +310,7 @@ namespace
     std::unordered_map<uint64_t, uint32_t> g_texLastUse;            // texKey -> present gen last referenced
     std::vector<uint64_t> g_superseded;   // [supersede] old version keys awaiting reclaim (guarded by m_mtx)
     std::unordered_set<uint64_t> g_reclaimed; unsigned long g_supReclaimed = 0, g_reDecodeReclaimed = 0;   // [supdiag]
+    unsigned long g_hashMemoHit = 0, g_hashMemoCompute = 0, g_hashMemoChecked = 0, g_hashMemoMiss = 0;   // [hashmemo]
     std::unordered_set<unsigned> g_deletedIds; unsigned long g_idReuse = 0;   // [supdiag] GL ids we deleted; reuse counter
     std::unordered_map<uint64_t, std::vector<Texture2D>> g_texPool; // (w<<32|h) -> free GL textures
     uint32_t g_texUseGen = 0;
@@ -905,8 +911,26 @@ uint64_t GsGpuRenderer::resolveTextureVersion(uint64_t baseKey, uint32_t pageLo,
     }
     if (dirty)
     {
+        // [hashmemo] PS2X_HASHMEMO: 1 (default) memoise the range hash keyed on (range, max page
+        // content seq, writeback generation) -- every draw sampling the scene between two VRAM
+        // writes re-hashed the same ~1 MB (20% of the guest thread in the fight profile);
+        // 2 = self-check (always hash, count memo mismatches in [cachestat]); 0 = off.
+        static const int s_hm = [](){ const char *v = std::getenv("PS2X_HASHMEMO"); return v ? std::atoi(v) : 1; }();
+        extern unsigned long g_ps2xWbGen;
+        struct HashMemo { uint32_t mx; unsigned long wbGen; uint64_t h; };
+        static std::unordered_map<uint64_t, HashMemo> s_memo;
+        uint32_t mxPre = 0;
+        for (uint32_t p = pageLo; p <= pageHi; ++p) if (m_contentSeq[p] > mxPre) mxPre = m_contentSeq[p];
+        const uint64_t memoKey = (static_cast<uint64_t>(pageLo) << 20) | pageHi;
+        HashMemo *memo = nullptr; bool memoHit = false;
+        if (s_hm)
+        {
+            memo = &s_memo[memoKey];
+            memoHit = (memo->h != 0 && memo->mx == mxPre && memo->wbGen == g_ps2xWbGen);
+        }
         uint64_t h = 1469598103934665603ull;
-        if (vram && vramSize)
+        if (memoHit && s_hm == 1) h = memo->h;
+        else if (vram && vramSize)
         {
             uint64_t begin = static_cast<uint64_t>(pageLo) * 8192ull;
             uint64_t end = (static_cast<uint64_t>(pageHi) + 1ull) * 8192ull;
@@ -926,7 +950,14 @@ uint64_t GsGpuRenderer::resolveTextureVersion(uint64_t baseKey, uint32_t pageLo,
             // dirty=1 on every call, yet verKey never moved and needDecode stayed 0.
             uint32_t mx = 0;
             for (uint32_t p = pageLo; p <= pageHi; ++p) if (m_contentSeq[p] > mx) mx = m_contentSeq[p];
-            h = (h ^ (uint64_t)mx) * 1099511628211ull;
+            if (!(memoHit && s_hm == 1)) h = (h ^ (uint64_t)mx) * 1099511628211ull;
+            if (memo)
+            {
+                if (s_hm == 2 && memoHit) { if (memo->h != h) ++g_hashMemoMiss; ++g_hashMemoChecked; }
+                else if (!memoHit) ++g_hashMemoCompute;
+                else ++g_hashMemoHit;
+                memo->mx = mx; memo->wbGen = g_ps2xWbGen; memo->h = h;
+            }
         }
         ve.seqChecked = m_writeSeq;
         ve.drawChecked = m_drawSeq;
@@ -986,6 +1017,8 @@ void GsGpuRenderer::flushRecentPagesToVram(int minVsync)
 }
 void GsGpuRenderer::flushPageToVram(uint32_t fbp)
 {
+    struct FlTot { std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+                   ~FlTot() { extern double g_flTot; g_flTot += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } flTot;   // [secstat]
     if (m_glInit && !ps2xOnGlThread())
     {   // [livegl] defer to the present thread's drain
         std::lock_guard<std::mutex> bk(g_barMx);
@@ -1043,7 +1076,9 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
                 static std::vector<float> zb;
                 zb.assign((size_t)zw * zh, 0.0f);
                 glBindTexture(0x0DE1u, zTex);
+                { extern double g_flDepth; const auto tz = std::chrono::steady_clock::now();
                 glGetTexImage(0x0DE1u, 0, 0x1902u, 0x1406u, zb.data());
+                  g_flDepth += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tz).count(); }
                 // glGetTexImage returns the texture BOTTOM-UP; GS row 0 is the TOP row. The
                 // colour flush already flips for exactly this reason, but the depth path did
                 // not -- so the Z field went into VRAM mirrored, and every consumer of it (the
@@ -1222,7 +1257,9 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
         }
     }
     else
-    glReadPixels(0, it->second.h - h, w, h, 0x1908, 0x1401, px.data());
+    { extern double g_flRead; const auto tr = std::chrono::steady_clock::now();
+      glReadPixels(0, it->second.h - h, w, h, 0x1908, 0x1401, px.data());
+      g_flRead += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tr).count(); }
     { extern double g_bsReadback; g_bsReadback += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tRb0).count(); }
     if (s_bd)
     {   // Identity of the framebuffer actually being read, to compare against [maskzero].
@@ -1439,25 +1476,154 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
         // ~25 ms/frame. Layout-independent (the shadow is the FBO image); a format or mask
         // change forces a full write.
         static const bool s_fdiff = [](){ const char *v = std::getenv("PS2X_FLUSHDIFF"); return !(v && v[0] == '0'); }();
-        struct Shadow { uint32_t psm = 0, mask = 0; int w = 0, h = 0; uint32_t seq = 0; std::vector<uint32_t> px; };
+        struct Shadow { uint32_t psm = 0, mask = 0; int w = 0, h = 0; uint32_t seq = 0; std::vector<uint32_t> px; std::vector<uint8_t> unk; /* [shrows] 1 = row content unknown */ };
         static std::unordered_map<uint32_t, Shadow> s_shadow; static std::vector<uint8_t> s_skip;
         extern const uint8_t *g_wbSkipMask; g_wbSkipMask = nullptr;
-        Shadow &sh = s_shadow[fbp];
+        // [shview] one shadow per (fbp, psm) view: a flush through the other format stamps the pages it
+        // wrote (onVramWriteback), which the band logic below turns into forced rows -- so the
+        // format alternation costs a band write instead of a full page.
+        Shadow &sh = s_shadow[(fbp << 8) | (fit->second.psm & 0xFFu)];
         // Any other VRAM writer (depth writeback, another-format flush, guest upload) bumps the
         // page range's content sequence; if it moved since the shadow was taken, VRAM no longer
         // matches the shadow and every pixel must be written.
         const uint32_t bppF = (fit->second.psm == 0x02u || fit->second.psm == 0x0Au || fit->second.psm == 0x32u || fit->second.psm == 0x3Au) ? 16u : (fit->second.psm == 0x13u || fit->second.psm == 0x1Bu) ? 8u : (fit->second.psm == 0x14u || fit->second.psm == 0x24u || fit->second.psm == 0x2Cu) ? 4u : 32u;
         const uint32_t nPagesF = (uint32_t)(((uint64_t)w * h * bppF / 8u + 8191u) / 8192u);
         auto pageSeqMax = [&]() { uint32_t mx = 0; for (uint32_t p = fbp; p < fbp + nPagesF && p < kVramPages; ++p) mx = std::max(mx, m_contentSeq[p]); return mx; };
-        if (s_fdiff && sh.psm == fit->second.psm && sh.mask == wbMask && sh.w == w && sh.h == h && sh.px.size() == px.size() && !rectUsed && sh.seq == pageSeqMax())
-        {
-            s_skip.assign(px.size(), 0u); size_t nch = 0;
-            for (size_t i = 0; i < px.size(); ++i) if (px[i] != sh.px[i]) { s_skip[i] = 1u; ++nch; }
-            if (nch < px.size()) g_wbSkipMask = s_skip.data();
+        extern const std::pair<int,int> *g_wbRowRange; g_wbRowRange = nullptr;
+        static const bool s_frows = [](){ const char *v = std::getenv("PS2X_FLUSHROWS"); return !(v && v[0] == '0'); }();
+        static std::vector<std::pair<int,int>> s_rows;
+        // [flushrectdiff] PS2X_FLUSHRECTDIFF (default ON, =0 off): dirty-rect flushes used to bypass
+        // the shadow diff and write the whole rect (1800 of 2460 fight flushes, 61M pixels per
+        // stat interval). The shadow is kept valid across rect flushes: with a valid shadow only
+        // the rect rows are diffed and then patched into it; with an invalid one the rect is
+        // written and the shadow refreshed from a full FBO readback (VRAM == FBO everywhere after
+        // a rect flush, by the rect invariant), which costs a readback but no VRAM writes.
+        static const bool s_frd = [](){ const char *v = std::getenv("PS2X_FLUSHRECTDIFF"); return !(v && v[0] == '0'); }();
+        // [shbands] PS2X_SHBANDS (default ON, =0 off): a content-seq bump inside the page range no
+        // longer voids the whole shadow. Attribution showed every such bump in the fight was one
+        // of OUR writebacks of an overlapping buffer (f368<->f336 two-stride alias, f224's pages
+        // 224-239 inside f112's 512-row FBO, the 64x64 RT page 504): only the pages that moved
+        // hold new bytes, so only the rows those pages map to must be written in full; every
+        // other row is still diffed. Exact by construction.
+        static const bool s_bands = [](){ const char *v = std::getenv("PS2X_SHBANDS"); return !(v && v[0] == '0'); }();
+        static std::vector<uint8_t> s_rowForce;   // 1 = row must be written in full
+        bool anyForce = false;
+        const bool shBase = s_fdiff && sh.psm == fit->second.psm && sh.mask == wbMask && sh.w == w && sh.h == h && sh.px.size() == px.size() && sh.unk.size() == (size_t)h;
+        bool shValid = shBase && sh.seq == pageSeqMax();
+        if (shBase)
+        {   // [shrows] rows whose VRAM content is unknown (never written full-width since the shadow
+            // was (re)built) are always written in full within the flush window
+            s_rowForce.assign((size_t)h, 0u);
+            for (int y = 0; y < h; ++y) if (sh.unk[(size_t)y]) { s_rowForce[(size_t)y] = 1u; anyForce = true; }
         }
+        if (shBase && !shValid && s_bands)
+        {
+            // page -> row band for this layout: a GS page is 64x32 px at 32 bpp, 64x64 at 16 bpp,
+            // 128x64 at 8 bpp; fbw pages span one band of rows across the buffer width.
+            const int bandRows = (bppF == 32u) ? 32 : (bppF == 16u) ? 64 : 64;
+            const uint32_t pagesPerBand = std::max(1u, (fit->second.fbw ? fit->second.fbw : 1u) * ((bppF == 8u) ? 1u : 1u));
+            bool ok = (bppF == 32u || bppF == 16u);   // 8/4-bpp page geometry differs (128x64): keep the full invalidation there
+            for (uint32_t p = fbp; ok && p < fbp + nPagesF && p < kVramPages; ++p)
+            {
+                if (m_contentSeq[p] <= sh.seq) continue;
+                const uint32_t band = (p - fbp) / pagesPerBand;
+                const int r0 = (int)(band * (uint32_t)bandRows), r1 = std::min(h, r0 + bandRows);
+                if (r0 >= h) continue;
+                for (int y = r0; y < r1; ++y) s_rowForce[(size_t)y] = 1u;
+                anyForce = true;
+            }
+            if (ok) { extern unsigned long g_shBandFlushes; ++g_shBandFlushes; }
+            shValid = ok;
+        }
+        const bool shHit = shValid && (!rectUsed || s_frd);
+        {   // [shstat] why does a flush miss its shadow? (printed with [secstat])
+            extern unsigned long g_shHit, g_shMissNone, g_shMissPsm, g_shMissMask, g_shMissSize, g_shMissRect, g_shMissSeq;
+            if (shHit) ++g_shHit;
+            else if (sh.px.empty()) ++g_shMissNone;
+            else if (sh.psm != fit->second.psm) ++g_shMissPsm;
+            else if (sh.mask != wbMask) ++g_shMissMask;
+            else if (sh.w != w || sh.h != h || sh.px.size() != px.size()) ++g_shMissSize;
+            else if (rectUsed && !s_frd) ++g_shMissRect;
+            else
+            {
+                ++g_shMissSeq;
+                extern std::vector<std::pair<uint32_t,uint32_t>> g_pageStampSrc; extern std::map<std::string, unsigned long> g_seqMissHist;
+                uint32_t mx = 0, mp = 0; for (uint32_t p = fbp; p < fbp + nPagesF && p < kVramPages; ++p) if (m_contentSeq[p] > mx) { mx = m_contentSeq[p]; mp = p; }
+                char kbuf[96]; const auto src = (mp < g_pageStampSrc.size()) ? g_pageStampSrc[mp] : std::pair<uint32_t,uint32_t>{0u, 0u};
+                std::snprintf(kbuf, sizeof kbuf, "f%u<-page%u(dbp %u +%u)", fbp, mp, src.first, src.second);
+                ++g_seqMissHist[kbuf];
+            }
+        }
+        if (shHit)
+        {
+            if (s_frows || rectUsed || anyForce)
+            {   // [flushrows] per-row memcmp against the shadow -> [x0,x1) of changed pixels per row.
+                // The per-pixel mask made every flush scan all 229k pixels twice (diff + write
+                // loop) to write ~3 rows; re-writing a pixel equal to the shadow is idempotent, so
+                // a row range is enough.
+                static const bool s_pixmask = [](){ const char *v = std::getenv("PS2X_ROWMASK"); return !(v && v[0] == '0'); }();
+                bool maskUsed = false;
+                s_rows.assign((size_t)h, {0, 0});
+                const int dy0 = rectUsed ? rY0 : 0, dy1 = rectUsed ? rY1 : h, dx0 = rectUsed ? rX0 : 0, dx1 = rectUsed ? rX1 : w;
+                for (int y = dy0; y < dy1; ++y)
+                {
+                    const uint32_t *a = px.data() + (size_t)y * w + dx0, *b = sh.px.data() + (size_t)y * w + dx0;
+                    const int n = dx1 - dx0; if (n <= 0) continue;
+                    if (anyForce && s_rowForce[(size_t)y])
+                    {   // [shbands] forced row: whole window, and (if masking) every pixel enabled
+                        s_rows[(size_t)y] = {dx0, dx1};
+                        if (s_pixmask) { if (s_skip.size() != px.size()) s_skip.assign(px.size(), 0u); std::memset(s_skip.data() + (size_t)y * w + dx0, 1, (size_t)n); maskUsed = true; }
+                        continue;
+                    }
+                    if (std::memcmp(a, b, (size_t)n * 4u) == 0) continue;
+                    int x0 = 0; while (a[x0] == b[x0]) ++x0;
+                    int x1 = n - 1; while (a[x1] == b[x1]) --x1;
+                    s_rows[(size_t)y] = {dx0 + x0, dx0 + x1 + 1};
+                    if (s_pixmask)
+                    {   // [rowmask] sparse changes inside a wide span: mask the unchanged pixels of this row
+                        if (s_skip.size() != px.size()) s_skip.assign(px.size(), 0u);
+                        uint8_t *m = s_skip.data() + (size_t)y * w + dx0;
+                        for (int x = x0; x <= x1; ++x) m[x] = (a[x] != b[x]) ? 1u : 0u;
+                        maskUsed = true;
+                    }
+                }
+                g_wbRowRange = s_rows.data();
+                if (maskUsed) g_wbSkipMask = s_skip.data();   // forced rows keep a null-mask semantics via the range only
+            }
+            else
+            {
+                s_skip.assign(px.size(), 0u); size_t nch = 0;
+                for (size_t i = 0; i < px.size(); ++i) if (px[i] != sh.px[i]) { s_skip[i] = 1u; ++nch; }
+                if (nch < px.size()) g_wbSkipMask = s_skip.data();
+            }
+        }
+    { extern double g_flWrite; const auto tw = std::chrono::steady_clock::now();
     ps2xWritebackToVramMasked(fbp, fit->second.fbw, fit->second.psm, w, h, px.data(), wbMask);
+      g_flWrite += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count(); }
         { extern const uint8_t *g_wbSkipMask; g_wbSkipMask = nullptr; }
-        if (s_fdiff) { sh.psm = fit->second.psm; sh.mask = wbMask; sh.w = w; sh.h = h; sh.px = px; sh.seq = pageSeqMax(); }
+        g_wbRowRange = nullptr;
+        if (s_fdiff)
+        {
+            const bool fullWidth = !rectUsed || (rX0 <= 0 && rX1 >= w);
+            const bool rebuilt = !shBase;
+            sh.psm = fit->second.psm; sh.mask = wbMask; sh.w = w; sh.h = h;
+            if (rebuilt) { sh.px.assign(px.size(), 0u); sh.unk.assign((size_t)h, 1u); }
+            if (!rectUsed)
+            {   // full flush: every row written full-width -> all known
+                sh.px.swap(px);
+                std::fill(sh.unk.begin(), sh.unk.end(), (uint8_t)0);
+            }
+            else
+            {   // rect flush: patch the rect rows; a row becomes known only when written full-width
+                for (int y = rY0; y < rY1; ++y)
+                {
+                    std::memcpy(sh.px.data() + (size_t)y * w + rX0, px.data() + (size_t)y * w + rX0, (size_t)(rX1 - rX0) * 4u);
+                    const bool forced = rebuilt || (anyForce && s_rowForce[(size_t)y]);
+                    if (forced) sh.unk[(size_t)y] = fullWidth ? 0u : 1u;
+                }
+            }
+            sh.seq = pageSeqMax();
+        }
         { extern int g_wbLastWrittenRows; extern long g_bsRowsWritten; extern int g_bsZeroFlush; g_bsRowsWritten += g_wbLastWrittenRows; if (g_wbLastWrittenRows == 0) ++g_bsZeroFlush; }
     }
     { extern int g_wbRectX0, g_wbRectY0, g_wbRectX1, g_wbRectY1; g_wbRectX0 = g_wbRectY0 = g_wbRectX1 = g_wbRectY1 = -1; }
@@ -1517,13 +1683,21 @@ bool GsGpuRenderer::serviceBlockingBarriers()
             if (g_bbQueue.empty()) break;
             r = g_bbQueue.front(); g_bbQueue.pop_front();
         }
+        extern double g_bbPickup, g_bbRender, g_bbFlush; extern int g_bbN;
+        const auto tPick = std::chrono::steady_clock::now();
         bool pending = false;
         { std::lock_guard<std::mutex> lk(m_mtx); pending = !m_pending.empty(); }
         if (pending) renderAndGetTextureId(512, 448);
         renderRange(512, 448);
+        const auto tRend = std::chrono::steady_clock::now();
         m_flushAlphaNow = r.alpha;
         flushPageToVram(r.page);
         m_flushAlphaNow = false;
+        const auto tFl = std::chrono::steady_clock::now();
+        g_bbPickup += std::chrono::duration<double, std::milli>(tPick - r.tPost).count();
+        g_bbRender += std::chrono::duration<double, std::milli>(tRend - tPick).count();
+        g_bbFlush  += std::chrono::duration<double, std::milli>(tFl - tRend).count();
+        ++g_bbN;
         g_barFlushed.insert(r.page);
         {
             std::lock_guard<std::mutex> lk(g_bbMx);
@@ -1540,9 +1714,34 @@ void GsGpuRenderer::waitForBlockingBarrierRequest(int micros)
 {
     std::unique_lock<std::mutex> lk(g_bbMx);
     if (!g_bbQueue.empty()) return;
-    g_bbCv.wait_for(lk, std::chrono::microseconds(micros), [&]{ return !g_bbQueue.empty(); });
+    g_bbCv.wait_for(lk, std::chrono::microseconds(micros), [&]{ return !g_bbQueue.empty() || g_preReady.load(std::memory_order_relaxed); });
 }
 void GsGpuRenderer::abortBlockingBarriers() { g_bbAbort.store(true); g_bbCv.notify_all(); }
+bool GsGpuRenderer::prerenderChunk()
+{
+    // [prerender] Between barriers the GL thread used to sit in the wait above while the guest
+    // recorded the next segment, and at the barrier the whole segment was drawn while the guest
+    // waited -- the two threads ran strictly serialized (perf: each ~half a core). Draw what is
+    // already recorded now, so the barrier only has the tail + the flush left. Chunk mode copies
+    // the new commands under m_mtx (O(frame) per frame, unlike the old whole-list copy) and
+    // renders them exactly as a segment render would, resuming at 0 inside the chunk.
+    const int k = prerenderK();
+    if (k <= 0 || !m_glInit || !ps2xOnGlThread()) return false;
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        g_preReady.store(false, std::memory_order_relaxed);
+        if (!m_pending.empty()) return false;   // end-of-frame render of the previous list is owed first
+        const size_t n = m_building.size();
+        if (n < m_segFrom || n - m_segFrom < (size_t)k) return false;
+        m_chunk.assign(m_building.begin() + (std::ptrdiff_t)m_segFrom, m_building.begin() + (std::ptrdiff_t)n);
+        m_chunkBase = m_segFrom;
+    }
+    ++g_preChunks; g_preCmds += m_chunk.size();
+    m_chunkMode = true; m_segMode = true;
+    renderAndGetTextureId(512, 448);
+    m_segMode = false; m_chunkMode = false;
+    return true;
+}
 bool GsGpuRenderer::blockingBarriersEnabled() { return s_barBlockEnv; }
 
 bool GsGpuRenderer::takeBarrierRequest(uint32_t &page)
@@ -1614,11 +1813,13 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
         void *waitScope = ps2xGuestWaitBegin();
         std::unique_lock<std::mutex> lk(g_bbMx);
         const uint64_t mine = ++g_bbPosted;
-        g_bbQueue.push_back({page, wantsAlphaAsData});
+        const auto tPost = std::chrono::steady_clock::now();
+        g_bbQueue.push_back({page, wantsAlphaAsData, tPost});
         g_bbCv.notify_all();
         const bool ok = g_bbCv.wait_for(lk, std::chrono::milliseconds(500), [&]{ return g_bbServed >= mine || g_bbAbort.load(); });
         lk.unlock();
         ps2xGuestWaitEnd(waitScope);
+        { extern double g_bbTotal; g_bbTotal += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tPost).count(); }
         if (!ok) { static int n = 0; if (n++ < 8) std::fprintf(stderr, "[barblock] timeout waiting for page %u (posted %llu served %llu)\n", page, (unsigned long long)mine, (unsigned long long)g_bbServed); }
         return;
     }
@@ -1654,6 +1855,10 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
         size_t segCmds = 0; { std::lock_guard<std::mutex> lk(m_mtx); segCmds = m_building.size() > m_segFrom ? m_building.size() - m_segFrom : 0; }
         if (s_bs) { ++g_bsPages[page]; g_bsCmds += (long)segCmds; ++g_bsSegHist[segCmds == 0 ? 0 : segCmds <= 4 ? 1 : segCmds <= 32 ? 2 : segCmds <= 256 ? 3 : 4]; }
         const auto t0 = std::chrono::steady_clock::now();
+        {   // PS2X_PRERENDER_RIG=1: exercise chunk mode on the replay (parity test for [prerender])
+            static const bool s_prr = [](){ const char *v = std::getenv("PS2X_PRERENDER_RIG"); return v && v[0] && v[0] != '0'; }();
+            if (s_prr) prerenderChunk();
+        }
         renderRange(512, 448);
         const auto t1 = std::chrono::steady_clock::now();
         m_flushAlphaNow = wantsAlphaAsData;
@@ -3005,12 +3210,25 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
         }
     }
     m_building.push_back(c);
+    {   // [prerender] wake the GL thread once a chunk's worth of new commands is waiting
+        const int k = prerenderK();
+        if (k > 0 && m_building.size() > m_segFrom && ((m_building.size() - m_segFrom) % (size_t)k) == 0u && !g_preReady.exchange(true))
+            g_bbCv.notify_all();
+    }
     ++m_recordCount;
 }
 
 extern "C" void ps2xGsRecordVsync();   // PS2X_GS_RECORD (ps2_gs_gpu.cpp); a function-body
                                        // extern "C" is a syntax error, it must live here
 double g_bsRender = 0, g_bsFlush = 0; int g_bsCount = 0;   // [barstat]
+double g_bbPickup = 0, g_bbRender = 0, g_bbFlush = 0, g_bbTotal = 0; int g_bbN = 0;   // [bbstat] blocking-barrier legs per frame (ms)
+double g_rsA = 0, g_rsB = 0, g_rsC = 0, g_rsD = 0, g_rsTot = 0;   // [secstat] segment-render sections: pre-census, census+reorder, draw loop, post, total
+double g_flDepth = 0, g_flRead = 0, g_flWrite = 0, g_flTot = 0;      // [secstat] flush sections
+unsigned long g_shRefresh = 0;   // [flushrectdiff]
+unsigned long g_shBandFlushes = 0;   // [shbands]
+std::vector<std::pair<uint32_t,uint32_t>> g_pageStampSrc;   // [seqattr] page -> (dbp, sizeBlocks) of the last stamping upload
+std::map<std::string, unsigned long> g_seqMissHist;          // [seqattr] "fbp->page<-dbp+size" -> count
+unsigned long g_shHit = 0, g_shMissNone = 0, g_shMissPsm = 0, g_shMissMask = 0, g_shMissSize = 0, g_shMissRect = 0, g_shMissSeq = 0;   // [shstat]
 int g_tcCount = 0, g_tcFrames = 0; double g_tcLum = 0, g_tcAlpha = 0;   // [tilecount]
 int g_caTiles = 0, g_caCovers = 0; uint32_t g_caDest = 0; char g_caFirst[160] = {0};   // [coverafter]
 double g_bsReadback = 0, g_bsWrite = 0;                    // [barstat] inside flushPageToVram
@@ -3035,6 +3253,20 @@ void GsGpuRenderer::swapFrame()
         if (s_bs && (g_bsCount || (++fr % 60) == 0))
         {
             std::fprintf(stderr, "[barstat] frame: %d barriers, render %.1f ms, flush %.1f ms (readback %.1f, vramwrite %.1f) | cmds drawn %ld | pages:", g_bsCount, g_bsRender, g_bsFlush, g_bsReadback, g_bsWrite, g_bsCmds);
+            { extern double g_bbPickup, g_bbRender, g_bbFlush, g_bbTotal; extern int g_bbN;
+              { extern unsigned long g_preChunks, g_preCmds; std::fprintf(stderr, "[bbstat] blocking barriers %d: pickup %.1f  render %.1f  flush %.1f  resume %.1f  (guest-side total %.1f ms) | prerendered %lu chunks / %lu cmds\n", g_bbN, g_bbPickup, g_bbRender, g_bbFlush, g_bbTotal - g_bbPickup - g_bbRender - g_bbFlush, g_bbTotal, g_preChunks, g_preCmds); g_preChunks = g_preCmds = 0; }
+              extern double g_rsA, g_rsB, g_rsC, g_rsD, g_rsTot, g_flDepth, g_flRead, g_flWrite, g_flTot;
+  std::fprintf(stderr, "[secstat] render: pre %.0f  census+reorder %.0f  drawloop %.0f  post %.0f  (total %.0f) | flush: depth %.0f  read %.0f  write %.0f  other %.0f (total %.0f)\n",
+               g_rsA, g_rsB, g_rsC, g_rsD, g_rsTot, g_flDepth, g_flRead, g_flWrite, g_flTot - g_flDepth - g_flRead - g_flWrite, g_flTot);
+  { extern unsigned long g_shHit, g_shMissNone, g_shMissPsm, g_shMissMask, g_shMissSize, g_shMissRect, g_shMissSeq; extern unsigned long g_wbPixelsWritten;
+    extern unsigned long g_shRefresh;
+    std::fprintf(stderr, "[shstat] shadow hit %lu | miss: none %lu psm %lu mask %lu size %lu rect %lu seq %lu | refreshes %lu | band-flushes %lu | pixels written %lu\n", g_shHit, g_shMissNone, g_shMissPsm, g_shMissMask, g_shMissSize, g_shMissRect, g_shMissSeq, g_shRefresh, g_shBandFlushes, g_wbPixelsWritten);
+    { extern std::map<std::string, unsigned long> g_seqMissHist; std::vector<std::pair<unsigned long,std::string>> v; for (auto &kv : g_seqMissHist) v.push_back({kv.second, kv.first});
+      std::sort(v.rbegin(), v.rend()); std::fprintf(stderr, "[seqattr]"); for (size_t i = 0; i < v.size() && i < 6; ++i) std::fprintf(stderr, "  %s x%lu", v[i].second.c_str(), v[i].first); std::fprintf(stderr, "\n"); g_seqMissHist.clear(); }
+    { extern unsigned long g_shBandFlushes; g_shBandFlushes = 0; }
+    g_shHit = g_shMissNone = g_shMissPsm = g_shMissMask = g_shMissSize = g_shMissRect = g_shMissSeq = 0; g_shRefresh = 0; g_wbPixelsWritten = 0; }
+  g_rsA = g_rsB = g_rsC = g_rsD = g_rsTot = g_flDepth = g_flRead = g_flWrite = g_flTot = 0;
+  g_bbPickup = g_bbRender = g_bbFlush = g_bbTotal = 0; g_bbN = 0; }
             for (auto &kv : g_bsPages) std::fprintf(stderr, " %u:%d", kv.first, kv.second);
             std::fprintf(stderr, " | seg sizes 0:%d 1-4:%d 5-32:%d 33-256:%d >256:%d | rows written %ld, zero-change flushes %d\n", g_bsSegHist[0], g_bsSegHist[1], g_bsSegHist[2], g_bsSegHist[3], g_bsSegHist[4], g_bsRowsWritten, g_bsZeroFlush);
         }
@@ -3118,6 +3350,8 @@ void GsGpuRenderer::onVramUpload(uint32_t dbpBlock, uint32_t sizeBlocks)
         m_pageSeq[p] = m_writeSeq;
         m_contentSeq[p] = m_writeSeq;
     }
+    { extern std::vector<std::pair<uint32_t,uint32_t>> g_pageStampSrc; if (g_pageStampSrc.size() < kVramPages) g_pageStampSrc.resize(kVramPages);
+      for (uint32_t p = p0; p <= p1; ++p) g_pageStampSrc[p] = {dbpBlock, sizeBlocks}; }   // [seqattr] upload
 }
 
 // Content-only stamp: makes cached decodes of these pages re-key, WITHOUT touching m_pageSeq
@@ -3130,6 +3364,8 @@ void GsGpuRenderer::onVramWriteback(uint32_t dbpBlock, uint32_t sizeBlocks)
     if (p0 >= kVramPages) p0 = kVramPages - 1;
     if (p1 >= kVramPages) p1 = kVramPages - 1;
     for (uint32_t p = p0; p <= p1; ++p) m_contentSeq[p] = m_writeSeq;
+    { extern std::vector<std::pair<uint32_t,uint32_t>> g_pageStampSrc; if (g_pageStampSrc.size() < kVramPages) g_pageStampSrc.resize(kVramPages);
+      for (uint32_t p = p0; p <= p1; ++p) g_pageStampSrc[p] = {dbpBlock, sizeBlocks | 0x80000000u}; }   // [seqattr] writeback stamp (bit31)
 }
 
 uint64_t GsGpuRenderer::recordedThisSecond()
@@ -3258,6 +3494,22 @@ void GsGpuRenderer::ensureGl(int w, int h)
 
 unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
 {
+    // [secstat] section timers (segment renders only; summed, printed with [bbstat])
+    struct SecStat {
+        bool on; std::chrono::steady_clock::time_point t0, t1{}, t2{}, t3{};
+        explicit SecStat(bool seg) : on(seg), t0(std::chrono::steady_clock::now()) {}
+        ~SecStat() {
+            if (!on) return;
+            extern double g_rsA, g_rsB, g_rsC, g_rsD, g_rsTot;
+            const auto te = std::chrono::steady_clock::now();
+            auto ms = [](auto x, auto y){ return std::chrono::duration<double, std::milli>(y - x).count(); };
+            g_rsTot += ms(t0, te);
+            if (t1.time_since_epoch().count()) g_rsA += ms(t0, t1);
+            if (t2.time_since_epoch().count()) g_rsB += ms(t1, t2);
+            if (t3.time_since_epoch().count()) { g_rsC += ms(t2, t3); g_rsD += ms(t3, te); }
+            else if (t2.time_since_epoch().count()) g_rsC += ms(t2, te);   // segment renders return before the post section
+        }
+    } secStat(m_segMode);
     ensureGl(fbWidth, fbHeight);
     if (g_liveStageArmed)
     {   // [livesync] FBOs hold the last COMPLETED render; read them here (GL thread) with the
@@ -3346,7 +3598,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     }
 
     std::vector<DrawCmd> cmds;
-    struct SegSwapBack { std::vector<DrawCmd> &a, &b; bool on; ~SegSwapBack() { if (on) a.swap(b); } } segSwapBack{cmds, m_building, m_segMode};
+    struct SegSwapBack { std::vector<DrawCmd> &a, &b; bool on; ~SegSwapBack() { if (on) a.swap(b); } } segSwapBack{cmds, m_chunkMode ? m_chunk : m_building, m_segMode};
     std::vector<DrawCmd> prevCmds;
     std::vector<size_t> listStarts; // index into cmds where each published list begins (frame boundaries)
     size_t nLists = 0;              // published lists concatenated into cmds this call
@@ -3376,7 +3628,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // list still being built. m_pending is left alone -- the end-of-frame render drains it.
         // [segswap] Segment renders used to COPY the whole in-progress list (40k DrawCmds) per
         // barrier -- ~330 MB of memcpy per frame at 41 barriers. Swap it in and back instead.
-        if (m_segMode) { cmds.swap(m_building); nLists = 1; }
+        if (m_segMode) { cmds.swap(m_chunkMode ? m_chunk : m_building); nLists = 1; }   // [prerender] chunk mode swaps the copy in
         frameGen = g_publishGen;
         if (g_interpOn)
         {
@@ -3604,7 +3856,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                                                      return (size_t)(n > 0 ? n : 192) * 1024u * 1024u; }();
             {   // [supersede] reclaim superseded versions not referenced by any not-yet-drawn list
                 static const int s_sup = [](){ const char *v = std::getenv("PS2X_SUPERSEDE"); return v ? std::atoi(v) : 1; }();   // 0 off, 1 full, 2 CPU-entry only, 3 GL-object only
-                if (s_sup && !g_superseded.empty())
+                if (s_sup && !g_superseded.empty() && !m_segMode)   // whole-list walk: end-of-frame render only, never per barrier
                 {
                     std::unordered_set<uint64_t> inflightS;
                     for (const DrawCmd &ic : cmds) if (ic.texKey) inflightS.insert(ic.texKey);
@@ -3641,7 +3893,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 extern unsigned long g_evictDrawHits;
                 const auto now = std::chrono::steady_clock::now();
                 if (s_cst && now - t0 >= std::chrono::seconds(1))
-                { std::fprintf(stderr, "[cachestat] entries %zu  %zu MB (budget %zu MB)  decodes/s %lu  evicted/s %lu  evict-then-draw/s %lu  reclaimed-total %lu  came-back-total %lu  id-reuse %lu deleted-live %zu\n", m_texCache.size(), cacheBytes >> 20, s_cacheBytes >> 20, g_putTexCount - lastPut, g_evictCount - lastEv, g_evictDrawHits - lastEd, g_supReclaimed, g_reDecodeReclaimed, g_idReuse, g_deletedIds.size()); lastPut = g_putTexCount; lastEv = g_evictCount; lastEd = g_evictDrawHits; t0 = now; }
+                { std::fprintf(stderr, "[cachestat] entries %zu  %zu MB (budget %zu MB)  decodes/s %lu  evicted/s %lu  evict-then-draw/s %lu  reclaimed-total %lu  came-back-total %lu  id-reuse %lu deleted-live %zu | hashmemo hit %lu compute %lu selfcheck %lu MISMATCH %lu\n", m_texCache.size(), cacheBytes >> 20, s_cacheBytes >> 20, g_putTexCount - lastPut, g_evictCount - lastEv, g_evictDrawHits - lastEd, g_supReclaimed, g_reDecodeReclaimed, g_idReuse, g_deletedIds.size(), g_hashMemoHit, g_hashMemoCompute, g_hashMemoChecked, g_hashMemoMiss); lastPut = g_putTexCount; lastEv = g_evictCount; lastEd = g_evictDrawHits; t0 = now; }
             }
             // CONTENT-SWAP PURGE (PS2X_SWAPPURGE=0 disables).
             //
@@ -3904,11 +4156,19 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // its second scene buffer as rows 448..896 of a tall surface — folding EVERY cmd's
         // scissor in gave dispH=896, so present cropped 896 rows from a 448-tall FBO -> the
         // black/garbage fight window.
-        for (const DrawCmd &c : cmds)
-        {
-            if (c.sw <= 0 || c.sh <= 0) continue;
-            if (c.sx + c.sw > w) w = c.sx + c.sw;
-            if (c.sy + c.sh > h) h = c.sy + c.sh;
+        {   // [cencache] incremental over the segment prefix (a max is order-independent)
+            static uint64_t s_dGen = ~0ull; static size_t s_dDone = 0; static int s_dW = 0, s_dH = 0;
+            const uint64_t gen = m_segMode ? g_publishGen : ~0ull;
+            const size_t dBase = m_chunkMode ? m_chunkBase : 0;   // [prerender]
+            if (!m_segMode || s_dGen != gen || s_dDone > dBase + cmds.size() || s_dDone < dBase) { s_dGen = gen; s_dDone = dBase; s_dW = s_dH = 0; }
+            for (size_t ci = s_dDone - dBase; ci < cmds.size(); ++ci)
+            {
+                const DrawCmd &c = cmds[ci];
+                if (c.sw <= 0 || c.sh <= 0) continue;
+                if (c.sx + c.sw > s_dW) s_dW = c.sx + c.sw;
+                if (c.sy + c.sh > s_dH) s_dH = c.sy + c.sh;
+            }
+            s_dDone = dBase + cmds.size(); w = s_dW; h = s_dH;
         }
         if (w > 0) m_dispW = w;
         if (h > 0) m_dispH = h;
@@ -3982,16 +4242,36 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         }
     }
 
+    secStat.t1 = std::chrono::steady_clock::now();   // [secstat]
     // ---- Classify framebuffers & pick the display buffer ----
     // A fbp that is both drawn-to AND sampled-as-a-texture is an offscreen render target.
     // The display buffer is the drawn-to fbp with the most coverage that ISN'T sampled.
-    std::unordered_set<uint32_t> sourceFbps;
-    std::unordered_map<uint32_t, int> rtTexW, rtTexH, destFbwById;
-    std::unordered_map<uint64_t, double> viewArea;   // (fbp<<8 | FRAME.PSM) -> area drawn through that view
-    std::unordered_map<uint32_t, double> destArea;
-    for (const DrawCmd &c : cmds)
+    // [cencache] Under blocking barriers this census ran over the WHOLE building list on every
+    // segment render (~86 per fight frame x tens of thousands of commands): the single largest
+    // GL-thread cost in the perf profile. The list only ever grows between segments of one
+    // frame, so accumulate into frame-level state keyed on the publish generation and process
+    // only the commands appended since the previous segment. Sums run in the same order over
+    // the same prefix, so the results are bit-identical to the full pass. The end-of-frame
+    // (non-segment) render still does the full pass from scratch.
+    struct CensusState {
+        uint64_t gen = ~0ull; size_t done = 0;
+        std::unordered_set<uint32_t> sourceFbps;
+        std::unordered_map<uint32_t, int> rtTexW, rtTexH, destFbwById;
+        std::unordered_map<uint64_t, double> viewArea;
+        std::unordered_map<uint32_t, double> destArea;
+    };
+    static CensusState s_cen;
+    const size_t cenBase = m_chunkMode ? m_chunkBase : 0;   // [prerender] list index of cmds[0]
+    static const bool s_cenCache = [](){ const char *v = std::getenv("PS2X_CENCACHE"); return !(v && v[0] == '0'); }();
     {
-        if (c.destFbw) destFbwById[c.destFbp] = static_cast<int>(c.destFbw);
+        const uint64_t gen = m_segMode ? g_publishGen : ~0ull;
+        if (!s_cenCache || !m_segMode || s_cen.gen != gen || s_cen.done > cenBase + cmds.size() || s_cen.done < cenBase)
+        { s_cen = CensusState{}; s_cen.gen = gen; s_cen.done = cenBase; }
+    }
+    for (size_t ci = s_cen.done - cenBase; ci < cmds.size(); ++ci)
+    {
+        const DrawCmd &c = cmds[ci];
+        if (c.destFbw) s_cen.destFbwById[c.destFbp] = static_cast<int>(c.destFbw);
         {   // area per (fbp, psm) view -- see the buffer re-view note below
             double va;
             if (c.isTriangle) {
@@ -4000,7 +4280,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                                               vy0 = std::min(vy0, c.tri[i].y); vy1 = std::max(vy1, c.tri[i].y); }
                 va = static_cast<double>(vx1 - vx0) * (vy1 - vy0);
             } else va = static_cast<double>(c.dx1 - c.dx0) * (c.dy1 - c.dy0);
-            viewArea[(static_cast<uint64_t>(c.destFbp) << 8) | c.destPsm] += std::abs(va);
+            s_cen.viewArea[(static_cast<uint64_t>(c.destFbp) << 8) | c.destPsm] += std::abs(va);
         }
         double area;
         if (c.isTriangle) {
@@ -4012,14 +4292,21 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // Its full-page area tripped the dbpresent double-buffer detector's in-progress
         // logic, flipping WHICH PARITY presents each frame -- the bracket-mode runs looked
         // "washed" purely because they presented the neighbouring frame.
-        if (!c.isVramBlit) destArea[c.destFbp] += area;
+        if (!c.isVramBlit) s_cen.destArea[c.destFbp] += area;
         if (c.srcTbp0) {
             uint32_t sf = tbp0ToFbp(c.srcTbp0);
-            sourceFbps.insert(sf);
-            if (c.srcTexW > rtTexW[sf]) rtTexW[sf] = c.srcTexW;
-            if (c.srcTexH > rtTexH[sf]) rtTexH[sf] = c.srcTexH;
+            s_cen.sourceFbps.insert(sf);
+            if (c.srcTexW > s_cen.rtTexW[sf]) s_cen.rtTexW[sf] = c.srcTexW;
+            if (c.srcTexH > s_cen.rtTexH[sf]) s_cen.rtTexH[sf] = c.srcTexH;
         }
     }
+    s_cen.done = cenBase + cmds.size();
+    // Working copies: the code below mutates these (operator[] inserts) and the cache must
+    // stay a pure function of the command prefix.
+    std::unordered_set<uint32_t> sourceFbps = s_cen.sourceFbps;
+    std::unordered_map<uint32_t, int> rtTexW = s_cen.rtTexW, rtTexH = s_cen.rtTexH, destFbwById = s_cen.destFbwById;
+    std::unordered_map<uint64_t, double> viewArea = s_cen.viewArea;   // (fbp<<8 | FRAME.PSM) -> area drawn through that view
+    std::unordered_map<uint32_t, double> destArea = s_cen.destArea;
     // ---- Buffer re-view (bit-depth aliasing) ----------------------------------------
     // BT3 draws into one address through two FRAME views in the same frame. The one that
     // shows is fbp0: the scene is PSMCT32 512x448, and a depth pass re-views the SAME memory
@@ -5095,6 +5382,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (s_zl.insert(__LINE__).second) \
                 std::fprintf(stderr, "[zpass] *** DROPPED at line %d *** dest=f%u fbmsk=%08x\n", \
                              __LINE__, c.destFbp, c.fbmsk); } } while (0)
+    secStat.t2 = std::chrono::steady_clock::now();   // [secstat]
     // Resume point. Segment renders advance m_segFrom as they go; the end-of-frame render
     // picks up where the last barrier left off instead of replaying (and re-blending) the
     // commands already drawn. The watermark is only meaningful when the indices line up:
@@ -5129,7 +5417,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
     };
     const bool segResume = m_segActive && reorderBuf.empty() &&
                            (m_segMode || nLists == 1) && m_segFrom <= DC.size();
-    const size_t ciStart = segResume ? m_segFrom : 0;
+    const size_t ciStart = (segResume && !m_chunkMode) ? m_segFrom : 0;   // [prerender] a chunk starts at its own 0
     {   // PS2X_SEGDIAG=1: which command range does each pass actually draw? If the end-of-frame
         // pass falls back to ciStart=0 after segment renders already drew part of the list,
         // every blended command is drawn TWICE and the picture brightens -- which is exactly
@@ -11574,7 +11862,7 @@ if (done.size() < 14 && !done.count(c.texKey))
     if (m_segMode)
     {
         endMode();
-        m_segFrom   = DC.size();
+        m_segFrom   = m_chunkMode ? m_chunkBase + DC.size() : DC.size();   // [prerender]
         m_segActive = true;
         return g_lastOutId;
     }
@@ -11666,6 +11954,7 @@ if (done.size() < 14 && !done.count(c.texKey))
     {
         static const bool s_td = [](){ const char *v = std::getenv("PS2X_TEXDIAG"); return v && v[0] && v[0] != '0'; }();
         static int s_tn = 0;
+        secStat.t3 = std::chrono::steady_clock::now();   // [secstat]
         if (s_td && (++s_tn % 120) == 0)
         {
             int nTri=0,nSpr=0,nXfer=0,nFromFbo=0,nDecoded=0,nMissing=0,nUntex=0,nToDisplay=0,nDispTex=0,nDispBlackSrc=0;

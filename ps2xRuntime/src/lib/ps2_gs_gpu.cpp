@@ -1624,10 +1624,16 @@ void ps2xVramReadBackT8H(uint32_t fbp, uint32_t tbw)
 
 // [livesync] guest-side drain: apply everything the present thread staged, at the caller's
 // (guest) stream position. Runs the SAME writeback functions with staging off.
+unsigned long g_ps2xWbGen = 0;
+unsigned long g_wbPixelsWritten = 0;   // [shstat]
+const std::pair<int,int> *g_wbRowRange = nullptr;   // [flushrows] per-row [x0,x1) to write, or null   // [hashmemo] bumped by every VRAM writeback (WBSTAMP is off by default, so m_contentSeq does not see them)
+
 void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
                                const uint32_t *px, uint32_t fbmsk);
 void ps2xApplyStagedWritebacks()
 {
+    ++g_ps2xWbGen;   // [hashmemo] any VRAM writeback invalidates memoised range hashes
+
     std::vector<StagedWb> work;
     {
         std::lock_guard<std::mutex> lk(g_stageWbMx);
@@ -1851,6 +1857,8 @@ extern "C" unsigned ps2xVramDiffOutside(uint32_t fbp, uint32_t fbw, uint32_t psm
 void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
                                const uint32_t *px, uint32_t fbmsk)
 {
+    ++g_ps2xWbGen;   // [hashmemo] any VRAM writeback invalidates memoised range hashes
+
     if (g_stageWrites)
     {
         std::lock_guard<std::mutex> lk(g_stageWbMx);
@@ -1902,12 +1910,21 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
     // written; px keeps the full w-stride layout.
     const int ry0 = (g_wbRectY0 >= 0) ? std::max(0, g_wbRectY0) : 0, ry1 = (g_wbRectY0 >= 0) ? std::min(h, g_wbRectY1) : h;
     const int rx0 = (g_wbRectY0 >= 0) ? std::max(0, g_wbRectX0) : 0, rx1 = (g_wbRectY0 >= 0) ? std::min(w, g_wbRectX1) : w;
+    const auto &wfn = gs->writeVramFn(psm); const auto &rfn = gs->readVramFn(psm);   // [wbhoist]
     int wrY0 = 1 << 30, wrY1 = -1;   // [flushdiff] rows actually written
     for (int y = ry0; y < ry1; ++y)
-        for (int x = rx0; x < rx1; ++x)
+    {
+        int xs = rx0, xe = rx1;
+        if (g_wbRowRange)
+        {   // [flushrows] per-row changed x-range from the shadow diff: unchanged rows cost one test
+            xs = std::max(xs, g_wbRowRange[(size_t)y].first); xe = std::min(xe, g_wbRowRange[(size_t)y].second);
+            if (xs >= xe) continue;
+        }
+        for (int x = xs; x < xe; ++x)
         {
             if (g_wbSkipMask && !g_wbSkipMask[(size_t)y * w + x]) continue;
             if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y;
+            ++g_wbPixelsWritten;
             const uint32_t nv = cvA(px[(size_t)y * w + x]);
             if (g_wbAlphaFillOnly)
             {   // RGB per the caller's mask (the previous version wrote it unconditionally,
@@ -1915,20 +1932,21 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
                 // the software rebuild's bands survive and the framebuffer's alpha fills the
                 // gaps. Wholesale alpha writes darken the sky (65 -> 36); protecting alpha
                 // entirely starves the mask (73.3% zero vs console's 24.1%).
-                const uint32_t ov = gs->ReadVram(psm, base, bw, (uint32_t)x, (uint32_t)y);
+                const uint32_t ov = rfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y);
                 const uint32_t rgbMask = fbmsk & 0x00FFFFFFu;
                 const uint32_t rgb = (ov & rgbMask) | (nv & ~rgbMask & 0x00FFFFFFu);
                 const uint32_t al  = (ov & 0xFF000000u) ? (ov & 0xFF000000u) : (nv & 0xFF000000u);
-                gs->WriteVram(psm, base, bw, (uint32_t)x, (uint32_t)y, rgb | al);
+                wfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y, rgb | al);
                 continue;
             }
             const bool p16 = s_wbPack16 && wbIs16(psm);
-            if (fbmsk == 0u) { gs->WriteVram(psm, base, bw, (uint32_t)x, (uint32_t)y, p16 ? wbPack16(nv) : nv); continue; }
-            uint32_t ov = gs->ReadVram(psm, base, bw, (uint32_t)x, (uint32_t)y);
+            if (fbmsk == 0u) { wfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y, p16 ? wbPack16(nv) : nv); continue; }
+            uint32_t ov = rfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y);
             if (p16) ov = wbUnpack16(ov & 0xFFFFu);
             const uint32_t mv = (ov & fbmsk) | (nv & ~fbmsk);
-            gs->WriteVram(psm, base, bw, (uint32_t)x, (uint32_t)y, p16 ? wbPack16(mv) : mv);
+            wfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y, p16 ? wbPack16(mv) : mv);
         }
+    }
     // A palette can BE a render target (BT3's outline CLUTs live in pages 499-500, which the
     // game renders into). The CLUT cache keys on m_texUploadGen, which only processImageData
     // bumps -- so without this a flushed palette would never be re-read.
@@ -1950,6 +1968,8 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
 
 void ps2xWritebackToVram(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h, const uint32_t *px)
 {
+    ++g_ps2xWbGen;   // [hashmemo] any VRAM writeback invalidates memoised range hashes
+
     GS *gs = g_gsWb ? g_gsWb : g_fmvGs;
     if (!gs || !px || w <= 0 || h <= 0) return;
     const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
