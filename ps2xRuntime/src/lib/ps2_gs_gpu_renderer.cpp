@@ -54,6 +54,9 @@ static std::condition_variable g_bbCv;
 static std::atomic<bool> g_preReady{false};   // [prerender] recordCmd raised: a chunk is waiting
 static int prerenderK() { static const int k = [](){ const char *v = std::getenv("PS2X_PRERENDER"); return v ? std::atoi(v) : 64; }(); return k; }   // 0 = off
 unsigned long g_preChunks = 0, g_preCmds = 0;   // [prerender] stats
+std::map<uint32_t, unsigned long> g_bbPageHist;   // [bbpages] blocking barriers per page
+std::map<uint32_t, double> g_bbPageMs;   // [bbpages] render+flush ms per page
+unsigned long g_bbSkipped = 0;   // [barskip]
 static std::deque<BarBlockReq> g_bbQueue;
 static uint64_t g_bbPosted = 0, g_bbServed = 0;
 static std::atomic<bool> g_bbAbort{false};
@@ -1697,6 +1700,8 @@ bool GsGpuRenderer::serviceBlockingBarriers()
         g_bbPickup += std::chrono::duration<double, std::milli>(tPick - r.tPost).count();
         g_bbRender += std::chrono::duration<double, std::milli>(tRend - tPick).count();
         g_bbFlush  += std::chrono::duration<double, std::milli>(tFl - tRend).count();
+        { extern std::map<uint32_t, unsigned long> g_bbPageHist; extern std::map<uint32_t, double> g_bbPageMs; ++g_bbPageHist[r.page];
+          g_bbPageMs[r.page] += std::chrono::duration<double, std::milli>(tFl - tPick).count(); }   // [bbpages]
         ++g_bbN;
         g_barFlushed.insert(r.page);
         {
@@ -1774,6 +1779,20 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
     if (!s_bar || !m_glInit) return;
     if (requireAligned && (srcBlock % 32u) != 0u) return;
     const uint32_t page = srcBlock / 32u;
+    {   // [barskip] PS2X_BARSKIP=p1,p2,...: no barrier for reads of these pages, on EVERY path
+        // (guest blocking, non-blocking, replay inline). Rig parity says whether a page's reads
+        // are already served correctly by the FBO path without the VRAM round trip.
+        // Default (BT3, measured 2026-08-27): 502,504 = the 64x64 cel-ramp RT (51% of all barriers;
+        // skipping it is not byte-identical but the only change is the REMOVAL of the black ground
+        // blob -- judge blob 1333 -> 100, rim/interior/edge-dip unchanged, i.e. closer to console),
+        // 368 = the fbp336 two-stride alias, 224 = the mask page (both byte-identical when skipped).
+        // Live: 2460 -> 780 barriers per stat interval, 12 -> 15 fps. PS2X_BARSKIP=- skips nothing.
+        static const std::unordered_set<uint32_t> s_skip = [](){ std::unordered_set<uint32_t> r; const char *v = std::getenv("PS2X_BARSKIP");
+            if (!v) v = "502,504,368,224";
+            if (v[0] == '-' || (v[0] == 'n' && v[1] == 'o')) return r;
+            { const char *q = v; while (*q) { char *e = nullptr; long n = std::strtol(q, &e, 10); if (e == q) break; r.insert((uint32_t)n); q = (*e == ',') ? e + 1 : e; } } return r; }();
+        if (s_skip.count(page)) { extern unsigned long g_bbSkipped; ++g_bbSkipped; return; }
+    }
     // PS2X_BARONLY=<page>[,<page>...]: restrict the barrier to named pages, to attribute a
     // visible change to the page that caused it.
     static const char *s_only = std::getenv("PS2X_BARONLY");
@@ -3255,6 +3274,7 @@ void GsGpuRenderer::swapFrame()
             std::fprintf(stderr, "[barstat] frame: %d barriers, render %.1f ms, flush %.1f ms (readback %.1f, vramwrite %.1f) | cmds drawn %ld | pages:", g_bsCount, g_bsRender, g_bsFlush, g_bsReadback, g_bsWrite, g_bsCmds);
             { extern double g_bbPickup, g_bbRender, g_bbFlush, g_bbTotal; extern int g_bbN;
               { extern unsigned long g_preChunks, g_preCmds; std::fprintf(stderr, "[bbstat] blocking barriers %d: pickup %.1f  render %.1f  flush %.1f  resume %.1f  (guest-side total %.1f ms) | prerendered %lu chunks / %lu cmds\n", g_bbN, g_bbPickup, g_bbRender, g_bbFlush, g_bbTotal - g_bbPickup - g_bbRender - g_bbFlush, g_bbTotal, g_preChunks, g_preCmds); g_preChunks = g_preCmds = 0; }
+  { extern std::map<uint32_t, unsigned long> g_bbPageHist; extern std::map<uint32_t, double> g_bbPageMs; extern unsigned long g_bbSkipped; std::fprintf(stderr, "[bbpages]"); for (auto &kv : g_bbPageHist) std::fprintf(stderr, " f%u:%lu(%.0fms)", kv.first, kv.second, g_bbPageMs[kv.first]); std::fprintf(stderr, " | skipped %lu\n", g_bbSkipped); g_bbPageHist.clear(); g_bbPageMs.clear(); g_bbSkipped = 0; }
               extern double g_rsA, g_rsB, g_rsC, g_rsD, g_rsTot, g_flDepth, g_flRead, g_flWrite, g_flTot;
   std::fprintf(stderr, "[secstat] render: pre %.0f  census+reorder %.0f  drawloop %.0f  post %.0f  (total %.0f) | flush: depth %.0f  read %.0f  write %.0f  other %.0f (total %.0f)\n",
                g_rsA, g_rsB, g_rsC, g_rsD, g_rsTot, g_flDepth, g_flRead, g_flWrite, g_flTot - g_flDepth - g_flRead - g_flWrite, g_flTot);
