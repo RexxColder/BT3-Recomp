@@ -26,6 +26,7 @@
 #include "raylib.h"
 #include "rlgl.h"
 extern "C" void glFinish(void);   // [unloadmode] drain experiment
+extern "C" void glFlush(void);    // [preflush]
 
 unsigned long g_texMints = 0, g_texRedecodes = 0;  // [vramdiag] churn accounting
 unsigned long g_uploadBlocks = 0;                 // GS VRAM blocks uploaded (64 words each)
@@ -1745,6 +1746,12 @@ bool GsGpuRenderer::prerenderChunk()
     m_chunkMode = true; m_segMode = true;
     renderAndGetTextureId(512, 448);
     m_segMode = false; m_chunkMode = false;
+    {   // [preflush] PS2X_PREFLUSH (default on, =0 off): hand the chunk to the GPU now. Without it the
+        // driver may sit on the batched commands until the barrier's glReadPixels forces them, and
+        // the GPU execution time lands on the critical path after all (scene barriers ~1.8 ms).
+        static const bool s_pf = [](){ const char *v = std::getenv("PS2X_PREFLUSH"); return !(v && v[0] == '0'); }();
+        if (s_pf) { rlDrawRenderBatchActive(); glFlush(); }
+    }
     return true;
 }
 bool GsGpuRenderer::blockingBarriersEnabled() { return s_barBlockEnv; }
