@@ -3245,7 +3245,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
             }
         }
     }
-    m_building.push_back(c);
+    m_building.push_back(std::move(c));   // [cmdmove] one copy instead of two (DrawCmd carries two shared_ptrs)
     {   // [prerender] wake the GL thread once a chunk's worth of new commands is waiting
         const int k = prerenderK();
         if (k > 0 && m_building.size() > m_segFrom && ((m_building.size() - m_segFrom) % (size_t)k) == 0u && !g_preReady.exchange(true))
