@@ -51,6 +51,7 @@ std::atomic<bool> g_vuCodeDumpReq{false}, g_vuCodeDumped{false}; // set by FCAND
 // total instructions/sec, to target the interpreter optimization at the hot ops.
 namespace {
     std::atomic<uint64_t> g_vuUpperHist[64];
+    std::atomic<uint64_t> g_vuLowerHist[128];
     std::atomic<uint64_t> g_vuTotalInstr{0};
     const bool g_vuProf = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_VUPROF"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
     // PS2X_MTXSEQ VU-side tracer (see run()): classify qw0-3 per run; force XGKICK dumps after a
@@ -289,7 +290,14 @@ namespace
         uint8_t upFs = 0u;
         uint8_t upFt = 0u;
         uint8_t upFd = 0u;
+        // [vulower] decoded lower slot (VU_LO_*), register indices and immediate resolved once per PC
+        uint8_t loKind = 0u;
+        uint8_t loA = 0u, loB = 0u, loC = 0u, loDest = 0u;
+        int32_t loImm = 0;
     };
+    enum : uint8_t { VU_LO_FALLBACK = 0, VU_LO_NOP, VU_LO_LQ, VU_LO_SQ, VU_LO_IADDIU, VU_LO_ISUBIU, VU_LO_IADD, VU_LO_ISUB,
+                     VU_LO_IADDI, VU_LO_IAND, VU_LO_IOR, VU_LO_MOVE, VU_LO_MR32, VU_LO_LQI, VU_LO_SQI, VU_LO_LQD, VU_LO_SQD,
+                     VU_LO_MTIR, VU_LO_MFIR };
     constexpr uint32_t kVuDecodeSlots = 2048u; // 16KB microcode / 8 bytes per instruction
     thread_local VuDecodeEntry g_vuDecode[kVuDecodeSlots];
 
@@ -297,6 +305,7 @@ namespace
     // instruction costs ~200ms/sec and inverted the result of the first VU1 A/B run.
     thread_local uint64_t g_vuFastHits = 0;
     thread_local uint64_t g_vuFastMisses = 0;
+    thread_local uint64_t g_vuLoFastHits = 0, g_vuLoFastMisses = 0;   // [vulower]
     thread_local uint64_t g_vuFastNs = 0;
 
     // Lane-select masks for the dest field, so the commit is a branchless blend instead of the
@@ -321,6 +330,62 @@ namespace
     };
 
     // Mirrors execUpper()'s dispatch exactly; anything not listed stays VU_UP_FALLBACK.
+    // [vulower] Decode the lower slot once per PC. Only ops whose interpreter case is pure register /
+    // VU-data-memory work are translated; everything else (branches, flag ops, DIV/SQRT, XGKICK,
+    // ILWR/ISWR, E*, R*, diag-gated LQ) stays on execLower. PS2X_VULOWER=0 disables.
+    inline void vuDecodeLower(uint32_t instr, VuDecodeEntry &e)
+    {
+        e.loKind = VU_LO_FALLBACK; e.loA = e.loB = e.loC = e.loDest = 0u; e.loImm = 0;
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_VULOWER"); return !(v && v[0] == '0'); }();
+        if (!s_on) return;
+        if (instr == 0u || instr == 0x8000033Cu) { e.loKind = VU_LO_NOP; return; }
+        const uint8_t opHi = (instr >> 25) & 0x7Fu;
+        const uint8_t dest = (instr >> 21) & 0xFu;
+        switch (opHi)
+        {
+        case 0x00:
+        {   // LQ: the two env-gated diagnostics inside the interpreter case must keep working
+            static const bool s_diag = [](){ return std::getenv("PS2X_IDW") != nullptr || std::getenv("PS2X_LQ_DUMP") != nullptr; }();
+            if (s_diag) return;
+            e.loKind = VU_LO_LQ; e.loA = FT(instr); e.loB = VIS(instr); e.loDest = dest; e.loImm = IMM11(instr); return;
+        }
+        case 0x01: e.loKind = VU_LO_SQ; e.loA = FS(instr); e.loB = VIT(instr); e.loDest = dest; e.loImm = IMM11(instr); return;
+        case 0x08: e.loKind = VU_LO_IADDIU; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800); return;
+        case 0x09: e.loKind = VU_LO_ISUBIU; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800); return;
+        case 0x40:
+        {
+            const uint8_t funct = instr & 0x3Fu;
+            const uint8_t vfT = FT(instr), vfS = FS(instr), viT = VIT(instr), viS = VIS(instr), viD = VID(instr);
+            switch (funct)
+            {
+            case 0x30: e.loKind = VU_LO_IADD; e.loA = viD; e.loB = viS; e.loC = viT; return;
+            case 0x31: e.loKind = VU_LO_ISUB; e.loA = viD; e.loB = viS; e.loC = viT; return;
+            case 0x32: e.loKind = VU_LO_IADDI; e.loA = viT; e.loB = viS; e.loImm = (int32_t)(int8_t)(((instr >> 6) & 0x1Fu) | (((instr >> 10) & 1u) ? 0xE0u : 0u)); return;
+            case 0x34: e.loKind = VU_LO_IAND; e.loA = viD; e.loB = viS; e.loC = viT; return;
+            case 0x35: e.loKind = VU_LO_IOR;  e.loA = viD; e.loB = viS; e.loC = viT; return;
+            case 0x3C: case 0x3D: case 0x3E: case 0x3F:
+            {
+                const uint8_t funct2 = (uint8_t)((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
+                switch (funct2)
+                {
+                case 0x30: e.loKind = VU_LO_MOVE; e.loA = vfT; e.loB = vfS; e.loDest = dest; return;
+                case 0x31: e.loKind = VU_LO_MR32; e.loA = vfT; e.loB = vfS; e.loDest = dest; return;
+                case 0x34: e.loKind = VU_LO_LQI; e.loA = vfT; e.loB = viS; e.loDest = dest; return;
+                case 0x35: e.loKind = VU_LO_SQI; e.loA = vfS; e.loB = viT; e.loDest = dest; return;
+                case 0x36: e.loKind = VU_LO_LQD; e.loA = vfT; e.loB = viS; e.loDest = dest; return;
+                case 0x37: e.loKind = VU_LO_SQD; e.loA = vfS; e.loB = viT; e.loDest = dest; return;
+                case 0x3C: e.loKind = VU_LO_MTIR; e.loA = viT; e.loB = vfS; e.loDest = dest; return;
+                case 0x3D: e.loKind = VU_LO_MFIR; e.loA = vfT; e.loB = viS; e.loDest = dest; return;
+                default: return;
+                }
+            }
+            default: return;
+            }
+        }
+        default: return;
+        }
+    }
+
     inline void vuDecodeUpper(uint32_t instr, VuDecodeEntry &e)
     {
         e.upKind = VU_UP_FALLBACK;
@@ -714,6 +779,8 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
+static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData, uint32_t dataSize);   // [vulower] defined below
+
 void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
@@ -819,8 +886,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             {
                 const uint64_t tot = g_vuFastHits + g_vuFastMisses;
                 if (tot)
-                    std::fprintf(stderr, "[vufast] %.1f%% fast | %.2f ns/op (%llu ops, %.2f s in VU1)\n",
+                    std::fprintf(stderr, "[vufast] %.1f%% fast (lower %.1f%%) | %.2f ns/op (%llu ops, %.2f s in VU1)\n",
                                  100.0 * (double)g_vuFastHits / (double)tot,
+                                 100.0 * (double)g_vuLoFastHits / (double)std::max<uint64_t>(1u, g_vuLoFastHits + g_vuLoFastMisses),
                                  (double)g_vuFastNs / (double)tot,
                                  (unsigned long long)tot, (double)g_vuFastNs / 1e9);
             }
@@ -965,6 +1033,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (g_vuProf)
         {
             g_vuUpperHist[upper & 0x3Fu].fetch_add(1, std::memory_order_relaxed);
+            g_vuLowerHist[(lower >> 25) & 0x7Fu].fetch_add(1, std::memory_order_relaxed);   // [vuprof] lower opHi (bits 31:25)
             uint64_t n = g_vuTotalInstr.fetch_add(1, std::memory_order_relaxed) + 1u;
             if ((n & 0x1FFFFFu) == 0u) // every ~2M instrs
             {
@@ -974,6 +1043,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 std::cerr << "[vuprof] total=" << n << " topUpperOps:";
                 for (int k = 0; k < 10; ++k)
                     std::cerr << " 0x" << std::hex << idx[k] << std::dec << "=" << g_vuUpperHist[idx[k]].load();
+                std::cerr << std::endl;
+                int lidx[128]; for (int i = 0; i < 128; ++i) lidx[i] = i;
+                std::sort(lidx, lidx + 128, [](int a, int b){ return g_vuLowerHist[a].load() > g_vuLowerHist[b].load(); });
+                std::cerr << "[vuprof] topLowerOpHi:";
+                for (int k = 0; k < 12; ++k)
+                    std::cerr << " 0x" << std::hex << lidx[k] << std::dec << "=" << g_vuLowerHist[lidx[k]].load();
                 std::cerr << std::endl;
             }
         }
@@ -1003,11 +1078,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                     e.lower = lower; e.upper = upper;
                     e.lowerFirst = lowerFirst; e.upperNop = upperNop;
                     vuDecodeUpper(upper, e);
+                    vuDecodeLower(lower, e);   // [vulower]
                     decoded = &e;
                 }
             }
         }
         // Upper-slot dispatch: the pre-decoded handler when this PC has one, ISA switch otherwise.
+        auto runLower = [&]() {   // [vulower]
+            const bool fast = s_vuFast && decoded && execLowerFast(m_state, *decoded, vuData, dataSize);
+            if (s_vuTime) (fast ? g_vuLoFastHits : g_vuLoFastMisses) += 1u;
+            if (!fast) execLower(lower, vuData, dataSize, gs, memory, upper);
+        };
         auto runUpper = [&]() {
             const bool fast = s_vuFast && decoded && execUpperFast(*decoded);
             // Counters only when asked for: two thread-local increments per instruction is ~94M/sec
@@ -1030,7 +1111,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             // VU upper/lower execute as a pair.  If the upper op writes a VF register
             // that the lower op reads or also writes, Dobie runs the lower side first
             // so it observes the old VF value and the upper write has priority.
-            execLower(lower, vuData, dataSize, gs, memory, upper);
+            runLower();
             if (!upperNop)
                 runUpper();
         }
@@ -1038,7 +1119,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         {
             if (!upperNop)
                 runUpper();
-            execLower(lower, vuData, dataSize, gs, memory, upper);
+            runLower();
         }
 
         // Enforce VF0 invariant. One 16-byte store rather than four scalar ones: this runs on
@@ -1582,6 +1663,119 @@ void VU1Interpreter::execUpper(uint32_t instr)
 // ============================================================================
 // Lower instructions
 // ============================================================================
+// [vulower] returns false when the op is not translated (caller falls back to execLower).
+static inline void vuLaneCopy(float *dst, const float *src, uint8_t dest)
+{
+    if (dest & 0x8) dst[0] = src[0];
+    if (dest & 0x4) dst[1] = src[1];
+    if (dest & 0x2) dst[2] = src[2];
+    if (dest & 0x1) dst[3] = src[3];
+}
+static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData, uint32_t dataSize)
+{
+    switch (e.loKind)
+    {
+    case VU_LO_NOP: return true;
+    case VU_LO_LQ:
+    {
+        uint32_t addr = ((uint32_t)(int32_t)(st.vi[e.loB] + e.loImm)) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize) { float tmp[4]; std::memcpy(tmp, vuData + addr, 16); vuLaneCopy(st.vf[e.loA], tmp, e.loDest); }
+        return true;
+    }
+    case VU_LO_SQ:
+    {
+        uint32_t addr = ((uint32_t)(int32_t)(st.vi[e.loB] + e.loImm)) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize)
+        {
+            float tmp[4]; std::memcpy(tmp, vuData + addr, 16);
+            const float *src = st.vf[e.loA];
+            if (e.loDest & 0x8) tmp[0] = src[0];
+            if (e.loDest & 0x4) tmp[1] = src[1];
+            if (e.loDest & 0x2) tmp[2] = src[2];
+            if (e.loDest & 0x1) tmp[3] = src[3];
+            std::memcpy(vuData + addr, tmp, 16);
+        }
+        return true;
+    }
+    case VU_LO_IADDIU: if (e.loA != 0) st.vi[e.loA] = (int16_t)(st.vi[e.loB] + (int16_t)e.loImm); return true;
+    case VU_LO_ISUBIU: if (e.loA != 0) st.vi[e.loA] = (int16_t)(st.vi[e.loB] - (int16_t)e.loImm); return true;
+    case VU_LO_IADD:   if (e.loA != 0) st.vi[e.loA] = (int16_t)(st.vi[e.loB] + st.vi[e.loC]); return true;
+    case VU_LO_ISUB:   if (e.loA != 0) st.vi[e.loA] = (int16_t)(st.vi[e.loB] - st.vi[e.loC]); return true;
+    case VU_LO_IADDI:  if (e.loA != 0) st.vi[e.loA] = (int16_t)(st.vi[e.loB] + e.loImm); return true;
+    case VU_LO_IAND:   if (e.loA != 0) st.vi[e.loA] = st.vi[e.loB] & st.vi[e.loC]; return true;
+    case VU_LO_IOR:    if (e.loA != 0) st.vi[e.loA] = st.vi[e.loB] | st.vi[e.loC]; return true;
+    case VU_LO_MOVE:   { float tmp[4]; std::memcpy(tmp, st.vf[e.loB], 16); vuLaneCopy(st.vf[e.loA], tmp, e.loDest); return true; }
+    case VU_LO_MR32:   { const float *v = st.vf[e.loB]; float tmp[4] = {v[1], v[2], v[3], v[0]}; vuLaneCopy(st.vf[e.loA], tmp, e.loDest); return true; }
+    case VU_LO_LQI:
+    {
+        uint32_t addr = ((uint32_t)(uint16_t)st.vi[e.loB]) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize) { float tmp[4]; std::memcpy(tmp, vuData + addr, 16); vuLaneCopy(st.vf[e.loA], tmp, e.loDest); }
+        if (e.loB != 0) st.vi[e.loB] = (int16_t)(st.vi[e.loB] + 1);
+        return true;
+    }
+    case VU_LO_SQI:
+    {
+        uint32_t addr = ((uint32_t)(uint16_t)st.vi[e.loB]) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize)
+        {
+            float tmp[4]; std::memcpy(tmp, vuData + addr, 16);
+            const float *src = st.vf[e.loA];
+            if (e.loDest & 0x8) tmp[0] = src[0];
+            if (e.loDest & 0x4) tmp[1] = src[1];
+            if (e.loDest & 0x2) tmp[2] = src[2];
+            if (e.loDest & 0x1) tmp[3] = src[3];
+            std::memcpy(vuData + addr, tmp, 16);
+        }
+        if (e.loB != 0) st.vi[e.loB] = (int16_t)(st.vi[e.loB] + 1);
+        return true;
+    }
+    case VU_LO_LQD:
+    {
+        if (e.loB != 0) st.vi[e.loB] = (int16_t)(st.vi[e.loB] - 1);
+        uint32_t addr = ((uint32_t)(uint16_t)st.vi[e.loB]) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize) { float tmp[4]; std::memcpy(tmp, vuData + addr, 16); vuLaneCopy(st.vf[e.loA], tmp, e.loDest); }
+        return true;
+    }
+    case VU_LO_SQD:
+    {
+        if (e.loB != 0) st.vi[e.loB] = (int16_t)(st.vi[e.loB] - 1);
+        uint32_t addr = ((uint32_t)(uint16_t)st.vi[e.loB]) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize)
+        {
+            float tmp[4]; std::memcpy(tmp, vuData + addr, 16);
+            const float *src = st.vf[e.loA];
+            if (e.loDest & 0x8) tmp[0] = src[0];
+            if (e.loDest & 0x4) tmp[1] = src[1];
+            if (e.loDest & 0x2) tmp[2] = src[2];
+            if (e.loDest & 0x1) tmp[3] = src[3];
+            std::memcpy(vuData + addr, tmp, 16);
+        }
+        return true;
+    }
+    case VU_LO_MTIR:
+    {
+        int comp = (e.loDest & 0x8) ? 0 : (e.loDest & 0x4) ? 1 : (e.loDest & 0x2) ? 2 : 3;
+        uint32_t fval; std::memcpy(&fval, &st.vf[e.loB][comp], 4);
+        if (e.loA != 0) st.vi[e.loA] = (int32_t)(int16_t)(fval & 0xFFFF);
+        return true;
+    }
+    case VU_LO_MFIR:
+    {
+        float result[4]; int32_t val = (int32_t)(int16_t)(st.vi[e.loB] & 0xFFFF);
+        std::memcpy(&result[0], &val, 4); result[1] = result[0]; result[2] = result[0]; result[3] = result[0];
+        vuLaneCopy(st.vf[e.loA], result, e.loDest);
+        return true;
+    }
+    default: return false;
+    }
+}
+
 void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr)
 {
     (void)upperInstr;
