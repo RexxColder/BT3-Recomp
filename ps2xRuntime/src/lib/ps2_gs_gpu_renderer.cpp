@@ -25,6 +25,7 @@
 
 #include "raylib.h"
 #include "rlgl.h"
+extern "C" void glFinish(void);   // [unloadmode] drain experiment
 
 unsigned long g_texMints = 0, g_texRedecodes = 0;  // [vramdiag] churn accounting
 unsigned long g_uploadBlocks = 0;                 // GS VRAM blocks uploaded (64 words each)
@@ -69,6 +70,8 @@ static bool ps2xOnGlThread()
     const size_t h = std::hash<std::thread::id>{}(std::this_thread::get_id());
     return g_glTidHash.load(std::memory_order_relaxed) == h;
 }
+unsigned long g_putTexCount = 0, g_evictCount = 0;   // [cachestat]
+std::unordered_set<uint64_t> g_evictedThisFrame; bool g_evictDrawOn = false; unsigned long g_evictDrawHits = 0;   // [evictdraw]
 static std::unordered_set<uint32_t> g_barDirty;  // pages written since their last flush
 struct DirtyRect { float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f; bool full = false; };
 static std::unordered_map<uint32_t, DirtyRect> g_barDirtyRect;   // [flushrect] bbox drawn since the last flush
@@ -216,12 +219,24 @@ namespace
     // buffers the post chain composites back over the scene.
     // PS2X_BILINEAR=0 restores the old always-POINT behaviour.
     std::unordered_map<unsigned, bool> g_texFilterState;   // last filter applied, per GL texture id
+    std::unordered_map<unsigned int, uint8_t> g_wrapState;   // tex.id -> (wrapU<<1)|wrapV last applied  [idreuse]
+    std::unordered_map<unsigned int, uint8_t> g_swzState;    // tex.id -> tcc swizzle last applied       [idreuse]
+    // [idreuse] every per-GL-id cache must forget an id when its object is deleted: GL hands the
+    // same id to the next allocation, and a stale "already applied" entry then skips the real
+    // glTexParameter calls (repeat-wrapped grass/sky drew clamped, the mask swizzle never
+    // applied). The texture pool hid this for months because it never deletes anything.
+    static void ps2xForgetTexId(unsigned int id) { g_texFilterState.erase(id); g_wrapState.erase(id); g_swzState.erase(id); }
     void ps2xApplyTexFilter(Texture2D &t, bool bilinear)
     {
         static const bool s_on = [](){ const char *v = std::getenv("PS2X_BILINEAR"); return !(v && v[0] == '0'); }();
         if (!s_on || t.id == 0) return;
+        // [filtercache] PS2X_FILTERCACHE=1 restores the "already applied" shortcut. Default OFF
+        // (2026-08-27): the cache went stale whenever a GL id was recycled (texture pool, freed
+        // ids), leaving alternate frames point- vs bilinear-sampled (menu/copyright shimmer).
+        // One glTexParameteri per textured draw is negligible; never trust the cache by default.
+        static const bool s_fc = [](){ const char *v = std::getenv("PS2X_FILTERCACHE"); return v && v[0] && v[0] != '0'; }();
         auto it = g_texFilterState.find(t.id);
-        if (it != g_texFilterState.end() && it->second == bilinear) return;   // don't thrash GL state
+        if (s_fc && it != g_texFilterState.end() && it->second == bilinear) return;   // don't thrash GL state
         SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
         g_texFilterState[t.id] = bilinear;
     }
@@ -288,6 +303,9 @@ namespace
     // evict keys unused for a grace window, and recycle the freed GL objects through a pool
     // keyed by (w,h) so a fade reuses one texture object (cheap UpdateTexture) each frame.
     std::unordered_map<uint64_t, uint32_t> g_texLastUse;            // texKey -> present gen last referenced
+    std::vector<uint64_t> g_superseded;   // [supersede] old version keys awaiting reclaim (guarded by m_mtx)
+    std::unordered_set<uint64_t> g_reclaimed; unsigned long g_supReclaimed = 0, g_reDecodeReclaimed = 0;   // [supdiag]
+    std::unordered_set<unsigned> g_deletedIds; unsigned long g_idReuse = 0;   // [supdiag] GL ids we deleted; reuse counter
     std::unordered_map<uint64_t, std::vector<Texture2D>> g_texPool; // (w<<32|h) -> free GL textures
     uint32_t g_texUseGen = 0;
     inline uint64_t texPoolKey(int w, int h) { return (static_cast<uint64_t>(w) << 32) | static_cast<uint32_t>(h); }
@@ -914,9 +932,17 @@ uint64_t GsGpuRenderer::resolveTextureVersion(uint64_t baseKey, uint32_t pageLo,
         ve.drawChecked = m_drawSeq;
         if (ve.verKey == 0 || h != ve.hash)
         {
+            const uint64_t oldKey = ve.verKey;
             ve.hash = h;
             ve.verKey = baseKey ^ ((h | 1ull) * 0x9E3779B97F4A7C15ull);
             if (ve.verKey == 0) ve.verKey = 1;
+            // [supersede] the previous version can never be sampled again (VRAM moved on): let the
+            // render thread reclaim it once no pending list references it. Without this every
+            // per-frame upload (BT3's scrolling menu clouds: 7 tiles/frame) left a dead 0.5 MB
+            // entry behind -- ~110 MB/s of graveyard, the 192 MB budget in seconds, then
+            // 400-2200 evictions/s forever (main reuses the same key in place and never evicts).
+            if (oldKey != 0 && oldKey != ve.verKey) g_superseded.push_back(oldKey);
+            if (g_reclaimed.count(ve.verKey)) { ++g_reDecodeReclaimed; g_reclaimed.erase(ve.verKey); }   // [supdiag] content came back after we reclaimed it
         }
     }
     auto it = m_texCache.find(ve.verKey);
@@ -2189,6 +2215,11 @@ bool GsGpuRenderer::revalidateTexture(uint64_t key, uint32_t pageLo, uint32_t pa
 
 void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi)
 {
+    // [evictnew] A freshly decoded entry had NO last-use record, so the budget eviction
+    // (last=0 -> oldest) dropped it before the frame that decoded it could draw it: the
+    // menu's scrolling cloud tiles (re-uploaded every frame) blinked out for single frames,
+    // and PS2X_TEXCACHEMB=1024 made it vanish. Stamp the entry as used now; GRACE covers it
+    // until it is drawn.
     // [texavg] diag: average decoded RGBA per texture — is the stage decoded DARK (decoder
     // bug) or bright (replay/blend bug)? Correlate key with [cover]/srcdiag texKey values.
     {
@@ -2208,6 +2239,8 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
     }
     (void)pageLo; (void)pageHi;
     std::lock_guard<std::mutex> lk(m_mtx);
+    ++g_putTexCount;   // [cachestat]
+    g_texLastUse[key] = g_texUseGen;   // [evictnew] a fresh entry must not look like the oldest (last=0) to the budget eviction
     { extern unsigned long g_texMints, g_texRedecodes;   // [vramdiag] churn accounting
       if (m_texCache.find(key) == m_texCache.end()) ++g_texMints; else ++g_texRedecodes; }
     CachedTex &ct = m_texCache[key];
@@ -2978,6 +3011,8 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
 extern "C" void ps2xGsRecordVsync();   // PS2X_GS_RECORD (ps2_gs_gpu.cpp); a function-body
                                        // extern "C" is a syntax error, it must live here
 double g_bsRender = 0, g_bsFlush = 0; int g_bsCount = 0;   // [barstat]
+int g_tcCount = 0, g_tcFrames = 0; double g_tcLum = 0, g_tcAlpha = 0;   // [tilecount]
+int g_caTiles = 0, g_caCovers = 0; uint32_t g_caDest = 0; char g_caFirst[160] = {0};   // [coverafter]
 double g_bsReadback = 0, g_bsWrite = 0;                    // [barstat] inside flushPageToVram
 long g_bsRowsWritten = 0; int g_bsZeroFlush = 0;         // [barstat] flushdiff effectiveness
 std::map<uint32_t, int> g_bsPages; long g_bsCmds = 0; std::map<int, int> g_bsSegHist;   // [barstat] pages / segment sizes
@@ -2985,6 +3020,15 @@ std::atomic<uint64_t> g_gsGuestSwapCount{0};   // [cdgate] guest frames publishe
 void GsGpuRenderer::swapFrame()
 {
     g_gsGuestSwapCount.fetch_add(1, std::memory_order_relaxed);
+    {   // [tilecount] per-frame line
+        static const bool s_tc = [](){ const char *v = std::getenv("PS2X_TILECOUNT"); return v && v[0] && v[0] != '0'; }();
+        if (s_tc && g_tcFrames < 400) { ++g_tcFrames; std::fprintf(stderr, "[tilecount] frame %d: %d draws, mean tex lum %.1f alpha %.1f\n", g_tcFrames, g_tcCount, g_tcCount ? g_tcLum / g_tcCount : 0.0, g_tcCount ? g_tcAlpha / g_tcCount : 0.0); }
+        g_tcCount = 0; g_tcLum = g_tcAlpha = 0;
+        static const bool s_ca2 = [](){ const char *v = std::getenv("PS2X_COVERAFTER"); return v && v[0] && v[0] != '0'; }();
+        static int caFrames = 0;
+        if (s_ca2 && caFrames < 400) { ++caFrames; std::fprintf(stderr, "[coverafter] frame %d: tiles %d, sky-covering draws after last tile: %d  first: %s\n", caFrames, g_caTiles, g_caCovers, g_caFirst); }
+        g_caTiles = 0; g_caCovers = 0; g_caFirst[0] = 0;
+    }
     {   // [barstat] per-frame barrier cost
         static const bool s_bs = [](){ const char *v = std::getenv("PS2X_BARSTAT"); return v && v[0] && v[0] != '0'; }();
         static int fr = 0;
@@ -3280,7 +3324,11 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     // guest there can hang the load. Collect handles under the lock, free them out here.
     {
         extern std::vector<Texture2D> g_pendingUnload;
-        for (Texture2D &t : g_pendingUnload) UnloadTexture(t);
+        {   // [unloadmode] PS2X_UNLOADMODE: 1 delete (default), 0 leak (never delete), 2 flush the batch + glFinish before deleting
+            static const int s_um = [](){ const char *v = std::getenv("PS2X_UNLOADMODE"); return v ? std::atoi(v) : 1; }();
+            if (s_um == 2 && !g_pendingUnload.empty()) { rlDrawRenderBatchActive(); glFinish(); }
+            if (s_um != 0) for (Texture2D &t : g_pendingUnload) { g_deletedIds.insert(t.id); ps2xForgetTexId(t.id); UnloadTexture(t); }
+        }
         g_pendingUnload.clear();
     }
 
@@ -3361,7 +3409,10 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             else
             {
                 if (glIt != g_glTex.end())
+                {   // [filtercache] the GL id may be reused by the next allocation: drop its filter-state entry
+                    ps2xForgetTexId(glIt->second.id);
                     UnloadTexture(glIt->second);
+                }
                 Image img{};
                 img.data = ct.rgba.data();
                 img.width = ct.w;
@@ -3371,17 +3422,25 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 // Recycle a same-size GL texture from the pool (avoids a fresh glTexImage2D
                 // alloc every fade frame); else allocate one.
                 Texture2D t{};
-                auto pit = g_texPool.find(texPoolKey(ct.w, ct.h));
+                static const bool s_poolOn = [](){ const char *v = std::getenv("PS2X_TEXPOOL"); return !(v && v[0] == '0'); }();   // [nopool] default ON again: the pool-off "fix" only dodged the [idreuse] bug
+                auto pit = s_poolOn ? g_texPool.find(texPoolKey(ct.w, ct.h)) : g_texPool.end();
                 if (pit != g_texPool.end() && !pit->second.empty())
                 {
                     t = pit->second.back();
                     pit->second.pop_back();
                     UpdateTexture(t, ct.rgba.data());
+                    // [filtercache] a pooled object keeps whatever filter it last had, but the per-id
+                    // cache may say otherwise -> ps2xApplyTexFilter skipped the real call and alternate
+                    // frames rendered the same texture point- vs bilinear-sampled (menu/copyright
+                    // "shimmer": f0 smooth, f112 quantized). Force a re-apply.
+                    g_texFilterState.erase(t.id);
                 }
                 else
                 {
                     t = LoadTextureFromImage(img);
+                    if (g_deletedIds.count(t.id)) { ++g_idReuse; g_deletedIds.erase(t.id); }   // [supdiag]
                     SetTextureFilter(t, TEXTURE_FILTER_POINT);
+                    g_texFilterState[t.id] = false;   // [filtercache] known state
                     SetTextureWrap(t, TEXTURE_WRAP_CLAMP); // PS2 UI doesn't tile; stop edge repeat
                 }
                 g_glTex[kv.first] = t;
@@ -3543,8 +3602,47 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             static const size_t s_cacheBytes = [](){ const char *v = std::getenv("PS2X_TEXCACHEMB");
                                                      const int n = v ? std::atoi(v) : 0;
                                                      return (size_t)(n > 0 ? n : 192) * 1024u * 1024u; }();
+            {   // [supersede] reclaim superseded versions not referenced by any not-yet-drawn list
+                static const int s_sup = [](){ const char *v = std::getenv("PS2X_SUPERSEDE"); return v ? std::atoi(v) : 1; }();   // 0 off, 1 full, 2 CPU-entry only, 3 GL-object only
+                if (s_sup && !g_superseded.empty())
+                {
+                    std::unordered_set<uint64_t> inflightS;
+                    for (const DrawCmd &ic : cmds) if (ic.texKey) inflightS.insert(ic.texKey);
+                    for (const auto &pl : m_pending) for (const DrawCmd &ic : pl) if (ic.texKey) inflightS.insert(ic.texKey);
+                    for (const DrawCmd &ic : m_building) if (ic.texKey) inflightS.insert(ic.texKey);
+                    std::vector<uint64_t> keep;
+                    for (uint64_t k : g_superseded)
+                    {
+                        if (inflightS.count(k)) { keep.push_back(k); continue; }
+                        g_reclaimed.insert(k); ++g_supReclaimed;
+                        if (s_sup != 2)
+                        {
+                            auto g = g_glTex.find(k);
+                            if (g != g_glTex.end())
+                            {   // same disposal as the eviction: recycle through the pool when it is on, else delete
+                                static const bool s_poolR = [](){ const char *v = std::getenv("PS2X_TEXPOOL"); return !(v && v[0] == '0'); }();
+                                auto &pool = g_texPool[texPoolKey(g->second.width, g->second.height)];
+                                if (s_poolR && pool.size() < 8) pool.push_back(g->second);
+                                else g_pendingUnload.push_back(g->second);   // drain forgets the id before deleting
+                                g_glTex.erase(g);
+                            }
+                        }
+                        if (s_sup != 3) { m_texCache.erase(k); g_texLastUse.erase(k); g_texRtSourced.erase(k); g_texRtIndexed.erase(k); }
+                    }
+                    g_superseded.swap(keep);
+                }
+            }
             size_t cacheBytes = 0;
             for (const auto &kv : m_texCache) cacheBytes += kv.second.rgba.size();
+            {   // [cachestat] PS2X_CACHESTAT=1: once a second -- entries, MB, decodes/s, evictions/s
+                static const bool s_cst = [](){ const char *v = std::getenv("PS2X_CACHESTAT"); return v && v[0] && v[0] != '0'; }();
+                extern unsigned long g_putTexCount, g_evictCount;
+                static auto t0 = std::chrono::steady_clock::now(); static unsigned long lastPut = 0, lastEv = 0, lastEd = 0;
+                extern unsigned long g_evictDrawHits;
+                const auto now = std::chrono::steady_clock::now();
+                if (s_cst && now - t0 >= std::chrono::seconds(1))
+                { std::fprintf(stderr, "[cachestat] entries %zu  %zu MB (budget %zu MB)  decodes/s %lu  evicted/s %lu  evict-then-draw/s %lu  reclaimed-total %lu  came-back-total %lu  id-reuse %lu deleted-live %zu\n", m_texCache.size(), cacheBytes >> 20, s_cacheBytes >> 20, g_putTexCount - lastPut, g_evictCount - lastEv, g_evictDrawHits - lastEd, g_supReclaimed, g_reDecodeReclaimed, g_idReuse, g_deletedIds.size()); lastPut = g_putTexCount; lastEv = g_evictCount; lastEd = g_evictDrawHits; t0 = now; }
+            }
             // CONTENT-SWAP PURGE (PS2X_SWAPPURGE=0 disables).
             //
             // The budget eviction below is a LAST RESORT that fires mid-fight, and what it drops
@@ -3639,6 +3737,12 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             if (!s_noEvict && g_texUseGen > GRACE && cacheBytes > s_cacheBytes)
             {
                 // Oldest-first, and only far enough to get back under budget.
+                std::unordered_set<uint64_t> inflight;   // [evictinflight] keys any not-yet-drawn command still references
+                for (const DrawCmd &ic : cmds) if (ic.texKey) inflight.insert(ic.texKey);
+                // m_mtx is already held by this render section (see the lock_guard above the
+                // texture-upload loop) -- taking it again here DEADLOCKED at the first eviction.
+                for (const auto &pl : m_pending) for (const DrawCmd &ic : pl) if (ic.texKey) inflight.insert(ic.texKey);
+                for (const DrawCmd &ic : m_building) if (ic.texKey) inflight.insert(ic.texKey);
                 std::vector<std::pair<uint32_t, uint64_t>> aged;
                 aged.reserve(m_texCache.size());
                 for (auto &kv : m_texCache)
@@ -3648,6 +3752,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     if (honourProtection && g_texRtSourced.count(kv.first)) continue;  // unrecoverable: re-decoding
                                                                    // it yields garbage, so evicting
                                                                    // it IS the arena corruption.
+                    if (inflight.count(kv.first)) continue;   // [evictinflight]
                     if (last + GRACE < g_texUseGen) aged.push_back({last, kv.first});
                 }
                 std::sort(aged.begin(), aged.end(),
@@ -3667,18 +3772,24 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 // the defect is GL-object REUSE (a key resolving to another texture's object);
                 // if it does not, the defect is that evicted RENDER-TARGET-sourced textures
                 // cannot be re-decoded (GPU mode never writes rendered pixels back to VRAM).
-                static const bool s_noPool = [](){ const char *v = std::getenv("PS2X_NOTEXPOOL"); return v && v[0] && v[0] != '0'; }();
+                static const bool s_noPool = [](){ const char *v = std::getenv("PS2X_TEXPOOL"); return v && v[0] == '0'; }();   // [nopool] pool OFF by default (2026-08-27): recycling GL objects made the menu cloud layer blink; PS2X_TEXPOOL=1 re-enables
+                g_evictCount += dead.size();   // [cachestat]
+                {   // [evictdraw] PS2X_EVICTDRAW=1: remember this frame's evicted keys to catch a redraw
+                    static const bool s_ed = [](){ const char *v = std::getenv("PS2X_EVICTDRAW"); return v && v[0] && v[0] != '0'; }();
+                    extern std::unordered_set<uint64_t> g_evictedThisFrame; extern bool g_evictDrawOn;
+                    g_evictDrawOn = s_ed; if (s_ed) for (uint64_t k : dead) g_evictedThisFrame.insert(k);
+                }
                 for (uint64_t k : dead)
                 {
                     auto g = g_glTex.find(k);
                     if (g != g_glTex.end())
                     {
-                        if (s_noPool) UnloadTexture(g->second);
+                        if (s_noPool) { ps2xForgetTexId(g->second.id); UnloadTexture(g->second); }
                         else
                         {
                             auto &pool = g_texPool[texPoolKey(g->second.width, g->second.height)];
                             if (pool.size() < 8) pool.push_back(g->second);
-                            else UnloadTexture(g->second);
+                            else { ps2xForgetTexId(g->second.id); UnloadTexture(g->second); }
                         }
                         g_glTex.erase(g);
                     }
@@ -4873,14 +4984,19 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         {
             const size_t ls = listStarts[li];
             const size_t le = (li + 1 < listStarts.size()) ? listStarts[li + 1] : cmds.size();
-            uint32_t n0 = 0, n112 = 0;
+            uint32_t n0 = 0, n112 = 0, t0 = 0, t112 = 0;
             for (size_t i = ls; i < le; ++i)
             {
                 if (cmds[i].isVramBlit) continue;   // bookkeeping-neutral; flipped the parity census
-                if (cmds[i].destFbp == 0u) ++n0;
-                else if (cmds[i].destFbp == 112u) ++n112;
+                if (cmds[i].destFbp == 0u) { ++n0; if (cmds[i].isTriangle) ++t0; }
+                else if (cmds[i].destFbp == 112u) { ++n112; if (cmds[i].isTriangle) ++t112; }
             }
-            if (n0 || n112) listSceneFbp[li] = (n0 >= n112) ? 0u : 112u;
+            // [presentlast] Under the barrier stack a frame's SPRITE composites (Z-rebuild stripes,
+            // mask/blur strips) can outnumber its scene draws into the OTHER buffer, so "most
+            // commands" picked the wrong buffer. The 3D geometry is triangles: decide by those
+            // when any exist, fall back to the command count otherwise (menus).
+            if (t0 || t112) listSceneFbp[li] = (t0 >= t112) ? 0u : 112u;
+            else if (n0 || n112) listSceneFbp[li] = (n0 >= n112) ? 0u : 112u;
         }
     }
     auto latchFrame = [&](uint32_t xfbp) {
@@ -4999,8 +5115,12 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
     // effect".
     static const bool s_a44noz = [](){ const char *v = std::getenv("PS2X_A44NOZ");
                                        return v && v[0] && v[0] != '0'; }();
+    // [nodepthtbp] PS2X_NODEPTHTBP=<tbp>: diagnostic -- draws sampling this source page get depth
+    // test ALWAYS and no depth write (is a layer vanishing because it fails the depth test?).
+    static const uint32_t s_ndt = [](){ const char *v = std::getenv("PS2X_NODEPTHTBP"); return v ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
     auto depthForCmd = [&](const DrawCmd &dc) {
         extern uint32_t g_zwbBp;
+        if (s_ndt && dc.texKey && dc.srcTbp0 == s_ndt) { applyDepth(false, 1u /*ALWAYS*/, false); return; }
         if (s_a44noz && dc.isTriangle && dc.abe && dc.blendMode == 0x44 &&
             dc.srcPsm == 0x00u && dc.tcc == 0u && dc.texKey != 0)
         { applyDepth(dc.depthTest, 1u /*ALWAYS*/, dc.depthWrite); return; }
@@ -8265,9 +8385,24 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 }
             }
             {
+            if (g_evictDrawOn && !c.isTransfer && c.texKey && g_evictedThisFrame.count(c.texKey))
+            {   // a texture evicted earlier THIS render is being drawn now -> it vanishes
+                extern unsigned long g_evictDrawHits; ++g_evictDrawHits;
+                static int n = 0; if (n < 12) { ++n; std::fprintf(stderr, "[evictdraw] DRAW of just-evicted key: dest f%u srcTbp %u psm %u %dx%d tri=%d\n", c.destFbp, c.srcTbp0, c.srcPsm, c.srcTexW, c.srcTexH, (int)c.isTriangle); }
+            }
             auto it = g_glTex.find(c.texKey);
             if (it == g_glTex.end())
             {
+                {   // [supdiag] PS2X_SUPDIAG=1: was this dropped draw's texture one the supersede reclaim freed?
+                    static const bool s_sd = [](){ const char *v = std::getenv("PS2X_SUPDIAG"); return v && v[0] && v[0] != '0'; }();
+                    static int n = 0;
+                    if (s_sd && c.texKey && n < 16)
+                    {   ++n;
+                        std::fprintf(stderr, "[supdiag] GL-miss drop: reclaimed=%d inCpu=%d dest f%u src tbp %u psm %u %dx%d seg=%d idx=%zu/%zu pending=%zu building=%zu\n",
+                                     (int)g_reclaimed.count(c.texKey), (int)(m_texCache.find(c.texKey) != m_texCache.end()),
+                                     c.destFbp, c.srcTbp0, c.srcPsm, c.srcTexW, c.srcTexH, (int)m_segMode, (size_t)(&c - cmds.data()), cmds.size(), m_pending.size(), m_building.size());
+                    }
+                }
                 // [maskmiss] This skip has NO env gate: a draw whose texture is in the CPU cache
                 // but has no GL texture is silently dropped. The fbp224 mask draws reach state
                 // setup but never reach the post-gate, and m_texCache-based probes still report
@@ -8282,10 +8417,54 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         std::fprintf(stderr, "[maskmiss] draws dropped for MISSING GL TEXTURE: fbp224 %lu, other %lu"
                                      " | of those, present in CPU cache: %lu\n", m224, mOther, inCache);
                 }
+                {   // [texmiss] PS2X_TEXMISS=1: how often are textured draws dropped for a missing GL texture?
+                    static const bool s_tm = [](){ const char *v = std::getenv("PS2X_TEXMISS"); return v && v[0] && v[0] != '0'; }();
+                    if (s_tm && !c.isTransfer)
+                    {
+                        static unsigned long nMiss = 0, nInCpu = 0, nUpload = 0; static int nDetail = 0;
+                        static auto t0 = std::chrono::steady_clock::now();
+                        ++nMiss; auto cit = m_texCache.find(c.texKey); if (cit != m_texCache.end()) { ++nInCpu; if (cit->second.needsUpload) ++nUpload; }
+                        if (nDetail < 12) { ++nDetail; std::fprintf(stderr, "[texmiss] draw dropped: dest f%u srcTbp %u psm %u %dx%d tri=%d key %llx | cpu-cache %s%s\n", c.destFbp, c.srcTbp0, c.srcPsm, c.srcTexW, c.srcTexH, (int)c.isTriangle, (unsigned long long)c.texKey, cit != m_texCache.end() ? "HIT" : "miss", (cit != m_texCache.end() && cit->second.needsUpload) ? " (needsUpload)" : ""); }
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now - t0 >= std::chrono::seconds(1)) { std::fprintf(stderr, "[texmiss] last second: %lu dropped (cpu-cache hit %lu, of which needsUpload %lu)\n", nMiss, nInCpu, nUpload); nMiss = nInCpu = nUpload = 0; t0 = now; }
+                    }
+                }
                 if (s_srcDiag) srcDiagTally("missing", c); { PS2X_GATE_HIT(); continue; }
             }
             tex = it->second;
             srcHow = "decoded";
+            {   // [coverafter] PS2X_COVERAFTER=<tbp>: per frame, large draws into the same buffer that land
+                // AFTER the last draw sampling <tbp> (does something paint over the layer on some frames?)
+                static const uint32_t s_ca = [](){ const char *v = std::getenv("PS2X_COVERAFTER"); return v ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
+                if (s_ca)
+                {
+                    extern int g_caTiles, g_caCovers; extern uint32_t g_caDest; extern char g_caFirst[160];
+                    if (c.texKey && c.srcTbp0 == s_ca) { ++g_caTiles; g_caDest = c.destFbp; g_caCovers = 0; g_caFirst[0] = 0; }
+                    else if (g_caTiles && c.destFbp == g_caDest && !c.isTransfer)
+                    {
+                        float x0, y0, x1, y1;
+                        if (c.isTriangle) { x0 = std::min({c.tri[0].x, c.tri[1].x, c.tri[2].x}); x1 = std::max({c.tri[0].x, c.tri[1].x, c.tri[2].x}); y0 = std::min({c.tri[0].y, c.tri[1].y, c.tri[2].y}); y1 = std::max({c.tri[0].y, c.tri[1].y, c.tri[2].y}); }
+                        else { x0 = std::min(c.dx0, c.dx1); x1 = std::max(c.dx0, c.dx1); y0 = std::min(c.dy0, c.dy1); y1 = std::max(c.dy0, c.dy1); }
+                        const bool onSky = (y0 < 160.f) && (x1 - x0) * (y1 - y0) >= 20000.f;
+                        if (onSky) { ++g_caCovers; if (!g_caFirst[0]) std::snprintf(g_caFirst, sizeof g_caFirst, "tex=%d src=%u psm=%u bm=%x fbmsk=%08x box=(%.0f,%.0f)-(%.0f,%.0f) %s", c.texKey ? 1 : 0, c.srcTbp0, c.srcPsm, (unsigned)c.blendMode, c.fbmsk, x0, y0, x1, y1, c.isTriangle ? "tri" : "spr"); }
+                    }
+                }
+            }
+            {   // [tilecount] PS2X_TILECOUNT=<tbp>: per-frame census of draws sampling that source page
+                static const uint32_t s_tc = [](){ const char *v = std::getenv("PS2X_TILECOUNT"); return v ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
+                if (s_tc && c.srcTbp0 == s_tc)
+                {
+                    extern int g_tcCount, g_tcFrames; extern double g_tcLum, g_tcAlpha;
+                    ++g_tcCount;
+                    auto cit = m_texCache.find(c.texKey);
+                    if (cit != m_texCache.end() && !cit->second.rgba.empty())
+                    {   // sparse sample of the decoded texture
+                        const auto &rg = cit->second.rgba; double l = 0, a = 0; size_t n = 0;
+                        for (size_t i = 0; i + 3 < rg.size(); i += 64) { l += (rg[i] + rg[i+1] + rg[i+2]) / 3.0; a += rg[i+3]; ++n; }
+                        if (n) { g_tcLum += l / n; g_tcAlpha += a / n; }
+                    }
+                }
+            }
             {   // PS2X_SEEDFBO=1: an FBO created on READ stands in for VRAM, and VRAM is not
                 // blank -- it holds whatever an earlier pass left. Creating it CLEARED makes the
                 // depth->alpha rebuild copy zeros over the good geometry alpha (measured: scene
@@ -9009,7 +9188,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                             return !(v && v[0] == '0'); }();
         if ((!fromFbo || s_fboWrap) && c.texKey != 0 && tex.id != 0 && tex.id != g_white.id)
         {
-            static std::unordered_map<unsigned int, uint8_t> s_wrapState; // tex.id -> (wrapU<<1)|wrapV
+            auto &s_wrapState = g_wrapState; // tex.id -> (wrapU<<1)|wrapV
             const uint8_t want = static_cast<uint8_t>((c.wrapU << 1) | c.wrapV);
             auto ws = s_wrapState.find(tex.id);
             if (ws == s_wrapState.end() || ws->second != want)
@@ -9176,7 +9355,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         // not blend by it — the bloom downsample bug that blacked out the fight).
         if (tex.id != 0 && tex.id != g_white.id)
         {
-            static std::unordered_map<unsigned int, uint8_t> s_swzState; // tex.id -> tcc
+            auto &s_swzState = g_swzState; // tex.id -> tcc
             // FBO sources: force A=ONE even when TCC=1. GS code that samples a framebuffer with
             // TCC=1 reads the fb's alpha, which opaque GS draws leave at 0x80 (=1.0 in blend
             // units) — but OUR FBO alpha channel is junk. The bloom downsample strips blend
@@ -11554,15 +11733,29 @@ if (done.size() < 14 && !done.count(c.texKey))
     // (proven: mid-frame FBO snapshot). When BOTH scene buffers are actively drawn,
     // present the one NOT touched by the most recent scene list: the completed frame.
     bool presentLatch = false;
-    if (s_barBlockEnv && !m_segMode && s_latch && !listSceneFbp.empty())
-    {   // [barblock] the double-buffer detector below keys on the drawn AREA of this render
-        // call, but with the blocking barrier the frame's bulk is drawn in segment renders that
-        // skip the census -- so it fell back to the in-progress buffer (a near-black half-built
-        // frame). Here every published list is complete once drawn: latch the last one's scene
-        // buffer and present the latch.
-        uint32_t lastScene = 0xFFFFFFFFu;
-        for (size_t li = listSceneFbp.size(); li > 0; --li) if (listSceneFbp[li - 1] == 0u || listSceneFbp[li - 1] == 112u) { lastScene = listSceneFbp[li - 1]; break; }
-        if (lastScene != 0xFFFFFFFFu) { latchFrame(lastScene); curFbp = 0xFFFFFFFFu; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1; presentLatch = true; }
+    {   // [presentlast] PS2X_PRESENTLAST (default ON, =0 restores the area heuristic): present the
+        // scene buffer of the LAST COMPLETED published list. The double-buffer detector below keys
+        // on the drawn AREA of this render call and flips between the two buffers whenever a
+        // frame's draws land elsewhere (menu sky flicker, arena flicker; under the blocking
+        // barrier the bulk is drawn in segment renders and it fell back to a half-built buffer).
+        // Every published list is complete once drawn: latch its scene buffer; on calls with no
+        // new list keep presenting the existing latch.
+        static const bool s_pl = [](){ const char *v = std::getenv("PS2X_PRESENTLAST"); return !(v && v[0] == '0'); }();
+        if (s_pl && !m_segMode && s_latch)
+        {
+            uint32_t lastScene = 0xFFFFFFFFu;
+            for (size_t li = listSceneFbp.size(); li > 0; --li) if (listSceneFbp[li - 1] == 0u || listSceneFbp[li - 1] == 112u) { lastScene = listSceneFbp[li - 1]; break; }
+            if (lastScene != 0xFFFFFFFFu) { latchFrame(lastScene); curFbp = 0xFFFFFFFFu; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1; }
+            if (g_frontLatchValid && g_frontLatch.rt.texture.id != 0) presentLatch = true;
+            static const bool s_pld = [](){ const char *v = std::getenv("PS2X_PLDIAG"); return v && v[0] && v[0] != '0'; }();
+            static int pldN = 0;
+            if (s_pld && pldN++ < 40)
+            {
+                std::string sc; for (uint32_t v : listSceneFbp) { sc += ' '; sc += (v == 0xFFFFFFFFu ? std::string("-") : std::to_string(v)); }
+                std::fprintf(stderr, "[presentlast] lists=%zu boundsValid=%d scenes:%s -> lastScene=%d latchValid=%d latch=%dx%d present=%d\n",
+                             listSceneFbp.size(), (int)listBoundsValid, sc.c_str(), (int)lastScene, (int)g_frontLatchValid, g_frontLatch.w, g_frontLatch.h, (int)presentLatch);
+            }
+        }
     }
     {
         static const bool s_dbp = [](){ const char *v = std::getenv("PS2X_DBPRESENT"); return !(v && v[0] == '0'); }();
