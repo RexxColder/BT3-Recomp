@@ -1927,6 +1927,17 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
             if (n) { if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y; g_wbPixelsWritten += n; }
             continue;
         }
+        if ((psm == 0x02u || psm == 0x0Au) && fbmsk == 0u && !g_wbAlphaFillOnly && !s_rawFlush)
+        {   // [rowct16] unmasked CT16/CT16S (the edge page f336): pack the row, then bulk write
+            static std::vector<uint16_t> row16; if (row16.size() < (size_t)w) row16.resize((size_t)w);
+            const uint32_t *srow = px + (size_t)y * w;
+            for (int x = xs; x < xe; ++x) row16[(size_t)x] = (uint16_t)(s_wbPack16 ? wbPack16(srow[x]) : srow[x]);
+            const u32 n = (psm == 0x02u)
+                ? GSMem::WriteRowCT16(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, row16.data(), g_wbSkipMask ? g_wbSkipMask + (size_t)y * w : nullptr)
+                : GSMem::WriteRowCT16S(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, row16.data(), g_wbSkipMask ? g_wbSkipMask + (size_t)y * w : nullptr);
+            if (n) { if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y; g_wbPixelsWritten += n; }
+            continue;
+        }
         for (int x = xs; x < xe; ++x)
         {
             if (g_wbSkipMask && !g_wbSkipMask[(size_t)y * w + x]) continue;

@@ -257,6 +257,34 @@ namespace GSMem
         return n;
     }
 
+    template <typename TraitsT, typename TableT>
+    static u32 writeRow16(const TableT &table, u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask)
+    {   // mirrors PixelStorageTraits<C16*>::Write: byte = (pixel_addr * 2) & (MEMORY_SIZE - 2)
+        constexpr u32 kBlocks = TraitsT::BlocksPerPage();
+        constexpr auto kExt   = TraitsT::PageExtent();             // 64 x 64
+        constexpr u32 kPixels = TraitsT::PixelsPerPage();          // 4096
+        const u32 block = bp % kBlocks;
+        const auto &row = table[block][y % kExt.y];
+        u32 n = 0, x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(TraitsT::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x)
+            {
+                if (mask && !mask[x]) continue;
+                const usz byte_addr = ((pageBase + row[x % kExt.x]) * 2u) & (MEMORY_SIZE - 2u);
+                std::memcpy(&data[byte_addr], &src[x], 2u);
+                ++n;
+            }
+        }
+        return n;
+    }
+    u32 WriteRowCT16(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask)
+    { return writeRow16<C16Traits>(PageTableC16, data, bp, bw, x0, x1, y, src, mask); }
+    u32 WriteRowCT16S(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask)
+    { return writeRow16<C16STraits>(PageTableC16S, data, bp, bw, x0, x1, y, src, mask); }
+
     void WriteCT24(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
     {
         PixelStorageTraits<C24>::Write(PageTableC32, data, bp, bw, x, y, value);

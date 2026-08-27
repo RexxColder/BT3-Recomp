@@ -539,6 +539,9 @@ namespace GSMem
 	// [rowct32] bulk row write for CT32 with no mask: page resolved once per 64-px column, one table
 	// lookup per pixel. Returns the number of pixels written. mask (optional): 0 = skip pixel.
 	u32 WriteRowCT32(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u32* src, const u8* mask);
+	// [rowct16] same for CT16 / CT16S: src holds the already-packed 16-bit texels.
+	u32 WriteRowCT16(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask);
+	u32 WriteRowCT16S(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask);
 	void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 
 	void WriteCT24(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
