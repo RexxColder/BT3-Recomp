@@ -297,7 +297,7 @@ namespace
     };
     enum : uint8_t { VU_LO_FALLBACK = 0, VU_LO_NOP, VU_LO_LQ, VU_LO_SQ, VU_LO_IADDIU, VU_LO_ISUBIU, VU_LO_IADD, VU_LO_ISUB,
                      VU_LO_IADDI, VU_LO_IAND, VU_LO_IOR, VU_LO_MOVE, VU_LO_MR32, VU_LO_LQI, VU_LO_SQI, VU_LO_LQD, VU_LO_SQD,
-                     VU_LO_MTIR, VU_LO_MFIR };
+                     VU_LO_MTIR, VU_LO_MFIR, VU_LO_B, VU_LO_BAL, VU_LO_IBEQ, VU_LO_IBNE, VU_LO_IBLTZ, VU_LO_IBGTZ, VU_LO_IBLEZ, VU_LO_IBGEZ, VU_LO_FCOR };
     constexpr uint32_t kVuDecodeSlots = 2048u; // 16KB microcode / 8 bytes per instruction
     thread_local VuDecodeEntry g_vuDecode[kVuDecodeSlots];
 
@@ -306,6 +306,7 @@ namespace
     thread_local uint64_t g_vuFastHits = 0;
     thread_local uint64_t g_vuFastMisses = 0;
     thread_local uint64_t g_vuLoFastHits = 0, g_vuLoFastMisses = 0;   // [vulower]
+    thread_local uint64_t g_vuUpMissHist[64] = {};   // [vufast] upper fallback histogram (op & 0x3F)
     thread_local uint64_t g_vuFastNs = 0;
 
     // Lane-select masks for the dest field, so the commit is a branchless blend instead of the
@@ -352,6 +353,15 @@ namespace
         case 0x01: e.loKind = VU_LO_SQ; e.loA = FS(instr); e.loB = VIT(instr); e.loDest = dest; e.loImm = IMM11(instr); return;
         case 0x08: e.loKind = VU_LO_IADDIU; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800); return;
         case 0x09: e.loKind = VU_LO_ISUBIU; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800); return;
+        case 0x13: e.loKind = VU_LO_FCOR; e.loImm = (int32_t)(instr & 0xFFFFFFu); return;
+        case 0x20: e.loKind = VU_LO_B;   e.loImm = IMM11(instr); return;
+        case 0x21: e.loKind = VU_LO_BAL; e.loA = VIT(instr); e.loImm = IMM11(instr); return;
+        case 0x28: e.loKind = VU_LO_IBEQ; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = IMM11(instr); return;
+        case 0x29: e.loKind = VU_LO_IBNE; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = IMM11(instr); return;
+        case 0x2C: e.loKind = VU_LO_IBLTZ; e.loB = VIS(instr); e.loImm = IMM11(instr); return;
+        case 0x2D: e.loKind = VU_LO_IBGTZ; e.loB = VIS(instr); e.loImm = IMM11(instr); return;
+        case 0x2E: e.loKind = VU_LO_IBLEZ; e.loB = VIS(instr); e.loImm = IMM11(instr); return;
+        case 0x2F: e.loKind = VU_LO_IBGEZ; e.loB = VIS(instr); e.loImm = IMM11(instr); return;
         case 0x40:
         {
             const uint8_t funct = instr & 0x3Fu;
@@ -891,6 +901,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                                  100.0 * (double)g_vuLoFastHits / (double)std::max<uint64_t>(1u, g_vuLoFastHits + g_vuLoFastMisses),
                                  (double)g_vuFastNs / (double)tot,
                                  (unsigned long long)tot, (double)g_vuFastNs / 1e9);
+                    { int idx[64]; for (int k = 0; k < 64; ++k) idx[k] = k;
+                      std::sort(idx, idx + 64, [](int a, int b){ return g_vuUpMissHist[a] > g_vuUpMissHist[b]; });
+                      std::fprintf(stderr, "[vufast] upper fallbacks:"); for (int k = 0; k < 8; ++k) std::fprintf(stderr, " 0x%02x=%llu", idx[k], (unsigned long long)g_vuUpMissHist[idx[k]]); std::fprintf(stderr, "\n"); }
+
             }
         }
     }
@@ -1094,7 +1108,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             // Counters only when asked for: two thread-local increments per instruction is ~94M/sec
             // in a fight, which is not free and would otherwise be charged to the shipping path.
             if (s_vuTime)
+            {
                 (fast ? g_vuFastHits : g_vuFastMisses) += 1u;
+                if (!fast) g_vuUpMissHist[upper & 0x3Fu] += 1u;   // [vufast] which upper ops still fall back
+            }
             if (!fast)
                 execUpper(upper);
         };
@@ -1772,6 +1789,16 @@ static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData,
         vuLaneCopy(st.vf[e.loA], result, e.loDest);
         return true;
     }
+    case VU_LO_FCOR: st.vi[1] = ((st.clip | (uint32_t)e.loImm) == 0xFFFFFFu) ? 1 : 0; return true;
+    case VU_LO_B:    { st.branchTarget = (st.pc + 8 + e.loImm * 8) & 0x3FFF; st.branchPending = true; st.branchDelay = 1; return true; }
+    case VU_LO_BAL:  { const uint32_t target = (st.pc + 8 + e.loImm * 8) & 0x3FFF; if (e.loA != 0) st.vi[e.loA] = (int32_t)((st.pc + 16) / 8);
+                       st.branchPending = true; st.branchTarget = target; st.branchDelay = 1; return true; }
+    case VU_LO_IBEQ: if ((int16_t)st.vi[e.loB] == (int16_t)st.vi[e.loA]) { st.branchTarget = (st.pc + 8 + e.loImm * 8) & 0x3FFF; st.branchPending = true; st.branchDelay = 1; } return true;
+    case VU_LO_IBNE: if ((int16_t)st.vi[e.loB] != (int16_t)st.vi[e.loA]) { st.branchTarget = (st.pc + 8 + e.loImm * 8) & 0x3FFF; st.branchPending = true; st.branchDelay = 1; } return true;
+    case VU_LO_IBLTZ: if ((int16_t)st.vi[e.loB] < 0)  { st.branchTarget = (st.pc + 8 + e.loImm * 8) & 0x3FFF; st.branchPending = true; st.branchDelay = 1; } return true;
+    case VU_LO_IBGTZ: if ((int16_t)st.vi[e.loB] > 0)  { st.branchTarget = (st.pc + 8 + e.loImm * 8) & 0x3FFF; st.branchPending = true; st.branchDelay = 1; } return true;
+    case VU_LO_IBLEZ: if ((int16_t)st.vi[e.loB] <= 0) { st.branchTarget = (st.pc + 8 + e.loImm * 8) & 0x3FFF; st.branchPending = true; st.branchDelay = 1; } return true;
+    case VU_LO_IBGEZ: if ((int16_t)st.vi[e.loB] >= 0) { st.branchTarget = (st.pc + 8 + e.loImm * 8) & 0x3FFF; st.branchPending = true; st.branchDelay = 1; } return true;
     default: return false;
     }
 }
