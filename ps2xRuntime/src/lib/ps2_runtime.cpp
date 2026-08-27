@@ -829,6 +829,12 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
         SetTargetFPS(60);
+        // [barblock] manual pacing: the present thread must service guest barriers every few
+        // hundred microseconds, which it cannot do while asleep inside EndDrawing's frame cap.
+        // PS2X_BARPACE=0 keeps raylib's frame cap (barrier latency then <= one frame) -- A/B for
+        // whether the manual pacing itself disturbs the guest.
+        static const bool s_barPace = [](){ const char *v = std::getenv("PS2X_BARPACE"); return !(v && v[0] == '0'); }();
+        if (GsGpuRenderer::blockingBarriersEnabled() && s_barPace) SetTargetFPS(0);
         // PS2X_TOPMOST=1: keep the game window above others — unattended (AFK) test runs
         // screenshot the whole desktop, and an occluded window can't be captured on Wayland.
         if (const char *tm = std::getenv("PS2X_TOPMOST"); tm && tm[0] && tm[0] != '0')
@@ -3544,8 +3550,15 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
+std::atomic<uint32_t> g_bt3StateLive{0xffffffffu};   // [barblock] last bt3state seen by the status probe
+static PS2Runtime *g_waitHookRuntime = nullptr;   // [barblock]
+void *PS2Runtime::guestWaitBegin() { return new GuestExecutionReleaseScope(this); }
+void PS2Runtime::guestWaitEnd(void *handle) { delete static_cast<GuestExecutionReleaseScope *>(handle); }
+extern "C" void *ps2xGuestWaitBegin() { return g_waitHookRuntime ? g_waitHookRuntime->guestWaitBegin() : nullptr; }
+extern "C" void ps2xGuestWaitEnd(void *h) { if (h && g_waitHookRuntime) g_waitHookRuntime->guestWaitEnd(h); }
 void PS2Runtime::run()
 {
+    g_waitHookRuntime = this;   // [barblock]
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
     ps2_syscalls::resetSoundDriverRpcState();
@@ -3689,6 +3702,7 @@ void PS2Runtime::run()
                     std::memcpy(&bt3StatePtr, rd + (0x2ff10cu & PS2_RAM_MASK), 4);
                     if (bt3StatePtr)
                         std::memcpy(&bt3State, rd + (((bt3StatePtr & 0x1FFFFFFFu) + 0x18u) & PS2_RAM_MASK), 4);
+                    g_bt3StateLive.store(bt3State, std::memory_order_relaxed);   // [barblock] loading-state gate
                     std::memcpy(&fadeState, rd + (0x301048u & PS2_RAM_MASK), 4);
                     std::memcpy(&fadeLevel, rd + (0x301050u & PS2_RAM_MASK), 4);
                     // TEST (PS2X_FORCE_TRIANGLE): stamp the game's button flag with
@@ -3807,6 +3821,7 @@ void PS2Runtime::run()
         // Refresh the native evdev reader for any Linux gamepad that GLFW cannot map.
         ps2_stubs::PadEvdevLinux::instance().update();
 #endif
+        if (gpuMode) ps2GpuRenderer().serviceBlockingBarriers();   // [barblock]
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
@@ -3842,6 +3857,23 @@ void PS2Runtime::run()
         // raylib's AudioStream calls are not safe to make from the guest threads that
         // produce the data (see PS2AudioBackend::onStreamPcm / serviceStreams).
         audioBackend().serviceStreams();
+        static const bool s_barPace2 = [](){ const char *v = std::getenv("PS2X_BARPACE"); return !(v && v[0] == '0'); }();
+        if (gpuMode && GsGpuRenderer::blockingBarriersEnabled() && s_barPace2)
+        {   // [barblock] pace to 60 Hz ourselves, servicing barrier requests while we wait.
+            static auto s_next = std::chrono::steady_clock::now();
+            const auto period = std::chrono::microseconds(16667);
+            auto now = std::chrono::steady_clock::now();
+            if (s_next + std::chrono::milliseconds(50) < now) s_next = now;   // fell behind: resync
+            s_next += period;
+            while ((now = std::chrono::steady_clock::now()) < s_next)
+            {
+                if (!ps2GpuRenderer().serviceBlockingBarriers())
+                {
+                    const auto left = std::chrono::duration_cast<std::chrono::microseconds>(s_next - now).count();
+                    ps2GpuRenderer().waitForBlockingBarrierRequest((int)std::max<long long>(1, left));   // cv-driven: wakes on a request, else sleeps to the frame deadline
+                }
+            }
+        }
 
         // PS2X_TEXWATCH (default ON, =0 disables): find the recompiled-EE writer of the
         // CORRUPTED floor TEX0 (tw=10 where real HW authors tw=8 — the stage-texture root
@@ -4027,6 +4059,7 @@ void PS2Runtime::run()
     }
 
     requestStop();
+    if (GsGpuRenderer::enabled()) ps2GpuRenderer().abortBlockingBarriers();   // [barblock]
 
     const auto joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!gameThreadFinished.load(std::memory_order_acquire) &&

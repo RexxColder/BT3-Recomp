@@ -367,6 +367,10 @@ public:
     inline u32 ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const;
 
     uint8_t *vramData() { return m_vram; }
+    // [slice] raw shadow of every general register written via writeRegister (A+D, REGLIST,
+    // PACKED). Lets the replay slicer re-emit the full register state as one A+D packet.
+    const uint64_t *rawRegs() const { return m_rawRegs; }
+    const bool *rawRegsSet() const { return m_rawSet; }
     uint32_t vramSize() const { return m_vramSize; }
 
     // Invalidate the decoded-palette cache. A barrier writeback can change a palette that
@@ -409,6 +413,8 @@ private:
 
     GSContext m_ctx[2];
     GSPrimReg m_prim{};
+    uint64_t m_rawRegs[0x63] = {};
+    bool m_rawSet[0x63] = {};
 
     uint8_t m_curR = 0x80, m_curG = 0x80, m_curB = 0x80, m_curA = 0x80;
     float m_curQ = 1.0f;

@@ -365,6 +365,11 @@ struct PS2DtxCompatLayout
 class PS2Runtime
 {
 public:
+    // [barblock] Host-side wait hooks for the GS barrier: release the scheduler token and the
+    // guest-execution lock while a guest thread waits for the GL thread, re-acquire after.
+    void *guestWaitBegin();
+    void guestWaitEnd(void *handle);
+
     struct IoPaths
     {
         std::filesystem::path elfPath;

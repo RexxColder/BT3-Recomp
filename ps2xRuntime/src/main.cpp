@@ -140,7 +140,7 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
     std::fclose(f);
     uint32_t magic; std::memcpy(&magic, d.data(), 4);
     GS &gs = rt.gs();
-    size_t off = 0;
+    size_t off = 0; int sliceBase = 0;
     if (magic == 0xFFFFFFFFu)
     {
         // PCSX2 dump: header + state (leads with 4MB VRAM) + privileged regs + packets.
@@ -165,6 +165,28 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
         }
         off = state + stateSize + 8192;
     }
+    else if (magic == 0xFFFFFFFEu)
+    {
+        // [slice] PS2X replay slice written by PS2X_GS_REPLAY_SLICE (see the vsync branch below):
+        //   u32 magic 0xFFFFFFFE | u32 baseVsync | u32 nregs | nregs x {u8 addr, u64 value}
+        //   | u32 vramBytes | VRAM | raw records...
+        // Restores the register file through one synthetic A+D GIF packet, seeds VRAM, and
+        // continues the vsync count from baseVsync so FROM/TO keep their full-recording meaning.
+        uint32_t base = 0, nregs = 0; std::memcpy(&base, d.data() + 4, 4); std::memcpy(&nregs, d.data() + 8, 4);
+        size_t p = 12;
+        std::vector<uint8_t> pkt; pkt.reserve(16 + 16 * nregs);
+        auto put64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) pkt.push_back((uint8_t)(v >> (8 * i))); };
+        put64((uint64_t)nregs | (1ull << 15) | (1ull << 60)); put64(0xEull);   // NLOOP, EOP, NREG=1, REGS=A+D
+        for (uint32_t i = 0; i < nregs; ++i)
+        { const uint8_t a = d[p]; uint64_t v; std::memcpy(&v, d.data() + p + 1, 8); p += 9; put64(v); put64(a); }
+        uint32_t vb = 0; std::memcpy(&vb, d.data() + p, 4); p += 4;
+        if (gs.vramData() && vb && p + vb <= (size_t)sz)
+        { std::memcpy(gs.vramData(), d.data() + p, std::min<size_t>(vb, gs.vramSize())); ps2GpuRenderer().onVramUpload(0u, 16384u); }
+        p += vb;
+        gs.processGIFPacket(pkt.data(), (uint32_t)pkt.size());
+        off = p; sliceBase = (int)base;
+        std::fprintf(stderr, "[slice] loaded: base vsync %u, %u registers restored, %u VRAM bytes, records from %zu\n", base, nregs, vb, off);
+    }
     else if (d[0] == 0u)
     {
         // Raw PS2X_GS_RECORD stream: packets from byte 0, no VRAM snapshot (the
@@ -186,7 +208,12 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
     const long replayLoops = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_LOOP");
                                    const long n = v ? std::atol(v) : 1L; return n > 0 ? n : 1L; }();
     const size_t offStart = off;
-    int vsyncs = 0; uint64_t xfers = 0; bool sawVsync = false;
+    int vsyncs = sliceBase; uint64_t xfers = 0; bool sawVsync = false;
+    // PS2X_GS_REPLAY_SLICE=<out> + PS2X_GS_REPLAY_SLICEAT=<vsync> [+ PS2X_GS_REPLAY_SLICEEND=<vsync>]:
+    // at that vsync, write a slice (registers + VRAM + the records up to SLICEEND) and stop.
+    const char *slicePath = std::getenv("PS2X_GS_REPLAY_SLICE");
+    const long sliceAt = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_SLICEAT"); return v ? std::atol(v) : 0L; }();
+    const long sliceEnd = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_SLICEEND"); return v ? std::atol(v) : 0L; }();
     std::fprintf(stderr, "[gsreplay] %s: %ld bytes, packets from %zu (loops=%ld)\n", path, sz, off, replayLoops);
     for (long loopIter = 0; loopIter < replayLoops; ++loopIter)
     {
@@ -211,8 +238,9 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
             {
                 static const bool s_bar = [](){ const char *v = std::getenv("PS2X_BARRIER");
                                                 return v && v[0] && v[0] != '0'; }();
+                static const bool s_livepath = [](){ const char *v = std::getenv("PS2X_LIVEPATH"); return v && v[0] && v[0] != '0'; }();
                 uint32_t bpage = 0;
-                while (s_bar && ps2GpuRenderer().takeBarrierRequest(bpage))
+                while (s_bar && !s_livepath && ps2GpuRenderer().takeBarrierRequest(bpage))
                 {
                     // renderRange, NOT swapFrame + renderAndGetTextureId: publishing mid-frame
                     // and running the full render made the display pick, the per-frame extent
@@ -281,6 +309,7 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
                     if (std::getenv("PS2X_BODYDUMP"))
                         std::fprintf(stderr, "[bodyfr] %d\n", vsyncs);
                     ps2GpuRenderer().swapFrame();
+                    { extern bool g_replayInWindow; g_replayInWindow = inWin; }
                     if ((dumpEvery > 0 && (vsyncs % (int)dumpEvery) == 0 && inWin) || (dumpTo > 0 && inWin))
                     {
                         ps2GpuRenderer().renderAndGetTextureId(512, 448);
@@ -319,6 +348,38 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
                     gsReplayDumpBuf(gs, 368u, 2u, 128, 128, 50000 + vsyncs);
                     gsReplayDumpBuf(gs, 502u, 1u, 64, 64, 60000 + vsyncs);
                 }
+            }
+            if (slicePath && slicePath[0] && sliceAt > 0 && vsyncs == sliceAt)
+            {
+                if (GsGpuRenderer::enabled()) ps2GpuRenderer().flushRecentPagesToVram(vsyncs - 3);
+                std::vector<uint8_t> o; auto put32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) o.push_back((uint8_t)(v >> (8 * i))); };
+                auto put64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) o.push_back((uint8_t)(v >> (8 * i))); };
+                put32(0xFFFFFFFEu); put32((uint32_t)vsyncs);
+                const uint64_t *rr = gs.rawRegs(); const bool *rs = gs.rawRegsSet();
+                std::vector<uint8_t> order;
+                for (int a = 1; a < 0x63; ++a)
+                {   // vertex kicks (0x02-0x05, 0x0C-0x0D), TEXFLUSH, TRXDIR, SIGNAL/FINISH/LABEL are not state
+                    if (a == 0x02 || a == 0x03 || a == 0x04 || a == 0x05 || a == 0x0C || a == 0x0D || a == 0x3F || a == 0x53 || a >= 0x60) continue;
+                    if (rs[a]) order.push_back((uint8_t)a);
+                }
+                if (rs[0]) order.push_back(0u);   // PRIM last (after PRMODECONT/PRMODE)
+                put32((uint32_t)order.size());
+                for (uint8_t a : order) { o.push_back(a); put64(rr[a]); }
+                put32(gs.vramSize()); o.insert(o.end(), gs.vramData(), gs.vramData() + gs.vramSize());
+                size_t e = off; int vs2 = vsyncs;   // records up to SLICEEND
+                while (e < (size_t)sz)
+                {
+                    const uint8_t t2 = d[e];
+                    if (t2 == 0) { uint32_t n2; std::memcpy(&n2, d.data() + e + 2, 4); e += 6 + n2; }
+                    else if (t2 == 1) { if (sliceEnd > 0 && vs2 >= sliceEnd) break; e += 2; ++vs2; }
+                    else if (t2 == 2) e += 5; else if (t2 == 3) e += 8193; else break;
+                }
+                if (e > (size_t)sz) e = (size_t)sz;
+                o.insert(o.end(), d.data() + off, d.data() + e);
+                if (FILE *sf = std::fopen(slicePath, "wb")) { std::fwrite(o.data(), 1, o.size(), sf); std::fclose(sf); }
+                std::fprintf(stderr, "[slice] wrote %s: %.1f MB, base vsync %d, %zu registers, records for vsyncs %d..%d\n",
+                             slicePath, o.size() / 1e6, vsyncs, order.size(), vsyncs, vs2);
+                break;
             }
             // Window done: the rest of the recording can't change what was already dumped.
             if (dumpTo > 0 && vsyncs > dumpTo)

@@ -209,8 +209,14 @@ public:
     // flushing that page to VRAM, so the next decode reads fresh bytes. Census says this fires
     // ~37 times per frame (0.09% of draws), so it is cheap.
     bool takeBarrierRequest(uint32_t &page);
+    // [barblock] PS2X_BARBLOCK=1: GL-thread service of guest barriers (see the .cpp).
+    bool serviceBlockingBarriers();
+    void waitForBlockingBarrierRequest(int micros);
+    void abortBlockingBarriers();
+    static bool blockingBarriersEnabled();
     // Read one page's FBO back and push it into VRAM in that page's own recorded format.
     void flushPageToVram(uint32_t fbp);
+    void flushRecentPagesToVram(int minVsync);   // [slice]
 
     // Mid-frame barrier render (PS2X_BARRIER). Draws the commands of the IN-PROGRESS list
     // that have not been drawn yet into their FBOs and returns -- no display pick, no

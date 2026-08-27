@@ -1579,6 +1579,21 @@ void ps2xWritebackDepthToVram(uint32_t zbp, uint32_t zbw, uint32_t zpsm, int w, 
     gs->bumpTexUploadGen();
     ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u));
 }
+// [wbpack16] GPU->VRAM writebacks used to hand WriteVram the raw RGBA8888 word for 16-bit
+// pages, so a CT16 pixel got the low 16 bits (R&31 | G<<8...) instead of R5G5B5A1 -- G landed
+// in B5 (>>2), B and A were dropped, and every CT16 flush wrote garbage colour bits (the reason
+// PS2X_FLUSHCT32 was needed for the scene pages). Pack/unpack like the SW rasterizer does.
+// PS2X_WBPACK16=0 restores the raw behaviour for A/B.
+static inline bool wbIs16(uint32_t psm) { return psm == GS_PSM_CT16 || psm == GS_PSM_CT16S; }
+static inline uint32_t wbPack16(uint32_t c)
+{ return ((c >> 3) & 0x1Fu) | (((c >> 11) & 0x1Fu) << 5) | (((c >> 19) & 0x1Fu) << 10) | (((c >> 31) & 1u) << 15); }
+static inline uint32_t wbUnpack16(uint32_t v)
+{ const uint32_t r = v & 0x1Fu, g = (v >> 5) & 0x1Fu, b = (v >> 10) & 0x1Fu, a = (v >> 15) & 1u;
+  return ((r << 3) | (r >> 2)) | (((g << 3) | (g >> 2)) << 8) | (((b << 3) | (b >> 2)) << 16) | ((a ? 0x80u : 0u) << 24); }
+int g_wbRectX0 = -1, g_wbRectY0 = -1, g_wbRectX1 = -1, g_wbRectY1 = -1;   // [flushrect] -1 = whole buffer
+int g_wbLastWrittenRows = 0;   // [flushdiff] rows written by the last masked writeback
+const uint8_t *g_wbSkipMask = nullptr;   // [flushdiff] per-pixel: 0 = unchanged since the last flush, skip the write
+static const bool s_wbPack16 = [](){ const char *v = std::getenv("PS2X_WBPACK16"); return !(v && v[0] == '0'); }();
 // Masked variant: GS FBMSK protects bits, so a writeback that ignores it destroys data the
 // hardware keeps. BT3's CT16 stripes pass writes fbp0 through FBMSK=0x00003fff -- bits 0..13 are
 // preserved -- so a full-pixel writeback zeroes most of the surface.
@@ -1662,6 +1677,28 @@ void ps2xCt16MapProbe()
 // PS2X_F336PRE=1: what does VRAM page `fbp` hold, read as CT16, at the moment it is called?
 // The edge detect's two SUBTRACTIVE passes (blend 0x62) clamp to zero on a zero destination,
 // and page 336 IS the stage-texture atlas (block 10752), so on console Cd is real texture.
+void ps2xVramCt16Dump(uint32_t fbp, uint32_t fbw, const char *path)
+{   // page `fbp` read as PSMCT16 (512x448) -> RGB png via raylib's ExportImage
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs; if (!gs) return;
+    const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
+    std::vector<uint8_t> px((size_t)512 * 448 * 4);
+    for (int y = 0; y < 448; ++y) for (int x = 0; x < 512; ++x)
+    {   const uint32_t v = gs->ReadVram(GS_PSM_CT16, base, fbw, (uint32_t)x, (uint32_t)y) & 0xFFFFu;
+        uint8_t *o = &px[((size_t)y * 512 + x) * 4];
+        o[0] = (uint8_t)((v & 0x1F) << 3); o[1] = (uint8_t)(((v >> 5) & 0x1F) << 3); o[2] = (uint8_t)(((v >> 10) & 0x1F) << 3); o[3] = 255; }
+    if (FILE *f = std::fopen(path, "wb"))
+    {   std::fprintf(f, "P6\n512 448\n255\n");
+        for (size_t i = 0; i < (size_t)512 * 448; ++i) std::fwrite(&px[i * 4], 1, 3, f);
+        std::fclose(f); std::fprintf(stderr, "[ct16dump] wrote %s\n", path); }
+}
+void ps2xVramT8HDump(uint32_t fbp, uint32_t fbw, const char *path)
+{   // page `fbp` read as PSMT8H (512x448 index bytes) -> P5 pgm
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs; if (!gs) return;
+    const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
+    std::vector<uint8_t> px((size_t)512 * 448);
+    for (int y = 0; y < 448; ++y) for (int x = 0; x < 512; ++x) px[(size_t)y * 512 + x] = (uint8_t)(gs->ReadVram(GS_PSM_T8H, base, fbw, (uint32_t)x, (uint32_t)y) & 0xFFu);
+    if (FILE *f = std::fopen(path, "wb")) { std::fprintf(f, "P5\n512 448\n255\n"); std::fwrite(px.data(), 1, px.size(), f); std::fclose(f); std::fprintf(stderr, "[t8hdump] wrote %s\n", path); }
+}
 void ps2xVramCt16Stats(uint32_t fbp, uint32_t fbw, const char *when)
 {
     GS *gs = g_gsWb ? g_gsWb : g_fmvGs;
@@ -1794,6 +1831,23 @@ void ps2xReadbackFromVram(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h
             px[(size_t)y * w + x] = gs->ReadVram(psm, base, bw, (uint32_t)x, (uint32_t)y);
 }
 
+// [flushrectchk] count pixels OUTSIDE [x0,x1)x[y0,y1) where the FBO (px) differs from VRAM;
+// returns the count and the bbox of the misses.
+extern "C" unsigned ps2xVramDiffOutside(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h, const uint32_t *px,
+                                        int x0, int y0, int x1, int y1, int *bx0, int *by0, int *bx1, int *by1)
+{
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs; if (!gs) return 0u;
+    const uint32_t base = GSInternal::framePageBaseToBlock(fbp); const uint32_t bw = fbw ? fbw : 1u;
+    const bool p16 = s_wbPack16 && wbIs16(psm); unsigned n = 0; *bx0 = *by0 = 1 << 20; *bx1 = *by1 = -1;
+    for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
+    {
+        if (x >= x0 && x < x1 && y >= y0 && y < y1) continue;
+        const uint32_t nv = px[(size_t)y * w + x]; const uint32_t ov = gs->ReadVram(psm, base, bw, (uint32_t)x, (uint32_t)y);
+        const bool diff = p16 ? ((ov & 0xFFFFu) != wbPack16(nv)) : (psm == 1u ? ((ov ^ nv) & 0xFFFFFFu) != 0u : ov != nv);
+        if (diff) { ++n; *bx0 = std::min(*bx0, x); *by0 = std::min(*by0, y); *bx1 = std::max(*bx1, x); *by1 = std::max(*by1, y); }
+    }
+    return n;
+}
 void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
                                const uint32_t *px, uint32_t fbmsk)
 {
@@ -1833,10 +1887,28 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
     }
     const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
     const uint32_t bw = fbw ? fbw : 1u;
-    for (int y = 0; y < h; ++y)
-        for (int x = 0; x < w; ++x)
+    // [rawflush] PS2X_RAWFLUSH=1: the FBO holds GL-scale alpha (GS 128 -> 255, needed for GL
+    // blending); VRAM must hold GS-scale bytes -- console reads them back as PALETTE INDICES
+    // (BT3's outline mask chain). Convert at this boundary: a_gs = round(a_gl*128/255), the
+    // inverse of the decoder's floor(a*255/128), exact for all 0..128.
+    static const bool s_rawFlush = [](){ const char *v = std::getenv("PS2X_RAWFLUSH");
+                                         return v && v[0] && v[0] != '0'; }();
+    auto cvA = [&](uint32_t v) -> uint32_t {
+        if (!s_rawFlush || psm != 0u) return v;
+        const uint32_t a = (v >> 24) & 0xFFu;
+        return (v & 0x00FFFFFFu) | (((a * 128u + 127u) / 255u) << 24);
+    };
+    // [flushrect] optional sub-rectangle (set by flushPageToVram): only these rows/cols are
+    // written; px keeps the full w-stride layout.
+    const int ry0 = (g_wbRectY0 >= 0) ? std::max(0, g_wbRectY0) : 0, ry1 = (g_wbRectY0 >= 0) ? std::min(h, g_wbRectY1) : h;
+    const int rx0 = (g_wbRectY0 >= 0) ? std::max(0, g_wbRectX0) : 0, rx1 = (g_wbRectY0 >= 0) ? std::min(w, g_wbRectX1) : w;
+    int wrY0 = 1 << 30, wrY1 = -1;   // [flushdiff] rows actually written
+    for (int y = ry0; y < ry1; ++y)
+        for (int x = rx0; x < rx1; ++x)
         {
-            const uint32_t nv = px[(size_t)y * w + x];
+            if (g_wbSkipMask && !g_wbSkipMask[(size_t)y * w + x]) continue;
+            if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y;
+            const uint32_t nv = cvA(px[(size_t)y * w + x]);
             if (g_wbAlphaFillOnly)
             {   // RGB per the caller's mask (the previous version wrote it unconditionally,
                 // which is what regressed the frame); ALPHA only where VRAM has none yet, so
@@ -1850,14 +1922,29 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
                 gs->WriteVram(psm, base, bw, (uint32_t)x, (uint32_t)y, rgb | al);
                 continue;
             }
-            if (fbmsk == 0u) { gs->WriteVram(psm, base, bw, (uint32_t)x, (uint32_t)y, nv); continue; }
-            const uint32_t ov = gs->ReadVram(psm, base, bw, (uint32_t)x, (uint32_t)y);
-            gs->WriteVram(psm, base, bw, (uint32_t)x, (uint32_t)y, (ov & fbmsk) | (nv & ~fbmsk));
+            const bool p16 = s_wbPack16 && wbIs16(psm);
+            if (fbmsk == 0u) { gs->WriteVram(psm, base, bw, (uint32_t)x, (uint32_t)y, p16 ? wbPack16(nv) : nv); continue; }
+            uint32_t ov = gs->ReadVram(psm, base, bw, (uint32_t)x, (uint32_t)y);
+            if (p16) ov = wbUnpack16(ov & 0xFFFFu);
+            const uint32_t mv = (ov & fbmsk) | (nv & ~fbmsk);
+            gs->WriteVram(psm, base, bw, (uint32_t)x, (uint32_t)y, p16 ? wbPack16(mv) : mv);
         }
     // A palette can BE a render target (BT3's outline CLUTs live in pages 499-500, which the
     // game renders into). The CLUT cache keys on m_texUploadGen, which only processImageData
     // bumps -- so without this a flushed palette would never be re-read.
     gs->bumpTexUploadGen();
+    g_wbLastWrittenRows = (wrY1 >= wrY0) ? (wrY1 - wrY0 + 1) : 0;
+    // NOTE: invalidating only the rows written (or nothing on a zero-change flush) was tried
+    // 2026-08-27 and is NOT byte-identical (1.4% px) for no measurable gain -- the full-range
+    // bump stays.
+    if (g_wbRectY0 >= 0)
+    {   // rows ry0..ry1-1 only, rounded out to whole page rows (32 rows for 32-bit, 64 for 16/8-bit, 128 for 4-bit)
+        const int y0i = ry0, y1i = ry1;
+        const uint32_t ph = (psm == 0x02u || psm == 0x0Au || psm == 0x32u || psm == 0x3Au || psm == 0x13u || psm == 0x1Bu) ? 64u : (psm == 0x14u || psm == 0x24u || psm == 0x2Cu) ? 128u : 32u;
+        const uint32_t pr0 = (uint32_t)y0i / ph, pr1 = ((uint32_t)std::max(y1i, y0i + 1) + ph - 1u) / ph;
+        ps2GpuRenderer().onVramWriteback(base + pr0 * bw * 32u, (pr1 - pr0) * bw * 32u);
+    }
+    else
     ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u));
 }
 
@@ -1869,7 +1956,7 @@ void ps2xWritebackToVram(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
     const uint32_t bw = fbw ? fbw : 1u;
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
-            gs->WriteVram(psm, base, bw, (uint32_t)x, (uint32_t)y, px[(size_t)y * w + x]);
+            gs->WriteVram(psm, base, bw, (uint32_t)x, (uint32_t)y, (s_wbPack16 && wbIs16(psm)) ? wbPack16(px[(size_t)y * w + x]) : px[(size_t)y * w + x]);
     // Tell the renderer these VRAM pages changed, or every cached decode of them stays stale and
     // the writeback is invisible to reads. onVramWriteback() existed but was NEVER CALLED.
     // A palette can BE a render target (BT3's outline CLUTs live in pages 499-500, which the
@@ -2551,6 +2638,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (regAddr < 0x63u) { m_rawRegs[regAddr] = value; m_rawSet[regAddr] = true; }   // [slice] raw shadow
     // [floortex0] (default on, PS2X_SRCDIAG=0 disables): the exact TEX0 the FLOOR draws
     // carry NOW — is the tw=10 corruption still present, or did it heal along the way?
     {
