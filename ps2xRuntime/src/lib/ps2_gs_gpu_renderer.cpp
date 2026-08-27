@@ -3636,6 +3636,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
 
     std::vector<DrawCmd> cmds;
     struct SegSwapBack { std::vector<DrawCmd> &a, &b; bool on; ~SegSwapBack() { if (on) a.swap(b); } } segSwapBack{cmds, m_chunkMode ? m_chunk : m_building, m_segMode};
+    struct PendingUp { uint64_t key = 0; std::vector<uint8_t> rgba; int w = 0, h = 0; };   // [uploadout]
+    static std::vector<PendingUp> s_ups;
     std::vector<DrawCmd> prevCmds;
     std::vector<size_t> listStarts; // index into cmds where each published list begins (frame boundaries)
     size_t nLists = 0;              // published lists concatenated into cmds this call
@@ -3685,99 +3687,20 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // the KEY (two decodes sharing one GL texture) rather than the upload.
         static const bool s_reup = [](){ const char *v = std::getenv("PS2X_TEXREUP");
                                          return v && v[0] && v[0] != '0'; }();
+        // [uploadout] Collect what needs uploading; the GL calls themselves run AFTER this lock
+        // block (see below). Holding m_mtx through glTexImage2D/UpdateTexture of several MB per
+        // frame blocked the guest's recordCmd/resolveTextureVersion/putTexture (~8% of the guest
+        // thread as pthread_mutex time). The bytes are swapped out here and swapped back after the
+        // upload; a putTexture that lands in between sets needsUpload again and wins.
+        s_ups.clear();
         for (auto &kv : m_texCache)
         {
             CachedTex &ct = kv.second;
             if ((!ct.needsUpload && !s_reup) || ct.w <= 0 || ct.rgba.size() < (size_t)ct.w * ct.h * 4)
                 continue;
-            auto glIt = g_glTex.find(kv.first);
-            if (glIt != g_glTex.end() && glIt->second.width == ct.w && glIt->second.height == ct.h)
-            {
-                UpdateTexture(glIt->second, ct.rgba.data());
-            }
-            else
-            {
-                if (glIt != g_glTex.end())
-                {   // [filtercache] the GL id may be reused by the next allocation: drop its filter-state entry
-                    ps2xForgetTexId(glIt->second.id);
-                    UnloadTexture(glIt->second);
-                }
-                Image img{};
-                img.data = ct.rgba.data();
-                img.width = ct.w;
-                img.height = ct.h;
-                img.mipmaps = 1;
-                img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-                // Recycle a same-size GL texture from the pool (avoids a fresh glTexImage2D
-                // alloc every fade frame); else allocate one.
-                Texture2D t{};
-                static const bool s_poolOn = [](){ const char *v = std::getenv("PS2X_TEXPOOL"); return !(v && v[0] == '0'); }();   // [nopool] default ON again: the pool-off "fix" only dodged the [idreuse] bug
-                auto pit = s_poolOn ? g_texPool.find(texPoolKey(ct.w, ct.h)) : g_texPool.end();
-                if (pit != g_texPool.end() && !pit->second.empty())
-                {
-                    t = pit->second.back();
-                    pit->second.pop_back();
-                    UpdateTexture(t, ct.rgba.data());
-                    // [filtercache] a pooled object keeps whatever filter it last had, but the per-id
-                    // cache may say otherwise -> ps2xApplyTexFilter skipped the real call and alternate
-                    // frames rendered the same texture point- vs bilinear-sampled (menu/copyright
-                    // "shimmer": f0 smooth, f112 quantized). Force a re-apply.
-                    g_texFilterState.erase(t.id);
-                }
-                else
-                {
-                    t = LoadTextureFromImage(img);
-                    if (g_deletedIds.count(t.id)) { ++g_idReuse; g_deletedIds.erase(t.id); }   // [supdiag]
-                    SetTextureFilter(t, TEXTURE_FILTER_POINT);
-                    g_texFilterState[t.id] = false;   // [filtercache] known state
-                    SetTextureWrap(t, TEXTURE_WRAP_CLAMP); // PS2 UI doesn't tile; stop edge repeat
-                }
-                g_glTex[kv.first] = t;
-                // Diagnostic: export each decoded texture once so we can view it.
-                {
-                    static const bool s_dx = [](){ const char *v = std::getenv("PS2X_GPU_DIAG"); return v && v[0] && v[0] != '0'; }();
-                    static std::unordered_map<uint64_t,bool> s_exp;
-                    if (s_dx && s_exp.find(kv.first) == s_exp.end())
-                    {
-                        s_exp[kv.first] = true;
-                        char path[128];
-                        std::snprintf(path, sizeof(path), "/home/z3/Desktop/bt3/work/gputex_%llu.png", (unsigned long long)kv.first);
-                        // Export with alpha forced opaque: BT3 stage/char palettes carry ~zero
-                        // alpha (authentic; the GS draws them via FIX blends that ignore it),
-                        // which made the dumps view as blank white. RGB is what matters here.
-                        std::vector<uint8_t> vis(ct.rgba);
-                        for (size_t vp = 3; vp < vis.size(); vp += 4) vis[vp] = 255u;
-                        Image vimg = img;
-                        vimg.data = vis.data();
-                        ExportImage(vimg, path);
-                    }
-                }
-            }
-            // PS2X_GL_TEXCHK: read the ACTUAL GL texture back and compare to the CPU buffer. If
-            // the GL side is black while the CPU side has content, the UPLOAD is the bug (not the
-            // decode, not the draw). Once per key; gated (readback is a GPU->CPU stall).
-            {
-                static const bool s_gc = [](){ const char *v = std::getenv("PS2X_GL_TEXCHK"); return v && v[0] && v[0] != '0'; }();
-                static std::unordered_map<uint64_t,bool> s_done;
-                if (s_gc && s_done.find(kv.first) == s_done.end())
-                {
-                    s_done[kv.first] = true;
-                    double cpuSum = 0; size_t cn = 0;
-                    for (size_t i = 0; i + 2 < ct.rgba.size(); i += 64) { cpuSum += ct.rgba[i] + ct.rgba[i+1] + ct.rgba[i+2]; ++cn; }
-                    const double cpuMean = cn ? cpuSum / (cn * 3.0) : 0.0;
-                    Image gi = LoadImageFromTexture(g_glTex[kv.first]);
-                    double glSum = 0; size_t gn = 0;
-                    const uint8_t *gp = static_cast<const uint8_t *>(gi.data);
-                    const size_t gbytes = static_cast<size_t>(gi.width) * gi.height * 4u;
-                    if (gp) for (size_t i = 0; i + 2 < gbytes; i += 64) { glSum += gp[i] + gp[i+1] + gp[i+2]; ++gn; }
-                    const double glMean = gn ? glSum / (gn * 3.0) : -1.0;
-                    UnloadImage(gi);
-                    std::fprintf(stderr, "[gltexchk] key=%llu %dx%d CPUmean=%.1f GLmean=%.1f%s\n",
-                                 (unsigned long long)kv.first, ct.w, ct.h, cpuMean, glMean,
-                                 (cpuMean > 8.0 && glMean >= 0.0 && glMean < 2.0) ? "  <== GL BLACK, CPU has content!" : "");
-                }
-            }
+            PendingUp u; u.key = kv.first; u.w = ct.w; u.h = ct.h; u.rgba.swap(ct.rgba);
             ct.needsUpload = false;
+            s_ups.push_back(std::move(u));
         }
 
         // LRU eviction -- advance one tick per genuinely new published frame. Keys drawn
@@ -4134,6 +4057,117 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         }
     }
 
+    // [uploadout] GL uploads outside m_mtx, then hand the bytes back.
+    for (PendingUp &u : s_ups)
+    {
+        {
+            auto glIt = g_glTex.find(u.key);
+            if (glIt != g_glTex.end() && glIt->second.width == u.w && glIt->second.height == u.h)
+            {
+                UpdateTexture(glIt->second, u.rgba.data());
+            }
+            else
+            {
+                if (glIt != g_glTex.end())
+                {   // [filtercache] the GL id may be reused by the next allocation: drop its filter-state entry
+                    ps2xForgetTexId(glIt->second.id);
+                    UnloadTexture(glIt->second);
+                }
+                Image img{};
+                img.data = u.rgba.data();
+                img.width = u.w;
+                img.height = u.h;
+                img.mipmaps = 1;
+                img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                // Recycle a same-size GL texture from the pool (avoids a fresh glTexImage2D
+                // alloc every fade frame); else allocate one.
+                Texture2D t{};
+                static const bool s_poolOn = [](){ const char *v = std::getenv("PS2X_TEXPOOL"); return !(v && v[0] == '0'); }();   // [nopool] default ON again: the pool-off "fix" only dodged the [idreuse] bug
+                auto pit = s_poolOn ? g_texPool.find(texPoolKey(u.w, u.h)) : g_texPool.end();
+                if (pit != g_texPool.end() && !pit->second.empty())
+                {
+                    t = pit->second.back();
+                    pit->second.pop_back();
+                    UpdateTexture(t, u.rgba.data());
+                    // [filtercache] a pooled object keeps whatever filter it last had, but the per-id
+                    // cache may say otherwise -> ps2xApplyTexFilter skipped the real call and alternate
+                    // frames rendered the same texture point- vs bilinear-sampled (menu/copyright
+                    // "shimmer": f0 smooth, f112 quantized). Force a re-apply.
+                    g_texFilterState.erase(t.id);
+                }
+                else
+                {
+                    t = LoadTextureFromImage(img);
+                    if (g_deletedIds.count(t.id)) { ++g_idReuse; g_deletedIds.erase(t.id); }   // [supdiag]
+                    SetTextureFilter(t, TEXTURE_FILTER_POINT);
+                    g_texFilterState[t.id] = false;   // [filtercache] known state
+                    SetTextureWrap(t, TEXTURE_WRAP_CLAMP); // PS2 UI doesn't tile; stop edge repeat
+                }
+                g_glTex[u.key] = t;
+                // Diagnostic: export each decoded texture once so we can view it.
+                {
+                    static const bool s_dx = [](){ const char *v = std::getenv("PS2X_GPU_DIAG"); return v && v[0] && v[0] != '0'; }();
+                    static std::unordered_map<uint64_t,bool> s_exp;
+                    if (s_dx && s_exp.find(u.key) == s_exp.end())
+                    {
+                        s_exp[u.key] = true;
+                        char path[128];
+                        std::snprintf(path, sizeof(path), "/home/z3/Desktop/bt3/work/gputex_%llu.png", (unsigned long long)u.key);
+                        // Export with alpha forced opaque: BT3 stage/char palettes carry ~zero
+                        // alpha (authentic; the GS draws them via FIX blends that ignore it),
+                        // which made the dumps view as blank white. RGB is what matters here.
+                        std::vector<uint8_t> vis(u.rgba);
+                        for (size_t vp = 3; vp < vis.size(); vp += 4) vis[vp] = 255u;
+                        Image vimg = img;
+                        vimg.data = vis.data();
+                        ExportImage(vimg, path);
+                    }
+                }
+            }
+            // PS2X_GL_TEXCHK: read the ACTUAL GL texture back and compare to the CPU buffer. If
+            // the GL side is black while the CPU side has content, the UPLOAD is the bug (not the
+            // decode, not the draw). Once per key; gated (readback is a GPU->CPU stall).
+            {
+                static const bool s_gc = [](){ const char *v = std::getenv("PS2X_GL_TEXCHK"); return v && v[0] && v[0] != '0'; }();
+                static std::unordered_map<uint64_t,bool> s_done;
+                if (s_gc && s_done.find(u.key) == s_done.end())
+                {
+                    s_done[u.key] = true;
+                    double cpuSum = 0; size_t cn = 0;
+                    for (size_t i = 0; i + 2 < u.rgba.size(); i += 64) { cpuSum += u.rgba[i] + u.rgba[i+1] + u.rgba[i+2]; ++cn; }
+                    const double cpuMean = cn ? cpuSum / (cn * 3.0) : 0.0;
+                    Image gi = LoadImageFromTexture(g_glTex[u.key]);
+                    double glSum = 0; size_t gn = 0;
+                    const uint8_t *gp = static_cast<const uint8_t *>(gi.data);
+                    const size_t gbytes = static_cast<size_t>(gi.width) * gi.height * 4u;
+                    if (gp) for (size_t i = 0; i + 2 < gbytes; i += 64) { glSum += gp[i] + gp[i+1] + gp[i+2]; ++gn; }
+                    const double glMean = gn ? glSum / (gn * 3.0) : -1.0;
+                    UnloadImage(gi);
+                    std::fprintf(stderr, "[gltexchk] key=%llu %dx%d CPUmean=%.1f GLmean=%.1f%s\n",
+                                 (unsigned long long)u.key, u.w, u.h, cpuMean, glMean,
+                                 (cpuMean > 8.0 && glMean >= 0.0 && glMean < 2.0) ? "  <== GL BLACK, CPU has content!" : "");
+                }
+            }
+
+        }
+    }
+    if (!s_ups.empty())
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        for (PendingUp &u : s_ups)
+        {
+            auto it = m_texCache.find(u.key);
+            if (it == m_texCache.end())
+            {   // entry reclaimed/evicted meanwhile: drop the GL object we just made
+                auto g = g_glTex.find(u.key);
+                if (g != g_glTex.end()) { ps2xForgetTexId(g->second.id); UnloadTexture(g->second); g_glTex.erase(g); }
+            }
+            else if (!it->second.needsUpload && it->second.rgba.empty())
+                it->second.rgba.swap(u.rgba);   // no newer decode arrived: restore the bytes
+            // else: a newer decode replaced the bytes and will re-upload next render
+        }
+        s_ups.clear();
+    }
     // Interpolation: replace the command list with prev->cur lerped at the current
     // fraction. Done AFTER texture upload/eviction (which key off the real current frame).
     if (g_interpOn && !prevCmds.empty() && interpT < 0.999f && prevCmds.size() && cmds.size())
