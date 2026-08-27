@@ -610,6 +610,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
                 if (pos + copyBytes <= sizeBytes)
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                    { extern std::atomic<uint32_t> g_vu1CodeGen; g_vu1CodeGen.fetch_add(1u, std::memory_order_relaxed); }   // [vucache16] invalidate the decode cache
             }
             pos += mpgBytes;
             if (pos > sizeBytes)

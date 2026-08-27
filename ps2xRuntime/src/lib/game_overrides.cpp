@@ -2502,7 +2502,7 @@ namespace
                 // stops it substituting the value -- the A/B that says whether the fix is the
                 // substitution or just the extra frame per poll shifting the race.
                 static const bool s_edgeFix = [](){ const char *v = std::getenv("PS2X_CDEDGE"); return !(v && v[0] == '0'); }();
-                static const bool s_edge2 = [](){ const char *v = std::getenv("PS2X_CDEDGE2"); return !(v && v[0] == '0'); }();
+                static const bool s_edge2 = [](){ const char *v = std::getenv("PS2X_CDEDGE2"); return v && v[0] && v[0] != '0'; }();   // opt-in (see the pump)
                 uint32_t pendNow = 0u;
                 if (stream) { if (const uint8_t *pp = getConstMemPtr(rdram, stream + 8u)) std::memcpy(&pendNow, pp, sizeof(pendNow)); }
                 if (waiting && s_edgeFix && s_edge2 && ds->activeReq.load(std::memory_order_relaxed) != pendNow)
@@ -2595,7 +2595,11 @@ namespace
         // [cdedge2] which request is the device working on? Snapshot the pending request and the
         // device read-state around the tick; if the device is busy/done at either end, that request
         // has genuinely been started -- the only case in which "idle" later means "completed".
+        // The request-identity snapshot never distinguished requests ([stream+8] is the same buffer) and its
+        // two device-state calls (a full R5900Context copy each) run on every poll: OFF by default now.
+        static const bool s_edge2Pump = [](){ const char *v = std::getenv("PS2X_CDEDGE2"); return v && v[0] && v[0] != '0'; }();
         uint32_t cdDev = 0u, pendBefore = 0u, stBefore = 1u;
+        if (s_edge2Pump)
         { if (const uint8_t *pdev = getConstMemPtr(rdram, handle + 4u)) std::memcpy(&cdDev, pdev, sizeof(cdDev));
           if (const uint8_t *pp = getConstMemPtr(rdram, handle + 8u)) std::memcpy(&pendBefore, pp, sizeof(pendBefore)); }
         auto devState = [&](uint32_t dev) -> uint32_t {

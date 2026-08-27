@@ -1777,6 +1777,7 @@ bool GsGpuRenderer::takeBarrierRequest(uint32_t &page)
 
 void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bool wantsAlphaAsData)
 {
+    flushStage();   // [recstage] the list must be complete before any barrier bookkeeping
     {   // PS2X_RTTEST=1: one-shot address round-trip (see ps2xVramRoundTripTest).
         static const bool s_rt = [](){ const char *v = std::getenv("PS2X_RTTEST");
                                        return v && v[0] && v[0] != '0'; }();
@@ -2663,9 +2664,28 @@ unsigned long g_a44rec = 0, g_a44drawn = 0;
 unsigned g_darkwFboId = 0; int g_darkwX = 0, g_darkwY = 0, g_darkwFboH = 0;
 uint32_t g_darkwLast = 0, g_darkwGen = 0; int g_darkwLogs = 0;
 
+// [recstage] recordCmd used to take m_mtx for every command (~100k per fight frame, ~1.3 ms of
+// uncontended lock traffic on the guest thread). Commands are now appended to a guest-owned staging
+// vector and moved into m_building under ONE lock every kStage commands, and at every point where
+// another thread or the frame logic needs the list complete (barrierBeforeRead, swapFrame,
+// prerender wake). PS2X_RECSTAGE=0 restores the per-command lock.
+static const int s_recStage = [](){ const char *v = std::getenv("PS2X_RECSTAGE"); return v ? std::atoi(v) : 16; }();
+void GsGpuRenderer::flushStage()
+{
+    if (m_stage.empty()) return;
+    std::lock_guard<std::mutex> lk(m_mtx);
+    m_building.insert(m_building.end(), std::make_move_iterator(m_stage.begin()), std::make_move_iterator(m_stage.end()));
+    m_stage.clear();
+    {   // [prerender] wake the GL thread once a chunk's worth of new commands is waiting
+        const int k = prerenderK();
+        if (k > 0 && m_building.size() > m_segFrom && (m_building.size() - m_segFrom) >= (size_t)k && !g_preReady.exchange(true))
+            g_bbCv.notify_all();
+    }
+}
 void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
 {
-    std::lock_guard<std::mutex> lk(m_mtx);
+    std::unique_lock<std::mutex> lk(m_mtx, std::defer_lock);
+    if (s_recStage <= 0) lk.lock();
     DrawCmd c = cmd;
     {   // PS2X_EDGEVIZ=4: BT3's outline is painted by an UNTEXTURED bm0x52 sprite
         // (Cd - Cs*Ad, vertex colour 100) whose Ad the CT16/TEXA edge passes wrote a few draws
@@ -3245,11 +3265,19 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
             }
         }
     }
-    m_building.push_back(std::move(c));   // [cmdmove] one copy instead of two (DrawCmd carries two shared_ptrs)
-    {   // [prerender] wake the GL thread once a chunk's worth of new commands is waiting
-        const int k = prerenderK();
-        if (k > 0 && m_building.size() > m_segFrom && ((m_building.size() - m_segFrom) % (size_t)k) == 0u && !g_preReady.exchange(true))
-            g_bbCv.notify_all();
+    if (s_recStage <= 0)
+    {
+        m_building.push_back(std::move(c));   // [cmdmove] one copy instead of two (DrawCmd carries two shared_ptrs)
+        {   // [prerender] wake the GL thread once a chunk's worth of new commands is waiting
+            const int k = prerenderK();
+            if (k > 0 && m_building.size() > m_segFrom && ((m_building.size() - m_segFrom) % (size_t)k) == 0u && !g_preReady.exchange(true))
+                g_bbCv.notify_all();
+        }
+    }
+    else
+    {
+        m_stage.push_back(std::move(c));
+        if (m_stage.size() >= (size_t)s_recStage) flushStage();   // lk is not held on this branch
     }
     ++m_recordCount;
 }
@@ -3273,6 +3301,7 @@ std::map<uint32_t, int> g_bsPages; long g_bsCmds = 0; std::map<int, int> g_bsSeg
 std::atomic<uint64_t> g_gsGuestSwapCount{0};   // [cdgate] guest frames published (read by the CD-tick pump)
 void GsGpuRenderer::swapFrame()
 {
+    flushStage();   // [recstage]
     g_gsGuestSwapCount.fetch_add(1, std::memory_order_relaxed);
     {   // [tilecount] per-frame line
         static const bool s_tc = [](){ const char *v = std::getenv("PS2X_TILECOUNT"); return v && v[0] && v[0] != '0'; }();

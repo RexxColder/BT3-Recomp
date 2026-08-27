@@ -21,6 +21,7 @@ struct Vif1UnpackRec { uint32_t destQw, cnt, srcGuest, spr; uint64_t frame; };
 extern thread_local Vif1UnpackRec g_unpackRing[32];
 extern thread_local uint32_t g_unpackRingPos;
 extern bool g_unpackRingEnabled();
+std::atomic<uint32_t> g_vu1CodeGen{1u};   // [vucache16] external linkage: bumped by the VIF1 MPG writer (ps2_vif1_interpreter.cpp)
 namespace { thread_local const uint8_t *g_curVuCode = nullptr; thread_local uint32_t g_curCodeSize = 0;
             thread_local VU1State g_entryStateShadow{}; }
 
@@ -278,23 +279,28 @@ namespace
         VU_UP_MULq,
     };
 
+    // [vucache16] 16-byte decode entry, validated by the microcode generation instead of comparing the
+    // two instruction words: the 2048-slot array now fits L1 (32 KB) -- the compare was 15% of run().
     struct VuDecodeEntry
     {
-        uint32_t lower = 1u; // 1 with upper==0 is never a real pair -> empty slot
-        uint32_t upper = 0u;
-        bool lowerFirst = false;
-        bool upperNop = false;
+        uint32_t gen = 0u;          // == g_vu1CodeGen when valid (0 = empty); any MPG write bumps the generation
         uint8_t upKind = VU_UP_FALLBACK;
         uint8_t upDest = 0u;
         uint8_t upBc = 0u;
         uint8_t upFs = 0u;
         uint8_t upFt = 0u;
         uint8_t upFd = 0u;
-        // [vulower] decoded lower slot (VU_LO_*), register indices and immediate resolved once per PC
-        uint8_t loKind = 0u;
-        uint8_t loA = 0u, loB = 0u, loC = 0u, loDest = 0u;
-        int32_t loImm = 0;
+        uint8_t loKindF = 0u;       // bits 0-5 VU_LO_* kind, bit 6 upperNop, bit 7 lowerFirst
+        uint8_t loDestC = 0u;       // bits 0-3 dest mask, bits 4-7 loC (vi index)
+        uint8_t loA = 0u, loB = 0u;
+        int16_t loImm = 0;
+        bool lowerFirst() const { return (loKindF & 0x80u) != 0u; }
+        bool upperNop() const { return (loKindF & 0x40u) != 0u; }
+        uint8_t loKind() const { return loKindF & 0x3Fu; }
+        uint8_t loDest() const { return loDestC & 0x0Fu; }
+        uint8_t loC() const { return loDestC >> 4; }
     };
+    static_assert(sizeof(VuDecodeEntry) == 16, "decode entry must stay 16 bytes (L1 budget)");
     enum : uint8_t { VU_LO_FALLBACK = 0, VU_LO_NOP, VU_LO_LQ, VU_LO_SQ, VU_LO_IADDIU, VU_LO_ISUBIU, VU_LO_IADD, VU_LO_ISUB,
                      VU_LO_IADDI, VU_LO_IAND, VU_LO_IOR, VU_LO_MOVE, VU_LO_MR32, VU_LO_LQI, VU_LO_SQI, VU_LO_LQD, VU_LO_SQD,
                      VU_LO_MTIR, VU_LO_MFIR, VU_LO_B, VU_LO_BAL, VU_LO_IBEQ, VU_LO_IBNE, VU_LO_IBLTZ, VU_LO_IBGTZ, VU_LO_IBLEZ, VU_LO_IBGEZ, VU_LO_FCOR };
@@ -336,10 +342,10 @@ namespace
     // ILWR/ISWR, E*, R*, diag-gated LQ) stays on execLower. PS2X_VULOWER=0 disables.
     inline void vuDecodeLower(uint32_t instr, VuDecodeEntry &e)
     {
-        e.loKind = VU_LO_FALLBACK; e.loA = e.loB = e.loC = e.loDest = 0u; e.loImm = 0;
+        e.loKindF &= 0xC0u; e.loA = e.loB = 0u; e.loDestC = 0u; e.loImm = 0;
         static const bool s_on = [](){ const char *v = std::getenv("PS2X_VULOWER"); return !(v && v[0] == '0'); }();
         if (!s_on) return;
-        if (instr == 0u || instr == 0x8000033Cu) { e.loKind = VU_LO_NOP; return; }
+        if (instr == 0u || instr == 0x8000033Cu) { e.loKindF = (e.loKindF & 0xC0u) | VU_LO_NOP; return; }
         const uint8_t opHi = (instr >> 25) & 0x7Fu;
         const uint8_t dest = (instr >> 21) & 0xFu;
         switch (opHi)
@@ -349,44 +355,44 @@ namespace
             static const bool s_diag = [](){ return std::getenv("PS2X_IDW") != nullptr || std::getenv("PS2X_LQ_DUMP") != nullptr; }();
             if (s_diag) return;
             if (FT(instr) == 0u) return;   // [vu0reset] a write to vf0 needs the interpreter's post-instruction reset
-            e.loKind = VU_LO_LQ; e.loA = FT(instr); e.loB = VIS(instr); e.loDest = dest; e.loImm = IMM11(instr); return;
+            e.loKindF = (e.loKindF & 0xC0u) | VU_LO_LQ; e.loA = FT(instr); e.loB = VIS(instr); e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); e.loImm = (int16_t)IMM11(instr); return;
         }
-        case 0x01: e.loKind = VU_LO_SQ; e.loA = FS(instr); e.loB = VIT(instr); e.loDest = dest; e.loImm = IMM11(instr); return;
-        case 0x08: e.loKind = VU_LO_IADDIU; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800); return;
-        case 0x09: e.loKind = VU_LO_ISUBIU; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800); return;
-        case 0x13: e.loKind = VU_LO_FCOR; e.loImm = (int32_t)(instr & 0xFFFFFFu); return;
-        case 0x20: e.loKind = VU_LO_B;   e.loImm = IMM11(instr); return;
-        case 0x21: e.loKind = VU_LO_BAL; e.loA = VIT(instr); e.loImm = IMM11(instr); return;
-        case 0x28: e.loKind = VU_LO_IBEQ; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = IMM11(instr); return;
-        case 0x29: e.loKind = VU_LO_IBNE; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = IMM11(instr); return;
-        case 0x2C: e.loKind = VU_LO_IBLTZ; e.loB = VIS(instr); e.loImm = IMM11(instr); return;
-        case 0x2D: e.loKind = VU_LO_IBGTZ; e.loB = VIS(instr); e.loImm = IMM11(instr); return;
-        case 0x2E: e.loKind = VU_LO_IBLEZ; e.loB = VIS(instr); e.loImm = IMM11(instr); return;
-        case 0x2F: e.loKind = VU_LO_IBGEZ; e.loB = VIS(instr); e.loImm = IMM11(instr); return;
+        case 0x01: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_SQ; e.loA = FS(instr); e.loB = VIT(instr); e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); e.loImm = (int16_t)IMM11(instr); return;
+        case 0x08: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_IADDIU; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = (int16_t)((instr & 0x7FF) | ((instr >> 10) & 0x7800)); return;
+        case 0x09: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_ISUBIU; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = (int16_t)((instr & 0x7FF) | ((instr >> 10) & 0x7800)); return;
+        // FCOR (0x13) needs a 24-bit immediate: interpreter fallback (2% of lower ops)
+        case 0x20: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_B;   e.loImm = (int16_t)IMM11(instr); return;
+        case 0x21: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_BAL; e.loA = VIT(instr); e.loImm = (int16_t)IMM11(instr); return;
+        case 0x28: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_IBEQ; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = (int16_t)IMM11(instr); return;
+        case 0x29: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_IBNE; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = (int16_t)IMM11(instr); return;
+        case 0x2C: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_IBLTZ; e.loB = VIS(instr); e.loImm = (int16_t)IMM11(instr); return;
+        case 0x2D: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_IBGTZ; e.loB = VIS(instr); e.loImm = (int16_t)IMM11(instr); return;
+        case 0x2E: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_IBLEZ; e.loB = VIS(instr); e.loImm = (int16_t)IMM11(instr); return;
+        case 0x2F: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_IBGEZ; e.loB = VIS(instr); e.loImm = (int16_t)IMM11(instr); return;
         case 0x40:
         {
             const uint8_t funct = instr & 0x3Fu;
             const uint8_t vfT = FT(instr), vfS = FS(instr), viT = VIT(instr), viS = VIS(instr), viD = VID(instr);
             switch (funct)
             {
-            case 0x30: e.loKind = VU_LO_IADD; e.loA = viD; e.loB = viS; e.loC = viT; return;
-            case 0x31: e.loKind = VU_LO_ISUB; e.loA = viD; e.loB = viS; e.loC = viT; return;
-            case 0x32: e.loKind = VU_LO_IADDI; e.loA = viT; e.loB = viS; e.loImm = (int32_t)(int8_t)(((instr >> 6) & 0x1Fu) | (((instr >> 10) & 1u) ? 0xE0u : 0u)); return;
-            case 0x34: e.loKind = VU_LO_IAND; e.loA = viD; e.loB = viS; e.loC = viT; return;
-            case 0x35: e.loKind = VU_LO_IOR;  e.loA = viD; e.loB = viS; e.loC = viT; return;
+            case 0x30: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_IADD; e.loA = viD; e.loB = viS; e.loDestC = (e.loDestC & 0x0Fu) | (uint8_t)(viT << 4); return;
+            case 0x31: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_ISUB; e.loA = viD; e.loB = viS; e.loDestC = (e.loDestC & 0x0Fu) | (uint8_t)(viT << 4); return;
+            case 0x32: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_IADDI; e.loA = viT; e.loB = viS; e.loImm = (int16_t)(int8_t)(((instr >> 6) & 0x1Fu) | (((instr >> 10) & 1u) ? 0xE0u : 0u)); return;
+            case 0x34: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_IAND; e.loA = viD; e.loB = viS; e.loDestC = (e.loDestC & 0x0Fu) | (uint8_t)(viT << 4); return;
+            case 0x35: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_IOR;  e.loA = viD; e.loB = viS; e.loDestC = (e.loDestC & 0x0Fu) | (uint8_t)(viT << 4); return;
             case 0x3C: case 0x3D: case 0x3E: case 0x3F:
             {
                 const uint8_t funct2 = (uint8_t)((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
                 switch (funct2)
                 {
-                case 0x30: if (vfT == 0u) return; e.loKind = VU_LO_MOVE; e.loA = vfT; e.loB = vfS; e.loDest = dest; return;
-                case 0x31: if (vfT == 0u) return; e.loKind = VU_LO_MR32; e.loA = vfT; e.loB = vfS; e.loDest = dest; return;
-                case 0x34: if (vfT == 0u) return; e.loKind = VU_LO_LQI; e.loA = vfT; e.loB = viS; e.loDest = dest; return;
-                case 0x35: e.loKind = VU_LO_SQI; e.loA = vfS; e.loB = viT; e.loDest = dest; return;
-                case 0x36: if (vfT == 0u) return; e.loKind = VU_LO_LQD; e.loA = vfT; e.loB = viS; e.loDest = dest; return;
-                case 0x37: e.loKind = VU_LO_SQD; e.loA = vfS; e.loB = viT; e.loDest = dest; return;
-                case 0x3C: e.loKind = VU_LO_MTIR; e.loA = viT; e.loB = vfS; e.loDest = dest; return;
-                case 0x3D: if (vfT == 0u) return; e.loKind = VU_LO_MFIR; e.loA = vfT; e.loB = viS; e.loDest = dest; return;
+                case 0x30: if (vfT == 0u) return; e.loKindF = (e.loKindF & 0xC0u) | VU_LO_MOVE; e.loA = vfT; e.loB = vfS; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
+                case 0x31: if (vfT == 0u) return; e.loKindF = (e.loKindF & 0xC0u) | VU_LO_MR32; e.loA = vfT; e.loB = vfS; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
+                case 0x34: if (vfT == 0u) return; e.loKindF = (e.loKindF & 0xC0u) | VU_LO_LQI; e.loA = vfT; e.loB = viS; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
+                case 0x35: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_SQI; e.loA = vfS; e.loB = viT; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
+                case 0x36: if (vfT == 0u) return; e.loKindF = (e.loKindF & 0xC0u) | VU_LO_LQD; e.loA = vfT; e.loB = viS; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
+                case 0x37: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_SQD; e.loA = vfS; e.loB = viT; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
+                case 0x3C: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_MTIR; e.loA = viT; e.loB = vfS; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
+                case 0x3D: if (vfT == 0u) return; e.loKindF = (e.loKindF & 0xC0u) | VU_LO_MFIR; e.loA = vfT; e.loB = viS; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
                 default: return;
                 }
             }
@@ -1078,10 +1084,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             static const bool s_useCache = [](){ const char *v = std::getenv("PS2X_VUDECODE"); return !(v && v[0] == '0'); }();
             const uint32_t slot = (m_state.pc >> 3) & (kVuDecodeSlots - 1u);
             VuDecodeEntry &e = g_vuDecode[slot];
-            if (s_useCache && e.lower == lower && e.upper == upper)
+            const uint32_t codeGen = g_vu1CodeGen.load(std::memory_order_relaxed);
+            if (s_useCache && e.gen == codeGen)
             {
-                lowerFirst = e.lowerFirst;
-                upperNop = e.upperNop;
+                lowerFirst = e.lowerFirst();
+                upperNop = e.upperNop();
                 decoded = &e;
             }
             else
@@ -1090,10 +1097,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 upperNop = s_useCache && vuUpperIsNop(upper);
                 if (s_useCache)
                 {
-                    e.lower = lower; e.upper = upper;
-                    e.lowerFirst = lowerFirst; e.upperNop = upperNop;
+                    e.loKindF = (uint8_t)((lowerFirst ? 0x80u : 0u) | (upperNop ? 0x40u : 0u));
                     vuDecodeUpper(upper, e);
                     vuDecodeLower(lower, e);   // [vulower]
+                    e.gen = codeGen;
                     decoded = &e;
                 }
             }
@@ -1700,14 +1707,15 @@ static inline void vuLaneCopy(float *dst, const float *src, uint8_t dest)
 }
 static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData, uint32_t dataSize)
 {
-    switch (e.loKind)
+    const uint8_t loDest = e.loDest(); const uint8_t loC = e.loC(); (void)loDest; (void)loC;
+    switch (e.loKind())
     {
     case VU_LO_NOP: return true;
     case VU_LO_LQ:
     {
         uint32_t addr = ((uint32_t)(int32_t)(st.vi[e.loB] + e.loImm)) * 16u;
         addr &= (dataSize - 1);
-        if (addr + 16 <= dataSize) { float tmp[4]; std::memcpy(tmp, vuData + addr, 16); vuLaneCopy(st.vf[e.loA], tmp, e.loDest); }
+        if (addr + 16 <= dataSize) { float tmp[4]; std::memcpy(tmp, vuData + addr, 16); vuLaneCopy(st.vf[e.loA], tmp, loDest); }
         return true;
     }
     case VU_LO_SQ:
@@ -1718,28 +1726,28 @@ static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData,
         {
             float tmp[4]; std::memcpy(tmp, vuData + addr, 16);
             const float *src = st.vf[e.loA];
-            if (e.loDest & 0x8) tmp[0] = src[0];
-            if (e.loDest & 0x4) tmp[1] = src[1];
-            if (e.loDest & 0x2) tmp[2] = src[2];
-            if (e.loDest & 0x1) tmp[3] = src[3];
+            if (loDest & 0x8) tmp[0] = src[0];
+            if (loDest & 0x4) tmp[1] = src[1];
+            if (loDest & 0x2) tmp[2] = src[2];
+            if (loDest & 0x1) tmp[3] = src[3];
             std::memcpy(vuData + addr, tmp, 16);
         }
         return true;
     }
     case VU_LO_IADDIU: if (e.loA != 0) st.vi[e.loA] = (int16_t)(st.vi[e.loB] + (int16_t)e.loImm); return true;
     case VU_LO_ISUBIU: if (e.loA != 0) st.vi[e.loA] = (int16_t)(st.vi[e.loB] - (int16_t)e.loImm); return true;
-    case VU_LO_IADD:   if (e.loA != 0) st.vi[e.loA] = (int16_t)(st.vi[e.loB] + st.vi[e.loC]); return true;
-    case VU_LO_ISUB:   if (e.loA != 0) st.vi[e.loA] = (int16_t)(st.vi[e.loB] - st.vi[e.loC]); return true;
+    case VU_LO_IADD:   if (e.loA != 0) st.vi[e.loA] = (int16_t)(st.vi[e.loB] + st.vi[loC]); return true;
+    case VU_LO_ISUB:   if (e.loA != 0) st.vi[e.loA] = (int16_t)(st.vi[e.loB] - st.vi[loC]); return true;
     case VU_LO_IADDI:  if (e.loA != 0) st.vi[e.loA] = (int16_t)(st.vi[e.loB] + e.loImm); return true;
-    case VU_LO_IAND:   if (e.loA != 0) st.vi[e.loA] = st.vi[e.loB] & st.vi[e.loC]; return true;
-    case VU_LO_IOR:    if (e.loA != 0) st.vi[e.loA] = st.vi[e.loB] | st.vi[e.loC]; return true;
-    case VU_LO_MOVE:   { float tmp[4]; std::memcpy(tmp, st.vf[e.loB], 16); vuLaneCopy(st.vf[e.loA], tmp, e.loDest); return true; }
-    case VU_LO_MR32:   { const float *v = st.vf[e.loB]; float tmp[4] = {v[1], v[2], v[3], v[0]}; vuLaneCopy(st.vf[e.loA], tmp, e.loDest); return true; }
+    case VU_LO_IAND:   if (e.loA != 0) st.vi[e.loA] = st.vi[e.loB] & st.vi[loC]; return true;
+    case VU_LO_IOR:    if (e.loA != 0) st.vi[e.loA] = st.vi[e.loB] | st.vi[loC]; return true;
+    case VU_LO_MOVE:   { float tmp[4]; std::memcpy(tmp, st.vf[e.loB], 16); vuLaneCopy(st.vf[e.loA], tmp, loDest); return true; }
+    case VU_LO_MR32:   { const float *v = st.vf[e.loB]; float tmp[4] = {v[1], v[2], v[3], v[0]}; vuLaneCopy(st.vf[e.loA], tmp, loDest); return true; }
     case VU_LO_LQI:
     {
         uint32_t addr = ((uint32_t)(uint16_t)st.vi[e.loB]) * 16u;
         addr &= (dataSize - 1);
-        if (addr + 16 <= dataSize) { float tmp[4]; std::memcpy(tmp, vuData + addr, 16); vuLaneCopy(st.vf[e.loA], tmp, e.loDest); }
+        if (addr + 16 <= dataSize) { float tmp[4]; std::memcpy(tmp, vuData + addr, 16); vuLaneCopy(st.vf[e.loA], tmp, loDest); }
         if (e.loB != 0) st.vi[e.loB] = (int16_t)(st.vi[e.loB] + 1);
         return true;
     }
@@ -1751,10 +1759,10 @@ static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData,
         {
             float tmp[4]; std::memcpy(tmp, vuData + addr, 16);
             const float *src = st.vf[e.loA];
-            if (e.loDest & 0x8) tmp[0] = src[0];
-            if (e.loDest & 0x4) tmp[1] = src[1];
-            if (e.loDest & 0x2) tmp[2] = src[2];
-            if (e.loDest & 0x1) tmp[3] = src[3];
+            if (loDest & 0x8) tmp[0] = src[0];
+            if (loDest & 0x4) tmp[1] = src[1];
+            if (loDest & 0x2) tmp[2] = src[2];
+            if (loDest & 0x1) tmp[3] = src[3];
             std::memcpy(vuData + addr, tmp, 16);
         }
         if (e.loB != 0) st.vi[e.loB] = (int16_t)(st.vi[e.loB] + 1);
@@ -1765,7 +1773,7 @@ static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData,
         if (e.loB != 0) st.vi[e.loB] = (int16_t)(st.vi[e.loB] - 1);
         uint32_t addr = ((uint32_t)(uint16_t)st.vi[e.loB]) * 16u;
         addr &= (dataSize - 1);
-        if (addr + 16 <= dataSize) { float tmp[4]; std::memcpy(tmp, vuData + addr, 16); vuLaneCopy(st.vf[e.loA], tmp, e.loDest); }
+        if (addr + 16 <= dataSize) { float tmp[4]; std::memcpy(tmp, vuData + addr, 16); vuLaneCopy(st.vf[e.loA], tmp, loDest); }
         return true;
     }
     case VU_LO_SQD:
@@ -1777,17 +1785,17 @@ static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData,
         {
             float tmp[4]; std::memcpy(tmp, vuData + addr, 16);
             const float *src = st.vf[e.loA];
-            if (e.loDest & 0x8) tmp[0] = src[0];
-            if (e.loDest & 0x4) tmp[1] = src[1];
-            if (e.loDest & 0x2) tmp[2] = src[2];
-            if (e.loDest & 0x1) tmp[3] = src[3];
+            if (loDest & 0x8) tmp[0] = src[0];
+            if (loDest & 0x4) tmp[1] = src[1];
+            if (loDest & 0x2) tmp[2] = src[2];
+            if (loDest & 0x1) tmp[3] = src[3];
             std::memcpy(vuData + addr, tmp, 16);
         }
         return true;
     }
     case VU_LO_MTIR:
     {
-        int comp = (e.loDest & 0x8) ? 0 : (e.loDest & 0x4) ? 1 : (e.loDest & 0x2) ? 2 : 3;
+        int comp = (loDest & 0x8) ? 0 : (loDest & 0x4) ? 1 : (loDest & 0x2) ? 2 : 3;
         uint32_t fval; std::memcpy(&fval, &st.vf[e.loB][comp], 4);
         if (e.loA != 0) st.vi[e.loA] = (int32_t)(int16_t)(fval & 0xFFFF);
         return true;
@@ -1796,10 +1804,9 @@ static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData,
     {
         float result[4]; int32_t val = (int32_t)(int16_t)(st.vi[e.loB] & 0xFFFF);
         std::memcpy(&result[0], &val, 4); result[1] = result[0]; result[2] = result[0]; result[3] = result[0];
-        vuLaneCopy(st.vf[e.loA], result, e.loDest);
+        vuLaneCopy(st.vf[e.loA], result, loDest);
         return true;
     }
-    case VU_LO_FCOR: st.vi[1] = ((st.clip | (uint32_t)e.loImm) == 0xFFFFFFu) ? 1 : 0; return true;
     case VU_LO_B:    { st.branchTarget = (st.pc + 8 + e.loImm * 8) & 0x3FFF; st.branchPending = true; st.branchDelay = 1; return true; }
     case VU_LO_BAL:  { const uint32_t target = (st.pc + 8 + e.loImm * 8) & 0x3FFF; if (e.loA != 0) st.vi[e.loA] = (int32_t)((st.pc + 16) / 8);
                        st.branchPending = true; st.branchTarget = target; st.branchDelay = 1; return true; }

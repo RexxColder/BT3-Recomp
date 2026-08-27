@@ -324,6 +324,8 @@ private:
     size_t m_segFrom   = 0;
     std::unordered_set<uint32_t> m_segDepthCleared;
     std::vector<DrawCmd> m_building;
+    std::vector<DrawCmd> m_stage;   // [recstage] guest-owned staging, moved into m_building under one lock
+    void flushStage();
     std::vector<DrawCmd> m_ready;
     // Published-but-not-yet-replayed lists, oldest first. FBOs are persistent (content only
     // changes by replaying draws), so every published list MUST be replayed exactly once, in
