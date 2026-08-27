@@ -1920,6 +1920,13 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
             xs = std::max(xs, g_wbRowRange[(size_t)y].first); xe = std::min(xe, g_wbRowRange[(size_t)y].second);
             if (xs >= xe) continue;
         }
+        if (psm == 0u && fbmsk == 0u && !g_wbAlphaFillOnly && !s_rawFlush)
+        {   // [rowct32] unmasked CT32 (the scene / mask page flushes): bulk row write
+            const u32 n = GSMem::WriteRowCT32(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, px + (size_t)y * w,
+                                              g_wbSkipMask ? g_wbSkipMask + (size_t)y * w : nullptr);
+            if (n) { if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y; g_wbPixelsWritten += n; }
+            continue;
+        }
         for (int x = xs; x < xe; ++x)
         {
             if (g_wbSkipMask && !g_wbSkipMask[(size_t)y * w + x]) continue;

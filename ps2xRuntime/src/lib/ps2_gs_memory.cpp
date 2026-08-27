@@ -230,6 +230,33 @@ namespace GSMem
         PixelStorageTraits<C32>::Write(PageTableC32, data, bp, bw, x, y, value);
     }
 
+    u32 WriteRowCT32(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u32* src, const u8* mask)
+    {
+        // Same address as PixelStorageTraits<C32>::Address/Write: page * PixelsPerPage + table[block][y%32][x%64],
+        // 4 bytes per pixel, wrapped to MEMORY_SIZE.
+        constexpr u32 kBlocks = C32Traits::BlocksPerPage();          // 32
+        constexpr auto kExt   = C32Traits::PageExtent();             // 64 x 32
+        constexpr u32 kPixels = C32Traits::PixelsPerPage();          // 2048
+        const u32 block = bp % kBlocks;
+        const auto &row = PageTableC32[block][y % kExt.y];
+        u32 n = 0;
+        u32 x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);   // end of this 64-px page column
+            const u32 page = static_cast<u32>(C32Traits::PageId(bp, bw, x, y));
+            const usz pageBase = static_cast<usz>(page) * kPixels;
+            for (; x < colEnd; ++x)
+            {
+                if (mask && !mask[x]) continue;
+                const usz byte_addr = ((pageBase + row[x % kExt.x]) * 4u) & (MEMORY_SIZE - 4u);
+                std::memcpy(&data[byte_addr], &src[x], 4u);
+                ++n;
+            }
+        }
+        return n;
+    }
+
     void WriteCT24(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
     {
         PixelStorageTraits<C24>::Write(PageTableC32, data, bp, bw, x, y, value);
