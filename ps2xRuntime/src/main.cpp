@@ -1,7 +1,7 @@
 #include "ps2_runtime.h"
 #include "games_database.h"
-#if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
-#include "ps2_debug_panel.h"
+#if !defined(PLATFORM_VITA)
+#include "ps2_settings_overlay.h"
 #endif
 
 #ifdef _DEBUG
@@ -65,12 +65,37 @@ namespace
         return result;
     }
 
+    std::filesystem::path getExecutableDirectory()
+    {
+#if defined(__linux__)
+        // Resolve the real executable location (portable dist), independent of cwd/argv.
+        std::error_code ec;
+        std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", ec);
+        if (!ec && !self.empty())
+        {
+            return self.parent_path().lexically_normal();
+        }
+#endif
+        std::error_code ec2;
+        const std::filesystem::path cwd = std::filesystem::current_path(ec2);
+        return (ec2 ? std::filesystem::path(".") : cwd).lexically_normal();
+    }
+
     std::filesystem::path getExecutablePath(int argc, char *argv[])
     {
         if (argc >= 2 && argv[1] && argv[1][0] != '\0')
         {
             std::cout << "Using argv boot path" << std::endl;
             return std::filesystem::path(argv[1]);
+        }
+        // Portable dist: auto-locate the guest ELF next to the executable in data/.
+        const std::filesystem::path exeDir = getExecutableDirectory();
+        const std::filesystem::path autoElf = exeDir / "data" / "SLUS_216.78";
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(autoElf, ec) && !ec)
+        {
+            std::cout << "Using auto-located boot file: " << autoElf.string() << std::endl;
+            return autoElf;
         }
 #if defined(PS2X_DEFAULT_BOOT_ELF)
         std::cout << "Using default boot file" << std::endl;
@@ -101,40 +126,67 @@ int main(int argc, char *argv[])
         std::string elfName = pathObj.filename().string();
         std::string normalizedId = normalizeGameId(elfName);
 
-        std::string windowTitle = "PS2-Recomp | ";
+        std::string windowTitle = "Dragon Ball Budokai Tenkaichi 3";
         const char *gameName = getGameName(normalizedId);
 
 #if !defined(PLATFORM_VITA)
-        if (gameName)
+        if (gameName && std::string(gameName) != "Unknown")
         {
-            windowTitle += std::string(gameName) + " | " + elfName;
+            windowTitle = std::string(gameName) + " | " + elfName;
         }
         else
 #endif
         {
-            windowTitle += elfName;
+            (void)gameName;
         }
 
         PS2Runtime runtime;
-#if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
-        // This hook is to prevent leak rlimgui deps to recompiler etc
-        PS2DebugPanel debugPanel;
+
+        // Performance defaults — only set if not already in environment
+        auto setDefault = [](const char *key, const char *val) {
+            if (!std::getenv(key))
+                setenv(key, val, 1);
+        };
+        setDefault("PS2X_SKIPPOST", "1");
+        setDefault("PS2X_SKIP_STALE_VRAM", "1");
+        setDefault("PS2X_TEXCACHEMB", "256");
+        setDefault("PS2X_TIMERMULT", "8");
+        setDefault("PS2X_BT3_CDTICK", "1");
+        setDefault("PS2X_SCHED", "1");
+        setDefault("PS2X_GPU_DEPTH", "1");
+        setDefault("PS2X_ASYNC_KICK", "1");
+        setDefault("PS2X_BT3_SNDACK", "1");
+#if !defined(PLATFORM_VITA)
+        // --soft -> software rasterizer (manual debugging utility).
+        const bool softGpu = std::any_of(argv, argv + argc, [](const char *a) {
+            return a && std::string(a) == "--soft";
+        });
+        if (!softGpu)
+        {
+            setDefault("PS2X_GPU", "1");
+        }
+#endif
+
+#if !defined(PLATFORM_VITA)
+        PS2SettingsOverlay settingsOverlay;
+        PS2SettingsOverlay::setConfigDirectory((getExecutableDirectory() / "savedata").string());
+        settingsOverlay.preloadSettings();
         runtime.setDebugUiCallbacks(
             [](PS2Runtime &rt, void *userData)
             {
                 (void)rt;
-                static_cast<PS2DebugPanel *>(userData)->initialize();
+                static_cast<PS2SettingsOverlay *>(userData)->initialize();
             },
             [](PS2Runtime &rt, void *userData)
             {
-                static_cast<PS2DebugPanel *>(userData)->draw(rt);
+                static_cast<PS2SettingsOverlay *>(userData)->draw(rt);
             },
             [](PS2Runtime &rt, void *userData)
             {
                 (void)rt;
-                static_cast<PS2DebugPanel *>(userData)->shutdown();
+                static_cast<PS2SettingsOverlay *>(userData)->shutdown();
             },
-            &debugPanel);
+            &settingsOverlay);
 #endif
         if (!runtime.initialize(windowTitle.c_str()))
         {

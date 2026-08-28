@@ -505,7 +505,7 @@ target_link_libraries(ps2EntryRunner
 
 if(NOT PS2X_IS_VITA)
     target_sources(ps2EntryRunner PRIVATE
-        src/lib/ps2_debug_panel.cpp
+        src/lib/ps2_settings_overlay.cpp
     )
     target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
     target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
