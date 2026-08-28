@@ -17,6 +17,7 @@
 #include <mutex>
 #include <map>
 #include <atomic>
+#include <chrono>
 #include <optional>
 #include <vector>
 #include <unordered_map>
@@ -2866,6 +2867,43 @@ namespace
     // two adjacent instructions. Arm the write-watch on exactly that slot for the duration of the thunk so the
     // store hook names the writer (guest pc). PS2X_THUNKWATCH=0 disables.
     PS2Runtime::RecompiledFunction g_orig2722c0 = nullptr;
+    // [vstep] PS2X_VSTEP=<n>: override the fight loop's hard-coded frame step (0x12bce4 passes a0=2 to
+    // func_102060 -> func_23D160 (30 Hz counter cadence) and func_264D98 (wait until the per-frame vblank
+    // counter reaches a0)). n=1 = render every vblank. [logicrate] counts func_115950 (the per-frame fight
+    // update) per second so a step-1 run can be checked for double-speed logic.
+    PS2Runtime::RecompiledFunction g_orig102060 = nullptr, g_orig115950 = nullptr;
+    void bt3VStep(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const int s_step = [](){ const char *v = std::getenv("PS2X_VSTEP"); return v && v[0] ? std::atoi(v) : 0; }();
+        if (s_step > 0 && getRegU32(ctx, 4) == 2u) ctx->r[4] = _mm_set_epi64x(0, (int64_t)s_step);   // $a0 = step
+        if (g_orig102060) g_orig102060(rdram, ctx, runtime);
+    }
+    // [vstepprobe] func_264D98(a0): the frame wait. Print a0, the per-frame vblank counter [gp-0x5148] at entry,
+    // and the vsync ticks elapsed inside the call, for the first calls and then every 300th.
+    PS2Runtime::RecompiledFunction g_orig264d98 = nullptr;
+    void bt3WaitProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u);
+        const uint32_t gp = getRegU32(ctx, 28);
+        uint32_t cnt = 0; { const uint8_t *p = getMemPtr(rdram, (gp - 0x5148u) & 0x1FFFFFFFu); if (p) std::memcpy(&cnt, p, 4); }
+        const uint32_t a0 = getRegU32(ctx, 4);
+        const uint64_t t0 = ps2_syscalls::GetCurrentVSyncTick();
+        if (g_orig264d98) g_orig264d98(rdram, ctx, runtime);
+        const uint64_t t1 = ps2_syscalls::GetCurrentVSyncTick();
+        if (n < 24u || (n % 300u) == 0u)
+            std::fprintf(stderr, "[vstepprobe] #%u a0=%u counter@entry=%u ticks_in_wait=%llu\n", n, a0, cnt, (unsigned long long)(t1 - t0));
+    }
+    void bt3LogicRate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        static auto s_t0 = std::chrono::steady_clock::now();
+        const uint32_t n = s_n.fetch_add(1u) + 1u;
+        const auto now = std::chrono::steady_clock::now();
+        const double dt = std::chrono::duration<double>(now - s_t0).count();
+        if (dt >= 5.0) { std::fprintf(stderr, "[logicrate] %.1f fight updates/s (%u in %.1f s)\n", (double)n / dt, n, dt); s_n.store(0u); s_t0 = now; }
+        if (g_orig115950) g_orig115950(rdram, ctx, runtime);
+    }
     void bt3ThunkStackWatch(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t sp = getRegU32(ctx, 29) & 0x1FFFFFFFu;
@@ -3595,6 +3633,16 @@ namespace
         // Camera view-matrix builder probe (PS2X_CAMPROBE).
         // Demo scene-tree recursion-depth guard: default ON (prevents the cyclic-tree stack
         // overflow crash). Disable with PS2X_NO_DEMO_GUARD. The PS2X_DEMOPROBE dump rides on it.
+        if (std::getenv("PS2X_VSTEP"))
+        {   // [vstep] [logicrate]
+            g_orig102060 = runtime.lookupFunction(0x00102060u);
+            if (g_orig102060) runtime.replaceFunction(0x00102060u, &bt3VStep);
+            g_orig115950 = runtime.lookupFunction(0x00115950u);
+            g_orig264d98 = runtime.lookupFunction(0x00264d98u);
+            if (g_orig264d98) runtime.replaceFunction(0x00264d98u, &bt3WaitProbe);   // [vstepprobe]
+            if (g_orig115950) runtime.replaceFunction(0x00115950u, &bt3LogicRate);
+            std::fprintf(stderr, "[vstep] step override armed (0x102060 %s, 0x115950 %s)\n", g_orig102060 ? "ok" : "MISSING", g_orig115950 ? "ok" : "MISSING");
+        }
         {   // [thunkwatch]
             const char *tw = std::getenv("PS2X_THUNKWATCH");
             if (!(tw && tw[0] == '0'))

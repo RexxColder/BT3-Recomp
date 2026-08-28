@@ -592,7 +592,7 @@ void GSRasterizer::drawPrimitive(GS *gs)
             if (vramRegion)
             {
                 std::memcpy(vramRegion, saved, sizeof(saved));
-                ++gsp->m_texUploadGen; // sky content back — invalidate the grass decode too
+                ++gsp->m_texUploadGen; gsp->invalidateClutCache(); // [clutpagegen] sky content back — invalidate the grass decode too
             }
         }
     } _grassSwap;
@@ -611,7 +611,7 @@ void GSRasterizer::drawPrimitive(GS *gs)
             _grassSwap.gsp = gs;
             // The swap changes the texel content under the draw — invalidate the CLUT/tex
             // cache key so sampling doesn't reuse the sky decode.
-            ++gs->m_texUploadGen;
+            ++gs->m_texUploadGen; gs->invalidateClutCache();   // [clutpagegen]
         }
     }
 
@@ -2770,7 +2770,12 @@ void GSRasterizer::ensureClutCache(GS *gs)
     mix(tex.cbp); mix(tex.cpsm); mix(tex.csm); mix(tex.csa); mix(tex.psm);
     mix(gs->m_texclut.cbw); mix(gs->m_texclut.cou); mix(gs->m_texclut.cov);
     mix(gs->m_texa.ta0); mix(gs->m_texa.aem ? 1u : 0u); mix(gs->m_texa.ta1);
-    const uint64_t key = (static_cast<uint64_t>(gs->m_texUploadGen) << 32) | h;
+    // [clutpagegen] key on the palette page(s)' own upload generation, not the global m_texUploadGen. CSM2 palettes
+    // (cbw/cou/cov addressing) keep the global generation.
+    const uint32_t cpg = (tex.cbp >> 5) & 511u;
+    const uint32_t pgen = (tex.csm != 0u) ? gs->m_texUploadGen
+                        : (gs->m_pageUploadGen[cpg] * 0x9E3779B1u) ^ (gs->m_pageUploadGen[(cpg + 1u) & 511u] * 0x85EBCA6Bu);
+    const uint64_t key = (static_cast<uint64_t>(pgen) << 32) | h;
     if (key == gs->m_clutCacheKey)
         return; // cache already valid for this palette state
 

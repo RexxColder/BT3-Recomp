@@ -1,3 +1,4 @@
+#include <iomanip>
 #include <cstdlib>
 #if !defined(_WIN32)
 #include <execinfo.h> // glibc backtrace for the bad-jump diagnostic
@@ -1488,6 +1489,7 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             << " v0=0x" << v0
             << " v1=0x" << v1
             << " a0Readable=" << (a0Readable ? "yes" : "no")
+            << " s0=0x" << getRegU32(ctx, 16) << " s1=0x" << getRegU32(ctx, 17) << " s2=0x" << getRegU32(ctx, 18) << " tid=" << g_schedTid   // [badjump] object regs
             << " a0[0]=0x" << a0Word0
             << " a0[4]=0x" << a0Word4
             << " a0[8]=0x" << a0Word8
@@ -1506,7 +1508,15 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
         {
             std::lock_guard<std::mutex> lock(s_missingFunctionLogMutex);
             std::cerr << oss.str() << std::endl;
-        }
+
+        {   // [badjump] 64 bytes at s0 (the object whose method/vtable was bad) and 64 bytes at sp
+            auto dump = [&](const char *what, uint32_t base) {
+                std::ostringstream d; d << "[guest-branch:mem] " << what << "=0x" << std::hex << base << ":";
+                for (uint32_t o = 0; o < 64u; o += 4u) { uint32_t w = 0; if (!readGuestU32Offset(base, o, w)) { d << " ??"; break; } d << ' ' << std::setw(8) << std::setfill('0') << w; }
+                std::cerr << d.str() << std::endl;
+            };
+            dump("s0", getRegU32(ctx, 16)); dump("sp", sp);
+        }        }
     }
 
     if (firstReport && policy == MissingFunctionPolicy::BreakOnce)

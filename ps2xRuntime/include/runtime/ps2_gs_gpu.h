@@ -399,6 +399,17 @@ public:
     // Invalidate the decoded-palette cache. A barrier writeback can change a palette that
     // lives in VRAM (BT3 RENDERS its outline CLUTs), and the cache key folds in this counter.
     void bumpTexUploadGen() { ++m_texUploadGen; }
+    // [clutpagegen] per-8KB-page upload generation: the CLUT cache keys on the generation of the palette's own
+    // page(s) instead of the global m_texUploadGen (which every texture upload bumps -> a 256-entry palette
+    // rebuild + hash after any upload, 2.5% of the guest thread).
+    uint32_t m_pageUploadGen[512]{};
+    void bumpPageUploadGen(uint32_t dbpBlock, uint32_t sizeBlocks)
+    {
+        uint32_t p0 = dbpBlock / 32u, p1 = (dbpBlock + sizeBlocks) / 32u;
+        if (p0 > 511u) p0 = 511u;
+        if (p1 > 511u) p1 = 511u;
+        for (uint32_t p = p0; p <= p1; ++p) ++m_pageUploadGen[p];
+    }
 
 private:
     void snapshotVRAM();

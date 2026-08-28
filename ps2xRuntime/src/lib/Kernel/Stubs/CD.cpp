@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cstdio>
 #include "Common.h"
 #include "CD.h"
 #include "MPEG.h"
@@ -130,6 +132,12 @@ namespace ps2_stubs
 
         CdReadArgs selected{a0, a1, a2, "a0/a1/a2"};
         bool ok = tryRead(selected);
+        {   // [cdreadlog] every read that landed: destination range + which argument layout, so a late/misplaced read
+            // can be matched against a corrupted object (loader wild-jump hunt). First 6000 only.
+            static std::atomic<uint32_t> s_cl{0};
+            if (ok && s_cl.fetch_add(1u) < 6000u)
+                std::fprintf(stderr, "[cdread] lbn=0x%x sectors=%u dst=0x%x..0x%x\n", selected.lbn, selected.sectors, selected.buf, selected.buf + selected.sectors * 2048u);
+        }
 
         if (!ok)
         {
@@ -158,6 +166,7 @@ namespace ps2_stubs
 
                     if (tryRead(candidate))
                     {
+                        std::fprintf(stderr, "[cdread] ALT %s lbn=0x%x sectors=%u dst=0x%x..0x%x\n", candidate.tag, candidate.lbn, candidate.sectors, candidate.buf, candidate.buf + candidate.sectors * 2048u);   // [cdreadlog]
                         static uint32_t recoverLogCount = 0;
                         if (recoverLogCount < 16)
                         {

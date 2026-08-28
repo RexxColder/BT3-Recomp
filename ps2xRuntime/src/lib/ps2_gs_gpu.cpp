@@ -1595,7 +1595,7 @@ void ps2xWritebackDepthToVram(uint32_t zbp, uint32_t zbw, uint32_t zpsm, int w, 
     // game renders into). The CLUT cache keys on m_texUploadGen, which only processImageData
     // bumps -- so without this a flushed palette would never be re-read.
     gs->bumpTexUploadGen();
-    ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u));
+    ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u)); gs->bumpPageUploadGen(base, (uint32_t)(((size_t)w * h * 4u) / 256u));   // [clutpagegen]
 }
 // [wbpack16] GPU->VRAM writebacks used to hand WriteVram the raw RGBA8888 word for 16-bit
 // pages, so a CT16 pixel got the low 16 bits (R&31 | G<<8...) instead of R5G5B5A1 -- G landed
@@ -2000,10 +2000,10 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
         const int y0i = ry0, y1i = ry1;
         const uint32_t ph = (psm == 0x02u || psm == 0x0Au || psm == 0x32u || psm == 0x3Au || psm == 0x13u || psm == 0x1Bu) ? 64u : (psm == 0x14u || psm == 0x24u || psm == 0x2Cu) ? 128u : 32u;
         const uint32_t pr0 = (uint32_t)y0i / ph, pr1 = ((uint32_t)std::max(y1i, y0i + 1) + ph - 1u) / ph;
-        ps2GpuRenderer().onVramWriteback(base + pr0 * bw * 32u, (pr1 - pr0) * bw * 32u);
+        ps2GpuRenderer().onVramWriteback(base + pr0 * bw * 32u, (pr1 - pr0) * bw * 32u); gs->bumpPageUploadGen(base + pr0 * bw * 32u, (pr1 - pr0) * bw * 32u);   // [clutpagegen]
     }
     else
-    ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u));
+    ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u)); gs->bumpPageUploadGen(base, (uint32_t)(((size_t)w * h * 4u) / 256u));   // [clutpagegen]
 }
 
 void ps2xWritebackToVram(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h, const uint32_t *px)
@@ -2024,7 +2024,7 @@ void ps2xWritebackToVram(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
     // game renders into). The CLUT cache keys on m_texUploadGen, which only processImageData
     // bumps -- so without this a flushed palette would never be re-read.
     gs->bumpTexUploadGen();
-    ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u));
+    ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u)); gs->bumpPageUploadGen(base, (uint32_t)(((size_t)w * h * 4u) / 256u));   // [clutpagegen]
     // [wbrt] PS2X_WBDIAG=1: round-trip self-check. If WriteVram(x,y,v) followed by
     // ReadVram(x,y) does not give back v, the base/stride/format I am passing is wrong and
     // every byte handed to VRAM is landing in the wrong place -- which would corrupt exactly
@@ -3336,7 +3336,7 @@ void GS::performLocalToLocalTransfer()
     // The old reason not to stamp (100% texture re-decode churn) is gone: content-
     // versioned texKeys re-decode only when the copied bytes actually changed.
     { extern GS *g_gsWb; g_gsWb = this; }   // writeback needs a GS to reach VRAM
-    ps2GpuRenderer().onVramUpload(dbp, static_cast<uint32_t>(dbw) * rrh);
+    ps2GpuRenderer().onVramUpload(dbp, static_cast<uint32_t>(dbw) * rrh); bumpPageUploadGen(dbp, static_cast<uint32_t>(dbw) * rrh);   // [clutpagegen]
 
     {
         static const bool s_l2l = [](){ const char *v = std::getenv("PS2X_TEX_PROBE"); return v && v[0] && v[0] != '0'; }();
@@ -4001,7 +4001,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             }
         }
         if (changed)
-            ps2GpuRenderer().onVramUpload(dbp, static_cast<uint32_t>(dbw) * rrh);
+            ps2GpuRenderer().onVramUpload(dbp, static_cast<uint32_t>(dbw) * rrh); bumpPageUploadGen(dbp, static_cast<uint32_t>(dbw) * rrh);   // [clutpagegen]
     }
 
     {
