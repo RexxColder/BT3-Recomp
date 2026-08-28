@@ -632,6 +632,7 @@ private:
         bool blocked = false;
         bool present = true;
         uint64_t order = 0;
+        uint32_t blockPc = 0, blockRa = 0;   // [schedwhy] guest pc/ra at the last block (which wait parked it)
         std::condition_variable cv;
     };
     int schedPickNextLocked(int afterTid);

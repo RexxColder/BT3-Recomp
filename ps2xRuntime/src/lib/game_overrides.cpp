@@ -2866,7 +2866,10 @@ namespace
         // Arm the write-watch on this tree-walk's STACK region (once) to catch the stray write
         // that corrupts FUN_002316d0's saved $ra (at $sp+0x18) with 0x2c9f80. ps2WatchReport
         // is garbage-filtered so only the out-of-code (0x2c9f80) write is reported, with its pc.
-        if (g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
+        // [watchgate] PS2X_DEMOSTACKWATCH=1 arms it; default OFF since 2026-08-28: the armed range stayed
+        // live into fights and every store into it went through ps2WatchReport's mutex (2.4% of the guest thread).
+        static const bool s_dsw = [](){ const char *v = std::getenv("PS2X_DEMOSTACKWATCH"); return v && v[0] && v[0] != '0'; }();
+        if (s_dsw && g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
         {
             const uint32_t sp = getRegU32(ctx, 29) & 0x1FFFFFFFu;
             g_ps2WatchHi.store(sp + 0x800u, std::memory_order_relaxed);
@@ -3106,7 +3109,8 @@ namespace
             const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6);
             // Arm the write-watch on the camera-target range [BASE+0x210, BASE+0x268) once,
             // so we catch whoever writes the target vector (0x220/0x260). BASE = a2 - 0x40.
-            if (g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
+            static const bool s_cw = [](){ const char *v = std::getenv("PS2X_CAMWATCH"); return v && v[0] && v[0] != '0'; }();   // [watchgate]
+            if (s_cw && g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
             {
                 const uint32_t base = (a2 - 0x40u) & 0x1FFFFFFFu;
                 g_bt3CamBase.store(base, std::memory_order_relaxed);
@@ -3899,7 +3903,7 @@ namespace
     extern "C" void ps2xGuestWaitEnd(void *);
     // Wait (yielding the guest execution token so the loader threads can run) until the 32-bit
     // field at `addr` becomes non-zero. Returns the value (0 after the cap).
-    static uint32_t bt3WaitFieldNonZero(uint8_t *rdram, uint32_t addr, const char *what, uint32_t pc)
+    static uint32_t bt3WaitFieldNonZero(uint8_t *rdram, uint32_t addr, const char *what, uint32_t pc, R5900Context *ctx = nullptr, PS2Runtime *runtime = nullptr)
     {
         static const int s_capMs = [](){ const char *v = std::getenv("PS2X_NULLPKT_WAITMS"); return v ? std::atoi(v) : 1000; }();
         auto rd = [&]() -> uint32_t { uint32_t v = 0; if (const uint8_t *q = getConstMemPtr(rdram, addr)) std::memcpy(&v, q, 4); return v; };
@@ -3910,6 +3914,14 @@ namespace
         int waited = 0;
         while (v == 0u && waited < s_capMs)
         {
+            // [nullpkt-tick] the list is filled by the loader, whose CD reads only complete when the CD server
+            // is ticked (see [spinpump]); the two 2026-08-28 loading hangs sat in this loop for the full cap with
+            // the loader parked. Tick it every iteration, then yield the scheduler.
+            if (ctx && runtime && runtime->hasFunction(0x0028a3b0u))
+            {
+                Bt3CdTickGuard tickGuard;
+                if (tickGuard.engaged) { bt3RunCdTickInline(rdram, ctx, runtime); s_bt3CdTicking = false; }
+            }
             void *scope = ps2xGuestWaitBegin();
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             ps2xGuestWaitEnd(scope);
@@ -3929,7 +3941,7 @@ namespace
         {
             // The known caller (0x1133ac) loads a1 from [s0+0x2C]; s0 is still live in the context.
             uint32_t v = 0u;
-            if (ra == 0x1133b4u) v = bt3WaitFieldNonZero(rdram, getRegU32(ctx, 16) + 0x2Cu, "func_114860 packet list [s0+0x2C]", 0x114860u);
+            if (ra == 0x1133b4u) v = bt3WaitFieldNonZero(rdram, getRegU32(ctx, 16) + 0x2Cu, "func_114860 packet list [s0+0x2C]", 0x114860u, ctx, runtime);
             if (v == 0u) { ctx->pc = ra; return; }
             ctx->r[5] = _mm_set_epi64x(0, (int64_t)(int32_t)v);   // low 64 bits = sign-extended 32-bit value, upper zero
         }
@@ -3941,7 +3953,7 @@ namespace
         const uint32_t a0 = getRegU32(ctx, 4);
         if (s_on && a0 != 0u)
         {
-            const uint32_t v = bt3WaitFieldNonZero(rdram, a0 + 0x44u, "sub_113478 list [a0+0x44]", 0x113478u);
+            const uint32_t v = bt3WaitFieldNonZero(rdram, a0 + 0x44u, "sub_113478 list [a0+0x44]", 0x113478u, ctx, runtime);
             if (v == 0u) { ctx->pc = getRegU32(ctx, 31); return; }
         }
         if (g_orig113478) g_orig113478(rdram, ctx, runtime);

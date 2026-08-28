@@ -3019,6 +3019,7 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
     return top - 0x10u;
 }
 
+thread_local uint32_t g_schedLastPc = 0, g_schedLastRa = 0;   // [schedwhy] per guest thread, updated per dispatch
 void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
 {
     uint32_t lastPc = std::numeric_limits<uint32_t>::max();
@@ -3086,6 +3087,7 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
             }
         }
 
+        g_schedLastPc = pc; g_schedLastRa = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));   // [schedwhy]
         if (pc == lastPc)
         {
             ++samePcCount;
@@ -3377,7 +3379,8 @@ void PS2Runtime::schedBeginBlock(int tid)
     if (!m_schedEnabled) return;
     std::lock_guard<std::mutex> lk(m_schedMutex);
     auto it = m_schedThreads.find(tid);
-    if (it != m_schedThreads.end()) it->second->blocked = true;
+    extern thread_local uint32_t g_schedLastPc, g_schedLastRa;
+    if (it != m_schedThreads.end()) { it->second->blocked = true; it->second->blockPc = g_schedLastPc; it->second->blockRa = g_schedLastRa; }   // [schedwhy]
     if (m_schedCurrent == tid)
     {
         int nxt = schedPickNextLocked(tid);
@@ -3770,7 +3773,9 @@ void PS2Runtime::run()
                     {
                         SchedThread &s = *kv.second;
                         std::cerr << " tid" << kv.first << "(" << (s.present?"P":"-") << (s.blocked?"B":"-")
-                                  << ",ord=" << s.order << ")";
+                                  << ",ord=" << s.order;
+                        if (s.blocked) std::cerr << ",pc=0x" << std::hex << s.blockPc << ",ra=0x" << s.blockRa << std::dec;   // [schedwhy]
+                        std::cerr << ")";
                     }
                     std::cerr << std::endl;
                 }
