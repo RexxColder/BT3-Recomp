@@ -24,7 +24,7 @@ static thread_local float s_jSink[4];   // vf0 write sink (vf0 is the constant (
 
 // commitFast, with the dest mask as a template argument.
 template <uint8_t DEST>
-static inline void commitF(VU1State &st, float *dst, __m128 r)
+static inline __attribute__((always_inline)) void commitF(VU1State &st, float *dst, __m128 r)
 {
     if (s_jMacMode != 0)
     {
@@ -63,7 +63,7 @@ static inline void commitF(VU1State &st, float *dst, __m128 r)
 }
 // commitRaw: lane blend only (ITOF/FTOI/ABS: the interpreter's applyDest sets no flags and never clamps)
 template <uint8_t DEST>
-static inline void commitRaw(float *dst, __m128 r)
+static inline __attribute__((always_inline)) void commitRaw(float *dst, __m128 r)
 {
     constexpr uint8_t d = DEST & 0xFu;
     if constexpr (d == 0xFu) { _mm_storeu_ps(dst, r); }

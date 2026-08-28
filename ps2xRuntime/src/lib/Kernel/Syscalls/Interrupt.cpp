@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <chrono>
 #include <atomic>
 #include "Common.h"
@@ -666,6 +667,7 @@ namespace ps2_syscalls
         info.gp = getRegU32(ctx, 28);
         info.sp = getRegU32(ctx, 29);
         info.enabled = true;
+        std::fprintf(stderr, "[intc] AddIntcHandler cause=%u handler=0x%x arg=0x%x ra=0x%x\n", info.cause, info.handler, info.arg, getRegU32(ctx, 31));   // [intclog]
 
         int handlerId = 0;
         {

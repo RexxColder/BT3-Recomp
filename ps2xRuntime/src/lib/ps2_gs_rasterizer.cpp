@@ -2776,6 +2776,13 @@ void GSRasterizer::ensureClutCache(GS *gs)
 
     fillClutFrom(gs->m_clutCache, gs->m_vram, gs->m_texa, gs->m_texclut, tex);   // [deferdec] shared with the GL-thread decode
     gs->m_clutCacheKey = key;
+    {   // [cluthash] hash the rebuilt palette once (was: 256 serial FNV mixes per textured draw = 8% of the guest thread)
+        uint64_t hh = 1469598103934665603ull;
+        for (int i = 0; i < 16; ++i) hh = (hh ^ (uint64_t)gs->m_clutCache[i]) * 1099511628211ull;
+        gs->m_clutCacheHash16 = hh;
+        for (int i = 16; i < 256; ++i) hh = (hh ^ (uint64_t)gs->m_clutCache[i]) * 1099511628211ull;
+        gs->m_clutCacheHash256 = hh;
+    }
     {   // PS2X_CLUTDUMP=<cbp>: print the whole decoded palette once, to diff against a
         // console-derived palette (index -> colour read straight off a PCSX2 texture dump).
         static const int s_cd = [](){ const char *v = std::getenv("PS2X_CLUTDUMP");
@@ -3675,7 +3682,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                  tex.cbp, tex.csa, sr / 256, sg / 256, sb / 256, bright, ah.size(), gs->m_clutCache[0], gs->m_clutCache[1], gs->m_clutCache[5], gs->m_clutCache[128], gs->m_clutCache[255]); }
             }
             const int nclut = (psmv == GS_PSM_T4 || psmv == GS_PSM_T4HL || psmv == GS_PSM_T4HH) ? 16 : 256;
-            for (int i = 0; i < nclut; ++i) mix(gs->m_clutCache[i]);
+            mix(nclut == 16 ? gs->m_clutCacheHash16 : gs->m_clutCacheHash256);   // [cluthash] same dependence, one mix
         }
         {   // [texakey] PS2X_TEXAKEY=1: the CT16/CT24 decode BAKES TEXA (TA0/TA1/AEM) into the texel
             // alpha, but the cache key ignored TEXA -- BT3's two edge-stamp classes read the same

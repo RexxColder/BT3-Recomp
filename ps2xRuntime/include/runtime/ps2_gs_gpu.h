@@ -460,6 +460,7 @@ private:
     // per pixel. Rebuilt (by GSRasterizer) when the state key or a texture upload
     // generation changes; read-only during parallel scanline rasterization.
     uint32_t m_clutCache[256]{};
+    uint64_t m_clutCacheHash16 = 0, m_clutCacheHash256 = 0;   // [cluthash] FNV of the decoded palette (16 / 256 entries), rebuilt with the cache -- the per-draw texture key mixes these instead of re-hashing 256 entries per draw
     uint64_t m_clutCacheKey = ~0ull;   // invalid until first build
     uint32_t m_texUploadGen = 0u;      // bumped on processImageData (palette/texture upload)
 
