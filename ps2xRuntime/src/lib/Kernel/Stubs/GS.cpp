@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cstdio>
 #include "Common.h"
 #include "GS.h"
 #include "ps2_log.h"
@@ -1457,6 +1459,10 @@ namespace ps2_stubs
 
     void sceGsSyncV(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        {   // [syncvlog] who paces on sceGsSyncV, and how often (per 256 calls)
+            static std::atomic<uint32_t> s_n{0}; const uint32_t n = s_n.fetch_add(1u);
+            if ((n & 255u) == 0u) std::fprintf(stderr, "[syncv] call #%u ra=0x%x mode=%u\n", n, getRegU32(ctx, 31), getRegU32(ctx, 4));
+        }
         const uint64_t tick = ps2_syscalls::WaitForNextVSyncTick(rdram, runtime);
         if (g_gparam.interlace != 0u)
         {

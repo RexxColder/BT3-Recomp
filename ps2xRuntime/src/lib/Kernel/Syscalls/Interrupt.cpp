@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <cstdio>
 #include <chrono>
 #include <atomic>
@@ -12,7 +13,10 @@ namespace ps2_syscalls
     {
         constexpr uint32_t kIntcVblankStart = 2u;
         constexpr uint32_t kIntcVblankEnd = 3u;
-        constexpr auto kVblankPeriod = std::chrono::microseconds(16667);
+        // [vblankus] PS2X_VBLANK_US overrides the emulated vblank period (default 16667 = 60 Hz). Diagnostic only:
+        // with the guest busy ~20 ms/frame, a 25000 us period gives 40 fps if the game waits for the NEXT vblank
+        // (1 tick) and 20 fps if it always waits two ticks.
+        static const auto kVblankPeriod = [](){ const char *v = std::getenv("PS2X_VBLANK_US"); const long us = (v && v[0]) ? std::atol(v) : 0L; return std::chrono::microseconds(us > 1000 ? us : 16667L); }();
         constexpr int kMaxCatchupTicks = 4;
 
         std::mutex g_irq_handler_mutex;

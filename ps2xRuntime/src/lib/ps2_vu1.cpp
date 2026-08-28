@@ -1080,6 +1080,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                                  (double)g_vuFastNs / (double)tot,
                                  (unsigned long long)tot, (double)g_vuFastNs / 1e9);
                     std::fprintf(stderr, "[jitstat] recompiled-program interpreter fallbacks: upper %llu lower %llu\n", (unsigned long long)m_jitSlowUp, (unsigned long long)m_jitSlowLo);   // [jitstat]
+                    {   // [jitstat] top lower fallback opcodes
+                        int top[6] = {-1,-1,-1,-1,-1,-1};
+                        for (int op = 0; op < 128; ++op) for (int t = 0; t < 6; ++t) { if (top[t] < 0 || m_jitSlowLoHist[op] > m_jitSlowLoHist[top[t]]) { for (int u = 5; u > t; --u) top[u] = top[u-1]; top[t] = op; break; } }
+                        std::fprintf(stderr, "[jitstat] lower fallback ops:");
+                        for (int t = 0; t < 6; ++t) if (top[t] >= 0 && m_jitSlowLoHist[top[t]]) std::fprintf(stderr, " 0x%02x=%llu", top[t], (unsigned long long)m_jitSlowLoHist[top[t]]);
+                        int ts[6] = {-1,-1,-1,-1,-1,-1};
+                        for (int f = 0; f < 2048; ++f) for (int t = 0; t < 6; ++t) { if (ts[t] < 0 || m_jitSlowLoSpec[f] > m_jitSlowLoSpec[ts[t]]) { for (int u = 5; u > t; --u) ts[u] = ts[u-1]; ts[t] = f; break; } }
+                        std::fprintf(stderr, " | special funct:");
+                        for (int t = 0; t < 6; ++t) if (ts[t] >= 0 && m_jitSlowLoSpec[ts[t]]) std::fprintf(stderr, " 0x%03x=%llu", ts[t], (unsigned long long)m_jitSlowLoSpec[ts[t]]);
+                        std::fprintf(stderr, "\n");
+                    }
                     { int idx[64]; for (int k = 0; k < 64; ++k) idx[k] = k;
                       std::sort(idx, idx + 64, [](int a, int b){ return g_vuUpMissHist[a] > g_vuUpMissHist[b]; });
                       std::fprintf(stderr, "[vufast] upper fallbacks:"); for (int k = 0; k < 8; ++k) std::fprintf(stderr, " 0x%02x=%llu", idx[k], (unsigned long long)g_vuUpMissHist[idx[k]]); std::fprintf(stderr, "\n"); }

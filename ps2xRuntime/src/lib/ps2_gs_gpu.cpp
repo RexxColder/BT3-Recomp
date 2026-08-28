@@ -3969,7 +3969,12 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         if (data && sizeBytes > 0u)
         {
             uint64_t h = 1469598103934665603ull;
-            for (uint32_t i = 0; i < sizeBytes; ++i) h = (h ^ data[i]) * 1099511628211ull;
+            {   // [uphash8] 8 bytes per FNV step instead of 1 (the byte loop was 7% of the guest thread: a serial
+                // multiply chain per byte over every upload). Only equality with the previous hash matters.
+                uint32_t i = 0;
+                for (; i + 8u <= sizeBytes; i += 8u) { uint64_t q; std::memcpy(&q, data + i, 8u); h = (h ^ q) * 1099511628211ull; }
+                for (; i < sizeBytes; ++i) h = (h ^ data[i]) * 1099511628211ull;
+            }
             h ^= (static_cast<uint64_t>(sizeBytes) << 1) ^ (static_cast<uint64_t>(dpsm) << 40);
             std::lock_guard<std::mutex> lk(g_uploadHashMx);
             uint64_t &last = g_uploadHash[dbp];
