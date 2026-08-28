@@ -58,7 +58,7 @@ struct BarBlockReq { uint32_t page; bool alpha;
 static std::mutex g_bbMx;
 static std::condition_variable g_bbCv;
 static std::atomic<bool> g_preReady{false};   // [prerender] recordCmd raised: a chunk is waiting
-static int prerenderK() { static const int k = [](){ const char *v = std::getenv("PS2X_PRERENDER"); return v ? std::atoi(v) : 64; }(); return k; }   // 0 = off
+static int prerenderK() { static const int k = [](){ const char *v = std::getenv("PS2X_PRERENDER"); return v ? std::atoi(v) : 16; }(); return k; }   // 0 = off; default 16 since 2026-08-28 (64 left ~3x more of each segment to draw AT the barrier: render leg 375 -> 53 ms/60 frames with RECSTAGE=64)
 unsigned long g_preChunks = 0, g_preCmds = 0;   // [prerender] stats
 std::map<uint32_t, unsigned long> g_bbPageHist;   // [bbpages] blocking barriers per page
 std::map<uint32_t, double> g_bbPageMs;   // [bbpages] render+flush ms per page
@@ -921,9 +921,36 @@ bool GsGpuRenderer::hasTexture(uint64_t key, uint32_t pageLo, uint32_t pageHi)
 uint64_t GsGpuRenderer::resolveTextureVersion(uint64_t baseKey, uint32_t pageLo, uint32_t pageHi,
                                               const uint8_t *vram, uint32_t vramSize, bool &needDecode)
 {
-    std::lock_guard<std::mutex> lk(m_mtx);
     if (pageLo >= kVramPages) pageLo = kVramPages - 1;
     if (pageHi >= kVramPages) pageHi = kVramPages - 1;
+    static const bool s_vf = [](){ const char *v = std::getenv("PS2X_VERFAST"); return !(v && v[0] == '0'); }();
+    static const int s_fboDirtyMode0 = [](){ const char *v = std::getenv("PS2X_FBODIRTY"); return v && v[0] ? std::atoi(v) : 0; }();
+    if (s_vf)
+    {   // [verfast] clean path without the renderer mutex: m_texVersion is only touched by this (guest) function; the page
+        // sequence arrays are read with acquire loads (their writers store under m_mtx); presence in m_texCache comes
+        // from the guest-side mirror, dropped whenever the GL thread bumps m_texCacheEpoch (any erase/clear).
+        auto vit = m_texVersion.find(baseKey);
+        if (vit != m_texVersion.end() && vit->second.verKey != 0)
+        {
+            const TexVersion &v = vit->second;
+            bool dirtyF = false;
+            for (uint32_t p = pageLo; p <= pageHi; ++p)
+                if (__atomic_load_n(&m_contentSeq[p], __ATOMIC_ACQUIRE) > v.seqChecked) { dirtyF = true; break; }
+            extern bool g_resolveAlphaData;
+            const bool fboD = (s_fboDirtyMode0 == 1) || (s_fboDirtyMode0 == 2 && g_resolveAlphaData);
+            if (!dirtyF && fboD)
+                for (uint32_t p = pageLo; p <= pageHi; ++p)
+                    if (__atomic_load_n(&m_pageDrawSeq[p], __ATOMIC_ACQUIRE) > v.drawChecked) { dirtyF = true; break; }
+            if (!dirtyF)
+            {
+                const uint32_t ep = m_texCacheEpoch.load(std::memory_order_acquire);
+                if (m_verPresentEpoch != ep) { m_verPresent.clear(); m_verPresentEpoch = ep; }
+                auto pit = m_verPresent.find(v.verKey);
+                if (pit != m_verPresent.end() && pit->second) { needDecode = false; return v.verKey; }
+            }
+        }
+    }
+    std::unique_lock<std::mutex> lk(m_mtx);   // [verlock] released around the content hash below
     TexVersion &ve = m_texVersion[baseKey];
     bool dirty = (ve.verKey == 0);
     if (!dirty)
@@ -984,6 +1011,7 @@ uint64_t GsGpuRenderer::resolveTextureVersion(uint64_t baseKey, uint32_t pageLo,
             memo = &s_memo[memoKey];
             memoHit = (memo->h != 0 && memo->mx == mxPre && memo->wbGen == g_ps2xWbGen);
         }
+        lk.unlock();   // [verlock] hash the span WITHOUT the renderer mutex: VRAM is guest-owned and the memo is guest-static; holding it here (up to MBs per draw) stalled the GL thread and made every lock/unlock a futex round trip
         uint64_t h = 1469598103934665603ull;
         if (memoHit && s_hm == 1) h = memo->h;
         else if (vram && vramSize)
@@ -999,6 +1027,7 @@ uint64_t GsGpuRenderer::resolveTextureVersion(uint64_t baseKey, uint32_t pageLo,
                 while (n--) { h = (h ^ *p8++) * 1099511628211ull; }
             }
         }
+        lk.lock();   // [verlock]
         {   // Fold the WRITEBACK generation of this page range into the hash. The hash alone is
             // over VRAM bytes, and in a replay the scene content repeats exactly, so it stays
             // constant -- which pinned the mask build's texture to whatever it decoded the FIRST
@@ -1034,6 +1063,12 @@ uint64_t GsGpuRenderer::resolveTextureVersion(uint64_t baseKey, uint32_t pageLo,
     }
     auto it = m_texCache.find(ve.verKey);
     needDecode = (it == m_texCache.end() || it->second.w <= 0);
+    if (s_vf)
+    {   // [verfast] refresh the mirror under the lock (erases happen under this lock, so the epoch read here is consistent)
+        const uint32_t ep = m_texCacheEpoch.load(std::memory_order_acquire);
+        if (m_verPresentEpoch != ep) { m_verPresent.clear(); m_verPresentEpoch = ep; }
+        m_verPresent[ve.verKey] = needDecode ? 0u : 1u;
+    }
     {   // PS2X_MASKDBG=1: why does the mask build's texture never re-decode? Print its dirty
         // decision with the numbers behind it -- seqChecked vs the max m_contentSeq over its
         // own page range -- for the scene-spanning reads only.
@@ -3009,7 +3044,7 @@ uint32_t g_darkwLast = 0, g_darkwGen = 0; int g_darkwLogs = 0;
 // vector and moved into m_building under ONE lock every kStage commands, and at every point where
 // another thread or the frame logic needs the list complete (barrierBeforeRead, swapFrame,
 // prerender wake). PS2X_RECSTAGE=0 restores the per-command lock.
-static const int s_recStage = [](){ const char *v = std::getenv("PS2X_RECSTAGE"); return v ? std::atoi(v) : 16; }();
+static const int s_recStage = [](){ const char *v = std::getenv("PS2X_RECSTAGE"); return v ? std::atoi(v) : 64; }();   // default 64 since 2026-08-28: with PRERENDER=16 it is what gets the outline stack to 30 fps (SJ11); no effect on the plain build
 void GsGpuRenderer::flushStage()
 {
     if (m_stage.empty()) return;
@@ -3743,6 +3778,7 @@ void GsGpuRenderer::swapFrame()
         if (s_queue && !g_interpOn)
         {
             m_pending.push_back(std::move(m_building));
+            g_bbCv.notify_all();   // [pubbreak] wake the GL pacing loop: present now, then pre-render the next frame
             if (!m_vecPool.empty()) { m_building = std::move(m_vecPool.back()); m_vecPool.pop_back(); }   // [vecpool]
             // Bounded backlog: if the present thread stalls, drop the OLDEST whole lists
             // (bounded loss beats unbounded memory). Logged so drops are never silent.
@@ -3763,6 +3799,11 @@ void GsGpuRenderer::swapFrame()
     }
 }
 
+bool GsGpuRenderer::hasPendingFrame()
+{   // [pubbreak]
+    std::lock_guard<std::mutex> lk(m_mtx);
+    return !m_pending.empty();
+}
 void GsGpuRenderer::onVramUpload(uint32_t dbpBlock, uint32_t sizeBlocks)
 {
     // Stamp the VRAM pages this upload touched with a fresh write-seq, so only textures
@@ -4028,7 +4069,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (s_rd && (s_rc % 240) == 0)
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            m_texCache.clear();
+            m_texCache.clear(); m_texCacheEpoch.fetch_add(1u, std::memory_order_release);   // [verfast]
         }
     }
 
@@ -4275,7 +4316,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                                 g_glTex.erase(g);
                             }
                         }
-                        if (s_sup != 3) { m_texCache.erase(k); g_texLastUse.erase(k); g_texRtSourced.erase(k); g_texRtIndexed.erase(k); }
+                        if (s_sup != 3) { m_texCache.erase(k); m_texCacheEpoch.fetch_add(1u, std::memory_order_release); g_texLastUse.erase(k); g_texRtSourced.erase(k); g_texRtIndexed.erase(k); }
                     }
                     g_superseded.swap(keep);
                 }
@@ -4347,7 +4388,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                         // upload, and BT3's loader polls a device-status halfword whose gate
                         // closes if the timing slips. Doing GL work under this lock hung the load.
                         if (g != g_glTex.end()) { g_pendingUnload.push_back(g->second); g_glTex.erase(g); }
-                        m_texCache.erase(k); g_texLastUse.erase(k); g_texRtSourced.erase(k); g_texRtIndexed.erase(k); ++freedN;
+                        m_texCache.erase(k); m_texCacheEpoch.fetch_add(1u, std::memory_order_release); g_texLastUse.erase(k); g_texRtSourced.erase(k); g_texRtIndexed.erase(k); ++freedN;
                     }
                     // Also drop the recycle pool: it is VRAM the budget never counted, and a
                     // recycled GL object serving a different key is the other suspect here.
@@ -4441,7 +4482,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                         }
                         g_glTex.erase(g);
                     }
-                    m_texCache.erase(k);
+                    m_texCache.erase(k); m_texCacheEpoch.fetch_add(1u, std::memory_order_release);   // [verfast]
                     g_texLastUse.erase(k);
                     g_texRtSourced.erase(k); g_texRtIndexed.erase(k);
                 }

@@ -278,6 +278,7 @@ public:
     void recordCmd(const DrawCmd &cmd);
     void swapFrame();      // frame boundary (FUN_00100ab8): publish command list
     void onVramUpload(uint32_t dbpBlock, uint32_t sizeBlocks); // stamp the written VRAM pages
+    bool hasPendingFrame();   // [pubbreak] a published list is waiting for its present
     void onVramWriteback(uint32_t dbpBlock, uint32_t sizeBlocks); // content-only stamp
     static constexpr uint32_t kVramPages = 512; // 4MB / 8KB page
     // DISPFB1 -> the scanned-out buffer's fbp AND its display stride (FBW, in 64px units).
@@ -353,6 +354,11 @@ private:
     std::vector<std::vector<DrawCmd>> m_vecPool;
     std::vector<DrawCmd> m_cmdsScratch;   // [vecpool] renderAndGetTextureId command scratch   // [vecpool] emptied frame lists handed back by the GL thread so the guest reuses their capacity (a moved-out m_building regrew from 0 every frame: ~5% of the guest thread in DrawCmd moves)
     std::unordered_map<uint64_t, CachedTex> m_texCache;
+    // [verfast] lock-free clean path for resolveTextureVersion: the guest keeps a mirror of "this verKey is decoded and
+    // present"; the GL thread bumps m_texCacheEpoch whenever it removes cache entries, which drops the mirror.
+    std::atomic<uint32_t> m_texCacheEpoch{0};
+    std::unordered_map<uint64_t, uint8_t> m_verPresent;
+    uint32_t m_verPresentEpoch = 0;
     struct TexVersion
     {
         uint32_t seqChecked = 0; // m_writeSeq when the span was last hashed/validated

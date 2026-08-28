@@ -2539,8 +2539,17 @@ namespace
     }
 
     // Run the CD file-server tick (FUN_0028a3b0) inline on the calling guest thread.
+    // [dispatchpump] when the CD server last ran (any path); the dispatch-loop pump only fires when this is stale
+    static std::atomic<int64_t> g_lastCdTickNs{0};
+    extern "C" bool ps2xCdTickStale(unsigned ms)
+    {
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t last = g_lastCdTickNs.load(std::memory_order_relaxed);
+        return last == 0 || (now - last) > (int64_t)ms * 1000000LL;
+    }
     static void bt3RunCdTickInline(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        g_lastCdTickNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);   // [dispatchpump]
         R5900Context tctx = *ctx;             // inherit gp/sp
         tctx.r[31] = _mm_setzero_si128();     // ra = 0 => run until return
         tctx.pc = 0x0028a3b0u;                // CD file-server tick
@@ -2558,6 +2567,13 @@ namespace
     // every loader thread blocked) deadlocks: nothing ticks the server, no completion, no populate.
     // Hardware preempts the poller with the IOP completion. Emulate it: tick the server here, then
     // yield the guest token so a woken loader thread can run. PS2X_SPINPUMP=0 disables.
+    // [dispatchpump] tick the CD file server WITHOUT sleeping (the dispatch-loop pump runs during fights too)
+    extern "C" void ps2xCdTickOnly(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (!runtime || !runtime->hasFunction(0x0028a3b0u)) return;
+        Bt3CdTickGuard tickGuard;
+        if (tickGuard.engaged) { bt3RunCdTickInline(rdram, ctx, runtime); s_bt3CdTicking = false; }
+    }
     extern "C" void *ps2xGuestWaitBegin();
     extern "C" void ps2xGuestWaitEnd(void *);
     extern "C" void ps2xSpinPump(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

@@ -433,6 +433,10 @@ namespace
     }
 }
 
+extern "C" bool ps2xCdTickStale(unsigned ms);   // [dispatchpump]
+extern "C" void ps2xCdTickOnly(uint8_t *, R5900Context *, PS2Runtime *);
+extern "C" void *ps2xGuestWaitBegin();
+extern "C" void ps2xGuestWaitEnd(void *);
 extern "C" void ps2xSpinPump(uint8_t *, R5900Context *, PS2Runtime *);   // [spinpump] game_overrides.cpp
 
 PS2Runtime::GuestExecutionScope::GuestExecutionScope(PS2Runtime *runtime) noexcept
@@ -3109,6 +3113,29 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
         }
 
         g_schedLastPc = pc; g_schedLastRa = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));   // [schedwhy]
+        {   // [dispatchpump] the loading deadlock the spin detector misses: the main thread polls through SEVERAL pcs
+            // (never the same one 2000x), the loader threads sit blocked on CD completions, and nothing ticks the CD
+            // file server or hands the cooperative token over. Every 16k dispatches on the main thread: tick the
+            // server if it has not run for 20 ms (no sleep), and yield once if another guest thread is runnable.
+            static const bool s_dpOn = [](){ const char *v = std::getenv("PS2X_DISPATCHPUMP"); return !(v && v[0] == '0'); }();
+            static thread_local uint32_t s_dp = 0;
+            if (s_dpOn && m_schedEnabled && ctx == &m_cpuContext && ((++s_dp & 0x3FFFu) == 0u))
+            {
+                if (ps2xCdTickStale(20u)) ps2xCdTickOnly(rdram, ctx, this);
+                bool othersRunnable = false;
+                {
+                    std::lock_guard<std::mutex> lk(m_schedMutex);
+                    for (auto &kv : m_schedThreads) { const SchedThread &s = *kv.second; if (kv.first != m_schedCurrent && s.present && !s.blocked) { othersRunnable = true; break; } }
+                }
+                if (othersRunnable)
+                {
+                    static std::atomic<uint32_t> s_dy{0};
+                    const uint32_t k = s_dy.fetch_add(1u);
+                    if (k < 4u || (k % 2000u) == 0u) std::fprintf(stderr, "[dispatchpump] main thread yielding to a runnable guest thread (x%u) at pc 0x%x\n", k + 1u, pc);
+                    void *scope = ps2xGuestWaitBegin(); std::this_thread::yield(); ps2xGuestWaitEnd(scope);
+                }
+            }
+        }
         if (pc == lastPc)
         {
             ++samePcCount;
@@ -3926,6 +3953,12 @@ void PS2Runtime::run()
             {
                 if (!ps2GpuRenderer().serviceBlockingBarriers())
                 {
+                    // [pubbreak] a published frame is waiting: present it now instead of idling to the deadline.
+                    // prerenderChunk() refuses to run while a list is pending (ordering), so every microsecond spent
+                    // here after a publish is pre-render coverage lost -> a bigger render leg at the next barrier
+                    // (outline SJ3: render leg 366 ms/60 frames vs 127 before the guest got faster).
+                    static const bool s_pb = [](){ const char *v = std::getenv("PS2X_PUBBREAK"); return !(v && v[0] == '0'); }();
+                    if (s_pb && ps2GpuRenderer().hasPendingFrame()) break;
                     if (ps2GpuRenderer().prerenderChunk()) continue;   // [prerender] draw ahead while the guest records
 
                     const auto left = std::chrono::duration_cast<std::chrono::microseconds>(s_next - now).count();
