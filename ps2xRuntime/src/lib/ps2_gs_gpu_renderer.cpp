@@ -3743,6 +3743,7 @@ void GsGpuRenderer::swapFrame()
         if (s_queue && !g_interpOn)
         {
             m_pending.push_back(std::move(m_building));
+            if (!m_vecPool.empty()) { m_building = std::move(m_vecPool.back()); m_vecPool.pop_back(); }   // [vecpool]
             // Bounded backlog: if the present thread stalls, drop the OLDEST whole lists
             // (bounded loss beats unbounded memory). Logged so drops are never silent.
             constexpr size_t kMaxPending = 16;
@@ -4031,7 +4032,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         }
     }
 
-    std::vector<DrawCmd> cmds;
+    std::vector<DrawCmd> &cmds = m_cmdsScratch; cmds.clear();   // [vecpool] persistent scratch: keeps its capacity across calls (a local reallocated ~2 MB and page-faulted it in every frame)
     struct SegSwapBack
     {   // [segshadow] swap back under the lock, then append what the guest recorded meanwhile
         GsGpuRenderer *r; std::vector<DrawCmd> &a, &b; bool on, shadow;
@@ -4076,7 +4077,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             for (auto &l : m_pending)
             {
                 listStarts.push_back(cmds.size());
-                cmds.insert(cmds.end(), l.begin(), l.end());
+                cmds.insert(cmds.end(), std::make_move_iterator(l.begin()), std::make_move_iterator(l.end()));   // [vecpool] move, not copy (3 shared_ptr refcounts per DrawCmd)
+                l.clear();
+                if (m_vecPool.size() < 4) m_vecPool.push_back(std::move(l));   // [vecpool] hand the capacity back to the guest
             }
             nLists = m_pending.size();
             m_pending.clear();

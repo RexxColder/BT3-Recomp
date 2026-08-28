@@ -350,6 +350,8 @@ private:
     // present thread didn't get to, leaving buffers frozen mid-frame (flat-gray scene at
     // downsample time, strobing presents, empty light/shadow maps).
     std::vector<std::vector<DrawCmd>> m_pending;
+    std::vector<std::vector<DrawCmd>> m_vecPool;
+    std::vector<DrawCmd> m_cmdsScratch;   // [vecpool] renderAndGetTextureId command scratch   // [vecpool] emptied frame lists handed back by the GL thread so the guest reuses their capacity (a moved-out m_building regrew from 0 every frame: ~5% of the guest thread in DrawCmd moves)
     std::unordered_map<uint64_t, CachedTex> m_texCache;
     struct TexVersion
     {

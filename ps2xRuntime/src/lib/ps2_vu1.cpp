@@ -915,7 +915,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     // [vu1jit] PS2X_VUJIT=1: run the statically recompiled program for this microcode (matched by a hash of the
     // program extent on every MPG upload); PS2X_VUJIT_VERIFY=1: run the interpreter on a copy first (dry XGKICK)
     // and compare state + data memory afterwards -- the correctness gate (the rig cannot see VU1 changes).
-    static const bool s_jit = [](){ const char *v = std::getenv("PS2X_VUJIT"); return v && v[0] && v[0] != '0'; }();
+    static const bool s_jit = [](){ const char *v = std::getenv("PS2X_VUJIT"); return !(v && v[0] == '0'); }();   // default ON since 2026-08-28 (verify: 7.7M runs, 0 mismatches)
     static const bool s_jitVerify = [](){ const char *v = std::getenv("PS2X_VUJIT_VERIFY"); return v && v[0] && v[0] != '0'; }();
     if (s_jit && !t_vuNoJit)
     {
