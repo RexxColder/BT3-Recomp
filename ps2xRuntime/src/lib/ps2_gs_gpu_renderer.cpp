@@ -923,18 +923,21 @@ bool GsGpuRenderer::hasTexture(uint64_t key, uint32_t pageLo, uint32_t pageHi)
 // the fighters' T4 skin draws (palettes cbp 15360..15399) in the previous frame; drawn right before the first fighter
 // draw of a frame so the body occludes it. Fallback for the mask-page shadow composite (see bt3-character-shadows).
 namespace {
-    struct GsBlob { float cx, feetY, w; };
+    struct GsBlob { float cx, feetY, w, feetZ; };
     std::vector<GsBlob> g_blobs;                 // from the previous frame
-    std::vector<float> g_blobX, g_blobY;         // this frame's fighter vertices
+    std::vector<float> g_blobX, g_blobY, g_blobZ; // this frame's fighter vertices (normalised GS z: larger = nearer)
     Texture2D g_blobTex{};
     bool g_blobDrawn = false;                    // once per frame; reset in blobFrameEnd()
+    int g_terrainDraws = 0;                      // T8 stage-texture triangles seen this frame (the blob must come AFTER the terrain)
+    uint32_t g_sceneFbp = 0xFFFFFFFFu;             // destFbp of this frame's terrain draws (the scene buffer)
+    bool isTerrainDraw(const GsGpuRenderer::DrawCmd &c) { return c.isTriangle && c.srcPsm == 19u && c.srcClutTbp == 12992u && !c.isTransfer; }
     int groundShadowMode() { static const int s = [](){ const char *v = std::getenv("PS2X_GROUNDSHADOW"); return v && v[0] ? std::atoi(v) : 0; }(); return s; }
     bool groundShadowOn() { return groundShadowMode() != 0; }
     bool isFighterDraw(const GsGpuRenderer::DrawCmd &c) { return c.isTriangle && c.srcPsm == 20u && c.srcClutTbp >= 15360u && c.srcClutTbp < 15400u && !c.isTransfer; }
-    void blobAccumulate(const GsGpuRenderer::DrawCmd &c) { for (int i = 0; i < 3; ++i) { g_blobX.push_back(c.tri[i].x); g_blobY.push_back(c.tri[i].y); } }
+    void blobAccumulate(const GsGpuRenderer::DrawCmd &c) { for (int i = 0; i < 3; ++i) { g_blobX.push_back(c.tri[i].x); g_blobY.push_back(c.tri[i].y); g_blobZ.push_back(c.tri[i].z); } }
     void blobFrameEnd()
     {
-        g_blobs.clear(); g_blobDrawn = false;
+        g_blobs.clear(); g_blobDrawn = false; g_terrainDraws = 0; g_sceneFbp = 0xFFFFFFFFu;
         const size_t n = g_blobX.size();
         if (n >= 60)
         {
@@ -950,17 +953,21 @@ namespace {
             }
             for (int k = 0; k < 2; ++k)
             {
-                std::vector<float> ys; float xmin = 1e9f, xmax = -1e9f; double sx = 0; size_t cnt = 0;
-                for (size_t i = 0; i < n; ++i) if (lab[i] == k) { ys.push_back(g_blobY[i]); xmin = std::min(xmin, g_blobX[i]); xmax = std::max(xmax, g_blobX[i]); sx += g_blobX[i]; ++cnt; }
+                std::vector<std::pair<float,float>> yz; float xmin = 1e9f, xmax = -1e9f; double sx = 0; size_t cnt = 0;
+                for (size_t i = 0; i < n; ++i) if (lab[i] == k) { yz.push_back({g_blobY[i], g_blobZ[i]}); xmin = std::min(xmin, g_blobX[i]); xmax = std::max(xmax, g_blobX[i]); sx += g_blobX[i]; ++cnt; }
                 if (cnt < 30) continue;
-                std::sort(ys.begin(), ys.end());
-                const float feet = ys[(size_t)((ys.size() - 1) * 0.97)];
+                std::sort(yz.begin(), yz.end());
+                const float feet = yz[(size_t)((yz.size() - 1) * 0.97)].first;
+                // feet depth: median z of the lowest 5% of vertices (the contact patch), used for the depth test
+                std::vector<float> zs; for (size_t i = (size_t)((yz.size() - 1) * 0.95); i < yz.size(); ++i) zs.push_back(yz[i].second);
+                std::sort(zs.begin(), zs.end());
+                const float feetZ = zs.empty() ? 0.0f : zs[zs.size() / 2];
                 const float w = std::min(220.0f, std::max(36.0f, xmax - xmin));
-                g_blobs.push_back(GsBlob{(float)(sx / cnt), feet, w});
+                g_blobs.push_back(GsBlob{(float)(sx / cnt), feet, w, feetZ});
             }
         }
         { static unsigned long nf = 0; if ((++nf % 120ul) == 1ul) std::fprintf(stderr, "[groundshadow] frame %lu: fighter verts %zu -> blobs %zu\n", nf, n, g_blobs.size()); }
-        g_blobX.clear(); g_blobY.clear();
+        g_blobX.clear(); g_blobY.clear(); g_blobZ.clear();
     }
     void blobEnsureTex()
     {
@@ -11258,9 +11265,10 @@ if (done.size() < 14 && !done.count(c.texKey))
 
         // Collapse an axis-aligned VRAM-textured triangle-pair into a sprite quad (crisp
         // thin edges). Skip for FBO sources (handled by the generic paths below).
-        if (groundShadowOn() && isFighterDraw(c))
+        if (groundShadowOn() && isTerrainDraw(c)) { ++g_terrainDraws; g_sceneFbp = c.destFbp; }   // [groundshadow] ordering: the early fighter pass precedes the terrain
+        if (groundShadowOn() && (isFighterDraw(c) || (!isTerrainDraw(c) && !c.isTransfer && g_terrainDraws > 200 && c.destFbp == g_sceneFbp)))
         {   // [groundshadow] first fighter draw of this frame: paint the previous frame's blobs underneath
-            if (!g_blobDrawn && !g_blobs.empty())
+            if (!g_blobDrawn && !g_blobs.empty() && g_terrainDraws > 200)
             {
                 g_blobDrawn = true;
                 blobEnsureTex();
@@ -11276,7 +11284,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 {
                     const float w = b.w * 1.05f, h = w * 0.34f;
                     const float x0 = b.cx - w * 0.5f, x1 = b.cx + w * 0.5f, y0 = b.feetY - h * 0.62f, y1 = b.feetY + h * 0.38f;
-                    { static int nlog = 0; if (nlog++ < 12) std::fprintf(stderr, "[groundshadow] draw cx=%.0f feet=%.0f w=%.0f -> (%.0f,%.0f)-(%.0f,%.0f) fbo=%u off=(%.0f,%.0f) depthOn=%d\n", b.cx, b.feetY, b.w, x0, y0, x1, y1, curFbp, offX, offY, (int)depthOn); }
+                    { static int nlog = 0; if (nlog++ < 12) std::fprintf(stderr, "[groundshadow] draw cx=%.0f feet=%.0f w=%.0f -> (%.0f,%.0f)-(%.0f,%.0f) fbo=%u off=(%.0f,%.0f) depthOn=%d terrain=%d\n", b.cx, b.feetY, b.w, x0, y0, x1, y1, curFbp, offX, offY, (int)depthOn, g_terrainDraws); }
                     if (dbg) rlColor4ub(255, 0, 255, 255); else rlColor4ub(0, 0, 0, 110);
                     rlNormal3f(0.0f, 0.0f, 1.0f);
                     rlTexCoord2f(0.0f, 0.0f); rlVertex2f(x0 + offX, y0 + offY);
@@ -11287,17 +11295,18 @@ if (done.size() < 14 && !done.count(c.texKey))
                 rlEnd();
                 rlDrawRenderBatchActive();
                 rlSetTexture(0);
+                if (dbg) { static int dn = 0; if (dn++ < 2) { unsigned char cm[4]; glGetBooleanv(0x0C23u /*GL_COLOR_WRITEMASK*/, cm); int fb = 0; glGetIntegerv(0x8CA6u, &fb); int vp[4]; glGetIntegerv(0x0BA2u, vp); int sb[4]; glGetIntegerv(0x0C10u, sb); std::fprintf(stderr, "[groundshadow] GL after draw: fb=%d viewport=(%d,%d,%d,%d) scissor=(%d,%d,%d,%d) scissorOn=%d colormask=%d%d%d%d blendOn=%d\n", fb, vp[0], vp[1], vp[2], vp[3], sb[0], sb[1], sb[2], sb[3], (int)glIsEnabled(0x0C11u), cm[0], cm[1], cm[2], cm[3], (int)glIsEnabled(0x0BE2u)); char pth[128]; std::snprintf(pth, sizeof pth, "/home/z3/Desktop/bt3/work/gsh_after_%d.ppm", dn); dumpBoundFbo(pth, 512, 448); } }   // [groundshadow] probe
                 rlSetShader(g_shader.id, g_shader.locs);   // back to the GS shader (its uniforms are untouched)
                 if (depthOn) { rlEnableDepthTest(); rlEnableDepthMask(); }
                 curMask = -1; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;   // let the loop re-apply this draw's state
                 depthForCmd(c);
             }
-            blobAccumulate(c);
+            if (isFighterDraw(c)) blobAccumulate(c);
         }
         {   // [shadowdecal] PS2X_SHADOWDECAL=0 skips the game's ground-shadow decal pass (floor-tile triangles sampling the
             // 256x256 PSMCT24 view of page 336 with TEXA AEM, vtxA=63, bm 0x44, DATE on). Its source is the mask chain we
-            // cannot reproduce yet; under the outline stack it paints the "arrow" blob on the ground (SJ17). Default: draw.
-            static const bool s_sd = [](){ const char *v = std::getenv("PS2X_SHADOWDECAL"); return !(v && v[0] == '0'); }();
+            // cannot reproduce yet; under the outline stack it paints the "arrow" blob on the ground (SJ17). Default: skip.
+            static const bool s_sd = [](){ const char *v = std::getenv("PS2X_SHADOWDECAL"); return v && v[0] && v[0] != '0'; }();   // default SKIP since 2026-08-29 (SJ25: the arrow is gone; =1 draws the decal)
             if (!s_sd && c.isTriangle && c.srcPsm == 1u && c.srcTbp0 == 10752u && c.dateEnable && c.blendMode == 0x44u && !c.isTransfer)
             { PS2X_GATE_HIT(); continue; }
         }

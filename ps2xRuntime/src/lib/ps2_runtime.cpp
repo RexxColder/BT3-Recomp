@@ -1836,7 +1836,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             GuestExecutionScope pumpScope(this);
             for (uint32_t tickPc : kTickPcs)
             {
-                if (!hasFunction(tickPc) || (s_noAdxPump && tickPc == 0x0028a530u))
+                if (ctx != &m_cpuContext || !hasFunction(tickPc) || (s_noAdxPump && tickPc == 0x0028a530u))   // [pumpmain]
                 {
                     continue;
                 }
@@ -1930,7 +1930,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                     {
                         for (uint32_t bp : kBurstPcs)
                         {
-                            if (!hasFunction(bp))
+                            if (ctx != &m_cpuContext || !hasFunction(bp))   // [pumpmain]
                             {
                                 continue;
                             }
@@ -2107,7 +2107,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             static thread_local uint64_t s_dispTick = 0u;
             // Only once slot 6 is registered (handler non-zero) and init settled.
             uint32_t slot6 = *reinterpret_cast<uint32_t *>(rdram + (0x321810u & 0x01FFFFFFu));
-            if (slot6 != 0u && ++s_dispTick > 3000u && hasFunction(0x00285fa0u))
+            if (ctx == &m_cpuContext && slot6 != 0u && ++s_dispTick > 3000u && hasFunction(0x00285fa0u))   // [pumpmain]
             {
                 s_pumping = true;
                 GuestExecutionScope dispScope(this);
@@ -2195,7 +2195,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             static const uint64_t s_kickDelaySec = [](){ const char *v = std::getenv("PS2X_KICKDELAY"); return (v && v[0]) ? std::strtoull(v, nullptr, 10) : 150ull; }();
             static const std::chrono::steady_clock::time_point s_startTp = std::chrono::steady_clock::now();
             const uint64_t elapsedSec = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - s_startTp).count();
-            if (!s_kicked && elapsedSec >= s_kickDelaySec && cnt == 1u && s_sawSndWait && hasFunction(kickPc))
+            if (ctx == &m_cpuContext && !s_kicked && elapsedSec >= s_kickDelaySec && cnt == 1u && s_sawSndWait && hasFunction(kickPc))   // [pumpmain]
             {
                 s_kicked = true;
                 s_pumping = true;
@@ -3154,7 +3154,7 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
                              pc, samePcCount, (ctx == &m_cpuContext) ? "main" : "thread", R(31), t6, rd16(t6 + 8u), rd32(t6), rd32(t6 + 4u), rd32(t6 + 0xCu),
                              R(4), R(5), R(6), R(7), R(2), R(16), R(17), R(18), R(15), R(24));
             }
-            if ((samePcCount % 2000u) == 0u)
+            if ((samePcCount % 2000u) == 0u && ctx == &m_cpuContext)   // [pumpmain] never run the tick on a sound thread's 2 KB stack
             {   // [spinpump] a busy-poll: advance the CD file server and let other guest threads run (see game_overrides)
                 ps2xSpinPump(rdram, ctx, this);
             }
@@ -3814,6 +3814,7 @@ void PS2Runtime::run()
                     const uint32_t sub8 = r32(0x2c9358u), sub4 = r32(0x2c9354u);
                     if (sub8 >= 0x100000u && sub8 < 0x2000000u) { sb << " | +8@" << sub8 << ":"; for (uint32_t o = 0; o < 0x20u; o += 4u) sb << ' ' << std::setw(8) << r32(sub8 + o); }
                     if (sub4 >= 0x100000u && sub4 < 0x2000000u) { sb << " | +4@" << sub4 << ":"; for (uint32_t o = 0; o < 0x10u; o += 4u) sb << ' ' << std::setw(8) << r32(sub4 + o); }
+                    { sb << " | slot3@2deb70:"; for (uint32_t o = 0; o < 0x40u; o += 4u) sb << ' ' << std::setw(8) << r32(0x2deb70u + o); }   // [sndblk] the sub-object slot the healthy init returns
                     std::cerr << sb.str() << std::dec << std::endl;
                 }
                 std::cerr << "[status] pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
