@@ -1025,8 +1025,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
 
         uint32_t lower, upper;
-        std::memcpy(&lower, vuCode + m_state.pc, 4);
-        std::memcpy(&upper, vuCode + m_state.pc + 4, 4);
+        {   // [fetch64] one 8-byte load for the pair (pc+8 <= codeSize checked above)
+            uint64_t pair; std::memcpy(&pair, vuCode + m_state.pc, 8);
+            lower = (uint32_t)pair; upper = (uint32_t)(pair >> 32);
+        }
 
         const bool iBit = ((upper >> 31) & 1u) != 0u;
         const bool eBit = ((upper >> 30) & 1u) != 0u;
