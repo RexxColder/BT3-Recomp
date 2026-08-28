@@ -2893,6 +2893,18 @@ namespace
         if (n < 40u)
             std::fprintf(stderr, "[fixupprobe] #%u a0=0x%x a1=0x%x a2=0x%x ra=0x%x hdr[0..4]=%08x %08x %08x %08x %08x  a1[0..3]=%08x %08x %08x %08x  sp=0x%x\n",
                          n, a0, a1, a2, ra, r32(a2), r32(a2 + 4u), r32(a2 + 8u), r32(a2 + 12u), r32(a2 + 16u), r32(a1), r32(a1 + 4u), r32(a1 + 8u), r32(a1 + 12u), getRegU32(ctx, 29));
+        {   // [fixupguard] the hung runs called this with a base 0x37000 past the real pack (stale pointer): the "header"
+            // there is sample data, so the entry pointer becomes garbage and the loop writes over the sound stream block
+            // 0x2c9350. Refuse a fixup whose header is implausible: count > 1024 or entries outside [a1, a1 + 2 MB).
+            static const bool s_guard = [](){ const char *v = std::getenv("PS2X_FIXUPGUARD"); return !(v && v[0] == '0'); }();
+            const uint32_t cnt = r32(a2), entOff = r32(a2 + 4u) * 4u;
+            const uint32_t entBase = (a1 + entOff) & 0x1FFFFFFFu, a1m = a1 & 0x1FFFFFFFu;
+            if (s_guard && (cnt > 1024u || entBase < a1m || entBase - a1m > 0x200000u || (a1 & 0x1FFFFFFFu) >= 0x2000000u))
+            {
+                std::fprintf(stderr, "[fixupguard] REJECTED fixup #%u: a1=0x%x a2=0x%x count=%u entries@+0x%x (garbage header) -- skipping to protect 0x2c9350\n", n, a1, a2, cnt, entOff);
+                return;
+            }
+        }
         if (g_orig10a028) g_orig10a028(rdram, ctx, runtime);
     }
     PS2Runtime::RecompiledFunction g_orig2722c0 = nullptr;
