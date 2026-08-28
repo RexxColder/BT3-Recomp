@@ -265,6 +265,12 @@ namespace
     enum : uint8_t
     {
         VU_UP_FALLBACK = 0,
+        // [vufast2] special group + remaining regular ops
+        VU_UP_ITOF, VU_UP_FTOI, VU_UP_ABS, VU_UP_CLIP,
+        VU_UP_ADDAbc, VU_UP_SUBAbc, VU_UP_MULAq, VU_UP_MULAi, VU_UP_ADDAq, VU_UP_MADDAq, VU_UP_ADDAi, VU_UP_MADDAi,
+        VU_UP_SUBAq, VU_UP_MSUBAq, VU_UP_SUBAi, VU_UP_MSUBAi, VU_UP_ADDA, VU_UP_MADDA, VU_UP_MULA, VU_UP_SUBA, VU_UP_MSUBA, VU_UP_OPMULA,
+        VU_UP_MSUBbc, VU_UP_MULi, VU_UP_ADDq, VU_UP_MADDq, VU_UP_ADDi, VU_UP_MADDi, VU_UP_SUBq, VU_UP_MSUBq, VU_UP_SUBi, VU_UP_MSUBi,
+        VU_UP_MADD, VU_UP_MUL, VU_UP_MSUB, VU_UP_OPMSUB,
         // special (funct >= 0x3C) -- these write ACC, not vd
         VU_UP_MADDAbc,
         VU_UP_MSUBAbc,
@@ -303,7 +309,7 @@ namespace
     static_assert(sizeof(VuDecodeEntry) == 16, "decode entry must stay 16 bytes (L1 budget)");
     enum : uint8_t { VU_LO_FALLBACK = 0, VU_LO_NOP, VU_LO_LQ, VU_LO_SQ, VU_LO_IADDIU, VU_LO_ISUBIU, VU_LO_IADD, VU_LO_ISUB,
                      VU_LO_IADDI, VU_LO_IAND, VU_LO_IOR, VU_LO_MOVE, VU_LO_MR32, VU_LO_LQI, VU_LO_SQI, VU_LO_LQD, VU_LO_SQD,
-                     VU_LO_MTIR, VU_LO_MFIR, VU_LO_B, VU_LO_BAL, VU_LO_IBEQ, VU_LO_IBNE, VU_LO_IBLTZ, VU_LO_IBGTZ, VU_LO_IBLEZ, VU_LO_IBGEZ, VU_LO_FCOR };
+                     VU_LO_MTIR, VU_LO_MFIR, VU_LO_B, VU_LO_BAL, VU_LO_IBEQ, VU_LO_IBNE, VU_LO_IBLTZ, VU_LO_IBGTZ, VU_LO_IBLEZ, VU_LO_IBGEZ, VU_LO_FCAND, VU_LO_FCOR2, VU_LO_FCGET, VU_LO_JR, VU_LO_JALR, VU_LO_ISW, VU_LO_ILW, VU_LO_DIVQ, VU_LO_SQRTQ, VU_LO_RSQRTQ, VU_LO_WAITQ, VU_LO_ILWR, VU_LO_ISWR, VU_LO_XTOP, VU_LO_XITOP, VU_LO_FCOR };
     constexpr uint32_t kVuDecodeSlots = 2048u; // 16KB microcode / 8 bytes per instruction
     thread_local VuDecodeEntry g_vuDecode[kVuDecodeSlots];
 
@@ -313,6 +319,9 @@ namespace
     thread_local uint64_t g_vuFastMisses = 0;
     thread_local uint64_t g_vuLoFastHits = 0, g_vuLoFastMisses = 0;   // [vulower]
     thread_local uint64_t g_vuUpMissHist[64] = {};   // [vufast] upper fallback histogram (op & 0x3F)
+    thread_local uint64_t g_vuLoMissHist[128] = {};   // [vulower] lower fallback histogram (lower >> 25)
+    thread_local uint64_t g_vuUpSpecHist[32] = {};   // [vufast] upper 0x3C-0x3F group: sub-op (bits 6-10)
+    thread_local uint64_t g_vuLoSpecHist[64] = {};   // [vulower] lower 0x40 group: (bits 6-10)<<1 | bit 0.. use ((lower>>6)&0x1F)
     thread_local uint64_t g_vuFastNs = 0;
 
     // Lane-select masks for the dest field, so the commit is a branchless blend instead of the
@@ -340,6 +349,7 @@ namespace
     // [vulower] Decode the lower slot once per PC. Only ops whose interpreter case is pure register /
     // VU-data-memory work are translated; everything else (branches, flag ops, DIV/SQRT, XGKICK,
     // ILWR/ISWR, E*, R*, diag-gated LQ) stays on execLower. PS2X_VULOWER=0 disables.
+#define VUFAST2_GATE() do { static const bool s_f2l = [](){ const char *v = std::getenv("PS2X_VUFAST2"); return !(v && v[0] == '0'); }(); if (!s_f2l) return; } while (0)
     inline void vuDecodeLower(uint32_t instr, VuDecodeEntry &e)
     {
         e.loKindF &= 0xC0u; e.loA = e.loB = 0u; e.loDestC = 0u; e.loImm = 0;
@@ -360,6 +370,15 @@ namespace
         case 0x08: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_IADDIU; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = (int16_t)((instr & 0x7FF) | ((instr >> 10) & 0x7800)); return;
         case 0x09: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_ISUBIU; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = (int16_t)((instr & 0x7FF) | ((instr >> 10) & 0x7800)); return;
         // FCOR (0x13) needs a 24-bit immediate: interpreter fallback (2% of lower ops)
+        // [vufast2] ILW/ISW: loA = vit, loB = vis, loDest = component mask, loImm = imm11
+        case 0x04: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_ILW; e.loA = VIT(instr); e.loB = VIS(instr); e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); e.loImm = (int16_t)IMM11(instr); return;
+        case 0x05: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_ISW; e.loA = VIT(instr); e.loB = VIS(instr); e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); e.loImm = (int16_t)IMM11(instr); return;
+        // [vufast2] FCAND/FCOR: imm24 = low 16 in loImm (bit pattern) | loA << 16
+        case 0x12: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_FCAND; e.loImm = (int16_t)(uint16_t)(instr & 0xFFFFu); e.loA = (uint8_t)((instr >> 16) & 0xFFu); return;
+        case 0x13: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_FCOR2; e.loImm = (int16_t)(uint16_t)(instr & 0xFFFFu); e.loA = (uint8_t)((instr >> 16) & 0xFFu); return;
+        case 0x1C: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_FCGET; e.loA = VIT(instr); return;
+        case 0x24: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_JR; e.loB = VIS(instr); return;
+        case 0x25: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_JALR; e.loA = VIT(instr); e.loB = VIS(instr); return;
         case 0x20: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_B;   e.loImm = (int16_t)IMM11(instr); return;
         case 0x21: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_BAL; e.loA = VIT(instr); e.loImm = (int16_t)IMM11(instr); return;
         case 0x28: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_IBEQ; e.loA = VIT(instr); e.loB = VIS(instr); e.loImm = (int16_t)IMM11(instr); return;
@@ -384,6 +403,11 @@ namespace
                 const uint8_t funct2 = (uint8_t)((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
                 switch (funct2)
                 {
+                // [vufast3] Q pipeline ops: loA = vfS, loB = vfT, loDest nibble = fsf | ftf << 2 (== the dest field)
+                case 0x38: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_DIVQ;   e.loA = vfS; e.loB = vfT; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
+                case 0x39: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_SQRTQ;  e.loA = vfS; e.loB = vfT; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
+                case 0x3A: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_RSQRTQ; e.loA = vfS; e.loB = vfT; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
+                case 0x3B: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_WAITQ;  return;
                 case 0x30: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_MOVE; e.loA = vfT; e.loB = vfS; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
                 case 0x31: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_MR32; e.loA = vfT; e.loB = vfS; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
                 case 0x34: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_LQI; e.loA = vfT; e.loB = viS; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
@@ -392,6 +416,11 @@ namespace
                 case 0x37: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_SQD; e.loA = vfS; e.loB = viT; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
                 case 0x3C: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_MTIR; e.loA = viT; e.loB = vfS; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
                 case 0x3D: e.loKindF = (e.loKindF & 0xC0u) | VU_LO_MFIR; e.loA = vfT; e.loB = viS; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
+                // [vufast4] register-indexed integer load/store + VIF TOP/ITOP reads
+                case 0x3E: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_ILWR; e.loA = viT; e.loB = viS; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
+                case 0x3F: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_ISWR; e.loA = viT; e.loB = viS; e.loDestC = (e.loDestC & 0xF0u) | (dest & 0x0Fu); return;
+                case 0x68: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_XTOP;  e.loA = viT; return;
+                case 0x69: VUFAST2_GATE(); e.loKindF = (e.loKindF & 0xC0u) | VU_LO_XITOP; e.loA = viT; return;
                 default: return;
                 }
             }
@@ -415,12 +444,34 @@ namespace
         {
             const uint32_t sop = (instr & 0x3u) | ((instr >> 4) & 0x7Cu);
             e.upBc = (uint8_t)(sop & 3u);
-            if (sop >= 0x08u && sop <= 0x0Bu)
-                e.upKind = VU_UP_MADDAbc;
-            else if (sop >= 0x0Cu && sop <= 0x0Fu)
-                e.upKind = VU_UP_MSUBAbc;
-            else if (sop >= 0x18u && sop <= 0x1Bu)
-                e.upKind = VU_UP_MULAbc;
+            static const bool s_f2 = [](){ const char *v = std::getenv("PS2X_VUFAST2"); return !(v && v[0] == '0'); }();   // [vufast2] =0: old op set
+            if (!s_f2)
+            {
+                if (sop >= 0x08u && sop <= 0x0Bu) e.upKind = VU_UP_MADDAbc;
+                else if (sop >= 0x0Cu && sop <= 0x0Fu) e.upKind = VU_UP_MSUBAbc;
+                else if (sop >= 0x18u && sop <= 0x1Bu) e.upKind = VU_UP_MULAbc;
+                return;
+            }
+            if (sop <= 0x03u)                          e.upKind = VU_UP_ADDAbc;    // [vufast2]
+            else if (sop <= 0x07u)                     e.upKind = VU_UP_SUBAbc;
+            else if (sop <= 0x0Bu)                     e.upKind = VU_UP_MADDAbc;
+            else if (sop <= 0x0Fu)                     e.upKind = VU_UP_MSUBAbc;
+            else if (sop <= 0x13u)                     e.upKind = VU_UP_ITOF;      // upBc = 0/4/12/15 selector
+            else if (sop <= 0x17u)                     e.upKind = VU_UP_FTOI;
+            else if (sop <= 0x1Bu)                     e.upKind = VU_UP_MULAbc;
+            else switch (sop)
+            {
+            case 0x1Cu: e.upKind = VU_UP_MULAq; break;   case 0x1Du: e.upKind = VU_UP_ABS; break;
+            case 0x1Eu: e.upKind = VU_UP_MULAi; break;   case 0x1Fu: e.upKind = VU_UP_CLIP; break;
+            case 0x20u: e.upKind = VU_UP_ADDAq; break;   case 0x21u: e.upKind = VU_UP_MADDAq; break;
+            case 0x22u: e.upKind = VU_UP_ADDAi; break;   case 0x23u: e.upKind = VU_UP_MADDAi; break;
+            case 0x24u: e.upKind = VU_UP_SUBAq; break;   case 0x25u: e.upKind = VU_UP_MSUBAq; break;
+            case 0x26u: e.upKind = VU_UP_SUBAi; break;   case 0x27u: e.upKind = VU_UP_MSUBAi; break;
+            case 0x28u: e.upKind = VU_UP_ADDA; break;    case 0x29u: e.upKind = VU_UP_MADDA; break;
+            case 0x2Au: e.upKind = VU_UP_MULA; break;    case 0x2Cu: e.upKind = VU_UP_SUBA; break;
+            case 0x2Du: e.upKind = VU_UP_MSUBA; break;   case 0x2Eu: e.upKind = VU_UP_OPMULA; break;
+            default: break;
+            }
             return;
         }
 
@@ -439,6 +490,21 @@ namespace
             e.upKind = VU_UP_ADD;
         else if (op == 0x2Cu)
             e.upKind = VU_UP_SUB;
+        else if (![](){ static const bool s_f2 = [](){ const char *v = std::getenv("PS2X_VUFAST2"); return !(v && v[0] == '0'); }(); return s_f2; }())
+            ;   // [vufast2] PS2X_VUFAST2=0: old op set
+        else if (op >= 0x0Cu && op <= 0x0Fu)   // [vufast2] remaining regular ops (no MAX/MINI: those don't set flags)
+            e.upKind = VU_UP_MSUBbc;
+        else switch (op)
+        {
+        case 0x1Eu: e.upKind = VU_UP_MULi; break;   case 0x20u: e.upKind = VU_UP_ADDq; break;
+        case 0x21u: e.upKind = VU_UP_MADDq; break;  case 0x22u: e.upKind = VU_UP_ADDi; break;
+        case 0x23u: e.upKind = VU_UP_MADDi; break;  case 0x24u: e.upKind = VU_UP_SUBq; break;
+        case 0x25u: e.upKind = VU_UP_MSUBq; break;  case 0x26u: e.upKind = VU_UP_SUBi; break;
+        case 0x27u: e.upKind = VU_UP_MSUBi; break;  case 0x29u: e.upKind = VU_UP_MADD; break;
+        case 0x2Au: e.upKind = VU_UP_MUL; break;    case 0x2Du: e.upKind = VU_UP_MSUB; break;
+        case 0x2Eu: e.upKind = VU_UP_OPMSUB; break;
+        default: break;
+        }
     }
 }
 
@@ -910,6 +976,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                     { int idx[64]; for (int k = 0; k < 64; ++k) idx[k] = k;
                       std::sort(idx, idx + 64, [](int a, int b){ return g_vuUpMissHist[a] > g_vuUpMissHist[b]; });
                       std::fprintf(stderr, "[vufast] upper fallbacks:"); for (int k = 0; k < 8; ++k) std::fprintf(stderr, " 0x%02x=%llu", idx[k], (unsigned long long)g_vuUpMissHist[idx[k]]); std::fprintf(stderr, "\n"); }
+                      { int li[128]; for (int k = 0; k < 128; ++k) li[k] = k;
+                        std::sort(li, li + 128, [](int a, int b){ return g_vuLoMissHist[a] > g_vuLoMissHist[b]; });
+                        std::fprintf(stderr, "[vulower] lower fallbacks (op7):"); for (int k = 0; k < 8; ++k) std::fprintf(stderr, " 0x%02x=%llu", li[k], (unsigned long long)g_vuLoMissHist[li[k]]);
+                        std::fprintf(stderr, "\n[vufast] upper 0x3C-3F sub-ops (bits 6-10):"); { int ui[32]; for (int k = 0; k < 32; ++k) ui[k] = k; std::sort(ui, ui + 32, [](int a, int b){ return g_vuUpSpecHist[a] > g_vuUpSpecHist[b]; }); for (int k = 0; k < 8; ++k) std::fprintf(stderr, " %02x=%llu", ui[k], (unsigned long long)g_vuUpSpecHist[ui[k]]); }
+                        std::fprintf(stderr, "\n[vulower] lower 0x40 sub-ops (bits 6-11):"); { int si[64]; for (int k = 0; k < 64; ++k) si[k] = k; std::sort(si, si + 64, [](int a, int b){ return g_vuLoSpecHist[a] > g_vuLoSpecHist[b]; }); for (int k = 0; k < 8; ++k) std::fprintf(stderr, " %02x=%llu", si[k], (unsigned long long)g_vuLoSpecHist[si[k]]); }
+                        std::fprintf(stderr, "\n"); }
 
             }
         }
@@ -967,10 +1039,80 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(m, r), _mm_andnot_ps(m, _mm_loadu_ps(dst))));
     };
 
-    auto execUpperFast = [this, &commitFast](const VuDecodeEntry &e) -> bool
+    // [vufast2] lane blend only: the interpreter's applyDest() (ITOF/FTOI/ABS) sets no flags and never clamps
+    auto commitRaw = [](float *dst, __m128 r, uint8_t dest)
+    {
+        const uint8_t d = dest & 0xFu;
+        if (d == 0xFu) { _mm_storeu_ps(dst, r); return; }
+        if (d == 0u) return;
+        const __m128 m = _mm_load_ps((const float *)kDestBlend[d]);
+        _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(m, r), _mm_andnot_ps(m, _mm_loadu_ps(dst))));
+    };
+    auto execUpperFast = [this, &commitFast, &commitRaw](const VuDecodeEntry &e) -> bool
     {
         if (e.upKind == VU_UP_FALLBACK)
             return false;
+        if (e.upKind <= VU_UP_CLIP)
+        {   // [vufast2] the raw-bit / flag ops: same arithmetic as the interpreter cases, no MAC flags
+            static thread_local float s_vf0SinkR[4];
+            const __m128 vsr = _mm_loadu_ps(m_state.vf[e.upFs]);
+            float *vtd = (e.upFt == 0u) ? s_vf0SinkR : m_state.vf[e.upFt];
+            switch (e.upKind)
+            {
+            case VU_UP_ITOF:
+            {
+                static const float kScale[4] = {1.0f, 1.0f / 16.0f, 1.0f / 4096.0f, 1.0f / 32768.0f};   // exact reciprocals: x/16 == x*(1/16)
+                commitRaw(vtd, _mm_mul_ps(_mm_cvtepi32_ps(_mm_castps_si128(vsr)), _mm_set1_ps(kScale[e.upBc])), e.upDest);
+                return true;
+            }
+            case VU_UP_FTOI:
+            {
+                static const float kMul[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
+                const __m128 f = (e.upBc == 0u) ? vsr : _mm_mul_ps(vsr, _mm_set1_ps(kMul[e.upBc]));
+                __m128i iv = _mm_cvttps_epi32(f);   // 0x80000000 marks NaN / out of range
+                const __m128i bad = _mm_cmpeq_epi32(iv, _mm_set1_epi32((int)0x80000000));
+                if (_mm_movemask_epi8(bad))
+                {   // vuFtoi(): NaN or below INT32_MIN -> by sign; >= 2^31 -> INT32_MAX; exactly -2^31 is a legit INT32_MIN
+                    const __m128i neg = _mm_srai_epi32(_mm_castps_si128(f), 31);              // all-ones where sign bit set
+                    const __m128i satv = _mm_or_si128(_mm_and_si128(neg, _mm_set1_epi32((int)0x80000000)),
+                                                      _mm_andnot_si128(neg, _mm_set1_epi32(0x7FFFFFFF)));
+                    iv = _mm_or_si128(_mm_and_si128(bad, satv), _mm_andnot_si128(bad, iv));
+                }
+                commitRaw(vtd, _mm_castsi128_ps(iv), e.upDest);
+                return true;
+            }
+            case VU_UP_ABS:
+                commitRaw(vtd, _mm_and_ps(vsr, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))), e.upDest);
+                return true;
+            case VU_UP_CLIP:
+            {   // verbatim from the interpreter's CLIP (incl. the [clippipe] 4-cycle latency model)
+                const float *vs = m_state.vf[e.upFs];
+                const float *vt = m_state.vf[e.upFt];
+                const float w = std::fabs(vt[3]);
+                uint32_t flags = 0;
+                if (vs[0] > +w) flags |= 0x01;
+                if (vs[0] < -w) flags |= 0x02;
+                if (vs[1] > +w) flags |= 0x04;
+                if (vs[1] < -w) flags |= 0x08;
+                if (vs[2] > +w) flags |= 0x10;
+                if (vs[2] < -w) flags |= 0x20;
+                const uint32_t base = (g_clipWait > 0u) ? g_pendingClip : m_state.clip;
+                const uint32_t nv = ((base << 6) | flags) & 0xFFFFFFu;
+                if (g_clipPipe)
+                {
+                    if (g_clipWait > 0u)
+                        m_state.clip = g_pendingClip;
+                    g_pendingClip = nv;
+                    g_clipWait = 4u;
+                }
+                else
+                    m_state.clip = nv;
+                ++g_clipOpN;
+                return true;
+            }
+            default: return false;
+            }
+        }
 
         // Separate _mm_mul_ps/_mm_add_ps rather than an FMA: the multiply-then-add rounds twice,
         // which is what the scalar interpreter path does. BT3 geometry rides the clip planes to
@@ -993,6 +1135,52 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         case VU_UP_ADD:     r = _mm_add_ps(vs, _mm_loadu_ps(vtp)); break;
         case VU_UP_SUB:     r = _mm_sub_ps(vs, _mm_loadu_ps(vtp)); break;
         case VU_UP_MULq:    r = _mm_mul_ps(vs, _mm_set1_ps(m_state.q)); break;
+        // [vufast2] ACC-writing ops
+        case VU_UP_ADDAbc:  r = _mm_add_ps(vs, bcv); toAcc = true; break;
+        case VU_UP_SUBAbc:  r = _mm_sub_ps(vs, bcv); toAcc = true; break;
+        case VU_UP_MULAq:   r = _mm_mul_ps(vs, _mm_set1_ps(m_state.q)); toAcc = true; break;
+        case VU_UP_MULAi:   r = _mm_mul_ps(vs, _mm_set1_ps(m_state.i)); toAcc = true; break;
+        case VU_UP_ADDAq:   r = _mm_add_ps(vs, _mm_set1_ps(m_state.q)); toAcc = true; break;
+        case VU_UP_MADDAq:  r = _mm_add_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, _mm_set1_ps(m_state.q))); toAcc = true; break;
+        case VU_UP_ADDAi:   r = _mm_add_ps(vs, _mm_set1_ps(m_state.i)); toAcc = true; break;
+        case VU_UP_MADDAi:  r = _mm_add_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, _mm_set1_ps(m_state.i))); toAcc = true; break;
+        case VU_UP_SUBAq:   r = _mm_sub_ps(vs, _mm_set1_ps(m_state.q)); toAcc = true; break;
+        case VU_UP_MSUBAq:  r = _mm_sub_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, _mm_set1_ps(m_state.q))); toAcc = true; break;
+        case VU_UP_SUBAi:   r = _mm_sub_ps(vs, _mm_set1_ps(m_state.i)); toAcc = true; break;
+        case VU_UP_MSUBAi:  r = _mm_sub_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, _mm_set1_ps(m_state.i))); toAcc = true; break;
+        case VU_UP_ADDA:    r = _mm_add_ps(vs, _mm_loadu_ps(vtp)); toAcc = true; break;
+        case VU_UP_MADDA:   r = _mm_add_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, _mm_loadu_ps(vtp))); toAcc = true; break;
+        case VU_UP_MULA:    r = _mm_mul_ps(vs, _mm_loadu_ps(vtp)); toAcc = true; break;
+        case VU_UP_SUBA:    r = _mm_sub_ps(vs, _mm_loadu_ps(vtp)); toAcc = true; break;
+        case VU_UP_MSUBA:   r = _mm_sub_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, _mm_loadu_ps(vtp))); toAcc = true; break;
+        case VU_UP_OPMULA:
+        {   // acc = (vs.y*vt.z, vs.z*vt.x, vs.x*vt.y, 0)
+            const __m128 vt4 = _mm_loadu_ps(vtp);
+            r = _mm_mul_ps(_mm_shuffle_ps(vs, vs, _MM_SHUFFLE(3, 0, 2, 1)), _mm_shuffle_ps(vt4, vt4, _MM_SHUFFLE(3, 1, 0, 2)));
+            r = _mm_and_ps(r, _mm_castsi128_ps(_mm_set_epi32(0, -1, -1, -1)));
+            toAcc = true; break;
+        }
+        // [vufast2] remaining regular ops (vd)
+        case VU_UP_MSUBbc:  r = _mm_sub_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, bcv)); break;
+        case VU_UP_MULi:    r = _mm_mul_ps(vs, _mm_set1_ps(m_state.i)); break;
+        case VU_UP_ADDq:    r = _mm_add_ps(vs, _mm_set1_ps(m_state.q)); break;
+        case VU_UP_MADDq:   r = _mm_add_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, _mm_set1_ps(m_state.q))); break;
+        case VU_UP_ADDi:    r = _mm_add_ps(vs, _mm_set1_ps(m_state.i)); break;
+        case VU_UP_MADDi:   r = _mm_add_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, _mm_set1_ps(m_state.i))); break;
+        case VU_UP_SUBq:    r = _mm_sub_ps(vs, _mm_set1_ps(m_state.q)); break;
+        case VU_UP_MSUBq:   r = _mm_sub_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, _mm_set1_ps(m_state.q))); break;
+        case VU_UP_SUBi:    r = _mm_sub_ps(vs, _mm_set1_ps(m_state.i)); break;
+        case VU_UP_MSUBi:   r = _mm_sub_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, _mm_set1_ps(m_state.i))); break;
+        case VU_UP_MADD:    r = _mm_add_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, _mm_loadu_ps(vtp))); break;
+        case VU_UP_MUL:     r = _mm_mul_ps(vs, _mm_loadu_ps(vtp)); break;
+        case VU_UP_MSUB:    r = _mm_sub_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(vs, _mm_loadu_ps(vtp))); break;
+        case VU_UP_OPMSUB:
+        {   // vd = (acc.x - vs.y*vt.z, acc.y - vs.z*vt.x, acc.z - vs.x*vt.y, 0)
+            const __m128 vt4 = _mm_loadu_ps(vtp);
+            r = _mm_sub_ps(_mm_loadu_ps(m_state.acc), _mm_mul_ps(_mm_shuffle_ps(vs, vs, _MM_SHUFFLE(3, 0, 2, 1)), _mm_shuffle_ps(vt4, vt4, _MM_SHUFFLE(3, 1, 0, 2))));
+            r = _mm_and_ps(r, _mm_castsi128_ps(_mm_set_epi32(0, -1, -1, -1)));
+            break;
+        }
         default: return false;
         }
 
@@ -1112,6 +1300,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             const bool fast = s_vuFast && decoded && execLowerFast(m_state, *decoded, vuData, dataSize);
             if (!fast) anyFallback = true;
             if (s_vuTime) (fast ? g_vuLoFastHits : g_vuLoFastMisses) += 1u;
+            if (s_vuTime && !fast) g_vuLoMissHist[(lower >> 25) & 0x7Fu] += 1u;
+            if (s_vuTime && !fast && ((lower >> 25) & 0x7Fu) == 0x40u) g_vuLoSpecHist[(lower >> 6) & 0x3Fu] += 1u;
             if (!fast) execLower(lower, vuData, dataSize, gs, memory, upper);
         };
         auto runUpper = [&]() {
@@ -1123,6 +1313,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             {
                 (fast ? g_vuFastHits : g_vuFastMisses) += 1u;
                 if (!fast) g_vuUpMissHist[upper & 0x3Fu] += 1u;   // [vufast] which upper ops still fall back
+                if (!fast && (upper & 0x3Cu) == 0x3Cu) g_vuUpSpecHist[(upper >> 6) & 0x1Fu] += 1u;
             }
             if (!fast)
                 execUpper(upper);
@@ -1158,7 +1349,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         // writes with dest vf0 decode as fallback), so the per-instruction reset (14% of run() in the
         // annotate) is only needed after an interpreter fallback or an I-bit load. PS2X_VU0RESET=1 = always.
         static const bool s_alwaysReset = [](){ const char *v = std::getenv("PS2X_VU0RESET"); return v && v[0] && v[0] != '0'; }();
-        if (s_alwaysReset || anyFallback || loi)
+        // [loireset] An I-bit pair runs only the (fast, vf0-sinking) upper op and stores the immediate
+        // into I -- nothing can write vf0/vi0, and an upper fallback already sets anyFallback. So
+        // the reset is not needed on `loi` either (it was 10% of run() in the PROF7 annotate).
+        if (s_alwaysReset || anyFallback)
         {
             _mm_storeu_ps(m_state.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f));
             m_state.vi[0] = 0;
@@ -1819,6 +2013,108 @@ static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData,
     case VU_LO_IBGTZ: if ((int16_t)st.vi[e.loB] > 0)  { st.branchTarget = (st.pc + 8 + e.loImm * 8) & 0x3FFF; st.branchPending = true; st.branchDelay = 1; } return true;
     case VU_LO_IBLEZ: if ((int16_t)st.vi[e.loB] <= 0) { st.branchTarget = (st.pc + 8 + e.loImm * 8) & 0x3FFF; st.branchPending = true; st.branchDelay = 1; } return true;
     case VU_LO_IBGEZ: if ((int16_t)st.vi[e.loB] >= 0) { st.branchTarget = (st.pc + 8 + e.loImm * 8) & 0x3FFF; st.branchPending = true; st.branchDelay = 1; } return true;
+    // [vufast2] flag / jump / integer memory ops, mirroring the interpreter cases
+    case VU_LO_FCAND:
+    {
+        const uint32_t imm24 = (uint32_t)(uint16_t)e.loImm | ((uint32_t)e.loA << 16);
+        st.vi[1] = ((st.clip & imm24) != 0u) ? 1 : 0;
+        ++g_fcandN; if (st.vi[1]) ++g_fcandNZ;   // the interpreter's probe counters (its one-shot log/dump stay on the slow path)
+        return true;
+    }
+    case VU_LO_FCOR2:
+    {
+        const uint32_t imm24 = (uint32_t)(uint16_t)e.loImm | ((uint32_t)e.loA << 16);
+        st.vi[1] = ((st.clip | imm24) == 0xFFFFFFu) ? 1 : 0;
+        return true;
+    }
+    case VU_LO_FCGET: if (e.loA != 0) st.vi[e.loA] = (int32_t)(st.clip & 0xFFFu); return true;
+    case VU_LO_JR:   { st.branchTarget = ((uint32_t)(uint16_t)st.vi[e.loB] * 8u) & 0x3FFF; st.branchPending = true; st.branchDelay = 1; return true; }
+    case VU_LO_JALR: { const uint32_t target = ((uint32_t)(uint16_t)st.vi[e.loB] * 8u) & 0x3FFF; if (e.loA != 0) st.vi[e.loA] = (int32_t)((st.pc + 16) / 8);
+                       st.branchTarget = target; st.branchPending = true; st.branchDelay = 1; return true; }
+    case VU_LO_ISW:
+    {
+        uint32_t addr = ((uint32_t)(int32_t)(st.vi[e.loB] + e.loImm)) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize)
+        {
+            const uint32_t val = (uint32_t)(uint16_t)(st.vi[e.loA] & 0xFFFF);
+            if (loDest & 0x8) std::memcpy(vuData + addr + 0, &val, 4);
+            if (loDest & 0x4) std::memcpy(vuData + addr + 4, &val, 4);
+            if (loDest & 0x2) std::memcpy(vuData + addr + 8, &val, 4);
+            if (loDest & 0x1) std::memcpy(vuData + addr + 12, &val, 4);
+        }
+        return true;
+    }
+    // [vufast3] Q pipeline ops (interpreter cases 0x38-0x3B verbatim minus their env-gated traces)
+    case VU_LO_DIVQ:
+    {
+        const float num = st.vf[e.loA][loDest & 3u];
+        const float den = st.vf[e.loB][(loDest >> 2) & 3u];
+        float res;
+        if (den != 0.0f) res = vuClampFloat(num / den);
+        else res = (num >= 0.0f) ? std::numeric_limits<float>::max() : -std::numeric_limits<float>::max();
+        if (g_qPipe) { if (st.qWait > 0u) st.q = st.pendingQ; st.pendingQ = res; st.qWait = 7u; } else st.q = res;
+        return true;
+    }
+    case VU_LO_SQRTQ:
+    {
+        const float val = st.vf[e.loB][(loDest >> 2) & 3u];
+        const float res = vuClampFloat(std::sqrt(std::fabs(val)));
+        if (g_qPipe) { if (st.qWait > 0u) st.q = st.pendingQ; st.pendingQ = res; st.qWait = 7u; } else st.q = res;
+        return true;
+    }
+    case VU_LO_RSQRTQ:
+    {
+        const float num = st.vf[e.loA][loDest & 3u];
+        const float den = std::sqrt(std::fabs(st.vf[e.loB][(loDest >> 2) & 3u]));
+        float res;
+        if (den != 0.0f) res = vuClampFloat(num / den);
+        else res = std::numeric_limits<float>::max();
+        if (g_qPipe) { if (st.qWait > 0u) st.q = st.pendingQ; st.pendingQ = res; st.qWait = 13u; } else st.q = res;
+        return true;
+    }
+    // [vufast4] interpreter cases 0x3E/0x3F/0x68/0x69 verbatim
+    case VU_LO_ILWR:
+    {
+        uint32_t addr = ((uint32_t)(uint16_t)st.vi[e.loB]) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize)
+        {
+            const int comp = (loDest & 0x8) ? 0 : (loDest & 0x4) ? 1 : (loDest & 0x2) ? 2 : 3;
+            uint32_t v; std::memcpy(&v, vuData + addr + comp * 4, 4);
+            if (e.loA != 0) st.vi[e.loA] = (int32_t)(int16_t)(v & 0xFFFF);
+        }
+        return true;
+    }
+    case VU_LO_ISWR:
+    {
+        uint32_t addr = ((uint32_t)(uint16_t)st.vi[e.loB]) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize)
+        {
+            const uint32_t val = (uint32_t)(uint16_t)(st.vi[e.loA] & 0xFFFF);
+            if (loDest & 0x8) std::memcpy(vuData + addr + 0, &val, 4);
+            if (loDest & 0x4) std::memcpy(vuData + addr + 4, &val, 4);
+            if (loDest & 0x2) std::memcpy(vuData + addr + 8, &val, 4);
+            if (loDest & 0x1) std::memcpy(vuData + addr + 12, &val, 4);
+        }
+        return true;
+    }
+    case VU_LO_XTOP:  if (e.loA != 0) st.vi[e.loA] = (int32_t)(st.top & 0x3FFu); return true;
+    case VU_LO_XITOP: if (e.loA != 0) st.vi[e.loA] = (int32_t)(st.itop & 0x3FFu); return true;
+    case VU_LO_WAITQ: if (st.qWait > 0u) { st.q = st.pendingQ; st.qWait = 0u; } return true;
+    case VU_LO_ILW:
+    {
+        uint32_t addr = ((uint32_t)(int32_t)(st.vi[e.loB] + e.loImm)) * 16u;
+        addr &= (dataSize - 1);
+        if (addr + 16 <= dataSize)
+        {
+            const int comp = (loDest & 0x8) ? 0 : (loDest & 0x4) ? 1 : (loDest & 0x2) ? 2 : 3;
+            uint32_t v; std::memcpy(&v, vuData + addr + comp * 4, 4);
+            if (e.loA != 0) st.vi[e.loA] = (int32_t)(int16_t)(v & 0xFFFF);
+        }
+        return true;
+    }
     default: return false;
     }
 }
