@@ -15,11 +15,26 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
+#include <condition_variable>
+#include <chrono>
 
 class GsGpuRenderer
 {
 public:
     static bool enabled(); // PS2X_GPU=1 (cached)
+    static void setEnabled(bool v);
+    static bool glowEnabled();
+    static void setGlow(bool v);
+    static bool postfxEnabled();
+    static void setPostfx(bool v);
+    static bool bilinearEnabled();
+    static void setBilinear(bool v);
+    static bool halfTexelEnabled();
+    static void setHalfTexel(bool v);
+    static bool skipPostEnabled();
+    static void setSkipPost(bool v);
+    static bool skipStaleVramEnabled();
+    static void setSkipStaleVram(bool v);
 
     // A draw command is either an axis-aligned SPRITE quad (rendered with the proven
     // DrawTexturePro path) or a TRIANGLE (rendered with rlgl). One ordered list keeps
@@ -157,6 +172,12 @@ public:
     // Replay the published frame into the FBO; returns the rendered GL texture id
     // (0 = nothing yet). fbWidth/fbHeight = the PS2 display size.
     unsigned int renderAndGetTextureId(int fbWidth, int fbHeight);
+    // The game is the MASTER of present: each real published game frame (swapFrame bumping
+    // g_publishGen) is one host present. currentPublishGen() reads the latest gen;
+    // WaitForNewFrame(curGen, stop) blocks the host present thread until the game publishes a
+    // frame past curGen (bounded timeout so a silent game can't hang the window).
+    uint32_t currentPublishGen();
+    bool WaitForNewFrame(uint32_t curGen, bool stopRequested);
     // Display region derived from the command scissors (the software latch that
     // normally reports this doesn't run in GPU mode). Valid after renderAndGetTextureId.
     int displayWidth() const { return m_dispW; }
@@ -185,6 +206,7 @@ private:
     };
 
     std::mutex m_mtx;
+    std::condition_variable m_frameCv;
     std::vector<DrawCmd> m_building;
     std::vector<DrawCmd> m_ready;
     // Published-but-not-yet-replayed lists, oldest first. FBOs are persistent (content only

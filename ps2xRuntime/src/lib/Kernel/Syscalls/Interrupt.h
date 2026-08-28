@@ -31,6 +31,9 @@ namespace ps2_syscalls
     void EnsureVSyncWorkerRunning(uint8_t *rdram, PS2Runtime *runtime);
     uint64_t GetCurrentVSyncTick();
     void stopInterruptWorker();
+    // Block the host present thread until the guest vblank tick advances past curTick.
+    // Returns false on stop-request or timeout (so the window never deadlocks).
+    bool HostWaitForVsyncAdvance(uint64_t curTick, PS2Runtime *runtime);
     uint64_t WaitForNextVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
     void WaitVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
     void SetVSyncFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

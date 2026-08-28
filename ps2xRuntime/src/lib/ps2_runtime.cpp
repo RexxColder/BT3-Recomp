@@ -133,8 +133,11 @@ static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x
 static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
 #else
-static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
-static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
+// 2x the PS2 display (640x448 -> 1280x720-ish): the game texture is scaled to fit the
+// window, so this gives the overlay/UI more logical resolution and a proportional look
+// in fullscreen instead of an oversized panel on a small logical framebuffer.
+static constexpr int HOST_WINDOW_WIDTH = 1280;
+static constexpr int HOST_WINDOW_HEIGHT = 720;
 #endif
 struct ElfHeader
 {
@@ -823,7 +826,7 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+        SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
@@ -3775,6 +3778,23 @@ void PS2Runtime::run()
         // GPU mode: render the recorded GS command list into the FBO and present that
         // (its texture is bottom-up, so flip Y). Software mode: upload guest VRAM.
         const bool gpuMode = GsGpuRenderer::enabled();
+
+        // Frame pacing: the GAME is the master, the overlay a secondary layer. In GPU mode
+        // the host presents exactly once per real published game frame (the GS renderer bumps
+        // g_publishGen in swapFrame). Presenting to the game's own frame rate removes the
+        // "beat"/aliasing that made 2D menus look stuttery (two independent clocks drifting),
+        // independent of whether the debug overlay is open. Software mode falls back to the
+        // guest vblank tick.
+        if (gpuMode)
+        {
+            const uint32_t curGen = ps2GpuRenderer().currentPublishGen();
+            ps2GpuRenderer().WaitForNewFrame(curGen, m_stopRequested.load(std::memory_order_relaxed));
+        }
+        else
+        {
+            const uint64_t curTick = ps2_syscalls::GetCurrentVSyncTick();
+            ps2_syscalls::HostWaitForVsyncAdvance(curTick, this);
+        }
         Texture2D presentTex = frameTex;
         bool flipY = false;
         if (gpuMode)

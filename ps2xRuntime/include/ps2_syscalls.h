@@ -41,6 +41,7 @@ namespace ps2_syscalls
     void clearDtxCompatLayout();
     void EnsureVSyncWorkerRunning(uint8_t *rdram, PS2Runtime *runtime);
     uint64_t GetCurrentVSyncTick();
+    bool HostWaitForVsyncAdvance(uint64_t curTick, PS2Runtime *runtime);
     uint64_t WaitForNextVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
     void WaitVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
     std::string dumpAllThreadStates();

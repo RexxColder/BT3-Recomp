@@ -538,6 +538,18 @@ namespace ps2_syscalls
         g_vsync_cv.notify_all();
     }
 
+    bool HostWaitForVsyncAdvance(uint64_t curTick, PS2Runtime *runtime)
+    {
+        ensureInterruptWorkerRunning(nullptr, runtime);
+        std::unique_lock<std::mutex> lock(g_vsync_flag_mutex);
+        const bool advanced = g_vsync_cv.wait_for(lock, std::chrono::milliseconds(250), [&]()
+        {
+            return g_vsync_tick_counter.load(std::memory_order_relaxed) > curTick ||
+                   (runtime != nullptr && runtime->isStopRequested());
+        });
+        return advanced || (runtime != nullptr && runtime->isStopRequested());
+    }
+
     uint64_t WaitForNextVSyncTick(uint8_t *rdram, PS2Runtime *runtime)
     {
         ensureInterruptWorkerRunning(rdram, runtime);
