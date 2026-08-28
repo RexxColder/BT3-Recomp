@@ -2861,6 +2861,20 @@ namespace
     }
 
     PS2Runtime::RecompiledFunction g_orig2316d0 = nullptr;
+    // [thunkwatch] sub_002722C0 = `sd ra,0(sp); ld ra,0(sp); j func_2892F0 (jr ra)`: the reloaded $ra comes back as
+    // garbage (0x30d49 / 0x30d71) in ~1 of 5 fight loads -> the loader thread's stack slot is overwritten between
+    // two adjacent instructions. Arm the write-watch on exactly that slot for the duration of the thunk so the
+    // store hook names the writer (guest pc). PS2X_THUNKWATCH=0 disables.
+    PS2Runtime::RecompiledFunction g_orig2722c0 = nullptr;
+    void bt3ThunkStackWatch(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = getRegU32(ctx, 29) & 0x1FFFFFFFu;
+        const uint32_t lo = (sp - 16u) & 0x1FFFFFFFu;
+        g_ps2WatchHi.store(sp, std::memory_order_relaxed);
+        g_ps2WatchLo.store(lo, std::memory_order_relaxed);
+        if (g_orig2722c0) g_orig2722c0(rdram, ctx, runtime);
+        g_ps2WatchLo.store(0u, std::memory_order_relaxed);
+    }
     void bt3DemoWalkGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_002316d0
     {
         // Arm the write-watch on this tree-walk's STACK region (once) to catch the stray write
@@ -3581,6 +3595,14 @@ namespace
         // Camera view-matrix builder probe (PS2X_CAMPROBE).
         // Demo scene-tree recursion-depth guard: default ON (prevents the cyclic-tree stack
         // overflow crash). Disable with PS2X_NO_DEMO_GUARD. The PS2X_DEMOPROBE dump rides on it.
+        {   // [thunkwatch]
+            const char *tw = std::getenv("PS2X_THUNKWATCH");
+            if (!(tw && tw[0] == '0'))
+            {
+                g_orig2722c0 = runtime.lookupFunction(0x002722c0u);
+                if (g_orig2722c0) runtime.replaceFunction(0x002722c0u, &bt3ThunkStackWatch);
+            }
+        }
         if (!std::getenv("PS2X_NO_DEMO_GUARD"))
         {
             g_orig2316d0 = runtime.lookupFunction(0x002316d0u);
