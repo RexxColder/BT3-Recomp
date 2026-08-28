@@ -567,3 +567,4 @@ install(DIRECTORY include/
 )
 # [lab] line-level perf annotate of the VU1 interpreter (-g only, no codegen change)
 set_source_files_properties(src/lib/ps2_vu1.cpp PROPERTIES COMPILE_OPTIONS "-g")
+set_source_files_properties(src/lib/ps2_gs_rasterizer.cpp PROPERTIES COMPILE_OPTIONS "-g")   # [lab] annotate the sprite recorder
