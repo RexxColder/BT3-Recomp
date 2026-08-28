@@ -27,6 +27,10 @@ static thread_local int g_subDx0 = 0, g_subDxW = 0;   // [subdecode] decode wind
 #include <condition_variable>
 #include <functional>
 #include <vector>
+#include <memory>
+// [deferdec] PS2X_DEFERDEC=1: a texture whose source page is GL-dirty is decoded by the GL thread
+// (in command order, right after it writes the page back) instead of making the guest wait.
+static const bool s_deferDec = [](){ const char *v = std::getenv("PS2X_DEFERDEC"); return v && v[0] && v[0] != '0'; }();
 
 using namespace GSInternal;
 
@@ -2654,18 +2658,16 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     }
 }
 
-uint32_t GSRasterizer::lookupCLUT(GS *gs,
-                                  uint8_t index,
-                                  uint32_t cbp,
-                                  uint8_t cpsm,
-                                  uint8_t csm,
-                                  uint8_t csa,
-                                  uint8_t sourcePsm)
+uint32_t GSRasterizer::lookupCLUT(GS *gs, uint8_t index, uint32_t cbp, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm)
+{
+    return lookupCLUTFrom(gs->m_vram, gs->m_texa, gs->m_texclut, index, cbp, cpsm, csm, csa, sourcePsm);
+}
+uint32_t GSRasterizer::lookupCLUTFrom(uint8_t *vram, const GSTexaReg &texa, const GSTexClutReg &texclut, uint8_t index, uint32_t cbp, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm)
 {
     const uint32_t clutIndex = resolveClutIndex(index, csm, csa, sourcePsm);
-    const uint32_t clutWidth = (gs->m_texclut.cbw != 0u) ? static_cast<uint32_t>(gs->m_texclut.cbw) : 1u;
-    const uint32_t clutX = static_cast<uint32_t>(gs->m_texclut.cou) + (clutIndex & 0x0Fu);
-    const uint32_t clutY = static_cast<uint32_t>(gs->m_texclut.cov) + (clutIndex >> 4);
+    const uint32_t clutWidth = (texclut.cbw != 0u) ? static_cast<uint32_t>(texclut.cbw) : 1u;
+    const uint32_t clutX = static_cast<uint32_t>(texclut.cou) + (clutIndex & 0x0Fu);
+    const uint32_t clutY = static_cast<uint32_t>(texclut.cov) + (clutIndex >> 4);
 
 
     {   // PS2X_CLUTDUMP=<cbp>: one-shot dump of the palette AS THIS CODE PATH RESOLVES IT, so it
@@ -2686,33 +2688,60 @@ uint32_t GSRasterizer::lookupCLUT(GS *gs,
                 for (uint32_t i = 0; i < 256u; ++i)
                 {
                     const uint32_t ci = resolveClutIndex((uint8_t)i, csm, csa, sourcePsm);
-                    const uint32_t cx = (uint32_t)gs->m_texclut.cou + (ci & 0x0Fu);
-                    const uint32_t cy = (uint32_t)gs->m_texclut.cov + (ci >> 4);
-                    uint32_t val = GSMem::ReadCT32(gs->m_vram, cbp, clutWidth, cx, cy);
+                    const uint32_t cx = (uint32_t)texclut.cou + (ci & 0x0Fu);
+                    const uint32_t cy = (uint32_t)texclut.cov + (ci >> 4);
+                    uint32_t val = GSMem::ReadCT32(vram, cbp, clutWidth, cx, cy);
                     std::fwrite(&val, 4, 1, qf);
                 }
                 std::fclose(qf);
             }
             std::fprintf(stderr, "[clutdump] cbp=%u csm=%u csa=%u srcpsm=%u clutWidth=%u cou=%u cov=%u\n",
                          cbp, (unsigned)csm, (unsigned)csa, (unsigned)sourcePsm, clutWidth,
-                         (unsigned)gs->m_texclut.cou, (unsigned)gs->m_texclut.cov);
+                         (unsigned)texclut.cou, (unsigned)texclut.cov);
         }
     }
     switch (cpsm)
     {
     case GS_PSM_CT32:
-        return applyTexa(gs->m_texa, cpsm, GSMem::ReadCT32(gs->m_vram, cbp, clutWidth, clutX, clutY));
+        return applyTexa(texa, cpsm, GSMem::ReadCT32(vram, cbp, clutWidth, clutX, clutY));
     case GS_PSM_CT24:
-        return applyTexa(gs->m_texa, cpsm, GSMem::ReadCT24(gs->m_vram, cbp, clutWidth, clutX, clutY));
+        return applyTexa(texa, cpsm, GSMem::ReadCT24(vram, cbp, clutWidth, clutX, clutY));
     case GS_PSM_CT16:
-        return applyTexa(gs->m_texa, cpsm, Rgba5551ToRgba8888(GSMem::ReadCT16(gs->m_vram, cbp, clutWidth, clutX, clutY)));
+        return applyTexa(texa, cpsm, Rgba5551ToRgba8888(GSMem::ReadCT16(vram, cbp, clutWidth, clutX, clutY)));
     case GS_PSM_CT16S:
-        return applyTexa(gs->m_texa, cpsm, Rgba5551ToRgba8888(GSMem::ReadCT16S(gs->m_vram, cbp, clutWidth, clutX, clutY)));
+        return applyTexa(texa, cpsm, Rgba5551ToRgba8888(GSMem::ReadCT16S(vram, cbp, clutWidth, clutX, clutY)));
     default:
         break;
     }
 
     return 0xFFFF00FFu;
+}
+
+// [deferdec] palette build shared by ensureClutCache (guest, cached by key) and decodeDeferred (GL thread).
+int GSRasterizer::fillClutFrom(uint32_t *out, uint8_t *vram, const GSTexaReg &texa, const GSTexClutReg &texclut, const GSTex0Reg &tex0)
+{
+    const GSTex0Reg &tex = tex0;
+    int count;
+    switch (tex.psm)
+    {
+    case GS_PSM_T4: case GS_PSM_T4HL: case GS_PSM_T4HH: count = 16; break;
+    case GS_PSM_T8: case GS_PSM_T8H: count = 256; break;
+    default: return 0;
+    }
+    for (int i = 0; i < count; ++i)
+        out[i] = lookupCLUTFrom(vram, texa, texclut, static_cast<uint8_t>(i), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+    {   // [edgewrap] PS2X_EDGEWRAP=1: BT3's edge generator subtracts the ramp-decoded mask from
+        // itself shifted one column (blend 0x62, COLCLAMP=0). The GS WRAPS, so any index change
+        // yields a nonzero G; GL clamps at 0 and only keeps k[x] > k[x+1] -- half the contour.
+        // Emulate the wrap with data: give the edge palette (CBP 16012, R=G=8k) an inverted B
+        // (255-R). The clamped pass then lands k[x]>k[x+1] in G and k[x]<k[x+1] in B, and the
+        // stamps' TEXA/AEM test (RGB != 0) sees both. The renderer unmasks B for that pass.
+        static const bool s_ew = [](){ const char *v = std::getenv("PS2X_EDGEWRAP"); return v && v[0] && v[0] != '0'; }();
+        if (s_ew && tex.cbp == 16012u)
+            for (int i = 0; i < count; ++i)
+            { const uint32_t e = out[i]; out[i] = (e & 0xFF00FFFFu) | ((255u - (e & 0xFFu)) << 16); }
+    }
+    return count;
 }
 
 void GSRasterizer::ensureClutCache(GS *gs)
@@ -2745,19 +2774,7 @@ void GSRasterizer::ensureClutCache(GS *gs)
     if (key == gs->m_clutCacheKey)
         return; // cache already valid for this palette state
 
-    for (int i = 0; i < count; ++i)
-        gs->m_clutCache[i] = lookupCLUT(gs, static_cast<uint8_t>(i), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
-    {   // [edgewrap] PS2X_EDGEWRAP=1: BT3's edge generator subtracts the ramp-decoded mask from
-        // itself shifted one column (blend 0x62, COLCLAMP=0). The GS WRAPS, so any index change
-        // yields a nonzero G; GL clamps at 0 and only keeps k[x] > k[x+1] -- half the contour.
-        // Emulate the wrap with data: give the edge palette (CBP 16012, R=G=8k) an inverted B
-        // (255-R). The clamped pass then lands k[x]>k[x+1] in G and k[x]<k[x+1] in B, and the
-        // stamps' TEXA/AEM test (RGB != 0) sees both. The renderer unmasks B for that pass.
-        static const bool s_ew = [](){ const char *v = std::getenv("PS2X_EDGEWRAP"); return v && v[0] && v[0] != '0'; }();
-        if (s_ew && tex.cbp == 16012u)
-            for (int i = 0; i < count; ++i)
-            { const uint32_t e = gs->m_clutCache[i]; gs->m_clutCache[i] = (e & 0xFF00FFFFu) | ((255u - (e & 0xFFu)) << 16); }
-    }
+    fillClutFrom(gs->m_clutCache, gs->m_vram, gs->m_texa, gs->m_texclut, tex);   // [deferdec] shared with the GL-thread decode
     gs->m_clutCacheKey = key;
     {   // PS2X_CLUTDUMP=<cbp>: print the whole decoded palette once, to diff against a
         // console-derived palette (index -> colour read straight off a PCSX2 texture dump).
@@ -2864,6 +2881,475 @@ void GSRasterizer::ensureClutCache(GS *gs)
 }
 
 // Records a SPRITE (as 2 triangles) or a TRIANGLE (1 triangle) to the GPU renderer.
+// [decodefn] The inline texture decode of recordSpriteGPU, extracted verbatim so the
+// decode can later run off the guest thread (deferred no-wait decode). Pure move:
+// same reads, same output. subW = decoded width (sub-decode aware), rgba = texels.
+void GSRasterizer::decodeTexRGBA(GS *gs, TexDecodeSrc src, int texW, int texH, bool rawAlphaDec, uint64_t texKey, int &subW, std::vector<uint8_t> &rgba)
+{
+    const GSTex0Reg &tex0 = *src.tex0;
+    if (gs) { ensureClutCache(gs); src.clutKey = gs->m_clutCacheKey; }   // [deferdec] refresh the key the cache pointer belongs to
+    subW = src.subDxW ? src.subDxW : texW; const int subX0 = src.subDxW ? src.subDx0 : 0;   // [subdecode]
+    rgba.assign(static_cast<size_t>(subW) * texH * 4u, 0u);
+    // sampleTexture() interprets the (u,v) args only on the FST path; on the
+    // STQ path it uses s/t/q (which we pass as 0,0,1) and would collapse every
+    // texel to (0,0). The box quads are STQ, so force FST + point sampling here
+    // to read the real per-texel content. Restore afterwards.
+    const uint32_t savedFst = gs ? gs->m_prim.fst : 0u;
+    if (gs) gs->m_prim.fst = 1u;
+    // FAST PATH -- 8-bit paletted (PSMT8) point sampling. This is the hot case:
+    // BT3's animated 128x256 T8 background re-detextures every frame (~3.9M
+    // texels/s). The generic sampleTexture() pays a std::function ReadVram
+    // dispatch + full psm/clamp/fst branching PER TEXEL. Here the CLUT was already
+    // decoded into src.clut[256] (raw-index keyed, swizzle baked in), and we
+    // iterate strictly in-range, so we can inline the swizzle address and read the
+    // index byte straight from VRAM. ~3-5x faster -> unlocks the animated screens.
+    const bool fastT8 = (tex0.psm == GS_PSM_T8) &&
+                        (src.clutKey != ~0ull) && src.vram;
+    // Same fast path for 4-bit paletted (PSMT4) -- BT3's logos alternate T8/T4 at
+    // the same tbp0, and the T4 ones were falling through to the ~220ns/texel
+    // sampleTexture path (862ms/s = the whole 20fps boot cap). addrPSMT4 yields a
+    // NIBBLE address; the low/high nibble of the byte is the CLUT index (16 entries).
+    const bool fastT4 = (tex0.psm == GS_PSM_T4) &&
+                        (src.clutKey != ~0ull) && src.vram;
+    if (fastT4)
+    {
+        const uint8_t *vram = src.vram;
+        const uint32_t vmask = src.vramSize ? (src.vramSize - 1u) : 0x3FFFFFu;
+        const uint32_t *clut = src.clut;
+        const uint32_t blk = tex0.tbp0;
+        const uint32_t bw = tex0.tbw;
+        const int W = subW;
+        uint8_t *dst = rgba.data();
+        // The fastT4 / fastT8 decoders expanded alpha (At * 255/128) UNCONDITIONALLY
+        // while the generic path honours PS2X_RAWTEXA. That inconsistency is why
+        // RAWTEXA appeared to have no effect on BT3's character textures -- they take
+        // the fast path. Same flag here so all three decode paths agree.
+        static const bool s_rawA4 = [](){ const char *v = std::getenv("PS2X_RAWTEXA");
+                                          return v && v[0] && v[0] != '0'; }();
+        parallelRows(0, texH - 1, [&](int ty)
+        {
+            for (int tx = 0; tx < W; ++tx)
+            {
+                const uint32_t na = GSPSMT4::addrPSMT4(blk, bw, static_cast<uint32_t>(tx + subX0), static_cast<uint32_t>(ty));
+                const uint8_t bval = vram[(na >> 1) & vmask];
+                const uint32_t idx = ((na & 1u) ? (bval >> 4) : (bval & 0x0Fu)) & 0x0Fu;
+                const uint32_t texel = clut[idx];
+                size_t o = (static_cast<size_t>(ty) * W + tx) * 4u;
+                dst[o + 0] = texel & 0xFF; dst[o + 1] = (texel >> 8) & 0xFF;
+                dst[o + 2] = (texel >> 16) & 0xFF;
+                // NOTE: expansion is UNCONDITIONAL here on purpose (RAWTEXA global
+                // raw wrecks the frame, MAE 11.96 -> 55.3) -- EXCEPT for [rawmask]
+                // alpha-as-data draws, whose alpha is an index, not a blend weight.
+                dst[o + 3] = rawAlphaDec
+                    ? static_cast<uint8_t>((texel >> 24) & 0xFFu)
+                    : static_cast<uint8_t>(std::min(255u, ((texel >> 24) & 0xFFu) * 255u / 128u));
+            }
+        });
+    }
+    else if (fastT8)
+    {
+        const uint8_t *vram = src.vram;
+        const uint32_t vmask = src.vramSize ? (src.vramSize - 1u) : 0x3FFFFFu;
+        const uint32_t *clut = src.clut;
+        const uint32_t blk = tex0.tbp0;
+        const uint32_t bw = tex0.tbw;
+        const int W = subW;
+        uint8_t *dst = rgba.data();
+        // Split the rows across the (GPU-mode-idle) scanline pool -- each row writes
+        // a disjoint RGBA span so it's race-free. This is the per-frame animated
+        // background, so parallel detexture directly buys wall-clock / fps.
+        parallelRows(0, texH - 1, [&](int ty)
+        {
+            for (int tx = 0; tx < W; ++tx)
+            {
+                const uint32_t off = GSPSMT8::addrPSMT8(blk, bw, static_cast<uint32_t>(tx + subX0), static_cast<uint32_t>(ty)) & vmask;
+                const uint32_t texel = clut[vram[off]];
+                size_t o = (static_cast<size_t>(ty) * W + tx) * 4u;
+                dst[o + 0] = texel & 0xFF; dst[o + 1] = (texel >> 8) & 0xFF;
+                dst[o + 2] = (texel >> 16) & 0xFF;
+                dst[o + 3] = rawAlphaDec
+                    ? static_cast<uint8_t>((texel >> 24) & 0xFFu)
+                    : static_cast<uint8_t>(std::min(255u, ((texel >> 24) & 0xFFu) * 255u / 128u));
+            }
+        });
+    }
+    else if ([&]() {   // [fastdecode] direct-colour / T8H fast path (see below)
+        static const bool s_fd = [](){ const char *v = std::getenv("PS2X_FASTDECODE"); return !(v && v[0] == '0'); }();
+        static const bool s_diagOff = [](){ return !std::getenv("PS2X_TEXHL") && !std::getenv("PS2X_TEXEL_PROBE") && !std::getenv("PS2X_UVLOG") && !std::getenv("PS2X_Z16SPY") && !std::getenv("PS2X_RAMPSPY"); }();
+        const uint32_t pm = tex0.psm;
+        const bool direct = pm == GS_PSM_CT32 || pm == GS_PSM_CT24 || pm == GS_PSM_Z32 || pm == GS_PSM_Z24 ||
+                            pm == GS_PSM_CT16 || pm == GS_PSM_CT16S || pm == GS_PSM_Z16 || pm == GS_PSM_Z16S;
+        const bool idx8h = pm == GS_PSM_T8H && src.clutKey != ~0ull;
+        return s_fd && s_diagOff && src.vram && (direct || idx8h); }())
+    {
+        // [fastdecode] The barrier chain re-decodes whole 512x448 RT pages (CT32 scene,
+        // T8H mask, CT16 edge map) after every flush, and those formats fell through to
+        // the generic per-texel sampleTexture (std::function ReadVram dispatch, full
+        // clamp/fst branching): 34% of a rig run. Same maths as samplePoint(), inlined
+        // and parallel. PS2X_FASTDECODE=0 restores the generic loop.
+        const uint32_t pm = tex0.psm; const uint32_t blkF = tex0.tbp0, bwF = tex0.tbw;
+        uint8_t *vramF = src.vram; const int W = texW, H = texH;
+        static const bool s_oldSampler = [](){ const char *v = std::getenv("PS2X_OLDSAMPLER"); return v && v[0] && v[0] != '0'; }();
+        const uint32_t wms = s_oldSampler ? 1u : (uint32_t)(src.clamp & 3u), wmt = s_oldSampler ? 1u : (uint32_t)((src.clamp >> 2) & 3u);
+        const int minU = (int)((src.clamp >> 4) & 0x3FFu), maxU = (int)((src.clamp >> 14) & 0x3FFu);
+        const int minV = (int)((src.clamp >> 24) & 0x3FFu), maxV = (int)((src.clamp >> 34) & 0x3FFu);
+        auto wrapC = [](int c, int size, uint32_t mode, int mn, int mx) -> int {
+            switch (mode) { case 0u: return c & (size - 1); case 2u: return clampInt(c, mn, mx > mn ? mx : size - 1);
+                            case 3u: return ((c & mn) | mx) & (size - 1); default: return clampInt(c, 0, size - 1); } };
+        u32 (*rd)(u8 *, u32, u32, u32, u32) = nullptr; int kind = 0;   // 0 = 32-bit direct, 1 = 16-bit direct, 2 = T8H
+        switch (pm) {
+            case GS_PSM_CT32: rd = GSMem::ReadCT32; break; case GS_PSM_CT24: rd = GSMem::ReadCT24; break;
+            case GS_PSM_Z32: rd = GSMem::ReadZ32; break; case GS_PSM_Z24: rd = GSMem::ReadZ24; break;
+            case GS_PSM_CT16: rd = GSMem::ReadCT16; kind = 1; break; case GS_PSM_CT16S: rd = GSMem::ReadCT16S; kind = 1; break;
+            case GS_PSM_Z16: rd = GSMem::ReadZ16; kind = 1; break; case GS_PSM_Z16S: rd = GSMem::ReadZ16S; kind = 1; break;
+            default: rd = GSMem::ReadP8H; kind = 2; break; }
+        const uint32_t *clutF = src.clut; const GSTexaReg texaF = (*src.texa);
+        static const bool s_rawA2 = [](){ const char *v = std::getenv("PS2X_RAWTEXA"); return v && v[0] && v[0] != '0'; }();
+        static const bool s_texaExp2 = [](){ const char *v = std::getenv("PS2X_TEXAEXP"); return v && v[0] && v[0] != '0'; }();
+        const bool ct16Src2 = (pm == GS_PSM_CT16 || pm == GS_PSM_CT16S);
+        const bool keepRaw2 = (s_rawA2 && !(s_texaExp2 && ct16Src2)) || rawAlphaDec;
+        uint8_t *dst = rgba.data();
+        // [rowdecode] the column wrap is the same for every row: compute it once, and when it is a
+        // contiguous ascending run use a bulk row reader (page once per 64-px column, one table
+        // lookup per texel) instead of a swizzled function-pointer read per texel.
+        static const bool s_rowDec = [](){ const char *v = std::getenv("PS2X_ROWDECODE"); return !(v && v[0] == '0'); }();
+        std::vector<int> uIdx((size_t)subW);
+        bool uContig = s_rowDec && subW > 0;
+        for (int tx = 0; tx < subW; ++tx) { uIdx[(size_t)tx] = wrapC(tx + subX0, W, wms, minU, maxU); if (tx && uIdx[(size_t)tx] != uIdx[0] + tx) uContig = false; }
+        const bool rowRead = uContig && (pm == GS_PSM_CT32 || pm == GS_PSM_CT24 || pm == GS_PSM_CT16 || pm == GS_PSM_CT16S || kind == 2);
+        parallelRows(0, H - 1, [&](int ty)
+        {
+            const int v = wrapC(ty, H, wmt, minV, maxV);
+            if (rowRead)
+            {
+                const u32 u0 = (u32)uIdx[0], u1 = u0 + (u32)subW;
+                uint32_t *drow = reinterpret_cast<uint32_t *>(dst + (size_t)ty * subW * 4u);
+                thread_local std::vector<uint32_t> buf32; thread_local std::vector<uint16_t> buf16; thread_local std::vector<uint8_t> buf8;
+                if (kind == 0)
+                {
+                    if (buf32.size() < (size_t)subW) buf32.resize((size_t)subW);
+                    GSMem::ReadRowCT32(vramF, blkF, bwF, u0, u1, (u32)v, buf32.data());
+                    for (int tx = 0; tx < subW; ++tx)
+                    {
+                        const uint32_t texel = applyTexa(texaF, (uint8_t)pm, buf32[(size_t)tx]);
+                        const uint32_t a = (texel >> 24) & 0xFFu;
+                        drow[tx] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : std::min(255u, a * 255u / 128u)) << 24);
+                    }
+                }
+                else if (kind == 1)
+                {
+                    if (buf16.size() < (size_t)subW) buf16.resize((size_t)subW);
+                    if (pm == GS_PSM_CT16S) GSMem::ReadRowCT16S(vramF, blkF, bwF, u0, u1, (u32)v, buf16.data());
+                    else GSMem::ReadRowCT16(vramF, blkF, bwF, u0, u1, (u32)v, buf16.data());
+                    for (int tx = 0; tx < subW; ++tx)
+                    {
+                        const uint32_t texel = applyTexa(texaF, (uint8_t)pm, Rgba5551ToRgba8888(buf16[(size_t)tx]));
+                        const uint32_t a = (texel >> 24) & 0xFFu;
+                        drow[tx] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : std::min(255u, a * 255u / 128u)) << 24);
+                    }
+                }
+                else
+                {
+                    if (buf8.size() < (size_t)subW) buf8.resize((size_t)subW);
+                    GSMem::ReadRowP8H(vramF, blkF, bwF, u0, u1, (u32)v, buf8.data());
+                    for (int tx = 0; tx < subW; ++tx)
+                    {
+                        const uint32_t texel = clutF[buf8[(size_t)tx]];
+                        const uint32_t a = (texel >> 24) & 0xFFu;
+                        drow[tx] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : std::min(255u, a * 255u / 128u)) << 24);
+                    }
+                }
+                return;
+            }
+            for (int tx = 0; tx < subW; ++tx)
+            {
+                const int u = uIdx[(size_t)tx];
+                const u32 out = rd(vramF, blkF, bwF, (u32)u, (u32)v);
+                uint32_t texel;
+                if (kind == 0) texel = applyTexa(texaF, (uint8_t)pm, out);
+                else if (kind == 1) texel = applyTexa(texaF, (uint8_t)pm, Rgba5551ToRgba8888((u16)out));
+                else texel = clutF[(u8)out];
+                const size_t o = ((size_t)ty * subW + tx) * 4u;
+                dst[o + 0] = texel & 0xFF; dst[o + 1] = (texel >> 8) & 0xFF; dst[o + 2] = (texel >> 16) & 0xFF;
+                const uint32_t a = (texel >> 24) & 0xFFu;
+                dst[o + 3] = keepRaw2 ? (uint8_t)a : (uint8_t)std::min(255u, a * 255u / 128u);
+            }
+        });
+    }
+    else if (!gs)
+    {   // [deferdec] the generic sampleTexture() path needs the live GS; decodeIsDeferrable() keeps it off-thread
+        static int n = 0; if (n++ < 4) std::fprintf(stderr, "[deferdec] generic decode path reached off-thread (psm %u) -- blank texture\n", (unsigned)tex0.psm);
+    }
+    else
+    for (int ty = 0; ty < texH; ++ty)
+        for (int tx = 0; tx < subW; ++tx)
+        {
+            uint32_t texel = sampleTexture(gs, 0.0f, 0.0f, 1.0f,
+                                           static_cast<uint16_t>((tx + subX0) * 16 + 8),
+                                           static_cast<uint16_t>(ty * 16 + 8));
+            size_t o = (static_cast<size_t>(ty) * subW + tx) * 4u;
+            rgba[o + 0] = texel & 0xFF; rgba[o + 1] = (texel >> 8) & 0xFF;
+            rgba[o + 2] = (texel >> 16) & 0xFF;
+            // PS2 texture/CLUT alpha is 0..128 (0x80 = fully opaque). Scale to
+            // 0..255 for the GL texture so blending isn't ~2x too transparent.
+            //
+            // PS2X_RAWTEXA=1: keep the RAW byte instead. That expansion CLAMPS, and a
+            // CLUT used as DATA spans the full 0..255 -- BT3's mask palette is exactly
+            // `255 - i`, so every index <= 127 saturated to 255 and the mask collapsed
+            // to 2 distinct values (measured: mean 127.5, uniq 2, vs console's 189).
+            // With this on, blending must take its factor from aBlend (PS2X_DUALSRC).
+            static const bool s_rawA = [](){ const char *v = std::getenv("PS2X_RAWTEXA");
+                                             return v && v[0] && v[0] != '0'; }();
+            // PS2X_RAWTEXA exists for CLUT-AS-DATA reads: BT3's mask palette is literally
+            // `255 - i`, so expanding it would clamp every index <= 127 to 255. That only
+            // applies to INDEXED sources. For a DIRECT-COLOUR source the alpha is a blend
+            // COEFFICIENT -- the GS divides Ad by 128, GL by 255 -- so keeping the raw byte
+            // makes every such blend run at half strength. That is exactly what hid BT3's
+            // outline: the CT16 edge pass stores TEXA's TA0=48 raw, so the untextured
+            // bm0x52 darkener (Cd - Cs*Ad) subtracted 100*48/255 = 19 instead of
+            // 100*48/128 = 37. PS2X_TEXAEXP=0 restores the old behaviour.
+            static const bool s_texaExp = [](){ const char *v = std::getenv("PS2X_TEXAEXP");
+                                                return v && v[0] && v[0] != '0'; }();
+            const uint32_t dpsm2 = tex0.psm;
+            // Scoped to PSMCT16 only. Expanding every non-indexed source also hits the
+            // CT32 alpha writers feeding the mask chain, and measured alpha at the
+            // darkener then fell 0.550% -> 0.000%. CT16 is the one format whose alpha is
+            // purely TEXA-derived and purely a blend coefficient.
+            const bool ct16Src = (dpsm2 == GS_PSM_CT16 || dpsm2 == GS_PSM_CT16S);
+            const bool keepRaw = (s_rawA && !(s_texaExp && ct16Src)) || rawAlphaDec;
+            rgba[o + 3] = keepRaw
+                ? static_cast<uint8_t>((texel >> 24) & 0xFFu)
+                : static_cast<uint8_t>(std::min(255u, ((texel >> 24) & 0xFFu) * 255u / 128u));
+        }
+    // Self-check (PS2X_GPU_DIAG): the fast T4/T8 paths bypass sampleTexture, so
+    // verify a subsample matches the authoritative per-texel path. Catches a
+    // swapped nibble / wrong swizzle for the fast formats.
+    {
+        static const bool s_vf = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_GPU_DIAG"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+        if (s_vf && (fastT4 || fastT8))
+        {
+            static std::atomic<int> s_checks{0};
+            if (gs && s_checks.fetch_add(1) < 6)
+            {
+                const uint32_t sf = gs->m_prim.fst; gs->m_prim.fst = 1u;
+                int mism = 0, tested = 0;
+                for (int ty = 0; ty < texH; ty += std::max(1, texH/16))
+                    for (int tx = 0; tx < texW; tx += std::max(1, texW/16))
+                    {
+                        uint32_t ref = sampleTexture(gs, 0.f,0.f,1.f, (uint16_t)(tx*16+8), (uint16_t)(ty*16+8));
+                        size_t o = (static_cast<size_t>(ty)*texW+tx)*4u;
+                        uint8_t rr=ref&0xFF, rg=(ref>>8)&0xFF, rb=(ref>>16)&0xFF;
+                        ++tested;
+                        if (rgba[o]!=rr || rgba[o+1]!=rg || rgba[o+2]!=rb) ++mism;
+                    }
+                gs->m_prim.fst = sf;
+                std::fprintf(stderr, "[fastcheck] psm=%u %dx%d mismatch=%d/%d\n", tex0.psm, texW, texH, mism, tested);
+            }
+        }
+    }
+    if (gs) gs->m_prim.fst = savedFst;
+    {
+        static const bool s_d = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_GPU_DIAG"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+        static std::set<uint64_t> s_logged;
+        if (s_d && s_logged.insert(texKey).second)
+        {
+            uint8_t maxR = 0, maxG = 0, maxB = 0, maxA = 0;
+            uint32_t brightPix = 0, opaquePix = 0;
+            for (size_t p = 0; p + 3 < rgba.size(); p += 4)
+            {
+                maxR = std::max(maxR, rgba[p]); maxG = std::max(maxG, rgba[p+1]);
+                maxB = std::max(maxB, rgba[p+2]); maxA = std::max(maxA, rgba[p+3]);
+                if (rgba[p+3] > 32) { ++opaquePix; if (std::max({rgba[p],rgba[p+1],rgba[p+2]}) > 128) ++brightPix; }
+            }
+            // Neighbor-difference "noise score": real art is locally smooth, a
+            // misaddressed decode (VRAM that isn't a texture) is white noise. Mean
+            // |RGB(x)-RGB(x+1)| > ~60 flags it for triage without opening the PNG.
+            uint64_t nd = 0, nc = 0;
+            for (size_t p = 0; p + 7 < rgba.size(); p += 32)
+            {
+                nd += std::abs((int)rgba[p] - (int)rgba[p+4]) + std::abs((int)rgba[p+1] - (int)rgba[p+5]) + std::abs((int)rgba[p+2] - (int)rgba[p+6]);
+                nc += 3;
+            }
+            const unsigned noise = nc ? (unsigned)(nd / nc) : 0u;
+            // Indexed textures: distinguish "palette collapsed" (CLUT-read bug -> all
+            // entries ~identical) from "indices flat" (texel VRAM stale/constant).
+            char clutInfo[96] = "";
+            {
+                const uint32_t p = tex0.psm;
+                const bool i8 = (p == GS_PSM_T8 || p == GS_PSM_T8H);
+                const bool i4 = (p == GS_PSM_T4 || p == GS_PSM_T4HL || p == GS_PSM_T4HH);
+                if ((i8 || i4) && src.clutKey != ~0ull)
+                {
+                    const int n = i4 ? 16 : 256;
+                    std::set<uint32_t> uniq;
+                    for (int i = 0; i < n; ++i) uniq.insert(src.clut[i]);
+                    std::snprintf(clutInfo, sizeof(clutInfo), " clutDistinct=%zu/%d clut[0]=%08x clut[%d]=%08x",
+                                  uniq.size(), n, src.clut[0], n/2, src.clut[n/2]);
+                }
+            }
+            std::fprintf(stderr, "[texdec] key=%llu %dx%d psm=%u tbp0=%u tbw=%u | CLUT cbp=%u cpsm=%u csm=%u csa=%u cld=%u texclut=%u,%u,%u | maxRGBA=(%u,%u,%u,%u) opaque=%u bright=%u noise=%u%s%s\n",
+                         (unsigned long long)texKey, texW, texH, tex0.psm, tex0.tbp0, tex0.tbw,
+                         tex0.cbp, tex0.cpsm, tex0.csm, tex0.csa, tex0.cld,
+                         (*src.texclut).cbw, (*src.texclut).cou, (*src.texclut).cov,
+                         maxR, maxG, maxB, maxA, opaquePix, brightPix, noise, noise > 60 ? " NOISY" : "", clutInfo);
+        }
+    }
+    // PS2X_HUDTEX: uncapped decode trace for the HUD's black textures -> WHY do they decode black?
+    {
+        static const bool s_ht = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_HUDTEX"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
+        if (s_ht && (texKey == 2382948793199915546ull || texKey == 8431140355099953178ull || texKey == 18369432953290548053ull)) {
+            uint8_t mA = 0, mRGB = 0; for (size_t p = 0; p + 3 < rgba.size(); p += 4) { mA = std::max(mA, rgba[p+3]); mRGB = std::max({mRGB, rgba[p], rgba[p+1], rgba[p+2]}); }
+            static int s_n = 0;
+            if (s_n++ < 10) std::fprintf(stderr, "[hudtex] key=%llu %dx%d psm=%u tbp0=%u tbw=%u tcc=%u tfx=%u | CLUT cbp=%u cpsm=%u csm=%u csa=%u cld=%u | decoded maxRGB=%u maxA=%u\n",
+                                         (unsigned long long)texKey, texW, texH, tex0.psm, tex0.tbp0, tex0.tbw, tex0.tcc, tex0.tfx,
+                                         tex0.cbp, tex0.cpsm, tex0.csm, tex0.csa, tex0.cld, mRGB, mA);
+        }
+    }
+    // PS2X_TEXDUMP_TBP=<tbp0>: log the first decodes of that tbp0 (key + CLUT regs +
+    // mean). The GPU_DIAG gputex export writes the PNG as gputex_<key>.png — this
+    // line maps tbp -> key so the file can be found without hunting content hashes.
+    {
+        static const uint32_t s_tdt = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_TEXDUMP_TBP"); return s_env; }(); return v ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
+        if (s_tdt && tex0.tbp0 == s_tdt)
+        {
+            static std::atomic<int> s_tn{0};
+            int n = s_tn.fetch_add(1);
+            if (n < 8)
+            {
+                uint64_t sum = 0; size_t cnt = 0;
+                uint8_t mn = 255, mx = 0;
+                for (size_t p = 0; p + 3 < rgba.size(); p += 16)
+                {
+                    sum += rgba[p] + rgba[p+1] + rgba[p+2]; cnt += 3;
+                    mn = std::min({mn, rgba[p], rgba[p+1], rgba[p+2]});
+                    mx = std::max({mx, rgba[p], rgba[p+1], rgba[p+2]});
+                }
+                std::fprintf(stderr, "[texdump] tbp0=%u #%d key=%llu %dx%d psm=%u | CLUT cbp=%u cpsm=%u csm=%u csa=%u cld=%u | meanRGB=%llu min=%u max=%u -> gputex_%llu.png\n",
+                             tex0.tbp0, n, (unsigned long long)texKey, texW, texH, tex0.psm,
+                             tex0.cbp, tex0.cpsm, tex0.csm, tex0.csa, tex0.cld,
+                             (unsigned long long)(cnt ? sum / cnt : 0), mn, mx, (unsigned long long)texKey);
+            }
+        }
+    }
+    {   // PS2X_TEXCENSUS=<psm>: what did this decode actually produce? For the mask
+        // chain the answer that matters is how many DISTINCT values came back -- an
+        // indexed read of a live buffer that returns one value is a flat wash, and
+        // looks identical to "the pass never ran".
+        static const int s_tc = [](){ const char *v = std::getenv("PS2X_TEXCENSUS");
+                                      return v && v[0] ? (int)std::strtol(v, nullptr, 16) : -1; }();
+        if (s_tc >= 0 && (int)tex0.psm == s_tc)
+        {
+            static int n = 0;
+            if (n++ < 400)
+            {
+                unsigned uniqA = 0, uniqRGB = 0;
+                bool seenA[256] = {false};
+                std::set<uint32_t> rgbSet;
+                for (size_t i = 0; i + 3 < rgba.size(); i += 4)
+                {
+                    if (!seenA[rgba[i + 3]]) { seenA[rgba[i + 3]] = true; ++uniqA; }
+                    if (rgbSet.size() < 64)
+                        rgbSet.insert((uint32_t)rgba[i] | ((uint32_t)rgba[i+1] << 8) | ((uint32_t)rgba[i+2] << 16));
+                }
+                uniqRGB = (unsigned)rgbSet.size();
+                // For an ADDITIVE composite (blend 0x48) the number that decides
+                // "outline strokes" vs "wash over the whole frame" is how much of the
+                // decoded texture is BLACK: adding 0 is a no-op, adding anything else
+                // brightens. Same for alpha-blended passes with alpha 0.
+                size_t nBlack = 0, nZeroA = 0, npx = 0;
+                unsigned long sr = 0, sg = 0, sb = 0, sa2 = 0;
+                for (size_t i = 0; i + 3 < rgba.size(); i += 4)
+                {
+                    ++npx;
+                    if (!rgba[i] && !rgba[i+1] && !rgba[i+2]) ++nBlack;
+                    if (!rgba[i+3]) ++nZeroA;
+                    sr += rgba[i]; sg += rgba[i+1]; sb += rgba[i+2];
+                    sa2 += rgba[i+3];
+                }
+                std::fprintf(stderr, "[texcensus] psm=%02x tbp=%u cbp=%u %dx%d -> distinct alpha=%u rgb=%u%s"
+                                     " | black %.1f%%  a==0 %.1f%%  mean rgb=(%.0f,%.0f,%.0f) meanA=%.1f\n",
+                             tex0.psm, tex0.tbp0, tex0.cbp, texW, texH,
+                             uniqA, uniqRGB, uniqRGB >= 64 ? "+" : "",
+                             100.0 * (double)nBlack / (double)npx,
+                             100.0 * (double)nZeroA / (double)npx,
+                             (double)sr / npx, (double)sg / npx, (double)sb / npx,
+                             (double)sa2 / npx);
+            }
+        }
+    }
+    {   // PS2X_TEXDUMP=<psm>: write each decode of that PSM as raw RGBA (w,h header).
+        // For a PSMT8H read through CLUT 16000 (which is exactly 255-i) the decoded
+        // ALPHA is 255 minus the source index, so this shows precisely what the mask
+        // composites see when they sample the scene.
+        static const int s_td = [](){ const char *v = std::getenv("PS2X_TEXDUMP");
+                                      return v && v[0] ? (int)std::strtol(v, nullptr, 16) : -1; }();
+        if (s_td >= 0 && (int)tex0.psm == s_td)
+        {
+            // Keep the LAST decodes, not the first: the first are frame-1 warm-up,
+            // before the alpha rebuild has run, and reading them as representative sent
+            // this investigation off twice.
+            static int s_i = 0;
+            if (s_i < 400)
+            {
+                char path[256];
+                const char *dir = std::getenv("PS2X_GS_REPLAY_OUT");
+                std::snprintf(path, sizeof(path), "%s/texlast_tbp%u_cbp%u.raw",
+                              dir ? dir : ".", tex0.tbp0, tex0.cbp);
+                ++s_i;
+                if (FILE *f = std::fopen(path, "wb"))
+                {
+                    int hdr[2] = { texW, texH };
+                    std::fwrite(hdr, sizeof(hdr), 1, f);
+                    std::fwrite(rgba.data(), 1, rgba.size(), f);
+                    std::fclose(f);
+                }
+            }
+        }
+    }
+    {   // [idxhist] PS2X_IDXHIST=1: for PSMT8H decodes of page 224 (the outline stamps' source),
+        // histogram the RAW INDEX BYTES the decode read from VRAM. Uniform => the mask never
+        // reached VRAM where this decode looks.
+        static const bool s_ih = [](){ const char *v = std::getenv("PS2X_IDXHIST"); return v && v[0] && v[0] != '0'; }();
+        static int ihN = 0;
+        if (s_ih && ihN < 6 && (gs && gs->m_prim.tme != 0) && tex0.psm == GS_PSM_T8H && (tex0.tbp0 / 32u) == 224u)
+        {
+            ++ihN;
+            std::map<unsigned, unsigned long> hh; unsigned long n = 0;
+            const uint8_t *vram = src.vram; const uint32_t vmask = src.vramSize ? (src.vramSize - 1u) : 0x3FFFFFu;
+            for (int ty = 0; ty < texH; ty += 2) for (int tx = 0; tx < texW; tx += 2)
+            {   const uint32_t wa = GSPSMCT32::addrPSMCT32(tex0.tbp0, tex0.tbw, (uint32_t)tx, (uint32_t)ty);
+                const uint32_t word = *reinterpret_cast<const uint32_t *>(vram + ((wa * 4u) & vmask));
+                ++n; ++hh[(word >> 24) & 0xFFu]; }
+            std::vector<std::pair<unsigned long, unsigned>> t; for (auto &kv : hh) t.push_back({kv.second, kv.first});
+            std::sort(t.rbegin(), t.rend());
+            std::fprintf(stderr, "[idxhist] T8H page224 tbp=%u tbw=%u %dx%d cbp=%u raw index bytes:", tex0.tbp0, tex0.tbw, texW, texH, tex0.cbp);
+            for (size_t i = 0; i < t.size() && i < 6; ++i) std::fprintf(stderr, " %u:%.1f%%", t[i].second, 100.0 * t[i].first / (double)n);
+            std::fprintf(stderr, "  distinct=%zu\n", hh.size());
+        }
+    }
+}
+
+// [deferdec] GL-thread entry: rebuild the palette from (now written-back) VRAM, then run the fast decode.
+void GSRasterizer::decodeDeferred(const TexDecodeReq &req, uint8_t *vram, size_t vramSize, int &subW, std::vector<uint8_t> &rgba)
+{
+    thread_local uint32_t clut[256];
+    const int n = fillClutFrom(clut, vram, req.texa, req.texclut, req.tex0);
+    TexDecodeSrc src;
+    src.tex0 = &req.tex0; src.clamp = req.clamp; src.vram = vram; src.vramSize = vramSize;
+    src.clut = clut; src.clutKey = n ? 1ull : ~0ull; src.texa = &req.texa; src.texclut = &req.texclut;
+    src.subDxW = req.subDxW; src.subDx0 = req.subDx0;
+    decodeTexRGBA(nullptr, src, req.texW, req.texH, req.rawAlphaDec, req.texKey, subW, rgba);
+}
+bool GSRasterizer::decodeIsDeferrable(uint32_t pm)
+{
+    static const bool s_fd = [](){ const char *v = std::getenv("PS2X_FASTDECODE"); return !(v && v[0] == '0'); }();
+    static const bool s_diagOff = [](){ return !std::getenv("PS2X_TEXHL") && !std::getenv("PS2X_TEXEL_PROBE") && !std::getenv("PS2X_UVLOG") && !std::getenv("PS2X_Z16SPY") && !std::getenv("PS2X_RAMPSPY"); }();
+    if (!s_fd || !s_diagOff) return false;
+    return pm == GS_PSM_T8 || pm == GS_PSM_T4 || pm == GS_PSM_T8H ||
+           pm == GS_PSM_CT32 || pm == GS_PSM_CT24 || pm == GS_PSM_Z32 || pm == GS_PSM_Z24 ||
+           pm == GS_PSM_CT16 || pm == GS_PSM_CT16S || pm == GS_PSM_Z16 || pm == GS_PSM_Z16S;
+}
+
 bool GSRasterizer::recordSpriteGPU(GS *gs)
 {
     const auto &ctx = gs->activeContext();
@@ -3073,6 +3559,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         g_rawAlphaDec_s = s_rawMask && ((ctx.frame.fbmsk & 0x00ffffffu) == 0x00ffffffu);
     }
     const bool rawAlphaDec = g_rawAlphaDec_s;
+    bool deferTex = false, deferClut = false, deferAlpha = false;   // [deferdec]
     if (tme)
     {
         const auto &tex = ctx.tex0;
@@ -3102,7 +3589,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             const bool wantsAlpha = (tex.psm == GS_PSM_T8H) ||
                                     (s_ct32a && tex.psm == GS_PSM_CT32);
             { extern uint32_t g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw; g_barReqTbp = tex.tbp0; g_barReqCbp = tex.cbp; g_barReqPsm = tex.psm; g_barReqTbw = tex.tbw; }
-            ps2GpuRenderer().barrierBeforeRead(tex.tbp0, true, wantsAlpha);
+            const bool deferOk = s_deferDec && GSRasterizer::decodeIsDeferrable(tex.psm);   // [deferdec]
+            ps2GpuRenderer().barrierBeforeRead(tex.tbp0, true, wantsAlpha, deferOk ? &deferTex : nullptr);
+            deferAlpha = wantsAlpha;
             // The PALETTE too. BT3's outline/shadow CLUTs live in pages 499-500, which the game
             // RENDERS into -- so their VRAM copy is stale and every composite decoded a dead
             // palette (129 distinct indices collapsing to 1 alpha). The CLUT base is not
@@ -3110,7 +3599,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             const uint32_t p2 = tex.psm;
             if (p2 == GS_PSM_T8 || p2 == GS_PSM_T8H || p2 == GS_PSM_T4 ||
                 p2 == GS_PSM_T4HL || p2 == GS_PSM_T4HH)
-                ps2GpuRenderer().barrierBeforeRead(tex.cbp, false);
+                ps2GpuRenderer().barrierBeforeRead(tex.cbp, false, false, deferOk ? &deferClut : nullptr);
         }
         {   // PS2X_RAMPCLUT=1: which CLUT do we select for BT3's cel/outline ramp? Console
             // drives tbp 15680 with SIX different palettes -- 15620/15628/15632/15640/15616/
@@ -3347,444 +3836,33 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             g_resolveAlphaData = (pv == GS_PSM_T8 || pv == GS_PSM_T8H || pv == GS_PSM_T4 || pv == GS_PSM_T4HL || pv == GS_PSM_T4HH)
                                  || ((ctx.frame.fbmsk & 0x00ffffffu) == 0x00ffffffu); }
         texKey = r.resolveTextureVersion(texKey, texPageLo, texPageHi, gs->m_vram, gs->m_vramSize, texNeedDecode);
-        if (texNeedDecode)
+        if (deferTex || deferClut) texNeedDecode = true;   // [deferdec] GL-dirty source: the record-time hash saw stale VRAM
+        // [deferpend] a page whose deferred flush is still queued is stale in VRAM: a read that needs a decode
+        // (a different view / key of the same page) must queue behind that flush, never decode synchronously.
+        const bool pendTex = s_deferDec && !deferTex && texNeedDecode && r.flushPending(ctx.tex0.tbp0 / 32u) && GSRasterizer::decodeIsDeferrable(ctx.tex0.psm);
+        const bool pendClut = s_deferDec && !deferClut && texNeedDecode && (ctx.tex0.psm == GS_PSM_T8 || ctx.tex0.psm == GS_PSM_T8H || ctx.tex0.psm == GS_PSM_T4 || ctx.tex0.psm == GS_PSM_T4HL || ctx.tex0.psm == GS_PSM_T4HH) && r.flushPending(ctx.tex0.cbp / 32u);
+        if (pendTex) deferTex = true;
+        if (pendClut) deferClut = true;
+        { static int n = 0; if ((deferTex || deferClut) && n < 4) { ++n; std::fprintf(stderr, "[deferdec] record: tbp0 %u psm %u need=%d deferTex=%d deferClut=%d\n", ctx.tex0.tbp0, (unsigned)ctx.tex0.psm, (int)texNeedDecode, (int)deferTex, (int)deferClut); } }
+        if (texNeedDecode && (deferTex || deferClut))
+        {   // [deferdec] no guest wait: the GL thread flushes the page(s) and decodes at this point of
+            // the command stream, so every draw recorded after this sees the decoded texture.
+            auto req = std::make_shared<TexDecodeReq>();
+            req->tex0 = ctx.tex0; req->clamp = ctx.clamp; req->texa = gs->m_texa; req->texclut = gs->m_texclut;
+            req->texW = texW; req->texH = texH; req->rawAlphaDec = rawAlphaDec; req->texKey = texKey;
+            req->pageLo = texPageLo; req->pageHi = texPageHi; req->subDxW = g_subDxW; req->subDx0 = g_subDx0;
+            req->flushPage = deferTex ? (ctx.tex0.tbp0 / 32u) : 0xFFFFFFFFu; req->flushAlpha = deferAlpha;
+            req->flushClutPage = deferClut ? (ctx.tex0.cbp / 32u) : 0xFFFFFFFFu;
+            r.postDecode(std::move(req));
+        }
+        else if (texNeedDecode)
         {
-            ensureClutCache(gs);
-            const int subW = g_subDxW ? g_subDxW : texW, subX0 = g_subDxW ? g_subDx0 : 0;   // [subdecode]
-            std::vector<uint8_t> rgba(static_cast<size_t>(subW) * texH * 4u);
-            // sampleTexture() interprets the (u,v) args only on the FST path; on the
-            // STQ path it uses s/t/q (which we pass as 0,0,1) and would collapse every
-            // texel to (0,0). The box quads are STQ, so force FST + point sampling here
-            // to read the real per-texel content. Restore afterwards.
-            const uint32_t savedFst = gs->m_prim.fst;
-            gs->m_prim.fst = 1u;
-            // FAST PATH -- 8-bit paletted (PSMT8) point sampling. This is the hot case:
-            // BT3's animated 128x256 T8 background re-detextures every frame (~3.9M
-            // texels/s). The generic sampleTexture() pays a std::function ReadVram
-            // dispatch + full psm/clamp/fst branching PER TEXEL. Here the CLUT was already
-            // decoded into gs->m_clutCache[256] (raw-index keyed, swizzle baked in), and we
-            // iterate strictly in-range, so we can inline the swizzle address and read the
-            // index byte straight from VRAM. ~3-5x faster -> unlocks the animated screens.
-            const bool fastT8 = (ctx.tex0.psm == GS_PSM_T8) &&
-                                (gs->m_clutCacheKey != ~0ull) && gs->m_vram;
-            // Same fast path for 4-bit paletted (PSMT4) -- BT3's logos alternate T8/T4 at
-            // the same tbp0, and the T4 ones were falling through to the ~220ns/texel
-            // sampleTexture path (862ms/s = the whole 20fps boot cap). addrPSMT4 yields a
-            // NIBBLE address; the low/high nibble of the byte is the CLUT index (16 entries).
-            const bool fastT4 = (ctx.tex0.psm == GS_PSM_T4) &&
-                                (gs->m_clutCacheKey != ~0ull) && gs->m_vram;
-            if (fastT4)
-            {
-                const uint8_t *vram = gs->m_vram;
-                const uint32_t vmask = gs->m_vramSize ? (gs->m_vramSize - 1u) : 0x3FFFFFu;
-                const uint32_t *clut = gs->m_clutCache;
-                const uint32_t blk = ctx.tex0.tbp0;
-                const uint32_t bw = ctx.tex0.tbw;
-                const int W = subW;
-                uint8_t *dst = rgba.data();
-                // The fastT4 / fastT8 decoders expanded alpha (At * 255/128) UNCONDITIONALLY
-                // while the generic path honours PS2X_RAWTEXA. That inconsistency is why
-                // RAWTEXA appeared to have no effect on BT3's character textures -- they take
-                // the fast path. Same flag here so all three decode paths agree.
-                static const bool s_rawA4 = [](){ const char *v = std::getenv("PS2X_RAWTEXA");
-                                                  return v && v[0] && v[0] != '0'; }();
-                parallelRows(0, texH - 1, [&](int ty)
-                {
-                    for (int tx = 0; tx < W; ++tx)
-                    {
-                        const uint32_t na = GSPSMT4::addrPSMT4(blk, bw, static_cast<uint32_t>(tx + subX0), static_cast<uint32_t>(ty));
-                        const uint8_t bval = vram[(na >> 1) & vmask];
-                        const uint32_t idx = ((na & 1u) ? (bval >> 4) : (bval & 0x0Fu)) & 0x0Fu;
-                        const uint32_t texel = clut[idx];
-                        size_t o = (static_cast<size_t>(ty) * W + tx) * 4u;
-                        dst[o + 0] = texel & 0xFF; dst[o + 1] = (texel >> 8) & 0xFF;
-                        dst[o + 2] = (texel >> 16) & 0xFF;
-                        // NOTE: expansion is UNCONDITIONAL here on purpose (RAWTEXA global
-                        // raw wrecks the frame, MAE 11.96 -> 55.3) -- EXCEPT for [rawmask]
-                        // alpha-as-data draws, whose alpha is an index, not a blend weight.
-                        dst[o + 3] = rawAlphaDec
-                            ? static_cast<uint8_t>((texel >> 24) & 0xFFu)
-                            : static_cast<uint8_t>(std::min(255u, ((texel >> 24) & 0xFFu) * 255u / 128u));
-                    }
-                });
-            }
-            else if (fastT8)
-            {
-                const uint8_t *vram = gs->m_vram;
-                const uint32_t vmask = gs->m_vramSize ? (gs->m_vramSize - 1u) : 0x3FFFFFu;
-                const uint32_t *clut = gs->m_clutCache;
-                const uint32_t blk = ctx.tex0.tbp0;
-                const uint32_t bw = ctx.tex0.tbw;
-                const int W = subW;
-                uint8_t *dst = rgba.data();
-                // Split the rows across the (GPU-mode-idle) scanline pool -- each row writes
-                // a disjoint RGBA span so it's race-free. This is the per-frame animated
-                // background, so parallel detexture directly buys wall-clock / fps.
-                parallelRows(0, texH - 1, [&](int ty)
-                {
-                    for (int tx = 0; tx < W; ++tx)
-                    {
-                        const uint32_t off = GSPSMT8::addrPSMT8(blk, bw, static_cast<uint32_t>(tx + subX0), static_cast<uint32_t>(ty)) & vmask;
-                        const uint32_t texel = clut[vram[off]];
-                        size_t o = (static_cast<size_t>(ty) * W + tx) * 4u;
-                        dst[o + 0] = texel & 0xFF; dst[o + 1] = (texel >> 8) & 0xFF;
-                        dst[o + 2] = (texel >> 16) & 0xFF;
-                        dst[o + 3] = rawAlphaDec
-                            ? static_cast<uint8_t>((texel >> 24) & 0xFFu)
-                            : static_cast<uint8_t>(std::min(255u, ((texel >> 24) & 0xFFu) * 255u / 128u));
-                    }
-                });
-            }
-            else if ([&]() {   // [fastdecode] direct-colour / T8H fast path (see below)
-                static const bool s_fd = [](){ const char *v = std::getenv("PS2X_FASTDECODE"); return !(v && v[0] == '0'); }();
-                static const bool s_diagOff = [](){ return !std::getenv("PS2X_TEXHL") && !std::getenv("PS2X_TEXEL_PROBE") && !std::getenv("PS2X_UVLOG") && !std::getenv("PS2X_Z16SPY") && !std::getenv("PS2X_RAMPSPY"); }();
-                const uint32_t pm = ctx.tex0.psm;
-                const bool direct = pm == GS_PSM_CT32 || pm == GS_PSM_CT24 || pm == GS_PSM_Z32 || pm == GS_PSM_Z24 ||
-                                    pm == GS_PSM_CT16 || pm == GS_PSM_CT16S || pm == GS_PSM_Z16 || pm == GS_PSM_Z16S;
-                const bool idx8h = pm == GS_PSM_T8H && gs->m_clutCacheKey != ~0ull;
-                return s_fd && s_diagOff && gs->m_vram && (direct || idx8h); }())
-            {
-                // [fastdecode] The barrier chain re-decodes whole 512x448 RT pages (CT32 scene,
-                // T8H mask, CT16 edge map) after every flush, and those formats fell through to
-                // the generic per-texel sampleTexture (std::function ReadVram dispatch, full
-                // clamp/fst branching): 34% of a rig run. Same maths as samplePoint(), inlined
-                // and parallel. PS2X_FASTDECODE=0 restores the generic loop.
-                const uint32_t pm = ctx.tex0.psm; const uint32_t blkF = ctx.tex0.tbp0, bwF = ctx.tex0.tbw;
-                uint8_t *vramF = gs->m_vram; const int W = texW, H = texH;
-                static const bool s_oldSampler = [](){ const char *v = std::getenv("PS2X_OLDSAMPLER"); return v && v[0] && v[0] != '0'; }();
-                const uint32_t wms = s_oldSampler ? 1u : (uint32_t)(ctx.clamp & 3u), wmt = s_oldSampler ? 1u : (uint32_t)((ctx.clamp >> 2) & 3u);
-                const int minU = (int)((ctx.clamp >> 4) & 0x3FFu), maxU = (int)((ctx.clamp >> 14) & 0x3FFu);
-                const int minV = (int)((ctx.clamp >> 24) & 0x3FFu), maxV = (int)((ctx.clamp >> 34) & 0x3FFu);
-                auto wrapC = [](int c, int size, uint32_t mode, int mn, int mx) -> int {
-                    switch (mode) { case 0u: return c & (size - 1); case 2u: return clampInt(c, mn, mx > mn ? mx : size - 1);
-                                    case 3u: return ((c & mn) | mx) & (size - 1); default: return clampInt(c, 0, size - 1); } };
-                u32 (*rd)(u8 *, u32, u32, u32, u32) = nullptr; int kind = 0;   // 0 = 32-bit direct, 1 = 16-bit direct, 2 = T8H
-                switch (pm) {
-                    case GS_PSM_CT32: rd = GSMem::ReadCT32; break; case GS_PSM_CT24: rd = GSMem::ReadCT24; break;
-                    case GS_PSM_Z32: rd = GSMem::ReadZ32; break; case GS_PSM_Z24: rd = GSMem::ReadZ24; break;
-                    case GS_PSM_CT16: rd = GSMem::ReadCT16; kind = 1; break; case GS_PSM_CT16S: rd = GSMem::ReadCT16S; kind = 1; break;
-                    case GS_PSM_Z16: rd = GSMem::ReadZ16; kind = 1; break; case GS_PSM_Z16S: rd = GSMem::ReadZ16S; kind = 1; break;
-                    default: rd = GSMem::ReadP8H; kind = 2; break; }
-                const uint32_t *clutF = gs->m_clutCache; const GSTexaReg texaF = gs->m_texa;
-                static const bool s_rawA2 = [](){ const char *v = std::getenv("PS2X_RAWTEXA"); return v && v[0] && v[0] != '0'; }();
-                static const bool s_texaExp2 = [](){ const char *v = std::getenv("PS2X_TEXAEXP"); return v && v[0] && v[0] != '0'; }();
-                const bool ct16Src2 = (pm == GS_PSM_CT16 || pm == GS_PSM_CT16S);
-                const bool keepRaw2 = (s_rawA2 && !(s_texaExp2 && ct16Src2)) || rawAlphaDec;
-                uint8_t *dst = rgba.data();
-                // [rowdecode] the column wrap is the same for every row: compute it once, and when it is a
-                // contiguous ascending run use a bulk row reader (page once per 64-px column, one table
-                // lookup per texel) instead of a swizzled function-pointer read per texel.
-                static const bool s_rowDec = [](){ const char *v = std::getenv("PS2X_ROWDECODE"); return !(v && v[0] == '0'); }();
-                std::vector<int> uIdx((size_t)subW);
-                bool uContig = s_rowDec && subW > 0;
-                for (int tx = 0; tx < subW; ++tx) { uIdx[(size_t)tx] = wrapC(tx + subX0, W, wms, minU, maxU); if (tx && uIdx[(size_t)tx] != uIdx[0] + tx) uContig = false; }
-                const bool rowRead = uContig && (pm == GS_PSM_CT32 || pm == GS_PSM_CT24 || pm == GS_PSM_CT16 || pm == GS_PSM_CT16S || kind == 2);
-                parallelRows(0, H - 1, [&](int ty)
-                {
-                    const int v = wrapC(ty, H, wmt, minV, maxV);
-                    if (rowRead)
-                    {
-                        const u32 u0 = (u32)uIdx[0], u1 = u0 + (u32)subW;
-                        uint32_t *drow = reinterpret_cast<uint32_t *>(dst + (size_t)ty * subW * 4u);
-                        thread_local std::vector<uint32_t> buf32; thread_local std::vector<uint16_t> buf16; thread_local std::vector<uint8_t> buf8;
-                        if (kind == 0)
-                        {
-                            if (buf32.size() < (size_t)subW) buf32.resize((size_t)subW);
-                            GSMem::ReadRowCT32(vramF, blkF, bwF, u0, u1, (u32)v, buf32.data());
-                            for (int tx = 0; tx < subW; ++tx)
-                            {
-                                const uint32_t texel = applyTexa(texaF, (uint8_t)pm, buf32[(size_t)tx]);
-                                const uint32_t a = (texel >> 24) & 0xFFu;
-                                drow[tx] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : std::min(255u, a * 255u / 128u)) << 24);
-                            }
-                        }
-                        else if (kind == 1)
-                        {
-                            if (buf16.size() < (size_t)subW) buf16.resize((size_t)subW);
-                            if (pm == GS_PSM_CT16S) GSMem::ReadRowCT16S(vramF, blkF, bwF, u0, u1, (u32)v, buf16.data());
-                            else GSMem::ReadRowCT16(vramF, blkF, bwF, u0, u1, (u32)v, buf16.data());
-                            for (int tx = 0; tx < subW; ++tx)
-                            {
-                                const uint32_t texel = applyTexa(texaF, (uint8_t)pm, Rgba5551ToRgba8888(buf16[(size_t)tx]));
-                                const uint32_t a = (texel >> 24) & 0xFFu;
-                                drow[tx] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : std::min(255u, a * 255u / 128u)) << 24);
-                            }
-                        }
-                        else
-                        {
-                            if (buf8.size() < (size_t)subW) buf8.resize((size_t)subW);
-                            GSMem::ReadRowP8H(vramF, blkF, bwF, u0, u1, (u32)v, buf8.data());
-                            for (int tx = 0; tx < subW; ++tx)
-                            {
-                                const uint32_t texel = clutF[buf8[(size_t)tx]];
-                                const uint32_t a = (texel >> 24) & 0xFFu;
-                                drow[tx] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : std::min(255u, a * 255u / 128u)) << 24);
-                            }
-                        }
-                        return;
-                    }
-                    for (int tx = 0; tx < subW; ++tx)
-                    {
-                        const int u = uIdx[(size_t)tx];
-                        const u32 out = rd(vramF, blkF, bwF, (u32)u, (u32)v);
-                        uint32_t texel;
-                        if (kind == 0) texel = applyTexa(texaF, (uint8_t)pm, out);
-                        else if (kind == 1) texel = applyTexa(texaF, (uint8_t)pm, Rgba5551ToRgba8888((u16)out));
-                        else texel = clutF[(u8)out];
-                        const size_t o = ((size_t)ty * subW + tx) * 4u;
-                        dst[o + 0] = texel & 0xFF; dst[o + 1] = (texel >> 8) & 0xFF; dst[o + 2] = (texel >> 16) & 0xFF;
-                        const uint32_t a = (texel >> 24) & 0xFFu;
-                        dst[o + 3] = keepRaw2 ? (uint8_t)a : (uint8_t)std::min(255u, a * 255u / 128u);
-                    }
-                });
-            }
-            else
-            for (int ty = 0; ty < texH; ++ty)
-                for (int tx = 0; tx < subW; ++tx)
-                {
-                    uint32_t texel = sampleTexture(gs, 0.0f, 0.0f, 1.0f,
-                                                   static_cast<uint16_t>((tx + subX0) * 16 + 8),
-                                                   static_cast<uint16_t>(ty * 16 + 8));
-                    size_t o = (static_cast<size_t>(ty) * subW + tx) * 4u;
-                    rgba[o + 0] = texel & 0xFF; rgba[o + 1] = (texel >> 8) & 0xFF;
-                    rgba[o + 2] = (texel >> 16) & 0xFF;
-                    // PS2 texture/CLUT alpha is 0..128 (0x80 = fully opaque). Scale to
-                    // 0..255 for the GL texture so blending isn't ~2x too transparent.
-                    //
-                    // PS2X_RAWTEXA=1: keep the RAW byte instead. That expansion CLAMPS, and a
-                    // CLUT used as DATA spans the full 0..255 -- BT3's mask palette is exactly
-                    // `255 - i`, so every index <= 127 saturated to 255 and the mask collapsed
-                    // to 2 distinct values (measured: mean 127.5, uniq 2, vs console's 189).
-                    // With this on, blending must take its factor from aBlend (PS2X_DUALSRC).
-                    static const bool s_rawA = [](){ const char *v = std::getenv("PS2X_RAWTEXA");
-                                                     return v && v[0] && v[0] != '0'; }();
-                    // PS2X_RAWTEXA exists for CLUT-AS-DATA reads: BT3's mask palette is literally
-                    // `255 - i`, so expanding it would clamp every index <= 127 to 255. That only
-                    // applies to INDEXED sources. For a DIRECT-COLOUR source the alpha is a blend
-                    // COEFFICIENT -- the GS divides Ad by 128, GL by 255 -- so keeping the raw byte
-                    // makes every such blend run at half strength. That is exactly what hid BT3's
-                    // outline: the CT16 edge pass stores TEXA's TA0=48 raw, so the untextured
-                    // bm0x52 darkener (Cd - Cs*Ad) subtracted 100*48/255 = 19 instead of
-                    // 100*48/128 = 37. PS2X_TEXAEXP=0 restores the old behaviour.
-                    static const bool s_texaExp = [](){ const char *v = std::getenv("PS2X_TEXAEXP");
-                                                        return v && v[0] && v[0] != '0'; }();
-                    const uint32_t dpsm2 = ctx.tex0.psm;
-                    // Scoped to PSMCT16 only. Expanding every non-indexed source also hits the
-                    // CT32 alpha writers feeding the mask chain, and measured alpha at the
-                    // darkener then fell 0.550% -> 0.000%. CT16 is the one format whose alpha is
-                    // purely TEXA-derived and purely a blend coefficient.
-                    const bool ct16Src = (dpsm2 == GS_PSM_CT16 || dpsm2 == GS_PSM_CT16S);
-                    const bool keepRaw = (s_rawA && !(s_texaExp && ct16Src)) || rawAlphaDec;
-                    rgba[o + 3] = keepRaw
-                        ? static_cast<uint8_t>((texel >> 24) & 0xFFu)
-                        : static_cast<uint8_t>(std::min(255u, ((texel >> 24) & 0xFFu) * 255u / 128u));
-                }
-            // Self-check (PS2X_GPU_DIAG): the fast T4/T8 paths bypass sampleTexture, so
-            // verify a subsample matches the authoritative per-texel path. Catches a
-            // swapped nibble / wrong swizzle for the fast formats.
-            {
-                static const bool s_vf = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_GPU_DIAG"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
-                if (s_vf && (fastT4 || fastT8))
-                {
-                    static std::atomic<int> s_checks{0};
-                    if (s_checks.fetch_add(1) < 6)
-                    {
-                        const uint32_t sf = gs->m_prim.fst; gs->m_prim.fst = 1u;
-                        int mism = 0, tested = 0;
-                        for (int ty = 0; ty < texH; ty += std::max(1, texH/16))
-                            for (int tx = 0; tx < texW; tx += std::max(1, texW/16))
-                            {
-                                uint32_t ref = sampleTexture(gs, 0.f,0.f,1.f, (uint16_t)(tx*16+8), (uint16_t)(ty*16+8));
-                                size_t o = (static_cast<size_t>(ty)*texW+tx)*4u;
-                                uint8_t rr=ref&0xFF, rg=(ref>>8)&0xFF, rb=(ref>>16)&0xFF;
-                                ++tested;
-                                if (rgba[o]!=rr || rgba[o+1]!=rg || rgba[o+2]!=rb) ++mism;
-                            }
-                        gs->m_prim.fst = sf;
-                        std::fprintf(stderr, "[fastcheck] psm=%u %dx%d mismatch=%d/%d\n", ctx.tex0.psm, texW, texH, mism, tested);
-                    }
-                }
-            }
-            gs->m_prim.fst = savedFst;
-            {
-                static const bool s_d = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_GPU_DIAG"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
-                static std::set<uint64_t> s_logged;
-                if (s_d && s_logged.insert(texKey).second)
-                {
-                    uint8_t maxR = 0, maxG = 0, maxB = 0, maxA = 0;
-                    uint32_t brightPix = 0, opaquePix = 0;
-                    for (size_t p = 0; p + 3 < rgba.size(); p += 4)
-                    {
-                        maxR = std::max(maxR, rgba[p]); maxG = std::max(maxG, rgba[p+1]);
-                        maxB = std::max(maxB, rgba[p+2]); maxA = std::max(maxA, rgba[p+3]);
-                        if (rgba[p+3] > 32) { ++opaquePix; if (std::max({rgba[p],rgba[p+1],rgba[p+2]}) > 128) ++brightPix; }
-                    }
-                    // Neighbor-difference "noise score": real art is locally smooth, a
-                    // misaddressed decode (VRAM that isn't a texture) is white noise. Mean
-                    // |RGB(x)-RGB(x+1)| > ~60 flags it for triage without opening the PNG.
-                    uint64_t nd = 0, nc = 0;
-                    for (size_t p = 0; p + 7 < rgba.size(); p += 32)
-                    {
-                        nd += std::abs((int)rgba[p] - (int)rgba[p+4]) + std::abs((int)rgba[p+1] - (int)rgba[p+5]) + std::abs((int)rgba[p+2] - (int)rgba[p+6]);
-                        nc += 3;
-                    }
-                    const unsigned noise = nc ? (unsigned)(nd / nc) : 0u;
-                    // Indexed textures: distinguish "palette collapsed" (CLUT-read bug -> all
-                    // entries ~identical) from "indices flat" (texel VRAM stale/constant).
-                    char clutInfo[96] = "";
-                    {
-                        const uint32_t p = ctx.tex0.psm;
-                        const bool i8 = (p == GS_PSM_T8 || p == GS_PSM_T8H);
-                        const bool i4 = (p == GS_PSM_T4 || p == GS_PSM_T4HL || p == GS_PSM_T4HH);
-                        if ((i8 || i4) && gs->m_clutCacheKey != ~0ull)
-                        {
-                            const int n = i4 ? 16 : 256;
-                            std::set<uint32_t> uniq;
-                            for (int i = 0; i < n; ++i) uniq.insert(gs->m_clutCache[i]);
-                            std::snprintf(clutInfo, sizeof(clutInfo), " clutDistinct=%zu/%d clut[0]=%08x clut[%d]=%08x",
-                                          uniq.size(), n, gs->m_clutCache[0], n/2, gs->m_clutCache[n/2]);
-                        }
-                    }
-                    std::fprintf(stderr, "[texdec] key=%llu %dx%d psm=%u tbp0=%u tbw=%u | CLUT cbp=%u cpsm=%u csm=%u csa=%u cld=%u texclut=%u,%u,%u | maxRGBA=(%u,%u,%u,%u) opaque=%u bright=%u noise=%u%s%s\n",
-                                 (unsigned long long)texKey, texW, texH, ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw,
-                                 ctx.tex0.cbp, ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.cld,
-                                 gs->m_texclut.cbw, gs->m_texclut.cou, gs->m_texclut.cov,
-                                 maxR, maxG, maxB, maxA, opaquePix, brightPix, noise, noise > 60 ? " NOISY" : "", clutInfo);
-                }
-            }
-            // PS2X_HUDTEX: uncapped decode trace for the HUD's black textures -> WHY do they decode black?
-            {
-                static const bool s_ht = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_HUDTEX"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
-                if (s_ht && (texKey == 2382948793199915546ull || texKey == 8431140355099953178ull || texKey == 18369432953290548053ull)) {
-                    uint8_t mA = 0, mRGB = 0; for (size_t p = 0; p + 3 < rgba.size(); p += 4) { mA = std::max(mA, rgba[p+3]); mRGB = std::max({mRGB, rgba[p], rgba[p+1], rgba[p+2]}); }
-                    static int s_n = 0;
-                    if (s_n++ < 10) std::fprintf(stderr, "[hudtex] key=%llu %dx%d psm=%u tbp0=%u tbw=%u tcc=%u tfx=%u | CLUT cbp=%u cpsm=%u csm=%u csa=%u cld=%u | decoded maxRGB=%u maxA=%u\n",
-                                                 (unsigned long long)texKey, texW, texH, ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.tcc, ctx.tex0.tfx,
-                                                 ctx.tex0.cbp, ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.cld, mRGB, mA);
-                }
-            }
-            // PS2X_TEXDUMP_TBP=<tbp0>: log the first decodes of that tbp0 (key + CLUT regs +
-            // mean). The GPU_DIAG gputex export writes the PNG as gputex_<key>.png — this
-            // line maps tbp -> key so the file can be found without hunting content hashes.
-            {
-                static const uint32_t s_tdt = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_TEXDUMP_TBP"); return s_env; }(); return v ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
-                if (s_tdt && ctx.tex0.tbp0 == s_tdt)
-                {
-                    static std::atomic<int> s_tn{0};
-                    int n = s_tn.fetch_add(1);
-                    if (n < 8)
-                    {
-                        uint64_t sum = 0; size_t cnt = 0;
-                        uint8_t mn = 255, mx = 0;
-                        for (size_t p = 0; p + 3 < rgba.size(); p += 16)
-                        {
-                            sum += rgba[p] + rgba[p+1] + rgba[p+2]; cnt += 3;
-                            mn = std::min({mn, rgba[p], rgba[p+1], rgba[p+2]});
-                            mx = std::max({mx, rgba[p], rgba[p+1], rgba[p+2]});
-                        }
-                        std::fprintf(stderr, "[texdump] tbp0=%u #%d key=%llu %dx%d psm=%u | CLUT cbp=%u cpsm=%u csm=%u csa=%u cld=%u | meanRGB=%llu min=%u max=%u -> gputex_%llu.png\n",
-                                     ctx.tex0.tbp0, n, (unsigned long long)texKey, texW, texH, ctx.tex0.psm,
-                                     ctx.tex0.cbp, ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.cld,
-                                     (unsigned long long)(cnt ? sum / cnt : 0), mn, mx, (unsigned long long)texKey);
-                    }
-                }
-            }
-            {   // PS2X_TEXCENSUS=<psm>: what did this decode actually produce? For the mask
-                // chain the answer that matters is how many DISTINCT values came back -- an
-                // indexed read of a live buffer that returns one value is a flat wash, and
-                // looks identical to "the pass never ran".
-                static const int s_tc = [](){ const char *v = std::getenv("PS2X_TEXCENSUS");
-                                              return v && v[0] ? (int)std::strtol(v, nullptr, 16) : -1; }();
-                if (s_tc >= 0 && (int)ctx.tex0.psm == s_tc)
-                {
-                    static int n = 0;
-                    if (n++ < 400)
-                    {
-                        unsigned uniqA = 0, uniqRGB = 0;
-                        bool seenA[256] = {false};
-                        std::set<uint32_t> rgbSet;
-                        for (size_t i = 0; i + 3 < rgba.size(); i += 4)
-                        {
-                            if (!seenA[rgba[i + 3]]) { seenA[rgba[i + 3]] = true; ++uniqA; }
-                            if (rgbSet.size() < 64)
-                                rgbSet.insert((uint32_t)rgba[i] | ((uint32_t)rgba[i+1] << 8) | ((uint32_t)rgba[i+2] << 16));
-                        }
-                        uniqRGB = (unsigned)rgbSet.size();
-                        // For an ADDITIVE composite (blend 0x48) the number that decides
-                        // "outline strokes" vs "wash over the whole frame" is how much of the
-                        // decoded texture is BLACK: adding 0 is a no-op, adding anything else
-                        // brightens. Same for alpha-blended passes with alpha 0.
-                        size_t nBlack = 0, nZeroA = 0, npx = 0;
-                        unsigned long sr = 0, sg = 0, sb = 0, sa2 = 0;
-                        for (size_t i = 0; i + 3 < rgba.size(); i += 4)
-                        {
-                            ++npx;
-                            if (!rgba[i] && !rgba[i+1] && !rgba[i+2]) ++nBlack;
-                            if (!rgba[i+3]) ++nZeroA;
-                            sr += rgba[i]; sg += rgba[i+1]; sb += rgba[i+2];
-                            sa2 += rgba[i+3];
-                        }
-                        std::fprintf(stderr, "[texcensus] psm=%02x tbp=%u cbp=%u %dx%d -> distinct alpha=%u rgb=%u%s"
-                                             " | black %.1f%%  a==0 %.1f%%  mean rgb=(%.0f,%.0f,%.0f) meanA=%.1f\n",
-                                     ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.cbp, texW, texH,
-                                     uniqA, uniqRGB, uniqRGB >= 64 ? "+" : "",
-                                     100.0 * (double)nBlack / (double)npx,
-                                     100.0 * (double)nZeroA / (double)npx,
-                                     (double)sr / npx, (double)sg / npx, (double)sb / npx,
-                                     (double)sa2 / npx);
-                    }
-                }
-            }
-            {   // PS2X_TEXDUMP=<psm>: write each decode of that PSM as raw RGBA (w,h header).
-                // For a PSMT8H read through CLUT 16000 (which is exactly 255-i) the decoded
-                // ALPHA is 255 minus the source index, so this shows precisely what the mask
-                // composites see when they sample the scene.
-                static const int s_td = [](){ const char *v = std::getenv("PS2X_TEXDUMP");
-                                              return v && v[0] ? (int)std::strtol(v, nullptr, 16) : -1; }();
-                if (s_td >= 0 && (int)ctx.tex0.psm == s_td)
-                {
-                    // Keep the LAST decodes, not the first: the first are frame-1 warm-up,
-                    // before the alpha rebuild has run, and reading them as representative sent
-                    // this investigation off twice.
-                    static int s_i = 0;
-                    if (s_i < 400)
-                    {
-                        char path[256];
-                        const char *dir = std::getenv("PS2X_GS_REPLAY_OUT");
-                        std::snprintf(path, sizeof(path), "%s/texlast_tbp%u_cbp%u.raw",
-                                      dir ? dir : ".", ctx.tex0.tbp0, ctx.tex0.cbp);
-                        ++s_i;
-                        if (FILE *f = std::fopen(path, "wb"))
-                        {
-                            int hdr[2] = { texW, texH };
-                            std::fwrite(hdr, sizeof(hdr), 1, f);
-                            std::fwrite(rgba.data(), 1, rgba.size(), f);
-                            std::fclose(f);
-                        }
-                    }
-                }
-            }
-            {   // [idxhist] PS2X_IDXHIST=1: for PSMT8H decodes of page 224 (the outline stamps' source),
-                // histogram the RAW INDEX BYTES the decode read from VRAM. Uniform => the mask never
-                // reached VRAM where this decode looks.
-                static const bool s_ih = [](){ const char *v = std::getenv("PS2X_IDXHIST"); return v && v[0] && v[0] != '0'; }();
-                static int ihN = 0;
-                if (s_ih && ihN < 6 && tme && ctx.tex0.psm == GS_PSM_T8H && (ctx.tex0.tbp0 / 32u) == 224u)
-                {
-                    ++ihN;
-                    std::map<unsigned, unsigned long> hh; unsigned long n = 0;
-                    const uint8_t *vram = gs->m_vram; const uint32_t vmask = gs->m_vramSize ? (gs->m_vramSize - 1u) : 0x3FFFFFu;
-                    for (int ty = 0; ty < texH; ty += 2) for (int tx = 0; tx < texW; tx += 2)
-                    {   const uint32_t wa = GSPSMCT32::addrPSMCT32(ctx.tex0.tbp0, ctx.tex0.tbw, (uint32_t)tx, (uint32_t)ty);
-                        const uint32_t word = *reinterpret_cast<const uint32_t *>(vram + ((wa * 4u) & vmask));
-                        ++n; ++hh[(word >> 24) & 0xFFu]; }
-                    std::vector<std::pair<unsigned long, unsigned>> t; for (auto &kv : hh) t.push_back({kv.second, kv.first});
-                    std::sort(t.rbegin(), t.rend());
-                    std::fprintf(stderr, "[idxhist] T8H page224 tbp=%u tbw=%u %dx%d cbp=%u raw index bytes:", ctx.tex0.tbp0, ctx.tex0.tbw, texW, texH, ctx.tex0.cbp);
-                    for (size_t i = 0; i < t.size() && i < 6; ++i) std::fprintf(stderr, " %u:%.1f%%", t[i].second, 100.0 * t[i].first / (double)n);
-                    std::fprintf(stderr, "  distinct=%zu\n", hh.size());
-                }
-            }
+            TexDecodeSrc src;
+            src.tex0 = &ctx.tex0; src.clamp = ctx.clamp; src.vram = gs->m_vram; src.vramSize = gs->m_vramSize;
+            src.clut = gs->m_clutCache; src.clutKey = gs->m_clutCacheKey; src.texa = &gs->m_texa; src.texclut = &gs->m_texclut;
+            src.subDxW = g_subDxW; src.subDx0 = g_subDx0;
+            int subW = 0; std::vector<uint8_t> rgba;
+            decodeTexRGBA(gs, src, texW, texH, rawAlphaDec, texKey, subW, rgba);   // [decodefn]
             r.putTexture(texKey, std::move(rgba), subW, texH, texPageLo, texPageHi);
         }
     }

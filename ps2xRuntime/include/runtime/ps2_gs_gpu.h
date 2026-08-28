@@ -190,6 +190,25 @@ struct GSContext
     uint64_t fba;
 };
 
+// [deferdec] everything a fast-path texture decode reads, snapshotted at record time so the
+// decode can run on the GL thread right after that thread writes the source page back.
+struct TexDecodeReq
+{
+    GSTex0Reg tex0{};
+    uint64_t clamp = 0;
+    GSTexaReg texa{0u, false, 0u};
+    GSTexClutReg texclut{0u, 0u, 0u};
+    int texW = 0, texH = 0;
+    bool rawAlphaDec = false;
+    uint64_t texKey = 0;
+    uint32_t pageLo = 0, pageHi = 0;
+    int subDxW = 0, subDx0 = 0;
+    uint32_t flushPage = 0xFFFFFFFFu, flushClutPage = 0xFFFFFFFFu;   // pages the GL thread must write back first
+    bool flushAlpha = false;
+    bool served = false;   // set by the GL thread once decoded
+    uint32_t zwbBp = 0, zwbPsm = 0, zwbBw = 0; double zwbZMax = 0.0;   // [zwbsnap] ZBUF state at the read: the flush must not use the guest's LATER zbuf
+};
+
 struct GSPrimReg
 {
     GSPrimType type;
@@ -373,6 +392,7 @@ public:
     const uint64_t *rawRegs() const { return m_rawRegs; }
     const bool *rawRegsSet() const { return m_rawSet; }
     uint32_t vramSize() const { return m_vramSize; }
+    GSRasterizer &rasterizer() { return m_rasterizer; }   // [deferdec]
 
     // Invalidate the decoded-palette cache. A barrier writeback can change a palette that
     // lives in VRAM (BT3 RENDERS its outline CLUTs), and the cache key folds in this counter.

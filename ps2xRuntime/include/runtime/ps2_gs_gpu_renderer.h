@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include <mutex>
 
+struct TexDecodeReq;   // [deferdec]
 class GsGpuRenderer
 {
 public:
@@ -61,6 +62,8 @@ public:
         // without it later GPU draws depth-test against a buffer with no character in it and
         // paint bright quads on the ground.
         bool depthOnly = false;
+        bool isDecode = false;                  // [deferdec] not a draw: service a deferred texture decode here
+        std::shared_ptr<TexDecodeReq> decode;   // [deferdec]
         // The pixels AS THEY WERE when the software run ended. Re-reading VRAM at render time
         // is wrong: by then VRAM holds the whole frame's software output, and the scene copy in
         // it predates every GPU draw recorded after the first bracket -- blitting that wiped
@@ -239,7 +242,11 @@ public:
     // every other flush must protect it, or a later flush with a flat/empty FBO alpha wipes
     // the field the mask build needs (measured: good field written, then zeroed, VRAM ends 0%).
     void barrierBeforeRead(uint32_t srcBlock, bool requireAligned = true,
-                           bool wantsAlphaAsData = false);
+                           bool wantsAlphaAsData = false, bool *deferOut = nullptr);   // [deferdec] deferOut: report "would wait" instead of waiting
+    void postDecode(std::shared_ptr<TexDecodeReq> req);   // [deferdec]
+    bool flushPending(uint32_t page);                    // [deferpend] a deferred flush of this page is queued but not yet serviced
+    bool serviceNextDecode();                            // [deferdec] GL thread: render up to the next unserved decode command, then service it
+    void serviceDecodeReq(TexDecodeReq &q);              // [deferdec] GL thread: flush page(s) -> decode -> putTexture
 
     // Push the scene FBO's ALPHA into VRAM once, immediately before BT3's alpha-rebuild pass
     // runs in software. The rebuild only writes bits 14-15 of a CT16 view (~25% of the alpha
@@ -319,6 +326,12 @@ private:
     // taken under m_mtx, so the guest keeps recording while the GL thread draws.
     bool   m_chunkMode = false;
     size_t m_chunkBase = 0;
+    bool   m_segSwapped = false;          // [segshadow] a segment render holds m_building swapped out; guest appends go to the shadow
+    std::vector<DrawCmd> m_buildingShadow;   // [segshadow]
+    std::vector<DrawCmd> m_segTail;          // [segtail] commands past m_stopAt, parked during a split segment render
+    const TexDecodeReq *m_zwbOverride = nullptr;   // [zwbsnap] while servicing a deferred flush: use the request's zbuf snapshot
+    bool   m_inDecodeService = false;   // [deferdec] reentrancy guard for serviceNextDecode
+    size_t m_stopAt = (size_t)-1;   // [deferdec] a render stops BEFORE this index (segment split at a decode command)
     std::vector<DrawCmd> m_chunk;
     bool   m_segActive = false;
     size_t m_segFrom   = 0;

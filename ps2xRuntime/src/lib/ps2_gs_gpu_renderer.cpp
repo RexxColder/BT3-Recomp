@@ -1,3 +1,4 @@
+#include <tuple>
 #include <deque>
 #include <condition_variable>
 // GPU (OpenGL via raylib) GS renderer — Stage 1: alpha-blended textured sprites.
@@ -25,6 +26,7 @@
 
 #include "raylib.h"
 #include "rlgl.h"
+#include "runtime/ps2_gs_gpu.h"
 extern "C" void glFinish(void);   // [unloadmode] drain experiment
 extern "C" void glFlush(void);    // [preflush]
 
@@ -43,12 +45,14 @@ std::unordered_set<uint32_t> g_wbWanted;          // pages indexed draws sampled
 std::unordered_set<uint32_t> g_wbDone;            // pages whose bytes are now REAL in VRAM
 std::unordered_set<uint32_t> g_drawnThisFrame;    // dest fbps touched by THIS frame's cmds
 static std::mutex g_barMx;
+static bool ddPageAllowed(uint32_t page);   // [ddpages]
 static std::vector<uint32_t> g_barPending;       // pages needing a render+flush before more building
 // [barblock] PS2X_BARBLOCK=1: the guest thread BLOCKS on a barrier until the GL thread has
 // rendered the in-progress list up to this point and flushed the page -- the replay rig's
 // synchronous semantics, across threads. Replaces the one-frame-late staging ([livesync]).
 struct BarBlockReq { uint32_t page; bool alpha;
     std::chrono::steady_clock::time_point tPost{};   // [bbstat]
+    std::shared_ptr<TexDecodeReq> dec;   // [deferdec] non-null: a deferred decode request (no waiter)
 };
 static std::mutex g_bbMx;
 static std::condition_variable g_bbCv;
@@ -93,6 +97,7 @@ unsigned long g_gateSeen = 0;   // commands the gate census looked at (PS2X_GATE
 // these can be emitted normally -- the workaround gates that exist because "an FBO cannot be
 // sampled while it is also being written" no longer apply once the bytes are in VRAM.
 std::unordered_set<uint32_t> g_barFlushed;
+static std::unordered_map<uint32_t, int> g_deferPending;   // [deferpend] pages with a posted-but-unserviced deferred flush (guarded by g_barMx)
 // fbp -> the fbp whose FBO actually holds its pixels (see realFbpFor / PS2X_MERGE_DISPLAY).
 // Published from beginFbp so flushPageToVram can find a merged buffer's real storage.
 std::unordered_map<uint32_t, uint32_t> g_realFbpMap;
@@ -235,21 +240,67 @@ namespace
     // glTexParameter calls (repeat-wrapped grass/sky drew clamped, the mask swizzle never
     // applied). The texture pool hid this for months because it never deletes anything.
     static void ps2xForgetTexId(unsigned int id) { g_texFilterState.erase(id); g_wrapState.erase(id); g_swzState.erase(id); }
+    // [forgetrt] the 2026-08-28 additions forget ids at the render-texture / temp-texture release sites too.
+    // PS2X_FORGETRT=0 restores the old behaviour (stale wrap/swizzle/filter entries survive an FBO re-create) --
+    // the rig bisect knob for the grass-speckle diff vs out_lab_REF2.
+    static void ps2xForgetRtTexId(unsigned int id)
+    {
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_FORGETRT"); return !(v && v[0] == '0'); }();
+        if (s_on) ps2xForgetTexId(id);
+    }
     void ps2xApplyTexFilter(Texture2D &t, bool bilinear)
     {
         static const bool s_on = [](){ const char *v = std::getenv("PS2X_BILINEAR"); return !(v && v[0] == '0'); }();
         if (!s_on || t.id == 0) return;
-        // [filtercache] PS2X_FILTERCACHE=1 restores the "already applied" shortcut. Default OFF
-        // (2026-08-27): the cache went stale whenever a GL id was recycled (texture pool, freed
-        // ids), leaving alternate frames point- vs bilinear-sampled (menu/copyright shimmer).
-        // One glTexParameteri per textured draw is negligible; never trust the cache by default.
-        static const bool s_fc = [](){ const char *v = std::getenv("PS2X_FILTERCACHE"); return v && v[0] && v[0] != '0'; }();
+        // [filtercache] the "already applied" shortcut. Was default OFF (2026-08-27) because the
+        // cache went stale whenever a GL id was recycled (alternate frames point- vs bilinear).
+        // Default ON again (2026-08-28): every id release now goes through ps2xForgetTexId (the
+        // [idreuse] fix), and the un-cached path was 8 real GL calls per textured DrawCmd --
+        // the single largest per-command GL cost in the draw loop. PS2X_FILTERCACHE=0 = old.
+        static const bool s_fc = [](){ const char *v = std::getenv("PS2X_FILTERCACHE"); return !(v && v[0] == '0'); }();
         auto it = g_texFilterState.find(t.id);
         if (s_fc && it != g_texFilterState.end() && it->second == bilinear) return;   // don't thrash GL state
         SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
         g_texFilterState[t.id] = bilinear;
     }
-    std::unordered_map<uint32_t, Fbo> g_fbos;
+    // [flatfbo] g_fbos was an unordered_map looked up dozens of times per DrawCmd (std::_Hashtable was ~5% of the
+    // GL thread in the PR9/PR9P profiles). Same API subset (find/end/count/operator[]/size/range-for), backed by
+    // a page-indexed slot table; node storage is a deque so references stay valid across inserts.
+    struct FlatFboMap
+    {
+        using P = std::pair<const uint32_t, Fbo>;
+        std::deque<P> items;
+        std::vector<int32_t> slot = std::vector<int32_t>(4096, -1);
+        std::unordered_map<uint32_t, int32_t> big;   // keys >= 4096 (sentinels)
+        struct iterator
+        {
+            std::deque<P> *d; size_t i;
+            P &operator*() const { return (*d)[i]; }
+            P *operator->() const { return &(*d)[i]; }
+            iterator &operator++() { ++i; return *this; }
+            bool operator==(const iterator &o) const { return i == o.i; }
+            bool operator!=(const iterator &o) const { return i != o.i; }
+        };
+        int32_t idx(uint32_t k) const { if (k < 4096u) return slot[k]; auto it = big.find(k); return it == big.end() ? -1 : it->second; }
+        iterator begin() { return {&items, 0}; }
+        iterator end() { return {&items, items.size()}; }
+        iterator find(uint32_t k) { const int32_t i = idx(k); return {&items, i < 0 ? items.size() : (size_t)i}; }
+        size_t count(uint32_t k) const { return idx(k) >= 0 ? 1u : 0u; }
+        size_t size() const { return items.size(); }
+        bool empty() const { return items.empty(); }
+        Fbo &operator[](uint32_t k)
+        {
+            int32_t i = idx(k);
+            if (i < 0)
+            {
+                i = (int32_t)items.size();
+                items.emplace_back(std::piecewise_construct, std::forward_as_tuple(k), std::forward_as_tuple());
+                if (k < 4096u) slot[k] = i; else big[k] = i;
+            }
+            return items[(size_t)i].second;
+        }
+    };
+    FlatFboMap g_fbos;
     // ONE depth texture for the whole frame: the GS has a single ZBUF (ZBP=224 here) shared by
     // every render target. Giving each FBO its own depth split it in two, so with the game
     // double-buffering fbp0/fbp112 the depth written in one frame was invisible the next.
@@ -444,7 +495,7 @@ namespace
                 if (std::sscanf(s_cap, "%u:%ux%u", &cf, &cw, &ch) == 3 && cf == fbp && cw && ch)
                 { w = (int)cw; h = (int)ch;
                   if (f.rt.texture.id != 0 && (f.w != (int)cw || f.h != (int)ch))
-                  { UnloadRenderTexture(f.rt); f.rt = RenderTexture2D{}; f.w = f.h = 0; }
+                  { ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); f.rt = RenderTexture2D{}; f.w = f.h = 0; }
                   if (f.rt.texture.id != 0) return f; }
             }
         }
@@ -464,7 +515,7 @@ namespace
         }
         if (f.w != w || f.h != h || f.rt.texture.id == 0)
         {
-            if (f.rt.texture.id != 0) UnloadRenderTexture(f.rt);
+            if (f.rt.texture.id != 0) { ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); }
             // PS2X_NODEPTH_RT: create COLOR-ONLY FBOs (no depth renderbuffer). raylib's
             // LoadRenderTexture always attaches a depth renderbuffer; a bad/large depth
             // attachment is a classic cause of "binding this FBO corrupts everything after".
@@ -1064,10 +1115,16 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
         extern uint32_t g_zwbBp, g_zwbPsm, g_zwbBw;
         extern double g_zwbZMax;
         extern void ps2xWritebackDepthToVram(uint32_t, uint32_t, uint32_t, int, int, const float *, double);
+        // [zwbsnap] a deferred flush runs later than the read it serves; by then the guest may have moved
+        // ZBUF (live only -- the replay flushes inline). Use the snapshot taken at the read.
+        const uint32_t zwbBp = m_zwbOverride ? m_zwbOverride->zwbBp : g_zwbBp;
+        const uint32_t zwbPsm = m_zwbOverride ? m_zwbOverride->zwbPsm : g_zwbPsm;
+        const uint32_t zwbBw = m_zwbOverride ? m_zwbOverride->zwbBw : g_zwbBw;
+        const double zwbZMax = m_zwbOverride ? m_zwbOverride->zwbZMax : g_zwbZMax;
         if (s_bd) { static int n0 = 0; if (n0++ < 6)
-            std::fprintf(stderr, "[bardiag] flush fbp%u: g_zwbBp=%u zpsm=%02x zbw=%u\n",
-                         fbp, g_zwbBp, g_zwbPsm, g_zwbBw); }
-        if (g_zwbBp != 0u && fbp == g_zwbBp)
+            std::fprintf(stderr, "[bardiag] flush fbp%u: zwbBp=%u zpsm=%02x zbw=%u\n",
+                         fbp, zwbBp, zwbPsm, zwbBw); }
+        if (zwbBp != 0u && fbp == zwbBp)
         {
             // Depth is SHARED between the scene buffers; take the shared texture directly and
             // fall back the same way the cel pass does (fbp0, then fbp112). Looking only at
@@ -1098,7 +1155,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
                 for (int y = 0; y < wbH; ++y)
                     std::memcpy(&zflip[(size_t)y * zw], &zb[(size_t)(zh - 1 - y) * zw],
                                 (size_t)zw * sizeof(float));
-                ps2xWritebackDepthToVram(g_zwbBp, g_zwbBw, g_zwbPsm, zw, wbH, zflip.data(), g_zwbZMax);
+                ps2xWritebackDepthToVram(zwbBp, zwbBw, zwbPsm, zw, wbH, zflip.data(), zwbZMax);
                 if (s_bd)
                 {
                     static int n = 0;
@@ -1108,7 +1165,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
                         for (float v : zb) { if (v < mn) mn = v; if (v > mx) mx = v; if (v > 0.0f) ++nz; }
                         std::fprintf(stderr, "[bardiag] flush fbp%-4u DEPTH %dx%d zpsm=%02x zbw=%u zMax=%.0f"
                                              "  z in [%.4f..%.4f]  nonzero %.2f%%\n",
-                                     fbp, zw, std::min(zh, zf->second.h), g_zwbPsm, g_zwbBw, g_zwbZMax,
+                                     fbp, zw, std::min(zh, zf->second.h), zwbPsm, zwbBw, zwbZMax,
                                      mn, mx, 100.0 * (double)nz / (double)zb.size());
                     }
                 }
@@ -1697,6 +1754,15 @@ bool GsGpuRenderer::serviceBlockingBarriers()
             if (g_bbQueue.empty()) break;
             r = g_bbQueue.front(); g_bbQueue.pop_front();
         }
+        if (r.dec)
+        {   // [deferdec] no waiter: render up to the decode command (a finished segment), flush, decode
+            bool pend = false; { std::lock_guard<std::mutex> lk(m_mtx); pend = !m_pending.empty(); }
+            if (pend) renderAndGetTextureId(512, 448);
+            while (serviceNextDecode()) {}
+            if (!r.dec->served) serviceDecodeReq(*r.dec);   // already rendered past it (published list): flush + decode anyway
+            any = true;
+            continue;
+        }
         extern double g_bbPickup, g_bbRender, g_bbFlush; extern int g_bbN;
         const auto tPick = std::chrono::steady_clock::now();
         bool pending = false;
@@ -1747,7 +1813,9 @@ bool GsGpuRenderer::prerenderChunk()
         std::lock_guard<std::mutex> lk(m_mtx);
         g_preReady.store(false, std::memory_order_relaxed);
         if (!m_pending.empty()) return false;   // end-of-frame render of the previous list is owed first
-        const size_t n = m_building.size();
+        size_t n = m_building.size();
+        for (size_t i = m_segFrom; i < n; ++i)   // [deferdec] a chunk must not cross an unserved decode command
+            if (m_building[i].isDecode && m_building[i].decode && !m_building[i].decode->served) { n = i; break; }
         if (n < m_segFrom || n - m_segFrom < (size_t)k) return false;
         m_chunk.assign(m_building.begin() + (std::ptrdiff_t)m_segFrom, m_building.begin() + (std::ptrdiff_t)n);
         m_chunkBase = m_segFrom;
@@ -1765,6 +1833,141 @@ bool GsGpuRenderer::prerenderChunk()
     return true;
 }
 bool GsGpuRenderer::blockingBarriersEnabled() { return s_barBlockEnv; }
+// [ddpages] PS2X_DEFERDEC_PAGES=p1,p2,...: defer only reads of these pages (bisect knob); unset = all pages
+static bool ddPageAllowed(uint32_t page)
+{
+    static const std::vector<uint32_t> s_pages = [](){ std::vector<uint32_t> r; const char *v = std::getenv("PS2X_DEFERDEC_PAGES");
+        if (v) for (const char *q = v; *q; ) { char *e = nullptr; long n = std::strtol(q, &e, 10); if (e == q) break; r.push_back((uint32_t)n); q = (*e == ',') ? e + 1 : e; }
+        return r; }();
+    if (s_pages.empty()) return true;
+    for (uint32_t p : s_pages) if (p == page) return true;
+    return false;
+}
+unsigned long g_deferPosted = 0, g_deferServed = 0, g_deferGate = 0, g_deferLate = 0;   // [deferdec] stats
+extern GS *g_gsWb;   // [deferdec] the GS the writeback path uses (set on the first writeback)
+void GsGpuRenderer::postDecode(std::shared_ptr<TexDecodeReq> req)
+{   // [deferdec] guest thread: a placeholder cache entry (w/h set, no texels) so this frame's later
+    // lookups of the same key don't decode again, then the command that will fill it in order.
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        CachedTex &ct = m_texCache[req->texKey];
+        ct.w = req->texW; ct.h = req->texH; ct.needsUpload = false; ct.rgba.clear();
+        g_texLastUse[req->texKey] = g_texUseGen;
+    }
+    { extern uint32_t g_zwbBp, g_zwbPsm, g_zwbBw; extern double g_zwbZMax;   // [zwbsnap]
+      req->zwbBp = g_zwbBp; req->zwbPsm = g_zwbPsm; req->zwbBw = g_zwbBw; req->zwbZMax = g_zwbZMax; }
+    DrawCmd c{};
+    c.isDecode = true; c.decode = req; c.texKey = req->texKey;
+    c.destFbp = 0xFFFFFFFEu; c.srcTbp0 = req->tex0.tbp0;
+    c.sx = c.sy = c.sw = c.sh = 0; c.dx0 = c.dy0 = c.dx1 = c.dy1 = 0.f; c.su0 = c.sv0 = c.su1 = c.sv1 = 0.f;
+    c.r = c.g = c.b = c.a = 0;
+    {   // [deferpend] the page(s) this request will flush are stale in VRAM until it is serviced
+        std::lock_guard<std::mutex> bk(g_barMx);
+        if (req->flushPage != 0xFFFFFFFFu) ++g_deferPending[req->flushPage];
+        if (req->flushClutPage != 0xFFFFFFFFu && req->flushClutPage != req->flushPage) ++g_deferPending[req->flushClutPage];
+    }
+    ++g_deferPosted;
+    if (g_deferPosted <= 4ul || (g_deferPosted & 1023ul) == 0ul) std::fprintf(stderr, "[deferdec] posted %lu served %lu late %lu (key %llx page %u clut %u)\n", g_deferPosted, g_deferServed, g_deferLate, (unsigned long long)req->texKey, req->flushPage, req->flushClutPage);
+    recordCmd(c);
+    flushStage();   // the GL thread must be able to see the command in m_building right away
+    static const bool s_ddRig = [](){ const char *v = std::getenv("PS2X_DEFERDEC_RIG"); return v && v[0] && v[0] != '0'; }();
+    if (s_ddRig && ps2xOnGlThread())
+    {   // replay (single-threaded): service inline, exactly what the GL thread would do.
+        // PS2X_DEFERDEC_LATE=1: leave it queued and service at publish (see swapFrame) -- the list then
+        // extends past every read the way the live GL thread sees it.
+        static const bool s_late = [](){ const char *v = std::getenv("PS2X_DEFERDEC_LATE"); return v && v[0] && v[0] != '0'; }();
+        if (!s_late) { while (serviceNextDecode()) {} }
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_bbMx);
+        BarBlockReq r{}; r.page = req->flushPage; r.alpha = req->flushAlpha; r.tPost = std::chrono::steady_clock::now(); r.dec = req;
+        g_bbQueue.push_back(r);
+    }
+    g_bbCv.notify_all();
+}
+bool GsGpuRenderer::flushPending(uint32_t page)
+{   // [deferpend]
+    std::lock_guard<std::mutex> bk(g_barMx);
+    return g_deferPending.count(page) != 0;
+}
+bool GsGpuRenderer::serviceNextDecode()
+{   // [deferdec] GL thread. Find the first unserved decode command at or after m_segFrom, render
+    // everything before it as a CHUNK (copied under the lock -- the guest keeps appending to
+    // m_building now that it no longer waits, so iterating it live is a use-after-free; the
+    // blocking barrier only got away with renderRange because the guest was parked), then flush +
+    // decode. Chunk rendering is the [prerender] path, rig byte-identical to segment rendering.
+    if (!m_glInit || !ps2xOnGlThread() || m_inDecodeService) return false;
+    struct InSvc { bool &f; ~InSvc() { f = false; } } inSvc{m_inDecodeService}; m_inDecodeService = true;
+    {   // a published (previous-frame) list is owed first, exactly like prerenderChunk/the barrier service
+        bool pend = false; { std::lock_guard<std::mutex> lk(m_mtx); pend = !m_pending.empty(); }
+        if (pend) renderAndGetTextureId(512, 448);
+    }
+    size_t idx = (size_t)-1; std::shared_ptr<TexDecodeReq> req;
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        for (size_t i = m_segFrom; i < m_building.size(); ++i)
+            if (m_building[i].isDecode && m_building[i].decode && !m_building[i].decode->served) { idx = i; req = m_building[i].decode; break; }
+        if (!req) return false;
+    }
+    // Segment render up to the decode command (rig byte-identical; the chunk-copy form was not).
+    // Safe live thanks to [segshadow]: the guest's concurrent appends land in the shadow list.
+    {   // PS2X_PRERENDER_RIG=1: on the replay, prerender chunks first, the way the live GL thread's idle
+        // loop does -- live the flush usually follows a CHUNK render, which is the rig-vs-live difference.
+        static const bool s_prr = [](){ const char *v = std::getenv("PS2X_PRERENDER_RIG"); return v && v[0] && v[0] != '0'; }();
+        if (s_prr) { while (prerenderChunk()) {} }
+    }
+    m_stopAt = idx;
+    renderRange(512, 448);
+    m_stopAt = (size_t)-1;
+    { std::lock_guard<std::mutex> lk(m_mtx); if (m_segFrom <= idx) m_segFrom = idx + 1; }
+    serviceDecodeReq(*req);
+    return true;
+}
+void GsGpuRenderer::serviceDecodeReq(TexDecodeReq &q)
+{   // [deferdec] GL thread, outside any render: the barrier's flush, then the decode from VRAM.
+    struct ZwbScope { GsGpuRenderer *r; ~ZwbScope() { r->m_zwbOverride = nullptr; } } zwbScope{this};   // [zwbsnap]
+    m_zwbOverride = &q;
+    if (q.flushPage != 0xFFFFFFFFu)
+    {
+        m_flushAlphaNow = q.flushAlpha;
+        flushPageToVram(q.flushPage);
+        m_flushAlphaNow = false;
+        g_barFlushed.insert(q.flushPage);
+        std::lock_guard<std::mutex> bk(g_barMx);   // [deferpend]
+        auto it = g_deferPending.find(q.flushPage); if (it != g_deferPending.end() && --it->second <= 0) g_deferPending.erase(it);
+    }
+    if (q.flushClutPage != 0xFFFFFFFFu && q.flushClutPage != q.flushPage)
+    {
+        flushPageToVram(q.flushClutPage);
+        g_barFlushed.insert(q.flushClutPage);
+        std::lock_guard<std::mutex> bk(g_barMx);   // [deferpend]
+        auto it = g_deferPending.find(q.flushClutPage); if (it != g_deferPending.end() && --it->second <= 0) g_deferPending.erase(it);
+    }
+    if (g_gsWb)
+    {
+        int subW = 0; std::vector<uint8_t> rgba;
+        g_gsWb->rasterizer().decodeDeferred(q, g_gsWb->vramData(), g_gsWb->vramSize(), subW, rgba);
+        double meanA = -1.0;
+        if (g_deferServed < 6ul && rgba.size() >= 4) { unsigned long sa = 0; for (size_t i = 3; i < rgba.size(); i += 4) sa += rgba[i]; meanA = (double)sa / (double)(rgba.size() / 4); }
+        {   // [ddlog] PS2X_DEFERDEC_LOG=path: one line per serviced decode (page psm size mean RGBA + a content hash)
+            static FILE *s_lf = [](){ const char *v = std::getenv("PS2X_DEFERDEC_LOG"); return v && v[0] ? std::fopen(v, "w") : nullptr; }();
+            if (s_lf && rgba.size() >= 4)
+            {
+                unsigned long sr = 0, sg = 0, sb = 0, sa = 0; uint64_t hh = 1469598103934665603ull;
+                for (size_t i = 0; i + 3 < rgba.size(); i += 4) { sr += rgba[i]; sg += rgba[i+1]; sb += rgba[i+2]; sa += rgba[i+3]; }
+                for (size_t i = 0; i < rgba.size(); i += 64) { hh = (hh ^ rgba[i]) * 1099511628211ull; }
+                const size_t px = rgba.size() / 4;
+                std::fprintf(s_lf, "%lu page %u psm %u clut %u alpha %d %dx%d mean %lu %lu %lu %lu hash %llx\n", g_deferServed + 1, q.flushPage, (unsigned)q.tex0.psm, q.flushClutPage, (int)q.flushAlpha, subW, q.texH, sr / px, sg / px, sb / px, sa / px, (unsigned long long)hh);
+                std::fflush(s_lf);
+            }
+        }
+        putTexture(q.texKey, std::move(rgba), subW, q.texH, q.pageLo, q.pageHi);   // uploaded by the next render's pre pass
+        ++g_deferServed;
+        if (g_deferServed <= 6ul) std::fprintf(stderr, "[deferdec] served %lu: key %llx page %u clut %u alpha=%d -> %dx%d meanA=%.1f\n", g_deferServed, (unsigned long long)q.texKey, q.flushPage, q.flushClutPage, (int)q.flushAlpha, subW, q.texH, meanA);
+    }
+    q.served = true;
+}
 
 bool GsGpuRenderer::takeBarrierRequest(uint32_t &page)
 {
@@ -1775,7 +1978,7 @@ bool GsGpuRenderer::takeBarrierRequest(uint32_t &page)
     return true;
 }
 
-void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bool wantsAlphaAsData)
+void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bool wantsAlphaAsData, bool *deferOut)
 {
     flushStage();   // [recstage] the list must be complete before any barrier bookkeeping
     {   // PS2X_RTTEST=1: one-shot address round-trip (see ps2xVramRoundTripTest).
@@ -1841,9 +2044,24 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
         }
         {
             std::lock_guard<std::mutex> bk(g_barMx);
-            const bool dirty = g_barDirty.count(page) != 0;
+            // [deferpend] a page whose flush is posted but not yet serviced is still stale in VRAM: a later
+            // read must not decode synchronously from it (that is what the rig, which flushes inline, never sees)
+            const bool pend = g_deferPending.count(page) != 0;
+            const bool dirtyBefore = g_barDirty.count(page) != 0;
+            const bool dirty = dirtyBefore || pend;
             if (!dirty && !(wantsAlphaAsData && (s_barAlwaysAEnv || g_barAlphaStale.count(page)))) return;
             g_barDirty.erase(page);
+            if (deferOut && ddPageAllowed(page))
+            {   // [deferdec] caller posts a decode command instead of waiting -- but only when the page has
+                // NEW draws since the last post: a pending-only page is already covered by the queued decode
+                // (same stale-VRAM key), and re-posting fed back into itself (32M posts in a minute, DD1W).
+                if (dirtyBefore || (!pend && wantsAlphaAsData)) *deferOut = true;   // the post registers the pending flush
+                // pending-only: deferOut stays false and we return without waiting -- the queued decode (same
+                // stale-VRAM key) already covers this read, so the caller's cache lookup finds the placeholder.
+                extern unsigned long g_deferGate; ++g_deferGate;
+                static int n = 0; if (n < 4) { ++n; std::fprintf(stderr, "[deferdec] gate: page %u dirty=%d alpha=%d -> deferred\n", page, (int)dirty, (int)wantsAlphaAsData); }
+                return;
+            }
         }
         // Hand off the scheduler token + guest-execution lock while we wait, or the loader
         // threads and the CD-tick pump starve (the "stuck loading screen").
@@ -1881,9 +2099,14 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
         // its last flush already wrote alpha; a clean page whose alpha was withheld still flushes.
         // PS2X_BARALWAYSA=1 restores the old unconditional behaviour for A/B.
         static const bool s_alwaysA = [](){ const char *v = std::getenv("PS2X_BARALWAYSA"); return v && v[0] && v[0] != '0'; }();
-        const bool dirty = g_barDirty.count(page) != 0;
+        const bool dirty = g_barDirty.count(page) != 0 || g_deferPending.count(page) != 0;   // [deferpend]
         if (!dirty && !(wantsAlphaAsData && (s_alwaysA || g_barAlphaStale.count(page)))) return;
         g_barDirty.erase(page);
+    }
+    {   // [deferdec] PS2X_DEFERDEC_RIG=1: take the deferred path on the replay too (single-threaded: the
+        // decode command is serviced when the frame render reaches it) -- the rig parity test for deferral.
+        static const bool s_ddRig = [](){ const char *v = std::getenv("PS2X_DEFERDEC_RIG"); return v && v[0] && v[0] != '0'; }();
+        if (deferOut && s_ddRig && ddPageAllowed(page)) { *deferOut = true; return; }   // replay: the post services inline (or late with PS2X_DEFERDEC_LATE)
     }
     {   // [barstat] PS2X_BARSTAT=1: where does a barrier's time go? (per-frame totals printed at swapFrame)
         extern double g_bsRender, g_bsFlush; extern int g_bsCount;
@@ -2184,7 +2407,7 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
     static Texture2D s_tex{}; static int s_tw = 0, s_th = 0;
     if (s_tex.id == 0 || s_tw != w || s_th != h)
     {
-        if (s_tex.id != 0) UnloadTexture(s_tex);
+        if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); UnloadTexture(s_tex); }
         Image im = GenImageColor(w, h, BLANK);
         s_tex = LoadTextureFromImage(im); UnloadImage(im);
         s_tw = w; s_th = h;
@@ -2674,7 +2897,10 @@ void GsGpuRenderer::flushStage()
 {
     if (m_stage.empty()) return;
     std::lock_guard<std::mutex> lk(m_mtx);
-    m_building.insert(m_building.end(), std::make_move_iterator(m_stage.begin()), std::make_move_iterator(m_stage.end()));
+    {   // [segshadow]
+        std::vector<DrawCmd> &dstL = m_segSwapped ? m_buildingShadow : m_building;
+        dstL.insert(dstL.end(), std::make_move_iterator(m_stage.begin()), std::make_move_iterator(m_stage.end()));
+    }
     m_stage.clear();
     {   // [prerender] wake the GL thread once a chunk's worth of new commands is waiting
         const int k = prerenderK();
@@ -3267,7 +3493,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     }
     if (s_recStage <= 0)
     {
-        m_building.push_back(std::move(c));   // [cmdmove] one copy instead of two (DrawCmd carries two shared_ptrs)
+        (m_segSwapped ? m_buildingShadow : m_building).push_back(std::move(c));   // [cmdmove] one copy instead of two; [segshadow]
         {   // [prerender] wake the GL thread once a chunk's worth of new commands is waiting
             const int k = prerenderK();
             if (k > 0 && m_building.size() > m_segFrom && ((m_building.size() - m_segFrom) % (size_t)k) == 0u && !g_preReady.exchange(true))
@@ -3355,7 +3581,15 @@ void GsGpuRenderer::swapFrame()
         if (s_fs) { static int n = 0; if (n < 4000)
             std::fprintf(stderr, "[framesize] swapFrame #%d publishing %zu cmds\n", ++n, m_building.size()); }
     }
-    std::lock_guard<std::mutex> lk(m_mtx);
+    std::unique_lock<std::mutex> lk(m_mtx);
+    while (m_segSwapped)
+    {   // [segshadow] a deferred-decode segment render holds the list; wait for its swap-back (ms at most)
+        lk.unlock();
+        void *sc = ps2xGuestWaitBegin();
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        ps2xGuestWaitEnd(sc);
+        lk.lock();
+    }
     if (!m_building.empty())
     {
         if (g_interpOn)
@@ -3560,6 +3794,11 @@ void GsGpuRenderer::ensureGl(int w, int h)
 
 unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
 {
+    {   // [deferdec] no render may pass an unserviced decode command: service them first, each one
+        // splitting the segment at its position (the barrier path's renderRange used to walk straight
+        // through queued decodes -> the draws behind them rendered against an empty placeholder).
+        if (ps2xOnGlThread() && !m_chunkMode && !m_inDecodeService && m_stopAt == (size_t)-1 && g_deferPosted != g_deferServed) { while (serviceNextDecode()) {} }
+    }
     // [secstat] section timers (segment renders only; summed, printed with [bbstat])
     struct SecStat {
         bool on; std::chrono::steady_clock::time_point t0, t1{}, t2{}, t3{};
@@ -3664,7 +3903,30 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     }
 
     std::vector<DrawCmd> cmds;
-    struct SegSwapBack { std::vector<DrawCmd> &a, &b; bool on; ~SegSwapBack() { if (on) a.swap(b); } } segSwapBack{cmds, m_chunkMode ? m_chunk : m_building, m_segMode};
+    struct SegSwapBack
+    {   // [segshadow] swap back under the lock, then append what the guest recorded meanwhile
+        GsGpuRenderer *r; std::vector<DrawCmd> &a, &b; bool on, shadow;
+        ~SegSwapBack()
+        {
+            if (!on) return;
+            std::lock_guard<std::mutex> lk(r->m_mtx);
+            a.swap(b);
+            if (shadow)
+            {
+                if (!r->m_segTail.empty())
+                {   // [segtail] restore the parked tail first (recorded before anything in the shadow)
+                    b.insert(b.end(), std::make_move_iterator(r->m_segTail.begin()), std::make_move_iterator(r->m_segTail.end()));
+                    r->m_segTail.clear();
+                }
+                if (!r->m_buildingShadow.empty())
+                {
+                    b.insert(b.end(), std::make_move_iterator(r->m_buildingShadow.begin()), std::make_move_iterator(r->m_buildingShadow.end()));
+                    r->m_buildingShadow.clear();
+                }
+                r->m_segSwapped = false;
+            }
+        }
+    } segSwapBack{this, cmds, m_chunkMode ? m_chunk : m_building, m_segMode, m_segMode && !m_chunkMode};
     struct PendingUp { uint64_t key = 0; std::vector<uint8_t> rgba; int w = 0, h = 0; };   // [uploadout]
     static std::vector<PendingUp> s_ups;
     std::vector<DrawCmd> prevCmds;
@@ -3696,7 +3958,20 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // list still being built. m_pending is left alone -- the end-of-frame render drains it.
         // [segswap] Segment renders used to COPY the whole in-progress list (40k DrawCmds) per
         // barrier -- ~330 MB of memcpy per frame at 41 barriers. Swap it in and back instead.
-        if (m_segMode) { cmds.swap(m_chunkMode ? m_chunk : m_building); nLists = 1; }   // [prerender] chunk mode swaps the copy in
+        if (m_segMode)
+        {   // [prerender] chunk mode swaps the copy in. [segshadow] this block already runs under the
+            // enclosing m_mtx lock; the flag marks the list as swapped out so guest appends go to
+            // m_buildingShadow until the swap-back (the guest no longer waits during a segment render).
+            cmds.swap(m_chunkMode ? m_chunk : m_building);
+            if (!m_chunkMode) m_segSwapped = true;
+            if (!m_chunkMode && m_stopAt < cmds.size())
+            {   // [segtail] park everything past the split point: every pre-pass (view sizes, display
+                // target, source census...) must see exactly what a blocking barrier's render saw.
+                m_segTail.assign(std::make_move_iterator(cmds.begin() + (std::ptrdiff_t)m_stopAt), std::make_move_iterator(cmds.end()));
+                cmds.resize(m_stopAt);
+            }
+            nLists = 1;
+        }
         frameGen = g_publishGen;
         if (g_interpOn)
         {
@@ -4087,7 +4362,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     }
 
     // [uploadout] GL uploads outside m_mtx, then hand the bytes back.
-    for (PendingUp &u : s_ups)
+    auto glUploadOne = [&](PendingUp &u)   // [deferdec] also used mid-loop for a just-decoded texture
     {
         {
             auto glIt = g_glTex.find(u.key);
@@ -4179,7 +4454,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             }
 
         }
-    }
+    };
+    for (PendingUp &u : s_ups) glUploadOne(u);
     if (!s_ups.empty())
     {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -5009,7 +5285,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             Fbo &cp = g_fboCopy[sfbp];
             if (cp.w != cw || cp.h != ch || cp.rt.texture.id == 0)
             {
-                if (cp.rt.texture.id != 0) UnloadRenderTexture(cp.rt);
+                if (cp.rt.texture.id != 0) { ps2xForgetRtTexId(cp.rt.texture.id); UnloadRenderTexture(cp.rt); }
                 cp.rt = LoadRenderTexture(cw, ch); cp.w = cw; cp.h = ch;
                 SetTextureFilter(cp.rt.texture, TEXTURE_FILTER_POINT);
             }
@@ -5393,7 +5669,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         const int cw = lit->second.w, ch = lit->second.h;
         if (g_frontLatch.w != cw || g_frontLatch.h != ch || g_frontLatch.rt.texture.id == 0)
         {
-            if (g_frontLatch.rt.texture.id != 0) UnloadRenderTexture(g_frontLatch.rt);
+            if (g_frontLatch.rt.texture.id != 0) { ps2xForgetRtTexId(g_frontLatch.rt.texture.id); UnloadRenderTexture(g_frontLatch.rt); }
             g_frontLatch.rt = LoadRenderTexture(cw, ch); g_frontLatch.w = cw; g_frontLatch.h = ch;
             SetTextureFilter(g_frontLatch.rt.texture, TEXTURE_FILTER_POINT);
         }
@@ -5536,9 +5812,17 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                              (int)!reorderBuf.empty());
         }
     }
-    for (size_t ci = ciStart; ci < DC.size(); ++ci)
+    const size_t ciEnd = std::min(DC.size(), m_stopAt);   // [deferdec] split point
+    for (size_t ci = ciStart; ci < ciEnd; ++ci)
     {
         const DrawCmd &c = DC[ci];
+        if (c.isDecode)
+        {   // [deferdec] decode commands are serviced OUTSIDE the loop (serviceNextDecode splits the
+            // render here so the flush sees a finished segment). Reaching one unserviced means the
+            // list was published before the GL thread got to it: the texture misses this frame.
+            if (!c.decode->served) { extern unsigned long g_deferLate; ++g_deferLate; static int n = 0; if (n < 4) { ++n; std::fprintf(stderr, "[deferdec] LATE: decode cmd reached in-loop unserviced (ci %zu/%zu)\n", ci, DC.size()); } }
+            continue;
+        }
         {   // [edgesrc] PS2X_EDGESRC=1: the outline's ALPHA-WRITER draws (fbmsk 00ffffff,
             // ATST NOTEQUAL-0, into the scene buffer). [darkq] proved the darkener itself is
             // healthy and that f0 frames carry Ad=48 while f112 frames carry none -- so census
@@ -5780,7 +6064,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         static Texture2D s_tex{}; static int s_tw = 0, s_th = 0;
                         if (s_tex.id == 0 || s_tw != ow || s_th != oh)
                         {
-                            if (s_tex.id != 0) UnloadTexture(s_tex);
+                            if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); UnloadTexture(s_tex); }
                             Image im = GenImageColor(ow, oh, BLANK);
                             s_tex = LoadTextureFromImage(im); UnloadImage(im);
                             s_tw = ow; s_th = oh;
@@ -11962,7 +12246,7 @@ if (done.size() < 14 && !done.count(c.texKey))
     if (m_segMode)
     {
         endMode();
-        m_segFrom   = m_chunkMode ? m_chunkBase + DC.size() : DC.size();   // [prerender]
+        m_segFrom   = m_chunkMode ? m_chunkBase + std::min(DC.size(), m_stopAt) : std::min(DC.size(), m_stopAt);   // [prerender] [deferdec]
         m_segActive = true;
         return g_lastOutId;
     }
