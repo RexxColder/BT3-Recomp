@@ -46,6 +46,7 @@ std::unordered_set<uint32_t> g_wbDone;            // pages whose bytes are now R
 std::unordered_set<uint32_t> g_drawnThisFrame;    // dest fbps touched by THIS frame's cmds
 static std::mutex g_barMx;
 static bool ddPageAllowed(uint32_t page);   // [ddpages]
+static uint32_t flushCoverPages(uint32_t page);   // [flushcover]
 static std::vector<uint32_t> g_barPending;       // pages needing a render+flush before more building
 // [barblock] PS2X_BARBLOCK=1: the guest thread BLOCKS on a barrier until the GL thread has
 // rendered the in-progress list up to this point and flushed the page -- the replay rig's
@@ -1668,6 +1669,26 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
         }
     { extern double g_flWrite; const auto tw = std::chrono::steady_clock::now();
     { extern int g_wbFlipY; g_wbFlipY = s_noflip ? 1 : 0; }
+    if (m_pageSkipSeq)
+    {   // [pageskip] a deferred flush must not overwrite pages the guest wrote (uploads / copies) AFTER the read it
+        // serves -- with a blocking barrier those writes always came after the flush. Mask their 64xN blocks out.
+        static std::vector<uint8_t> s_pskip; bool any = false;
+        const uint32_t fbw = std::max(1u, (uint32_t)fit->second.fbw);
+        const uint32_t psm = fit->second.psm;
+        const int bh = (psm == 0x02u || psm == 0x0Au || psm == 0x32u || psm == 0x3Au) ? 64 : 32;   // page = 64x32 (32-bit) / 64x64 (16-bit)
+        for (size_t k = 0; k < m_pageSkipSeq->size(); ++k)
+        {
+            const uint32_t page = m_pageSkipLo + (uint32_t)k;
+            if (page >= kVramPages || page < fbp) continue;
+            if (m_uploadSeq[page] <= (*m_pageSkipSeq)[k]) continue;   // no guest write since the read: flush it
+            if (!any) { s_pskip.assign(px.size(), 1u); if (g_wbSkipMask) for (size_t i = 0; i < px.size(); ++i) s_pskip[i] = g_wbSkipMask[i]; any = true; }
+            const uint32_t rel = page - fbp, bx = rel % fbw, by = rel / fbw;
+            for (int y = (int)by * bh; y < (int)(by + 1u) * bh && y < h; ++y)
+                for (int x = (int)bx * 64; x < (int)(bx + 1u) * 64 && x < w; ++x) s_pskip[(size_t)y * w + x] = 0u;
+            extern unsigned long g_deferPageSkip; ++g_deferPageSkip;
+        }
+        if (any) g_wbSkipMask = s_pskip.data();
+    }
     ps2xWritebackToVramMasked(fbp, fit->second.fbw, fit->second.psm, w, h, px.data(), wbMask);
     { extern int g_wbFlipY; g_wbFlipY = 0; }
       g_flWrite += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count(); }
@@ -1760,6 +1781,7 @@ bool GsGpuRenderer::serviceBlockingBarriers()
             if (pend) renderAndGetTextureId(512, 448);
             while (serviceNextDecode()) {}
             if (!r.dec->served) serviceDecodeReq(*r.dec);   // already rendered past it (published list): flush + decode anyway
+            g_bbCv.notify_all();   // [uploadwait] wake a guest waiting for this page's flush
             any = true;
             continue;
         }
@@ -1843,7 +1865,8 @@ static bool ddPageAllowed(uint32_t page)
     for (uint32_t p : s_pages) if (p == page) return true;
     return false;
 }
-unsigned long g_deferPosted = 0, g_deferServed = 0, g_deferGate = 0, g_deferLate = 0;   // [deferdec] stats
+unsigned long g_deferPosted = 0, g_deferServed = 0, g_deferGate = 0, g_deferLate = 0, g_deferPubWait = 0, g_deferUploadWait = 0, g_deferPageSkip = 0;   // [deferdec] stats
+static std::unordered_map<uint64_t, std::shared_ptr<TexDecodeReq>> g_deferByKey;   // [ddkey] key -> latest request (diag; guarded by m_mtx)
 extern GS *g_gsWb;   // [deferdec] the GS the writeback path uses (set on the first writeback)
 void GsGpuRenderer::postDecode(std::shared_ptr<TexDecodeReq> req)
 {   // [deferdec] guest thread: a placeholder cache entry (w/h set, no texels) so this frame's later
@@ -1851,8 +1874,18 @@ void GsGpuRenderer::postDecode(std::shared_ptr<TexDecodeReq> req)
     {
         std::lock_guard<std::mutex> lk(m_mtx);
         CachedTex &ct = m_texCache[req->texKey];
-        ct.w = req->texW; ct.h = req->texH; ct.needsUpload = false; ct.rgba.clear();
+        // [placeholder] never disturb an existing entry: a same-key re-post arriving before the previous
+        // decode's upload would otherwise wipe its texels and clear needsUpload (the draws in between then
+        // bound whatever old GL texture the key had -> stray stale outline fragments live).
+        if (ct.w <= 0) { ct.w = req->texW; ct.h = req->texH; ct.needsUpload = false; ct.rgba.clear(); }
         g_texLastUse[req->texKey] = g_texUseGen;
+        g_deferByKey[req->texKey] = req;   // [ddkey]
+        auto snap = [&](uint32_t page, uint32_t &lo, std::vector<uint32_t> &seq) {   // [pageskip]
+            if (page == 0xFFFFFFFFu || page >= kVramPages) return;
+            const uint32_t n = std::min(flushCoverPages(page), kVramPages - page);
+            lo = page; seq.assign(m_uploadSeq + page, m_uploadSeq + page + n); };
+        snap(req->flushPage, req->coverLo, req->coverSeq);
+        snap(req->flushClutPage, req->coverLo2, req->coverSeq2);
     }
     { extern uint32_t g_zwbBp, g_zwbPsm, g_zwbBw; extern double g_zwbZMax;   // [zwbsnap]
       req->zwbBp = g_zwbBp; req->zwbPsm = g_zwbPsm; req->zwbBw = g_zwbBw; req->zwbZMax = g_zwbZMax; }
@@ -1867,7 +1900,7 @@ void GsGpuRenderer::postDecode(std::shared_ptr<TexDecodeReq> req)
         if (req->flushClutPage != 0xFFFFFFFFu && req->flushClutPage != req->flushPage) ++g_deferPending[req->flushClutPage];
     }
     ++g_deferPosted;
-    if (g_deferPosted <= 4ul || (g_deferPosted & 1023ul) == 0ul) std::fprintf(stderr, "[deferdec] posted %lu served %lu late %lu (key %llx page %u clut %u)\n", g_deferPosted, g_deferServed, g_deferLate, (unsigned long long)req->texKey, req->flushPage, req->flushClutPage);
+    if (g_deferPosted <= 4ul || (g_deferPosted & 1023ul) == 0ul) std::fprintf(stderr, "[deferdec] posted %lu served %lu late %lu pubwait %lu upwait %lu pageskip %lu (key %llx page %u clut %u)\n", g_deferPosted, g_deferServed, g_deferLate, g_deferPubWait, g_deferUploadWait, g_deferPageSkip, (unsigned long long)req->texKey, req->flushPage, req->flushClutPage);
     recordCmd(c);
     flushStage();   // the GL thread must be able to see the command in m_building right away
     static const bool s_ddRig = [](){ const char *v = std::getenv("PS2X_DEFERDEC_RIG"); return v && v[0] && v[0] != '0'; }();
@@ -1886,10 +1919,51 @@ void GsGpuRenderer::postDecode(std::shared_ptr<TexDecodeReq> req)
     }
     g_bbCv.notify_all();
 }
+// [flushcover] a page flush writes the WHOLE FBO of that page back (512x448 CT32 = 112 pages), so a queued
+// flush of page P is pending for every page its write will cover -- the shadow blob at page 349 was being
+// overwritten by the deferred flush of page 336 landing after the game's re-upload (sky-blue 64x64 textures).
+static uint32_t flushCoverPages(uint32_t page)
+{
+    auto it = g_fbos.find(page);
+    if (it == g_fbos.end() || it->second.w <= 0 || it->second.h <= 0) return 128u;   // unknown yet: be conservative
+    return (uint32_t)(((size_t)it->second.w * (size_t)it->second.h * 4u + 8191u) / 8192u);   // 4 bpp: conservative for 16-bit views
+}
+static bool flushPendingLocked(uint32_t page)
+{   // g_barMx held
+    for (const auto &kv : g_deferPending)
+        if (kv.second > 0 && page >= kv.first && page < kv.first + flushCoverPages(kv.first)) return true;
+    return false;
+}
 bool GsGpuRenderer::flushPending(uint32_t page)
-{   // [deferpend]
+{   // [deferpend] [flushcover]
     std::lock_guard<std::mutex> bk(g_barMx);
-    return g_deferPending.count(page) != 0;
+    return flushPendingLocked(page);
+}
+void GsGpuRenderer::waitPendingFlush(uint32_t page)
+{   // [uploadwait] a guest VRAM write (image upload / local copy) into a page whose deferred flush is still
+    // queued would be overwritten by that flush (and the decode would read the newer data): wait for the
+    // service, bounded. This is the only wait left in the deferred design and it is rare (CLUT re-uploads).
+    static const bool s_uw = [](){ const char *v = std::getenv("PS2X_UPLOADWAIT"); return v && v[0] && v[0] != '0'; }();   // =1: full wait for the queued flush (old behaviour)
+    auto inWindow = [&]() -> bool {
+        const uint32_t lo = m_svcLo.load(), n = m_svcN.load(), lo2 = m_svcLo2.load(), n2 = m_svcN2.load();
+        return (n && page >= lo && page < lo + n) || (n2 && page >= lo2 && page < lo2 + n2); };
+    static const bool s_sw = [](){ const char *v = std::getenv("PS2X_SVCWINDOW"); return v && v[0] && v[0] != '0'; }();   // [svcwindow] opt-in (made the picture worse, 01:10)
+    if (!s_uw)
+    {   // [svcwindow] only while a service is actively saving/flushing/restoring these pages (about a millisecond)
+        if (!s_sw || !inWindow()) return;
+        extern unsigned long g_deferUploadWait; ++g_deferUploadWait;
+        void *sc0 = ps2xGuestWaitBegin();
+        for (int i = 0; i < 20000 && inWindow(); ++i) std::this_thread::sleep_for(std::chrono::microseconds(50));
+        ps2xGuestWaitEnd(sc0);
+        return;
+    }
+    if (!flushPending(page)) return;
+    extern unsigned long g_deferUploadWait; ++g_deferUploadWait;
+    void *sc = ps2xGuestWaitBegin();
+    std::unique_lock<std::mutex> lk(g_bbMx);
+    g_bbCv.wait_for(lk, std::chrono::milliseconds(500), [&]{ std::lock_guard<std::mutex> bk(g_barMx); return !flushPendingLocked(page) || g_bbAbort.load(); });
+    lk.unlock();
+    ps2xGuestWaitEnd(sc);
 }
 bool GsGpuRenderer::serviceNextDecode()
 {   // [deferdec] GL thread. Find the first unserved decode command at or after m_segFrom, render
@@ -1928,21 +2002,45 @@ void GsGpuRenderer::serviceDecodeReq(TexDecodeReq &q)
 {   // [deferdec] GL thread, outside any render: the barrier's flush, then the decode from VRAM.
     struct ZwbScope { GsGpuRenderer *r; ~ZwbScope() { r->m_zwbOverride = nullptr; } } zwbScope{this};   // [zwbsnap]
     m_zwbOverride = &q;
+    // [pagesave] pages the GUEST wrote after the read hold newer data than the flush: save them, flush everything
+    // (the decode must see the FBO content the read expected), decode, then put the guest's data back. The pages
+    // stay marked pending until the restore is done, so a guest read meanwhile is deferred, not decoded from the
+    // clobbered VRAM; a page the guest writes again during the window is not restored over (newest wins).
+    struct Saved { uint32_t page; uint32_t seq; std::vector<uint8_t> bytes; };
+    std::vector<Saved> saved;
+    auto savePages = [&](uint32_t lo, const std::vector<uint32_t> &seq) {
+        if (!g_gsWb || lo == 0xFFFFFFFFu) return;
+        uint8_t *vram = g_gsWb->vramData(); const size_t vsz = g_gsWb->vramSize();
+        std::lock_guard<std::mutex> lk(m_mtx);
+        for (size_t k = 0; k < seq.size(); ++k)
+        {
+            const uint32_t page = lo + (uint32_t)k;
+            if (page >= kVramPages || m_uploadSeq[page] <= seq[k]) continue;
+            const size_t off = (size_t)page * 8192u; if (off + 8192u > vsz) break;
+            saved.push_back({page, m_uploadSeq[page], std::vector<uint8_t>(vram + off, vram + off + 8192u)});
+            extern unsigned long g_deferPageSkip; ++g_deferPageSkip;
+        }
+    };
+    // [svcwindow] guest uploads into these pages wait until the restore is done (see waitPendingFlush)
+    m_svcLo.store(q.coverLo); m_svcN.store((uint32_t)q.coverSeq.size()); m_svcLo2.store(q.coverLo2); m_svcN2.store((uint32_t)q.coverSeq2.size());
+    struct SvcWindow { GsGpuRenderer *r; ~SvcWindow() { r->m_svcN.store(0); r->m_svcN2.store(0); r->m_svcLo.store(0xFFFFFFFFu); r->m_svcLo2.store(0xFFFFFFFFu); } } svcWindow{this};
+    savePages(q.coverLo, q.coverSeq); savePages(q.coverLo2, q.coverSeq2);
+    auto releasePending = [&](uint32_t pg) {   // [deferpend] v1 order (the best-measured state): release right after the flush
+        std::lock_guard<std::mutex> bk(g_barMx);
+        auto it = g_deferPending.find(pg); if (it != g_deferPending.end() && --it->second <= 0) g_deferPending.erase(it); };
     if (q.flushPage != 0xFFFFFFFFu)
     {
         m_flushAlphaNow = q.flushAlpha;
         flushPageToVram(q.flushPage);
         m_flushAlphaNow = false;
         g_barFlushed.insert(q.flushPage);
-        std::lock_guard<std::mutex> bk(g_barMx);   // [deferpend]
-        auto it = g_deferPending.find(q.flushPage); if (it != g_deferPending.end() && --it->second <= 0) g_deferPending.erase(it);
+        releasePending(q.flushPage);
     }
     if (q.flushClutPage != 0xFFFFFFFFu && q.flushClutPage != q.flushPage)
     {
         flushPageToVram(q.flushClutPage);
         g_barFlushed.insert(q.flushClutPage);
-        std::lock_guard<std::mutex> bk(g_barMx);   // [deferpend]
-        auto it = g_deferPending.find(q.flushClutPage); if (it != g_deferPending.end() && --it->second <= 0) g_deferPending.erase(it);
+        releasePending(q.flushClutPage);
     }
     if (g_gsWb)
     {
@@ -1965,6 +2063,13 @@ void GsGpuRenderer::serviceDecodeReq(TexDecodeReq &q)
         putTexture(q.texKey, std::move(rgba), subW, q.texH, q.pageLo, q.pageHi);   // uploaded by the next render's pre pass
         ++g_deferServed;
         if (g_deferServed <= 6ul) std::fprintf(stderr, "[deferdec] served %lu: key %llx page %u clut %u alpha=%d -> %dx%d meanA=%.1f\n", g_deferServed, (unsigned long long)q.texKey, q.flushPage, q.flushClutPage, (int)q.flushAlpha, subW, q.texH, meanA);
+    }
+    if (!saved.empty() && g_gsWb)
+    {   // restore the guest's newer pages (unless the guest wrote them again meanwhile)
+        uint8_t *vram = g_gsWb->vramData();
+        std::lock_guard<std::mutex> lk(m_mtx);
+        for (const Saved &e : saved)   // no guest write can have landed inside the window (uploads wait for it)
+            std::memcpy(vram + (size_t)e.page * 8192u, e.bytes.data(), 8192u);
     }
     q.served = true;
 }
@@ -2046,7 +2151,7 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
             std::lock_guard<std::mutex> bk(g_barMx);
             // [deferpend] a page whose flush is posted but not yet serviced is still stale in VRAM: a later
             // read must not decode synchronously from it (that is what the rig, which flushes inline, never sees)
-            const bool pend = g_deferPending.count(page) != 0;
+            const bool pend = flushPendingLocked(page);   // [flushcover]
             const bool dirtyBefore = g_barDirty.count(page) != 0;
             const bool dirty = dirtyBefore || pend;
             if (!dirty && !(wantsAlphaAsData && (s_barAlwaysAEnv || g_barAlphaStale.count(page)))) return;
@@ -2099,7 +2204,7 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
         // its last flush already wrote alpha; a clean page whose alpha was withheld still flushes.
         // PS2X_BARALWAYSA=1 restores the old unconditional behaviour for A/B.
         static const bool s_alwaysA = [](){ const char *v = std::getenv("PS2X_BARALWAYSA"); return v && v[0] && v[0] != '0'; }();
-        const bool dirty = g_barDirty.count(page) != 0 || g_deferPending.count(page) != 0;   // [deferpend]
+        const bool dirty = g_barDirty.count(page) != 0 || flushPendingLocked(page);   // [deferpend] [flushcover]
         if (!dirty && !(wantsAlphaAsData && (s_alwaysA || g_barAlphaStale.count(page)))) return;
         g_barDirty.erase(page);
     }
@@ -2700,6 +2805,18 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
                          (unsigned long long)key, w, h,
                          (unsigned)(sr/px), (unsigned)(sg/px), (unsigned)(sb/px), (unsigned)(sa/px));
             std::fflush(s_f);
+        }
+    }
+    {   // [texlog] PS2X_TEXLOG=path: one line per putTexture (both the guest's synchronous decodes and the deferred
+        // ones): dims + mean RGBA + a coarse content hash, to diff a texture's content between builds/modes.
+        static FILE *s_tl = [](){ const char *v = std::getenv("PS2X_TEXLOG"); return v && v[0] ? std::fopen(v, "w") : nullptr; }();
+        if (s_tl && w > 0 && h > 0 && rgba.size() >= 4)
+        {
+            unsigned long sr = 0, sg = 0, sb = 0, sa = 0; uint64_t hh = 1469598103934665603ull;
+            for (size_t i = 0; i + 3 < rgba.size(); i += 4) { sr += rgba[i]; sg += rgba[i+1]; sb += rgba[i+2]; sa += rgba[i+3]; }
+            for (size_t i = 0; i < rgba.size(); i += 64) { hh = (hh ^ rgba[i]) * 1099511628211ull; }
+            const size_t px = rgba.size() / 4;
+            std::fprintf(s_tl, "%dx%d pages %u-%u gl=%d mean %lu %lu %lu %lu hash %llx\n", w, h, pageLo, pageHi, (int)ps2xOnGlThread(), sr / px, sg / px, sb / px, sa / px, (unsigned long long)hh);
         }
     }
     (void)pageLo; (void)pageHi;
@@ -3582,13 +3699,24 @@ void GsGpuRenderer::swapFrame()
             std::fprintf(stderr, "[framesize] swapFrame #%d publishing %zu cmds\n", ++n, m_building.size()); }
     }
     std::unique_lock<std::mutex> lk(m_mtx);
-    while (m_segSwapped)
-    {   // [segshadow] a deferred-decode segment render holds the list; wait for its swap-back (ms at most)
-        lk.unlock();
-        void *sc = ps2xGuestWaitBegin();
-        std::this_thread::sleep_for(std::chrono::microseconds(200));
-        ps2xGuestWaitEnd(sc);
-        lk.lock();
+    auto unservicedDecode = [&]() -> bool {   // [deferpub] a decode command published unserviced can only be
+        for (size_t i = m_segFrom; i < m_building.size(); ++i)   // reached in-loop by the frame render -> its draws
+            if (m_building[i].isDecode && m_building[i].decode && !m_building[i].decode->served) return true;   // bind an empty placeholder
+        return false; };
+    {
+        static const bool s_dd = [](){ const char *v = std::getenv("PS2X_DEFERDEC"); return v && v[0] && v[0] != '0'; }();
+        extern unsigned long g_deferPubWait; unsigned spins = 0;
+        while (m_segSwapped || (s_dd && unservicedDecode()))
+        {   // [segshadow] a segment render holds the list / [deferpub] the GL thread is still draining this frame's
+            // decode queue: wait for it (bounded: the queue is at most a few ms behind; 200 ms cap = don't deadlock)
+            lk.unlock();
+            void *sc = ps2xGuestWaitBegin();
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            ps2xGuestWaitEnd(sc);
+            lk.lock();
+            if (++spins == 1u) ++g_deferPubWait;
+            if (spins > 1000u) { static int n = 0; if (n++ < 4) std::fprintf(stderr, "[deferdec] publish waited 200 ms for the decode queue -- giving up this frame\n"); break; }
+        }
     }
     if (!m_building.empty())
     {
@@ -3649,6 +3777,7 @@ void GsGpuRenderer::onVramUpload(uint32_t dbpBlock, uint32_t sizeBlocks)
     {   // BOTH: a guest upload changes content AND is what srcUploaded keys on.
         m_pageSeq[p] = m_writeSeq;
         m_contentSeq[p] = m_writeSeq;
+        if (!ps2xOnGlThread()) m_uploadSeq[p] = m_writeSeq;   // [pageskip] GUEST write only (the writeback path also calls onVramUpload via [wbstamp])
     }
     { extern std::vector<std::pair<uint32_t,uint32_t>> g_pageStampSrc; if (g_pageStampSrc.size() < kVramPages) g_pageStampSrc.resize(kVramPages);
       for (uint32_t p = p0; p <= p1; ++p) g_pageStampSrc[p] = {dbpBlock, sizeBlocks}; }   // [seqattr] upload
@@ -9070,9 +9199,17 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     static int n = 0;
                     if (s_sd && c.texKey && n < 16)
                     {   ++n;
-                        std::fprintf(stderr, "[supdiag] GL-miss drop: reclaimed=%d inCpu=%d dest f%u src tbp %u psm %u %dx%d seg=%d idx=%zu/%zu pending=%zu building=%zu\n",
-                                     (int)g_reclaimed.count(c.texKey), (int)(m_texCache.find(c.texKey) != m_texCache.end()),
-                                     c.destFbp, c.srcTbp0, c.srcPsm, c.srcTexW, c.srcTexH, (int)m_segMode, (size_t)(&c - cmds.data()), cmds.size(), m_pending.size(), m_building.size());
+                        {   // [ddkey] deferred-request + cache state of the dropped key
+                            int dd = -1, served = -1; uint32_t fp = 0, cp = 0; int cw = -1; size_t cb = 0; int nu = -1;
+                            auto di = g_deferByKey.find(c.texKey);
+                            if (di != g_deferByKey.end()) { dd = 1; served = (int)di->second->served; fp = di->second->flushPage; cp = di->second->flushClutPage; } else dd = 0;
+                            auto ti = m_texCache.find(c.texKey);
+                            if (ti != m_texCache.end()) { cw = ti->second.w; cb = ti->second.rgba.size(); nu = (int)ti->second.needsUpload; }
+                            std::fprintf(stderr, "[supdiag] GL-miss drop: reclaimed=%d inCpu=%d dest f%u src tbp %u psm %u %dx%d seg=%d idx=%zu/%zu pending=%zu building=%zu | deferred=%d served=%d flush=%u clut=%u | cache w=%d bytes=%zu needsUpload=%d\n",
+                                         (int)g_reclaimed.count(c.texKey), (int)(m_texCache.find(c.texKey) != m_texCache.end()),
+                                         c.destFbp, c.srcTbp0, c.srcPsm, c.srcTexW, c.srcTexH, (int)m_segMode, (size_t)(&c - cmds.data()), cmds.size(), m_pending.size(), m_building.size(),
+                                         dd, served, fp, cp, cw, cb, nu);
+                        }
                     }
                 }
                 // [maskmiss] This skip has NO env gate: a draw whose texture is in the CPU cache

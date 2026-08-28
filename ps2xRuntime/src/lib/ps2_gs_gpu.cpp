@@ -3113,6 +3113,16 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_transferState.x = m_trxpos.dsax;
         m_transferState.y = m_trxpos.dsay;
         m_transferState.total_pixels = m_trxreg.rrw * m_trxreg.rrh;
+        if ((m_trxdir == 0u || m_trxdir == 2u) && m_vram)
+        {   // [uploadwait] the destination pages must not have a deferred flush still queued (see waitPendingFlush)
+            const uint32_t bpp = (m_bitbltbuf.dpsm == GS_PSM_T8 || m_bitbltbuf.dpsm == GS_PSM_T8H) ? 1u
+                               : (m_bitbltbuf.dpsm == GS_PSM_T4 || m_bitbltbuf.dpsm == GS_PSM_T4HL || m_bitbltbuf.dpsm == GS_PSM_T4HH) ? 1u
+                               : (m_bitbltbuf.dpsm == GS_PSM_CT16 || m_bitbltbuf.dpsm == GS_PSM_CT16S || m_bitbltbuf.dpsm == GS_PSM_Z16 || m_bitbltbuf.dpsm == GS_PSM_Z16S) ? 2u : 4u;
+            const uint32_t rowBytes = std::max(1u, (uint32_t)m_bitbltbuf.dbw) * 64u * bpp;
+            const uint32_t pageLo = m_bitbltbuf.dbp / 32u;
+            const uint32_t pageHi = pageLo + ((m_trxpos.dsay + m_trxreg.rrh) * rowBytes) / 8192u + 1u;
+            for (uint32_t p = pageLo; p <= pageHi && p < 512u; ++p) ps2GpuRenderer().waitPendingFlush(p);
+        }
         m_transferState.copied_pixels = 0;
 
         if (m_trxdir == 2 && m_vram)

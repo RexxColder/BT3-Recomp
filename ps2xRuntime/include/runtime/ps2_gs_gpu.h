@@ -206,6 +206,8 @@ struct TexDecodeReq
     uint32_t flushPage = 0xFFFFFFFFu, flushClutPage = 0xFFFFFFFFu;   // pages the GL thread must write back first
     bool flushAlpha = false;
     bool served = false;   // set by the GL thread once decoded
+    uint32_t coverLo = 0xFFFFFFFFu, coverLo2 = 0xFFFFFFFFu;   // [pageskip] first page of each flush's FBO cover
+    std::vector<uint32_t> coverSeq, coverSeq2;                 // [pageskip] m_contentSeq of the covered pages at the read: pages the guest wrote after it are not overwritten by the flush
     uint32_t zwbBp = 0, zwbPsm = 0, zwbBw = 0; double zwbZMax = 0.0;   // [zwbsnap] ZBUF state at the read: the flush must not use the guest's LATER zbuf
 };
 

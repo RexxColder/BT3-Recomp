@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <atomic>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -245,6 +246,7 @@ public:
                            bool wantsAlphaAsData = false, bool *deferOut = nullptr);   // [deferdec] deferOut: report "would wait" instead of waiting
     void postDecode(std::shared_ptr<TexDecodeReq> req);   // [deferdec]
     bool flushPending(uint32_t page);                    // [deferpend] a deferred flush of this page is queued but not yet serviced
+    void waitPendingFlush(uint32_t page);                // [uploadwait] guest: block (bounded) until that flush has run -- before overwriting the page
     bool serviceNextDecode();                            // [deferdec] GL thread: render up to the next unserved decode command, then service it
     void serviceDecodeReq(TexDecodeReq &q);              // [deferdec] GL thread: flush page(s) -> decode -> putTexture
 
@@ -329,6 +331,8 @@ private:
     bool   m_segSwapped = false;          // [segshadow] a segment render holds m_building swapped out; guest appends go to the shadow
     std::vector<DrawCmd> m_buildingShadow;   // [segshadow]
     std::vector<DrawCmd> m_segTail;          // [segtail] commands past m_stopAt, parked during a split segment render
+    const std::vector<uint32_t> *m_pageSkipSeq = nullptr; uint32_t m_pageSkipLo = 0;   // [pageskip] while servicing a deferred flush
+    std::atomic<uint32_t> m_svcLo{0xFFFFFFFFu}, m_svcN{0}, m_svcLo2{0xFFFFFFFFu}, m_svcN2{0};   // [svcwindow] page ranges a deferred service is touching right now
     const TexDecodeReq *m_zwbOverride = nullptr;   // [zwbsnap] while servicing a deferred flush: use the request's zbuf snapshot
     bool   m_inDecodeService = false;   // [deferdec] reentrancy guard for serviceNextDecode
     size_t m_stopAt = (size_t)-1;   // [deferdec] a render stops BEFORE this index (segment split at a decode command)
@@ -371,6 +375,7 @@ private:
     // stamping m_pageSeq from a writeback flips the FBO-vs-decode routing and makes the blur
     // chain flap between paths on alternate frames.
     uint32_t m_contentSeq[kVramPages] = {};
+    uint32_t m_uploadSeq[kVramPages] = {};   // [pageskip] bumped by GUEST uploads/copies only (m_contentSeq also counts GL writebacks)
     // Last write seq at which a draw/transfer RENDERED INTO each fbp. Indexed by fbp,
     // which equals the VRAM page index (tbp0/32), same unit as m_pageSeq. Compared
     // against m_pageSeq to decide upload-vs-RT precedence (DrawCmd::srcUploaded).
