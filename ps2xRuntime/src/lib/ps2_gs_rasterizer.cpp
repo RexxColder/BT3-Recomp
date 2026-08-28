@@ -4130,8 +4130,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         if (cmd.srcIndexed && p == 27u)
         {
             ensureClutCache(gs);
-            uint64_t h2 = 1469598103934665603ull;
-            for (int i = 0; i < 256; ++i) h2 = (h2 ^ gs->m_clutCache[i]) * 1099511628211ull;
+            const uint64_t h2 = gs->m_clutCacheHash256;   // [cluthash] fresh: ensureClutCache just ran
             cmd.srcClutKey = h2 ? h2 : 1ull;
             extern void ps2xPublishClut(uint64_t key, const uint32_t *pal);
             ps2xPublishClut(cmd.srcClutKey, gs->m_clutCache);
