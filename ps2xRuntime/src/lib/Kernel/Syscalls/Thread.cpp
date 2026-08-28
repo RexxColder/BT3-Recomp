@@ -1300,3 +1300,19 @@ namespace ps2_syscalls
         return false;
     }
 }
+
+// [schedwhy2] wait reason of a guest thread for the [sched-state] dump: wait type / id, and for a semaphore wait the
+// semaphore's current count and waiter count. Returns false if the thread is unknown.
+extern "C" bool ps2xThreadWaitInfo(int tid, int *waitType, int *waitId, int *semaCount, int *semaWaiters, int *wakeupCount)
+{
+    auto info = lookupThreadInfo(tid);
+    if (!info) return false;
+    std::lock_guard<std::mutex> lock(info->m);
+    *waitType = info->waitType; *waitId = info->waitId; *wakeupCount = info->wakeupCount; *semaCount = -1; *semaWaiters = -1;
+    if (info->waitType == TSW_SEMA)
+    {
+        auto sema = lookupSemaInfo(info->waitId);
+        if (sema) { *semaCount = sema->count; *semaWaiters = sema->waiters; }
+    }
+    return true;
+}

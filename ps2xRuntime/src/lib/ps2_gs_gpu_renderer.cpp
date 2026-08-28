@@ -918,6 +918,66 @@ bool GsGpuRenderer::hasTexture(uint64_t key, uint32_t pageLo, uint32_t pageHi)
     return true;
 }
 
+
+// [groundshadow] PS2X_GROUNDSHADOW=1: a soft dark ellipse under each fighter, derived from the screen-space extent of
+// the fighters' T4 skin draws (palettes cbp 15360..15399) in the previous frame; drawn right before the first fighter
+// draw of a frame so the body occludes it. Fallback for the mask-page shadow composite (see bt3-character-shadows).
+namespace {
+    struct GsBlob { float cx, feetY, w; };
+    std::vector<GsBlob> g_blobs;                 // from the previous frame
+    std::vector<float> g_blobX, g_blobY;         // this frame's fighter vertices
+    Texture2D g_blobTex{};
+    bool g_blobDrawn = false;                    // once per frame; reset in blobFrameEnd()
+    int groundShadowMode() { static const int s = [](){ const char *v = std::getenv("PS2X_GROUNDSHADOW"); return v && v[0] ? std::atoi(v) : 0; }(); return s; }
+    bool groundShadowOn() { return groundShadowMode() != 0; }
+    bool isFighterDraw(const GsGpuRenderer::DrawCmd &c) { return c.isTriangle && c.srcPsm == 20u && c.srcClutTbp >= 15360u && c.srcClutTbp < 15400u && !c.isTransfer; }
+    void blobAccumulate(const GsGpuRenderer::DrawCmd &c) { for (int i = 0; i < 3; ++i) { g_blobX.push_back(c.tri[i].x); g_blobY.push_back(c.tri[i].y); } }
+    void blobFrameEnd()
+    {
+        g_blobs.clear(); g_blobDrawn = false;
+        const size_t n = g_blobX.size();
+        if (n >= 60)
+        {
+            float lo = g_blobX[0], hi = g_blobX[0];
+            for (float x : g_blobX) { lo = std::min(lo, x); hi = std::max(hi, x); }
+            float c0 = lo, c1 = hi;
+            std::vector<uint8_t> lab(n, 0);
+            for (int it = 0; it < 6; ++it)
+            {
+                double s0 = 0, s1 = 0; size_t n0 = 0, n1 = 0;
+                for (size_t i = 0; i < n; ++i) { const bool b = std::fabs(g_blobX[i] - c1) < std::fabs(g_blobX[i] - c0); lab[i] = b; if (b) { s1 += g_blobX[i]; ++n1; } else { s0 += g_blobX[i]; ++n0; } }
+                if (n0) c0 = (float)(s0 / n0); if (n1) c1 = (float)(s1 / n1);
+            }
+            for (int k = 0; k < 2; ++k)
+            {
+                std::vector<float> ys; float xmin = 1e9f, xmax = -1e9f; double sx = 0; size_t cnt = 0;
+                for (size_t i = 0; i < n; ++i) if (lab[i] == k) { ys.push_back(g_blobY[i]); xmin = std::min(xmin, g_blobX[i]); xmax = std::max(xmax, g_blobX[i]); sx += g_blobX[i]; ++cnt; }
+                if (cnt < 30) continue;
+                std::sort(ys.begin(), ys.end());
+                const float feet = ys[(size_t)((ys.size() - 1) * 0.97)];
+                const float w = std::min(220.0f, std::max(36.0f, xmax - xmin));
+                g_blobs.push_back(GsBlob{(float)(sx / cnt), feet, w});
+            }
+        }
+        { static unsigned long nf = 0; if ((++nf % 120ul) == 1ul) std::fprintf(stderr, "[groundshadow] frame %lu: fighter verts %zu -> blobs %zu\n", nf, n, g_blobs.size()); }
+        g_blobX.clear(); g_blobY.clear();
+    }
+    void blobEnsureTex()
+    {
+        if (g_blobTex.id) return;
+        const int N = 64; std::vector<uint8_t> px((size_t)N * N * 4);
+        for (int y = 0; y < N; ++y) for (int x = 0; x < N; ++x)
+        {
+            const float dx = (x + 0.5f) / N * 2.0f - 1.0f, dy = (y + 0.5f) / N * 2.0f - 1.0f;
+            const float r = std::sqrt(dx * dx + dy * dy);
+            float a = r >= 1.0f ? 0.0f : (1.0f - r); a = a * a * (3.0f - 2.0f * a);   // smoothstep falloff
+            uint8_t *p = &px[((size_t)y * N + x) * 4]; p[0] = p[1] = p[2] = 0; p[3] = (uint8_t)(a * 255.0f);
+        }
+        Image im{px.data(), N, N, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+        g_blobTex = LoadTextureFromImage(im);
+        SetTextureFilter(g_blobTex, TEXTURE_FILTER_BILINEAR);
+    }
+}
 uint64_t GsGpuRenderer::resolveTextureVersion(uint64_t baseKey, uint32_t pageLo, uint32_t pageHi,
                                               const uint8_t *vram, uint32_t vramSize, bool &needDecode)
 {
@@ -1011,20 +1071,32 @@ uint64_t GsGpuRenderer::resolveTextureVersion(uint64_t baseKey, uint32_t pageLo,
             memo = &s_memo[memoKey];
             memoHit = (memo->h != 0 && memo->mx == mxPre && memo->wbGen == g_ps2xWbGen);
         }
+        std::vector<uint32_t> pseq; pseq.reserve(pageHi - pageLo + 1u);   // [pagehash] per-page content seqs captured under the lock
+        for (uint32_t p = pageLo; p <= pageHi; ++p) pseq.push_back(m_contentSeq[p]);
         lk.unlock();   // [verlock] hash the span WITHOUT the renderer mutex: VRAM is guest-owned and the memo is guest-static; holding it here (up to MBs per draw) stalled the GL thread and made every lock/unlock a futex round trip
         uint64_t h = 1469598103934665603ull;
         if (memoHit && s_hm == 1) h = memo->h;
         else if (vram && vramSize)
-        {
-            uint64_t begin = static_cast<uint64_t>(pageLo) * 8192ull;
-            uint64_t end = (static_cast<uint64_t>(pageHi) + 1ull) * 8192ull;
-            if (begin < vramSize)
+        {   // [pagehash] per-page hash memo keyed on the page's content seq: after any upload into a shared 8 KB page
+            // the old code re-hashed the WHOLE texture span (several pages, 91% of terrain-texture checks were dirty
+            // in the fight -- chain64 [reval]); now only the page whose seq moved is re-hashed.
+            static std::vector<std::pair<uint32_t, uint64_t>> s_ph(kVramPages, std::make_pair(0xFFFFFFFFu, 0ull));
+            for (uint32_t p = pageLo; p <= pageHi; ++p)
             {
-                if (end > vramSize) end = vramSize;
-                const uint8_t *p8 = vram + begin;
-                uint64_t n = end - begin;
-                while (n >= 8) { uint64_t v; std::memcpy(&v, p8, 8); h = (h ^ v) * 1099511628211ull; p8 += 8; n -= 8; }
-                while (n--) { h = (h ^ *p8++) * 1099511628211ull; }
+                const uint64_t begin = static_cast<uint64_t>(p) * 8192ull;
+                if (begin >= vramSize) break;
+                const uint64_t end = std::min<uint64_t>(begin + 8192ull, vramSize);
+                const uint32_t seq = pseq[p - pageLo];
+                auto &e = s_ph[p];
+                if (e.first != seq || e.second == 0ull)
+                {
+                    uint64_t ph = 1469598103934665603ull;
+                    const uint8_t *p8 = vram + begin; uint64_t n = end - begin;
+                    while (n >= 8) { uint64_t v; std::memcpy(&v, p8, 8); ph = (ph ^ v) * 1099511628211ull; p8 += 8; n -= 8; }
+                    while (n--) { ph = (ph ^ *p8++) * 1099511628211ull; }
+                    e.first = seq; e.second = ph ? ph : 1ull;
+                }
+                h = (h ^ e.second) * 1099511628211ull;
             }
         }
         lk.lock();   // [verlock]
@@ -6500,6 +6572,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         if (listBoundsValid && nextListBoundary < listStarts.size() && ci == listStarts[nextListBoundary])
         {
             ++nextListBoundary;
+            if (groundShadowOn()) blobFrameEnd();   // [groundshadow]
             if (depthOn && ci != 0)
             {
                 endMode();
@@ -11185,6 +11258,49 @@ if (done.size() < 14 && !done.count(c.texKey))
 
         // Collapse an axis-aligned VRAM-textured triangle-pair into a sprite quad (crisp
         // thin edges). Skip for FBO sources (handled by the generic paths below).
+        if (groundShadowOn() && isFighterDraw(c))
+        {   // [groundshadow] first fighter draw of this frame: paint the previous frame's blobs underneath
+            if (!g_blobDrawn && !g_blobs.empty())
+            {
+                g_blobDrawn = true;
+                blobEnsureTex();
+                rlDrawRenderBatchActive();
+                rlSetShader(rlGetShaderIdDefault(), rlGetShaderLocsDefault());   // plain textured-alpha shader, not the GS emulation shader's current mode
+                rlSetBlendMode(BLEND_ALPHA);
+                glColorMask(1, 1, 1, 0);   // never touch the alpha channel (it carries the mask indices)
+                rlDisableDepthTest(); rlDisableDepthMask();
+                const bool dbg = groundShadowMode() == 2;   // opaque magenta, untextured: does the quad reach the target at all?
+                rlSetTexture(dbg ? g_white.id : g_blobTex.id);
+                rlBegin(RL_QUADS);
+                for (const GsBlob &b : g_blobs)
+                {
+                    const float w = b.w * 1.05f, h = w * 0.34f;
+                    const float x0 = b.cx - w * 0.5f, x1 = b.cx + w * 0.5f, y0 = b.feetY - h * 0.62f, y1 = b.feetY + h * 0.38f;
+                    { static int nlog = 0; if (nlog++ < 12) std::fprintf(stderr, "[groundshadow] draw cx=%.0f feet=%.0f w=%.0f -> (%.0f,%.0f)-(%.0f,%.0f) fbo=%u off=(%.0f,%.0f) depthOn=%d\n", b.cx, b.feetY, b.w, x0, y0, x1, y1, curFbp, offX, offY, (int)depthOn); }
+                    if (dbg) rlColor4ub(255, 0, 255, 255); else rlColor4ub(0, 0, 0, 110);
+                    rlNormal3f(0.0f, 0.0f, 1.0f);
+                    rlTexCoord2f(0.0f, 0.0f); rlVertex2f(x0 + offX, y0 + offY);
+                    rlTexCoord2f(0.0f, 1.0f); rlVertex2f(x0 + offX, y1 + offY);
+                    rlTexCoord2f(1.0f, 1.0f); rlVertex2f(x1 + offX, y1 + offY);
+                    rlTexCoord2f(1.0f, 0.0f); rlVertex2f(x1 + offX, y0 + offY);
+                }
+                rlEnd();
+                rlDrawRenderBatchActive();
+                rlSetTexture(0);
+                rlSetShader(g_shader.id, g_shader.locs);   // back to the GS shader (its uniforms are untouched)
+                if (depthOn) { rlEnableDepthTest(); rlEnableDepthMask(); }
+                curMask = -1; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;   // let the loop re-apply this draw's state
+                depthForCmd(c);
+            }
+            blobAccumulate(c);
+        }
+        {   // [shadowdecal] PS2X_SHADOWDECAL=0 skips the game's ground-shadow decal pass (floor-tile triangles sampling the
+            // 256x256 PSMCT24 view of page 336 with TEXA AEM, vtxA=63, bm 0x44, DATE on). Its source is the mask chain we
+            // cannot reproduce yet; under the outline stack it paints the "arrow" blob on the ground (SJ17). Default: draw.
+            static const bool s_sd = [](){ const char *v = std::getenv("PS2X_SHADOWDECAL"); return !(v && v[0] == '0'); }();
+            if (!s_sd && c.isTriangle && c.srcPsm == 1u && c.srcTbp0 == 10752u && c.dateEnable && c.blendMode == 0x44u && !c.isTransfer)
+            { PS2X_GATE_HIT(); continue; }
+        }
         if (c.destFbp == 224u && c.texKey != 0) g_f224Mark = 36;
         if (c.isTriangle && c.texKey != 0 && !fromFbo && ci + 1 < DC.size())
         {

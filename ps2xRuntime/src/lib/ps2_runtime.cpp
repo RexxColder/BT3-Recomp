@@ -433,6 +433,7 @@ namespace
     }
 }
 
+extern "C" bool ps2xThreadWaitInfo(int tid, int *waitType, int *waitId, int *semaCount, int *semaWaiters, int *wakeupCount);   // [schedwhy2] Thread.cpp
 extern "C" bool ps2xCdTickStale(unsigned ms);   // [dispatchpump]
 extern "C" void ps2xCdTickOnly(uint8_t *, R5900Context *, PS2Runtime *);
 extern "C" void *ps2xGuestWaitBegin();
@@ -3122,16 +3123,18 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
             if (s_dpOn && m_schedEnabled && ctx == &m_cpuContext && ((++s_dp & 0x3FFFu) == 0u))
             {
                 if (ps2xCdTickStale(20u)) ps2xCdTickOnly(rdram, ctx, this);
-                bool othersRunnable = false;
-                {
+                bool othersPresent = false;
+                {   // any other guest thread at all: a thread whose semaphore was just signalled from the RPC/interrupt
+                    // path still shows blocked=true until it gets the token, and this loop is the only place the main
+                    // thread's syscall-free polling ever gives it up (P17: sound thread tid4 signalled, never scheduled)
                     std::lock_guard<std::mutex> lk(m_schedMutex);
-                    for (auto &kv : m_schedThreads) { const SchedThread &s = *kv.second; if (kv.first != m_schedCurrent && s.present && !s.blocked) { othersRunnable = true; break; } }
+                    for (auto &kv : m_schedThreads) { const SchedThread &s = *kv.second; if (kv.first != m_schedCurrent && s.present) { othersPresent = true; break; } }
                 }
-                if (othersRunnable)
+                if (othersPresent)
                 {
                     static std::atomic<uint32_t> s_dy{0};
                     const uint32_t k = s_dy.fetch_add(1u);
-                    if (k < 4u || (k % 2000u) == 0u) std::fprintf(stderr, "[dispatchpump] main thread yielding to a runnable guest thread (x%u) at pc 0x%x\n", k + 1u, pc);
+                    if (k < 4u || (k % 20000u) == 0u) std::fprintf(stderr, "[dispatchpump] main thread yield (x%u) at pc 0x%x\n", k + 1u, pc);
                     void *scope = ps2xGuestWaitBegin(); std::this_thread::yield(); ps2xGuestWaitEnd(scope);
                 }
             }
@@ -3801,6 +3804,18 @@ void PS2Runtime::run()
                                   << " +0xa8=0x" << fa8 << " +0xbc=0x" << fbc << std::dec << std::endl;
                     }
                 }
+                {   // [sndblk] the sound stream control block 0x2c9350 (+8 / +4 sub-objects): the object the loading
+                    // hangs corrupt (field +0x10 = 0x02xxxxxx tagged handle dereferenced on tid4). Dumped with every
+                    // status line during loading (bt3state 0x2d) so a hung state can be diffed against a healthy one.
+                    const uint8_t *rd2 = m_memory.getRDRAM();
+                    auto r32 = [&](uint32_t a) -> uint32_t { uint32_t v = 0; std::memcpy(&v, rd2 + (a & PS2_RAM_MASK), 4); return v; };
+                    std::ostringstream sb; sb << "[sndblk] 0x2c9350:";
+                    for (uint32_t o = 0; o < 0x40u; o += 4u) sb << ' ' << std::hex << std::setw(8) << std::setfill('0') << r32(0x2c9350u + o);
+                    const uint32_t sub8 = r32(0x2c9358u), sub4 = r32(0x2c9354u);
+                    if (sub8 >= 0x100000u && sub8 < 0x2000000u) { sb << " | +8@" << sub8 << ":"; for (uint32_t o = 0; o < 0x20u; o += 4u) sb << ' ' << std::setw(8) << r32(sub8 + o); }
+                    if (sub4 >= 0x100000u && sub4 < 0x2000000u) { sb << " | +4@" << sub4 << ":"; for (uint32_t o = 0; o < 0x10u; o += 4u) sb << ' ' << std::setw(8) << r32(sub4 + o); }
+                    std::cerr << sb.str() << std::dec << std::endl;
+                }
                 std::cerr << "[status] pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
                           << " ra=0x" << m_debugRa.load(std::memory_order_relaxed) << std::dec
                           << " dma=" << m_memory.dmaStartCount()
@@ -3823,6 +3838,16 @@ void PS2Runtime::run()
                         std::cerr << " tid" << kv.first << "(" << (s.present?"P":"-") << (s.blocked?"B":"-")
                                   << ",ord=" << s.order;
                         if (s.blocked) std::cerr << ",pc=0x" << std::hex << s.blockPc << ",ra=0x" << s.blockRa << std::dec;   // [schedwhy]
+                        if (s.blocked)
+                        {   // [schedwhy2]
+                            int wt = 0, wid = 0, sc = -1, sw = -1, wk = 0;
+                            if (ps2xThreadWaitInfo(kv.first, &wt, &wid, &sc, &sw, &wk))
+                            {
+                                std::cerr << ",wait=" << wt << "/" << wid;
+                                if (sc >= 0) std::cerr << ",sema(cnt=" << sc << ",waiters=" << sw << ")";
+                                std::cerr << ",wk=" << wk;
+                            }
+                        }
                         std::cerr << ")";
                     }
                     std::cerr << std::endl;
