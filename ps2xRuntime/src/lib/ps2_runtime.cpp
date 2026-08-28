@@ -1321,6 +1321,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
     }
 }
 
+static thread_local R5900Context *t_bjCtx = nullptr; static thread_local uint8_t *t_bjRdram = nullptr;   // [thunkwatch]
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
@@ -1345,6 +1346,15 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
             std::cerr << "[badjump] out-of-code target 0x" << std::hex << address
                       << " ; last valid fn entered = 0x" << s_lastValidDispatch
                       << " ; prev = 0x" << s_prevValidDispatch << std::dec << std::endl;
+            {   // [thunkwatch] the sub_002722C0 case reloads $ra from [sp-16] (after its delay-slot addiu): show the slot
+                if (t_bjCtx && t_bjRdram)
+                {
+                    const uint32_t sp = static_cast<uint32_t>(_mm_extract_epi32(t_bjCtx->r[29], 0));
+                    uint32_t w[4] = {0, 0, 0, 0};
+                    for (int k = 0; k < 4; ++k) { const uint32_t a = (sp - 16u + 4u * k) & 0x1FFFFFFFu; if (a + 4 <= 32u * 1024u * 1024u) std::memcpy(&w[k], t_bjRdram + a, 4); }
+                    std::fprintf(stderr, "[badjump] sp=0x%x  [sp-16..sp)= %08x %08x %08x %08x  tid=%d ra=0x%x\n", sp, w[0], w[1], w[2], w[3], g_schedTid, static_cast<uint32_t>(_mm_extract_epi32(t_bjCtx->r[31], 0)));
+                }
+            }
             // Capture the C++ stack depth at the first bad jump: a huge depth == guest recursion
             // overflowed the (host) stack and clobbered the saved $ra. Small depth == a stray
             // write corrupted it. No gdb needed -> no timing perturbation.
@@ -1687,6 +1697,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
+    t_bjCtx = ctx; t_bjRdram = rdram;   // [thunkwatch] for the [badjump] slot dump
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
