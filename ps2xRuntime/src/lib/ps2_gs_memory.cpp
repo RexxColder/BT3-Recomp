@@ -280,6 +280,47 @@ namespace GSMem
         }
         return n;
     }
+    // [rowdecode] bulk row readers -- mirror the writers: page once per 64-px column, one table lookup per texel.
+    void ReadRowCT32(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u32* dst)
+    {
+        constexpr u32 kBlocks = C32Traits::BlocksPerPage(); constexpr auto kExt = C32Traits::PageExtent(); constexpr u32 kPixels = C32Traits::PixelsPerPage();
+        const auto &row = PageTableC32[bp % kBlocks][y % kExt.y];
+        u32 x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(C32Traits::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x) { const usz a = ((pageBase + row[x % kExt.x]) * 4u) & (MEMORY_SIZE - 4u); std::memcpy(dst + (x - x0), &data[a], 4u); }
+        }
+    }
+    void ReadRowP8H(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u8* dst)
+    {   // P8H = the high byte of the CT32 word at the same pixel address (BitOffset 24)
+        constexpr u32 kBlocks = C32Traits::BlocksPerPage(); constexpr auto kExt = C32Traits::PageExtent(); constexpr u32 kPixels = C32Traits::PixelsPerPage();
+        const auto &row = PageTableC32[bp % kBlocks][y % kExt.y];
+        u32 x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(C32Traits::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x) { const usz a = ((pageBase + row[x % kExt.x]) * 4u + 3u) & (MEMORY_SIZE - 1u); dst[x - x0] = data[a]; }
+        }
+    }
+    template <typename TraitsT, typename TableT>
+    static void readRow16(const TableT &table, const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst)
+    {
+        constexpr u32 kBlocks = TraitsT::BlocksPerPage(); constexpr auto kExt = TraitsT::PageExtent(); constexpr u32 kPixels = TraitsT::PixelsPerPage();
+        const auto &row = table[bp % kBlocks][y % kExt.y];
+        u32 x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(TraitsT::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x) { const usz a = ((pageBase + row[x % kExt.x]) * 2u) & (MEMORY_SIZE - 2u); std::memcpy(dst + (x - x0), &data[a], 2u); }
+        }
+    }
+    void ReadRowCT16(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst)  { readRow16<C16Traits>(PageTableC16, data, bp, bw, x0, x1, y, dst); }
+    void ReadRowCT16S(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst) { readRow16<C16STraits>(PageTableC16S, data, bp, bw, x0, x1, y, dst); }
+
     u32 WriteRowCT16(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask)
     { return writeRow16<C16Traits>(PageTableC16, data, bp, bw, x0, x1, y, src, mask); }
     u32 WriteRowCT16S(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask)

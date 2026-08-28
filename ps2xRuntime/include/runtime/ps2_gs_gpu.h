@@ -364,6 +364,7 @@ public:
     void refreshDisplaySnapshot();
 
     inline void WriteVram(u32 psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+    void invalidateClutCache() { m_clutCacheKey = ~0ull; }   // [clutwb] (~0 = the "invalid until built" sentinel the decoders test) a VRAM writeback may have changed a rendered palette
     inline u32 ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const;
 
     uint8_t *vramData() { return m_vram; }

@@ -542,6 +542,11 @@ namespace GSMem
 	// [rowct16] same for CT16 / CT16S: src holds the already-packed 16-bit texels.
 	u32 WriteRowCT16(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask);
 	u32 WriteRowCT16S(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask);
+	// [rowdecode] bulk row READS (same addressing as Read*): dst receives x1-x0 texels of row y.
+	void ReadRowCT32(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u32* dst);
+	void ReadRowP8H(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u8* dst);
+	void ReadRowCT16(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst);
+	void ReadRowCT16S(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst);
 	void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 
 	void WriteCT24(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);

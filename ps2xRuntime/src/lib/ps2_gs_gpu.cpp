@@ -1634,6 +1634,7 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
 void ps2xApplyStagedWritebacks()
 {
     ++g_ps2xWbGen;   // [hashmemo] any VRAM writeback invalidates memoised range hashes
+    { GS *gsc = g_gsWb ? g_gsWb : g_fmvGs; if (gsc) gsc->invalidateClutCache(); }   // [clutwb] a flushed page may hold a rendered palette: force the CLUT cache to re-decode
 
     std::vector<StagedWb> work;
     {
@@ -1859,6 +1860,7 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
                                const uint32_t *px, uint32_t fbmsk)
 {
     ++g_ps2xWbGen;   // [hashmemo] any VRAM writeback invalidates memoised range hashes
+    { GS *gsc = g_gsWb ? g_gsWb : g_fmvGs; if (gsc) gsc->invalidateClutCache(); }   // [clutwb] a flushed page may hold a rendered palette: force the CLUT cache to re-decode
 
     if (g_stageWrites)
     {
@@ -1989,6 +1991,7 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
 void ps2xWritebackToVram(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h, const uint32_t *px)
 {
     ++g_ps2xWbGen;   // [hashmemo] any VRAM writeback invalidates memoised range hashes
+    { GS *gsc = g_gsWb ? g_gsWb : g_fmvGs; if (gsc) gsc->invalidateClutCache(); }   // [clutwb] a flushed page may hold a rendered palette: force the CLUT cache to re-decode
 
     GS *gs = g_gsWb ? g_gsWb : g_fmvGs;
     if (!gs || !px || w <= 0 || h <= 0) return;

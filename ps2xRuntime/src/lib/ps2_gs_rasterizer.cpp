@@ -3471,12 +3471,61 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 const bool ct16Src2 = (pm == GS_PSM_CT16 || pm == GS_PSM_CT16S);
                 const bool keepRaw2 = (s_rawA2 && !(s_texaExp2 && ct16Src2)) || rawAlphaDec;
                 uint8_t *dst = rgba.data();
+                // [rowdecode] the column wrap is the same for every row: compute it once, and when it is a
+                // contiguous ascending run use a bulk row reader (page once per 64-px column, one table
+                // lookup per texel) instead of a swizzled function-pointer read per texel.
+                static const bool s_rowDec = [](){ const char *v = std::getenv("PS2X_ROWDECODE"); return !(v && v[0] == '0'); }();
+                std::vector<int> uIdx((size_t)subW);
+                bool uContig = s_rowDec && subW > 0;
+                for (int tx = 0; tx < subW; ++tx) { uIdx[(size_t)tx] = wrapC(tx + subX0, W, wms, minU, maxU); if (tx && uIdx[(size_t)tx] != uIdx[0] + tx) uContig = false; }
+                const bool rowRead = uContig && (pm == GS_PSM_CT32 || pm == GS_PSM_CT24 || pm == GS_PSM_CT16 || pm == GS_PSM_CT16S || kind == 2);
                 parallelRows(0, H - 1, [&](int ty)
                 {
                     const int v = wrapC(ty, H, wmt, minV, maxV);
+                    if (rowRead)
+                    {
+                        const u32 u0 = (u32)uIdx[0], u1 = u0 + (u32)subW;
+                        uint32_t *drow = reinterpret_cast<uint32_t *>(dst + (size_t)ty * subW * 4u);
+                        thread_local std::vector<uint32_t> buf32; thread_local std::vector<uint16_t> buf16; thread_local std::vector<uint8_t> buf8;
+                        if (kind == 0)
+                        {
+                            if (buf32.size() < (size_t)subW) buf32.resize((size_t)subW);
+                            GSMem::ReadRowCT32(vramF, blkF, bwF, u0, u1, (u32)v, buf32.data());
+                            for (int tx = 0; tx < subW; ++tx)
+                            {
+                                const uint32_t texel = applyTexa(texaF, (uint8_t)pm, buf32[(size_t)tx]);
+                                const uint32_t a = (texel >> 24) & 0xFFu;
+                                drow[tx] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : std::min(255u, a * 255u / 128u)) << 24);
+                            }
+                        }
+                        else if (kind == 1)
+                        {
+                            if (buf16.size() < (size_t)subW) buf16.resize((size_t)subW);
+                            if (pm == GS_PSM_CT16S) GSMem::ReadRowCT16S(vramF, blkF, bwF, u0, u1, (u32)v, buf16.data());
+                            else GSMem::ReadRowCT16(vramF, blkF, bwF, u0, u1, (u32)v, buf16.data());
+                            for (int tx = 0; tx < subW; ++tx)
+                            {
+                                const uint32_t texel = applyTexa(texaF, (uint8_t)pm, Rgba5551ToRgba8888(buf16[(size_t)tx]));
+                                const uint32_t a = (texel >> 24) & 0xFFu;
+                                drow[tx] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : std::min(255u, a * 255u / 128u)) << 24);
+                            }
+                        }
+                        else
+                        {
+                            if (buf8.size() < (size_t)subW) buf8.resize((size_t)subW);
+                            GSMem::ReadRowP8H(vramF, blkF, bwF, u0, u1, (u32)v, buf8.data());
+                            for (int tx = 0; tx < subW; ++tx)
+                            {
+                                const uint32_t texel = clutF[buf8[(size_t)tx]];
+                                const uint32_t a = (texel >> 24) & 0xFFu;
+                                drow[tx] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : std::min(255u, a * 255u / 128u)) << 24);
+                            }
+                        }
+                        return;
+                    }
                     for (int tx = 0; tx < subW; ++tx)
                     {
-                        const int u = wrapC(tx + subX0, W, wms, minU, maxU);
+                        const int u = uIdx[(size_t)tx];
                         const u32 out = rd(vramF, blkF, bwF, (u32)u, (u32)v);
                         uint32_t texel;
                         if (kind == 0) texel = applyTexa(texaF, (uint8_t)pm, out);
