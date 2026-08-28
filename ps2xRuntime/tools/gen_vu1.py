@@ -35,8 +35,7 @@ def emit_pair_body(out, k, lo, up, pairs, inline_mode):
     pc = 8 * k
     out.append(f'        // pc 0x{pc:x}  lo=0x{lo:08x} up=0x{up:08x}')
     out.append('        ++cyc;')   # [leanpair] the limit is checked at control-flow points only (see gen_program)
-    out.append('        if (st.qWait > 0u && --st.qWait == 0u) st.q = st.pendingQ;')
-    out.append('        if (g_clipWait > 0u && --g_clipWait == 0u) st.clip = g_pendingClip;')
+    out.append('        if ((st.qWait | g_clipWait) != 0u) { if (st.qWait > 0u && --st.qWait == 0u) st.q = st.pendingQ; if (g_clipWait > 0u && --g_clipWait == 0u) st.clip = g_pendingClip; }   // [pipeidle] one test per pair when both pipelines are idle')
     out.append('        {')
     loi = (up >> 31) & 1
     ebit = (up >> 30) & 1
