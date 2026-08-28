@@ -336,6 +336,20 @@ namespace ps2_syscalls
             info->waitId = 0;
             info->wakeupCount = 0;
             info->suspendCount = 0;
+            {   // [minstack] PS2X_MINSTACK=<bytes>: a guest thread created with a smaller stack gets a private larger one.
+                // BT3's sound threads are created with 0x800/0x1000-byte stacks right above the sound stream control block
+                // 0x2c9350; the loading hangs show a 64-bit register spill landing on that block (see bt3-loading-stall).
+                static const uint32_t s_minStack = [](){ const char *v = std::getenv("PS2X_MINSTACK"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
+                if (s_minStack != 0u && !info->ownsStack && info->stackSize != 0u && info->stackSize < s_minStack)
+                {
+                    const uint32_t big = runtime->guestMalloc(s_minStack, 16u);
+                    if (big != 0)
+                    {
+                        std::fprintf(stderr, "[minstack] tid=%d stack 0x%x size 0x%x -> private 0x%x size 0x%x\n", tid, info->stack, info->stackSize, big, s_minStack);
+                        info->stack = big; info->stackSize = s_minStack; info->ownsStack = true;
+                    }
+                }
+            }
             if (info->stack == 0 && info->stackSize != 0)
             {
                 const uint32_t autoStack = runtime->guestMalloc(info->stackSize, 16u);

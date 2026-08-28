@@ -2882,6 +2882,19 @@ namespace
     // garbage (0x30d49 / 0x30d71) in ~1 of 5 fight loads -> the loader thread's stack slot is overwritten between
     // two adjacent instructions. Arm the write-watch on exactly that slot for the duration of the thunk so the
     // store hook names the writer (guest pc). PS2X_THUNKWATCH=0 disables.
+    // [fixupprobe] FUN_0010a028 = the loader's pointer-fixup loop (bank offsets -> absolute pointers). The loading hang's
+    // corrupting store (pc 0x10a074 -> 0x2c9360) came from here with base a1 = 0x02f60500. Log every call's inputs.
+    PS2Runtime::RecompiledFunction g_orig10a028 = nullptr;
+    void bt3FixupProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6), ra = getRegU32(ctx, 31);
+        auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *p = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (p) std::memcpy(&v, p, 4); return v; };
+        static std::atomic<uint32_t> s_n{0}; const uint32_t n = s_n.fetch_add(1u);
+        if (n < 40u)
+            std::fprintf(stderr, "[fixupprobe] #%u a0=0x%x a1=0x%x a2=0x%x ra=0x%x hdr[0..4]=%08x %08x %08x %08x %08x  a1[0..3]=%08x %08x %08x %08x  sp=0x%x\n",
+                         n, a0, a1, a2, ra, r32(a2), r32(a2 + 4u), r32(a2 + 8u), r32(a2 + 12u), r32(a2 + 16u), r32(a1), r32(a1 + 4u), r32(a1 + 8u), r32(a1 + 12u), getRegU32(ctx, 29));
+        if (g_orig10a028) g_orig10a028(rdram, ctx, runtime);
+    }
     PS2Runtime::RecompiledFunction g_orig2722c0 = nullptr;
     // [vstep] PS2X_VSTEP=<n>: override the fight loop's hard-coded frame step (0x12bce4 passes a0=2 to
     // func_102060 -> func_23D160 (30 Hz counter cadence) and func_264D98 (wait until the per-frame vblank
@@ -3658,6 +3671,10 @@ namespace
             if (g_orig264d98) runtime.replaceFunction(0x00264d98u, &bt3WaitProbe);   // [vstepprobe]
             if (g_orig115950) runtime.replaceFunction(0x00115950u, &bt3LogicRate);
             std::fprintf(stderr, "[vstep] step override armed (0x102060 %s, 0x115950 %s)\n", g_orig102060 ? "ok" : "MISSING", g_orig115950 ? "ok" : "MISSING");
+        }
+        {   // [fixupprobe] always on (a few lines per load)
+            g_orig10a028 = runtime.lookupFunction(0x0010a028u);
+            if (g_orig10a028) runtime.replaceFunction(0x0010a028u, &bt3FixupProbe);
         }
         {   // [thunkwatch]
             const char *tw = std::getenv("PS2X_THUNKWATCH");
