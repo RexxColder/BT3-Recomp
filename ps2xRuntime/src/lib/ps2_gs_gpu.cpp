@@ -673,9 +673,22 @@ GSDebugSnapshot GS::getDebugSnapshot() const
 }
 
 
+// [gshist] The GS debug-history ring (one entry per GIF tag, register write, draw, transfer,
+// present) was recorded unconditionally -- ~2% of the guest thread with the F1 panel closed and
+// nobody reading it. Record only while a reader holds a lease: getDebugHistory() (the F1 panel's
+// per-frame call) extends it 5 s. PS2X_GSHIST=1 = always record (old behaviour).
+static std::atomic<uint64_t> g_gsHistLeaseTick{0};
+static inline bool gsHistWanted()
+{
+    static const bool s_force = [](){ const char *v = std::getenv("PS2X_GSHIST"); return v && v[0] && v[0] != '0'; }();
+    if (s_force) return true;
+    return ps2_syscalls::GetCurrentVSyncTick() <= g_gsHistLeaseTick.load(std::memory_order_relaxed);
+}
+
 std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    g_gsHistLeaseTick.store(ps2_syscalls::GetCurrentVSyncTick() + 300u, std::memory_order_relaxed);   // [gshist]
 
     std::vector<GSDebugHistoryEntry> out;
     out.reserve(m_debugHistoryCount);
@@ -761,6 +774,7 @@ void GS::recordDebugEventUnlocked(GSDebugHistoryEntry entry)
 
 void GS::recordGifTagDebugEventUnlocked(uint32_t sizeBytes, uint32_t nloop, uint8_t flg, uint32_t nreg)
 {
+    if (!gsHistWanted()) return;   // [gshist]
     GSDebugHistoryEntry entry = makeDebugEventUnlocked(GSDebugEventKind::GifTag);
     entry.gifSizeBytes = sizeBytes;
     entry.gifNloop = nloop;
@@ -771,6 +785,7 @@ void GS::recordGifTagDebugEventUnlocked(uint32_t sizeBytes, uint32_t nloop, uint
 
 void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
 {
+    if (!gsHistWanted()) return;   // [gshist]
     switch (regAddr)
     {
     case GS_REG_PRIM:
@@ -809,6 +824,7 @@ void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
 
 void GS::recordDrawDebugEventUnlocked(int vertexCount)
 {
+    if (!gsHistWanted()) return;   // [gshist]
     if (vertexCount <= 0)
     {
         return;
@@ -841,6 +857,7 @@ void GS::recordDrawDebugEventUnlocked(int vertexCount)
 
 void GS::recordTransferDebugEventUnlocked()
 {
+    if (!gsHistWanted()) return;   // [gshist]
     GSDebugHistoryEntry entry = makeDebugEventUnlocked(GSDebugEventKind::Transfer);
     entry.transferPixels = m_transferState.total_pixels;
     recordDebugEventUnlocked(entry);
@@ -848,6 +865,7 @@ void GS::recordTransferDebugEventUnlocked()
 
 void GS::recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp, uint32_t width, uint32_t height, bool usedPreferred)
 {
+    if (!gsHistWanted()) return;   // [gshist]
     GSDebugHistoryEntry entry = makeDebugEventUnlocked(GSDebugEventKind::Present);
     entry.displayFbp = displayFbp;
     entry.sourceFbp = sourceFbp;
@@ -1926,8 +1944,8 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
         }
         if (psm == 0u && fbmsk == 0u && !g_wbAlphaFillOnly && !s_rawFlush)
         {   // [rowct32] unmasked CT32 (the scene / mask page flushes): bulk row write
-            const u32 n = GSMem::WriteRowCT32(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, px + PROW(y),
-                                              g_wbSkipMask ? g_wbSkipMask + (size_t)y * w : nullptr);
+            const u32 n = GSMem::WriteRowCT32(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, px + PROW(y) + xs,   // [rowrel] src/mask relative to xs
+                                              g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr);
             if (n) { if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y; g_wbPixelsWritten += n; }
             continue;
         }
@@ -1937,8 +1955,8 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
             const uint32_t *srow = px + PROW(y);
             for (int x = xs; x < xe; ++x) row16[(size_t)x] = (uint16_t)(s_wbPack16 ? wbPack16(srow[x]) : srow[x]);
             const u32 n = (psm == 0x02u)
-                ? GSMem::WriteRowCT16(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, row16.data(), g_wbSkipMask ? g_wbSkipMask + (size_t)y * w : nullptr)
-                : GSMem::WriteRowCT16S(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, row16.data(), g_wbSkipMask ? g_wbSkipMask + (size_t)y * w : nullptr);
+                ? GSMem::WriteRowCT16(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, row16.data() + xs, g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr)
+                : GSMem::WriteRowCT16S(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, row16.data() + xs, g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr);
             if (n) { if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y; g_wbPixelsWritten += n; }
             continue;
         }
@@ -2250,6 +2268,7 @@ extern "C" void ps2xGsRecordOnSignal(int sig)
     std::raise(sig);
 }
 
+static thread_local int t_gsStateHeld = 0;   // [relock] >0 while this thread holds m_stateMutex in processGIFPacket
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     {   // PS2X_GS_RECORD=<path>: append this packet to a replayable stream so live-only bugs
@@ -2279,6 +2298,11 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         }
     }
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    { extern GS *g_gsWb; if (!g_gsWb) g_gsWb = this; }   // [deferdec] the GL thread's decode needs the GS before any writeback happened (replay had none)
+    // [relock] writeRegister() re-locked this recursive mutex for EVERY register in the packet
+    // (~7% of the guest thread in pthread lock/unlock). Mark it held for this thread so the
+    // nested writeRegister() calls skip the lock (same mutex, same thread: no semantic change).
+    struct GsHeldGuard { GsHeldGuard() { ++t_gsStateHeld; } ~GsHeldGuard() { --t_gsStateHeld; } } _gsHeld;
     if (!data || sizeBytes < 16 || !m_vram)
         return;
     m_curPktData = data;
@@ -2680,7 +2704,9 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    static const bool s_relock = [](){ const char *v = std::getenv("PS2X_RELOCK"); return !(v && v[0] == '0'); }();   // [relock] =0 -> always lock
+    std::unique_lock<std::recursive_mutex> lock(m_stateMutex, std::defer_lock);
+    if (!s_relock || t_gsStateHeld == 0) lock.lock();
     if (regAddr < 0x63u) { m_rawRegs[regAddr] = value; m_rawSet[regAddr] = true; }   // [slice] raw shadow
     // [floortex0] (default on, PS2X_SRCDIAG=0 disables): the exact TEX0 the FLOOR draws
     // carry NOW — is the tw=10 corruption still present, or did it heal along the way?
@@ -4030,11 +4056,35 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             return;
     }
 
+    static const bool s_uploadRow = [](){ const char *v = std::getenv("PS2X_UPLOADROW"); return !(v && v[0] == '0'); }();   // [uploadrow]
     // remove the format branching from the loops
     // TODO: fixup copypasta
     switch (dpsm)
     {
     case GS_PSM_CT32:
+        // [uploadrow] whole row segments through the bulk writer (same per-pixel addresses, same wrap and
+        // deactivation points as the per-pixel loop it replaces). PS2X_UPLOADROW=0 = per-pixel.
+        if (s_uploadRow)
+        {
+            while (data_offset + 4u <= sizeBytes)
+            {
+                const uint32_t rowLeft = rrw - (m_transferState.copied_pixels % rrw);
+                const uint32_t dataLeft = (sizeBytes - data_offset) / 4u;
+                const uint32_t totLeft = m_transferState.total_pixels - m_transferState.copied_pixels;
+                uint32_t run = std::min(rowLeft, std::min(dataLeft, totLeft));
+                if (run == 0u) break;
+                if (((uintptr_t)&data[data_offset] & 3u) == 0u)
+                    GSMem::WriteRowCT32(m_vram, dbp, dbw, m_transferState.x, m_transferState.x + run, m_transferState.y, reinterpret_cast<const u32 *>(&data[data_offset]), nullptr);
+                else
+                {   static thread_local std::vector<u32> tmp; if (tmp.size() < run) tmp.resize(run);
+                    std::memcpy(tmp.data(), &data[data_offset], (size_t)run * 4u);
+                    GSMem::WriteRowCT32(m_vram, dbp, dbw, m_transferState.x, m_transferState.x + run, m_transferState.y, tmp.data(), nullptr); }
+                m_transferState.x += run; m_transferState.copied_pixels += run; data_offset += run * 4u;
+                if ((m_transferState.copied_pixels % rrw) == 0) { m_transferState.x = dsax; m_transferState.y++; }
+                if (m_transferState.copied_pixels >= m_transferState.total_pixels) { m_trxdir = 3; m_transferState.total_pixels = 0; break; }
+            }
+            break;
+        }
         while (data_offset < sizeBytes)
         {
             u32 c;
@@ -4259,6 +4309,22 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         break;
 
     case GS_PSM_T8:
+        if (s_uploadRow)
+        {   // [uploadrow]
+            while (data_offset < sizeBytes)
+            {
+                const uint32_t rowLeft = rrw - (m_transferState.copied_pixels % rrw);
+                const uint32_t dataLeft = sizeBytes - data_offset;
+                const uint32_t totLeft = m_transferState.total_pixels - m_transferState.copied_pixels;
+                uint32_t run = std::min(rowLeft, std::min(dataLeft, totLeft));
+                if (run == 0u) break;
+                GSMem::WriteRowP8(m_vram, dbp, dbw, m_transferState.x, m_transferState.x + run, m_transferState.y, &data[data_offset]);
+                m_transferState.x += run; m_transferState.copied_pixels += run; data_offset += run;
+                if ((m_transferState.copied_pixels % rrw) == 0) { m_transferState.x = dsax; m_transferState.y++; }
+                if (m_transferState.copied_pixels >= m_transferState.total_pixels) { m_trxdir = 3; m_transferState.total_pixels = 0; break; }
+            }
+            break;
+        }
         while (data_offset < sizeBytes)
         {
             u8 c = data[data_offset];
