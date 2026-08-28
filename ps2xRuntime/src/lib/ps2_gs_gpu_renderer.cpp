@@ -935,9 +935,9 @@ namespace {
     bool groundShadowOn() { return groundShadowMode() != 0; }
     bool isFighterDraw(const GsGpuRenderer::DrawCmd &c) { return c.isTriangle && c.srcPsm == 20u && c.srcClutTbp >= 15360u && c.srcClutTbp < 15400u && !c.isTransfer; }
     void blobAccumulate(const GsGpuRenderer::DrawCmd &c) { for (int i = 0; i < 3; ++i) { g_blobX.push_back(c.tri[i].x); g_blobY.push_back(c.tri[i].y); g_blobZ.push_back(c.tri[i].z); } }
-    void blobFrameEnd()
+    void blobCompute()
     {
-        g_blobs.clear(); g_blobDrawn = false; g_terrainDraws = 0; g_sceneFbp = 0xFFFFFFFFu;
+        g_blobs.clear();
         const size_t n = g_blobX.size();
         if (n >= 60)
         {
@@ -967,6 +967,10 @@ namespace {
             }
         }
         { static unsigned long nf = 0; if ((++nf % 120ul) == 1ul) std::fprintf(stderr, "[groundshadow] frame %lu: fighter verts %zu -> blobs %zu\n", nf, n, g_blobs.size()); }
+    }
+    void blobFrameEnd()
+    {   // new list/frame: reset the accumulation (the draw happened at the previous list's last command)
+        g_blobs.clear(); g_blobDrawn = false; g_terrainDraws = 0; g_sceneFbp = 0xFFFFFFFFu;
         g_blobX.clear(); g_blobY.clear(); g_blobZ.clear();
     }
     void blobEnsureTex()
@@ -6576,6 +6580,46 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         // New published list (game frame) starts here: depth is per-frame state, so reset the
         // once-per-replay depth-clear tracking and force a full FBO rebind (the beginFbp
         // early-return path skips the depth clear when the FBO didn't change).
+        if (groundShadowOn() && g_sceneFbp != 0xFFFFFFFFu && !g_blobDrawn
+            && (ci + 1 == ciEnd || (listBoundsValid && nextListBoundary < listStarts.size() && ci + 1 == listStarts[nextListBoundary])))
+        {   // [groundshadow] v6: last command of this list -> draw the blobs into this frame's scene FBO with a depth test at the
+            // fighters' feet depth (nudged nearer): the ground (farther) shows it, the bodies (nearer) occlude it, and no later
+            // full-frame pass can erase it. Independent of draw ordering, which defeated v1-v5.
+            g_blobDrawn = true;
+            blobCompute();
+            if (!g_blobs.empty())
+            {
+                blobEnsureTex();
+                const uint32_t sceneKey = viewKey(g_sceneFbp, 0);
+                if (sceneKey != curFbp) { beginFbp(sceneKey); curBlendOn = -1; curBlendEq = -1; curBlendFix = -1; }
+                rlDrawRenderBatchActive();
+                rlSetShader(rlGetShaderIdDefault(), rlGetShaderLocsDefault());
+                rlSetBlendMode(BLEND_ALPHA);
+                glColorMask(1, 1, 1, 0);
+                if (depthOn) applyDepth(true, 2 /* GS ZTST GEQUAL */, false); else rlDisableDepthTest();
+                const bool dbg = groundShadowMode() == 2;
+                rlSetTexture(dbg ? g_white.id : g_blobTex.id);
+                rlBegin(RL_QUADS);
+                for (const GsBlob &b : g_blobs)
+                {
+                    const float w = b.w * 1.05f, h = w * 0.34f;
+                    const float x0 = b.cx - w * 0.5f, x1 = b.cx + w * 0.5f, y0 = b.feetY - h * 0.62f, y1 = b.feetY + h * 0.38f;
+                    const float zq = std::min(1.0f, b.feetZ * 1.003f + 0.0005f);   // slightly nearer than the contact patch
+                    { static int nlog = 0; if (nlog++ < 8) std::fprintf(stderr, "[groundshadow] v6 draw cx=%.0f feet=%.0f w=%.0f z=%.4f fbo=%u ci=%zu/%zu\n", b.cx, b.feetY, b.w, zq, g_sceneFbp, ci, ciEnd); }
+                    if (dbg) rlColor4ub(255, 0, 255, 255); else rlColor4ub(0, 0, 0, 110);
+                    rlNormal3f(0.0f, 0.0f, 1.0f);
+                    rlTexCoord2f(0.0f, 0.0f); if (depthOn) rlVertex3f(x0, y0, -zq); else rlVertex2f(x0, y0);
+                    rlTexCoord2f(0.0f, 1.0f); if (depthOn) rlVertex3f(x0, y1, -zq); else rlVertex2f(x0, y1);
+                    rlTexCoord2f(1.0f, 1.0f); if (depthOn) rlVertex3f(x1, y1, -zq); else rlVertex2f(x1, y1);
+                    rlTexCoord2f(1.0f, 0.0f); if (depthOn) rlVertex3f(x1, y0, -zq); else rlVertex2f(x1, y0);
+                }
+                rlEnd();
+                rlDrawRenderBatchActive();
+                rlSetTexture(0);
+                rlSetShader(g_shader.id, g_shader.locs);
+                curMask = -1; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1; curDepthTest = -1; curDepthFunc = -1; curDepthWrite = -1;
+            }
+        }
         if (listBoundsValid && nextListBoundary < listStarts.size() && ci == listStarts[nextListBoundary])
         {
             ++nextListBoundary;
