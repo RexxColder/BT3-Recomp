@@ -37,6 +37,7 @@ namespace ps2_stubs
         bool isButtonDown(int gamepadButton) const;
         bool isButtonPressed(int gamepadButton);
         float getAxis(int gamepadAxis) const;
+        float getRawAxis(int gamepadAxis) const; // raw normalized, no deadzone — for capture
         int buttonCount() const;
         int axisCount() const;
 
@@ -66,7 +67,6 @@ namespace ps2_stubs
         void noteAbs(int code, int value);
         float normalizeStick(int raw, int index) const;
         float normalizeTrigger(int raw, int index) const;
-        void updateTriggerButtons();
         void updateDpadFromHat();
         void rebuildRawState();
 

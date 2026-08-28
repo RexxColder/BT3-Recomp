@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <vector>
 #include <algorithm>
+#include <mutex>
 
 namespace ps2_stubs
 {
@@ -69,6 +70,12 @@ namespace ps2_stubs
 #if defined(__linux__)
         bool nativeGamepadMatches(const std::vector<int> &pads, const PadEvdevLinux &native)
         {
+            if (!native.isAvailable())
+                return false;
+            // If no GLFW pad has a mapping (pads empty), trust evdev unconditionally —
+            // the native reader provides correct axes/buttons independently of GLFW.
+            if (pads.empty())
+                return true;
             for (int pad : pads)
             {
                 const char *name = GetGamepadName(pad);
@@ -93,12 +100,8 @@ namespace ps2_stubs
         // One-time gamepad mapping setup (8BitDo Ultimate + PS2X_PAD_MAPPINGS file).
         void ensureGamepadMappings()
         {
-            static bool s_mapped = false;
-            if (s_mapped)
-            {
-                return;
-            }
-            s_mapped = true;
+            static std::once_flag s_flag;
+            std::call_once(s_flag, []() {
             SetGamepadMappings(
                 "03000000c82d00000631000014010000,8BitDo Ultimate Wireless,platform:Linux,"
                 "a:b0,b:b1,x:b2,y:b3,back:b6,start:b7,guide:b8,leftstick:b9,rightstick:b10,"
@@ -113,6 +116,18 @@ namespace ps2_stubs
                 "a:b48,b:b49,x:b51,y:b52,back:b58,start:b59,guide:b60,leftstick:b61,rightstick:b62,"
                 "leftshoulder:b54,rightshoulder:b55,dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,"
                 "leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:a4,righttrigger:a5");
+            // Xbox Series X|S via xpad/xpadneo (USB bus 03, common PIDs 0x02fd/0x0b00/0x0b13/0x0b20).
+            // Standard HID button layout (b0-b15). Covers both wired and wireless adapters.
+            SetGamepadMappings(
+                "030000005e040000130b000000000000,Xbox Series Controller,platform:Linux,"
+                "a:b0,b:b1,x:b2,y:b3,back:b6,start:b7,guide:b8,leftstick:b9,rightstick:b10,"
+                "leftshoulder:b4,rightshoulder:b5,dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,"
+                "leftx:a0,lefty:a1,rightx:a3,righty:a4,lefttrigger:a2,righttrigger:a5");
+            SetGamepadMappings(
+                "030000005e040000fd02000000000000,Xbox Series Controller,platform:Linux,"
+                "a:b0,b:b1,x:b2,y:b3,back:b6,start:b7,guide:b8,leftstick:b9,rightstick:b10,"
+                "leftshoulder:b4,rightshoulder:b5,dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,"
+                "leftx:a0,lefty:a1,rightx:a3,righty:a4,lefttrigger:a2,righttrigger:a5");
             if (const char *mf = std::getenv("PS2X_PAD_MAPPINGS"))
             {
                 if (FILE *f = std::fopen(mf, "rb"))
@@ -133,6 +148,7 @@ namespace ps2_stubs
                     std::fclose(f);
                 }
             }
+            }); // std::call_once
         }
 
         // Declared here rather than including GLFW/glfw3.h, which clashes with raylib.h.
@@ -150,28 +166,27 @@ namespace ps2_stubs
         void logGamepadSlotsOnce()
         {
             static const bool s_on = [](){ const char *v = std::getenv("PS2X_PADLOG"); return v && v[0] == '1'; }();
-            static bool s_done = false;
-            if (!s_on || s_done)
-                return;
-            // Only latch once a pad has actually appeared: GLFW enumerates joysticks during the
-            // first frames, so logging at the very first call reports an empty list and hides
-            // whatever turns up a moment later.
-            bool any = false;
-            for (int g = 0; g < 16 && !any; ++g) any = IsGamepadAvailable(g);
-            if (!any)
-                return;
-            s_done = true;
-            for (int g = 0; g < 16; ++g)
-            {
-                const bool avail = IsGamepadAvailable(g);
-                const char *nm = avail ? glfwGetJoystickName(g) : nullptr; // raylib's buffer overflows
-                if (avail)
-                    std::fprintf(stderr, "[padlog] slot %d: AVAILABLE name='%s' axes=%d listed=%d\n",
-                                 g, nm ? nm : "?", GetGamepadAxisCount(g),
+            static std::once_flag s_logFlag;
+            std::call_once(s_logFlag, []() {
+                if (!s_on)
+                    return;
+                for (int g = 0; g < 16; ++g)
+                {
+                    int nAxes = 0, nButtons = 0;
+                    glfwGetJoystickAxes(g, &nAxes);
+                    glfwGetJoystickButtons(g, &nButtons);
+                    if (nAxes == 0 && nButtons == 0)
+                        continue; // slot completely empty
+                    const bool mapped = IsGamepadAvailable(g);
+                    const bool isGamepad = glfwJoystickIsGamepad(g);
+                    const char *nm = glfwGetJoystickName(g);
+                    std::fprintf(stderr, "[padlog] slot %d: %s name='%s' axes=%d buttons=%d mapped=%d gamepad=%d listed=%d\n",
+                                 g,
+                                 mapped ? "MAPPED" : (isGamepad ? "GAMEPAD" : "RAW"),
+                                 nm ? nm : "?", nAxes, nButtons, mapped ? 1 : 0, isGamepad ? 1 : 0,
                                  slotLooksLikeGamepad(g) ? 1 : 0);
-                else
-                    std::fprintf(stderr, "[padlog] slot %d: not available (no mapping, or empty)\n", g);
-            }
+                }
+            }); // std::call_once
         }
 
         // GLFW knows what is a controller; raylib does not expose it.
@@ -187,20 +202,29 @@ namespace ps2_stubs
         // (the 8BitDo Ultimate here) report no mapping yet are perfectly usable once bound.
         bool slotLooksLikeGamepad(int g)
         {
-            if (!IsGamepadAvailable(g))
-                return false;
+            // PS2X_PAD_ALLDEV=1: skip all checks — treat every joystick as a pad
             static const bool s_all = [](){ const char *v = std::getenv("PS2X_PAD_ALLDEV"); return v && v[0] == '1'; }();
-            if (s_all) // escape hatch if this ever rejects a legitimate pad
+            if (s_all)
                 return true;
+            // GLFW recognized this as a mapped gamepad
             if (glfwJoystickIsGamepad(g))
                 return true;
-            // Axes alone are not enough: a DualSense also publishes separate "Motion Sensors"
-            // and "Touchpad" joysticks that report 6 axes each. Buttons separate them -- those
-            // have 0 and 4, a real pad has 15-17, and the mislabelled keyboards have 1-2 axes.
+            // Check raw GLFW state: real pads have >=4 axes and >=8 buttons.
+            // This catches pads that have no SDL mapping yet (hot-plug generic,
+            // 8BitDo before hardcode, Xbox Series via xpad/xpadneo).
+            // DualSense "Motion Sensors" and "Touchpad" are filtered out by
+            // the button count (< 8), and keyboards by axis count (< 4).
             int nAxes = 0, nButtons = 0;
             glfwGetJoystickAxes(g, &nAxes);
             glfwGetJoystickButtons(g, &nButtons);
-            return nAxes >= 4 && nButtons >= 8;
+            if (nAxes >= 4 && nButtons >= 8)
+                return true;
+            // IsGamepadAvailable is mapping-dependent: only true if SDL DB has the GUID.
+            // Use as last resort — it catches the rare case where GLFW mapped the pad
+            // but nAxes/nButtons reported wrong (unlikely, but avoids regressions).
+            if (IsGamepadAvailable(g))
+                return true;
+            return false;
         }
 
         std::vector<int> availableGamepads()
@@ -246,8 +270,11 @@ namespace ps2_stubs
             btn(PadAction::Triangle, GAMEPAD_BUTTON_RIGHT_FACE_UP);
             btn(PadAction::L1, GAMEPAD_BUTTON_LEFT_TRIGGER_1);
             btn(PadAction::R1, GAMEPAD_BUTTON_RIGHT_TRIGGER_1);
-            btn(PadAction::L2, GAMEPAD_BUTTON_LEFT_TRIGGER_2);
-            btn(PadAction::R2, GAMEPAD_BUTTON_RIGHT_TRIGGER_2);
+            // L2/R2 are ANALOG AXES (GAMEPAD_AXIS_LEFT_TRIGGER=4 / RIGHT_TRIGGER=5), not buttons:
+            // the Xbox via evdev reports them as ABS_Z/ABS_RZ (never as BTN_*), so a Button bind
+            // would never fire. Match the evdev/GLFW axis layout the same way the overlay captures.
+            axis(PadAction::L2, GAMEPAD_AXIS_LEFT_TRIGGER, 1.0f);
+            axis(PadAction::R2, GAMEPAD_AXIS_RIGHT_TRIGGER, 1.0f);
             btn(PadAction::L3, GAMEPAD_BUTTON_LEFT_THUMB);
             btn(PadAction::R3, GAMEPAD_BUTTON_RIGHT_THUMB);
             btn(PadAction::Select, GAMEPAD_BUTTON_MIDDLE_LEFT);
@@ -303,13 +330,15 @@ namespace ps2_stubs
             return cfg;
         }
 
-        // Legacy "auto" poll: merge every available gamepad (fixed map) + keyboard
-        // (fixed map). Reproduces the pre-configurator behaviour exactly.
-        void pollLegacyAuto(PadPacket &pkt)
+        // Legacy "auto" poll: merge every available gamepad (using the per-player
+        // binds, like the configured-device path) + keyboard (fixed map).
+        void pollLegacyAuto(const PadPlayerConfig &cfg, PadPacket &pkt)
         {
             const std::vector<int> pads = availableGamepads();
 #if defined(__linux__)
             const PadEvdevLinux &native = PadEvdevLinux::instance();
+            // nativeOk when evdev is open, even if GLFW has no mapping (pads empty).
+            // nativeGamepadMatches returns true when pads.empty() && native.isAvailable().
             const bool nativeOk = native.isAvailable() && nativeGamepadMatches(pads, native);
 #else
             const bool nativeOk = false;
@@ -339,31 +368,64 @@ namespace ps2_stubs
                 mergeAxis(pad, GAMEPAD_AXIS_LEFT_Y, ly);
                 mergeAxis(pad, GAMEPAD_AXIS_RIGHT_X, rx);
                 mergeAxis(pad, GAMEPAD_AXIS_RIGHT_Y, ry);
-
-                auto btn = [&](PadAction a, int button)
+            }
+            // Buttons: honour cfg.binds across every available gamepad, so binds made in the
+            // overlay (and the default L2/R2-as-axis layout) work in Auto mode too.
+            for (size_t a = 0; a < static_cast<size_t>(PadAction::Count); ++a)
+            {
+                const PadBind &bind = cfg.binds[a];
+                const PadAction action = static_cast<PadAction>(a);
+                if (!isButtonAction(action) || bind.kind == PadBindKind::None)
                 {
-                    if (IsGamepadButtonDown(pad, button) ||
-                        (nativeOk && native.isButtonDown(button)))
+                    continue;
+                }
+                bool pressed = false;
+                if (bind.kind == PadBindKind::Button)
+                {
+                    for (int pad : pads)
                     {
-                        pkt.buttons = static_cast<uint16_t>(pkt.buttons & ~buttonMaskForAction(a));
+                        if (IsGamepadButtonDown(pad, bind.value) ||
+                            (nativeOk && native.isButtonDown(bind.value)))
+                        {
+                            pressed = true;
+                            break;
+                        }
                     }
-                };
-                btn(PadAction::Up, GAMEPAD_BUTTON_LEFT_FACE_UP);
-                btn(PadAction::Down, GAMEPAD_BUTTON_LEFT_FACE_DOWN);
-                btn(PadAction::Left, GAMEPAD_BUTTON_LEFT_FACE_LEFT);
-                btn(PadAction::Right, GAMEPAD_BUTTON_LEFT_FACE_RIGHT);
-                btn(PadAction::Cross, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
-                btn(PadAction::Circle, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT);
-                btn(PadAction::Square, GAMEPAD_BUTTON_RIGHT_FACE_LEFT);
-                btn(PadAction::Triangle, GAMEPAD_BUTTON_RIGHT_FACE_UP);
-                btn(PadAction::L1, GAMEPAD_BUTTON_LEFT_TRIGGER_1);
-                btn(PadAction::R1, GAMEPAD_BUTTON_RIGHT_TRIGGER_1);
-                btn(PadAction::L2, GAMEPAD_BUTTON_LEFT_TRIGGER_2);
-                btn(PadAction::R2, GAMEPAD_BUTTON_RIGHT_TRIGGER_2);
-                btn(PadAction::L3, GAMEPAD_BUTTON_LEFT_THUMB);
-                btn(PadAction::R3, GAMEPAD_BUTTON_RIGHT_THUMB);
-                btn(PadAction::Select, GAMEPAD_BUTTON_MIDDLE_LEFT);
-                btn(PadAction::Start, GAMEPAD_BUTTON_MIDDLE_RIGHT);
+                    if (!pressed && pads.empty() && nativeOk)
+                    {
+                        pressed = native.isButtonDown(bind.value);
+                    }
+                }
+                else if (bind.kind == PadBindKind::Axis)
+                {
+                    for (int pad : pads)
+                    {
+                        float v = GetGamepadAxisMovement(pad, bind.value);
+#if defined(__linux__)
+                        if (nativeOk)
+                        {
+                            const float nv = native.getAxis(bind.value);
+                            if (std::fabs(nv) > std::fabs(v))
+                            {
+                                v = nv;
+                            }
+                        }
+#endif
+                        if (std::fabs(v) > bind.deadzone)
+                        {
+                            pressed = true;
+                            break;
+                        }
+                    }
+                    if (!pressed && pads.empty() && nativeOk)
+                    {
+                        pressed = std::fabs(native.getAxis(bind.value)) > bind.deadzone;
+                    }
+                }
+                if (pressed)
+                {
+                    pkt.buttons = static_cast<uint16_t>(pkt.buttons & ~buttonMaskForAction(action));
+                }
             }
             // Read native axes even when GLFW has no mapping for the
             // controller (pads empty).  The evdev reader provides the
@@ -638,6 +700,18 @@ namespace ps2_stubs
         return cfg;
     }
 
+    bool PadConfig::s_inputSuspended = false;
+
+    void PadConfig::setInputSuspended(bool suspended)
+    {
+        s_inputSuspended = suspended;
+    }
+
+    bool PadConfig::inputSuspended()
+    {
+        return s_inputSuspended;
+    }
+
     PadPlayerConfig PadConfig::snapshot(size_t p) const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -883,6 +957,12 @@ namespace ps2_stubs
             return pkt;
         }
 
+        // Settings overlay is open: swallow pad input so it never reaches the game.
+        if (s_inputSuspended)
+        {
+            return pkt;
+        }
+
         ensureGamepadMappings();
         if (!IsWindowReady())
         {
@@ -898,7 +978,7 @@ namespace ps2_stubs
         const bool anyPad = cfg.device.kind == PadDeviceKind::None;
         if (anyPad)
         {
-            pollLegacyAuto(pkt);
+            pollLegacyAuto(cfg, pkt);
             return pkt;
         }
 
@@ -941,6 +1021,41 @@ namespace ps2_stubs
                         pressed = true;
                         break;
                     }
+                }
+                // Fallback: GLFW has no mapping but evdev is open — read directly
+                if (!pressed && pads.empty() && nativeOk)
+                {
+                    pressed = native.isButtonDown(bind.value);
+                }
+            }
+            else if (bind.kind == PadBindKind::Axis)
+            {
+                // Analog axis bound to a button action (e.g. L2/R2 triggers captured as
+                // axes). Treated as pressed when the axis magnitude clears the deadzone.
+                for (int pad : pads)
+                {
+                    float v = GetGamepadAxisMovement(pad, bind.value);
+#if defined(__linux__)
+                    if (nativeOk)
+                    {
+                        const float nv = native.getAxis(bind.value);
+                        if (std::fabs(nv) > std::fabs(v))
+                        {
+                            v = nv;
+                        }
+                    }
+#endif
+                    if (std::fabs(v) > bind.deadzone)
+                    {
+                        pressed = true;
+                        break;
+                    }
+                }
+                // Fallback: GLFW has no mapping but evdev is open — read directly.
+                if (!pressed && pads.empty() && nativeOk &&
+                    std::fabs(native.getAxis(bind.value)) > bind.deadzone)
+                {
+                    pressed = true;
                 }
             }
             if (pressed)

@@ -112,6 +112,11 @@ namespace ps2_stubs
         void setDefaultDir(const std::string &elfDir);
         std::string defaultPath() const;
 
+        // Suspend gamepad->guest input while the settings overlay is open, so pad
+        // navigation of the overlay never bleeds into the running game.
+        static void setInputSuspended(bool suspended);
+        static bool inputSuspended();
+
         bool load();  // load from defaultPath(); keeps current values on error
         bool save() const;
 
@@ -124,6 +129,8 @@ namespace ps2_stubs
         PadConfig();
         PadConfig(const PadConfig &) = delete;
         PadConfig &operator=(const PadConfig &) = delete;
+
+        static bool s_inputSuspended;
 
         mutable std::mutex m_mutex;
         std::array<PadPlayerConfig, kPlayerCount> m_players;

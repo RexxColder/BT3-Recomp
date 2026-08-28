@@ -60,12 +60,12 @@ namespace ps2_stubs
         {
             switch (code)
             {
-            case ABS_X: return 0;
-            case ABS_Y: return 1;
-            case ABS_RX: return 2;
-            case ABS_RY: return 3;
-            case ABS_Z: return 4;
-            case ABS_RZ: return 5;
+            case ABS_X: return 0;  // Left stick X
+            case ABS_Y: return 1;  // Left stick Y
+            case ABS_RX: return 2; // Right stick X
+            case ABS_RY: return 3; // Right stick Y
+            case ABS_Z: return 4;  // Left trigger (0..1023)
+            case ABS_RZ: return 5; // Right trigger (0..1023)
             }
             return -1;
         }
@@ -104,10 +104,20 @@ namespace ps2_stubs
 
         DIR *dir = opendir("/dev/input");
         if (!dir)
+        {
+            std::fprintf(stderr, "[pad_evdev] cannot open /dev/input: %s — "
+                                 "check permissions (user must be in 'input' group)\n",
+                         std::strerror(errno));
             return;
+        }
 
+        // Two passes: first look for known Xbox xone (0x045e:0x0b12) or name "xbox",
+        // then any generic controller with EV_ABS+EV_KEY. This ensures Xbox Series
+        // (via xpad/xpadneo), 8BitDo, DualSense, and other pads are found.
         std::string bestPath;
         std::string bestName;
+        std::string genericPath;
+        std::string genericName;
         struct dirent *ent;
         while ((ent = readdir(dir)) != nullptr)
         {
@@ -126,16 +136,25 @@ namespace ps2_stubs
             ::close(fd);
             if (!ok || !isBitSet(EV_ABS, evBits) || !isBitSet(EV_KEY, evBits))
                 continue;
+            // Pass 1: known xone driver (exact VID:PID)
             if (id.vendor == 0x045e && id.product == 0x0b12)
             {
                 bestPath = path;
                 bestName = name;
                 break;
             }
+            // Pass 1: name contains "xbox" (case-insensitive)
             if (bestPath.empty() && containsIgnoreCase(name, "xbox"))
             {
                 bestPath = path;
                 bestName = name;
+            }
+            // Pass 2: any generic controller (EV_ABS+EV_KEY, 0 vendor = virtual or unlisted)
+            if (bestPath.empty() && genericPath.empty() &&
+                id.vendor != 0 && id.product != 0)
+            {
+                genericPath = path;
+                genericName = name;
             }
         }
         closedir(dir);
@@ -143,6 +162,10 @@ namespace ps2_stubs
         if (!bestPath.empty())
         {
             openPath(bestPath.c_str());
+        }
+        else if (!genericPath.empty())
+        {
+            openPath(genericPath.c_str());
         }
     }
 
@@ -217,7 +240,6 @@ namespace ps2_stubs
         m_ready = true;
 
         resync();
-        updateTriggerButtons();
         updateDpadFromHat();
 
         std::fprintf(stderr, "[pad_evdev] opened %s '%s' axes=%d buttons=%d\n",
@@ -301,7 +323,6 @@ namespace ps2_stubs
             if (ioctl(m_fd, EVIOCGABS(ABS_HAT0Y), &ai) >= 0)
                 m_raw.hatY = static_cast<float>(ai.value);
         }
-        updateTriggerButtons();
         updateDpadFromHat();
         rebuildRawState();
     }
@@ -393,38 +414,27 @@ namespace ps2_stubs
 
     int PadEvdevLinux::codeToButton(int code) const
     {
+        // Xbox Series via xpadneo/uhid: BTN_A..BTN_THUMBR are standard.
+        // BTN_TL2/BTN_TR2 (0x136/0x137) are the digital CLICK of the trigger
+        // mechanism — NOT L2/R2 analog. Triggers are pure axes (ABS_Z/ABS_RZ).
+        // 0x0a7 is the Xbox Share button.
         switch (code)
         {
-        case BTN_A:
-        case 0x030: return 7; // GAMEPAD_BUTTON_RIGHT_FACE_DOWN (A/Cross)
-        case BTN_B:
-        case 0x031: return 6; // GAMEPAD_BUTTON_RIGHT_FACE_RIGHT (B/Circle)
-        case BTN_X:
-        case 0x033: return 8; // GAMEPAD_BUTTON_RIGHT_FACE_LEFT (X/Square)
-        case BTN_Y:
-        case 0x034: return 5; // GAMEPAD_BUTTON_RIGHT_FACE_UP (Y/Triangle)
-        case BTN_TL:
-        case 0x036: return 9; // GAMEPAD_BUTTON_LEFT_TRIGGER_1 (LB/L1)
-        case BTN_TR:
-        case 0x037: return 11; // GAMEPAD_BUTTON_RIGHT_TRIGGER_1 (RB/R1)
-        case BTN_TL2:
-        case 0x038: return 10; // GAMEPAD_BUTTON_LEFT_TRIGGER_2 (LT/L2)
-        case BTN_TR2:
-        case 0x039: return 12; // GAMEPAD_BUTTON_RIGHT_TRIGGER_2 (RT/R2)
-        case BTN_SELECT:
-        case 0x03a: return 13; // GAMEPAD_BUTTON_MIDDLE_LEFT (Back/Select)
-        case BTN_START:
-        case 0x03b: return 15; // GAMEPAD_BUTTON_MIDDLE_RIGHT (Start)
-        case BTN_MODE:
-        case 0x03c: return 14; // GAMEPAD_BUTTON_MIDDLE (Guide)
-        case BTN_THUMBL:
-        case 0x03d: return 16; // GAMEPAD_BUTTON_LEFT_THUMB (L3)
-        case BTN_THUMBR:
-        case 0x03e: return 17; // GAMEPAD_BUTTON_RIGHT_THUMB (R3)
-        case BTN_DPAD_UP: return 1;
-        case BTN_DPAD_RIGHT: return 2;
+        case BTN_A:         return 7;  // A/Cross
+        case BTN_B:         return 6;  // B/Circle
+        case BTN_X:         return 8;  // X/Square
+        case BTN_Y:         return 5;  // Y/Triangle
+        case BTN_TL:        return 9;  // LB/L1
+        case BTN_TR:        return 11; // RB/R1
+        case BTN_SELECT:    return 13; // Back/Select
+        case BTN_START:     return 15; // Start
+        case BTN_MODE:      return 14; // Guide
+        case BTN_THUMBL:    return 16; // L3
+        case BTN_THUMBR:    return 17; // R3
+        case BTN_DPAD_UP:   return 1;
         case BTN_DPAD_DOWN: return 3;
         case BTN_DPAD_LEFT: return 4;
+        case BTN_DPAD_RIGHT:return 2;
         }
         return -1;
     }
@@ -464,7 +474,6 @@ namespace ps2_stubs
             m_raw.hatY = static_cast<float>(value);
             updateDpadFromHat();
         }
-        updateTriggerButtons();
     }
 
     float PadEvdevLinux::normalizeStick(int raw, int index) const
@@ -476,6 +485,9 @@ namespace ps2_stubs
         const float center = (min + max) * 0.5f;
         const float half = std::max(static_cast<float>(max - center), 1.0f);
         float v = (static_cast<float>(raw) - center) / half;
+        // Deadzone at center: values within 0.1 of center are "rest"
+        if (std::fabs(v) < 0.1f)
+            return 0.0f;
         return std::clamp(v, -1.0f, 1.0f);
     }
 
@@ -485,22 +497,30 @@ namespace ps2_stubs
         const int max = m_absMax[index];
         if (max <= min)
             return 0.0f;
+        // Xbox Series: unsigned range 0..65535, rest ~32000.
+        // Map to 0..1 with deadzone at center (rest).
         if (min >= 0)
         {
-            float v = (static_cast<float>(raw) - static_cast<float>(min)) / static_cast<float>(max - min);
+            const float center = (min + max) * 0.5f;
+            const float half = std::max(static_cast<float>(max - min) * 0.5f, 1.0f);
+            float v = (static_cast<float>(raw) - center) / half;
+            // Deadzone at rest: values within 0.15 of center are "not pressed"
+            if (std::fabs(v) < 0.15f)
+                return 0.0f;
+            // Map [0.15..1.0] -> [0..1] (only positive half is meaningful for triggers)
+            if (v < 0.0f)
+                v = 0.0f;
+            v = (v - 0.15f) / 0.85f;
             return std::clamp(v, 0.0f, 1.0f);
         }
+        // Signed range (min<0): center = 0, deadzone around center
         const float center = (min + max) * 0.5f;
         const float half = std::max(static_cast<float>(max - center), 1.0f);
         float v = (static_cast<float>(raw) - center) / half;
+        if (std::fabs(v) < 0.15f)
+            return 0.0f;
         v = (v + 1.0f) * 0.5f;
         return std::clamp(v, 0.0f, 1.0f);
-    }
-
-    void PadEvdevLinux::updateTriggerButtons()
-    {
-        m_btnDown[10] = m_axis[4] > 0.1f ? 1 : 0;
-        m_btnDown[12] = m_axis[5] > 0.1f ? 1 : 0;
     }
 
     void PadEvdevLinux::updateDpadFromHat()
@@ -513,6 +533,9 @@ namespace ps2_stubs
 
     void PadEvdevLinux::rebuildRawState()
     {
+        // Preserve hat values set by noteAbs (ABS_HAT0X/Y) before reset
+        const float savedHatX = m_raw.hatX;
+        const float savedHatY = m_raw.hatY;
         m_raw = {};
         for (int i = 0; i < (int)m_keyState.size() && m_raw.downCount < 32; ++i)
         {
@@ -525,6 +548,8 @@ namespace ps2_stubs
         m_raw.ry = m_axis[3];
         m_raw.lt = m_axis[4];
         m_raw.rt = m_axis[5];
+        m_raw.hatX = savedHatX;
+        m_raw.hatY = savedHatY;
     }
 
     bool PadEvdevLinux::isAvailable() const
@@ -577,6 +602,29 @@ namespace ps2_stubs
         if (gamepadAxis < 0 || gamepadAxis >= (int)m_axis.size())
             return 0.0f;
         return m_axis[gamepadAxis];
+    }
+
+    float PadEvdevLinux::getRawAxis(int gamepadAxis) const
+    {
+        if (gamepadAxis < 0 || gamepadAxis >= (int)m_axis.size())
+            return 0.0f;
+        const int raw = m_absRaw[gamepadAxis];
+        const int min = m_absMin[gamepadAxis];
+        const int max = m_absMax[gamepadAxis];
+        if (max <= min)
+            return 0.0f;
+        if (min >= 0)
+        {
+            // Unsigned axis (e.g. triggers 0..65535): rest is at min, not at the midpoint.
+            // Normalizing against the center yields -1.0 at rest, which keeps trigger axes
+            // permanently "active" in edge/debounce logic. Map rest->0, full->1 instead.
+            const float half = std::max(static_cast<float>(max - min), 1.0f);
+            return std::clamp((static_cast<float>(raw) - min) / half, 0.0f, 1.0f);
+        }
+        // Signed axis (sticks): center = 0.
+        const float center = (min + max) * 0.5f;
+        const float half = std::max(static_cast<float>(max - center), 1.0f);
+        return std::clamp((static_cast<float>(raw) - center) / half, -1.0f, 1.0f);
     }
 
     int PadEvdevLinux::buttonCount() const
