@@ -538,12 +538,14 @@ namespace GSMem
 	void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	// [rowct32] bulk row write for CT32 with no mask: page resolved once per 64-px column, one table
 	// lookup per pixel. Returns the number of pixels written. mask (optional): 0 = skip pixel.
+	// [rowrel] every row helper takes src/mask/dst RELATIVE to x0 (src[0] = pixel x0).
 	u32 WriteRowCT32(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u32* src, const u8* mask);
 	// [rowct16] same for CT16 / CT16S: src holds the already-packed 16-bit texels.
 	u32 WriteRowCT16(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask);
 	u32 WriteRowCT16S(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask);
 	// [rowdecode] bulk row READS (same addressing as Read*): dst receives x1-x0 texels of row y.
 	void ReadRowCT32(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u32* dst);
+	u32 WriteRowP8(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u8* src);   // [uploadrow] PSMT8 (128x64 pages, 1 byte/texel)
 	void ReadRowP8H(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u8* dst);
 	void ReadRowCT16(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst);
 	void ReadRowCT16S(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst);

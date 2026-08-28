@@ -248,9 +248,9 @@ namespace GSMem
             const usz pageBase = static_cast<usz>(page) * kPixels;
             for (; x < colEnd; ++x)
             {
-                if (mask && !mask[x]) continue;
+                if (mask && !mask[x - x0]) continue;   // [rowrel] src/mask are RELATIVE to x0 (like WriteRowP8/ReadRow*)
                 const usz byte_addr = ((pageBase + row[x % kExt.x]) * 4u) & (MEMORY_SIZE - 4u);
-                std::memcpy(&data[byte_addr], &src[x], 4u);
+                std::memcpy(&data[byte_addr], &src[x - x0], 4u);
                 ++n;
             }
         }
@@ -272,11 +272,24 @@ namespace GSMem
             const usz pageBase = static_cast<usz>(TraitsT::PageId(bp, bw, x, y)) * kPixels;
             for (; x < colEnd; ++x)
             {
-                if (mask && !mask[x]) continue;
+                if (mask && !mask[x - x0]) continue;   // [rowrel]
                 const usz byte_addr = ((pageBase + row[x % kExt.x]) * 2u) & (MEMORY_SIZE - 2u);
-                std::memcpy(&data[byte_addr], &src[x], 2u);
+                std::memcpy(&data[byte_addr], &src[x - x0], 2u);
                 ++n;
             }
+        }
+        return n;
+    }
+    u32 WriteRowP8(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u8* src)
+    {   // mirrors PixelStorageTraits<P8>::Write: byte = pixel_addr (8 bpp), page 128x64 texels
+        constexpr u32 kBlocks = P8Traits::BlocksPerPage(); constexpr auto kExt = P8Traits::PageExtent(); constexpr u32 kPixels = P8Traits::PixelsPerPage();
+        const auto &row = PageTableP8[bp % kBlocks][y % kExt.y];
+        u32 n = 0, x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(P8Traits::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x) { data[(pageBase + row[x % kExt.x]) & (MEMORY_SIZE - 1u)] = src[x - x0]; ++n; }
         }
         return n;
     }
