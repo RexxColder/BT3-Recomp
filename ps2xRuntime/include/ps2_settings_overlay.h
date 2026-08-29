@@ -7,6 +7,8 @@
 #include <array>
 #include <cstdint>
 
+struct ImFont;
+
 class PS2SettingsOverlay
 {
 public:
@@ -22,6 +24,7 @@ public:
         bool halfTexel = true;
         bool skipPost = true;
         bool skipStaleVram = true;
+        int renderScale = 1; // internal resolution multiplier: 1/2/3/4 (see GsGpuRenderer::renderScale)
         float deadzone = 0.15f;
         bool fullscreen = true;
         bool widescreen = false;
@@ -59,6 +62,17 @@ private:
     Settings m_settings;
     std::string m_configPath;
     int m_activeTab = 0;
+
+    // Open/close deploy animation. m_animT is an eased 0..1 value: 0 = fully
+    // closed/hidden, 1 = fully open. It chases m_visible every frame, so the
+    // panel keeps rendering (fading + sliding out) for a few frames AFTER
+    // m_visible flips to false, instead of popping away instantly.
+    float m_animT = 0.0f;
+
+    // Capsule HUD display font (Russo One), loaded once in initialize().
+    // Null (falls back to the default ImGui font) if the .ttf couldn't be found.
+    ImFont *m_fontHudTitle = nullptr; // title bar
+    ImFont *m_fontHudLabel = nullptr; // tab labels + section headers
 
     // Settings dump logging — which areas are captured to the dump log.
     bool m_dumpAudio = true;

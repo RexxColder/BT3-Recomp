@@ -20,6 +20,18 @@
 static const char *kConfigFileName = "bt3_settings.ini";
 static const char *kDumpFileName = "bt3_settings_dump.log";
 
+// Deploy/retract animation timing for the overlay window (see PS2SettingsOverlay::draw).
+static constexpr float kOverlayAnimDuration = 0.16f; // seconds, open or close
+
+// Ease-out cubic: fast start, gentle settle. Used both ways (open + close) so the
+// deploy and retract read as mirror images of the same motion.
+static float overlayAnimEase(float t)
+{
+    t = std::max(0.0f, std::min(1.0f, t));
+    const float inv = 1.0f - t;
+    return 1.0f - inv * inv * inv;
+}
+
 // RAII guard for ImGui style pushes: pops exactly what it pushed on destruction,
 // even across exceptions/early returns — this is what prevents the overlay from
 // corrupting ImGui's style stack and crashing.
@@ -65,10 +77,13 @@ namespace
     }
 }
 
-// --- Dragon Ball Z accent palette -------------------------------------------
+// --- "Capsule HUD" accent palette -------------------------------------------
+// Dark near-black tech panel with a single orange accent (still Dragon Ball Z's
+// orange/gold, just applied in a flatter, squared-off, HUD-readout style instead
+// of the earlier rounded "energy glow" look).
 namespace
 {
-    constexpr float DBZ_R = 0.94f, DBZ_G = 0.63f, DBZ_B = 0.19f;   // orange
+    constexpr float DBZ_R = 1.00f, DBZ_G = 0.62f, DBZ_B = 0.10f;   // HUD orange
     constexpr float GOLD_R = 1.00f, GOLD_G = 0.80f, GOLD_B = 0.30f;
 
     ImVec4 dbz(float r, float g, float b, float a = 1.0f)
@@ -81,18 +96,21 @@ namespace
     void pushDbzTheme()
     {
         ImGuiStyle &s = ImGui::GetStyle();
-        s.WindowPadding    = ImVec2(12, 10);
+        s.WindowPadding    = ImVec2(14, 10);
         s.FramePadding     = ImVec2(6, 4);
         s.ItemSpacing      = ImVec2(8, 6);
         s.ItemInnerSpacing = ImVec2(5, 4);
         s.ScrollbarSize    = 12.0f;
-        s.WindowRounding   = 10.0f;
-        s.FrameRounding    = 6.0f;
-        s.GrabRounding     = 5.0f;
-        s.TabRounding      = 6.0f;
-        s.ScrollbarRounding= 6.0f;
+        // Capsule HUD: squared-off panel, thin border, no soft rounding anywhere —
+        // reads as a technical readout rather than a glowing energy aura.
+        s.WindowRounding   = 2.0f;
+        s.FrameRounding    = 2.0f;
+        s.GrabRounding     = 1.0f;
+        s.TabRounding      = 0.0f;
+        s.ScrollbarRounding= 2.0f;
         s.WindowBorderSize = 1.0f;
-        s.FrameBorderSize  = 0.0f;
+        s.FrameBorderSize  = 1.0f;
+        s.TabBarBorderSize = 1.0f;
         s.WindowTitleAlign = ImVec2(0.5f, 0.5f);
     }
 
@@ -104,43 +122,48 @@ namespace
         static constexpr int kColors = 40;
         DbzThemeScope()
         {
-            ImGui::PushStyleColor(ImGuiCol_WindowBg,            dbz(0.07f, 0.07f, 0.13f, 0.96f));
-            ImGui::PushStyleColor(ImGuiCol_ChildBg,             dbz(0.10f, 0.10f, 0.17f, 0.60f));
-            ImGui::PushStyleColor(ImGuiCol_PopupBg,             dbz(0.09f, 0.09f, 0.15f, 0.97f));
-            ImGui::PushStyleColor(ImGuiCol_Border,              accent(0.35f));
-            ImGui::PushStyleColor(ImGuiCol_BorderShadow,        dbz(0.0f, 0.0f, 0.0f, 0.25f));
-            ImGui::PushStyleColor(ImGuiCol_TitleBg,             dbz(0.13f, 0.11f, 0.06f));
-            ImGui::PushStyleColor(ImGuiCol_TitleBgActive,       accent());
-            ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed,    dbz(0.13f, 0.11f, 0.06f));
-            ImGui::PushStyleColor(ImGuiCol_Text,                dbz(0.95f, 0.95f, 0.95f));
-            ImGui::PushStyleColor(ImGuiCol_TextDisabled,        dbz(0.55f, 0.55f, 0.62f));
+            // Capsule HUD: near-black navy panel, thin orange edges, flat readout
+            // rows instead of the previous purple-tinted "glow" surfaces.
+            ImGui::PushStyleColor(ImGuiCol_WindowBg,            dbz(0.04f, 0.06f, 0.08f, 0.97f));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg,             dbz(0.06f, 0.08f, 0.10f, 0.60f));
+            ImGui::PushStyleColor(ImGuiCol_PopupBg,             dbz(0.04f, 0.06f, 0.08f, 0.98f));
+            ImGui::PushStyleColor(ImGuiCol_Border,              accent(0.55f));
+            ImGui::PushStyleColor(ImGuiCol_BorderShadow,        dbz(0.0f, 0.0f, 0.0f, 0.0f));
+            ImGui::PushStyleColor(ImGuiCol_TitleBg,             dbz(0.04f, 0.06f, 0.08f));
+            ImGui::PushStyleColor(ImGuiCol_TitleBgActive,       dbz(0.04f, 0.06f, 0.08f));
+            ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed,    dbz(0.04f, 0.06f, 0.08f));
+            ImGui::PushStyleColor(ImGuiCol_Text,                dbz(0.84f, 0.89f, 0.92f));
+            ImGui::PushStyleColor(ImGuiCol_TextDisabled,        dbz(0.29f, 0.39f, 0.44f));
             ImGui::PushStyleColor(ImGuiCol_TextSelectedBg,      accent(0.30f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBg,             dbz(0.14f, 0.14f, 0.23f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,      dbz(0.20f, 0.17f, 0.28f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgActive,       dbz(0.94f, 0.63f, 0.19f, 0.25f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBg,             dbz(0.07f, 0.09f, 0.11f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,      dbz(0.10f, 0.13f, 0.15f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive,       dbz(1.00f, 0.62f, 0.10f, 0.20f));
             ImGui::PushStyleColor(ImGuiCol_SliderGrab,          accent());
             ImGui::PushStyleColor(ImGuiCol_SliderGrabActive,    gold());
-            ImGui::PushStyleColor(ImGuiCol_CheckMark,           gold());
-            ImGui::PushStyleColor(ImGuiCol_Button,              dbz(0.20f, 0.17f, 0.12f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,       accent());
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,        dbz(0.85f, 0.55f, 0.15f));
-            ImGui::PushStyleColor(ImGuiCol_Header,              dbz(0.16f, 0.14f, 0.10f));
-            ImGui::PushStyleColor(ImGuiCol_HeaderHovered,       accent(0.30f));
-            ImGui::PushStyleColor(ImGuiCol_HeaderActive,        accent(0.45f));
-            ImGui::PushStyleColor(ImGuiCol_Separator,           accent(0.30f));
+            ImGui::PushStyleColor(ImGuiCol_CheckMark,           accent());
+            ImGui::PushStyleColor(ImGuiCol_Button,              dbz(0.07f, 0.09f, 0.11f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,       dbz(1.00f, 0.62f, 0.10f, 0.18f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,        dbz(1.00f, 0.62f, 0.10f, 0.30f));
+            ImGui::PushStyleColor(ImGuiCol_Header,              dbz(0.09f, 0.11f, 0.13f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered,       accent(0.22f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderActive,        accent(0.35f));
+            ImGui::PushStyleColor(ImGuiCol_Separator,           dbz(0.12f, 0.16f, 0.19f));
             ImGui::PushStyleColor(ImGuiCol_SeparatorHovered,    accent(0.55f));
             ImGui::PushStyleColor(ImGuiCol_SeparatorActive,     gold());
-            ImGui::PushStyleColor(ImGuiCol_Tab,                 dbz(0.12f, 0.12f, 0.20f));
-            ImGui::PushStyleColor(ImGuiCol_TabHovered,          accent(0.45f));
-            ImGui::PushStyleColor(ImGuiCol_TabActive,           accent());
-            ImGui::PushStyleColor(ImGuiCol_TabUnfocused,        dbz(0.12f, 0.12f, 0.20f));
-            ImGui::PushStyleColor(ImGuiCol_TabUnfocusedActive,  dbz(0.60f, 0.40f, 0.12f));
-            ImGui::PushStyleColor(ImGuiCol_TableHeaderBg,       dbz(0.16f, 0.13f, 0.07f));
-            ImGui::PushStyleColor(ImGuiCol_TableRowBg,          dbz(0.11f, 0.11f, 0.18f, 0.50f));
-            ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt,       dbz(0.94f, 0.63f, 0.19f, 0.05f));
-            ImGui::PushStyleColor(ImGuiCol_ScrollbarBg,         dbz(0.09f, 0.09f, 0.15f, 0.60f));
-            ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab,       accent(0.55f));
-            ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered,accent(0.75f));
+            // Flat "ghost" tabs with a thin orange border (TabBarBorderSize above)
+            // instead of a filled rounded-pill active tab — reads as a HUD section
+            // switcher rather than a browser-style tab strip.
+            ImGui::PushStyleColor(ImGuiCol_Tab,                 dbz(0.04f, 0.06f, 0.08f, 0.0f));
+            ImGui::PushStyleColor(ImGuiCol_TabHovered,          accent(0.20f));
+            ImGui::PushStyleColor(ImGuiCol_TabActive,           accent(0.14f));
+            ImGui::PushStyleColor(ImGuiCol_TabUnfocused,        dbz(0.04f, 0.06f, 0.08f, 0.0f));
+            ImGui::PushStyleColor(ImGuiCol_TabUnfocusedActive,  accent(0.10f));
+            ImGui::PushStyleColor(ImGuiCol_TableHeaderBg,       dbz(0.08f, 0.10f, 0.12f));
+            ImGui::PushStyleColor(ImGuiCol_TableRowBg,          dbz(0.05f, 0.07f, 0.09f, 0.50f));
+            ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt,       dbz(1.00f, 0.62f, 0.10f, 0.04f));
+            ImGui::PushStyleColor(ImGuiCol_ScrollbarBg,         dbz(0.04f, 0.06f, 0.08f, 0.60f));
+            ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab,       accent(0.45f));
+            ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered,accent(0.70f));
             ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, gold());
             ImGui::PushStyleColor(ImGuiCol_PlotLines,           accent());
             ImGui::PushStyleColor(ImGuiCol_PlotHistogram,       accent());
@@ -150,13 +173,41 @@ namespace
         DbzThemeScope &operator=(const DbzThemeScope &) = delete;
     };
 
+    // --- Capsule HUD font loading -------------------------------------------
+    // Resolved font path lives in a file-scope static so loadOverlayFonts()
+    // (called from initialize()) can read it without user-data arguments.
+    std::string s_hudFontPath;
+    bool s_fontLoaded = false;
+
+    void loadOverlayFonts()
+    {
+        ImGuiIO &io = ImGui::GetIO();
+        // Wipe the atlas built by rlImGui (default font + FontAwesome) and
+        // replace it with a single Russo One face.  Because Russo One becomes
+        // Fonts[0] (the ImGui "default" font), every piece of text in the
+        // overlay — title, tabs, section headers, body — renders in it
+        // automatically without any PushFont calls.
+        io.Fonts->Clear();
+        if (!s_hudFontPath.empty())
+        {
+            io.Fonts->AddFontFromFileTTF(s_hudFontPath.c_str(), 16.0f);
+            s_fontLoaded = true;
+        }
+        else
+        {
+            io.Fonts->AddFontDefault();
+            s_fontLoaded = false;
+        }
+    }
+
     // Blinking alpha for "Press..." capture hints.
     float blinkAlpha()
     {
         return 0.5f + 0.5f * std::sin(ImGui::GetTime() * 6.0f);
     }
 
-    // Section header helper: small uppercase accent text with a leading orange bar.
+    // Section header helper: small uppercase accent text (Russo One, when loaded)
+    // with a leading orange bar.
     void sectionHeader(const char *label)
     {
         ImGui::Spacing();
@@ -222,12 +273,39 @@ void PS2SettingsOverlay::initialize()
 {
     if (m_initialized)
         return;
+    // --- Capsule HUD display font (Russo One) -------------------------------
+    // Shipped under assets/fonts next to the executable (portable dist), same
+    // layout convention as savedata/ (see getExecutableDirectory() in main.cpp).
+    // s_configDir is "<exeDir>/savedata", so its parent is <exeDir>.
+    //
+    // rlImGui builds its font atlas inside rlImGuiSetup() -> rlImGuiBeginInitImGui(),
+    // which calls AddFontDefault() for us UNLESS we register our own callback via
+    // rlImGuiSetLoadFontsCallback() first (rlImGui has no separate "reload fonts"
+    // entry point — the callback is the supported hook for adding extra fonts). So
+    // the path must be resolved and the callback installed BEFORE rlImGuiSetup runs.
+    if (!s_configDir.empty())
+    {
+        const std::filesystem::path fontPath =
+            std::filesystem::path(s_configDir).parent_path() / "assets" / "fonts" / "RussoOne-Regular.ttf";
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(fontPath, ec) && !ec)
+            s_hudFontPath = fontPath.string();
+        else
+            std::fprintf(stderr, "[overlay] Russo One font not found at %s, falling back to default font\n",
+                        fontPath.string().c_str());
+    }
     rlImGuiSetup(true);
+    // The rlImGui version used here has no rlImGuiSetLoadFontsCallback() hook, so load
+    // the Capsule HUD fonts directly after setup — ImGui rebuilds the atlas lazily on
+    // the first frame.
+    loadOverlayFonts();
+
     ImGuiIO &io = ImGui::GetIO();
     // Do NOT enable NavEnableGamepad: raylib feeds the connected gamepad's axes/buttons
     // straight into ImGui, so with the nav flag on a joystick at rest would yank sliders
     // (e.g. volume) to 0 the instant they are clicked. The overlay is mouse/keyboard only.
     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+
     m_initialized = true;
     m_configPath = s_configDir.empty()
         ? (std::filesystem::current_path() / kConfigFileName).string()
@@ -329,6 +407,11 @@ void PS2SettingsOverlay::loadSettings()
                     m_settings.skipPost = (val == "1" || val == "true");
                 else if (key == "skip_stale_vram")
                     m_settings.skipStaleVram = (val == "1" || val == "true");
+                else if (key == "render_scale")
+                {
+                    int s = std::atoi(val.c_str());
+                    m_settings.renderScale = (s >= 1 && s <= 4) ? s : 1;
+                }
                 else if (key == "fullscreen")
                     m_settings.fullscreen = (val == "1" || val == "true");
                 else if (key == "widescreen")
@@ -433,6 +516,7 @@ void PS2SettingsOverlay::saveSettings() const
     file << "halftexel=" << (m_settings.halfTexel ? "1" : "0") << "\n";
     file << "skippost=" << (m_settings.skipPost ? "1" : "0") << "\n";
     file << "skip_stale_vram=" << (m_settings.skipStaleVram ? "1" : "0") << "\n";
+    file << "render_scale=" << m_settings.renderScale << "\n";
     file << "fullscreen=" << (m_settings.fullscreen ? "1" : "0") << "\n";
     file << "widescreen=" << (m_settings.widescreen ? "1" : "0") << "\n\n";
 
@@ -492,6 +576,7 @@ void PS2SettingsOverlay::applySettings()
     GsGpuRenderer::setHalfTexel(m_settings.halfTexel);
     GsGpuRenderer::setSkipPost(m_settings.skipPost);
     GsGpuRenderer::setSkipStaleVram(m_settings.skipStaleVram);
+    GsGpuRenderer::setRenderScale(m_settings.renderScale);
     applyDeadzone();
 
     // Apply selected device to PadConfig
@@ -715,8 +800,25 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
         m_dirty = false;
     }
 
-    if (!m_visible)
+    // --- Deploy / retract animation ------------------------------------------
+    // m_animT eases toward 1 (open) or 0 (closed) every frame instead of snapping,
+    // so closing still needs a few frames to fade + slide away even though m_visible
+    // has already flipped to false below. Keep advancing it even while !m_visible so
+    // the retract animation can finish; only bail once it's fully settled at 0.
+    {
+        const float dt = ImGui::GetIO().DeltaTime;
+        const float target = m_visible ? 1.0f : 0.0f;
+        const float step = dt > 0.0f ? (dt / kOverlayAnimDuration) : 1.0f;
+        if (m_animT < target)
+            m_animT = std::min(target, m_animT + step);
+        else if (m_animT > target)
+            m_animT = std::max(target, m_animT - step);
+    }
+
+    if (m_animT <= 0.0001f)
         return;
+
+    const float animEase = overlayAnimEase(m_animT);
 
     // --- Draw overlay ---
     // Capture the pre-frame visibility so we can detect a true->false transition caused
@@ -730,35 +832,60 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
         pushDbzTheme();
         DbzThemeScope dbzTheme;   // pops all 40 style colours on scope exit
 
-        const ImVec2 winSize(960, 0);
+        // Fade the whole window (and the bindings popup, if open) in/out with the
+        // deploy animation.
+        ScopedStyleVar animAlpha(ImGuiStyleVar_Alpha, animEase);
+
+        const ImVec2 winSize(1080, 0);
         ImGui::SetNextWindowSize(winSize, ImGuiCond_Always);
         {
             const ImVec2 vp = ImGui::GetMainViewport()->Size;
             const float maxH = std::max(180.0f, vp.y * 0.92f);
-            ImGui::SetNextWindowSizeConstraints(ImVec2(960, 180), ImVec2(960, maxH));
+            ImGui::SetNextWindowSizeConstraints(ImVec2(1080, 180), ImVec2(1080, maxH));
         }
-        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
 
-        ImGui::Begin("Settings##overlay", &m_visible,
+        // Slide the panel in from just above centre as it deploys (and back up as it
+        // retracts) instead of popping in place — reads like the HUD "powering up"
+        // rather than an abrupt toggle.
+        ImVec2 pos = ImGui::GetMainViewport()->GetCenter();
+        pos.y += (1.0f - animEase) * -26.0f;
+        ImGui::SetNextWindowPos(pos, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+
+        ImGui::Begin("DBZ BT3 // SETTINGS##overlay", &m_visible,
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
 
-        // --- Custom title bar ---
+        // Ignore clicks while the panel is only mid-retract (fading/sliding out after
+        // Close/X was already pressed) so a stray click can't land on a control that's
+        // about to disappear.
+        ImGui::BeginDisabled(!m_visible);
+
+        // --- Capsule HUD corner brackets ---
         {
             ImDrawList *dl = ImGui::GetWindowDrawList();
             if (dl)
             {
-                ImVec2 min = ImGui::GetWindowPos();
-                ImVec2 max = ImVec2(min.x + ImGui::GetWindowWidth(), min.y + 34);
-                dl->AddRectFilled(min, max, IM_COL32(15, 13, 7, 255));
-                dl->AddRectFilled(min, ImVec2(min.x + 4, max.y), IM_COL32(240, 160, 48, 255));
-                ImGui::SetCursorPos(ImVec2(16, 9));
-                ScopedStyleColor c(ImGuiCol_Text, gold());
-                ImGui::TextUnformatted("DBZ BT3 Settings");
+                const ImVec2 wMin = ImGui::GetWindowPos();
+                const ImVec2 wMax = ImVec2(wMin.x + ImGui::GetWindowWidth(), wMin.y + ImGui::GetWindowHeight());
+                const float bl = 14.0f;
+                const ImU32 bracketCol = IM_COL32(255, 158, 26, 200);
+                dl->AddLine(ImVec2(wMin.x + 6, wMin.y + 6), ImVec2(wMin.x + 6 + bl, wMin.y + 6), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMin.x + 6, wMin.y + 6), ImVec2(wMin.x + 6, wMin.y + 6 + bl), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMax.x - 6, wMin.y + 6), ImVec2(wMax.x - 6 - bl, wMin.y + 6), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMax.x - 6, wMin.y + 6), ImVec2(wMax.x - 6, wMin.y + 6 + bl), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMin.x + 6, wMax.y - 6), ImVec2(wMin.x + 6 + bl, wMax.y - 6), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMin.x + 6, wMax.y - 6), ImVec2(wMin.x + 6, wMax.y - 6 - bl), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMax.x - 6, wMax.y - 6), ImVec2(wMax.x - 6 - bl, wMax.y - 6), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMax.x - 6, wMax.y - 6), ImVec2(wMax.x - 6, wMax.y - 6 - bl), bracketCol, 2.0f);
             }
         }
         ImGui::Spacing();
 
         // --- Tabs ---
+        // BeginTabItem draws its header label immediately (using whatever font is
+        // bound at that call); the tab's *content* is only drawn afterwards, once we
+        // call drawXTab(). So the HUD font is pushed/popped tightly around each
+        // BeginTabItem call only — section headers inside each tab push it again
+        // themselves (see sectionHeader()) — leaving the body text in the default font.
         {
             ScopedStyleVar v(ImGuiStyleVar_TabBorderSize, 0.0f);
             if (ImGui::BeginTabBar("SettingsTabs"))
@@ -804,7 +931,15 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
                 ImGui::TextUnformatted(hint);
             }
 
-            ImGui::SameLine(ImGui::GetWindowWidth() - 88);
+            ImGui::SameLine(ImGui::GetWindowWidth() - 170);
+            {
+                ScopedStyleColor c0(ImGuiCol_Button, dbz(0.15f, 0.30f, 0.55f));
+                ScopedStyleColor c1(ImGuiCol_ButtonHovered, dbz(0.20f, 0.40f, 0.70f));
+                ScopedStyleColor c2(ImGuiCol_ButtonActive, dbz(0.18f, 0.35f, 0.60f));
+                if (ImGui::Button("Apply", ImVec2(64, 0)))
+                    applySettings();
+            }
+            ImGui::SameLine();
             {
                 ScopedStyleColor c0(ImGuiCol_Button, dbz(0.45f, 0.12f, 0.10f));
                 ScopedStyleColor c1(ImGuiCol_ButtonHovered, dbz(0.60f, 0.16f, 0.12f));
@@ -821,6 +956,8 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
         if (m_showBindingsPopup && !ImGui::IsPopupOpen("Controller Bindings"))
             ImGui::OpenPopup("Controller Bindings");
         drawBindingsPopup();
+
+        ImGui::EndDisabled();
 
         // Detect closing via the Close button or the title-bar X: ImGui sets *p_open
         // (m_visible) to false directly. That path doesn't go through toggleVisible(),
@@ -880,6 +1017,31 @@ void PS2SettingsOverlay::drawVideoTab()
         m_dirty = true;
     if (toggleSwitch("Skip Post-Processing", &m_settings.skipPost))
         m_dirty = true;
+
+    // Internal resolution: renders the on-screen buffer at a multiple of the native
+    // 640x448 PS2 output, then downsamples on present -- same "Internal Resolution"
+    // concept as PCSX2/Dolphin. Render targets later sampled as textures (shadows,
+    // reflections, HUD composites) always stay native; see GsGpuRenderer::renderScale()
+    // for exactly what is and isn't scaled, and why.
+    sectionHeader("INTERNAL RESOLUTION");
+    {
+        ImGui::Text("Render Scale");
+        ImGui::SameLine(120);
+        ImGui::SetNextItemWidth(220);
+        static const char *kScaleLabels[4] = {
+            "x1 - Native (640x448)",
+            "x2 - ~720p output",
+            "x3 - ~1080p output",
+            "x4 - ~1440p output",
+        };
+        int scaleIdx = std::max(0, std::min(3, m_settings.renderScale - 1));
+        if (ImGui::Combo("##renderscale", &scaleIdx, kScaleLabels, 4))
+        {
+            m_settings.renderScale = scaleIdx + 1;
+            m_dirty = true;
+        }
+        ImGui::TextDisabled("Sharper 3D edges & HUD. Sampled render targets (shadows, reflections) stay native.");
+    }
 
     // Filtering
     sectionHeader("FILTERING");
@@ -1157,6 +1319,7 @@ void PS2SettingsOverlay::drawBindingsTable()
         ImGui::TableSetupColumn("Binding", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("##btn", ImGuiTableColumnFlags_WidthFixed, 56);
         ImGui::TableSetupScrollFreeze(0, 1);
+        // Capsule HUD: readout-style column headers (Russo One, when loaded).
         ImGui::TableHeadersRow();
 
         for (size_t a = 0; a < static_cast<size_t>(ps2_stubs::PadAction::Count); ++a)
@@ -1290,8 +1453,31 @@ void PS2SettingsOverlay::drawBindingsPopup()
     if (ImGui::BeginPopupModal("Controller Bindings", &m_showBindingsPopup,
                                ImGuiWindowFlags_NoResize))
     {
+        // Capsule HUD corner brackets, matching the main panel — keeps the popup
+        // reading as part of the same HUD rather than a plain generic dialog.
+        {
+            ImDrawList *dl = ImGui::GetWindowDrawList();
+            if (dl)
+            {
+                const ImVec2 wMin = ImGui::GetWindowPos();
+                const ImVec2 wMax = ImVec2(wMin.x + ImGui::GetWindowWidth(), wMin.y + ImGui::GetWindowHeight());
+                const float bl = 12.0f;
+                const ImU32 bracketCol = IM_COL32(255, 158, 26, 170);
+                dl->AddLine(ImVec2(wMin.x + 5, wMin.y + 5), ImVec2(wMin.x + 5 + bl, wMin.y + 5), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMin.x + 5, wMin.y + 5), ImVec2(wMin.x + 5, wMin.y + 5 + bl), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMax.x - 5, wMin.y + 5), ImVec2(wMax.x - 5 - bl, wMin.y + 5), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMax.x - 5, wMin.y + 5), ImVec2(wMax.x - 5, wMin.y + 5 + bl), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMin.x + 5, wMax.y - 5), ImVec2(wMin.x + 5 + bl, wMax.y - 5), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMin.x + 5, wMax.y - 5), ImVec2(wMin.x + 5, wMax.y - 5 - bl), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMax.x - 5, wMax.y - 5), ImVec2(wMax.x - 5 - bl, wMax.y - 5), bracketCol, 2.0f);
+                dl->AddLine(ImVec2(wMax.x - 5, wMax.y - 5), ImVec2(wMax.x - 5, wMax.y - 5 - bl), bracketCol, 2.0f);
+            }
+        }
+
         if (ImGui::BeginTabBar("##bindtabs"))
         {
+            // Same pattern as the main tab bar: push the HUD font only around the
+            // tab label itself, not the tab's content.
             if (ImGui::BeginTabItem("Bindings"))
             {
                 ImGui::Spacing();
@@ -1310,18 +1496,26 @@ void PS2SettingsOverlay::drawBindingsPopup()
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.30f, 0.30f, 0.36f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.40f, 0.40f, 0.46f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, dbz(0.35f, 0.35f, 0.40f));
+        // Flat HUD buttons — dark navy body, thin orange border via the theme's
+        // default Border colour, orange tint on hover/active — replacing the old
+        // grey "generic dialog button" look so this matches the main panel.
+        ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.07f, 0.09f, 0.11f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(1.00f, 0.62f, 0.10f, 0.18f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, dbz(1.00f, 0.62f, 0.10f, 0.30f));
         if (ImGui::Button("Close", ImVec2(100, 30)))
             m_showBindingsPopup = false;
         ImGui::PopStyleColor(3);
         ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, accent(0.85f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, accent());
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, gold());
+        ImGui::PushStyleColor(ImGuiCol_Text, dbz(0.05f, 0.03f, 0.01f));
         if (ImGui::Button("Save", ImVec2(100, 30)))
         {
             applySettings();
             saveSettings();
         }
+        ImGui::PopStyleColor(4);
 
         ImGui::EndPopup();
     }
@@ -1405,6 +1599,7 @@ void PS2SettingsOverlay::dumpSettingsToFile()
         file << "  halftexel    = " << (m_settings.halfTexel ? "1" : "0") << "\n";
         file << "  skip_post    = " << (m_settings.skipPost ? "1" : "0") << "\n";
         file << "  skip_stale   = " << (m_settings.skipStaleVram ? "1" : "0") << "\n";
+        file << "  render_scale = " << m_settings.renderScale << "\n";
         file << "  fullscreen   = " << (m_settings.fullscreen ? "1" : "0") << "\n";
         file << "  widescreen   = " << (m_settings.widescreen ? "1" : "0") << "\n";
         file << "\n";
@@ -1454,6 +1649,7 @@ void PS2SettingsOverlay::dumpSettingsToFile()
         file << "  halftexel_enabled    = " << (GsGpuRenderer::halfTexelEnabled() ? "1" : "0") << "\n";
         file << "  skip_post_enabled    = " << (GsGpuRenderer::skipPostEnabled() ? "1" : "0") << "\n";
         file << "  skip_stale_enabled   = " << (GsGpuRenderer::skipStaleVramEnabled() ? "1" : "0") << "\n";
+        file << "  render_scale         = " << GsGpuRenderer::renderScale() << "\n";
         file << "  master_volume        = " << PS2AudioBackend::masterVolume() << "\n";
         file << "  music_volume         = " << PS2AudioBackend::musicVolume() << "\n";
         file << "  sfx_volume           = " << PS2AudioBackend::sfxVolume() << "\n";
@@ -1519,7 +1715,7 @@ void PS2SettingsOverlay::drawGamepadTestArea(const std::array<uint8_t, 32> &btnD
         ImGui::Spacing();
         const float availX = ImGui::GetContentRegionAvail().x;
         const float btnW = std::max(24.0f, (availX - 8.0f * 9) / 8.0f);
-        const float btnH = 26.0f;
+        const float btnH = 22.0f;
         int col = 0;
         for (int i = 0; i < kNumBtns; ++i)
         {
@@ -1555,8 +1751,8 @@ void PS2SettingsOverlay::drawGamepadTestArea(const std::array<uint8_t, 32> &btnD
         ImGui::Text("Axes");
         ImGui::Spacing();
 
-        const float stickR = 38.0f;
-        const float gap = 20.0f;
+        const float stickR = 28.0f;
+        const float gap = 14.0f;
         const float stickBox = stickR * 2.0f;
         ImDrawList *dl = ImGui::GetWindowDrawList();
 
@@ -1610,7 +1806,7 @@ void PS2SettingsOverlay::drawGamepadTestArea(const std::array<uint8_t, 32> &btnD
         ImGui::Spacing();
 
         // --- Triggers: vertical bars, each with a Dummy for its box, labels normal. ---
-        const float trH = 60.0f, trW = 18.0f;
+        const float trH = 42.0f, trW = 16.0f;
         const float trigRowW = trW * 2 + gap;
         const float trigOff = (ImGui::GetContentRegionAvail().x - trigRowW) / 2.0f;
         ImGui::Dummy(ImVec2(trigOff, 0));

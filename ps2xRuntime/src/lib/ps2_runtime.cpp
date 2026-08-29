@@ -19,6 +19,7 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#include "ps2_settings_overlay.h"
 #include "rlgl.h" // rlSetBlendFactorsSeparate for the blend-free present blit
 namespace ps2_syscalls { bool bt3WakeThreadByEntry(uint32_t entry); }
 
@@ -832,6 +833,27 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
         SetTargetFPS(60);
+        // Position the window on the monitor that currently has mouse focus.
+#if !defined(PLATFORM_VITA)
+        {
+            Vector2 cursorPos = GetMousePosition();
+            int monitorCount = GetMonitorCount();
+            for (int i = 0; i < monitorCount; ++i)
+            {
+                Vector2 monPos = GetMonitorPosition(i);
+                int monW = GetMonitorWidth(i);
+                int monH = GetMonitorHeight(i);
+                if (cursorPos.x >= monPos.x && cursorPos.x < monPos.x + monW &&
+                    cursorPos.y >= monPos.y && cursorPos.y < monPos.y + monH)
+                {
+                    SetWindowPosition(
+                        (int)monPos.x + (monW - HOST_WINDOW_WIDTH) / 2,
+                        (int)monPos.y + (monH - HOST_WINDOW_HEIGHT) / 2);
+                    break;
+                }
+            }
+        }
+#endif
         // PS2X_TOPMOST=1: keep the game window above others — unattended (AFK) test runs
         // screenshot the whole desktop, and an occluded window can't be captured on Wayland.
         if (const char *tm = std::getenv("PS2X_TOPMOST"); tm && tm[0] && tm[0] != '0')
@@ -3815,6 +3837,12 @@ void PS2Runtime::run()
             int dh = ps2GpuRenderer().displayHeight();
             if (dw > 0 && dw <= static_cast<int>(FB_WIDTH)) presentWidth = static_cast<uint32_t>(dw);
             if (dh > 0 && dh <= static_cast<int>(DEFAULT_DISPLAY_HEIGHT)) presentHeight = static_cast<uint32_t>(dh);
+            // Ensure present dimensions are at least the nominal framebuffer size.
+            // The scissor extent can be SMALLER than the FBO (e.g. game draws 512 wide
+            // into a 640-wide FBO); using the smaller value zooms in on the drawn region
+            // instead of showing the full frame like the software path does.
+            if (presentWidth < FB_WIDTH) presentWidth = FB_WIDTH;
+            if (presentHeight < DEFAULT_DISPLAY_HEIGHT) presentHeight = DEFAULT_DISPLAY_HEIGHT;
             static bool s_dlog = false;
             if (!s_dlog && dw > 0 && std::getenv("PS2X_GPU_DIAG")) { s_dlog = true; std::cerr << "[gpupresent] disp=" << dw << "x" << dh << " -> present=" << presentWidth << "x" << presentHeight << std::endl; }
         }
@@ -3834,8 +3862,16 @@ void PS2Runtime::run()
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
         const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        float dstWidth = srcWidth * scale;
+        float dstHeight = srcHeight * scale;
+        // Widescreen: stretch to fill the screen instead of letterboxing.
+#if !defined(PLATFORM_VITA)
+        if (PS2SettingsOverlay::isWidescreen())
+        {
+            dstWidth = screenWidth;
+            dstHeight = screenHeight;
+        }
+#endif
         // Atlas mode presents a sub-rect of the big atlas texture -> crop from the display slot origin.
         const float srcX = flipY ? static_cast<float>(ps2GpuRenderer().presentSrcX()) : 0.0f;
         const float srcY = flipY ? static_cast<float>(ps2GpuRenderer().presentSrcY()) : 0.0f;

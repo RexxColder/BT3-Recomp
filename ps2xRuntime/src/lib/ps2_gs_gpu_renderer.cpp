@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <map>
 #include <string>
+#include <atomic>
 
 #include "raylib.h"
 #include "rlgl.h"
@@ -465,6 +466,24 @@ bool GsGpuRenderer::skipPostEnabled()      { return s_skipPost; }
 void GsGpuRenderer::setSkipPost(bool v)    { s_skipPost = v; }
 bool GsGpuRenderer::skipStaleVramEnabled() { return s_skipStaleVram; }
 void GsGpuRenderer::setSkipStaleVram(bool v) { s_skipStaleVram = v; }
+
+// Internal resolution multiplier. 1 = native (default; the scaling code below is a
+// straight no-op at this value, so nothing changes until the user opts in).
+static std::atomic<int> s_renderScale{[]() {
+    const char *v = std::getenv("PS2X_RENDER_SCALE");
+    int s = (v && v[0]) ? std::atoi(v) : 1;
+    if (s < 1) s = 1;
+    if (s > 4) s = 4;
+    return s;
+}()};
+
+int GsGpuRenderer::renderScale() { return s_renderScale.load(std::memory_order_relaxed); }
+void GsGpuRenderer::setRenderScale(int s)
+{
+    if (s < 1) s = 1;
+    if (s > 4) s = 4;
+    s_renderScale.store(s, std::memory_order_relaxed);
+}
 
 GsGpuRenderer &ps2GpuRenderer()
 {
@@ -1187,6 +1206,15 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // produce garbage.
         if (m_dispW > 16 && m_presentTexW > 0 && m_dispW > m_presentTexW) m_dispW = m_presentTexW;
         if (m_dispH > 16 && m_presentTexH > 0 && m_dispH > m_presentTexH) m_dispH = m_presentTexH;
+        // Scale display region to match the render scale: the FBO is effScale× larger
+        // than native, so the game content that fills scissor (sx,sy,sw,sh) at native
+        // coords actually occupies effScale× that region in the FBO. The present path
+        // uses m_dispW/m_dispH to construct srcRect, so it must reflect the real FBO
+        // content region.
+        {
+            const int rs = GsGpuRenderer::renderScale();
+            if (rs > 1 && m_dispW > 0 && m_dispH > 0) { m_dispW *= rs; m_dispH *= rs; }
+        }
     }
 
     // Per-frame texture census (PS2X_GPU_DIAG): distinct texKeys + cmd count for the
@@ -1470,13 +1498,47 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (depthOn && curDepthTest != 0) { rlDisableDepthTest(); rlEnableDepthMask(); curDepthTest = 0; curDepthFunc = -1; curDepthWrite = 1; }
         if (curMask != 15) { glColorMask(1, 1, 1, 1); curMask = 15; } // full mask for blits/present
         rlDisableScissorTest(); EndBlendMode(); EndShaderMode(); EndTextureMode(); inMode = false; curRealFbp = 0xFFFFFFFFu; } };
+    // ---- Internal resolution ("Render Scale") -----------------------------------
+    // Scale ONLY the "normal display" buffers (fboSizeFor's non-sourceFbps branch below)
+    // and the draw geometry landing in them. Render targets later sampled as textures
+    // (sourceFbps -- shadows/reflections/composites, and the Z-as-texture 8px-column
+    // re-view trick) are deliberately left at native resolution.
+    //
+    // Two escape hatches force native (S=1) for the WHOLE frame:
+    //   - Atlas mode (PS2X_ATLAS): every fbp shares ONE big FBO at fixed sub-rects
+    //   - Any local-to-local VRAM transfer (isTransfer) whose src/dst is a scaled buffer
+    int effScale = s_atlas ? 1 : GsGpuRenderer::renderScale();
+    if (effScale > 1)
+    {
+        for (const DrawCmd &tc : cmds)
+        {
+            if (!tc.isTransfer) continue;
+            if (!sourceFbps.count(tc.xSrcFbp) || !sourceFbps.count(tc.xDstFbp)) { effScale = 1; break; }
+        }
+    }
+    const bool renderScaling = effScale > 1;
+    const float renderScaleF = static_cast<float>(effScale);
+    // scaleCmd: multiplies draw geometry coords by renderScaleF for non-RT, non-transfer draws
+    auto scaleCmd = [&](DrawCmd cc) -> DrawCmd {
+        if (!renderScaling || cc.isTransfer || sourceFbps.count(cc.destFbp))
+            return cc;
+        cc.dx0 *= renderScaleF; cc.dy0 *= renderScaleF;
+        cc.dx1 *= renderScaleF; cc.dy1 *= renderScaleF;
+        cc.sx = static_cast<int>(std::lround(cc.sx * renderScaleF));
+        cc.sy = static_cast<int>(std::lround(cc.sy * renderScaleF));
+        cc.sw = static_cast<int>(std::lround(cc.sw * renderScaleF));
+        cc.sh = static_cast<int>(std::lround(cc.sh * renderScaleF));
+        for (auto &v : cc.tri) { v.x *= renderScaleF; v.y *= renderScaleF; }
+        return cc;
+    };
     auto fboSizeFor = [&](uint32_t fbp, int &w, int &h) {
-        if (sourceFbps.count(fbp)) { // render target: size to the sampled texture
+        if (sourceFbps.count(fbp)) { // render target: size to the sampled texture (native, unscaled)
             w = (rtTexW.count(fbp) && rtTexW[fbp] > 0) ? rtTexW[fbp] : (destFbwById.count(fbp) ? destFbwById[fbp] * 64 : 256);
             h = (rtTexH.count(fbp) && rtTexH[fbp] > 0) ? rtTexH[fbp] : 512;
         } else {
             w = destFbwById.count(fbp) ? std::max(64, std::min(1024, destFbwById[fbp] * 64)) : m_fboW;
             h = m_fboH; // display/normal buffer: requested display height (present flips against this)
+            if (renderScaling) { w *= effScale; h *= effScale; }
         }
         if (w < 1) w = m_fboW; if (h < 1) h = m_fboH;
         // PS2X_CAP_FBO: clamp render-target FBO size (test whether the big-FBO corruption is the
@@ -2036,7 +2098,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     static uint32_t s_prevListScene = 0xFFFFFFFFu;
     for (size_t ci = 0; ci < DC.size(); ++ci)
     {
-        const DrawCmd &c = DC[ci];
+        DrawCmd cScaled = scaleCmd(DC[ci]);
+        const DrawCmd &c = cScaled;
         // A secondary bit-depth view of a buffer we hold as one RGBA8 FBO, writing through a
         // mask we cannot express either. Narrow on purpose: a bit-depth re-view ALONE is not
         // enough to drop a draw -- fbp336 is legitimately rendered through both a 256x256
@@ -3260,7 +3323,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // thin edges). Skip for FBO sources (handled by the generic paths below).
         if (c.isTriangle && c.texKey != 0 && !fromFbo && ci + 1 < DC.size())
         {
-            const DrawCmd &c2 = DC[ci + 1];
+            DrawCmd c2Scaled = scaleCmd(DC[ci + 1]);
+            const DrawCmd &c2 = c2Scaled;
             if (c2.isTriangle && c2.texKey == c.texKey && c2.destFbp == c.destFbp &&
                 c2.sx == c.sx && c2.sy == c.sy && c2.sw == c.sw && c2.sh == c.sh)
             {

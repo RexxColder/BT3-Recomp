@@ -509,6 +509,16 @@ if(NOT PS2X_IS_VITA)
     )
     target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
     target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
+
+    # Stage the settings-overlay assets (Capsule HUD font) next to the executable,
+    # same portable-dist convention as savedata/ (see getExecutableDirectory() in
+    # main.cpp: assets are resolved as "<exeDir>/assets/...").
+    add_custom_command(TARGET ps2EntryRunner POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+            "$<TARGET_FILE_DIR:ps2EntryRunner>/assets"
+        COMMENT "Staging overlay assets (fonts) next to ps2EntryRunner"
+    )
 endif()
 
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)

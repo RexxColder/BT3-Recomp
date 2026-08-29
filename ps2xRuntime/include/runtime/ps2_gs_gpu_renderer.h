@@ -36,6 +36,15 @@ public:
     static bool skipStaleVramEnabled();
     static void setSkipStaleVram(bool v);
 
+    // Internal resolution ("Render Scale"). Multiplies the geometry + FBO size of the
+    // DISPLAY-chain buffers only -- never a render target later sampled as a texture
+    // (shadows/reflections/composites), and automatically forced back to 1 for any frame
+    // where scaling would be unsafe (atlas mode, or a local-to-local VRAM transfer that
+    // touches a to-be-scaled buffer). See renderAndGetTextureId() for the exact gating.
+    // 1 = native (default, zero behaviour change).
+    static int renderScale();
+    static void setRenderScale(int s); // clamped to [1,4]
+
     // A draw command is either an axis-aligned SPRITE quad (rendered with the proven
     // DrawTexturePro path) or a TRIANGLE (rendered with rlgl). One ordered list keeps
     // blend order correct. texKey 0 = untextured (flat).
