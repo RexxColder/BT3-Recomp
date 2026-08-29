@@ -737,6 +737,7 @@ namespace
         // GS interpolates S, T and Q linearly in screen space and divides PER PIXEL. Doing the
         // divide per vertex and interpolating the quotient smears the cel/outline ramp.
         "  vec2 stq = (uPerspQ > 0.5 && abs(fragQ) > 1e-9) ? (fragTexCoord / fragQ) : fragTexCoord;\n"
+        "  if (uPerspQ > 0.5 && fragQ <= 0.0) discard;\n"   // [decalq] behind the projector: the GS coordinate is +-inf (clamped border) -> nothing
         "  if (uRegion.w > 0.5) stq = vec2(clamp(stq.x, 0.0005, uRegion.x), clamp(stq.y, uRegion.y, uRegion.z));\n"
         // Projective shadow decal (BT3 Pass 2): the stage floor triangles under an actor are
         // textured with the character silhouette rendered at 0x2A00. Coordinates outside the

@@ -4331,6 +4331,8 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             const float amin = std::min(std::min(std::fabs(qa), std::fabs(qb)), std::fabs(qc));
             perspSafe = (amin > 1e-4f) && ((qa > 0.0f) == (qb > 0.0f)) && ((qb > 0.0f) == (qc > 0.0f));
         }
+        // [decalq] the ground-shadow decal class (CT24 read of the Pass-1 silhouette, DATE, blend 0x44)
+        const bool shadowDecalClass = tme && ctx.tex0.tbp0 == 10752u && ctx.tex0.psm == 1u && (((ctx.test >> 14) & 1u) != 0u) && ((ctx.alpha & 0xFFu) == 0x44u);
         for (int i = 0; i < 3; ++i)
         {
             const GSVertex &v = gs->m_vtxQueue[i];
@@ -4391,13 +4393,15 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             // for 15680/13440/13672/13840/16064, but tbp10752 does NOT (ours 0.0000..0.3806 vs
             // console -4.0635..2.2991) -- console clips those triangles and we keep them, so a
             // per-pixel divide there uses a q we got wrong and wrecks the sky.
-            const bool shadowDecalClass = ctx.tex0.tbp0 == 10752u && ctx.tex0.psm == 1u && (((ctx.test >> 14) & 1u) != 0u) && ((ctx.alpha & 0xFFu) == 0x44u);
             const bool perspThis = s_perspQ &&
-                (s_perspMode == 5 ? shadowDecalClass
+                (s_perspMode == 5 ? false
                  : s_perspMode == 4 ? (ctx.tex0.tbp0 != 10752u)
                  : s_perspMode == 3 ? (ctx.tex0.tbp0 == 10752u || ctx.tex0.tbp0 == 15680u)
                  : s_perspMode == 2 ? true
                  : ctx.tex0.tbp0 == 15680u);
+            // [decalq] the shadow decal keeps the per-pixel path even when q changes sign across the tile: the GS divides
+            // per pixel (q<=0 -> coordinates fly to +-inf -> CLAMP border = black = nothing); the affine fallback swept the
+            // silhouette across the whole tile (the "wedge" on the grass). The shader discards fragments with q <= 0.
             if (perspThis && perspSafe)
             {
                 cmd.tri[i].u = v.s;
@@ -4627,11 +4631,27 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                         uvErrTexels = std::max({uvErrTexels, du, dv});
                     }
                 }
-                if (qOk && uvErrTexels > 3.0f)
+                // [decalq] a shadow-decal tile whose q changes sign straddles the projector plane: subdivide it anyway and
+                // drop the pieces that contain q <= 0 (the GS maps them to +-inf = clamped border = nothing); the affine
+                // fallback used to sweep the silhouette across the whole tile (the "wedge" on the grass).
+                static const bool s_decalQ = [](){ const char *v = std::getenv("PS2X_DECALQ"); return !(v && v[0] == '0'); }();   // =0: old affine fallback (A/B)
+                if (shadowDecalClass && !qOk)
+                {   // [decalq] log every mixed-sign-q decal tile (the wedge source) with a timestamp for screenshot matching
+                    static const auto t0 = std::chrono::steady_clock::now(); static int n = 0;
+                    if (n++ < 2000)
+                    {
+                        const long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+                        std::fprintf(stderr, "[decalq] t=%ldms unsafe tile q %.4f %.4f %.4f xy (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f) %s\n", ms, sv[0].q, sv[1].q, sv[2].q,
+                                     sv[0].x, sv[0].y, sv[1].x, sv[1].y, sv[2].x, sv[2].y, s_decalQ ? "subdivide+drop" : "AFFINE (old)");
+                    }
+                }
+                if (s_decalQ && shadowDecalClass && !qOk) uvErrTexels = 1e9f;
+                if ((qOk || shadowDecalClass) && uvErrTexels > 3.0f && cmd.tri[0].q == 1.0f)
                 {
                     auto emitTri = [&](const SV &a, const SV &b, const SV &c2)
                     {
                         const SV *vv[3] = {&a, &b, &c2};
+                        if (s_decalQ && shadowDecalClass && (a.q <= 1e-4f || b.q <= 1e-4f || c2.q <= 1e-4f)) return;   // [decalq]
                         for (int i = 0; i < 3; ++i)
                         {
                             cmd.tri[i].x = vv[i]->x; cmd.tri[i].y = vv[i]->y; cmd.tri[i].z = vv[i]->zn;
