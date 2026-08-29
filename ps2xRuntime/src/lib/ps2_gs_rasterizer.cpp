@@ -4394,7 +4394,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             // console -4.0635..2.2991) -- console clips those triangles and we keep them, so a
             // per-pixel divide there uses a q we got wrong and wrecks the sky.
             const bool perspThis = s_perspQ &&
-                (s_perspMode == 5 ? false
+                (s_perspMode == 5 ? (shadowDecalClass && [](){ static const bool r = [](){ const char *v = std::getenv("PS2X_DECALRAW"); return v && v[0] == '1'; }(); return r; }())
                  : s_perspMode == 4 ? (ctx.tex0.tbp0 != 10752u)
                  : s_perspMode == 3 ? (ctx.tex0.tbp0 == 10752u || ctx.tex0.tbp0 == 15680u)
                  : s_perspMode == 2 ? true
@@ -4402,7 +4402,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             // [decalq] the shadow decal keeps the per-pixel path even when q changes sign across the tile: the GS divides
             // per pixel (q<=0 -> coordinates fly to +-inf -> CLAMP border = black = nothing); the affine fallback swept the
             // silhouette across the whole tile (the "wedge" on the grass). The shader discards fragments with q <= 0.
-            if (perspThis && perspSafe)
+            if (perspThis && (perspSafe || shadowDecalClass))
             {
                 cmd.tri[i].u = v.s;
                 cmd.tri[i].v = v.t;
@@ -4652,6 +4652,15 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     {
                         const SV *vv[3] = {&a, &b, &c2};
                         if (s_decalQ && shadowDecalClass && (a.q <= 1e-4f || b.q <= 1e-4f || c2.q <= 1e-4f)) return;   // [decalq]
+                        if (shadowDecalClass)
+                        {   // [decalgarb] BT3 hands the far fighter's floor tiles vertices with GARBAGE s/t (console 1853: s=-496.6
+                            // t=-214 at q=0.0037 -> s/q = -133000). The GS's per-pixel divide sweeps those past the texture into the
+                            // clamped black border within a sub-pixel band; an affine piece emitted at the depth cap next to such
+                            // a corner sweeps the whole silhouette across a visible band instead (the "wedge" near a distant Gohan).
+                            const SV *pv[3] = {&a, &b, &c2};
+                            for (int i = 0; i < 3; ++i)
+                                if (std::fabs(pv[i]->s / pv[i]->q) > 8.0f || std::fabs(pv[i]->t / pv[i]->q) > 8.0f) return;
+                        }
                         for (int i = 0; i < 3; ++i)
                         {
                             cmd.tri[i].x = vv[i]->x; cmd.tri[i].y = vv[i]->y; cmd.tri[i].z = vv[i]->zn;
@@ -4698,7 +4707,17 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     {
                         Item it = s_work.back();
                         s_work.pop_back();
-                        if (it.depth >= 5 || (it.depth > 0 && pieceErr(it.a, it.b, it.c) <= 3.0f))
+                        // [decalq] the shadow decal needs a finer split: an affine piece with 3 texels of error at the
+                        // silhouette edge paints a whole sliver the GS does not (console decal 1853: 15 px, ours 16+38).
+                        // [decalsub] PS2X_DECALSUB=<depthCap>,<errTexels> for the shadow-decal class (default 5,3 = the generic rule);
+                        // errCap 1/depth 7 removed the far-fighter sliver but cost 30 -> 20 fps (7000 pieces/frame).
+                        // Default for the decal: depth cap 7, err 3 -- pieces that hit the old cap of 5 were emitted with a
+                        // large residual error and painted the sliver; cap 7 removes it at +35% pieces (2311 vs 1705/frame).
+                        static int s_dcap = 7; static float s_derr = 3.0f;
+                        static const bool s_dsub = [](){ const char *v = std::getenv("PS2X_DECALSUB"); return v && std::sscanf(v, "%d,%f", &s_dcap, &s_derr) == 2; }();
+                        (void)s_dsub;
+                        const int depthCap = shadowDecalClass ? s_dcap : 5; const float errCap = shadowDecalClass ? s_derr : 3.0f;
+                        if (it.depth >= depthCap || (it.depth > 0 && pieceErr(it.a, it.b, it.c) <= errCap))
                         {
                             emitTri(it.a, it.b, it.c);
                             continue;

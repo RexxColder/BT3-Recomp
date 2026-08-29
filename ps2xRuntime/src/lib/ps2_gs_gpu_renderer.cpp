@@ -129,6 +129,21 @@ extern "C" void *ps2xGuestWaitBegin();   // [barblock] ps2_runtime.cpp
 extern "C" void ps2xGuestWaitEnd(void *);
 #endif
 extern "C" void glBindTexture(unsigned int target, unsigned int texture);
+extern "C" void glScissor(int x, int y, int width, int height);
+extern "C" void glEnable(unsigned cap);
+// [rtthazard] the texture of the FBO most recently SAMPLED by a draw (fromFbo). Rendering into that FBO right after
+// sampling it (BT3: shadow decal A samples fbp336, then clear/mesh for fighter B render into fbp336) lost the writes --
+// the second fighter's decal projected fighter A's silhouette (the "sliver" near a distant Gohan). Flush, unbind and
+// put a texture barrier between the two.
+static uint32_t g_lastSampledFboTex = 0;
+static uint32_t g_lastRenderedFboTex = 0;   // [texbarrier] texture of the FBO most recently bound for rendering
+#include <dlfcn.h>
+static void ps2xTextureBarrier()
+{
+    typedef void (*PFN)(void);
+    static PFN p = [](){ void *f = dlsym(RTLD_DEFAULT, "glTextureBarrier"); if (!f) f = dlsym(RTLD_DEFAULT, "glTextureBarrierNV"); return reinterpret_cast<PFN>(f); }();
+    if (p) p(); else glFinish();
+}
 extern "C" void glTexParameteri(unsigned int target, unsigned int pname, int param);
 // GS FRAME.FBMSK -> per-channel color write mask (rlgl has no wrapper).
 extern "C" void glColorMask(unsigned char red, unsigned char green, unsigned char blue, unsigned char alpha);
@@ -652,7 +667,9 @@ namespace
     const GsGpuRenderer::DrawCmd *g_dbgDecalCmd = nullptr;   // [decaldbg]
     int g_locPerspQ = -1;
     int g_locRegion = -1;   // [region]
+    float g_curTexa[4] = {1.0f, 1.0f, 0.0f, 0.0f};   // [texacache] last uTexa pushed -- every writer must update it
     const GsGpuRenderer::DrawCmd *g_curDecalCmd = nullptr;
+    bool g_decalUViz = false; float g_decalUVizMode = 1.f;   // [decaldbg 6/7]
     float g_curReg[4] = {0.f, 0.f, 0.f, -1.f};   // [region] last uRegion value pushed   // [region] the shadow-decal command being drawn (loop top)               // PS2X_PERSPQ: per-pixel S/Q divide
     int g_locForceA = -1;               // PS2X_FORCEA: constant alpha write test
     int g_locZTex = -1;                 // PS2X_ZTEX: texture0 is a depth texture
@@ -867,7 +884,8 @@ namespace
         "  finalColor = vec4(clamp(c.rgb * bright * uSubScale, 0.0, 1.0), aStore);\n"
         // PS2X_UVIZ: write the interpolated ramp coordinate itself, so the per-pixel u the
         // SAMPLER actually sees can be read back out of the frame and histogrammed.
-        "  if (uUViz > 0.5) finalColor = vec4(stq.x, stq.x, stq.x, 1.0);\n"
+        "  if (uUViz > 1.5) finalColor = vec4(t.rgb, 1.0);\n"   // [decaldbg 7] the raw sampled texel
+        "  else if (uUViz > 0.5) finalColor = vec4(stq.x * 4.0, (stq.y - 0.5) * 2.0, t.a, 1.0);\n"   // [decaldbg 6] R = u (x4: region), G = v (region), B = synthesised alpha
         "}\n";
 }
 
@@ -2663,7 +2681,7 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
       if (g_locAref >= 0)     { const float half = 0.5f; SetShaderValue(g_shader, g_locAref, &half, SHADER_UNIFORM_FLOAT); }
       // uTexa.w < 1.5 makes the shader REPLACE the sampled alpha with uTexa.x, which would
       // wipe the coverage mask; 3.0 selects the pass-through branch that keeps t.a.
-      if (g_locTexa >= 0)     { const float t4[4] = {1,1,0,3}; SetShaderValue(g_shader, g_locTexa, t4, SHADER_UNIFORM_VEC4); } }
+      if (g_locTexa >= 0)     { const float t4[4] = {1,1,0,3}; SetShaderValue(g_shader, g_locTexa, t4, SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t4, sizeof t4); } }
 
     {   // PS2X_SWOCMP=1: does the snapshot still match the FBO at EXECUTION time? Everything
         // else is eliminated (placement verified 1:1 with corner markers, plus content,
@@ -4030,7 +4048,7 @@ void GsGpuRenderer::ensureGl(int w, int h)
         if (g_locProjClip >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locProjClip, &z, SHADER_UNIFORM_FLOAT); }
         if (g_locTfx >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locTfx, &z, SHADER_UNIFORM_FLOAT); }
         if (g_locTexa >= 0) { const float t0[4] = {1.0f, 1.0f, 0.0f, 0.0f};
-                              SetShaderValue(g_shader, g_locTexa, t0, SHADER_UNIFORM_VEC4); }
+                              SetShaderValue(g_shader, g_locTexa, t0, SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t0, sizeof t0); }
         if (g_locAScale >= 0)
         {
             // DEFAULT OFF. finalColor.a does double duty: GL uses it as the SOURCE ALPHA for RGB
@@ -5400,12 +5418,33 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         }
         // Already bound to the right FBO (e.g. fbp0 then its merged partner fbp112) -> just update the
         // logical target + force scissor recompute; no FBO switch (that switch is the corruptor).
+        {   // [fbotrace] PS2X_FBOTRACE=1: every beginFbp decision vs GL's real draw-framebuffer binding
+            static const bool s_ft = [](){ const char *v = std::getenv("PS2X_FBOTRACE"); return v && v[0] && v[0] != '0'; }();
+            static int n = 0;
+            if (s_ft && n++ < 400)
+            {
+                int bound = -1; glGetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &bound);
+                auto fit = g_fbos.find(rf); const unsigned want = (fit != g_fbos.end()) ? fit->second.rt.id : 0u;
+                std::fprintf(stderr, "[fbotrace] beginFbp(%u) rf=%u curRealFbp=%u curFbp=%u -> %s | GL bound=%d want=%u%s\n", fbp, rf, curRealFbp, curFbp,
+                             rf == curRealFbp ? "EARLY-RETURN" : "switch", bound, want, (rf == curRealFbp && want && (unsigned)bound != want) ? "  <<< MISMATCH" : "");
+            }
+        }
         if (rf == curRealFbp) { curFbp = fbp; curSx = -0x40000000; return; }
         endMode();
         int w, h; fboSizeFor(rf, w, h);
         Fbo &f = ensureFbo(rf, w, h);
         curRealFbp = rf;
         BeginTextureMode(f.rt);
+        g_lastRenderedFboTex = f.rt.texture.id;   // [texbarrier] sampling this texture later needs a barrier
+        if (g_lastSampledFboTex != 0 && g_lastSampledFboTex == f.rt.texture.id)
+        {   // [rtthazard] this FBO's texture was just sampled. PS2X_RTTHAZARD=barrier|finish|read|rebind|0 (A/B)
+            static const std::string s_hz = [](){ const char *v = std::getenv("PS2X_RTTHAZARD"); return std::string(v ? v : "0"); }();
+            g_lastSampledFboTex = 0;
+            if (s_hz == "barrier") { rlDrawRenderBatchActive(); glBindTexture(0x0DE1, 0); ps2xTextureBarrier(); }
+            else if (s_hz == "finish") { rlDrawRenderBatchActive(); glFinish(); }
+            else if (s_hz == "read") { rlDrawRenderBatchActive(); uint32_t px = 0; glReadPixels(0, 0, 1, 1, 0x1908, 0x1401, &px); }
+            else if (s_hz == "rebind") { rlDrawRenderBatchActive(); EndTextureMode(); BeginTextureMode(f.rt); }
+        }
         // PS2X_FBO_CHECK: is this FBO actually complete? An incomplete big FBO would corrupt all
         // subsequent GL draws (the fbp224/336 poison). Logged once per fbp.
         {
@@ -6112,7 +6151,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     std::vector<uint32_t> buf((size_t)w * h);
                     rlEnableFramebuffer(it->second.rt.id);
                     glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
-                    curFbp = 0xFFFFFFFFu;   // force a re-bind before the next draw
+                    curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;   // force a REAL re-bind before the next draw (probe bound another FBO)
                     std::map<unsigned, unsigned long> hist; unsigned long nz = 0;
                     for (uint32_t v : buf) { const unsigned a = v >> 24; ++hist[a]; if (a) ++nz; }
                     std::vector<std::pair<unsigned long, unsigned>> top; for (auto &kv : hist) top.push_back({kv.second, kv.first});
@@ -6120,7 +6159,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     std::fprintf(stderr, "[dofdump] %s fbp%u %dx%d alpha: nonzero %.2f%%, %zu distinct, top:", tag, fbp, w, h, 100.0 * nz / buf.size(), hist.size());
                     for (size_t i = 0; i < top.size() && i < 6; ++i) std::fprintf(stderr, " %u(%lu)", top[i].second, top[i].first);
                     std::fprintf(stderr, "\n");
-                    if ((s_nDump++ % 4) == 0)
+                    if (true)
                     {
                         Image ia = GenImageColor(w, h, BLACK), ic = GenImageColor(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
@@ -6401,7 +6440,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                           if (g_locUViz >= 0)     SetShaderValue(g_shader, g_locUViz, &zero, SHADER_UNIFORM_FLOAT);
                           if (g_locSubScale >= 0) SetShaderValue(g_shader, g_locSubScale, &one, SHADER_UNIFORM_FLOAT);
                           if (g_locAtst >= 0)     { const float off2 = -1.0f; SetShaderValue(g_shader, g_locAtst, &off2, SHADER_UNIFORM_FLOAT); }
-                          if (g_locTexa >= 0)     { const float t4[4] = {0,0,0,0}; SetShaderValue(g_shader, g_locTexa, t4, SHADER_UNIFORM_VEC4); } }
+                          if (g_locTexa >= 0)     { const float t4[4] = {0,0,0,0}; SetShaderValue(g_shader, g_locTexa, t4, SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t4, sizeof t4); } }   // [texacache] this reset used to leave the cache stale -> fighter B's decal lost its TEXA mode (the wedge)
                         applyDepth(false, 1u, false);
                         rlSetBlendMode(RL_BLEND_ALPHA);
                         rlSetTexture(s_tex.id);
@@ -10680,7 +10719,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 {   // PS2X_TEXAFBO (default ON): give render-target sources the alpha the GS
                     // would synthesise, not the FBO's stored byte. PSMCT24 only.
                     static const bool s_texaFbo = [](){ const char *v = std::getenv("PS2X_TEXAFBO"); return !(v && v[0] == '0'); }();
-                    static float curTexa[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+                    float *curTexa = g_curTexa;   // [texacache] shared with the uncached writers below
                     // PSMCT16 re-view of a live RT. BT3 builds the SCENE ALPHA MASK this way:
                     // two fullscreen alpha-only passes (FBMSK=0x00ffffff) read fbp336 as psm 2
                     // with TFX=1/TCC=1, so the alpha written is purely the TEXA expansion of a
@@ -10698,13 +10737,22 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     static const bool s_maskRaw = [](){ const char *v = std::getenv("PS2X_MASKRAW");
                                                         return v && v[0] && v[0] != '0'; }();
                     const bool psmTexa = (c.srcPsm == 1u) || (s_texa16 && c.srcPsm == 2u);
+                    if (fromFbo && tex.id != 0) g_lastSampledFboTex = tex.id;   // [rtthazard]
+                    if (fromFbo && tex.id != 0 && tex.id == g_lastRenderedFboTex)
+                    {   // [texbarrier] this FBO was rendered to since we last sampled it (BT3: fighter B's silhouette mesh into
+                        // fbp336, then fighter B's decal samples fbp336). Without a barrier the sampler saw the pre-mesh contents
+                        // (the far fighter's decal painted a band = the live "wedge"); a full readback at that point fixed it.
+                        static const bool s_tb = [](){ const char *v = std::getenv("PS2X_TEXBARRIER"); return !(v && v[0] == '0'); }();
+                        if (s_tb) { rlDrawRenderBatchActive(); ps2xTextureBarrier(); }
+                        g_lastRenderedFboTex = 0;
+                    }
                     const float mode = (s_texaFbo && fromFbo && c.tcc && tex.id != 0
                                         && tex.id != g_white.id && psmTexa)
                                      ? ((c.srcPsm == 2u) ? (s_maskRaw ? 3.0f : 2.0f) : 1.0f) : 0.0f;
                     {   // [texadecal] PS2X_BLOBTEX=1: the shadow-decal class's TEXA clause values.
                         static const bool s_bt2 = [](){ const char *v = std::getenv("PS2X_BLOBTEX"); return v && v[0] && v[0] != '0'; }();
                         static int n2 = 0;
-                        if (s_bt2 && g_replayInWindow && n2 < 6 && c.isTriangle && c.srcPsm == 1u && c.srcTbp0 == 10752u
+                        if (s_bt2 && g_replayInWindow && (n2 < 6 || g_dbgDecalCmd == &c) && n2 < 80 && c.isTriangle && c.srcPsm == 1u && c.srcTbp0 == 10752u
                             && c.srcTexW == 256 && c.srcTexH == 256)
                         { ++n2; std::fprintf(stderr, "[texadecal] texaFbo=%d fromFbo=%d tcc=%d tex.id=%u white=%u psmTexa=%d -> mode=%.0f (curTexa=%.2f,%.2f,%.0f,%.0f)\n",
                                              (int)s_texaFbo, (int)fromFbo, (int)c.tcc, tex.id, g_white.id, (int)psmTexa, mode,
@@ -11399,8 +11447,90 @@ if (done.size() < 14 && !done.count(c.texKey))
             static const bool s_dd = [](){ const char *v = std::getenv("PS2X_DECALDATE"); return v && v[0] == '1'; }();
             const bool isShadowDecal = c.isTriangle && c.srcPsm == 1u && c.srcTbp0 == 10752u && c.dateEnable && (c.blendMode & 0xFFu) == 0x44u && !c.isTransfer;
             if (!s_sd && isShadowDecal) { PS2X_GATE_HIT(); continue; }
+            {   // [decalonly] PS2X_DECALONLY=1|2: draw only the first (fighter A) or second (fighter B) decal batch of a frame (A/B live)
+                static const int s_only = [](){ const char *v = std::getenv("PS2X_DECALONLY"); return v && v[0] ? std::atoi(v) : 0; }();
+                static uint32_t gen = 0xFFFFFFFFu; static int batch = 0; static bool inBatch = false;
+                if (s_only)
+                {
+                    if (g_publishGen != gen) { gen = g_publishGen; batch = 0; inBatch = false; }
+                    if (isShadowDecal) { if (!inBatch) { ++batch; inBatch = true; } if (batch != s_only) { PS2X_GATE_HIT(); continue; } }
+                    else inBatch = false;
+                }
+            }
             if (s_sd && !s_dd && isShadowDecal) const_cast<GsGpuRenderer::DrawCmd &>(c).dateEnable = false;
+            {   // [decalsync] at the FIRST decal piece after a non-decal command: flush the pending silhouette-mesh batch while
+                // its FBO is still current, re-bind that FBO directly and force the destination to be entered through a fresh
+                // EndTextureMode/BeginTextureMode cycle. Without this the far fighter's decal sampled the buffer as it was
+                // BEFORE its mesh (the live "wedge"); a glTextureBarrier/glFinish did not help, this bind cycle does
+                // (found as the effective ingredient of a readback probe). PS2X_DECALSYNC=0 disables.
+                static bool prevDecal = false;
+                static const bool s_ds = [](){ const char *v = std::getenv("PS2X_DECALSYNC"); return !(v && v[0] == '0'); }();
+                if (s_ds && isShadowDecal && !prevDecal)
+                {
+                    auto sit = g_fbos.find(tbp0ToFbp(c.srcTbp0));
+                    if (sit != g_fbos.end() && sit->second.rt.texture.id != 0)
+                    { rlDrawRenderBatchActive(); rlEnableFramebuffer(sit->second.rt.id); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu; }
+                }
+                prevDecal = isShadowDecal;
+            }
             g_curDecalCmd = isShadowDecal ? &c : nullptr;   // [region]/[perspq] scope: this command only
+            {   // [f336census] PS2X_F336CENSUS=1: per frame, the run-length of commands into fbp336 (tri/spr counts) and the
+                // decal commands, in order -- does the second fighter's clear+mesh reach the draw loop at all?
+                static const bool s_c336 = [](){ const char *v = std::getenv("PS2X_F336CENSUS"); return v && v[0] && v[0] != '0'; }();
+                if (s_c336)
+                {
+                    static uint32_t gen = 0xFFFFFFFFu; static std::string line; static int runKind = -1; static int runN = 0; static int frames = 0;
+                    auto flush = [&](){ if (runN) { char b[48]; std::snprintf(b, sizeof b, " %s%d", runKind == 0 ? "tri336x" : runKind == 1 ? "spr336x" : runKind == 2 ? "DECALx" : "xfer336x", runN); line += b; runN = 0; } };
+                    if (g_publishGen != gen) { flush(); if (!line.empty() && frames++ < 6) std::fprintf(stderr, "[f336census] gen %u:%s\n", gen, line.c_str()); line.clear(); gen = g_publishGen; }
+                    int kind = -1;
+                    if (isShadowDecal) kind = 2;
+                    else if (c.destFbp == 336u) kind = c.isTransfer ? 3 : (c.isTriangle ? 0 : 1);
+                    if (kind == 1 && frames < 2 && !c.isTransfer)
+                    {
+                        rlDrawRenderBatchActive();   // the previous sprite is now drawn under the CURRENT GL state: read it
+                        int fb = -1, sc[4] = {0,0,0,0}, vp[4] = {0,0,0,0}; unsigned char cm[4] = {0,0,0,0};
+                        glGetIntegerv(0x8CA6, &fb); glGetIntegerv(0x0C10, sc); glGetIntegerv(0x0BA2, vp); glGetBooleanv(0x0C23, cm);
+                        std::fprintf(stderr, "[f336census]     spr rect (%.1f,%.1f)-(%.1f,%.1f) rgba=%u,%u,%u,%u abe=%d | GL: fbo=%d scissor=(%d,%d %dx%d) sc_on=%d viewport=(%d,%d %dx%d) mask=%d%d%d%d blend=%d depth=%d curFbp=%u curRealFbp=%u\n",
+                                     c.dx0, c.dy0, c.dx1, c.dy1, c.r, c.g, c.b, c.a, (int)c.abe, fb, sc[0], sc[1], sc[2], sc[3], glIsEnabled(0x0C11) ? 1 : 0, vp[0], vp[1], vp[2], vp[3], cm[0], cm[1], cm[2], cm[3], glIsEnabled(0x0BE2) ? 1 : 0, glIsEnabled(0x0B71) ? 1 : 0, curFbp, curRealFbp);
+                    }
+                    if (kind >= 0)
+                    {
+                        if (kind != runKind)
+                        {
+                            flush(); runKind = kind;
+                            static const int s_cmode = [](){ const char *v = std::getenv("PS2X_F336CENSUS"); return v && v[0] ? std::atoi(v) : 0; }();
+                            if ((s_cmode == 5 || s_cmode == 6) && kind == 2)
+                            {   // ingredient test: the census probe's side effects without / with a tiny readback
+                                auto it = g_fbos.find(336u);
+                                if (it != g_fbos.end() && it->second.rt.texture.id != 0)
+                                {
+                                    rlDrawRenderBatchActive(); rlEnableFramebuffer(it->second.rt.id);
+                                    if (s_cmode == 6) { uint32_t px1 = 0; glReadPixels(0, 0, 1, 1, 0x1908, 0x1401, &px1); }
+                                    curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
+                                }
+                            }
+                            if (frames < 3 && (s_cmode == 1 || (s_cmode == 2 && kind == 0) || (s_cmode == 3 && kind == 1) || (s_cmode == 4 && kind == 2)))
+                            {   // region pixel census at every run boundary (what does fbp336 hold right now?)
+                                auto it = g_fbos.find(336u);
+                                if (it != g_fbos.end() && it->second.rt.texture.id != 0)
+                                {
+                                    rlDrawRenderBatchActive();
+                                    const int w = it->second.w, h = it->second.h; std::vector<uint32_t> buf((size_t)w * h);
+                                    rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
+                                    unsigned long nz = 0; for (int y = 0; y < std::min(h, 256); ++y) for (int x = 0; x < std::min(w, 256); ++x) if (buf[(size_t)(h - 1 - y) * w + x] & 0x00FFFFFFu) ++nz;
+                                    std::fprintf(stderr, "[f336census]   >> region before this %s run: %lu nonzero px (fbo id %u tex %u)\n", kind == 0 ? "tri" : kind == 1 ? "spr" : kind == 2 ? "DECAL" : "xfer", nz, it->second.rt.id, it->second.rt.texture.id);
+                                }
+                            }
+                            if (kind <= 1 && frames < 3)
+                                std::fprintf(stderr, "[f336census]   run start %s: scissor (%d,%d %dx%d) v0 (%.0f,%.0f) z=%.5f fbmsk=%08x depth=%d/%u/%d rgba=%u,%u,%u,%u abe=%d bm=%x tex=%d dst=%u\n",
+                                             kind == 0 ? "tri" : "spr", c.sx, c.sy, c.sw, c.sh, c.isTriangle ? c.tri[0].x : c.dx0, c.isTriangle ? c.tri[0].y : c.dy0, c.isTriangle ? c.tri[0].z : 0.f, c.fbmsk,
+                                             (int)c.depthTest, (unsigned)c.depthFunc, (int)c.depthWrite, c.isTriangle ? c.tri[0].r : c.r, c.isTriangle ? c.tri[0].g : c.g, c.isTriangle ? c.tri[0].b : c.b, c.isTriangle ? c.tri[0].a : c.a,
+                                             (int)c.abe, (unsigned)c.blendMode, (int)(c.texKey != 0 || c.srcTbp0 != 0), c.destFbp);
+                        }
+                        ++runN;
+                    }
+                }
+            }
             {   // [decalrect] PS2X_DECALRECT=x0,y0,x1,y1: log every shadow-decal piece whose screen bbox touches the rect
                 static const bool s_dr = [](){ const char *v = std::getenv("PS2X_DECALRECT"); return v && v[0]; }();
                 static float rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
@@ -11411,11 +11541,15 @@ if (done.size() < 14 && !done.count(c.texKey))
                     for (int k = 1; k < 3; ++k) { x0 = std::min(x0, c.tri[k].x); x1 = std::max(x1, c.tri[k].x); y0 = std::min(y0, c.tri[k].y); y1 = std::max(y1, c.tri[k].y); }
                     if (x1 >= rx0 && x0 <= rx1 && y1 >= ry0 && y0 <= ry1)
                     {
-                        static int n = 0;
-                        if (n++ < 400)
-                            std::fprintf(stderr, "[decalrect] gen %u piece xy (%.1f,%.1f) (%.1f,%.1f) (%.1f,%.1f) uv (%.4f,%.4f) (%.4f,%.4f) (%.4f,%.4f) q %.5f %.5f %.5f a=%u dest=%u\n",
-                                         g_publishGen, c.tri[0].x, c.tri[0].y, c.tri[1].x, c.tri[1].y, c.tri[2].x, c.tri[2].y,
+                        g_dbgDecalCmd = &c;   // [decaldbg] trace this piece at whichever emit site draws it
+                        static const auto t0 = std::chrono::steady_clock::now(); static long n = 0;
+                        if (n++ < 3000000L)
+                        {
+                            const long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+                            std::fprintf(stderr, "[decalrect] t=%ldms gen %u piece xy (%.1f,%.1f) (%.1f,%.1f) (%.1f,%.1f) uv (%.4f,%.4f) (%.4f,%.4f) (%.4f,%.4f) q %.5f %.5f %.5f a=%u dest=%u\n",
+                                         ms, g_publishGen, c.tri[0].x, c.tri[0].y, c.tri[1].x, c.tri[1].y, c.tri[2].x, c.tri[2].y,
                                          c.tri[0].u, c.tri[0].v, c.tri[1].u, c.tri[1].v, c.tri[2].u, c.tri[2].v, c.tri[0].q, c.tri[1].q, c.tri[2].q, (unsigned)c.tri[0].a, c.destFbp);
+                        }
                     }
                 }
             }
@@ -11423,6 +11557,35 @@ if (done.size() < 14 && !done.count(c.texKey))
             {   // [region] the clamp uniform persists across draws; disable it before any non-decal command (sprites never set it)
                 rlDrawRenderBatchActive(); const float off[4] = {1.f, 0.f, 1.f, 0.f};
                 SetShaderValue(g_shader, g_locRegion, off, SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, off, sizeof off);
+                // [decalend] the FIRST sprite after a decal batch was lost (the second fighter's 336 clear missed its first
+                // 32-px column -> 17 px of fighter A's silhouette survived -> fighter B's decal projected them = the sliver).
+                // A forced real FBO re-bind before that command (what the readback probes did by accident) fixes it.
+                curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
+                // [regionclear] the game now clears the silhouette buffer (16 untextured column sprites, RGBA 0, no blend)
+                // for the second fighter; the FIRST of those sprites does not land in our renderer (17 px of fighter A's
+                // silhouette survived at x<32 and fighter B's decal projected them = the live wedge). Do the clear the game
+                // intends with glClear on the 256x256 region before its sprites run.
+                static const bool s_rc = [](){ const char *v = std::getenv("PS2X_REGIONCLEAR"); return !(v && v[0] == '0'); }();
+                if (s_rc && c.destFbp == 336u && !c.isTriangle && !c.isTransfer && c.r == 0 && c.g == 0 && c.b == 0 && c.a == 0)
+                {
+                    beginFbp(336u);
+                    auto it = g_fbos.find(curRealFbp);
+                    if (it != g_fbos.end() && it->second.rt.texture.id != 0)
+                    {
+                        rlDrawRenderBatchActive();
+                        const int h = it->second.h;
+                        glScissor(0, h - 256, 256, 256); glEnable(0x0C11 /*GL_SCISSOR_TEST*/);
+                        glColorMask(1, 1, 1, 1); glClearColor(0.f, 0.f, 0.f, 0.f); glClear(0x00004000u);
+                        curSx = -0x40000000; curMask = -1;   // the renderer re-applies its own scissor/mask on the next draw
+                        static int n = 0; if (n++ < 3) std::fprintf(stderr, "[regionclear] cleared fbp336 region 256x256 (fbo %dx%d) before the game's clear sprites\n", it->second.w, h);
+                    }
+                }
+            }
+            if (!isShadowDecal && g_decalUViz)
+            {   // [decaldbg 6] the visualiser uniform persists too: turn it off before any non-decal command
+                static int loc = -2; if (loc == -2) loc = GetShaderLocation(g_shader, "uUViz");
+                static bool on = false;
+                if (loc >= 0) { rlDrawRenderBatchActive(); const float z = 0.f; SetShaderValue(g_shader, loc, &z, SHADER_UNIFORM_FLOAT); on = false; }
             }
             {   // [decaldbg] PS2X_DECALDBG=1: draw the shadow-decal tiles UNTEXTURED (vertex colour, no alpha test) to see
                 // their screen coverage; =2: textured but alpha test off; =3: like 1 but depth test off too.
@@ -11433,6 +11596,8 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if (s_dbg == 1 || s_dbg == 3) { m.srcTbp0 = 0; m.texKey = 0; for (int k = 0; k < 3; ++k) { m.tri[k].r = 255; m.tri[k].g = 0; m.tri[k].b = 255; m.tri[k].a = 128; } }
                     m.alphaTest = false; m.dateEnable = false;
                     if (s_dbg == 3) m.depthTest = false;
+                    if (s_dbg == 6) { m.blendMode = 0x64u; m.abe = false; m.depthTest = false; g_decalUViz = true; }   // write stq as colour, opaque
+                    if (s_dbg == 7) { m.blendMode = 0x64u; m.abe = false; m.depthTest = false; g_decalUViz = true; g_decalUVizMode = 2.f; }   // write the sampled texel, opaque
                     g_dbgDecalCmd = &c;
                     static int n = 0; if (n++ < 6) std::fprintf(stderr, "[decaldbg] mode %d: tri xy (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f) z %.4f %.4f %.4f depthTest=%d func=%u destFbp=%u fbmsk=%08x bm=0x%x atst=%d/%u/%u srcPsm=%u srcTbp0=%u\n", s_dbg, c.tri[0].x, c.tri[0].y, c.tri[1].x, c.tri[1].y, c.tri[2].x, c.tri[2].y, c.tri[0].z, c.tri[1].z, c.tri[2].z, (int)c.depthTest, (unsigned)c.depthFunc, c.destFbp, c.fbmsk, (unsigned)c.blendMode, (int)c.alphaTest, (unsigned)c.alphaFunc, (unsigned)c.alphaRef, (unsigned)c.srcPsm, c.srcTbp0);
                 }
@@ -11449,21 +11614,24 @@ if (done.size() < 14 && !done.count(c.texKey))
                     {
                         rlDrawRenderBatchActive();
                         const int w = it->second.w, h = it->second.h; std::vector<uint32_t> buf((size_t)w * h);
-                        rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); curFbp = 0xFFFFFFFFu;
+                        rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                         unsigned long mag = 0; for (uint32_t v : buf) { const unsigned r = v & 0xFF, g = (v >> 8) & 0xFF, b = (v >> 16) & 0xFF; if (r > 150 && b > 150 && g < 80) ++mag; }
                         Image ic = GenImageColor(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) { const uint32_t v = buf[(size_t)y * w + x]; ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255}); }
                         ImageFlipVertical(&ic); char pc[200]; std::snprintf(pc, sizeof pc, "/home/z3/Desktop/bt3/work/shots/decal_after_fbp%u.png", s_afterDest); ExportImage(ic, pc); UnloadImage(ic);
-                        std::fprintf(stderr, "[decaldump] after decal batch: dest fbp%u %dx%d magenta px %lu\n", s_afterDest, w, h, mag);
+                        std::fprintf(stderr, "[decaldump] after decal batch: dest fbp%u %dx%d magenta px %lu | next cmd: tri=%d spr=%d xfer=%d dest=%u srcPsm=%u srcTbp0=%u fbmsk=%08x vA=%u\n", s_afterDest, w, h, mag, (int)c.isTriangle, (int)(!c.isTriangle && !c.isTransfer), (int)c.isTransfer, c.destFbp, (unsigned)c.srcPsm, c.srcTbp0, c.fbmsk, (unsigned)(c.isTriangle ? c.tri[0].a : c.a));
                     }
                 }
+                static int s_batch = 0;
                 if (s_ddump && isShadowDecal)
                 {
+                    if (!s_pendAfter) ++s_batch;   // a new decal batch (first decal after a non-decal command)
                     s_pendAfter = true; s_afterDest = c.destFbp;
-                    static uint32_t s_gen = 0xFFFFFFFFu; static int s_nDec = 0;
-                    if (g_publishGen != s_gen)
+                    static uint32_t s_gen = 0xFFFFFFFFu; static int s_nDec = 0; static int s_lastBatch = -1;
+                    if (g_publishGen != s_gen) { s_gen = g_publishGen; s_nDec = 0; s_batch = 1; }
+                    if (s_batch != s_lastBatch)
                     {
-                        s_gen = g_publishGen; s_nDec = 0;
+                        s_lastBatch = s_batch;
                         auto it = g_fbos.find(336u);
                         if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                         {
@@ -11472,7 +11640,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             std::vector<uint32_t> buf((size_t)w * h);
                             rlEnableFramebuffer(it->second.rt.id);
                             glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
-                            curFbp = 0xFFFFFFFFu;
+                            curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                             unsigned long nz = 0, nzA = 0; const int cw = std::min(w, 256), chh = std::min(h, 256);
                             Image ic = GenImageColor(cw, chh, BLACK), ia = GenImageColor(cw, chh, BLACK);
                             for (int y = 0; y < chh; ++y) for (int x = 0; x < cw; ++x)
@@ -11482,9 +11650,9 @@ if (done.size() < 14 && !done.count(c.texKey))
                                 ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255});
                                 const unsigned char a = v >> 24; ImageDrawPixel(&ia, x, y, Color{a, a, a, 255});
                             }
-                            ExportImage(ic, "/home/z3/Desktop/bt3/work/shots/decal_rgb_fbp336.png"); ExportImage(ia, "/home/z3/Desktop/bt3/work/shots/decal_alpha_fbp336.png");
+                            char pb[200]; std::snprintf(pb, sizeof pb, "/home/z3/Desktop/bt3/work/shots/decal_rgb_fbp336_b%d.png", s_batch); ExportImage(ic, pb); ExportImage(ia, "/home/z3/Desktop/bt3/work/shots/decal_alpha_fbp336.png");
                             UnloadImage(ic); UnloadImage(ia);
-                            std::fprintf(stderr, "[decaldump] gen %u fbp336 %dx%d: 256x256 region nonzero RGB %lu px, nonzero A %lu px\n", g_publishGen, w, h, nz, nzA);
+                            std::fprintf(stderr, "[decaldump] gen %u batch %d fbp336 %dx%d: 256x256 region nonzero RGB %lu px, nonzero A %lu px | piece xy (%.0f,%.0f) dest=%u\n", g_publishGen, s_batch, w, h, nz, nzA, c.tri[0].x, c.tri[0].y, c.destFbp);
                         }
                     }
                     if (s_nDec++ < 6)
@@ -12451,6 +12619,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                     && (tex.width != c.srcTexW || tex.height != c.srcTexH))
                                 { uu *= (float)c.srcTexW / (float)tex.width; vv *= (float)c.srcTexH / (float)tex.height; }
                                 rlTexCoord2f(uu, vflip ? 1.0f - vv : vv);
+                                if (g_dbgDecalCmd == &c && i == 0) { static int n3 = 0; if (n3++ < 60) std::fprintf(stderr, "[decaldbg]   EMIT FBOUV-site tri: curFbp=%u fromFbo=%d idxRt=%d tex=%dx%d src=%dx%d rescaled=%d u/v=(%.3f,%.3f)\n", curFbp, (int)fromFbo, (int)idxRt, tex.width, tex.height, (int)c.srcTexW, (int)c.srcTexH, (int)(s_fbouv && fromFbo && !idxRt), uu, vv); }
                             }
                             rlNormal3f(0.0f, 0.0f, 1.0f);
                             if (depthOn) rlVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
@@ -12481,11 +12650,14 @@ if (done.size() < 14 && !done.count(c.texKey))
             ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
             rlCheckRenderBatchLimit(4);
             {   // [region] declared/actual clamp for RT-sourced draws (see uRegion)
+                static int s_locUViz = -2; if (s_locUViz == -2) s_locUViz = GetShaderLocation(g_shader, "uUViz");
+                { const float v = (g_decalUViz && g_curDecalCmd == &c) ? g_decalUVizMode : 0.f; if (s_locUViz >= 0 && v > 0.5f) { rlDrawRenderBatchActive(); SetShaderValue(g_shader, s_locUViz, &v, SHADER_UNIFORM_FLOAT); } }
                         float reg[4] = {1.f, 0.f, 1.f, 0.f};
             if (g_curDecalCmd == &c && fromFbo && c.srcTexW > 0 && c.srcTexH > 0 && tex.width > 0 && tex.height > 0 && (tex.width != c.srcTexW || tex.height != c.srcTexH))
             {   // clamp INSIDE the declared region by half a texel: the texel just past the region is live FBO data
                         const float ku = (float)c.srcTexW / (float)tex.width, kv = (float)c.srcTexH / (float)tex.height;
-                        const float hu = 0.5f / (float)tex.width, hv = 0.5f / (float)tex.height;
+                        static const float s_inset = [](){ const char *v = std::getenv("PS2X_REGIONINSET"); return v && v[0] ? (float)std::atof(v) : 0.5f; }();   // texels
+                        const float hu = s_inset / (float)tex.width, hv = s_inset / (float)tex.height;
                         reg[0] = ku - hu; reg[1] = vflip ? 1.0f - kv + hv : hv; reg[2] = vflip ? 1.0f - hv : kv - hv; reg[3] = 1.f; }
             if (g_locRegion >= 0 && (reg[0] != g_curReg[0] || reg[1] != g_curReg[1] || reg[2] != g_curReg[2] || reg[3] != g_curReg[3]))
             { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locRegion, reg, SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, reg, sizeof reg); }
@@ -12560,14 +12732,24 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if (q != 1.0f) rlTexCoord2f(uu, vflip ? (q - vv) : vv);
                     else rlTexCoord2f(uu, vflip ? 1.0f - vv : vv);
                 }
-                if (g_dbgDecalCmd == &c && i == 0) { static int n2 = 0; if (n2++ < 6) std::fprintf(stderr, "[decaldbg]   EMIT generic tri: curFbp=%u offX=%.0f offY=%.0f depthOn=%d vflip=%d fromFbo=%d tex.id=%u u/v/q v0=(%.3f,%.3f,%.4f)\n", curFbp, (double)offX, (double)offY, (int)depthOn, (int)vflip, (int)fromFbo, tex.id, c.tri[0].u, c.tri[0].v, c.tri[0].q); }
+                if (g_dbgDecalCmd == &c && i == 0) { static int n2 = 0; float gt[4] = {-9,-9,-9,-9}, gf = -9, gp = -9, gc = -9, gi = -9, gx = -9, ga = -9, gr = -9, gz = -9, gzs = -9; if (g_locZTex >= 0) glGetUniformfv(g_shader.id, g_locZTex, &gz); { int lz = GetShaderLocation(g_shader, "uZScale"); if (lz >= 0) glGetUniformfv(g_shader.id, lz, &gzs); } if (g_locTexa >= 0) glGetUniformfv(g_shader.id, g_locTexa, gt); if (g_locTcc >= 0) glGetUniformfv(g_shader.id, g_locTcc, &gc); if (g_locIdxMode >= 0) glGetUniformfv(g_shader.id, g_locIdxMode, &gi); if (g_locTfx >= 0) glGetUniformfv(g_shader.id, g_locTfx, &gx); if (g_locAtst >= 0) glGetUniformfv(g_shader.id, g_locAtst, &ga); if (g_locAref >= 0) glGetUniformfv(g_shader.id, g_locAref, &gr); if (g_locFboOne >= 0) glGetUniformfv(g_shader.id, g_locFboOne, &gf); if (g_locPerspQ >= 0) glGetUniformfv(g_shader.id, g_locPerspQ, &gp); if (n2++ < 60) std::fprintf(stderr, "[decaldbg]   EMIT generic tri: curFbp=%u vflip=%d fromFbo=%d tex.id=%u %dx%d src=%dx%d u/v/q v0=(%.3f,%.3f,%.4f) uRegion=(%.4f,%.4f,%.4f,%.0f) | GL uTexa=(%.2f,%.2f,%.2f,%.2f) cache=(%.2f,%.2f,%.2f,%.2f) uFboOne=%.1f uPerspQ=%.1f uTcc=%.1f uIdxMode=%.1f uTfx=%.1f uAtst=%.1f uAref=%.2f uZTex=%.1f uZScale=%.3f\n", curFbp, (int)vflip, (int)fromFbo, tex.id, tex.width, tex.height, (int)c.srcTexW, (int)c.srcTexH, c.tri[0].u, c.tri[0].v, c.tri[0].q, g_curReg[0], g_curReg[1], g_curReg[2], g_curReg[3], gt[0], gt[1], gt[2], gt[3], g_curTexa[0], g_curTexa[1], g_curTexa[2], g_curTexa[3], gf, gp, gc, gi, gx, ga, gr, gz, gzs); }
                 rlNormal3f(c.tri[i].q, 0.0f, 1.0f);   // .x carries the GS q (PS2X_PERSPQ)
                 // ortho maps window_depth = -z, so pass -z to store the intended depth.
                 if (depthOn) rlVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
                 else rlVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
             }
             rlEnd();
-            rlSetTexture(0);
+            {   // [decalbatch] consecutive shadow-decal pieces share every GL state and the same FBO texture: keep the
+                // texture bound so rlgl accumulates them in ONE draw entry (one glDrawArrays per run of pieces instead of
+                // one per piece -- 2300 pieces/frame at depth cap 7 cost 30 -> 25 fps otherwise).
+                auto nextIsDecal = [&]() -> bool
+                {
+                    if (g_curDecalCmd != &c || ci + 1 >= ciEnd) return false;
+                    const GsGpuRenderer::DrawCmd &n = DC[ci + 1];
+                    return n.isTriangle && n.srcPsm == 1u && n.srcTbp0 == 10752u && (n.blendMode & 0xFFu) == 0x44u && !n.isTransfer && n.destFbp == c.destFbp;
+                };
+                if (!nextIsDecal()) rlSetTexture(0);
+            }
 
             // [pixprobe] (with PS2X_SRCDIAG): after emitting a character triangle, flush the
             // batch and read the pixel at its centroid from the BOUND FBO. Answers, at the GL
