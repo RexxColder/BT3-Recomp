@@ -3968,6 +3968,18 @@ void PS2Runtime::run()
         BeginBlendMode(BLEND_CUSTOM_SEPARATE);
         DrawTexturePro(presentTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         EndBlendMode();
+        {   // [presentlog] PS2X_PRESENTLOG=1: print every CHANGE of the present geometry (a 60 Hz alternation shows as a
+            // stream of transitions; a static picture shows two lines total).
+            static const bool s_pl = [](){ const char *v = std::getenv("PS2X_PRESENTLOG"); return v && v[0] && v[0] != '0'; }();
+            if (s_pl)
+            {
+                static unsigned long s_n = 0; ++s_n;
+                static float prev[10] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+                const float cur[10] = {(float)presentTex.id, (float)presentTex.width, (float)presentTex.height, srcX, srcY, srcWidth, srcHeight, screenWidth, screenHeight, dstRect.x};
+                bool ch = false; for (int i = 0; i < 10; ++i) ch |= (cur[i] != prev[i]);
+                if (ch) { std::fprintf(stderr, "[presentlog] #%lu tex=%u %dx%d src=(%.1f,%.1f %gx%g) screen=%gx%g dst=(%.2f,%.2f %.2fx%.2f)\n", s_n, presentTex.id, presentTex.width, presentTex.height, srcX, srcY, srcWidth, srcHeight, screenWidth, screenHeight, dstRect.x, dstRect.y, dstRect.width, dstRect.height); for (int i = 0; i < 10; ++i) prev[i] = cur[i]; }
+            }
+        }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);

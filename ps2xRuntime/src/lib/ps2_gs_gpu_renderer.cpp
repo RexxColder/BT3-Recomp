@@ -483,6 +483,37 @@ namespace
                      fbp, texId, (unsigned)ifmt, rsz, asz, asz > 0 ? "has alpha" : "*** NO ALPHA ***");
     }
 
+    // [rtsnap] Sampling a render target's texture right after rendering into it returns STALE content on this
+    // driver for some draws (the decal sliver, the outline chain's column stripes -> HUD lobes/bars one frame
+    // behind at stripe boundaries); glFinish / glTextureBarrier do not help, a framebuffer blit does. So any
+    // FBO-sourced sample reads a blit snapshot of the FBO, refreshed whenever the FBO was entered for rendering
+    // since the last snapshot (g_glEnterSeq is bumped by beginFbp's real switch). PS2X_RTSNAP=0 disables.
+    std::unordered_map<uint32_t, RenderTexture2D> g_rtSnap; std::unordered_map<uint32_t, uint32_t> g_rtSnapSeq, g_glEnterSeq;
+    unsigned long g_rtSnapBlits = 0;
+    static bool rtSnapEnabled() { static const bool s = [](){ const char *v = std::getenv("PS2X_RTSNAP"); return !(v && v[0] == '0'); }(); return s; }
+    static Texture2D rtSnapshotFor(uint32_t fbp, const Fbo &f)
+    {
+        RenderTexture2D &snap = g_rtSnap[fbp];
+        const int w = f.w, h = f.h;
+        if (w <= 0 || h <= 0 || f.rt.id == 0) return f.rt.texture;
+        int prev = 0; glGetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &prev);
+        if (snap.texture.id == 0 || snap.texture.width != w || snap.texture.height != h)
+        {
+            if (snap.texture.id != 0) UnloadRenderTexture(snap);
+            snap = LoadRenderTexture(w, h); SetTextureFilter(snap.texture, TEXTURE_FILTER_POINT);
+            g_rtSnapSeq[fbp] = 0xFFFFFFFFu;
+        }
+        const uint32_t seq = g_glEnterSeq[fbp];
+        if (g_rtSnapSeq[fbp] != seq)
+        {
+            rlDrawRenderBatchActive();
+            glBindFramebuffer(0x8CA8 /*READ*/, f.rt.id); glBindFramebuffer(0x8CA9 /*DRAW*/, snap.id);
+            glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, 0x4000 /*COLOR*/, 0x2600 /*NEAREST*/);
+            g_rtSnapSeq[fbp] = seq; ++g_rtSnapBlits;
+        }
+        glBindFramebuffer(0x8D40 /*FRAMEBUFFER*/, (unsigned)prev);
+        return snap.texture;
+    }
     Fbo &ensureFbo(uint32_t fbp, int w, int h)
     {
         Fbo &f = g_fbos[fbp];
@@ -5440,6 +5471,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         Fbo &f = ensureFbo(rf, w, h);
         curRealFbp = rf;
         BeginTextureMode(f.rt);
+        ++g_glEnterSeq[rf];   // [rtsnap]
         g_lastRenderedFboTex = f.rt.texture.id;   // [texbarrier] sampling this texture later needs a barrier
         if (g_lastSampledFboTex != 0 && g_lastSampledFboTex == f.rt.texture.id)
         {   // [rtthazard] this FBO's texture was just sampled. PS2X_RTTHAZARD=barrier|finish|read|rebind|0 (A/B)
@@ -9354,6 +9386,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             auto cpIt = g_fboCopy.find(sf);
             if (s_rawFix && big && cpIt != g_fboCopy.end() && cpIt->second.rt.texture.id != 0)
                 tex = cpIt->second.rt.texture;
+            else if (rtSnapEnabled())
+                tex = rtSnapshotFor(sf, g_fbos[sf]);   // [rtsnap] the PSMT8H stripes read the alpha byte of a coherent copy
             else
                 tex = g_fbos[sf].rt.texture;
             vflip = true; fromFbo = true; idxRt = true;
@@ -9396,6 +9430,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             auto cpIt = g_fboCopy.find(sfKey);
             if (s_rawFix && big && cpIt != g_fboCopy.end() && cpIt->second.rt.texture.id != 0)
                 tex = cpIt->second.rt.texture;
+            else if (rtSnapEnabled())
+                tex = rtSnapshotFor(sfKey, g_fbos[sfKey]);   // [rtsnap] coherent copy, not the live attachment
             else
                 tex = g_fbos[sfKey].rt.texture;
             vflip = true; fromFbo = true;
@@ -11554,6 +11590,40 @@ if (done.size() < 14 && !done.count(c.texKey))
                     }
                 }
             }
+            {   // [hudprobe] PS2X_HUDPROBE=x0,y0,x1,y1: log every textured triangle into the display buffer whose bbox touches
+                // the rect, with the render mode (chunk pre-render vs final) -- the HUD wobble under BARBLOCK.
+                static const bool s_hp = [](){ const char *v = std::getenv("PS2X_HUDPROBE"); return v && v[0]; }();
+                static float hx0 = 0, hy0 = 0, hx1 = 0, hy1 = 0;
+                static const bool s_hpOk = [](){ const char *v = std::getenv("PS2X_HUDPROBE"); return v && std::sscanf(v, "%f,%f,%f,%f", &hx0, &hy0, &hx1, &hy1) == 4; }();
+                if (s_hp && s_hpOk && !c.isTriangle && !c.isTransfer && (c.destFbp == 0u || c.destFbp == 112u) && c.srcTbp0 != 0u
+                    && std::max(c.dx0, c.dx1) >= hx0 && std::min(c.dx0, c.dx1) <= hx1 && std::max(c.dy0, c.dy1) >= hy0 && std::min(c.dy0, c.dy1) <= hy1
+                    && std::fabs(c.dx1 - c.dx0) <= 64.f)
+                {
+                    static long ns = 0;
+                    if (ns++ < 6000L)
+                        std::fprintf(stderr, "[hudprobe] gen %u chunk=%d seg=%d ci=%zu SPRITE dest=%u src=%u psm=%u %dx%d key=%llx d (%.3f,%.3f)-(%.3f,%.3f) uv (%.5f,%.5f)-(%.5f,%.5f) rgba %u,%u,%u,%u bm=0x%02x fbmsk=%08x\n",
+                                     g_publishGen, (int)m_chunkMode, (int)m_segMode, ci, c.destFbp, c.srcTbp0, c.srcPsm, (int)c.srcTexW, (int)c.srcTexH, (unsigned long long)c.texKey,
+                                     c.dx0, c.dy0, c.dx1, c.dy1, c.su0, c.sv0, c.su1, c.sv1, (unsigned)c.r, (unsigned)c.g, (unsigned)c.b, (unsigned)c.a, c.blendMode, c.fbmsk);
+                }
+                if (s_hp && s_hpOk && c.isTriangle && !c.isTransfer && (c.destFbp == 0u || c.destFbp == 112u) && c.srcTbp0 != 0u)
+                {
+                    float x0 = c.tri[0].x, x1 = x0, y0 = c.tri[0].y, y1 = y0;
+                    for (int k = 1; k < 3; ++k) { x0 = std::min(x0, c.tri[k].x); x1 = std::max(x1, c.tri[k].x); y0 = std::min(y0, c.tri[k].y); y1 = std::max(y1, c.tri[k].y); }
+                    if (x1 >= hx0 && x0 <= hx1 && y1 >= hy0 && y0 <= hy1 && (x1 - x0) <= 64.f && (y1 - y0) <= 64.f)
+                    {
+                        static long n = 0;
+                        if (n++ < 6000L)
+                        {
+                            g_dbgDecalCmd = &c;
+                            std::fprintf(stderr, "[hudprobe] gen %u chunk=%d seg=%d ci=%zu dest=%u src=%u psm=%u %dx%d key=%llx xyz (%.3f,%.3f,%.0f) (%.3f,%.3f,%.0f) (%.3f,%.3f,%.0f) uv (%.5f,%.5f) (%.5f,%.5f) (%.5f,%.5f) q %.4f rgba %u,%u,%u,%u depth=%d/%d bm=0x%02x fbmsk=%08x ate=%d\n",
+                                         g_publishGen, (int)m_chunkMode, (int)m_segMode, ci, c.destFbp, c.srcTbp0, c.srcPsm, (int)c.srcTexW, (int)c.srcTexH, (unsigned long long)c.texKey,
+                                         c.tri[0].x, c.tri[0].y, c.tri[0].z, c.tri[1].x, c.tri[1].y, c.tri[1].z, c.tri[2].x, c.tri[2].y, c.tri[2].z,
+                                         c.tri[0].u, c.tri[0].v, c.tri[1].u, c.tri[1].v, c.tri[2].u, c.tri[2].v, c.tri[0].q,
+                                         (unsigned)c.tri[0].r, (unsigned)c.tri[0].g, (unsigned)c.tri[0].b, (unsigned)c.tri[0].a, (int)c.depthTest, (int)c.depthFunc, c.blendMode, c.fbmsk, (int)c.alphaTest);
+                        }
+                    }
+                }
+            }
             {   // [decalrect] PS2X_DECALRECT=x0,y0,x1,y1: log every shadow-decal piece whose screen bbox touches the rect
                 static const bool s_dr = [](){ const char *v = std::getenv("PS2X_DECALRECT"); return v && v[0]; }();
                 static float rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
@@ -12757,7 +12827,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     else rlTexCoord2f(uu, vflip ? 1.0f - vv : vv);
                 }
                 if (g_dbgDecalCmd == &c && i == 0) { static int n4 = 0; if (n4++ < 6) { auto fit3 = g_fbos.find(336u); if (fit3 != g_fbos.end()) { int prevFb = 0, att = -1, attType = -1; glGetIntegerv(0x8CA6, &prevFb); glBindFramebuffer(0x8D40, fit3->second.rt.id); glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD1, &att); glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD0, &attType); glBindFramebuffer(0x8D40, (unsigned)prevFb); std::fprintf(stderr, "[decaldbg]   ATTACH fbp336 fbo=%u colour attachment name=%d type=0x%x | decal samples tex.id=%u (rt.texture.id=%u)\n", fit3->second.rt.id, att, attType, tex.id, fit3->second.rt.texture.id); } } }
-                if (g_dbgDecalCmd == &c && i == 0) { static int n2 = 0; float gt[4] = {-9,-9,-9,-9}, gf = -9, gp = -9, gc = -9, gi = -9, gx = -9, ga = -9, gr = -9, gz = -9, gzs = -9; if (g_locZTex >= 0) glGetUniformfv(g_shader.id, g_locZTex, &gz); { int lz = GetShaderLocation(g_shader, "uZScale"); if (lz >= 0) glGetUniformfv(g_shader.id, lz, &gzs); } if (g_locTexa >= 0) glGetUniformfv(g_shader.id, g_locTexa, gt); if (g_locTcc >= 0) glGetUniformfv(g_shader.id, g_locTcc, &gc); if (g_locIdxMode >= 0) glGetUniformfv(g_shader.id, g_locIdxMode, &gi); if (g_locTfx >= 0) glGetUniformfv(g_shader.id, g_locTfx, &gx); if (g_locAtst >= 0) glGetUniformfv(g_shader.id, g_locAtst, &ga); if (g_locAref >= 0) glGetUniformfv(g_shader.id, g_locAref, &gr); if (g_locFboOne >= 0) glGetUniformfv(g_shader.id, g_locFboOne, &gf); if (g_locPerspQ >= 0) glGetUniformfv(g_shader.id, g_locPerspQ, &gp); if (n2++ < 60) std::fprintf(stderr, "[decaldbg]   EMIT generic tri: curFbp=%u vflip=%d fromFbo=%d tex.id=%u %dx%d src=%dx%d u/v/q v0=(%.3f,%.3f,%.4f) uRegion=(%.4f,%.4f,%.4f,%.0f) | GL uTexa=(%.2f,%.2f,%.2f,%.2f) cache=(%.2f,%.2f,%.2f,%.2f) uFboOne=%.1f uPerspQ=%.1f uTcc=%.1f uIdxMode=%.1f uTfx=%.1f uAtst=%.1f uAref=%.2f uZTex=%.1f uZScale=%.3f\n", curFbp, (int)vflip, (int)fromFbo, tex.id, tex.width, tex.height, (int)c.srcTexW, (int)c.srcTexH, c.tri[0].u, c.tri[0].v, c.tri[0].q, g_curReg[0], g_curReg[1], g_curReg[2], g_curReg[3], gt[0], gt[1], gt[2], gt[3], g_curTexa[0], g_curTexa[1], g_curTexa[2], g_curTexa[3], gf, gp, gc, gi, gx, ga, gr, gz, gzs); }
+                if (g_dbgDecalCmd == &c && i == 0) { static int n2 = 0; float gt[4] = {-9,-9,-9,-9}, gf = -9, gp = -9, gc = -9, gi = -9, gx = -9, ga = -9, gr = -9, gz = -9, gzs = -9; if (g_locZTex >= 0) glGetUniformfv(g_shader.id, g_locZTex, &gz); { int lz = GetShaderLocation(g_shader, "uZScale"); if (lz >= 0) glGetUniformfv(g_shader.id, lz, &gzs); } if (g_locTexa >= 0) glGetUniformfv(g_shader.id, g_locTexa, gt); if (g_locTcc >= 0) glGetUniformfv(g_shader.id, g_locTcc, &gc); if (g_locIdxMode >= 0) glGetUniformfv(g_shader.id, g_locIdxMode, &gi); if (g_locTfx >= 0) glGetUniformfv(g_shader.id, g_locTfx, &gx); if (g_locAtst >= 0) glGetUniformfv(g_shader.id, g_locAtst, &ga); if (g_locAref >= 0) glGetUniformfv(g_shader.id, g_locAref, &gr); if (g_locFboOne >= 0) glGetUniformfv(g_shader.id, g_locFboOne, &gf); if (g_locPerspQ >= 0) glGetUniformfv(g_shader.id, g_locPerspQ, &gp); if (n2++ < 6000) std::fprintf(stderr, "[decaldbg]   EMIT generic tri: chunk=%d curFbp=%u vflip=%d fromFbo=%d tex.id=%u %dx%d src=%dx%d u/v/q v0=(%.3f,%.3f,%.4f) uRegion=(%.4f,%.4f,%.4f,%.0f) | GL uTexa=(%.2f,%.2f,%.2f,%.2f) cache=(%.2f,%.2f,%.2f,%.2f) uFboOne=%.1f uPerspQ=%.1f uTcc=%.1f uIdxMode=%.1f uTfx=%.1f uAtst=%.1f uAref=%.2f uZTex=%.1f uZScale=%.3f\n", (int)m_chunkMode, curFbp, (int)vflip, (int)fromFbo, tex.id, tex.width, tex.height, (int)c.srcTexW, (int)c.srcTexH, c.tri[0].u, c.tri[0].v, c.tri[0].q, g_curReg[0], g_curReg[1], g_curReg[2], g_curReg[3], gt[0], gt[1], gt[2], gt[3], g_curTexa[0], g_curTexa[1], g_curTexa[2], g_curTexa[3], gf, gp, gc, gi, gx, ga, gr, gz, gzs); }
                 rlNormal3f(c.tri[i].q, 0.0f, 1.0f);   // .x carries the GS q (PS2X_PERSPQ)
                 // ortho maps window_depth = -z, so pass -z to store the intended depth.
                 if (depthOn) rlVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
