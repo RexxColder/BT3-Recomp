@@ -2931,6 +2931,10 @@ namespace
         { 0x00115c98u, "silhouette(115c98)", nullptr, {0} }, { 0x00114508u, "114508", nullptr, {0} },
         { 0x0010fd98u, "10fd98", nullptr, {0} }, { 0x001231e0u, "mcode(1231e0)", nullptr, {0} },
         { 0x00123d50u, "mcode(123d50)", nullptr, {0} }, { 0x00123e40u, "mcode(123e40)", nullptr, {0} },
+        // functions that form FRAME=0x00040150 (fbp336 fbw4 = the Pass-1 shadow-silhouette target, pcsx2dump draw 1849)
+        { 0x00103600u, "frame336(103600)", nullptr, {0} }, { 0x00104060u, "frame336(104060)", nullptr, {0} },
+        { 0x00247d98u, "frame336(247d98)", nullptr, {0} }, { 0x00107ee0u, "frame336(107ee0)", nullptr, {0} },
+        { 0x00113c08u, "frame336(113c08)", nullptr, {0} }, { 0x00244890u, "frame336(244890)", nullptr, {0} },
     };
     template <int I> void bt3ShadowProbeFn(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -2950,8 +2954,9 @@ namespace
     void bt3ShadowProbeArm(PS2Runtime &runtime)
     {
         PS2Runtime::RecompiledFunction fns[] = { &bt3ShadowProbeFn<0>, &bt3ShadowProbeFn<1>, &bt3ShadowProbeFn<2>, &bt3ShadowProbeFn<3>, &bt3ShadowProbeFn<4>, &bt3ShadowProbeFn<5>,
-                                                 &bt3ShadowProbeFn<6>, &bt3ShadowProbeFn<7>, &bt3ShadowProbeFn<8>, &bt3ShadowProbeFn<9>, &bt3ShadowProbeFn<10>, &bt3ShadowProbeFn<11> };
-        for (int i = 0; i < 12; ++i)
+                                                 &bt3ShadowProbeFn<6>, &bt3ShadowProbeFn<7>, &bt3ShadowProbeFn<8>, &bt3ShadowProbeFn<9>, &bt3ShadowProbeFn<10>, &bt3ShadowProbeFn<11>,
+                                                 &bt3ShadowProbeFn<12>, &bt3ShadowProbeFn<13>, &bt3ShadowProbeFn<14>, &bt3ShadowProbeFn<15>, &bt3ShadowProbeFn<16>, &bt3ShadowProbeFn<17> };
+        for (int i = 0; i < 18; ++i)
         {
             g_shProbe[i].orig = runtime.lookupFunction(g_shProbe[i].addr);
             if (g_shProbe[i].orig) runtime.replaceFunction(g_shProbe[i].addr, fns[i]);

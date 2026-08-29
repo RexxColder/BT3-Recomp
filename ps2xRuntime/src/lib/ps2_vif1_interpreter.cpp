@@ -15,6 +15,12 @@ namespace { std::atomic<uint32_t> g_boneScanTarget{0}; }
 extern std::vector<std::array<uint32_t, 3>> g_kickSrcMap; // see ps2_memory.cpp
 extern bool g_kickSrcMapEnabled();
 extern uint32_t g_vif1QwcSrcGuest; // qwc (non-chain) transfer source base
+// [shadowpass] PS2X_SHADOWPASS=1: the game sends the Pass-1 shadow-silhouette GS context every frame
+// (DIRECT A+D FRAME_1=0x40150 = fbp336 fbw4, then SCISSOR_1 (1,1)-(254,254)) but no vertices ever land
+// in fbp336 under our runtime (pcsx2dump draw 1849 = 9348-vertex grey mesh). Count what VIF1/VU1 do
+// while that context is current: MSCALs (entry pc), XGKICKs and their GIF NLOOPs.
+bool g_spInShadow = false; bool g_spFrame336 = false; bool g_spScissor254 = false;
+uint32_t g_spSets = 0, g_spMscal = 0, g_spLastPC = 0, g_spKicks = 0, g_spLoops = 0, g_spUnpackQw = 0;
 extern bool g_vif1QwcActive;
 // PS2X_KICKHIST: rolling history of recent VIF1 unpacks (dest qw, count, EE source, frame),
 // dumped by the XGKICK spike probe to show exactly which writes fed a popup kick's buffer.
@@ -473,6 +479,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
             uint32_t startPC = (uint32_t)imm * 8u;
+            if (g_spInShadow) { ++g_spMscal; g_spLastPC = startPC; }   // [shadowpass]
             // [mvpdisp]: which microprogram consumes the last 13qw@addr0 unpack (healthy vs
             // degenerate)? Same pc for both = one program, garbage input; different pc =
             // packet families and the degenerate ones are misrouted.
@@ -681,6 +688,42 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         }
                         else
                             o += nloop * 16u;
+                    }
+                }
+                {   // [shadowpass] detect the Pass-1 context in DIRECT A+D packets
+                    static const bool s_sp = [](){ const char *v = std::getenv("PS2X_SHADOWPASS"); return v && v[0] && v[0] != '0'; }();
+                    if (s_sp)
+                    {
+                        uint32_t o = 0; const uint32_t lim = qwCount * 16u;
+                        while (o + 16u <= lim && o < 4096u)
+                        {
+                            uint64_t tlo, thi; std::memcpy(&tlo, data + pos + o, 8); std::memcpy(&thi, data + pos + o + 8, 8); o += 16u;
+                            const uint32_t nloop = (uint32_t)(tlo & 0x7FFF); const uint32_t flg = (uint32_t)((tlo >> 58) & 3u);
+                            uint32_t nreg = (uint32_t)((tlo >> 60) & 0xFu); if (!nreg) nreg = 16u;
+                            if (flg == 0u)
+                            {
+                                for (uint32_t l = 0; l < nloop && o + 16u <= lim; ++l)
+                                    for (uint32_t r = 0; r < nreg && o + 16u <= lim; ++r, o += 16u)
+                                    {
+                                        if (((thi >> (r * 4u)) & 0xFu) != 14u) continue;
+                                        uint64_t plo, phi; std::memcpy(&plo, data + pos + o, 8); std::memcpy(&phi, data + pos + o + 8, 8);
+                                        const uint32_t addr = (uint32_t)(phi & 0xFFu);
+                                        if (addr == 0x4Cu) { g_spFrame336 = ((plo & 0xFFFFFFFFu) == 0x40150u); if (!g_spFrame336) g_spInShadow = false; }
+                                        else if (addr == 0x40u && g_spFrame336 && (plo & 0xFFFFFFFFFFFFull) == 0x00fe000100fe0001ull)
+                                        {
+                                            g_spInShadow = true; const uint32_t n = ++g_spSets;
+                                            if (n <= 4u || (n % 240u) == 0u)
+                                            {
+                                                std::fprintf(stderr, "[shadowpass] ctx set #%u (DIRECT qwc=%u) | since previous set: mscal=%u lastPC=0x%x unpackQw=%u kicks=%u nloopSum=%u\n",
+                                                             n, qwCount, g_spMscal, g_spLastPC, g_spUnpackQw, g_spKicks, g_spLoops);
+                                            }
+                                            g_spMscal = 0; g_spKicks = 0; g_spLoops = 0; g_spUnpackQw = 0;
+                                        }
+                                    }
+                            }
+                            else if (flg == 1u) o += ((nloop * nreg + 1u) / 2u) * 16u;
+                            else o += nloop * 16u;
+                        }
                     }
                 }
                 const bool directHl = (opcode == VIF_DIRECTHL);

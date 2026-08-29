@@ -2702,8 +2702,16 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
     }
 }
 
+// [prmode] last raw PRIM / PRMODE values (single GS instance) so PRMODECONT switches can re-apply attributes
+static uint64_t s_primRaw = 0, s_prmodeRaw = 0;
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
+    auto applyPrimAttrs = [this](uint64_t v)
+    {   // [prmode] attribute bits shared by PRIM and PRMODE
+        m_prim.iip = ((v >> 3) & 1) != 0; m_prim.tme = ((v >> 4) & 1) != 0; m_prim.fge = ((v >> 5) & 1) != 0;
+        m_prim.abe = ((v >> 6) & 1) != 0; m_prim.aa1 = ((v >> 7) & 1) != 0; m_prim.fst = ((v >> 8) & 1) != 0;
+        m_prim.ctxt = ((v >> 9) & 1) != 0; m_prim.fix = ((v >> 10) & 1) != 0;
+    };
     static const bool s_relock = [](){ const char *v = std::getenv("PS2X_RELOCK"); return !(v && v[0] == '0'); }();   // [relock] =0 -> always lock
     std::unique_lock<std::recursive_mutex> lock(m_stateMutex, std::defer_lock);
     if (!s_relock || t_gsStateHeld == 0) lock.lock();
@@ -2822,15 +2830,16 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     {
     case GS_REG_PRIM:
     {
+        // [prmode] PRMODECONT=0 means the attribute bits (IIP/TME/FGE/ABE/AA1/FST/CTXT/FIX) come from PRMODE,
+        // and a PRIM write (register or GIF-tag PRE) only selects the primitive TYPE. We used to copy the
+        // attributes from PRIM regardless, so BT3's shadow-silhouette pass (VU1 packets: PRMODECONT=0,
+        // PRMODE=0x48 = ctx1/TME off, GIF-tag PRIM with CTXT=1) landed in context 2 = the scene buffer
+        // instead of FRAME_1 = fbp336, and the ground-shadow decal sampled an empty silhouette.
+        // PS2X_PRMODE=0 restores the old behaviour (A/B).
+        static const bool s_prmodeFix = [](){ const char *v = std::getenv("PS2X_PRMODE"); return !(v && v[0] == '0'); }();
+        s_primRaw = value;
         m_prim.type = static_cast<GSPrimType>(value & 0x7);
-        m_prim.iip = ((value >> 3) & 1) != 0;
-        m_prim.tme = ((value >> 4) & 1) != 0;
-        m_prim.fge = ((value >> 5) & 1) != 0;
-        m_prim.abe = ((value >> 6) & 1) != 0;
-        m_prim.aa1 = ((value >> 7) & 1) != 0;
-        m_prim.fst = ((value >> 8) & 1) != 0;
-        m_prim.ctxt = ((value >> 9) & 1) != 0;
-        m_prim.fix = ((value >> 10) & 1) != 0;
+        if (m_prmodecont || !s_prmodeFix) applyPrimAttrs(value);
         m_vtxCount = 0;
         m_vtxIndex = 0;
         break;
@@ -2985,20 +2994,15 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         break;
     }
     case GS_REG_PRMODECONT:
+    {   // [prmode] switching the attribute source re-applies the attributes from the now-active register
+        static const bool s_prmodeFix = [](){ const char *v = std::getenv("PS2X_PRMODE"); return !(v && v[0] == '0'); }();
         m_prmodecont = (value & 1) != 0;
+        if (s_prmodeFix) applyPrimAttrs(m_prmodecont ? s_primRaw : s_prmodeRaw);
         break;
+    }
     case GS_REG_PRMODE:
-        if (!m_prmodecont)
-        {
-            m_prim.iip = ((value >> 3) & 1) != 0;
-            m_prim.tme = ((value >> 4) & 1) != 0;
-            m_prim.fge = ((value >> 5) & 1) != 0;
-            m_prim.abe = ((value >> 6) & 1) != 0;
-            m_prim.aa1 = ((value >> 7) & 1) != 0;
-            m_prim.fst = ((value >> 8) & 1) != 0;
-            m_prim.ctxt = ((value >> 9) & 1) != 0;
-            m_prim.fix = ((value >> 10) & 1) != 0;
-        }
+        s_prmodeRaw = value;
+        if (!m_prmodecont) applyPrimAttrs(value);
         break;
     case GS_REG_TEXCLUT:
         m_texclut.cbw = static_cast<uint8_t>(value & 0x3Fu);
@@ -3006,6 +3010,22 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_texclut.cov = static_cast<uint16_t>((value >> 12) & 0x3FFu);
         break;
     case GS_REG_SCISSOR_1:
+    {   // [shadowpass] the Pass-1 shadow context = FRAME_1 fbp336/fbw4 + SCISSOR (1,1)-(254,254), in either order
+        extern bool g_spInShadow, g_spFrame336, g_spScissor254; extern uint32_t g_spSets, g_spMscal, g_spLastPC, g_spKicks, g_spLoops, g_spUnpackQw;
+        static const bool s_sp = [](){ const char *v = std::getenv("PS2X_SHADOWPASS"); return v && v[0] && v[0] != '0'; }();
+        if (s_sp)
+        {
+            g_spScissor254 = ((value & 0x07FF07FF07FF07FFull) == 0x00fe000100fe0001ull);
+            if (!g_spScissor254) g_spInShadow = false;
+            else if (g_spFrame336 && !g_spInShadow)
+            {
+                g_spInShadow = true; const uint32_t n = ++g_spSets;
+                if (n <= 4u || (n % 240u) == 0u)
+                    std::fprintf(stderr, "[shadowpass] ctx set #%u | since previous set: mscal=%u lastPC=0x%x kicks=%u nloopSum=%u\n", n, g_spMscal, g_spLastPC, g_spKicks, g_spLoops);
+                g_spMscal = 0; g_spKicks = 0; g_spLoops = 0; g_spUnpackQw = 0;
+            }
+        }
+    }
     case GS_REG_SCISSOR_2:
     {
         int ci = (regAddr == GS_REG_SCISSOR_2) ? 1 : 0;
@@ -3052,6 +3072,18 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         break;
     }
     case GS_REG_FRAME_1:
+    {   // [shadowpass]
+        extern bool g_spInShadow, g_spFrame336, g_spScissor254; extern uint32_t g_spSets, g_spMscal, g_spLastPC, g_spKicks, g_spLoops, g_spUnpackQw;
+        g_spFrame336 = ((value & 0xFFFFFFFFull) == 0x40150ull);
+        if (!g_spFrame336) g_spInShadow = false;
+        else if (g_spScissor254 && !g_spInShadow)
+        {
+            g_spInShadow = true; const uint32_t n = ++g_spSets;
+            if (n <= 4u || (n % 240u) == 0u)
+                std::fprintf(stderr, "[shadowpass] ctx set #%u (frame after scissor) | since previous set: mscal=%u lastPC=0x%x kicks=%u nloopSum=%u\n", n, g_spMscal, g_spLastPC, g_spKicks, g_spLoops);
+            g_spMscal = 0; g_spKicks = 0; g_spLoops = 0; g_spUnpackQw = 0;
+        }
+    }
     case GS_REG_FRAME_2:
     {
         int ci = (regAddr == GS_REG_FRAME_2) ? 1 : 0;
