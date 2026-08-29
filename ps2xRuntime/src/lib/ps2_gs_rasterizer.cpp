@@ -28,6 +28,16 @@ static thread_local int g_subDx0 = 0, g_subDxW = 0;   // [subdecode] decode wind
 #include <functional>
 #include <vector>
 #include <memory>
+
+// [pixcenter] destinations that receive the GS-corner -> GL-centre half-pixel shift (display buffers only).
+static bool pixCenterDestOk(uint32_t fbp)
+{
+    static const std::vector<uint32_t> s_list = [](){ std::vector<uint32_t> r; const char *v = std::getenv("PS2X_PIXCENTER_FBPS");
+        const char *p = v && v[0] ? v : "0,112"; while (*p) { char *e = nullptr; long n = std::strtol(p, &e, 10); if (e == p) break; r.push_back((uint32_t)n); p = (*e == ',') ? e + 1 : e; } return r; }();
+    for (uint32_t f : s_list) if (f == fbp) return true;
+    return false;
+}
+
 // [deferdec] PS2X_DEFERDEC=1: a texture whose source page is GL-dirty is decoded by the GL thread
 // (in command order, right after it writes the page back) instead of making the guest wait.
 static const bool s_deferDec = [](){ const char *v = std::getenv("PS2X_DEFERDEC"); return v && v[0] && v[0] != '0'; }();
@@ -4238,10 +4248,11 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             // half-texel UVs (u = x + 0.5 for 1:1 HUD art) only hit texel centres when the geometry is shifted by the
             // same half pixel -- otherwise bilinear draws land on texel BOUNDARIES (blur) and point draws one texel off,
             // and which of the two you get depends on batch breaks (the outline env's HUD wobble). Sprites too.
-            static const std::array<float,2> s_pcS = [](){ std::array<float,2> r{0.5f,0.5f};   // default ON 2026-08-29: GS pixel corners -> GL pixel centres (PS2X_PIXCENTER=0,0 reverts)
+            static const std::array<float,2> s_pcS = [](){ std::array<float,2> r{0.5f,0.5f};   // default ON (display buffers only, see pixCenterDestOk); PS2X_PIXCENTER=0,0 reverts
                 if (const char *v = std::getenv("PS2X_PIXCENTER")) std::sscanf(v, "%f,%f", &r[0], &r[1]);
+                if (const char *v = std::getenv("PS2X_PIXCENTER_SPR")) std::sscanf(v, "%f,%f", &r[0], &r[1]);   // sprites separately (A/B)
                 return r; }();
-            x0 += s_pcS[0]; x1 += s_pcS[0]; y0 += s_pcS[1]; y1 += s_pcS[1];
+            if (pixCenterDestOk(ctx.frame.fbp)) { x0 += s_pcS[0]; x1 += s_pcS[0]; y0 += s_pcS[1]; y1 += s_pcS[1]; }
         }
         cmd.dx0 = x0; cmd.dy0 = y0; cmd.dx1 = x1; cmd.dy1 = y1;
         if (g_subDxW) { u0 -= (float)g_subDx0; u1 -= (float)g_subDx0; }   // [subdecode] window-relative
@@ -4365,9 +4376,13 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             // uniform half-pixel bias. Cross-correlating our frame against the console screenshot
             // over the CHARACTER (the only high-frequency region, so the only well-constrained
             // one) puts the optimum at exactly half a pixel diagonally.
-            static const std::array<float,2> s_pc = [](){ std::array<float,2> r{0.5f,0.5f};   // default ON 2026-08-29: GS pixel corners -> GL pixel centres (PS2X_PIXCENTER=0,0 reverts)
+            static const std::array<float,2> s_pc0 = [](){ std::array<float,2> r{0.5f,0.5f};   // default ON (display buffers only, see pixCenterDestOk); PS2X_PIXCENTER=0,0 reverts
                 if (const char *v = std::getenv("PS2X_PIXCENTER")) std::sscanf(v, "%f,%f", &r[0], &r[1]);
                 return r; }();
+            // [pixcenter] only draws INTO THE DISPLAY buffers get the shift (PS2X_PIXCENTER_FBPS, default "0,112"):
+            // shifting the render-target passes moved the shadow silhouette into its region's border row/column and
+            // the decal clamp smeared it into a dark ground band (user 2026-08-29, replay hud.gs fr345).
+            const std::array<float,2> s_pc = pixCenterDestOk(ctx.frame.fbp) ? s_pc0 : std::array<float,2>{0.0f, 0.0f};
             if (s_subpx)
             {
                 cmd.tri[i].x = v.x - static_cast<float>(ofx) + s_pc[0];
