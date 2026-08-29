@@ -4234,6 +4234,15 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         }
         if (x0 > x1) { std::swap(x0, x1); std::swap(u0, u1); }
         if (y0 > y1) { std::swap(y0, y1); std::swap(tv0, tv1); }
+        {   // [pixcenter] PS2X_PIXCENTER="dx,dy": the GS addresses pixel CORNERS, GL samples pixel CENTRES; the game's
+            // half-texel UVs (u = x + 0.5 for 1:1 HUD art) only hit texel centres when the geometry is shifted by the
+            // same half pixel -- otherwise bilinear draws land on texel BOUNDARIES (blur) and point draws one texel off,
+            // and which of the two you get depends on batch breaks (the outline env's HUD wobble). Sprites too.
+            static const std::array<float,2> s_pcS = [](){ std::array<float,2> r{0.5f,0.5f};   // default ON 2026-08-29: GS pixel corners -> GL pixel centres (PS2X_PIXCENTER=0,0 reverts)
+                if (const char *v = std::getenv("PS2X_PIXCENTER")) std::sscanf(v, "%f,%f", &r[0], &r[1]);
+                return r; }();
+            x0 += s_pcS[0]; x1 += s_pcS[0]; y0 += s_pcS[1]; y1 += s_pcS[1];
+        }
         cmd.dx0 = x0; cmd.dy0 = y0; cmd.dx1 = x1; cmd.dy1 = y1;
         if (g_subDxW) { u0 -= (float)g_subDx0; u1 -= (float)g_subDx0; }   // [subdecode] window-relative
         cmd.su0 = u0; cmd.sv0 = tv0; cmd.su1 = u1; cmd.sv1 = tv1;
@@ -4356,7 +4365,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             // uniform half-pixel bias. Cross-correlating our frame against the console screenshot
             // over the CHARACTER (the only high-frequency region, so the only well-constrained
             // one) puts the optimum at exactly half a pixel diagonally.
-            static const std::array<float,2> s_pc = [](){ std::array<float,2> r{0.0f,0.0f};
+            static const std::array<float,2> s_pc = [](){ std::array<float,2> r{0.5f,0.5f};   // default ON 2026-08-29: GS pixel corners -> GL pixel centres (PS2X_PIXCENTER=0,0 reverts)
                 if (const char *v = std::getenv("PS2X_PIXCENTER")) std::sscanf(v, "%f,%f", &r[0], &r[1]);
                 return r; }();
             if (s_subpx)
