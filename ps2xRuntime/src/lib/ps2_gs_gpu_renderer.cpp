@@ -278,7 +278,21 @@ namespace
         // the single largest per-command GL cost in the draw loop. PS2X_FILTERCACHE=0 = old.
         static const bool s_fc = [](){ const char *v = std::getenv("PS2X_FILTERCACHE"); return !(v && v[0] == '0'); }();
         auto it = g_texFilterState.find(t.id);
-        if (s_fc && it != g_texFilterState.end() && it->second == bilinear) return;   // don't thrash GL state
+        if (s_fc && it != g_texFilterState.end() && it->second == bilinear)
+        {   // [filterchk] PS2X_FILTERCHK=1: the cache says "already applied" -- verify against GL and correct + log a lie.
+            static const bool s_chk = [](){ const char *v = std::getenv("PS2X_FILTERCHK"); return v && v[0] && v[0] != '0'; }();
+            if (!s_chk) return;
+            int mag = 0; glBindTexture(0x0DE1, t.id); glGetTexParameteriv(0x0DE1, 0x2800 /*GL_TEXTURE_MAG_FILTER*/, &mag);
+            const bool glBilinear = (mag == 0x2601 /*GL_LINEAR*/);
+            if (glBilinear == bilinear) return;
+            static unsigned long nMiss = 0; ++nMiss;
+            if (nMiss <= 20 || (nMiss % 500u) == 0u)
+                std::fprintf(stderr, "[filterchk] #%lu tex %u: cache says %s, GL says %s (%dx%d) -> corrected\n", nMiss, t.id, bilinear ? "bilinear" : "point", glBilinear ? "bilinear" : "point", t.width, t.height);
+            rlDrawRenderBatchActive();
+            SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+            g_texFilterState[t.id] = bilinear;
+            return;
+        }
         // [filterflush] a filter change is a GL texture parameter: quads of this texture still sitting in the
         // rlgl batch would be drawn with the NEW filter (the batch is flushed later). Draw them first. Without this
         // the same HUD glyph came out point- or bilinear-sampled depending on where the batch happened to break
@@ -505,7 +519,8 @@ namespace
         if (snap.texture.id == 0 || snap.texture.width != w || snap.texture.height != h)
         {
             if (snap.texture.id != 0) UnloadRenderTexture(snap);
-            snap = LoadRenderTexture(w, h); SetTextureFilter(snap.texture, TEXTURE_FILTER_POINT);
+            if (snap.texture.id != 0) ps2xForgetTexId(snap.texture.id);
+            snap = LoadRenderTexture(w, h); SetTextureFilter(snap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(snap.texture.id);
             g_rtSnapSeq[fbp] = 0xFFFFFFFFu;
         }
         const uint32_t seq = g_glEnterSeq[fbp];
@@ -586,6 +601,7 @@ namespace
                 {
                     rlEnableFramebuffer(t.id);
                     t.texture.id = rlLoadTexture(nullptr, w, h, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1);
+                    ps2xForgetTexId(t.texture.id);   // [filtercache]
                     t.texture.width = w; t.texture.height = h; t.texture.mipmaps = 1;
                     t.texture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
                     rlFramebufferAttach(t.id, t.texture.id, RL_ATTACHMENT_COLOR_CHANNEL0, RL_ATTACHMENT_TEXTURE2D, 0);
@@ -659,6 +675,7 @@ namespace
                 {
                     rlEnableFramebuffer(t.id);
                     t.texture.id = rlLoadTexture(nullptr, w, h, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1);
+                    ps2xForgetTexId(t.texture.id);   // [filtercache]
                     t.texture.width = w; t.texture.height = h; t.texture.mipmaps = 1;
                     t.texture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
                     t.depth.id = 0; // no depth attachment
@@ -4732,6 +4749,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 else
                 {
                     t = LoadTextureFromImage(img);
+                ps2xForgetTexId(t.id);   // [filtercache] a recycled GL id must not inherit the previous object's filter state
                     if (g_deletedIds.count(t.id)) { ++g_idReuse; g_deletedIds.erase(t.id); }   // [supdiag]
                     SetTextureFilter(t, TEXTURE_FILTER_POINT);
                     g_texFilterState[t.id] = false;   // [filtercache] known state
@@ -11526,7 +11544,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         {
                             const int w = sit->second.w, h = sit->second.h;
                             if (g_decalSnap.texture.id == 0 || g_decalSnap.texture.width != w || g_decalSnap.texture.height != h)
-                            { if (g_decalSnap.texture.id) UnloadRenderTexture(g_decalSnap); g_decalSnap = LoadRenderTexture(w, h); SetTextureFilter(g_decalSnap.texture, TEXTURE_FILTER_POINT); }
+                            { if (g_decalSnap.texture.id) { ps2xForgetTexId(g_decalSnap.texture.id); UnloadRenderTexture(g_decalSnap); } g_decalSnap = LoadRenderTexture(w, h); SetTextureFilter(g_decalSnap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(g_decalSnap.texture.id); }
                             glBindFramebuffer(0x8CA8 /*READ*/, sit->second.rt.id); glBindFramebuffer(0x8CA9 /*DRAW*/, g_decalSnap.id);
                             glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, 0x4000 /*COLOR*/, 0x2600 /*NEAREST*/);
                             glBindFramebuffer(0x8D40 /*FRAMEBUFFER*/, 0);
@@ -11620,8 +11638,8 @@ if (done.size() < 14 && !done.count(c.texKey))
                         if (n++ < 6000L)
                         {
                             g_dbgDecalCmd = &c;
-                            std::fprintf(stderr, "[hudprobe] gen %u chunk=%d seg=%d ci=%zu dest=%u src=%u psm=%u %dx%d key=%llx xyz (%.3f,%.3f,%.0f) (%.3f,%.3f,%.0f) (%.3f,%.3f,%.0f) uv (%.5f,%.5f) (%.5f,%.5f) (%.5f,%.5f) q %.4f rgba %u,%u,%u,%u depth=%d/%d bm=0x%02x fbmsk=%08x ate=%d\n",
-                                         g_publishGen, (int)m_chunkMode, (int)m_segMode, ci, c.destFbp, c.srcTbp0, c.srcPsm, (int)c.srcTexW, (int)c.srcTexH, (unsigned long long)c.texKey,
+                            std::fprintf(stderr, "[hudprobe] gen %u chunk=%d seg=%d ci=%zu bilinear=%d dest=%u src=%u psm=%u %dx%d key=%llx xyz (%.3f,%.3f,%.0f) (%.3f,%.3f,%.0f) (%.3f,%.3f,%.0f) uv (%.5f,%.5f) (%.5f,%.5f) (%.5f,%.5f) q %.4f rgba %u,%u,%u,%u depth=%d/%d bm=0x%02x fbmsk=%08x ate=%d\n",
+                                         g_publishGen, (int)m_chunkMode, (int)m_segMode, ci, (int)c.bilinear, c.destFbp, c.srcTbp0, c.srcPsm, (int)c.srcTexW, (int)c.srcTexH, (unsigned long long)c.texKey,
                                          c.tri[0].x, c.tri[0].y, c.tri[0].z, c.tri[1].x, c.tri[1].y, c.tri[1].z, c.tri[2].x, c.tri[2].y, c.tri[2].z,
                                          c.tri[0].u, c.tri[0].v, c.tri[1].u, c.tri[1].v, c.tri[2].u, c.tri[2].v, c.tri[0].q,
                                          (unsigned)c.tri[0].r, (unsigned)c.tri[0].g, (unsigned)c.tri[0].b, (unsigned)c.tri[0].a, (int)c.depthTest, (int)c.depthFunc, c.blendMode, c.fbmsk, (int)c.alphaTest);
@@ -11762,7 +11780,8 @@ if (done.size() < 14 && !done.count(c.texKey))
             }
         }
         if (c.destFbp == 224u && c.texKey != 0) g_f224Mark = 36;
-        if (c.isTriangle && c.texKey != 0 && !fromFbo && ci + 1 < DC.size())
+        static const bool s_qm = [](){ const char *v = std::getenv("PS2X_QUADMERGE"); return v && v[0] && v[0] != '0'; }();   // [quadmerge] default OFF 2026-08-30: the merged-quad emit samples the HUD glyphs half a texel off (blur) while the generic path is exact; merge adjacency depends on chunk boundaries -> the HUD wobble. =1 restores.
+        if (s_qm && c.isTriangle && c.texKey != 0 && !fromFbo && ci + 1 < DC.size())
         {
             const DrawCmd &c2 = DC[ci + 1];
             if (c2.isTriangle && c2.texKey == c.texKey && c2.destFbp == c.destFbp &&
