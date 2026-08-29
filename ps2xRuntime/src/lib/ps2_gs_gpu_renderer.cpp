@@ -279,6 +279,11 @@ namespace
         static const bool s_fc = [](){ const char *v = std::getenv("PS2X_FILTERCACHE"); return !(v && v[0] == '0'); }();
         auto it = g_texFilterState.find(t.id);
         if (s_fc && it != g_texFilterState.end() && it->second == bilinear) return;   // don't thrash GL state
+        // [filterflush] a filter change is a GL texture parameter: quads of this texture still sitting in the
+        // rlgl batch would be drawn with the NEW filter (the batch is flushed later). Draw them first. Without this
+        // the same HUD glyph came out point- or bilinear-sampled depending on where the batch happened to break
+        // (BARBLOCK's chunk pre-renders move the breaks -> the timer's left lobe alternated crisp/blurred).
+        rlDrawRenderBatchActive();
         SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
         g_texFilterState[t.id] = bilinear;
     }
