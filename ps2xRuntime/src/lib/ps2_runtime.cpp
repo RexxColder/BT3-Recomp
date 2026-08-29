@@ -1265,7 +1265,12 @@ namespace
         // [ksegfn] kseg0/kseg1 aliases of RAM (0x8xxxxxxx / 0xAxxxxxxx) are the same code on a PS2. BT3's loader path
         // calls through kseg0-form function pointers (JALR target 0x8026cbc8 = 0x26cbc8); unmasked they miss the tables,
         // fall to the overlay interpreter (which lacked lq/sq) and the load hangs with a garbage return address.
-        if (address >= 0x80000000u && address < 0xC0000000u) address &= 0x1FFFFFFFu;
+        if (address >= 0x80000000u && address < 0xC0000000u)
+        {
+            static std::atomic<uint32_t> s_n{0}; const uint32_t n = s_n.fetch_add(1u);
+            if (n < 40u || (n % 5000u) == 0u) std::fprintf(stderr, "[ksegfn] #%u kseg-form function pointer 0x%08x -> 0x%08x\n", n, address, address & 0x1FFFFFFFu);
+            address &= 0x1FFFFFFFu;
+        }
         uint32_t slot = 0u;
         if (generatedFunctionTableSlot(address, slot))
         {
