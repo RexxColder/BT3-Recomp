@@ -130,6 +130,9 @@ extern "C" void ps2xGuestWaitEnd(void *);
 #endif
 extern "C" void glBindTexture(unsigned int target, unsigned int texture);
 extern "C" void glScissor(int x, int y, int width, int height);
+extern "C" void glBindFramebuffer(unsigned target, unsigned framebuffer);   // [decalsync 3]
+extern "C" void glGetFramebufferAttachmentParameteriv(unsigned target, unsigned attachment, unsigned pname, int *params);
+extern "C" void glBlitFramebuffer(int, int, int, int, int, int, int, int, unsigned mask, unsigned filter);
 extern "C" void glEnable(unsigned cap);
 // [rtthazard] the texture of the FBO most recently SAMPLED by a draw (fromFbo). Rendering into that FBO right after
 // sampling it (BT3: shadow decal A samples fbp336, then clear/mesh for fighter B render into fbp336) lost the writes --
@@ -670,6 +673,7 @@ namespace
     float g_curTexa[4] = {1.0f, 1.0f, 0.0f, 0.0f};   // [texacache] last uTexa pushed -- every writer must update it
     const GsGpuRenderer::DrawCmd *g_curDecalCmd = nullptr;
     bool g_decalUViz = false; float g_decalUVizMode = 1.f;   // [decaldbg 6/7]
+    RenderTexture2D g_decalSnap = {0}; unsigned g_decalSnapSrcTex = 0;   // [decalsync 3] silhouette snapshot
     float g_curReg[4] = {0.f, 0.f, 0.f, -1.f};   // [region] last uRegion value pushed   // [region] the shadow-decal command being drawn (loop top)               // PS2X_PERSPQ: per-pixel S/Q divide
     int g_locForceA = -1;               // PS2X_FORCEA: constant alpha write test
     int g_locZTex = -1;                 // PS2X_ZTEX: texture0 is a depth texture
@@ -830,6 +834,7 @@ namespace
         // TCC=0 (console dump), with vertex alpha 128 (full). Scene alpha feeds the fbp224
         // mask via a PSMT8H read, so losing it blanks the mask, the shadows and the DoF weight.
         "  if (uTcc < 0.5) c.a = fragColor.a * colDiffuse.a;\n"
+        "  if (uUViz > 2.5) { finalColor = vec4(t.rgb, 1.0); blendAlpha = vec4(1.0); return; }\n"   // [decaldbg 8] the sampled texel, path untouched
         "  if (uAtst > -0.5) {\n"
         "    int at = int(uAtst + 0.5);\n"
         "    bool pass = true;\n"
@@ -9589,6 +9594,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             }
             }
             decal_bound:;
+            if (g_decalSnapSrcTex != 0 && g_curDecalCmd == &c && fromFbo && tex.id == g_decalSnapSrcTex) tex = g_decalSnap.texture;   // [decalsync 3]
         }
         {   // [darkad] PS2X_DARKAD=1: dest alpha of the scene right BEFORE the darkener (the ink
             // draw: untextured, bm 0x52 = Cd - Cs*Ad, into the scene). Console at this point holds
@@ -11469,7 +11475,24 @@ if (done.size() < 14 && !done.count(c.texKey))
                 {
                     auto sit = g_fbos.find(tbp0ToFbp(c.srcTbp0));
                     if (sit != g_fbos.end() && sit->second.rt.texture.id != 0)
-                    { rlDrawRenderBatchActive(); rlEnableFramebuffer(sit->second.rt.id); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu; }
+                    {
+                        rlDrawRenderBatchActive(); rlEnableFramebuffer(sit->second.rt.id); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
+                        // PS2X_DECALSYNC=2: also drain the GPU + texture barrier after the rebind. =3: SNAPSHOT -- blit the
+                        // silhouette FBO into a private texture (a blit is a hard sync point) and sample the decal from that.
+                        static const int s_dsMode = [](){ const char *v = std::getenv("PS2X_DECALSYNC"); return v && v[0] ? std::atoi(v) : 3; }();   // default 3 (snapshot): measured band 41 -> 0 px, shadows byte-identical
+                        if (s_dsMode == 2) { glFinish(); ps2xTextureBarrier(); }
+                        if (s_dsMode == 3)
+                        {
+                            const int w = sit->second.w, h = sit->second.h;
+                            if (g_decalSnap.texture.id == 0 || g_decalSnap.texture.width != w || g_decalSnap.texture.height != h)
+                            { if (g_decalSnap.texture.id) UnloadRenderTexture(g_decalSnap); g_decalSnap = LoadRenderTexture(w, h); SetTextureFilter(g_decalSnap.texture, TEXTURE_FILTER_POINT); }
+                            glBindFramebuffer(0x8CA8 /*READ*/, sit->second.rt.id); glBindFramebuffer(0x8CA9 /*DRAW*/, g_decalSnap.id);
+                            glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, 0x4000 /*COLOR*/, 0x2600 /*NEAREST*/);
+                            glBindFramebuffer(0x8D40 /*FRAMEBUFFER*/, 0);
+                            g_decalSnapSrcTex = sit->second.rt.texture.id;
+                            static int n = 0; if (n++ < 2) std::fprintf(stderr, "[decalsync] mode 3: snapshot %dx%d of fbp%u (tex %u -> %u)\n", w, h, tbp0ToFbp(c.srcTbp0), g_decalSnapSrcTex, g_decalSnap.texture.id);
+                        }
+                    }
                 }
                 prevDecal = isShadowDecal;
             }
@@ -11597,7 +11620,8 @@ if (done.size() < 14 && !done.count(c.texKey))
                     m.alphaTest = false; m.dateEnable = false;
                     if (s_dbg == 3) m.depthTest = false;
                     if (s_dbg == 6) { m.blendMode = 0x64u; m.abe = false; m.depthTest = false; g_decalUViz = true; }   // write stq as colour, opaque
-                    if (s_dbg == 7) { m.blendMode = 0x64u; m.abe = false; m.depthTest = false; g_decalUViz = true; g_decalUVizMode = 2.f; }   // write the sampled texel, opaque
+                    if (s_dbg == 7) { m.blendMode = 0x64u; m.abe = false; m.depthTest = false; g_decalUViz = true; g_decalUVizMode = 2.f; }
+                    if (s_dbg == 8) { g_decalUViz = true; g_decalUVizMode = 3.f; }   // [decaldbg 8] shader-only: write the sampled texel opaque, DrawCmd untouched   // write the sampled texel, opaque
                     g_dbgDecalCmd = &c;
                     static int n = 0; if (n++ < 6) std::fprintf(stderr, "[decaldbg] mode %d: tri xy (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f) z %.4f %.4f %.4f depthTest=%d func=%u destFbp=%u fbmsk=%08x bm=0x%x atst=%d/%u/%u srcPsm=%u srcTbp0=%u\n", s_dbg, c.tri[0].x, c.tri[0].y, c.tri[1].x, c.tri[1].y, c.tri[2].x, c.tri[2].y, c.tri[0].z, c.tri[1].z, c.tri[2].z, (int)c.depthTest, (unsigned)c.depthFunc, c.destFbp, c.fbmsk, (unsigned)c.blendMode, (int)c.alphaTest, (unsigned)c.alphaFunc, (unsigned)c.alphaRef, (unsigned)c.srcPsm, c.srcTbp0);
                 }
@@ -12732,6 +12756,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if (q != 1.0f) rlTexCoord2f(uu, vflip ? (q - vv) : vv);
                     else rlTexCoord2f(uu, vflip ? 1.0f - vv : vv);
                 }
+                if (g_dbgDecalCmd == &c && i == 0) { static int n4 = 0; if (n4++ < 6) { auto fit3 = g_fbos.find(336u); if (fit3 != g_fbos.end()) { int prevFb = 0, att = -1, attType = -1; glGetIntegerv(0x8CA6, &prevFb); glBindFramebuffer(0x8D40, fit3->second.rt.id); glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD1, &att); glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD0, &attType); glBindFramebuffer(0x8D40, (unsigned)prevFb); std::fprintf(stderr, "[decaldbg]   ATTACH fbp336 fbo=%u colour attachment name=%d type=0x%x | decal samples tex.id=%u (rt.texture.id=%u)\n", fit3->second.rt.id, att, attType, tex.id, fit3->second.rt.texture.id); } } }
                 if (g_dbgDecalCmd == &c && i == 0) { static int n2 = 0; float gt[4] = {-9,-9,-9,-9}, gf = -9, gp = -9, gc = -9, gi = -9, gx = -9, ga = -9, gr = -9, gz = -9, gzs = -9; if (g_locZTex >= 0) glGetUniformfv(g_shader.id, g_locZTex, &gz); { int lz = GetShaderLocation(g_shader, "uZScale"); if (lz >= 0) glGetUniformfv(g_shader.id, lz, &gzs); } if (g_locTexa >= 0) glGetUniformfv(g_shader.id, g_locTexa, gt); if (g_locTcc >= 0) glGetUniformfv(g_shader.id, g_locTcc, &gc); if (g_locIdxMode >= 0) glGetUniformfv(g_shader.id, g_locIdxMode, &gi); if (g_locTfx >= 0) glGetUniformfv(g_shader.id, g_locTfx, &gx); if (g_locAtst >= 0) glGetUniformfv(g_shader.id, g_locAtst, &ga); if (g_locAref >= 0) glGetUniformfv(g_shader.id, g_locAref, &gr); if (g_locFboOne >= 0) glGetUniformfv(g_shader.id, g_locFboOne, &gf); if (g_locPerspQ >= 0) glGetUniformfv(g_shader.id, g_locPerspQ, &gp); if (n2++ < 60) std::fprintf(stderr, "[decaldbg]   EMIT generic tri: curFbp=%u vflip=%d fromFbo=%d tex.id=%u %dx%d src=%dx%d u/v/q v0=(%.3f,%.3f,%.4f) uRegion=(%.4f,%.4f,%.4f,%.0f) | GL uTexa=(%.2f,%.2f,%.2f,%.2f) cache=(%.2f,%.2f,%.2f,%.2f) uFboOne=%.1f uPerspQ=%.1f uTcc=%.1f uIdxMode=%.1f uTfx=%.1f uAtst=%.1f uAref=%.2f uZTex=%.1f uZScale=%.3f\n", curFbp, (int)vflip, (int)fromFbo, tex.id, tex.width, tex.height, (int)c.srcTexW, (int)c.srcTexH, c.tri[0].u, c.tri[0].v, c.tri[0].q, g_curReg[0], g_curReg[1], g_curReg[2], g_curReg[3], gt[0], gt[1], gt[2], gt[3], g_curTexa[0], g_curTexa[1], g_curTexa[2], g_curTexa[3], gf, gp, gc, gi, gx, ga, gr, gz, gzs); }
                 rlNormal3f(c.tri[i].q, 0.0f, 1.0f);   // .x carries the GS q (PS2X_PERSPQ)
                 // ortho maps window_depth = -z, so pass -z to store the intended depth.
