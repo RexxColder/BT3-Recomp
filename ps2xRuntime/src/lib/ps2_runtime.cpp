@@ -436,6 +436,7 @@ namespace
 extern "C" bool ps2xThreadWaitInfo(int tid, int *waitType, int *waitId, int *semaCount, int *semaWaiters, int *wakeupCount);   // [schedwhy2] Thread.cpp
 extern "C" bool ps2xCdTickStale(unsigned ms);   // [dispatchpump]
 extern "C" void ps2xCdTickOnly(uint8_t *, R5900Context *, PS2Runtime *);
+extern "C" void ps2xFixupRingDump();   // [fixupring]
 extern "C" void *ps2xGuestWaitBegin();
 extern "C" void ps2xGuestWaitEnd(void *);
 extern "C" void ps2xSpinPump(uint8_t *, R5900Context *, PS2Runtime *);   // [spinpump] game_overrides.cpp
@@ -3809,6 +3810,7 @@ void PS2Runtime::run()
                     // status line during loading (bt3state 0x2d) so a hung state can be diffed against a healthy one.
                     const uint8_t *rd2 = m_memory.getRDRAM();
                     auto r32 = [&](uint32_t a) -> uint32_t { uint32_t v = 0; std::memcpy(&v, rd2 + (a & PS2_RAM_MASK), 4); return v; };
+                    ps2xFixupRingDump();   // [fixupring] last 16 loader fixup calls, only when new ones arrived
                     std::ostringstream sb; sb << "[sndblk] 0x2c9350:";
                     for (uint32_t o = 0; o < 0x40u; o += 4u) sb << ' ' << std::hex << std::setw(8) << std::setfill('0') << r32(0x2c9350u + o);
                     const uint32_t sub8 = r32(0x2c9358u), sub4 = r32(0x2c9354u);

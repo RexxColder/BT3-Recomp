@@ -2884,12 +2884,21 @@ namespace
     // store hook names the writer (guest pc). PS2X_THUNKWATCH=0 disables.
     // [fixupprobe] FUN_0010a028 = the loader's pointer-fixup loop (bank offsets -> absolute pointers). The loading hang's
     // corrupting store (pc 0x10a074 -> 0x2c9360) came from here with base a1 = 0x02f60500. Log every call's inputs.
+    struct FixupRing { uint32_t n, a0, a1, a2, ra, cnt, entOff, sp; };
+    FixupRing g_fixupRing[16] = {};
+    uint32_t g_fixupRingPos = 0;
     PS2Runtime::RecompiledFunction g_orig10a028 = nullptr;
     void bt3FixupProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6), ra = getRegU32(ctx, 31);
         auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *p = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (p) std::memcpy(&v, p, 4); return v; };
         static std::atomic<uint32_t> s_n{0}; const uint32_t n = s_n.fetch_add(1u);
+        {   // [fixupring] keep the LAST 16 calls (the first-40 log never contains the hang's own call);
+            // ps2xFixupRingDump() prints them from the [status] line when the game sits at 0 fps.
+            static std::mutex s_rm; std::lock_guard<std::mutex> lk(s_rm);
+            FixupRing &r = g_fixupRing[g_fixupRingPos++ & 15u];
+            r.n = n; r.a0 = a0; r.a1 = a1; r.a2 = a2; r.ra = ra; r.cnt = r32(a2); r.entOff = r32(a2 + 4u); r.sp = getRegU32(ctx, 29);
+        }
         if (n < 40u)
             std::fprintf(stderr, "[fixupprobe] #%u a0=0x%x a1=0x%x a2=0x%x ra=0x%x hdr[0..4]=%08x %08x %08x %08x %08x  a1[0..3]=%08x %08x %08x %08x  sp=0x%x\n",
                          n, a0, a1, a2, ra, r32(a2), r32(a2 + 4u), r32(a2 + 8u), r32(a2 + 12u), r32(a2 + 16u), r32(a1), r32(a1 + 4u), r32(a1 + 8u), r32(a1 + 12u), getRegU32(ctx, 29));
@@ -2907,6 +2916,62 @@ namespace
         }
         if (g_orig10a028) g_orig10a028(rdram, ctx, runtime);
     }
+
+    // [shadowprobe] PS2X_SHADOWPROBE=1: the game's character-shadow pipeline (Pass 1 silhouette microcode into fbp336 +
+    // Pass 2 floor decal) never runs its silhouette pass under our runtime (no triangle ever hits fbp336, the shadow
+    // microcode pieces at 0x2c2d30/0x2c3080/0x2c3380 never upload). Static chain: sub_00115290 creates the shadow
+    // system ([gp-0x595C] = ctx, gated on [[gp-0x5154]+0x24]) <- 0x23fc80; 0x115de0 (model draw driver) -> 0x115478
+    // (bails when [gp-0x595C]==0 or [[gp-0x5690]+8]&1) -> returns 8 -> 0x115c98 -> sub_001231E0 (silhouette
+    // microcode). Log entries + the gates to see which link breaks.
+    struct ShadowProbeSlot { uint32_t addr; const char *name; PS2Runtime::RecompiledFunction orig; std::atomic<uint32_t> n; };
+    ShadowProbeSlot g_shProbe[] = {
+        { 0x00115290u, "create(115290)", nullptr, {0} }, { 0x00115370u, "destroy(115370)", nullptr, {0} },
+        { 0x0023fc80u, "creator-caller(23fc80)", nullptr, {0} }, { 0x0023fc40u, "23fc40", nullptr, {0} },
+        { 0x00115de0u, "drawdriver(115de0)", nullptr, {0} }, { 0x00115478u, "gate(115478)", nullptr, {0} },
+        { 0x00115c98u, "silhouette(115c98)", nullptr, {0} }, { 0x00114508u, "114508", nullptr, {0} },
+        { 0x0010fd98u, "10fd98", nullptr, {0} }, { 0x001231e0u, "mcode(1231e0)", nullptr, {0} },
+        { 0x00123d50u, "mcode(123d50)", nullptr, {0} }, { 0x00123e40u, "mcode(123e40)", nullptr, {0} },
+    };
+    template <int I> void bt3ShadowProbeFn(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ShadowProbeSlot &sl = g_shProbe[I];
+        const uint32_t n = sl.n.fetch_add(1u);
+        auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *p = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (p) std::memcpy(&v, p, 4); return v; };
+        const uint32_t gp = getRegU32(ctx, 28), a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6), ra = getRegU32(ctx, 31);
+        const uint32_t shCtx = r32(gp - 0x595Cu), g5690 = r32(gp - 0x5690u), g5154 = r32(gp - 0x5154u);
+        const bool say = n < 6u || (n % 2000u) == 0u;
+        if (say)
+            std::fprintf(stderr, "[shadowprobe] %s #%u a0=0x%x a1=0x%x a2=0x%x ra=0x%x | shCtx[gp-595C]=0x%x  [gp-5690]=0x%x +8=0x%x  [gp-5154]=0x%x +24=0x%x (+24/+28=0x%x/0x%x)\n",
+                         sl.name, n, a0, a1, a2, ra, shCtx, g5690, g5690 ? r32(g5690 + 8u) : 0u, g5154, g5154 ? r32(g5154 + 0x24u) : 0u,
+                         (g5154 && r32(g5154 + 0x24u)) ? r32(r32(g5154 + 0x24u) + 0x24u) : 0u, (g5154 && r32(g5154 + 0x24u)) ? r32(r32(g5154 + 0x24u) + 0x28u) : 0u);
+        if (sl.orig) sl.orig(rdram, ctx, runtime);
+        if (say && (I == 5 || I == 0)) std::fprintf(stderr, "[shadowprobe] %s #%u -> v0=0x%x shCtx=0x%x\n", sl.name, n, getRegU32(ctx, 2), r32(gp - 0x595Cu));
+    }
+    void bt3ShadowProbeArm(PS2Runtime &runtime)
+    {
+        PS2Runtime::RecompiledFunction fns[] = { &bt3ShadowProbeFn<0>, &bt3ShadowProbeFn<1>, &bt3ShadowProbeFn<2>, &bt3ShadowProbeFn<3>, &bt3ShadowProbeFn<4>, &bt3ShadowProbeFn<5>,
+                                                 &bt3ShadowProbeFn<6>, &bt3ShadowProbeFn<7>, &bt3ShadowProbeFn<8>, &bt3ShadowProbeFn<9>, &bt3ShadowProbeFn<10>, &bt3ShadowProbeFn<11> };
+        for (int i = 0; i < 12; ++i)
+        {
+            g_shProbe[i].orig = runtime.lookupFunction(g_shProbe[i].addr);
+            if (g_shProbe[i].orig) runtime.replaceFunction(g_shProbe[i].addr, fns[i]);
+            std::fprintf(stderr, "[shadowprobe] hook %s %s\n", g_shProbe[i].name, g_shProbe[i].orig ? "ok" : "MISSING");
+        }
+    }
+    void bt3FixupRingDumpImpl()
+    {
+        static uint32_t s_lastPos = 0;
+        if (g_fixupRingPos == s_lastPos) return;   // nothing new since the last status line
+        s_lastPos = g_fixupRingPos;
+        std::fprintf(stderr, "[fixupring] last %u fixup calls (newest last):\n", g_fixupRingPos < 16u ? g_fixupRingPos : 16u);
+        const uint32_t start = g_fixupRingPos >= 16u ? g_fixupRingPos - 16u : 0u;
+        for (uint32_t i = start; i < g_fixupRingPos; ++i)
+        {
+            const FixupRing &r = g_fixupRing[i & 15u];
+            std::fprintf(stderr, "[fixupring]   #%u a0=0x%x a1=0x%x a2=0x%x ra=0x%x count=%u entOff=0x%x sp=0x%x\n", r.n, r.a0, r.a1, r.a2, r.ra, r.cnt, r.entOff * 4u, r.sp);
+        }
+    }
+    extern "C" void ps2xFixupRingDump() { bt3FixupRingDumpImpl(); }
     PS2Runtime::RecompiledFunction g_orig2722c0 = nullptr;
     // [vstep] PS2X_VSTEP=<n>: override the fight loop's hard-coded frame step (0x12bce4 passes a0=2 to
     // func_102060 -> func_23D160 (30 Hz counter cadence) and func_264D98 (wait until the per-frame vblank
@@ -3683,6 +3748,10 @@ namespace
             if (g_orig264d98) runtime.replaceFunction(0x00264d98u, &bt3WaitProbe);   // [vstepprobe]
             if (g_orig115950) runtime.replaceFunction(0x00115950u, &bt3LogicRate);
             std::fprintf(stderr, "[vstep] step override armed (0x102060 %s, 0x115950 %s)\n", g_orig102060 ? "ok" : "MISSING", g_orig115950 ? "ok" : "MISSING");
+        }
+        {   // [shadowprobe]
+            const char *sp = std::getenv("PS2X_SHADOWPROBE");
+            if (sp && sp[0] == '1') bt3ShadowProbeArm(runtime);
         }
         {   // [fixupprobe] always on (a few lines per load)
             g_orig10a028 = runtime.lookupFunction(0x0010a028u);
