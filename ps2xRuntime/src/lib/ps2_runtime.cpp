@@ -1262,6 +1262,10 @@ namespace
     // Resolve a guest PC against the boot ELF table first, then the overlay table.
     PS2Runtime::RecompiledFunction lookupGeneratedFunction(uint32_t address)
     {
+        // [ksegfn] kseg0/kseg1 aliases of RAM (0x8xxxxxxx / 0xAxxxxxxx) are the same code on a PS2. BT3's loader path
+        // calls through kseg0-form function pointers (JALR target 0x8026cbc8 = 0x26cbc8); unmasked they miss the tables,
+        // fall to the overlay interpreter (which lacked lq/sq) and the load hangs with a garbage return address.
+        if (address >= 0x80000000u && address < 0xC0000000u) address &= 0x1FFFFFFFu;
         uint32_t slot = 0u;
         if (generatedFunctionTableSlot(address, slot))
         {

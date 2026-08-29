@@ -11400,6 +11400,24 @@ if (done.size() < 14 && !done.count(c.texKey))
             if (!s_sd && isShadowDecal) { PS2X_GATE_HIT(); continue; }
             if (s_sd && !s_dd && isShadowDecal) const_cast<GsGpuRenderer::DrawCmd &>(c).dateEnable = false;
             g_curDecalCmd = isShadowDecal ? &c : nullptr;   // [region]/[perspq] scope: this command only
+            {   // [decalrect] PS2X_DECALRECT=x0,y0,x1,y1: log every shadow-decal piece whose screen bbox touches the rect
+                static const bool s_dr = [](){ const char *v = std::getenv("PS2X_DECALRECT"); return v && v[0]; }();
+                static float rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
+                static const bool s_drOk = [](){ const char *v = std::getenv("PS2X_DECALRECT"); return v && std::sscanf(v, "%f,%f,%f,%f", &rx0, &ry0, &rx1, &ry1) == 4; }();
+                if (s_dr && s_drOk && isShadowDecal)
+                {
+                    float x0 = c.tri[0].x, x1 = x0, y0 = c.tri[0].y, y1 = y0;
+                    for (int k = 1; k < 3; ++k) { x0 = std::min(x0, c.tri[k].x); x1 = std::max(x1, c.tri[k].x); y0 = std::min(y0, c.tri[k].y); y1 = std::max(y1, c.tri[k].y); }
+                    if (x1 >= rx0 && x0 <= rx1 && y1 >= ry0 && y0 <= ry1)
+                    {
+                        static int n = 0;
+                        if (n++ < 400)
+                            std::fprintf(stderr, "[decalrect] gen %u piece xy (%.1f,%.1f) (%.1f,%.1f) (%.1f,%.1f) uv (%.4f,%.4f) (%.4f,%.4f) (%.4f,%.4f) q %.5f %.5f %.5f a=%u dest=%u\n",
+                                         g_publishGen, c.tri[0].x, c.tri[0].y, c.tri[1].x, c.tri[1].y, c.tri[2].x, c.tri[2].y,
+                                         c.tri[0].u, c.tri[0].v, c.tri[1].u, c.tri[1].v, c.tri[2].u, c.tri[2].v, c.tri[0].q, c.tri[1].q, c.tri[2].q, (unsigned)c.tri[0].a, c.destFbp);
+                    }
+                }
+            }
             if (!isShadowDecal && g_curReg[3] > 0.5f && g_locRegion >= 0)
             {   // [region] the clamp uniform persists across draws; disable it before any non-decal command (sprites never set it)
                 rlDrawRenderBatchActive(); const float off[4] = {1.f, 0.f, 1.f, 0.f};
