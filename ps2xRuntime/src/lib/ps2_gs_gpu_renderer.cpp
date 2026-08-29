@@ -924,8 +924,13 @@ bool GsGpuRenderer::hasTexture(uint64_t key, uint32_t pageLo, uint32_t pageHi)
 // draw of a frame so the body occludes it. Fallback for the mask-page shadow composite (see bt3-character-shadows).
 namespace {
     struct GsBlob { float cx, feetY, w, feetZ; };
-    std::vector<GsBlob> g_blobs;                 // from the previous frame
-    std::vector<float> g_blobX, g_blobY, g_blobZ; // this frame's fighter vertices (normalised GS z: larger = nearer)
+    std::vector<GsBlob> g_blobs;                 // computed at draw time
+    // [groundshadow] v8: one accumulator per scene buffer parity (fbp 0 -> [0], fbp 112 -> [1]). Pre-render chunks of the
+    // NEXT frame run before the current frame's final drain, so a single per-frame accumulator was wiped early (flicker).
+    struct BlobAcc { std::vector<float> X, Y, Z; bool drawn = false; int terrain = 0; };
+    BlobAcc g_acc[2];
+    int accIdx(uint32_t fbp) { return fbp == 112u ? 1 : 0; }
+    std::vector<float> g_blobX, g_blobY, g_blobZ; // scratch copy of the accumulator being computed
     Texture2D g_blobTex{};
     bool g_blobDrawn = false;                    // once per frame; reset in blobFrameEnd()
     int g_terrainDraws = 0;                      // T8 stage-texture triangles seen this frame (the blob must come AFTER the terrain)
@@ -934,10 +939,10 @@ namespace {
     int groundShadowMode() { static const int s = [](){ const char *v = std::getenv("PS2X_GROUNDSHADOW"); return v && v[0] ? std::atoi(v) : 0; }(); return s; }
     bool groundShadowOn() { return groundShadowMode() != 0; }
     bool isFighterDraw(const GsGpuRenderer::DrawCmd &c) { return c.isTriangle && c.srcPsm == 20u && c.srcClutTbp >= 15360u && c.srcClutTbp < 15400u && !c.isTransfer; }
-    void blobAccumulate(const GsGpuRenderer::DrawCmd &c) { for (int i = 0; i < 3; ++i) { g_blobX.push_back(c.tri[i].x); g_blobY.push_back(c.tri[i].y); g_blobZ.push_back(c.tri[i].z); } }
-    void blobCompute()
+    void blobAccumulate(const GsGpuRenderer::DrawCmd &c) { BlobAcc &a = g_acc[accIdx(c.destFbp)]; for (int i = 0; i < 3; ++i) { a.X.push_back(c.tri[i].x); a.Y.push_back(c.tri[i].y); a.Z.push_back(c.tri[i].z); } }
+    void blobCompute(const BlobAcc &acc)
     {
-        g_blobs.clear();
+        g_blobs.clear(); g_blobX = acc.X; g_blobY = acc.Y; g_blobZ = acc.Z;
         const size_t n = g_blobX.size();
         if (n >= 60)
         {
@@ -968,11 +973,7 @@ namespace {
         }
         { static unsigned long nf = 0; if ((++nf % 120ul) == 1ul) std::fprintf(stderr, "[groundshadow] frame %lu: fighter verts %zu -> blobs %zu\n", nf, n, g_blobs.size()); }
     }
-    void blobFrameEnd()
-    {   // new list/frame: reset the accumulation (the draw happened at the previous list's last command)
-        g_blobs.clear(); g_blobDrawn = false; g_terrainDraws = 0; g_sceneFbp = 0xFFFFFFFFu;
-        g_blobX.clear(); g_blobY.clear(); g_blobZ.clear();
-    }
+    void blobResetParity(uint32_t fbp) { BlobAcc &a = g_acc[accIdx(fbp)]; a.X.clear(); a.Y.clear(); a.Z.clear(); a.drawn = false; a.terrain = 0; }
     void blobEnsureTex()
     {
         if (g_blobTex.id) return;
@@ -6580,17 +6581,20 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         // New published list (game frame) starts here: depth is per-frame state, so reset the
         // once-per-replay depth-clear tracking and force a full FBO rebind (the beginFbp
         // early-return path skips the depth clear when the FBO didn't change).
-        if (groundShadowOn() && g_sceneFbp != 0xFFFFFFFFu && !g_blobDrawn
-            && (ci + 1 == ciEnd || (listBoundsValid && nextListBoundary < listStarts.size() && ci + 1 == listStarts[nextListBoundary])))
-        {   // [groundshadow] v6: last command of this list -> draw the blobs into this frame's scene FBO with a depth test at the
+        if (groundShadowOn() && !m_chunkMode && !m_segMode && ci + 1 == ciEnd)
+        for (int par = 0; par < 2; ++par)
+        {   // only the final (non-chunk, non-segment) drain of the frame: after the DoF/post copies, so nothing repaints over it   // [groundshadow] v6: last command of this list -> draw the blobs into this frame's scene FBO with a depth test at the
+            BlobAcc &acc = g_acc[par];
+            if (acc.drawn || acc.X.size() < 60 || acc.terrain < 200) continue;
+            const uint32_t sceneFbp = par ? 112u : 0u;
             // fighters' feet depth (nudged nearer): the ground (farther) shows it, the bodies (nearer) occlude it, and no later
             // full-frame pass can erase it. Independent of draw ordering, which defeated v1-v5.
-            g_blobDrawn = true;
-            blobCompute();
+            blobCompute(acc);
             if (!g_blobs.empty())
             {
+                acc.drawn = true;
                 blobEnsureTex();
-                const uint32_t sceneKey = viewKey(g_sceneFbp, 0);
+                const uint32_t sceneKey = viewKey(sceneFbp, 0);
                 if (sceneKey != curFbp) { beginFbp(sceneKey); curBlendOn = -1; curBlendEq = -1; curBlendFix = -1; }
                 rlDrawRenderBatchActive();
                 rlSetShader(rlGetShaderIdDefault(), rlGetShaderLocsDefault());
@@ -6600,13 +6604,20 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 const bool dbg = groundShadowMode() == 2;
                 rlSetTexture(dbg ? g_white.id : g_blobTex.id);
                 rlBegin(RL_QUADS);
+                // [gshadowtune] env-tunable without a rebuild: width factor, height/width, alpha, vertical offset (fraction of h
+                // above the feet line), depth nudge factor (>1 = nearer than the contact patch)
+                static const float s_kw = [](){ const char *v = std::getenv("PS2X_GSHADOW_W"); return v && v[0] ? (float)std::atof(v) : 0.9f; }();
+                static const float s_kh = [](){ const char *v = std::getenv("PS2X_GSHADOW_H"); return v && v[0] ? (float)std::atof(v) : 0.28f; }();
+                static const int   s_ka = [](){ const char *v = std::getenv("PS2X_GSHADOW_A"); return v && v[0] ? std::atoi(v) : 150; }();
+                static const float s_kdy = [](){ const char *v = std::getenv("PS2X_GSHADOW_DY"); return v && v[0] ? (float)std::atof(v) : 0.62f; }();
+                static const float s_kz = [](){ const char *v = std::getenv("PS2X_GSHADOW_ZN"); return v && v[0] ? (float)std::atof(v) : 1.003f; }();
                 for (const GsBlob &b : g_blobs)
                 {
-                    const float w = b.w * 1.05f, h = w * 0.34f;
-                    const float x0 = b.cx - w * 0.5f, x1 = b.cx + w * 0.5f, y0 = b.feetY - h * 0.62f, y1 = b.feetY + h * 0.38f;
-                    const float zq = std::min(1.0f, b.feetZ * 1.003f + 0.0005f);   // slightly nearer than the contact patch
-                    { static int nlog = 0; if (nlog++ < 8) std::fprintf(stderr, "[groundshadow] v6 draw cx=%.0f feet=%.0f w=%.0f z=%.4f fbo=%u ci=%zu/%zu\n", b.cx, b.feetY, b.w, zq, g_sceneFbp, ci, ciEnd); }
-                    if (dbg) rlColor4ub(255, 0, 255, 255); else rlColor4ub(0, 0, 0, 110);
+                    const float w = b.w * s_kw, h = w * s_kh;
+                    const float x0 = b.cx - w * 0.5f, x1 = b.cx + w * 0.5f, y0 = b.feetY - h * s_kdy, y1 = y0 + h;
+                    const float zq = std::min(1.0f, b.feetZ * s_kz + 0.0005f);   // slightly nearer than the contact patch
+                    { static int nlog = 0; if (nlog++ < 8) std::fprintf(stderr, "[groundshadow] v8 draw cx=%.0f feet=%.0f w=%.0f z=%.4f fbo=%u ci=%zu/%zu\n", b.cx, b.feetY, b.w, zq, sceneFbp, ci, ciEnd); }
+                    if (dbg) rlColor4ub(255, 0, 255, 255); else rlColor4ub(0, 0, 0, (unsigned char)std::min(255, std::max(0, s_ka)));
                     rlNormal3f(0.0f, 0.0f, 1.0f);
                     rlTexCoord2f(0.0f, 0.0f); if (depthOn) rlVertex3f(x0, y0, -zq); else rlVertex2f(x0, y0);
                     rlTexCoord2f(0.0f, 1.0f); if (depthOn) rlVertex3f(x0, y1, -zq); else rlVertex2f(x0, y1);
@@ -6623,7 +6634,6 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         if (listBoundsValid && nextListBoundary < listStarts.size() && ci == listStarts[nextListBoundary])
         {
             ++nextListBoundary;
-            if (groundShadowOn()) blobFrameEnd();   // [groundshadow]
             if (depthOn && ci != 0)
             {
                 endMode();
@@ -11309,44 +11319,8 @@ if (done.size() < 14 && !done.count(c.texKey))
 
         // Collapse an axis-aligned VRAM-textured triangle-pair into a sprite quad (crisp
         // thin edges). Skip for FBO sources (handled by the generic paths below).
-        if (groundShadowOn() && isTerrainDraw(c)) { ++g_terrainDraws; g_sceneFbp = c.destFbp; }   // [groundshadow] ordering: the early fighter pass precedes the terrain
-        if (groundShadowOn() && (isFighterDraw(c) || (!isTerrainDraw(c) && !c.isTransfer && g_terrainDraws > 200 && c.destFbp == g_sceneFbp)))
-        {   // [groundshadow] first fighter draw of this frame: paint the previous frame's blobs underneath
-            if (!g_blobDrawn && !g_blobs.empty() && g_terrainDraws > 200)
-            {
-                g_blobDrawn = true;
-                blobEnsureTex();
-                rlDrawRenderBatchActive();
-                rlSetShader(rlGetShaderIdDefault(), rlGetShaderLocsDefault());   // plain textured-alpha shader, not the GS emulation shader's current mode
-                rlSetBlendMode(BLEND_ALPHA);
-                glColorMask(1, 1, 1, 0);   // never touch the alpha channel (it carries the mask indices)
-                rlDisableDepthTest(); rlDisableDepthMask();
-                const bool dbg = groundShadowMode() == 2;   // opaque magenta, untextured: does the quad reach the target at all?
-                rlSetTexture(dbg ? g_white.id : g_blobTex.id);
-                rlBegin(RL_QUADS);
-                for (const GsBlob &b : g_blobs)
-                {
-                    const float w = b.w * 1.05f, h = w * 0.34f;
-                    const float x0 = b.cx - w * 0.5f, x1 = b.cx + w * 0.5f, y0 = b.feetY - h * 0.62f, y1 = b.feetY + h * 0.38f;
-                    { static int nlog = 0; if (nlog++ < 12) std::fprintf(stderr, "[groundshadow] draw cx=%.0f feet=%.0f w=%.0f -> (%.0f,%.0f)-(%.0f,%.0f) fbo=%u off=(%.0f,%.0f) depthOn=%d terrain=%d\n", b.cx, b.feetY, b.w, x0, y0, x1, y1, curFbp, offX, offY, (int)depthOn, g_terrainDraws); }
-                    if (dbg) rlColor4ub(255, 0, 255, 255); else rlColor4ub(0, 0, 0, 110);
-                    rlNormal3f(0.0f, 0.0f, 1.0f);
-                    rlTexCoord2f(0.0f, 0.0f); rlVertex2f(x0 + offX, y0 + offY);
-                    rlTexCoord2f(0.0f, 1.0f); rlVertex2f(x0 + offX, y1 + offY);
-                    rlTexCoord2f(1.0f, 1.0f); rlVertex2f(x1 + offX, y1 + offY);
-                    rlTexCoord2f(1.0f, 0.0f); rlVertex2f(x1 + offX, y0 + offY);
-                }
-                rlEnd();
-                rlDrawRenderBatchActive();
-                rlSetTexture(0);
-                if (dbg) { static int dn = 0; if (dn++ < 2) { unsigned char cm[4]; glGetBooleanv(0x0C23u /*GL_COLOR_WRITEMASK*/, cm); int fb = 0; glGetIntegerv(0x8CA6u, &fb); int vp[4]; glGetIntegerv(0x0BA2u, vp); int sb[4]; glGetIntegerv(0x0C10u, sb); std::fprintf(stderr, "[groundshadow] GL after draw: fb=%d viewport=(%d,%d,%d,%d) scissor=(%d,%d,%d,%d) scissorOn=%d colormask=%d%d%d%d blendOn=%d\n", fb, vp[0], vp[1], vp[2], vp[3], sb[0], sb[1], sb[2], sb[3], (int)glIsEnabled(0x0C11u), cm[0], cm[1], cm[2], cm[3], (int)glIsEnabled(0x0BE2u)); char pth[128]; std::snprintf(pth, sizeof pth, "/home/z3/Desktop/bt3/work/gsh_after_%d.ppm", dn); dumpBoundFbo(pth, 512, 448); } }   // [groundshadow] probe
-                rlSetShader(g_shader.id, g_shader.locs);   // back to the GS shader (its uniforms are untouched)
-                if (depthOn) { rlEnableDepthTest(); rlEnableDepthMask(); }
-                curMask = -1; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;   // let the loop re-apply this draw's state
-                depthForCmd(c);
-            }
-            if (isFighterDraw(c)) blobAccumulate(c);
-        }
+        if (groundShadowOn() && isTerrainDraw(c)) { BlobAcc &a = g_acc[accIdx(c.destFbp)]; if (a.drawn) blobResetParity(c.destFbp); ++a.terrain; g_sceneFbp = c.destFbp; }   // a terrain draw after this parity was drawn = its next frame
+        if (groundShadowOn() && isFighterDraw(c)) blobAccumulate(c);   // [groundshadow] v6: accumulate only; the draw happens at the list's last command
         {   // [shadowdecal] PS2X_SHADOWDECAL=0 skips the game's ground-shadow decal pass (floor-tile triangles sampling the
             // 256x256 PSMCT24 view of page 336 with TEXA AEM, vtxA=63, bm 0x44, DATE on). Its source is the mask chain we
             // cannot reproduce yet; under the outline stack it paints the "arrow" blob on the ground (SJ17). Default: skip.
