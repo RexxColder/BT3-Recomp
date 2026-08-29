@@ -1647,6 +1647,7 @@ unsigned long g_wbPixelsWritten = 0;   // [shstat]
 const std::pair<int,int> *g_wbRowRange = nullptr;   // [flushrows] per-row [x0,x1) to write, or null
 int g_wbFlipY = 0;   // [noflip] 1 = px rows are bottom-up (buffer row for VRAM row y is h-1-y)   // [hashmemo] bumped by every VRAM writeback (WBSTAMP is off by default, so m_contentSeq does not see them)
 
+static void wbHudLog(const char *who, uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h, uint32_t base, uint32_t bw);   // [wbhud]
 void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
                                const uint32_t *px, uint32_t fbmsk);
 void ps2xApplyStagedWritebacks()
@@ -1877,6 +1878,7 @@ extern "C" unsigned ps2xVramDiffOutside(uint32_t fbp, uint32_t fbw, uint32_t psm
 void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
                                const uint32_t *px, uint32_t fbmsk)
 {
+    wbHudLog("masked", fbp, fbw, psm, w, h, GSInternal::framePageBaseToBlock(fbp), fbw ? fbw : 1u);
     ++g_ps2xWbGen;   // [hashmemo] any VRAM writeback invalidates memoised range hashes
     { GS *gsc = g_gsWb ? g_gsWb : g_fmvGs; if (gsc) gsc->invalidateClutCache(); }   // [clutwb] a flushed page may hold a rendered palette: force the CLUT cache to re-decode
 
@@ -2006,6 +2008,21 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
     ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u)); gs->bumpPageUploadGen(base, (uint32_t)(((size_t)w * h * 4u) / 256u));   // [clutpagegen]
 }
 
+
+// [wbhud] PS2X_WBHUDLOG=1: BT3's HUD textures live at block 7168 (byte 0x1C0000) = fbp224's base. Log every writeback
+// whose block range overlaps them, so the ordering against the game's HUD re-uploads can be read from the log.
+static void wbHudLog(const char *who, uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h, uint32_t base, uint32_t bw)
+{
+    static const bool s_hl = [](){ const char *v = std::getenv("PS2X_WBHUDLOG"); return v && v[0] && v[0] != '0'; }();
+    if (!s_hl) return;
+    const bool is16 = (psm == GS_PSM_CT16 || psm == GS_PSM_CT16S);
+    const uint32_t end = base + (uint32_t)h * (is16 ? (bw + 1u) / 2u : bw);
+    static unsigned long n = 0, nHit = 0; ++n;
+    const bool hit = (base < 7680u && end > 7168u);
+    if (hit) ++nHit;
+    if ((hit && nHit <= 60) || (n % 2000u) == 0u)
+        std::fprintf(stderr, "[wbhud] #%lu%s %s fbp=%u fbw=%u psm=%u %dx%d blocks [%u,%u) %s HUD pages [7168,7680)\n", n, hit ? " HIT" : "", who, fbp, fbw, psm, w, h, base, end, hit ? "OVERLAPS" : "misses");
+}
 void ps2xWritebackToVram(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h, const uint32_t *px)
 {
     ++g_ps2xWbGen;   // [hashmemo] any VRAM writeback invalidates memoised range hashes
@@ -2015,6 +2032,7 @@ void ps2xWritebackToVram(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
     if (!gs || !px || w <= 0 || h <= 0) return;
     const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
     const uint32_t bw = fbw ? fbw : 1u;
+    wbHudLog("plain", fbp, fbw, psm, w, h, base, bw);
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
             gs->WriteVram(psm, base, bw, (uint32_t)x, (uint32_t)y, (s_wbPack16 && wbIs16(psm)) ? wbPack16(px[(size_t)y * w + x]) : px[(size_t)y * w + x]);
