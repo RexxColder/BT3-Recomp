@@ -256,6 +256,20 @@ namespace
         case 0x21: // lh
             SET_GPR_S32(ctx, rt, (int32_t)(int16_t)READ16(GPR_U32(ctx, rs) + simm));
             return true;
+        case 0x1e: // lq (128-bit, address forced to 16-byte alignment)
+        {
+            const uint32_t addr = (GPR_U32(ctx, rs) + simm) & ~0xFu;
+            const uint64_t lo = READ64(addr), hi = READ64(addr + 8u);
+            if (rt != 0u) ctx->r[rt] = _mm_set_epi64x((int64_t)hi, (int64_t)lo);
+            return true;
+        }
+        case 0x1f: // sq
+        {
+            const uint32_t addr = (GPR_U32(ctx, rs) + simm) & ~0xFu;
+            alignas(16) uint64_t v[2]; _mm_store_si128(reinterpret_cast<__m128i *>(v), ctx->r[rt]);
+            WRITE64(addr, v[0]); WRITE64(addr + 8u, v[1]);
+            return true;
+        }
         case 0x23: // lw
             SET_GPR_S32(ctx, rt, (int32_t)READ32(GPR_U32(ctx, rs) + simm));
             return true;
