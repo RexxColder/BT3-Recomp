@@ -2632,6 +2632,15 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             g_xgkickEntryPc = g_curStartPc;
             g_xgkickTop = m_state.top & 0x3FFu;
             g_xgkickKickAddr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
+            {   // [shadowpass] count kicks + GIF NLOOP while the Pass-1 shadow context is current
+                extern bool g_spInShadow; extern uint32_t g_spKicks, g_spLoops;
+                if (g_spInShadow)
+                {
+                    ++g_spKicks;
+                    const uint32_t ka = g_xgkickKickAddr % dataSize;
+                    if (ka + 8u <= dataSize) { uint64_t tag; std::memcpy(&tag, vuData + ka, 8); g_spLoops += (uint32_t)(tag & 0x7FFFu); }
+                }
+            }
             g_xgkickVuData = vuData;
             g_xgkickVuDataSize = dataSize;
             g_xgkickVuCode = g_curVuCode;

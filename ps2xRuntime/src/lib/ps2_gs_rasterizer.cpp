@@ -4372,13 +4372,17 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             cmd.tri[i].v = tme ? (tv / static_cast<float>(texH)) : 0.0f;
             // PS2X_PERSPQ=1: hand the shader RAW s,t and q instead of the per-vertex quotient,
             // so the divide happens per pixel the way the GS does it.
+            // 2026-08-29 [prmode]: the ground-shadow decal (CT24 read of the Pass-1 silhouette at tbp 10752, DATE,
+            // blend 0x44) is a projective decal -- its s/q,t/q sweep across each floor tile, so the per-vertex
+            // quotient lands only a sliver of the silhouette (228 px vs console's 4649). Mode 5 = that class only,
+            // and it is the DEFAULT when PS2X_PERSPQ is unset; PS2X_PERSPQ=0 disables every per-pixel divide.
             static const bool s_perspQ = [](){ const char *e = std::getenv("PS2X_PERSPQ");
-                                               return e && e[0] && e[0] != '0'; }();
+                                               return !(e && e[0] == '0'); }();
             // Scope: PS2X_PERSPQ=1 applies ONLY to the cel/outline ramp (tbp 15680), which is
             // what needs it. Applied to every FST=0 draw it also re-samples the sky and terrain,
             // whose large quads visibly lose detail. PS2X_PERSPQ=2 = all FST=0 draws (A/B).
             static const int s_perspMode = [](){ const char *e = std::getenv("PS2X_PERSPQ");
-                                                 return e && e[0] ? std::atoi(e) : 0; }();
+                                                 return e && e[0] ? std::atoi(e) : 5; }();
             // 1 = cel ramp only (tbp 15680); 3 = characters + ramp (tbp 10752 is the character
             // texture staging base, tbp 13xxx is terrain/sky and is what visibly degrades);
             // 2 = every FST=0 draw, which is the faithful GS behaviour but exposes bad q on the
@@ -4387,8 +4391,10 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             // for 15680/13440/13672/13840/16064, but tbp10752 does NOT (ours 0.0000..0.3806 vs
             // console -4.0635..2.2991) -- console clips those triangles and we keep them, so a
             // per-pixel divide there uses a q we got wrong and wrecks the sky.
+            const bool shadowDecalClass = ctx.tex0.tbp0 == 10752u && ctx.tex0.psm == 1u && (((ctx.test >> 14) & 1u) != 0u) && ((ctx.alpha & 0xFFu) == 0x44u);
             const bool perspThis = s_perspQ &&
-                (s_perspMode == 4 ? (ctx.tex0.tbp0 != 10752u)
+                (s_perspMode == 5 ? shadowDecalClass
+                 : s_perspMode == 4 ? (ctx.tex0.tbp0 != 10752u)
                  : s_perspMode == 3 ? (ctx.tex0.tbp0 == 10752u || ctx.tex0.tbp0 == 15680u)
                  : s_perspMode == 2 ? true
                  : ctx.tex0.tbp0 == 15680u);
@@ -4632,6 +4638,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                             // texelUV normalization is u = (s/q)*texW / texW = s/q (atlas 0..1)
                             cmd.tri[i].u = vv[i]->s / vv[i]->q;
                             cmd.tri[i].v = vv[i]->t / vv[i]->q;
+                            cmd.tri[i].q = 1.0f;   // [perspq] sub-vertices carry the quotient: no per-pixel divide
                             cmd.tri[i].r = vv[i]->r; cmd.tri[i].g = vv[i]->g; cmd.tri[i].b = vv[i]->b; cmd.tri[i].a = vv[i]->a;
                         }
                         r.recordCmd(cmd);
