@@ -79,7 +79,8 @@ bool g_replayInWindow = false;          // replay main loop: true only inside FR
 bool g_resolveAlphaData = false;        // set by the rasterizer around texture resolves of alpha-as-data draws
 static const char *g_emitPath = "none";   // [emitpath] which emission branch the current command took
 uint32_t g_barReqTbp = 0, g_barReqCbp = 0, g_barReqPsm = 0, g_barReqTbw = 0;
-unsigned long g_ddRtSkip = 0;   // [ddrtdirect 2]   // the draw whose texture resolve raised the barrier
+unsigned long g_ddRtSkip = 0;   // [ddrtdirect 2]
+extern unsigned long g_svcFlushSkip;   // [svcflushseq] defined below   // the draw whose texture resolve raised the barrier
 static bool ps2xOnGlThread()
 {
     const size_t h = std::hash<std::thread::id>{}(std::this_thread::get_id());
@@ -2127,6 +2128,7 @@ unsigned long g_deferPosted = 0, g_deferServed = 0, g_deferGate = 0, g_deferLate
 // so with shared_ptr it pinned every request ever posted -- and since [srcsnap3] a request owns 8 KB per texture page
 // + a 16 KB CLUT snapshot, ~78k posts per fight = tens of GB (the 2026-08-30 out-of-memory). Expired entries are swept.
 static std::unordered_map<uint64_t, std::weak_ptr<TexDecodeReq>> g_deferByKey;
+static std::unordered_map<const TexDecodeReq*, unsigned long> g_postIdx; static unsigned long g_postCounter = 0;   // [svcflushseq] (guarded by m_mtx)
 extern GS *g_gsWb;   // [deferdec] the GS the writeback path uses (set on the first writeback)
 void GsGpuRenderer::postDecode(std::shared_ptr<TexDecodeReq> req)
 {   // [deferdec] guest thread: a placeholder cache entry (w/h set, no texels) so this frame's later
@@ -2140,6 +2142,7 @@ void GsGpuRenderer::postDecode(std::shared_ptr<TexDecodeReq> req)
         if (ct.w <= 0) { ct.w = req->texW; ct.h = req->texH; ct.needsUpload = false; ct.rgba.clear(); }
         g_texLastUse[req->texKey] = g_texUseGen;
         g_deferByKey[req->texKey] = req;   // [ddkey]
+        g_postIdx[req.get()] = ++g_postCounter;   // [svcflushseq] post order, for the flush-skip rule
         if (g_deferByKey.size() > 4096u)     // sweep: drop entries whose request has been serviced and freed
             for (auto it = g_deferByKey.begin(); it != g_deferByKey.end(); ) { if (it->second.expired()) it = g_deferByKey.erase(it); else ++it; }
         auto snap = [&](uint32_t page, uint32_t &lo, std::vector<uint32_t> &seq) {   // [pageskip]
@@ -2230,7 +2233,7 @@ void GsGpuRenderer::postDecode(std::shared_ptr<TexDecodeReq> req)
         if (req->flushClutPage != 0xFFFFFFFFu) g_deferPostSeq[req->flushClutPage] = m_writeSeq;
     }
     ++g_deferPosted;
-    if (g_deferPosted <= 4ul || (g_deferPosted & 1023ul) == 0ul) std::fprintf(stderr, "[deferdec] posted %lu served %lu late %lu pubwait %lu upwait %lu pageskip %lu (key %llx page %u clut %u)\n", g_deferPosted, g_deferServed, g_deferLate, g_deferPubWait, g_deferUploadWait, g_deferPageSkip, (unsigned long long)req->texKey, req->flushPage, req->flushClutPage);
+    if (g_deferPosted <= 4ul || (g_deferPosted & 1023ul) == 0ul) std::fprintf(stderr, "[deferdec] svcskip %lu | posted %lu served %lu late %lu pubwait %lu upwait %lu pageskip %lu (key %llx page %u clut %u)\n", g_svcFlushSkip, g_deferPosted, g_deferServed, g_deferLate, g_deferPubWait, g_deferUploadWait, g_deferPageSkip, (unsigned long long)req->texKey, req->flushPage, req->flushClutPage);
     recordCmd(c);
     flushStage();   // the GL thread must be able to see the command in m_building right away
     static const bool s_ddRig = [](){ const char *v = std::getenv("PS2X_DEFERDEC_RIG"); return v && v[0] && v[0] != '0'; }();
@@ -2289,16 +2292,26 @@ extern "C" uint32_t ps2xDeferCoverFor(uint32_t page)
         for (const char *q = v; *q; ) { char *e = nullptr; long n = std::strtol(q, &e, 10); if (e == q) break; r.insert((uint32_t)n); q = (*e == ',') ? e + 1 : e; }
         return r; }();
     if (s_skip.count(page)) return 0xFFFFFFFFu;
-    std::lock_guard<std::mutex> bk(g_barMx);
-    for (const auto &kv : g_deferPending)
-        if (kv.second > 0 && page >= kv.first && page < kv.first + flushCoverPages(kv.first)) return kv.first;
-    return 0xFFFFFFFFu;
+    return ps2GpuRenderer().flushPending(page) ? page : 0xFFFFFFFFu;   // (a pend-post flushes nothing, so the cover fbp itself is not needed)
 }
 bool GsGpuRenderer::flushPending(uint32_t page)
-{   // [deferpend] [flushcover]
+{   // [deferpend] [flushcover] -- with the barrier's own [dduploadwins] rule: a page the guest UPLOADED after the covering
+    // fbp's last render holds game data, not RT content; sync decodes it from VRAM with no flush, so it is not "pending"
+    // (the 8-bit HUD sheets re-streamed 7x per frame into fbp336's span were thousands of needless posts + snapshots).
+    // PS2X_PENDUPLOADWINS=0 = old (pending whenever a cover flush is queued).
+    static const bool s_puw = [](){ const char *v = std::getenv("PS2X_PENDUPLOADWINS"); return !(v && v[0] == '0'); }();
     std::lock_guard<std::mutex> bk(g_barMx);
-    return flushPendingLocked(page);
+    if (!s_puw || page >= kVramPages) return flushPendingLocked(page);
+    for (const auto &kv : g_deferPending)
+        if (kv.second > 0 && page >= kv.first && page < kv.first + flushCoverPages(kv.first))
+        {
+            if (kv.first < kVramPages && m_pageSeq[page] > m_fbpRenderSeq[kv.first]) { extern unsigned long g_pendUploadWins; ++g_pendUploadWins; return false; }
+            return true;
+        }
+    return false;
 }
+unsigned long g_pendUploadWins = 0;
+unsigned long g_svcFlushSkip = 0;   // [svcflushseq]
 void GsGpuRenderer::waitPendingFlush(uint32_t page)
 {   // [uploadwait] a guest VRAM write (image upload / local copy) into a page whose deferred flush is still
     // queued would be overwritten by that flush (and the decode would read the newer data): wait for the
@@ -2390,7 +2403,7 @@ void GsGpuRenderer::serviceDecodeReq(TexDecodeReq &q)
     // snapshots + the flush MIRRORED into it (g_wbMirror) -- and live VRAM is never touched with old bytes. [srcsnap3]'s
     // write-back into live VRAM had the right semantics but raced the guest's own sync decodes / local copies (white gi,
     // missing panels, black frames live).
-    static const bool s_mir = [](){ const char *v = std::getenv("PS2X_DDMIRROR"); return v && v[0] && v[0] != '0'; }();   // opt-in: same garble as srcsnap3, and the per-service copy costs 26 -> 19 fps
+    static const bool s_mir = [](){ const char *v = std::getenv("PS2X_DDMIRROR"); return !(v && v[0] == '0'); }();   // default ON since 2026-08-30 21:00: free at 40k posts, and the only path that gives "post-time snapshot + this flush's rows" (scene alpha, CT16 view)
     static std::vector<uint8_t> s_scratch;
     extern uint8_t *g_wbMirror;
     if (s_mir && g_gsWb)
@@ -2448,17 +2461,41 @@ void GsGpuRenderer::serviceDecodeReq(TexDecodeReq &q)
     auto releasePending = [&](uint32_t pg) {   // [deferpend] v1 order (the best-measured state): release right after the flush
         std::lock_guard<std::mutex> bk(g_barMx);
         auto it = g_deferPending.find(pg); if (it != g_deferPending.end() && --it->second <= 0) g_deferPending.erase(it); };
+    // [svcflushseq] PS2X_SVCFLUSHSEQ=0 = old: a service flushed its fbp on EVERY post (~13 FBO readbacks per frame, 25 ms of
+    // glReadPixels on the GL thread) even when nothing had been rendered into it since the previous service. Same rule as
+    // the end-of-frame loop: skip when the fbp's render seq is unchanged since the last service flush (and that flush
+    // wrote alpha if this read wants it). VRAM already holds this render's content.
+    static const bool s_sfs = [](){ const char *v = std::getenv("PS2X_SVCFLUSHSEQ"); return !(v && v[0] == '0'); }();
+    struct LastSvc { uint32_t seq = 0; bool alpha = false; unsigned long postedAt = 0; };
+    static std::unordered_map<uint64_t, LastSvc> s_lastSvc;   // (fbp, flush VIEW) -> last service flush: render seq, alpha written, posts so far
+    extern unsigned long g_svcFlushSkip;
+    unsigned long myPost = 0;
+    { std::lock_guard<std::mutex> lk(m_mtx); auto pi = g_postIdx.find(&q); if (pi != g_postIdx.end()) { myPost = pi->second; g_postIdx.erase(pi); } }
+    // The key includes the flush's VIEW (psm/fbw from the request's [fmtsnap]): fbp336 is flushed both as CT32 256x448 and as
+    // a CT16 512x448 re-view, which write different bytes -- one must never stand in for the other.
+    auto svcFlush = [&](uint32_t fbp, bool alpha) {
+        const uint32_t vpsm = q.fmtValid ? q.fmtPsm : 0xFFu, vfbw = q.fmtValid ? q.fmtFbw : 0xFFu;
+        const uint64_t key = (uint64_t)fbp | ((uint64_t)vpsm << 32) | ((uint64_t)vfbw << 48);
+        if (s_sfs && fbp < kVramPages)
+        {
+            auto it = s_lastSvc.find(key);
+            // skip only if that flush happened BEFORE this request was posted (its snapshot already holds the rows)
+            if (it != s_lastSvc.end() && it->second.seq == m_fbpRenderSeq[fbp] && (it->second.alpha || !alpha) && myPost > it->second.postedAt) { ++g_svcFlushSkip; return; }
+        }
+        m_flushAlphaNow = alpha;
+        flushPageToVram(fbp);
+        m_flushAlphaNow = false;
+        if (fbp < kVramPages) { auto &e = s_lastSvc[key]; const bool same = (e.seq == m_fbpRenderSeq[fbp]); e.seq = m_fbpRenderSeq[fbp]; e.alpha = alpha || (same && e.alpha); e.postedAt = g_postCounter; }
+    };
     if (q.flushPage != 0xFFFFFFFFu)
     {
-        m_flushAlphaNow = q.flushAlpha;
-        flushPageToVram(q.flushPage);
-        m_flushAlphaNow = false;
+        svcFlush(q.flushPage, q.flushAlpha);
         g_barFlushed.insert(q.flushPage);
         releasePending(q.flushPage);
     }
     if (q.flushClutPage != 0xFFFFFFFFu && q.flushClutPage != q.flushPage)
     {
-        flushPageToVram(q.flushClutPage);
+        svcFlush(q.flushClutPage, false);
         g_barFlushed.insert(q.flushClutPage);
         releasePending(q.flushClutPage);
     }
