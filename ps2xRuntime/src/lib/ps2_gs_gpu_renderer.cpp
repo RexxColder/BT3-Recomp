@@ -2467,8 +2467,13 @@ void GsGpuRenderer::serviceDecodeReq(TexDecodeReq &q)
                 copyPages(q.pageLo, q.pageHi);
                 if (q.flushClutPage != 0xFFFFFFFFu) copyPages(q.flushClutPage, q.flushClutPage + 1u);
                 { const uint32_t cp = (uint32_t)(q.tex0.cbp / 32u); copyPages(cp, cp + 1u); }
-                if (q.clutSnapPage != 0xFFFFFFFFu && q.clutSnap.size() == 16384u && (size_t)q.clutSnapPage * 8192u + 16384u <= vsz)
-                    std::memcpy(s_scratch.data() + (size_t)q.clutSnapPage * 8192u, q.clutSnap.data(), 16384u);   // [clutsnap] palette of the READ, not of now
+                // [clutsnap] palette of the READ, not of now -- unless the palette is RT-PRODUCED (its page lies in a real FBO
+                // cover, BT3: the outline CLUTs at 499-500 rendered by the game): then the post-time bytes are pre-flush and
+                // the flushed live page (copied above) is the read's view. PS2X_CLUTRT=0 = always overlay.
+                static const bool s_crt = [](){ const char *v = std::getenv("PS2X_CLUTRT"); return !(v && v[0] == '0'); }();
+                const bool clutRt = s_crt && q.flushClutPage != 0xFFFFFFFFu && q.flushClutPage != q.clutSnapPage && g_fbpFmt.find(q.flushClutPage) != g_fbpFmt.end();
+                if (!clutRt && q.clutSnapPage != 0xFFFFFFFFu && q.clutSnap.size() == 16384u && (size_t)q.clutSnapPage * 8192u + 16384u <= vsz)
+                    std::memcpy(s_scratch.data() + (size_t)q.clutSnapPage * 8192u, q.clutSnap.data(), 16384u);
                 for (size_t si = 0; si < q.srcSnap.size(); ++si)   // [srcsnap] upload-fed source pages as they were at the READ
                 {   // [srcsnap2] only where the guest wrote the page AFTER the post; otherwise live VRAM (in-order flushes) is the read's view
                     const auto &sp = q.srcSnap[si];
@@ -2675,7 +2680,13 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
                 std::fprintf(stderr, "[pt] %lu READ page=%u tbp=%u cbp=%u psm=%u tbw=%u dirtyB=%d pend=%d dirty=%d alpha=%d defer=%d seq=%u\n", g_ptN, page, g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw, (int)dirtyBefore, (int)pend, (int)dirty, (int)wantsAlphaAsData, (int)(deferOut != nullptr), m_writeSeq); }
             if (!dirty && !(wantsAlphaAsData && (s_barAlwaysAEnv || g_barAlphaStale.count(page)))) return;
             g_barDirty.erase(page);
-            if (deferOut && ddPageAllowed(page))
+            // [ddrtdirect] PS2X_DDRTDIRECT (default on, =0 off): a NON-INDEXED read (CT32/24/16) of a page that is itself an
+            // FBO-backed frame buffer is served by the draw path straight from the FBO texture in the sync build (its
+            // decode is a dummy: fbp368's 128x128 timer plate hashes to one empty texture 3736x). Deferring it makes the
+            // draw use the deferred decode instead of the live FBO -> the plate goes missing. Keep such reads synchronous.
+            static const bool s_rtd = [](){ const char *v = std::getenv("PS2X_DDRTDIRECT"); return !(v && v[0] == '0'); }();
+            const bool rtDirect = s_rtd && (g_barReqPsm == 0u || g_barReqPsm == 1u || g_barReqPsm == 2u || g_barReqPsm == 10u) && g_fbpFmt.find(page) != g_fbpFmt.end();
+            if (deferOut && !rtDirect && ddPageAllowed(page))
             {   // [deferdec] caller posts a decode command instead of waiting -- but only when the page has
                 // NEW draws since the last post: a pending-only page is already covered by the queued decode
                 // (same stale-VRAM key), and re-posting fed back into itself (32M posts in a minute, DD1W).
