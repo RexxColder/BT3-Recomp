@@ -85,6 +85,10 @@ int g_recordAliasKind = 0;   // [gpualias] set around recordSpriteGPU for a CT16
 static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c);   // [gpualias] mode>=4: run the f336 chain GPU-side (defined before recordCmd)
 static bool g_gaViewReady = false;   // [gpualias] the view texture holds chain output
 static int g_gaCur = 0;              // [gpualias] ping-pong index
+static RenderTexture2D g_gaViewTex[2];         // [gpualias] ping-pong CT16 view of the chain output
+uint32_t g_gaClutData[256];                    // [gpualias] SW-chain palette snapshot (guest writes)
+std::atomic<unsigned> g_gaClutSeq{0};
+static unsigned long g_gaExecCount = 0;       // [gpualias] chain passes executed (staleness tracking)
 std::atomic<uint64_t> g_guestBusyNs{0}, g_guestBusyFrames{0};   // [guestbusy] file scope: read by ps2_runtime.cpp
 extern unsigned long g_svcFlushSkip;   // [svcflushseq] defined below
 extern unsigned long g_linFetch, g_linMiss, g_linRefresh;   // [linvram] defined below
@@ -1979,6 +1983,25 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
             { static unsigned long n = 0; if ((++n % 2000ul) == 0ul) std::fprintf(stderr, "[linvram] fetch %lu miss %lu pageRefresh %lu\n", g_linFetch, g_linMiss, g_linRefresh); }
         }
         else ps2xWritebackToVramMasked(fbp, fit->second.fbw, fit->second.psm, w, h, px.data(), wbMask);
+        {   // [gpualias] mode>=4: a CT16 reader of the edge-map region triggered this flush, but
+            // the chain renders in the executor now, not the FBO -- the bytes above are DoF/scene
+            // content in the wrong view (the striped-scene artifact). Overwrite the CT16 window
+            // with the executor's view so every VRAM consumer decodes the true chain output.
+            static const int s_gaWb = [](){ const char *v = std::getenv("PS2X_GPUALIAS"); return v && v[0] ? std::atoi(v) : 0; }();
+            if (s_gaWb >= 4 && fbp == 336u && g_gaViewReady && g_barReqPsm == 0x02u &&
+                g_gaViewTex[g_gaCur].texture.id != 0)
+            {
+                rlDrawRenderBatchActive();
+                Image vi = LoadImageFromTexture(g_gaViewTex[g_gaCur].texture);
+                if (vi.data)
+                {
+                    ps2xWritebackToVramMasked(336u, 8u, 0x02u, 512, 448, (const uint32_t *)vi.data, 0u);
+                    UnloadImage(vi);
+                    static int n = 0;
+                    if (n++ < 4) std::fprintf(stderr, "[gpualias] view->VRAM writeback (CT16-reader flush of f336)\n");
+                }
+            }
+        }
     }
     { extern int g_wbFlipY; g_wbFlipY = 0; }
       g_flWrite += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count(); }
@@ -3745,11 +3768,10 @@ void GsGpuRenderer::flushStage()
 // P8H texel (u,v) = the ALPHA byte of f224's FBO at (u,v) (T8H page = CT32 page).
 extern "C" void glDisable(unsigned int cap);
 extern "C" void glDepthMask(unsigned char flag);
-static RenderTexture2D g_gaViewTex[2];
 static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
 {
     static Shader sh{}; static bool init = false, bad = false;
-    static int locStage=-1, locM16=-1, locXOff=-1, locSrcFlip=-1, locSrcH=-1, locRect=-1, locSrcA=-1, locPal=-1, locDbg=-1;
+    static int locStage=-1, locM16=-1, locXOff=-1, locSrcFlip=-1, locSrcH=-1, locRect=-1, locSrcA=-1, locPal=-1, locDbg=-1, locIdxScl=-1;
     if (bad) return false;
     if (!init)
     {
@@ -3770,6 +3792,7 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
             "uniform int uXOff;\n"
             "uniform int uSrcFlip;\n"
             "uniform int uSrcH;\n"
+            "uniform float uIdxScl;\n"   // 128 when the FBO alpha stores GS bytes rescaled x255/128, else 255
             "uniform ivec4 uRect;\n"
             "uniform int uDbg;\n"
             "out vec4 finalColor;\n"
@@ -3782,7 +3805,7 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
             "  ivec4 S = ivec4(0);\n"
             "  if (uStage != 0) {\n"
             "    ivec2 suv = ivec2(xy.x + uXOff, (uSrcFlip == 1) ? (uSrcH - 1 - xy.y) : xy.y);\n"
-            "    int idx = int(texelFetch(uSrcA, suv, 0).a * 255.0 + 0.5);\n"
+            "    int idx = int(texelFetch(uSrcA, suv, 0).a * uIdxScl + 0.5);\n"
             "    ivec4 C = ivec4(texelFetch(uPal, ivec2(idx, 0), 0) * 255.0 + 0.5);\n"
             "    if (uDbg == 2) { finalColor = vec4(vec3(float(idx) / 255.0), 1.0); return; }\n"
             "    if (uDbg == 3) { finalColor = vec4(vec3(C.rgb) / 255.0, float(C.a) / 255.0); return; }\n"
@@ -3804,6 +3827,7 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
         locSrcH = GetShaderLocation(sh, "uSrcH"); locRect = GetShaderLocation(sh, "uRect");
         locSrcA = GetShaderLocation(sh, "uSrcA"); locPal = GetShaderLocation(sh, "uPal");
         locDbg = GetShaderLocation(sh, "uDbg");
+        locIdxScl = GetShaderLocation(sh, "uIdxScl");
         g_gaViewTex[0] = LoadRenderTexture(512, 448); g_gaViewTex[1] = LoadRenderTexture(512, 448);
         if (g_gaViewTex[0].id == 0 || g_gaViewTex[1].id == 0) { bad = true; return false; }
         SetTextureFilter(g_gaViewTex[0].texture, TEXTURE_FILTER_POINT);
@@ -3823,7 +3847,28 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
         auto sit = g_fbos.find(224u);
         if (sit == g_fbos.end() || sit->second.rt.texture.id == 0) return false;
         srcA = sit->second.rt.texture; srcH = sit->second.h;
-        pal = palTextureFor(c.srcClutKey);
+        {   // The SW chain's OWN palette (snapshotted at record time). palTextureFor's published
+            // palette disagreed above index 15: only ~28% of the ink survived and the outer band
+            // of the mask sprouted scribbles.
+            static Texture2D gaPal{}; static unsigned haveSeq = 0;
+            const unsigned seq = g_gaClutSeq.load();
+            if (seq != 0 && (gaPal.id == 0 || seq != haveSeq))
+            {
+                haveSeq = seq;
+                if (gaPal.id == 0)
+                {
+                    Image im{}; im.data = g_gaClutData; im.width = 256; im.height = 1; im.mipmaps = 1;
+                    im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                    gaPal = LoadTextureFromImage(im);   // uploads a copy; do NOT UnloadImage (borrowed data)
+                    SetTextureFilter(gaPal, TEXTURE_FILTER_POINT);
+                }
+                else UpdateTexture(gaPal, g_gaClutData);
+                static int n = 0;
+                if (n++ < 2) std::fprintf(stderr, "[gpualias] SW palette seq %u: [0]=%08x [1]=%08x [3]=%08x [16]=%08x [64]=%08x [128]=%08x [255]=%08x\n",
+                                          seq, g_gaClutData[0], g_gaClutData[1], g_gaClutData[3], g_gaClutData[16], g_gaClutData[64], g_gaClutData[128], g_gaClutData[255]);
+            }
+            pal = (gaPal.id != 0) ? gaPal : palTextureFor(c.srcClutKey);
+        }
         if (pal.id == 0) { static int n=0; if (n++<4) std::fprintf(stderr, "[gpualias] exec: no palette for key %llx\n", (unsigned long long)c.srcClutKey); return false; }
     }
     static const int s_flip = [](){ const char *v = std::getenv("PS2X_GPUALIAS_FLIP"); return v && v[0] ? std::atoi(v) : 1; }();
@@ -3845,6 +3890,13 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
     SetShaderValue(sh, locSrcH, &srcH, SHADER_UNIFORM_INT);
     SetShaderValue(sh, locRect, rect, SHADER_UNIFORM_IVEC4);
     SetShaderValue(sh, locDbg, &s_dbg, SHADER_UNIFORM_INT);
+    {   // The mask page's FBO alpha stores GS bytes RESCALED x255/128 when the ALPHA128 pipeline
+        // wrote it (sampled indices came back 1,5,9,13 = floor(gsByte*255/128) of 1,3,5,7).
+        // Undo the rescale exactly the way the main shader's uIdxScale logic does.
+        extern bool g_fbpAlphaIsGsByte[512];
+        const float scl = (224u < 512u && g_fbpAlphaIsGsByte[224]) ? 255.0f : 128.0f;
+        SetShaderValue(sh, locIdxScl, &scl, SHADER_UNIFORM_FLOAT);
+    }
     if (stage != 0)
     {   // SetShaderValueTexture leaves the sampler at unit 0 (= texture0) in this stack -- see the
         // [idxpal] block below. Bind explicit high units (above raylib's 0..4) and point the
@@ -3885,7 +3937,7 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
     EndBlendMode();
     EndTextureMode();
     glDepthMask(1); glEnable(0x0B71u); glEnable(0x0C11u);   // restore loop expectations
-    g_gaCur = dst; g_gaViewReady = true;
+    g_gaCur = dst; g_gaViewReady = true; ++g_gaExecCount;
     {   // PS2X_GPUALIAS_DUMPSTAGE=1: export the view at each stage boundary, once per stage kind
         static const bool s_ds = [](){ const char *v = std::getenv("PS2X_GPUALIAS_DUMPSTAGE"); return v && v[0] && v[0] != '0'; }();
         static int lastStage = -1; static bool done[4] = {false,false,false,false};
@@ -4562,6 +4614,12 @@ void GsGpuRenderer::swapFrame()
         if (s_bs && (g_bsCount || (++fr % 60) == 0))
         {
             std::fprintf(stderr, "[barstat] frame: %d barriers, render %.1f ms, flush %.1f ms (gpufinish %.1f, readback %.1f, vramwrite %.1f) | cmds drawn %ld | pages:", g_bsCount, g_bsRender, g_bsFlush, g_bsFinish, g_bsReadback, g_bsWrite, g_bsCmds);
+            {   // [gpualias] staleness: no chain execs for 2 consecutive frames (menus, non-fight
+                // scenes) -> stop serving the view (flip + VRAM writeback) until it runs again.
+                static unsigned long lastExec = 0; static int idle = 0;
+                if (g_gaExecCount == lastExec) { if (++idle >= 2) g_gaViewReady = false; }
+                else { idle = 0; lastExec = g_gaExecCount; }
+            }
             { extern double g_bbPickup, g_bbRender, g_bbFlush, g_bbTotal; extern int g_bbN;
               { extern unsigned long g_preChunks, g_preCmds; std::fprintf(stderr, "[bbstat] blocking barriers %d: pickup %.1f  render %.1f  flush %.1f  resume %.1f  (guest-side total %.1f ms) | prerendered %lu chunks / %lu cmds\n", g_bbN, g_bbPickup, g_bbRender, g_bbFlush, g_bbTotal - g_bbPickup - g_bbRender - g_bbFlush, g_bbTotal, g_preChunks, g_preCmds); g_preChunks = g_preCmds = 0; }
               { extern std::map<uint32_t, int> g_bbByPage; std::string bp; int shown = 0;
