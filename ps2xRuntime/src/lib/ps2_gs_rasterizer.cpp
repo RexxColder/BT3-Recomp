@@ -3707,7 +3707,8 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 // texture (renderer-side flip) -- the VRAM this barrier would flush+decode is
                 // never consumed for those draws, so skip the whole flush/readback round-trip.
                 static const int s_ga4 = [](){ const char *v = std::getenv("PS2X_GPUALIAS"); return v && v[0] ? std::atoi(v) : 0; }();
-                const bool gaServed = s_ga4 >= 4 && tex.tbp0 == 10752u && (tex.psm == 0x02u || tex.psm == 0x0Au)
+                static const bool s_noskip = [](){ const char *v = std::getenv("PS2X_GPUALIAS_NOSKIP"); return v && v[0] && v[0] != '0'; }();   // A/B: keep the flush (its VRAM bytes feed OTHER readers)
+                const bool gaServed = !s_noskip && s_ga4 >= 4 && tex.tbp0 == 10752u && (tex.psm == 0x02u || tex.psm == 0x0Au)
                     // ink-composite signature ONLY (must mirror the renderer flip): other CT16
                     // readers of page 336 (HUD composite, menus) still need the VRAM round-trip.
                     && gs->m_texa.aem && gs->m_texa.ta1 == 0u

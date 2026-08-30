@@ -83,9 +83,19 @@ uint32_t g_barReqTbp = 0, g_barReqCbp = 0, g_barReqPsm = 0, g_barReqTbw = 0;
 unsigned long g_ddRtSkip = 0;   // [ddrtdirect 2]
 int g_recordAliasKind = 0;   // [gpualias] set around recordSpriteGPU for a CT16-view alias pass
 static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c);   // [gpualias] mode>=4: run the f336 chain GPU-side (defined before recordCmd)
-static bool gaBuildReviewTex(const Texture2D &src, int srcH);   // [gpualias] mode 4: CT16 re-view of the f336 FBO (control-equivalent serving)
+static bool gaBuildReviewTex(const Texture2D &src, int srcH, int ta0, int ta1, int aem);   // [gpualias] mode 4: CT16 re-view + decode-exact TEXA alpha, per serving class
 static bool g_gaViewReady = false;   // [gpualias] the view texture holds chain output
 static int g_gaCur = 0;              // [gpualias] ping-pong index
+extern "C" void glUseProgram(unsigned int program);
+extern "C" unsigned int glGetError(void);
+extern "C" void glGenVertexArrays(int n, unsigned int *arrays);
+extern "C" void glBindVertexArray(unsigned int array);
+extern "C" void glDrawArrays(unsigned int mode, int first, int count);
+extern "C" void glDrawBuffer(unsigned int buf);
+extern "C" void glTexParameteri(unsigned int target, unsigned int pname, int param);
+extern "C" void glGetTexParameteriv(unsigned int target, unsigned int pname, int *params);
+extern "C" void glUniform1i(int location, int v0);
+extern "C" void glViewport(int x, int y, int w, int h);
 static RenderTexture2D g_gaViewTex[2];         // [gpualias] ping-pong CT16 view of the chain output
 uint32_t g_gaClutData[256];                    // [gpualias] SW-chain palette snapshot (guest writes)
 std::atomic<unsigned> g_gaClutSeq{0};
@@ -3965,7 +3975,10 @@ static bool gaExecShaderInit()
             "    ivec2 t = ivec2(xy.x, (uSrcFlip == 1) ? (uSrcH - 1 - xy.y) : xy.y);\n"   // identity, not a byte shuffle
             "    ivec4 F = ivec4(texelFetch(uSrcA, t, 0) * 255.0 + 0.5);\n"
             "    int h = (F.r >> 3) | ((F.g >> 3) << 5) | ((F.b >> 3) << 10) | ((F.a >> 7) << 15);\n"
-            "    finalColor = vec4(float((h & 31) << 3), float(((h >> 5) & 31) << 3), float(((h >> 10) & 31) << 3), float(((h >> 15) & 1) << 7)) / 255.0;\n"
+            "    int ta0 = uM16 & 255; int ta1 = (uM16 >> 8) & 255; int aem = (uM16 >> 16) & 1;\n"
+            "    int a8 = (aem == 1 && (h & 0x7FFF) == 0) ? 0 : (((h >> 15) == 1) ? ta1 : ta0);\n"
+            "    a8 = min((a8 * 255) / 128, 255);\n"   // ALPHA128 upload rescale, same as the decode path (0x30 -> 95)
+            "    finalColor = vec4(float((h & 31) << 3), float(((h >> 5) & 31) << 3), float(((h >> 10) & 31) << 3), float(a8)) / 255.0;\n"
             "    return;\n"
             "  }\n"
             "  vec4 pv = texelFetch(texture0, xy, 0);\n"
@@ -4012,38 +4025,135 @@ static bool gaExecShaderInit()
 // texture. Control's consumers decode VRAM = flush(FBO)-reinterpreted-as-CT16; this shader is
 // that reinterpretation done GPU-side, so serving it is control-equivalent BY CONSTRUCTION
 // while the barrier/flush/decode round-trip is skipped. Reuses the alias shader (uStage 9).
-static bool gaBuildReviewTex(const Texture2D &src, int srcH)
+static bool gaBuildReviewTex(const Texture2D &src, int srcH, int ta0, int ta1, int aem)
 {
-    if (!gaExecShaderReady()) return false;
-    Shader sh = gaExecShader();
-    rlDrawRenderBatchActive();
-    const int dst = 1 - g_gaCur;
-    BeginTextureMode(g_gaViewTex[dst]);
-    glColorMask(1, 1, 1, 1); glDisable(0x0B71u); glDepthMask(0); glDisable(0x0C11u);
-    rlSetBlendFactors(1, 0, 0x8006);
-    BeginBlendMode(BLEND_CUSTOM);
-    BeginShaderMode(sh);
-    int stage = 9; SetShaderValue(sh, gaLocStage(), &stage, SHADER_UNIFORM_INT);
-    {   // the FBO's ACTUAL page layout: width in CT32 pages (64px each)
-        int fpw = src.width / 64; if (fpw < 1) fpw = 1;
-        SetShaderValue(sh, g_gaLoc[2] /*uXOff*/, &fpw, SHADER_UNIFORM_INT);
-        static int n = 0;
-        if (n++ < 4) std::fprintf(stderr, "[gpualias] review build: f336 FBO %dx%d (%d pages/row) srcH=%d\n", src.width, src.height, fpw, srcH);
+    // RAW-GL pass: the raylib BeginTextureMode/BeginShaderMode version mutated rlgl's cached
+    // state (matrices, blend, current shader) 96x/frame mid-loop, and the neighboring draws --
+    // including the rim/shading passes -- rendered wrong (the missing-outline saga). This
+    // version touches ONLY raw GL, saves and restores every piece it changes, and draws via
+    // rlLoadDrawQuad with a no-matrix program. rlgl never knows it happened.
+    static unsigned int prog = 0; static int locSrc = -1, locH = -1, locFlip = -1, locTexa = -1, locDbgC = -1;
+    static bool bad = false;
+    if (bad) return false;
+    if (prog == 0)
+    {
+        static const char *vs =
+            "#version 330\n"   // vertex-less fullscreen triangle: no attributes, no VBO
+            "void main(){ vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+            "             gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+        static const char *fs =
+            "#version 330\n"
+            "uniform sampler2D uSrc;\n"
+            "uniform int uH;\n"
+            "uniform int uFlip;\n"
+            "uniform int uTexa;\n"   // ta0 | ta1<<8 | aem<<16
+            "uniform int uDbgC;\n"
+            "out vec4 finalColor;\n"
+            "void main(){\n"
+            "  if (uDbgC == 1) { finalColor = vec4(1.0, 0.0, 1.0, 1.0); return; }\n"
+            "  if (uDbgC == 2) { finalColor = texelFetch(uSrc, ivec2(gl_FragCoord.xy), 0); return; }\n"
+            "  if (uDbgC == 3) { finalColor = vec4(float(uH) / 1024.0, float(uFlip), float(uTexa & 255) / 255.0, 1.0); return; }\n"
+            "  ivec2 xy = ivec2(gl_FragCoord.xy);\n"
+            "  ivec2 t = ivec2(xy.x, (uFlip == 1) ? (uH - 1 - xy.y) : xy.y);\n"
+            "  ivec4 F = ivec4(texelFetch(uSrc, t, 0) * 255.0 + 0.5);\n"
+            "  int h = (F.r >> 3) | ((F.g >> 3) << 5) | ((F.b >> 3) << 10) | ((F.a >> 7) << 15);\n"
+            "  int ta0 = uTexa & 255; int ta1 = (uTexa >> 8) & 255; int aem = (uTexa >> 16) & 1;\n"
+            "  int a8 = (aem == 1 && (h & 0x7FFF) == 0) ? 0 : (((h >> 15) == 1) ? ta1 : ta0);\n"
+            "  a8 = min((a8 * 255) / 128, 255);\n"
+            "  finalColor = vec4(float((h & 31) << 3), float(((h >> 5) & 31) << 3), float(((h >> 10) & 31) << 3), float(a8)) / 255.0;\n"
+            "}\n";
+        Shader sh2 = LoadShaderFromMemory(vs, fs);   // init-time rlgl use is harmless
+        if (sh2.id == 0) { bad = true; std::fprintf(stderr, "[gpualias] raw review shader FAILED\n"); return false; }
+        prog = sh2.id;
+        locSrc = GetShaderLocation(sh2, "uSrc"); locH = GetShaderLocation(sh2, "uH");
+        locFlip = GetShaderLocation(sh2, "uFlip"); locTexa = GetShaderLocation(sh2, "uTexa");
+        locDbgC = GetShaderLocation(sh2, "uDbgC");
+        if (g_gaViewTex[0].id == 0)
+        {
+            g_gaViewTex[0] = LoadRenderTexture(512, 448); g_gaViewTex[1] = LoadRenderTexture(512, 448);
+            if (g_gaViewTex[0].id == 0 || g_gaViewTex[1].id == 0) { bad = true; return false; }
+            SetTextureFilter(g_gaViewTex[0].texture, TEXTURE_FILTER_POINT);
+            SetTextureFilter(g_gaViewTex[1].texture, TEXTURE_FILTER_POINT);
+        }
+        std::fprintf(stderr, "[gpualias] raw review builder ready (prog %u)\n", prog);
     }
-    static const int s_flip = [](){ const char *v = std::getenv("PS2X_GPUALIAS_FLIP"); return v && v[0] ? std::atoi(v) : 1; }();
-    int flip = s_flip; SetShaderValue(sh, gaLocSrcFlip(), &flip, SHADER_UNIFORM_INT);
-    SetShaderValue(sh, gaLocSrcH(), &srcH, SHADER_UNIFORM_INT);
-    const int rect[4] = { 0, 0, 512, 448 };
-    SetShaderValue(sh, gaLocRect(), rect, SHADER_UNIFORM_IVEC4);
-    static const int kSrcUnit = 9;
-    glActiveTexture(0x84C0u + kSrcUnit); glBindTexture(0x0DE1u, src.id); glActiveTexture(0x84C0u);
-    SetShaderValue(sh, gaLocSrcA(), &kSrcUnit, SHADER_UNIFORM_INT);
-    DrawTexturePro(g_gaViewTex[g_gaCur].texture, Rectangle{0.0f, 0.0f, 512.0f, 448.0f},
-                   Rectangle{0.0f, 0.0f, 512.0f, 448.0f}, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-    EndShaderMode();
-    EndBlendMode();
-    EndTextureMode();
-    glDepthMask(1); glEnable(0x0B71u); glEnable(0x0C11u);
+    rlDrawRenderBatchActive();   // flush rlgl's pending batch BEFORE touching raw state
+    // ---- save every piece of GL state this pass changes ----
+    int prevProg = 0, prevFbo = 0, prevVp[4] = {0,0,0,0}, prevActive = 0, prevTex0 = 0;
+    unsigned char prevCM[4] = {1,1,1,1};
+    glGetIntegerv(0x8B8D /*GL_CURRENT_PROGRAM*/, &prevProg);
+    glGetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &prevFbo);
+    glGetIntegerv(0x0BA2 /*GL_VIEWPORT*/, prevVp);
+    glGetIntegerv(0x84E0 /*GL_ACTIVE_TEXTURE*/, &prevActive);
+    const bool hadBlend = glIsEnabled(0x0BE2 /*GL_BLEND*/) != 0;
+    const bool hadDepth = glIsEnabled(0x0B71 /*GL_DEPTH_TEST*/) != 0;
+    const bool hadScis  = glIsEnabled(0x0C11 /*GL_SCISSOR_TEST*/) != 0;
+    const bool hadCull  = glIsEnabled(0x0B44 /*GL_CULL_FACE*/) != 0;
+    const bool hadSten  = glIsEnabled(0x0B90 /*GL_STENCIL_TEST*/) != 0;
+    bool hadClip[4]; for (int ci2 = 0; ci2 < 4; ++ci2) hadClip[ci2] = glIsEnabled(0x3000u + ci2 /*GL_CLIP_DISTANCE*/) != 0;
+    unsigned char hadDepthMask = 1; glGetBooleanv(0x0B72 /*GL_DEPTH_WRITEMASK*/, &hadDepthMask);
+    glGetBooleanv(0x0C23 /*GL_COLOR_WRITEMASK*/, prevCM);
+    glActiveTexture(0x84C0u);
+    glGetIntegerv(0x8069 /*GL_TEXTURE_BINDING_2D*/, &prevTex0);
+    int prevVao = 0; glGetIntegerv(0x85B5 /*GL_VERTEX_ARRAY_BINDING*/, &prevVao);
+    static unsigned int myVao = 0;
+    if (myVao == 0) glGenVertexArrays(1, &myVao);
+    // ---- the pass ----
+    const int dst = 1 - g_gaCur;
+    glBindFramebuffer(0x8D40u /*GL_FRAMEBUFFER*/, g_gaViewTex[dst].id);
+    glViewport(0, 0, 512, 448);
+    glDisable(0x0BE2u); glDisable(0x0B71u); glDisable(0x0C11u); glDisable(0x0B44u /*GL_CULL_FACE*/);
+    for (int ci2 = 0; ci2 < 4; ++ci2) if (hadClip[ci2]) glDisable(0x3000u + ci2);
+    if (hadSten) glDisable(0x0B90u);
+    glDepthMask(0); glColorMask(1, 1, 1, 1);
+    glBindTexture(0x0DE1u, src.id);
+    int prevMin = 0, prevMag = 0;
+    glGetTexParameteriv(0x0DE1u, 0x2801 /*GL_TEXTURE_MIN_FILTER*/, &prevMin);
+    glGetTexParameteriv(0x0DE1u, 0x2800 /*GL_TEXTURE_MAG_FILTER*/, &prevMag);
+    glTexParameteri(0x0DE1u, 0x2801, 0x2600 /*GL_NEAREST*/);
+    glTexParameteri(0x0DE1u, 0x2800, 0x2600);
+    glDrawBuffer(0x8CE0u /*GL_COLOR_ATTACHMENT0*/);
+    glUseProgram(prog);
+    glUniform1i(locSrc, 0); glUniform1i(locH, srcH); glUniform1i(locFlip, 1);
+    glUniform1i(locTexa, (ta0 & 255) | ((ta1 & 255) << 8) | ((aem & 1) << 16));
+    {   static const int s_rawdbg = [](){ const char *v = std::getenv("PS2X_GPUALIAS_RAWDBG"); return v && v[0] ? std::atoi(v) : 0; }();
+        glUniform1i(locDbgC, s_rawdbg); }
+    glBindVertexArray(myVao);
+    glDrawArrays(0x0004u /*GL_TRIANGLES*/, 0, 3);
+    {   // one-shot proof the quad rasterized: read one texel back
+        static int nbuild = 0; ++nbuild;
+        if (nbuild == 400)
+        {
+            unsigned int px = 0;
+            glReadPixels(256, 224, 1, 1, 0x1908, 0x1401, &px);
+            unsigned int px2 = 0; glReadPixels(100, 100, 1, 1, 0x1908, 0x1401, &px2);
+            const unsigned e = glGetError();
+            int fbst = 0; glGetIntegerv(0x8CA6, &fbst);
+            std::fprintf(stderr, "[gpualias] raw build probe(#%d): texel=%08x tex2=%08x glErr=0x%x fbo=%d(want %u) rdisc=%d src=%ux%u id=%u\n",
+                         nbuild, px, px2, e, fbst, g_gaViewTex[dst].id, glIsEnabled(0x8C89 /*GL_RASTERIZER_DISCARD*/) ? 1 : 0, src.width, src.height, src.id);
+        }
+    }
+    // ---- restore ----
+    glBindTexture(0x0DE1u, src.id);
+    glTexParameteri(0x0DE1u, 0x2801, prevMin);
+    glTexParameteri(0x0DE1u, 0x2800, prevMag);
+    glBindVertexArray((unsigned)prevVao);
+    glUseProgram((unsigned)prevProg);
+    glBindTexture(0x0DE1u, (unsigned)prevTex0);
+    glActiveTexture((unsigned)prevActive);
+    glBindFramebuffer(0x8D40u, (unsigned)prevFbo);
+    glViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
+    if (hadBlend) glEnable(0x0BE2u);
+    if (hadDepth) glEnable(0x0B71u);
+    if (hadScis)  glEnable(0x0C11u);
+    if (hadCull)  glEnable(0x0B44u);
+    for (int ci2 = 0; ci2 < 4; ++ci2) if (hadClip[ci2]) glEnable(0x3000u + ci2);
+    if (hadSten) glEnable(0x0B90u);
+    glDepthMask(hadDepthMask);
+    glColorMask(prevCM[0], prevCM[1], prevCM[2], prevCM[3]);
+    ps2xTextureBarrier();   // the serve's draw samples this texture NEXT; without the barrier the
+                            // fetch reads pre-pass data (undefined) and the composites no-op --
+                            // the last link of the missing-outline chain.
     g_gaCur = dst;
     return true;
 }
@@ -9955,14 +10065,15 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         // Resolve the source: if the sampled texture aliases a render-target framebuffer,
         // sample that FBO (render-to-texture); else the decoded VRAM texture. FBO color
         // textures are bottom-up, so flag a V-flip.
-        Texture2D tex = g_white; bool vflip = false; bool fromFbo = false;
+        Texture2D tex = g_white; bool vflip = false; bool fromFbo = false; bool gaServed = false;   // [gpualias] flip-served: skip every later texture override
         {   // [gpualias] mode>=4: serve the CT16-view read of fbp336 (the edge-chain consumer) from the executor's view texture
             static const int s_gaC = [](){ const char *v = std::getenv("PS2X_GPUALIAS"); return v && v[0] ? std::atoi(v) : 0; }();
             // Page 336's CT16 view holds DIFFERENT content across the frame (HUD composite, DoF,
             // edge map). Serve ONLY the ink composite -- its signature: bm 0x64 replace, TEXA
             // (0x30, 0, aem=1), narrow column sprites into the scene. Everything else (HUD reads,
             // menus) must keep the VRAM path or it composites the edge map as garbage.
-            if (s_gaC >= 4 && !c.srcIndexed && c.srcTbp0 == 336u * 32u &&
+            static const bool s_gaNoFlip = [](){ const char *v = std::getenv("PS2X_GPUALIAS_NOFLIP"); return v && v[0] && v[0] != '0'; }();
+            if (!s_gaNoFlip && s_gaC >= 4 && !c.srcIndexed && c.srcTbp0 == 336u * 32u &&
                 (c.srcPsm == 0x02u || c.srcPsm == 0x0Au) && !c.isTriangle &&
                 // two consumer classes read the edge map: the INK composite (bm64, TEXA 0x30)
                 // and the SCENE-ALPHA composite (alpha-only fbmsk, TEXA 0x80) -- the DoF/shadow
@@ -9983,14 +10094,15 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 auto fit336 = g_fbos.find(336u);
                 const bool have336 = fit336 != g_fbos.end() && fit336->second.rt.texture.id != 0;
                 bool built = false;
-                if (have336 && gaBuildReviewTex(fit336->second.rt.texture, fit336->second.h))
+                if (have336 && gaBuildReviewTex(fit336->second.rt.texture, fit336->second.h,
+                                                (int)c.texaTa0, (int)c.texaTa1, c.texaAem ? 1 : 0))
                 {
-                    built = true;
-                    curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;   // the builder rebound FBO/shader state
+                    built = true;   // raw builder: full GL state save/restore, no rlgl cache impact
                 }
                 if (!built || g_gaViewTex[g_gaCur].texture.id == 0)
                     goto gaNoFlip;   // could not build: fall back to the normal path
-                tex = g_gaViewTex[g_gaCur].texture; vflip = false; fromFbo = true;
+                tex = g_gaViewTex[g_gaCur].texture; vflip = false; fromFbo = false; gaServed = true;   // decoded-path TEXA (baked); gaServed guards the overrides below
+                { static int n2s = 0; if (++n2s == 300) std::fprintf(stderr, "[gpualias] serve check: tex.id=%u (views %u/%u)\n", tex.id, g_gaViewTex[0].texture.id, g_gaViewTex[1].texture.id); }
                 static unsigned long n = 0;
                 {   // PS2X_GPUALIAS_DUMP=1: export the view + the f224 source once, for offline content checks
                     static const bool s_gd = [](){ const char *v = std::getenv("PS2X_GPUALIAS_DUMP"); return v && v[0] && v[0] != '0'; }();
@@ -10257,7 +10369,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             std::fprintf(stderr, "[srcdiag] cfg noff=%d atlas=%d\n", s_noff ? 1 : 0, s_atlas ? 1 : 0);
             if (FILE *f = srcDiagFile()) { std::fprintf(f, "[srcdiag] cfg noff=%d atlas=%d\n", s_noff ? 1 : 0, s_atlas ? 1 : 0); std::fflush(f); } } }
         const char *srcHow = "untex";
-        if (fromFbo) { /* [gpualias] the flip above already chose the texture */ }
+        if (fromFbo || gaServed) { /* [gpualias] the flip above already chose the texture */ }
         else if (!s_noff && !c.srcIndexed && (!c.srcUploaded || destAlphaLerp) && s_atlas && c.texKey != 0 && sf != c.destFbp && (c.srcTbp0 == sf * 32u) && g_atlasSlots.count(sf))
         {
             // Composite: the source RT lives in the atlas at its slot. Sample g_atlas, remap UV/src
@@ -10478,8 +10590,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 extern unsigned long g_evictDrawHits; ++g_evictDrawHits;
                 static int n = 0; if (n < 12) { ++n; std::fprintf(stderr, "[evictdraw] DRAW of just-evicted key: dest f%u srcTbp %u psm %u %dx%d tri=%d\n", c.destFbp, c.srcTbp0, c.srcPsm, c.srcTexW, c.srcTexH, (int)c.isTriangle); }
             }
-            auto it = g_glTex.find(c.texKey);
-            if (it == g_glTex.end())
+            auto it = gaServed ? g_glTex.end() : g_glTex.find(c.texKey);   // [gpualias] served draws keep the view texture
+            if (!gaServed && it == g_glTex.end())
             {
                 {   // [supdiag] PS2X_SUPDIAG=1: was this dropped draw's texture one the supersede reclaim freed?
                     static const bool s_sd = [](){ const char *v = std::getenv("PS2X_SUPDIAG"); return v && v[0] && v[0] != '0'; }();
@@ -10528,8 +10640,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 }
                 if (s_srcDiag) srcDiagTally("missing", c); { PS2X_GATE_HIT(); continue; }
             }
-            tex = it->second;
-            srcHow = "decoded";
+            if (!gaServed) { tex = it->second; srcHow = "decoded"; } else srcHow = "gaview";
             {   // [coverafter] PS2X_COVERAFTER=<tbp>: per frame, large draws into the same buffer that land
                 // AFTER the last draw sampling <tbp> (does something paint over the layer on some frames?)
                 static const uint32_t s_ca = [](){ const char *v = std::getenv("PS2X_COVERAFTER"); return v ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
