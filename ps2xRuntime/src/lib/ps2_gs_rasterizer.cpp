@@ -1773,6 +1773,19 @@ void GSRasterizer::drawPrimitive(GS *gs)
             }
             extern int g_recordAliasKind;
             g_recordAliasKind = kind;
+            if (kind == 3 && s_ga >= 4)
+            {   // [gpualias] hand the executor the SAME palette the SW chain semantics use
+                // (applyTexa'd m_clutCache); the GPU-published palette disagreed above idx 15.
+                ensureClutCache(gs);
+                extern uint32_t g_gaClutData[256]; extern std::atomic<unsigned> g_gaClutSeq;
+                static uint64_t lastKey = 0;
+                if (gs->m_clutCacheKey != ~0ull && gs->m_clutCacheKey != lastKey)
+                {
+                    lastKey = gs->m_clutCacheKey;
+                    std::memcpy(g_gaClutData, gs->m_clutCache, sizeof(uint32_t) * 256);
+                    g_gaClutSeq.fetch_add(1);
+                }
+            }
         }
     }
     if (GsGpuRenderer::enabled() && !aliasZPass)
