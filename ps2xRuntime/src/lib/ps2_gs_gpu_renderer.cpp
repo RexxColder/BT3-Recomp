@@ -1533,6 +1533,10 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
     }
     rlDrawRenderBatchActive();
     rlEnableFramebuffer(it->second.rt.id);
+    {   // [rbsplit] PS2X_RBSPLIT=1: how much of a readback stall is the GPU finishing the segment (glFinish) vs the transfer
+        static const bool s_rbs = [](){ const char *v = std::getenv("PS2X_RBSPLIT"); return !(v && v[0] == '0'); }();   // default ON: the driver's synchronous glReadPixels stalled ~20 ms/frame; glFinish first makes the whole readback ~5.5 ms/frame (rig 20 -> 23 fps)
+        if (s_rbs) { extern double g_bsFinish; const auto tf = std::chrono::steady_clock::now(); glFinish(); g_bsFinish += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count(); }
+    }
     const auto tRb0 = std::chrono::steady_clock::now();
     if (rectUsed)
     {
@@ -2738,7 +2742,7 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
             // FBO-backed frame buffer is served by the draw path straight from the FBO texture in the sync build (its
             // decode is a dummy: fbp368's 128x128 timer plate hashes to one empty texture 3736x). Deferring it makes the
             // draw use the deferred decode instead of the live FBO -> the plate goes missing. Keep such reads synchronous.
-            static const int s_rtd = [](){ const char *v = std::getenv("PS2X_DDRTDIRECT"); return v && v[0] ? std::atoi(v) : 1; }();   // 0 off, 1 = keep sync (default: correct picture), 2 = skip (27 fps live but the fbp336/112 composites decode from VRAM -> stale blocks, no outline)
+            static const int s_rtd = [](){ const char *v = std::getenv("PS2X_DDRTDIRECT"); return v && v[0] ? std::atoi(v) : 0; }();   // default 0 since 2026-08-30 18:50: full deferral is census-clean now ([defercover]/[ddmirror]/[svcflushseq]) and the fastest (matrix: 23-24.6 vs 20 for mode 1 / sync); 1 = keep sync; 2 = skip (fast but stale composites)
             const bool rtDirect = s_rtd != 0 && (g_barReqPsm == 0u || g_barReqPsm == 1u || g_barReqPsm == 2u || g_barReqPsm == 10u) && g_fbpFmt.find(page) != g_fbpFmt.end();
             if (deferOut && rtDirect && s_rtd == 2)
             {   // [ddrtdirect 2] no wait and no post: the draw samples the FBO texture, which the GL thread fills IN ORDER
@@ -4235,6 +4239,7 @@ unsigned long g_shHit = 0, g_shMissNone = 0, g_shMissPsm = 0, g_shMissMask = 0, 
 int g_tcCount = 0, g_tcFrames = 0; double g_tcLum = 0, g_tcAlpha = 0;   // [tilecount]
 int g_caTiles = 0, g_caCovers = 0; uint32_t g_caDest = 0; char g_caFirst[160] = {0};   // [coverafter]
 double g_bsReadback = 0, g_bsWrite = 0;                    // [barstat] inside flushPageToVram
+double g_bsFinish = 0;   // [rbsplit] glFinish time before the readback (GPU still rendering the segment)
 long g_bsRowsWritten = 0; int g_bsZeroFlush = 0;         // [barstat] flushdiff effectiveness
 std::map<uint32_t, int> g_bsPages; long g_bsCmds = 0; std::map<int, int> g_bsSegHist;   // [barstat] pages / segment sizes
 std::atomic<uint64_t> g_gsGuestSwapCount{0};   // [cdgate] guest frames published (read by the CD-tick pump)
@@ -4256,7 +4261,7 @@ void GsGpuRenderer::swapFrame()
         static int fr = 0;
         if (s_bs && (g_bsCount || (++fr % 60) == 0))
         {
-            std::fprintf(stderr, "[barstat] frame: %d barriers, render %.1f ms, flush %.1f ms (readback %.1f, vramwrite %.1f) | cmds drawn %ld | pages:", g_bsCount, g_bsRender, g_bsFlush, g_bsReadback, g_bsWrite, g_bsCmds);
+            std::fprintf(stderr, "[barstat] frame: %d barriers, render %.1f ms, flush %.1f ms (gpufinish %.1f, readback %.1f, vramwrite %.1f) | cmds drawn %ld | pages:", g_bsCount, g_bsRender, g_bsFlush, g_bsFinish, g_bsReadback, g_bsWrite, g_bsCmds);
             { extern double g_bbPickup, g_bbRender, g_bbFlush, g_bbTotal; extern int g_bbN;
               { extern unsigned long g_preChunks, g_preCmds; std::fprintf(stderr, "[bbstat] blocking barriers %d: pickup %.1f  render %.1f  flush %.1f  resume %.1f  (guest-side total %.1f ms) | prerendered %lu chunks / %lu cmds\n", g_bbN, g_bbPickup, g_bbRender, g_bbFlush, g_bbTotal - g_bbPickup - g_bbRender - g_bbFlush, g_bbTotal, g_preChunks, g_preCmds); g_preChunks = g_preCmds = 0; }
   { extern std::map<uint32_t, unsigned long> g_bbPageHist; extern std::map<uint32_t, double> g_bbPageMs; extern unsigned long g_bbSkipped; std::fprintf(stderr, "[bbpages]"); for (auto &kv : g_bbPageHist) std::fprintf(stderr, " f%u:%lu(%.0fms)", kv.first, kv.second, g_bbPageMs[kv.first]); std::fprintf(stderr, " | skipped %lu\n", g_bbSkipped); g_bbPageHist.clear(); g_bbPageMs.clear(); g_bbSkipped = 0; }
@@ -4275,7 +4280,7 @@ void GsGpuRenderer::swapFrame()
             for (auto &kv : g_bsPages) std::fprintf(stderr, " %u:%d", kv.first, kv.second);
             std::fprintf(stderr, " | seg sizes 0:%d 1-4:%d 5-32:%d 33-256:%d >256:%d | rows written %ld, zero-change flushes %d\n", g_bsSegHist[0], g_bsSegHist[1], g_bsSegHist[2], g_bsSegHist[3], g_bsSegHist[4], g_bsRowsWritten, g_bsZeroFlush);
         }
-        g_bsRender = g_bsFlush = g_bsReadback = g_bsWrite = 0; g_bsCount = 0; g_bsPages.clear(); g_bsCmds = 0; g_bsSegHist.clear(); g_bsRowsWritten = 0; g_bsZeroFlush = 0;
+        g_bsRender = g_bsFlush = g_bsReadback = g_bsWrite = 0; g_bsFinish = 0; g_bsCount = 0; g_bsPages.clear(); g_bsCmds = 0; g_bsSegHist.clear(); g_bsRowsWritten = 0; g_bsZeroFlush = 0;
     }
     {   // [livesync] guest frame boundary: apply everything the present thread staged since
         // the last flip. This is the ONE point in the guest stream where VRAM changes, so the
