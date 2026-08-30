@@ -81,6 +81,7 @@ static const char *g_emitPath = "none";   // [emitpath] which emission branch th
 uint32_t g_barReqTbp = 0, g_barReqCbp = 0, g_barReqPsm = 0, g_barReqTbw = 0;
 unsigned long g_ddRtSkip = 0;   // [ddrtdirect 2]
 extern unsigned long g_svcFlushSkip;   // [svcflushseq] defined below
+extern unsigned long g_linFetch, g_linMiss, g_linRefresh;   // [linvram] defined below
 extern unsigned long g_ddMaxqWaits;   // [ddmaxq] defined below   // the draw whose texture resolve raised the barrier
 static bool ps2xOnGlThread()
 {
@@ -148,6 +149,16 @@ extern "C" void glBindTexture(unsigned int target, unsigned int texture);
 extern "C" void glScissor(int x, int y, int width, int height);
 extern "C" void glBindFramebuffer(unsigned target, unsigned framebuffer);   // [decalsync 3]
 extern "C" void glGetFramebufferAttachmentParameteriv(unsigned target, unsigned attachment, unsigned pname, int *params);
+// [timing] the draw loop / flush timers (std::chrono::steady_clock::now() per command and per flush) cost 25% of the GL
+// thread in perf (__vdso_clock_gettime). Off unless PS2X_TIMING=1: the [secstat]/[barstat] numbers then read 0.
+static const bool g_timingOn = [](){ const char *v = std::getenv("PS2X_TIMING"); return v && v[0] && v[0] != '0'; }();
+static inline std::chrono::steady_clock::time_point psxNow() { return g_timingOn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; }
+
+struct LinImg { std::mutex m; int w = 0, h = 0; uint32_t fbp = 0, fbw = 0, psm = 0; std::vector<uint32_t> px; std::vector<uint32_t> pageSeq; bool init = false; };
+static std::mutex g_linMx; static std::unordered_map<uint32_t, LinImg*> g_linImgs;   // key (fbp<<8)|viewPsm
+extern uint32_t *g_wbLinear; extern int g_wbLinearStride;
+unsigned long g_linFetch = 0, g_linMiss = 0, g_linRefresh = 0;
+
 extern "C" void glBlitFramebuffer(int, int, int, int, int, int, int, int, unsigned mask, unsigned filter);
 extern "C" void glEnable(unsigned cap);
 // [rtthazard] the texture of the FBO most recently SAMPLED by a draw (fromFbo). Rendering into that FBO right after
@@ -1949,7 +1960,20 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
         std::string lst; for (uint32_t pg = g_ptLo; pg <= g_ptHi && pg < kVramPages; ++pg) if (hitp[pg]) { anyHit = true; lst += std::to_string(pg) + " "; }
         if (anyHit && g_ptN < ptMax()) { ++g_ptN; std::fprintf(stderr, "[pt] %lu FLUSH fbp=%u psm=%u fbw=%u %dx%d mask=%08x svc=%d ranged=%d pagesHit: %s\n", g_ptN, fbp, psmF, fbwF, w, h, wbMask, (int)(m_zwbOverride != nullptr), (int)(g_wbRowRange != nullptr), lst.c_str()); }
     }
-    ps2xWritebackToVramMasked(fbp, fit->second.fbw, fit->second.psm, w, h, px.data(), wbMask);
+    {   // [linvram] mirror this writeback into the fbp's linear image (view = this flush's psm/fbw; size = the FBO)
+        static const bool s_lv = [](){ const char *v = std::getenv("PS2X_LINVRAM"); return v && v[0] && v[0] != '0'; }();   // opt-in: correct, but the swizzle was ~10% of the decode and the page refreshes (sheets rewritten every frame inside the RT spans) cost more
+        LinImg *img = s_lv ? linImageFor(fbp, fit->second.psm, fit->second.fbw ? fit->second.fbw : 1u, std::max(w, it->second.w), std::max(h, it->second.h), true) : nullptr;
+        if (img)
+        {
+            std::lock_guard<std::mutex> il(img->m);
+            linRefresh(*img);                       // pages the guest wrote since: bring the image up to VRAM first
+            g_wbLinear = img->px.data(); g_wbLinearStride = img->w;
+            ps2xWritebackToVramMasked(fbp, fit->second.fbw, fit->second.psm, w, h, px.data(), wbMask);
+            g_wbLinear = nullptr; g_wbLinearStride = 0;
+            { static unsigned long n = 0; if ((++n % 2000ul) == 0ul) std::fprintf(stderr, "[linvram] fetch %lu miss %lu pageRefresh %lu\n", g_linFetch, g_linMiss, g_linRefresh); }
+        }
+        else ps2xWritebackToVramMasked(fbp, fit->second.fbw, fit->second.psm, w, h, px.data(), wbMask);
+    }
     { extern int g_wbFlipY; g_wbFlipY = 0; }
       g_flWrite += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count(); }
         { extern const uint8_t *g_wbSkipMask; g_wbSkipMask = nullptr; }
@@ -2308,6 +2332,66 @@ extern "C" uint32_t ps2xDeferCoverFbp(uint32_t page)
     for (const auto &kv : g_deferPending)
         if (kv.second > 0 && page >= kv.first && page < kv.first + flushCoverPages(kv.first)) return kv.first;
     return page;
+}
+
+// [linvram] A LINEAR image of what VRAM holds for an fbp in one flush VIEW (psm/fbw). The writeback fills it with the
+// exact values it stores (g_wbLinear); pages the GUEST wrote since are refreshed from VRAM page-wise (through the
+// swizzle, once per page write) before use. The guest's decoder then reads render-target textures from this image
+// instead of swizzled VRAM (profile: ~57% of the guest thread was decodeTexRGBA + ReadRow*/ReadZ16 on RT content).
+static inline bool linView16(uint32_t psm) { return psm == 0x02u || psm == 0x0Au; }
+// refresh every page of the image span that the guest wrote after our copy of it (or all, on init)
+void GsGpuRenderer::linRefresh(LinImg &img)
+{
+    GS *gs = g_gsWb; if (!gs) return;
+    const int pw = 64, ph = linView16(img.psm) ? 64 : 32;      // page = 64x32 (32-bit) / 64x64 (16-bit)
+    const uint32_t ppr = std::max(1u, img.fbw);                  // pages per row band
+    const uint32_t nPages = (uint32_t)((img.h + ph - 1) / ph) * ppr;
+    if (img.pageSeq.size() != nPages) img.pageSeq.assign(nPages, 0u);
+    const uint32_t base = img.fbp * 32u;   // frame page -> block
+    std::vector<uint32_t> row32; std::vector<uint16_t> row16;
+    for (uint32_t k = 0; k < nPages; ++k)
+    {
+        const uint32_t pg = img.fbp + k; if (pg >= kVramPages) break;
+        if (img.init && m_uploadSeq[pg] <= img.pageSeq[k]) continue;
+        const int x0 = (int)(k % ppr) * pw, y0 = (int)(k / ppr) * ph;
+        const int x1 = std::min(img.w, x0 + pw), y1 = std::min(img.h, y0 + ph);
+        if (x0 >= x1 || y0 >= y1) { img.pageSeq[k] = m_uploadSeq[pg]; continue; }
+        if (linView16(img.psm)) { row16.resize((size_t)(x1 - x0));
+            for (int y = y0; y < y1; ++y) { if (img.psm == 0x02u) GSMem::ReadRowCT16(gs->vramData(), base, img.fbw, (u32)x0, (u32)x1, (u32)y, row16.data()); else GSMem::ReadRowCT16S(gs->vramData(), base, img.fbw, (u32)x0, (u32)x1, (u32)y, row16.data());
+                for (int x = x0; x < x1; ++x) img.px[(size_t)y * img.w + x] = row16[(size_t)(x - x0)]; } }
+        else { row32.resize((size_t)(x1 - x0));
+            for (int y = y0; y < y1; ++y) { GSMem::ReadRowCT32(gs->vramData(), base, img.fbw, (u32)x0, (u32)x1, (u32)y, row32.data());
+                std::memcpy(img.px.data() + (size_t)y * img.w + x0, row32.data(), (size_t)(x1 - x0) * 4u); } }
+        img.pageSeq[k] = m_uploadSeq[pg]; ++g_linRefresh;
+    }
+    img.init = true;
+}
+LinImg *GsGpuRenderer::linImageFor(uint32_t fbp, uint32_t psm, uint32_t fbw, int w, int h, bool create)
+{
+    const uint32_t vpsm = linView16(psm) ? 0x02u : 0x00u;
+    std::lock_guard<std::mutex> lk(g_linMx);
+    auto it = g_linImgs.find((fbp << 8) | vpsm);
+    if (it == g_linImgs.end()) { if (!create) return nullptr; it = g_linImgs.emplace((fbp << 8) | vpsm, new LinImg()).first; }
+    LinImg *img = it->second;
+    if (create && (img->w != w || img->h != h || img->fbw != fbw)) { std::lock_guard<std::mutex> il(img->m); img->w = w; img->h = h; img->fbw = fbw; img->fbp = fbp; img->psm = vpsm; img->px.assign((size_t)w * h, 0u); img->pageSeq.clear(); img->init = false; }
+    return img;
+}
+// guest side: copy rows 0..H-1, columns u0..u0+subW of the texture at tbp0 (tbw, psm) out of the image, if it has one
+extern "C" bool ps2xLinearFetch(uint32_t tbp0, uint32_t psm, uint32_t tbw, uint32_t u0, int subW, int H, uint32_t *dst)
+{
+    static const bool s_lv = [](){ const char *v = std::getenv("PS2X_LINVRAM"); return v && v[0] && v[0] != '0'; }();   // opt-in: correct, but the swizzle was ~10% of the decode and the page refreshes (sheets rewritten every frame inside the RT spans) cost more
+    if (!s_lv || (tbp0 % 32u) != 0u) return false;
+    const bool r16 = (psm == 0x02u || psm == 0x0Au);
+    const bool r32 = (psm == 0x00u || psm == 0x01u || psm == 27u || psm == 36u || psm == 44u);
+    if (!r16 && !r32) return false;
+    LinImg *img = ps2GpuRenderer().linImageFor(tbp0 / 32u, r16 ? 0x02u : 0x00u, tbw, 0, 0, false);
+    if (!img) { ++g_linMiss; return false; }
+    std::lock_guard<std::mutex> il(img->m);
+    if (!img->init && img->w == 0) { ++g_linMiss; return false; }
+    if (img->fbw != tbw || (int)u0 + subW > img->w || H > img->h) { ++g_linMiss; return false; }
+    ps2GpuRenderer().linRefresh(*img);
+    for (int v = 0; v < H; ++v) std::memcpy(dst + (size_t)v * subW, img->px.data() + (size_t)v * img->w + u0, (size_t)subW * 4u);
+    ++g_linFetch; return true;
 }
 bool GsGpuRenderer::flushPending(uint32_t page)
 {   // [deferpend] [flushcover] -- with the barrier's own [dduploadwins] rule: a page the guest UPLOADED after the covering
@@ -6480,13 +6564,13 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 std::snprintf(lp, sizeof lp, "/home/z3/Desktop/bt3/work/probefb_latch%u.ppm", s_ln);
                 dumpBoundFbo(lp, cw, ch);
             }
-            static std::chrono::steady_clock::time_point s_lt = std::chrono::steady_clock::now();
+            static std::chrono::steady_clock::time_point s_lt = psxNow();
             static unsigned s_lsec = 0;
             ++s_lsec;
-            if (std::chrono::duration<double>(std::chrono::steady_clock::now() - s_lt).count() >= 1.0)
+            if (std::chrono::duration<double>(psxNow() - s_lt).count() >= 1.0)
             {
                 if (FILE *f = srcDiagFile()) { std::fprintf(f, "[latch] n/s=%u src=f%u total=%u\n", s_lsec, xfbp, s_ln); std::fflush(f); }
-                s_lsec = 0; s_lt = std::chrono::steady_clock::now();
+                s_lsec = 0; s_lt = psxNow();
             }
         }
         EndTextureMode();
@@ -6546,7 +6630,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (s_zl.insert(__LINE__).second) \
                 std::fprintf(stderr, "[zpass] *** DROPPED at line %d *** dest=f%u fbmsk=%08x\n", \
                              __LINE__, c.destFbp, c.fbmsk); } } while (0)
-    secStat.t2 = std::chrono::steady_clock::now();   // [secstat]
+    secStat.t2 = psxNow();   // [secstat]
     // Resume point. Segment renders advance m_segFrom as they go; the end-of-frame render
     // picks up where the last barrier left off instead of replaying (and re-blending) the
     // commands already drawn. The watermark is only meaningful when the indices line up:
@@ -10001,10 +10085,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     if (s_tm && !c.isTransfer)
                     {
                         static unsigned long nMiss = 0, nInCpu = 0, nUpload = 0; static int nDetail = 0;
-                        static auto t0 = std::chrono::steady_clock::now();
+                        static auto t0 = psxNow();
                         ++nMiss; auto cit = m_texCache.find(c.texKey); if (cit != m_texCache.end()) { ++nInCpu; if (cit->second.needsUpload) ++nUpload; }
                         if (nDetail < 12) { ++nDetail; std::fprintf(stderr, "[texmiss] draw dropped: dest f%u srcTbp %u psm %u %dx%d tri=%d key %llx | cpu-cache %s%s\n", c.destFbp, c.srcTbp0, c.srcPsm, c.srcTexW, c.srcTexH, (int)c.isTriangle, (unsigned long long)c.texKey, cit != m_texCache.end() ? "HIT" : "miss", (cit != m_texCache.end() && cit->second.needsUpload) ? " (needsUpload)" : ""); }
-                        const auto now = std::chrono::steady_clock::now();
+                        const auto now = psxNow();
                         if (now - t0 >= std::chrono::seconds(1)) { std::fprintf(stderr, "[texmiss] last second: %lu dropped (cpu-cache hit %lu, of which needsUpload %lu)\n", nMiss, nInCpu, nUpload); nMiss = nInCpu = nUpload = 0; t0 = now; }
                     }
                 }
@@ -10570,7 +10654,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             static float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
             static float bu0 = 1e9f, bu1 = -1e9f, bv0 = 1e9f, bv1 = -1e9f;
             static uint32_t bn = 0, bnBadUv = 0, bnBig = 0;
-            static std::chrono::steady_clock::time_point bt = std::chrono::steady_clock::now();
+            static std::chrono::steady_clock::time_point bt = psxNow();
             bool badUv = false;
             for (int i = 0; i < 3; ++i)
             {
@@ -10603,7 +10687,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                  c.tri[0].r, c.tri[0].g, c.tri[0].b, c.tri[0].a, c.blendMode);
             }
             ++bn;
-            if (std::chrono::duration<double>(std::chrono::steady_clock::now() - bt).count() >= 1.0)
+            if (std::chrono::duration<double>(psxNow() - bt).count() >= 1.0)
             {
                 if (FILE *f = srcDiagFile())
                 {
@@ -10614,7 +10698,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 }
                 bx0 = by0 = 1e9f; bx1 = by1 = -1e9f; bu0 = bv0 = 1e9f; bu1 = bv1 = -1e9f;
                 bn = bnBadUv = bnBig = 0;
-                bt = std::chrono::steady_clock::now();
+                bt = psxNow();
             }
         }
 
@@ -10690,9 +10774,9 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if ((double)(x1 - x0) * (y1 - y0) > 0.30 * 512.0 * 448.0)
             {
                 static unsigned s_cn = 0;
-                static std::chrono::steady_clock::time_point s_ct = std::chrono::steady_clock::now();
-                if (std::chrono::duration<double>(std::chrono::steady_clock::now() - s_ct).count() >= 1.0)
-                { s_cn = 0; s_ct = std::chrono::steady_clock::now(); }
+                static std::chrono::steady_clock::time_point s_ct = psxNow();
+                if (std::chrono::duration<double>(psxNow() - s_ct).count() >= 1.0)
+                { s_cn = 0; s_ct = psxNow(); }
                 if (s_cn < 12 || (wantEndSnap && ci >= 15000))
                 {
                     ++s_cn;
@@ -12081,10 +12165,10 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if (x1 >= rx0 && x0 <= rx1 && y1 >= ry0 && y0 <= ry1)
                     {
                         g_dbgDecalCmd = &c;   // [decaldbg] trace this piece at whichever emit site draws it
-                        static const auto t0 = std::chrono::steady_clock::now(); static long n = 0;
+                        static const auto t0 = psxNow(); static long n = 0;
                         if (n++ < 3000000L)
                         {
-                            const long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+                            const long ms = std::chrono::duration_cast<std::chrono::milliseconds>(psxNow() - t0).count();
                             std::fprintf(stderr, "[decalrect] t=%ldms gen %u piece xy (%.1f,%.1f) (%.1f,%.1f) (%.1f,%.1f) uv (%.4f,%.4f) (%.4f,%.4f) (%.4f,%.4f) q %.5f %.5f %.5f a=%u dest=%u\n",
                                          ms, g_publishGen, c.tri[0].x, c.tri[0].y, c.tri[1].x, c.tri[1].y, c.tri[2].x, c.tri[2].y,
                                          c.tri[0].u, c.tri[0].v, c.tri[1].u, c.tri[1].v, c.tri[2].u, c.tri[2].v, c.tri[0].q, c.tri[1].q, c.tri[2].q, (unsigned)c.tri[0].a, c.destFbp);
