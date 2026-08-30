@@ -1,3 +1,4 @@
+#include <vector>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -206,6 +207,44 @@ namespace GSMem
     static P8PageLookupTable   PageTableP8{ };
     static P4PageLookupTable   PageTableP4{ };
 
+    // [ct16pair] PS2X_CT16MAPBUILD=1 (diag, runs once at table init): derive and VERIFY the CT16-view -> CT32 pairing
+    // that the GPU alias passes need. For each CT16 pixel (x16,y16) of a fbw-8 view, find which CT32 pixel (x32,y32)
+    // of the same pages holds its two bytes and which half (0 = bits 0..15 = B,G bytes-ish; 1 = bits 16..31).
+    // Verified by writing a sentinel through WriteVram(psm=CT16) into a zeroed buffer and reading the CT32 word back.
+    static void ct16MapBuild()
+    {
+        const u32 bw = 8u;   // 512-px view, the shape BT3 uses for fbp0/112/336
+        int shape_x_ok = 0, shape_y_ok = 0, n = 0, verified = 0, mismatch = 0;
+        int sampleN = 0;
+        std::vector<u8> scratch(MEMORY_SIZE, 0u);
+        for (u32 y16 = 0; y16 < 96u; ++y16)
+            for (u32 x16 = 0; x16 < 128u; ++x16)
+            {
+                const u32 a16 = PixelStorageTraits<C16>::Address(PageTableC16, 0u, bw, x16, y16) * 2u;   // byte addr
+                // find the CT32 pixel owning these bytes: its word-aligned base
+                const u32 wordByte = a16 & ~3u; const u32 half = (a16 & 2u) >> 1;
+                // search the CT32 pixel with that word address in a local window (same pages)
+                bool found = false; u32 fx = 0, fy = 0;
+                for (u32 y32 = (y16 / 2 > 4u ? y16 / 2 - 4u : 0u); y32 < y16 / 2 + 5u && !found; ++y32)
+                    for (u32 x32 = (x16 > 8u ? x16 - 8u : 0u); x32 < x16 + 9u; ++x32)
+                        if (PixelStorageTraits<C32>::Address(PageTableC32, 0u, bw, x32, y32) * 4u == wordByte) { found = true; fx = x32; fy = y32; break; }
+                if (!found) continue;
+                ++n; shape_x_ok += (fx == x16); shape_y_ok += (fy == y16 / 2 && (y16 & 1u) == half) || (fy == y16 / 2);
+                if (sampleN < 12 && (x16 < 3u || y16 < 3u || (x16 == 64u && y16 < 6u)))
+                { ++sampleN; std::fprintf(stderr, "[ct16pair] (%3u,%3u) -> CT32 (%3u,%3u) half=%u\n", x16, y16, fx, fy, half); }
+                // verify with a real write
+                if ((x16 % 17u) == 0u && (y16 % 13u) == 0u)
+                {
+                    std::fill(scratch.begin(), scratch.begin() + 65536, 0u);
+                    PixelStorageTraits<C16>::Write(PageTableC16, scratch.data(), 0u, bw, x16, y16, 0xABCDu);
+                    u32 w32 = 0; std::memcpy(&w32, &scratch[wordByte], 4u);
+                    const u32 got = half ? (w32 >> 16) : (w32 & 0xFFFFu);
+                    if (got == 0xABCDu) ++verified; else ++mismatch;
+                }
+            }
+        std::fprintf(stderr, "[ct16pair] mapped %d px: x32==x16 %d, y-shape(y/2,half=y&1) %d | write-verified %d, mismatched %d\n",
+                     n, shape_x_ok, shape_y_ok, verified, mismatch);
+    }
     void InitLookupTables()
     {
         // 32 bit
@@ -217,6 +256,7 @@ namespace GSMem
         PixelStorageTraits<C16S>::InitPageLookupTable(PageTableC16S, BlockTableC16S, ColumnTable16);
         PixelStorageTraits<Z16>::InitPageLookupTable(PageTableZ16, BlockTableZ16, ColumnTable16);
         PixelStorageTraits<Z16S>::InitPageLookupTable(PageTableZ16S, BlockTableZ16S, ColumnTable16);
+        { const char *v = std::getenv("PS2X_CT16MAPBUILD"); if (v && v[0] && v[0] != '0') ct16MapBuild(); }   // [ct16pair]
 
         // 8 bit
         PixelStorageTraits<P8>::InitPageLookupTable(PageTableP8, BlockTableP8, ColumnTable8);
