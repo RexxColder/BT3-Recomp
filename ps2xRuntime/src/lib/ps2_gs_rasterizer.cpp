@@ -1751,6 +1751,30 @@ void GSRasterizer::drawPrimitive(GS *gs)
 
     // GPU mode: record to the hardware renderer instead of software-rasterizing.
     // Stage 1 handles sprites (98% of the menu); other primitives are skipped for now.
+    struct AliasKindClear { ~AliasKindClear() { extern int g_recordAliasKind; g_recordAliasKind = 0; } } s_akClear;
+    {   // [gpualias] PS2X_GPUALIAS=1: census of the CT16-view alias passes. The SWALIAS block above is OFF in the
+        // current stack, so these draws flow through the NORMAL GPU record below -- classify them here and tag the
+        // recorded command via g_recordAliasKind (cleared by s_akClear at every exit). Census only: nothing else changes.
+        static const int s_ga = [](){ const char *v = std::getenv("PS2X_GPUALIAS"); return v && v[0] ? std::atoi(v) : 0; }();
+        if (s_ga > 0 && GsGpuRenderer::enabled() && gs->activeContext().frame.psm == 0x02u)
+        {
+            const auto &actx = gs->activeContext();
+            const uint32_t spsm = actx.tex0.psm, msk = actx.frame.fbmsk;
+            const bool tme = gs->m_prim.tme != 0;
+            int kind = 0;
+            if (gs->m_prim.type == 6u)
+                kind = !tme ? (msk == 0u ? 2 : 0)
+                            : ((spsm == 0x30u || spsm == 0x31u || spsm == 0x32u) ? 1 : (spsm == 27u ? 3 : 0));
+            {   // hook census incl. unclassified, to check inventory completeness
+                static unsigned long n = 0;
+                if (++n <= 8 || (n % 4000ul) == 0ul)
+                    std::fprintf(stderr, "[gpualias-hook] #%lu kind=%d type=%u tme=%u spsm=0x%x dfbp=%u msk=%08x\n",
+                                 n, kind, (unsigned)gs->m_prim.type, (unsigned)tme, spsm, actx.frame.fbp, msk);
+            }
+            extern int g_recordAliasKind;
+            g_recordAliasKind = kind;
+        }
+    }
     if (GsGpuRenderer::enabled() && !aliasZPass)
     {
         switch (gs->m_prim.type)

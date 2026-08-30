@@ -81,6 +81,7 @@ bool g_resolveAlphaData = false;        // set by the rasterizer around texture 
 static const char *g_emitPath = "none";   // [emitpath] which emission branch the current command took
 uint32_t g_barReqTbp = 0, g_barReqCbp = 0, g_barReqPsm = 0, g_barReqTbw = 0;
 unsigned long g_ddRtSkip = 0;   // [ddrtdirect 2]
+int g_recordAliasKind = 0;   // [gpualias] set around recordSpriteGPU for a CT16-view alias pass
 std::atomic<uint64_t> g_guestBusyNs{0}, g_guestBusyFrames{0};   // [guestbusy] file scope: read by ps2_runtime.cpp
 extern unsigned long g_svcFlushSkip;   // [svcflushseq] defined below
 extern unsigned long g_linFetch, g_linMiss, g_linRefresh;   // [linvram] defined below
@@ -3731,6 +3732,11 @@ void GsGpuRenderer::flushStage()
 }
 void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
 {
+    {   // [gpualias] tag commands recorded for a CT16-view alias pass
+        extern int g_recordAliasKind;
+        if (g_recordAliasKind) { const_cast<DrawCmd &>(cmd).isAliasPass = true; const_cast<DrawCmd &>(cmd).aliasKind = (uint8_t)g_recordAliasKind; }
+        { static unsigned long tn = 0; if (g_recordAliasKind && ++tn <= 5) std::fprintf(stderr, "[gpualias-tag] #%lu kind=%d\n", tn, g_recordAliasKind); }
+    }
     std::unique_lock<std::mutex> lk(m_mtx, std::defer_lock);
     if (s_recStage <= 0) lk.lock();
     DrawCmd c = cmd;
@@ -6722,6 +6728,16 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (!c.decode->served) { extern unsigned long g_deferLate; ++g_deferLate; static int n = 0; if (n < 4) { ++n; std::fprintf(stderr, "[deferdec] LATE: decode cmd reached in-loop unserviced (ci %zu/%zu)\n", ci, DC.size()); } }
             continue;
         }
+        if (c.isAliasPass)
+        {   // [gpualias] census-only for now: the SW raster + vramBlit still produce the result; log the shapes.
+            static unsigned long n = 0; static unsigned long byKind[4] = {0,0,0,0};
+            ++byKind[c.aliasKind & 3u];
+            if (++n <= 10 || (n % 2000ul) == 0ul)
+                std::fprintf(stderr, "[gpualias] #%lu kind=%u dest=f%u psm=%u fbmsk=%08x rect=(%.0f,%.0f)-(%.0f,%.0f) src=(%u,psm%u %dx%d) bm=%02x abe=%d | k1=%lu k2=%lu k3=%lu\n",
+                             n, c.aliasKind, c.destFbp, c.destPsm, c.fbmsk, c.dx0, c.dy0, c.dx1, c.dy1,
+                             c.srcTbp0, c.srcPsm, (int)c.srcTexW, (int)c.srcTexH, (unsigned)c.blendMode, c.abe ? 1 : 0,
+                             byKind[1], byKind[2], byKind[3]);
+        }   // census only: FALL THROUGH to normal execution (identical output with GPUALIAS=1)
         {   // [dofdump] PS2X_DOFDUMP=1: console's shadow silhouette (sil_a: 0/128 in fbp336 alpha) is born when the
             // DoF downsample sprites copy the SCENE into fbp336 -- the copy carries the scene alpha (128 under the
             // fighters on console). Dump OUR scene alpha at the frame's first such copy, and fbp336's alpha right after
