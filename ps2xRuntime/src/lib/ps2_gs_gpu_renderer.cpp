@@ -2071,7 +2071,10 @@ static bool ddPageAllowed(uint32_t page)
 }
 unsigned long g_ddUploadWins = 0;   // [dduploadwins]
 unsigned long g_deferPosted = 0, g_deferServed = 0, g_deferGate = 0, g_deferLate = 0, g_deferPubWait = 0, g_deferUploadWait = 0, g_deferPageSkip = 0;   // [deferdec] stats
-static std::unordered_map<uint64_t, std::shared_ptr<TexDecodeReq>> g_deferByKey;   // [ddkey] key -> latest request (diag; guarded by m_mtx)
+// [ddkey] key -> latest request (diag; guarded by m_mtx). WEAK: this map is never erased and texKey is content-versioned,
+// so with shared_ptr it pinned every request ever posted -- and since [srcsnap3] a request owns 8 KB per texture page
+// + a 16 KB CLUT snapshot, ~78k posts per fight = tens of GB (the 2026-08-30 out-of-memory). Expired entries are swept.
+static std::unordered_map<uint64_t, std::weak_ptr<TexDecodeReq>> g_deferByKey;
 extern GS *g_gsWb;   // [deferdec] the GS the writeback path uses (set on the first writeback)
 void GsGpuRenderer::postDecode(std::shared_ptr<TexDecodeReq> req)
 {   // [deferdec] guest thread: a placeholder cache entry (w/h set, no texels) so this frame's later
@@ -2135,6 +2138,8 @@ static uint32_t flushCoverPages(uint32_t page)
         // fbp336's FBO is 1024x512 (256 pages) while the game uses it as 256x256 fbw 4 (32 pages); the wide cover made
         // every streamed texture in 336..592 (character sheets at 420+, CLUTs at 480/488) look flush-dependent.
         static const bool s_c2 = [](){ const char *v = std::getenv("PS2X_FLUSHCOVER2"); return !(v && v[0] == '0'); }();
+        if (g_deferByKey.size() > 4096u)     // sweep: drop entries whose request has been serviced and freed
+            for (auto it = g_deferByKey.begin(); it != g_deferByKey.end(); ) { if (it->second.expired()) it = g_deferByKey.erase(it); else ++it; }
         auto fit = g_fbpFmt.find(page);
         if (s_c2 && fit != g_fbpFmt.end() && fit->second.fbw > 0 && fit->second.maxY > 0)
         {
@@ -9584,7 +9589,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         {   // [ddkey] deferred-request + cache state of the dropped key
                             int dd = -1, served = -1; uint32_t fp = 0, cp = 0; int cw = -1; size_t cb = 0; int nu = -1;
                             auto di = g_deferByKey.find(c.texKey);
-                            if (di != g_deferByKey.end()) { dd = 1; served = (int)di->second->served; fp = di->second->flushPage; cp = di->second->flushClutPage; } else dd = 0;
+                            std::shared_ptr<TexDecodeReq> dsp = (di != g_deferByKey.end()) ? di->second.lock() : nullptr;
+                            if (dsp) { dd = 1; served = (int)dsp->served; fp = dsp->flushPage; cp = dsp->flushClutPage; } else dd = 0;
                             auto ti = m_texCache.find(c.texKey);
                             if (ti != m_texCache.end()) { cw = ti->second.w; cb = ti->second.rgba.size(); nu = (int)ti->second.needsUpload; }
                             std::fprintf(stderr, "[supdiag] GL-miss drop: reclaimed=%d inCpu=%d dest f%u src tbp %u psm %u %dx%d seg=%d idx=%zu/%zu pending=%zu building=%zu | deferred=%d served=%d flush=%u clut=%u | cache w=%d bytes=%zu needsUpload=%d\n",
