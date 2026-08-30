@@ -99,6 +99,19 @@ unsigned long g_gateSeen = 0;   // commands the gate census looked at (PS2X_GATE
 // sampled while it is also being written" no longer apply once the bytes are in VRAM.
 std::unordered_set<uint32_t> g_barFlushed;
 static std::unordered_map<uint32_t, int> g_deferPending;   // [deferpend] pages with a posted-but-unserviced deferred flush (guarded by g_barMx)
+static std::unordered_map<uint32_t, uint32_t> g_deferPostSeq;
+// [pagetrace] PS2X_PAGETRACE=lo,hi : ordered stderr trace of everything that touches VRAM pages [lo,hi]
+// (uploads, barrier reads, flush writes with the pages that actually received pixels, decodes) -- the ground truth
+// for the sync-vs-deferred ordering of BT3's HUD sheets inside the fbp336 span.
+static uint32_t g_ptLo = 1, g_ptHi = 0;
+static bool ptInit() { static const bool r = [](){ const char *v = std::getenv("PS2X_PAGETRACE"); if (!v || !v[0]) return false;
+    char *e = nullptr; g_ptLo = (uint32_t)std::strtoul(v, &e, 10); g_ptHi = (*e == ',') ? (uint32_t)std::strtoul(e + 1, nullptr, 10) : g_ptLo; return true; }(); return r; }
+static unsigned long g_ptFrames = 0;
+static unsigned long ptFrom() { static const unsigned long v = [](){ const char *e = std::getenv("PS2X_PAGETRACE_FROM"); return e ? std::strtoul(e, nullptr, 10) : 0ul; }(); return v; }
+static unsigned long ptMax() { static const unsigned long v = [](){ const char *e = std::getenv("PS2X_PAGETRACE_MAX"); return e ? std::strtoul(e, nullptr, 10) : 20000ul; }(); return v; }
+static inline bool ptHit(uint32_t lo, uint32_t hi) { return ptInit() && g_ptFrames >= ptFrom() && !(hi < g_ptLo || lo > g_ptHi); }
+static unsigned long g_ptN = 0;
+   // [ddpostseq] cover page -> m_writeSeq of the NEWEST pending post (guarded by g_barMx)
 // fbp -> the fbp whose FBO actually holds its pixels (see realFbpFor / PS2X_MERGE_DISPLAY).
 // Published from beginFbp so flushPageToVram can find a merged buffer's real storage.
 std::unordered_map<uint32_t, uint32_t> g_realFbpMap;
@@ -728,6 +741,7 @@ namespace
     const GsGpuRenderer::DrawCmd *g_curDecalCmd = nullptr;
     bool g_decalUViz = false; float g_decalUVizMode = 1.f;   // [decaldbg 6/7]
     RenderTexture2D g_decalSnap = {0}; unsigned g_decalSnapSrcTex = 0;   // [decalsync 3] silhouette snapshot
+    uint8_t g_lastWriter[512] = {0};   // [lastwriter] per VRAM page: 1 = guest upload, 2 = GL writeback (diag)
     float g_curReg[4] = {0.f, 0.f, 0.f, -1.f};   // [region] last uRegion value pushed   // [region] the shadow-decal command being drawn (loop top)               // PS2X_PERSPQ: per-pixel S/Q divide
     int g_locForceA = -1;               // PS2X_FORCEA: constant alpha write test
     int g_locZTex = -1;                 // PS2X_ZTEX: texture0 is a depth texture
@@ -1435,6 +1449,16 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
         fit->second.psm = 0x02u; fit->second.fbw = g_barReqTbw ? g_barReqTbw : 8u; fit->second.maxX = 512; fit->second.maxY = 448;
         static int nfa = 0; if (s_bd && nfa++ < 6) std::fprintf(stderr, "[bardiag] flush fbp%u: as-read override -> CT16 fbw=%u 512x448\n", fbp, fit->second.fbw);
     }
+    if (m_zwbOverride && m_zwbOverride->fmtValid && m_zwbOverride->flushPage == fbp)
+    {   // [fmtsnap] deferred service: flush with the format captured at the read, not the guest's current (later) one
+        static const bool s_fs = [](){ const char *v = std::getenv("PS2X_FMTSNAP"); return !(v && v[0] == '0'); }();
+        if (s_fs)
+        {
+            fmtRestore.on = true;
+            fit->second.fbw = m_zwbOverride->fmtFbw; fit->second.psm = m_zwbOverride->fmtPsm;
+            fit->second.maxX = m_zwbOverride->fmtMaxX; fit->second.maxY = m_zwbOverride->fmtMaxY;
+        }
+    }
     (void)fmtOverride;
     // Bound by the game's own extent, not our grow-only allocation: fbp224's FBO is 1024x1024
     // and 1024*1024*4 is the whole 4MB of VRAM, which would wrap over every other buffer.
@@ -1739,6 +1763,12 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
     {   // [flushdim] PS2X_FLUSHDIM=1: what each flush actually writes/invalidates
         static const bool s_fd = [](){ const char *v = std::getenv("PS2X_FLUSHDIM"); return v && v[0] && v[0] != '0'; }();
         static int nfd = 0;
+        {   // [flushdim2] PS2X_FLUSHDIM=2: only the NON-canonical pages (deferred service of a page inside an RT span), 200 lines
+            static const bool s_fd2 = [](){ const char *v = std::getenv("PS2X_FLUSHDIM"); return v && v[0] == '2'; }();
+            static int nfd2 = 0;
+            const bool canon = (fbp == 0u || fbp == 112u || fbp == 224u || fbp == 336u || fbp == 368u || fbp == 502u || fbp == 504u);
+            if (s_fd2 && !canon && nfd2 < 200) { ++nfd2; std::fprintf(stderr, "[flushdim2] fbp%u rfbp%u psm 0x%02x fbw %u w %d h %d (fbo %dx%d max %dx%d) svc=%d fmtsnap=%d\n", fbp, rfbp, fit->second.psm, fit->second.fbw, w, h, it->second.w, it->second.h, fit->second.maxX, fit->second.maxY, (int)(m_zwbOverride != nullptr), (int)(m_zwbOverride && m_zwbOverride->fmtValid)); }
+        }
         if (s_fd && nfd < 80) { ++nfd; std::fprintf(stderr, "[flushdim] fbp%-4u psm 0x%02x fbw %u  w %d h %d  (fbo %dx%d, max %dx%d) -> %u blocks = pages %u..%u\n", fbp, fit->second.psm, fit->second.fbw, w, h, it->second.w, it->second.h, fit->second.maxX, fit->second.maxY, (unsigned)((size_t)w * h * 4u / 256u), fbp, fbp + (unsigned)((size_t)w * h * 4u / 256u / 32u)); }
     }
     { std::lock_guard<std::mutex> bk(g_barMx); if (wbMask & 0xFF000000u) g_barAlphaStale.insert(fbp); else g_barAlphaStale.erase(fbp); }   // [bargate2]
@@ -1762,7 +1792,12 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
         // matches the shadow and every pixel must be written.
         const uint32_t bppF = (fit->second.psm == 0x02u || fit->second.psm == 0x0Au || fit->second.psm == 0x32u || fit->second.psm == 0x3Au) ? 16u : (fit->second.psm == 0x13u || fit->second.psm == 0x1Bu) ? 8u : (fit->second.psm == 0x14u || fit->second.psm == 0x24u || fit->second.psm == 0x2Cu) ? 4u : 32u;
         const uint32_t nPagesF = (uint32_t)(((uint64_t)w * h * bppF / 8u + 8191u) / 8192u);
-        auto pageSeqMax = [&]() { uint32_t mx = 0; for (uint32_t p = fbp; p < fbp + nPagesF && p < kVramPages; ++p) mx = std::max(mx, m_contentSeq[p]); return mx; };
+        // [cseqsnap] deferred service: the content stamps as they were at the READ (the guest is ahead by then)
+        const std::vector<uint32_t> *cseqSnap = (m_zwbOverride && m_zwbOverride->flushPage == fbp && !m_zwbOverride->coverContentSeq.empty()) ? &m_zwbOverride->coverContentSeq : nullptr;
+        auto contentSeqAt = [&](uint32_t p) -> uint32_t {
+            if (cseqSnap && p >= fbp && p - fbp < (uint32_t)cseqSnap->size()) return (*cseqSnap)[p - fbp];
+            return m_contentSeq[p]; };
+        auto pageSeqMax = [&]() { uint32_t mx = 0; for (uint32_t p = fbp; p < fbp + nPagesF && p < kVramPages; ++p) mx = std::max(mx, contentSeqAt(p)); return mx; };
         extern const std::pair<int,int> *g_wbRowRange; g_wbRowRange = nullptr;
         static const bool s_frows = [](){ const char *v = std::getenv("PS2X_FLUSHROWS"); return !(v && v[0] == '0'); }();
         static std::vector<std::pair<int,int>> s_rows;
@@ -1799,7 +1834,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
             bool ok = (bppF == 32u || bppF == 16u);   // 8/4-bpp page geometry differs (128x64): keep the full invalidation there
             for (uint32_t p = fbp; ok && p < fbp + nPagesF && p < kVramPages; ++p)
             {
-                if (m_contentSeq[p] <= sh.seq) continue;
+                if (contentSeqAt(p) <= sh.seq) continue;   // [cseqsnap]
                 const uint32_t band = (p - fbp) / pagesPerBand;
                 const int r0 = (int)(band * (uint32_t)bandRows), r1 = std::min(h, r0 + bandRows);
                 if (r0 >= h) continue;
@@ -1892,6 +1927,20 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
             extern unsigned long g_deferPageSkip; ++g_deferPageSkip;
         }
         if (any) g_wbSkipMask = s_pskip.data();
+    }
+    if (ptInit() && g_ptFrames >= ptFrom())
+    {   // [pagetrace] which pages of this flush receive pixels (row ranges, or all rows when unranged)
+        const uint32_t fbwF = std::max(1u, (uint32_t)fit->second.fbw); const uint32_t psmF = fit->second.psm;
+        const int bh = (psmF == 0x02u || psmF == 0x0Au || psmF == 0x32u || psmF == 0x3Au) ? 64 : 32;
+        std::vector<uint8_t> hitp(kVramPages, 0u); bool anyHit = false;
+        for (int y = 0; y < h; ++y)
+        {
+            int x0 = 0, x1 = w; if (g_wbRowRange) { x0 = g_wbRowRange[y].first; x1 = g_wbRowRange[y].second; if (x1 <= x0) continue; }
+            for (int x = x0; x < x1; x += 64) { const uint32_t pg = fbp + (uint32_t)(y / bh) * fbwF + (uint32_t)(x / 64); if (pg < kVramPages) hitp[pg] = 1u; }
+            const uint32_t pgE = fbp + (uint32_t)(y / bh) * fbwF + (uint32_t)((x1 - 1) / 64); if (pgE < kVramPages) hitp[pgE] = 1u;
+        }
+        std::string lst; for (uint32_t pg = g_ptLo; pg <= g_ptHi && pg < kVramPages; ++pg) if (hitp[pg]) { anyHit = true; lst += std::to_string(pg) + " "; }
+        if (anyHit && g_ptN < ptMax()) { ++g_ptN; std::fprintf(stderr, "[pt] %lu FLUSH fbp=%u psm=%u fbw=%u %dx%d mask=%08x svc=%d ranged=%d pagesHit: %s\n", g_ptN, fbp, psmF, fbwF, w, h, wbMask, (int)(m_zwbOverride != nullptr), (int)(g_wbRowRange != nullptr), lst.c_str()); }
     }
     ps2xWritebackToVramMasked(fbp, fit->second.fbw, fit->second.psm, w, h, px.data(), wbMask);
     { extern int g_wbFlipY; g_wbFlipY = 0; }
@@ -2069,7 +2118,9 @@ static bool ddPageAllowed(uint32_t page)
     for (uint32_t p : s_pages) if (p == page) return true;
     return false;
 }
-unsigned long g_ddUploadWins = 0;   // [dduploadwins]
+unsigned long g_ddUploadWins = 0, g_ddRestoreSkip = 0;   // [dduploadwins] [ddrestore]
+unsigned long g_ddUploadWins2 = 0;   // [ddpostseq]
+unsigned long g_ddSnapBack = 0;   // [srcsnap3] pages put back to their post-time bytes before a service flush
 unsigned long g_deferPosted = 0, g_deferServed = 0, g_deferGate = 0, g_deferLate = 0, g_deferPubWait = 0, g_deferUploadWait = 0, g_deferPageSkip = 0;   // [deferdec] stats
 // [ddkey] key -> latest request (diag; guarded by m_mtx). WEAK: this map is never erased and texKey is content-versioned,
 // so with shared_ptr it pinned every request ever posted -- and since [srcsnap3] a request owns 8 KB per texture page
@@ -2088,12 +2139,80 @@ void GsGpuRenderer::postDecode(std::shared_ptr<TexDecodeReq> req)
         if (ct.w <= 0) { ct.w = req->texW; ct.h = req->texH; ct.needsUpload = false; ct.rgba.clear(); }
         g_texLastUse[req->texKey] = g_texUseGen;
         g_deferByKey[req->texKey] = req;   // [ddkey]
+        if (g_deferByKey.size() > 4096u)     // sweep: drop entries whose request has been serviced and freed
+            for (auto it = g_deferByKey.begin(); it != g_deferByKey.end(); ) { if (it->second.expired()) it = g_deferByKey.erase(it); else ++it; }
         auto snap = [&](uint32_t page, uint32_t &lo, std::vector<uint32_t> &seq) {   // [pageskip]
             if (page == 0xFFFFFFFFu || page >= kVramPages) return;
             const uint32_t n = std::min(flushCoverPages(page), kVramPages - page);
             lo = page; seq.assign(m_uploadSeq + page, m_uploadSeq + page + n); };
         snap(req->flushPage, req->coverLo, req->coverSeq);
         snap(req->flushClutPage, req->coverLo2, req->coverSeq2);
+        {   // [srcsnap] texture pages that are NOT produced by the pending flush hold uploaded bytes that the guest may
+            // re-stream before the service runs: keep them as they are now (the common RT-view request has none)
+            if (g_gsWb && req->pageLo <= req->pageHi && req->pageLo < kVramPages)
+            {
+                // [srcsnap2] a cover only "produces" its pages when the cover page is a real frame buffer (g_fbpFmt entry):
+                // a request whose flushPage is a plain page inside an RT span (BT3's 8-bit HUD sheets at 338-352, CLUTs at
+                // 356-358) flushes nothing at service (no FBO) and decoded LIVE VRAM = the sheet the guest had re-streamed
+                // there since the read. Snapshot those pages too, with their upload seq; the service overlays only the
+                // pages the guest wrote after the post. PS2X_SRCSNAP2=0 = old (out-of-cover pages only, unconditional).
+                static const bool s_ss2 = [](){ const char *v = std::getenv("PS2X_SRCSNAP2"); return !(v && v[0] == '0'); }();
+                // [srcsnap3] PS2X_SRCSNAP3 (default on, =0 off): snapshot EVERY texture page; the service writes the post-time
+                // bytes back into VRAM (for pages the guest re-wrote since) BEFORE its flush, so the incremental flush lands on
+                // the VRAM the read saw and the decode reads the same bytes the sync path would have.
+                static const bool s_ss3 = [](){ const char *v = std::getenv("PS2X_SRCSNAP3"); return !(v && v[0] == '0'); }();
+                auto realCover = [&](uint32_t cp, uint32_t lo, size_t n) {
+                    if (s_ss3) return false;
+                    return cp != 0xFFFFFFFFu && (!s_ss2 || g_fbpFmt.find(cp) != g_fbpFmt.end()) && lo != 0xFFFFFFFFu && n > 0; };
+                const bool rc1 = realCover(req->flushPage, req->coverLo, req->coverSeq.size());
+                const bool rc2 = realCover(req->flushClutPage, req->coverLo2, req->coverSeq2.size());
+                auto inCover = [&](uint32_t pg) {
+                    return (rc1 && pg >= req->coverLo && pg < req->coverLo + (uint32_t)req->coverSeq.size())
+                        || (rc2 && pg >= req->coverLo2 && pg < req->coverLo2 + (uint32_t)req->coverSeq2.size()); };
+                const size_t vsz = g_gsWb->vramSize(); const uint8_t *vr = g_gsWb->vramData();
+                for (uint32_t pg = req->pageLo; pg <= req->pageHi && pg < kVramPages; ++pg)
+                    if (!inCover(pg) && (size_t)pg * 8192u + 8192u <= vsz)
+                    {
+                        req->srcSnap.emplace_back(pg, std::vector<uint8_t>(vr + (size_t)pg * 8192u, vr + (size_t)pg * 8192u + 8192u));
+                        req->srcSnapSeq.push_back(m_uploadSeq[pg]);
+                    }
+            }
+        }
+        {   // [clutsnap] palette bytes at the READ (2 pages from cbp's page): the deferred decode must not use a later slot refill
+            if (g_gsWb && req->tex0.cbp != 0u)
+            {
+                const uint32_t cp = (uint32_t)(req->tex0.cbp / 32u); const size_t vsz = g_gsWb->vramSize();
+                if (cp < kVramPages && (size_t)cp * 8192u + 16384u <= vsz)
+                { req->clutSnapPage = cp; req->clutSnap.assign(g_gsWb->vramData() + (size_t)cp * 8192u, g_gsWb->vramData() + (size_t)cp * 8192u + 16384u);
+                  req->clutSnapSeq[0] = m_uploadSeq[cp]; req->clutSnapSeq[1] = (cp + 1u < kVramPages) ? m_uploadSeq[cp + 1u] : 0u; }
+                {   // [clutzero] PS2X_CLUTZERO=1: is the READ's palette already zero in live VRAM, and who wrote the page last?
+                    static const bool s_cz = [](){ const char *v = std::getenv("PS2X_CLUTZERO"); return v && v[0] && v[0] != '0'; }();
+                    if (s_cz && (req->tex0.psm == 19u || req->tex0.psm == 20u) && cp >= 356u && cp <= 359u)
+                    {
+                        static unsigned long n = 0;
+                        if (n++ < 60)
+                        {
+                            size_t nz = 0; for (size_t i = 0; i < 1024u; ++i) nz += (req->clutSnap[i] != 0u);   // first 1 KB = a 256-entry CT32 palette
+                            std::fprintf(stderr, "[clutzero] post: psm %u tex pages %u-%u clut page %u nonzero %zu/1024 lastWriter %u (seq %u, cover flushPage %u) frame %lu\n",
+                                         (unsigned)req->tex0.psm, req->pageLo, req->pageHi, cp, nz, (unsigned)g_lastWriter[cp], m_uploadSeq[cp], req->flushPage, (unsigned long)g_publishGen);
+                        }
+                    }
+                }
+            }
+        }
+        {   // [fmtsnap] the frame format the flush must use = the one in force at the READ (see TexDecodeReq)
+            auto ff = g_fbpFmt.find(req->flushPage);
+            if (ff != g_fbpFmt.end()) { req->fmtValid = true; req->fmtFbw = ff->second.fbw; req->fmtPsm = ff->second.psm; req->fmtMaxX = ff->second.maxX; req->fmtMaxY = ff->second.maxY; }
+        }
+    }
+    {   // [cseqsnap] see TexDecodeReq::coverContentSeq (guest thread; m_contentSeq is written by this thread's uploads/copies)
+        static const bool s_cs = [](){ const char *v = std::getenv("PS2X_CSEQSNAP"); return !(v && v[0] == '0'); }();
+        if (s_cs && req->flushPage != 0xFFFFFFFFu && req->flushPage < kVramPages)
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            const uint32_t n = std::min(256u, kVramPages - req->flushPage);
+            req->coverContentSeq.assign(m_contentSeq + req->flushPage, m_contentSeq + req->flushPage + n);
+        }
     }
     { extern uint32_t g_zwbBp, g_zwbPsm, g_zwbBw; extern double g_zwbZMax;   // [zwbsnap]
       req->zwbBp = g_zwbBp; req->zwbPsm = g_zwbPsm; req->zwbBw = g_zwbBw; req->zwbZMax = g_zwbZMax; }
@@ -2106,6 +2225,8 @@ void GsGpuRenderer::postDecode(std::shared_ptr<TexDecodeReq> req)
         std::lock_guard<std::mutex> bk(g_barMx);
         if (req->flushPage != 0xFFFFFFFFu) ++g_deferPending[req->flushPage];
         if (req->flushClutPage != 0xFFFFFFFFu && req->flushClutPage != req->flushPage) ++g_deferPending[req->flushClutPage];
+        if (req->flushPage != 0xFFFFFFFFu) g_deferPostSeq[req->flushPage] = m_writeSeq;   // [ddpostseq]
+        if (req->flushClutPage != 0xFFFFFFFFu) g_deferPostSeq[req->flushClutPage] = m_writeSeq;
     }
     ++g_deferPosted;
     if (g_deferPosted <= 4ul || (g_deferPosted & 1023ul) == 0ul) std::fprintf(stderr, "[deferdec] posted %lu served %lu late %lu pubwait %lu upwait %lu pageskip %lu (key %llx page %u clut %u)\n", g_deferPosted, g_deferServed, g_deferLate, g_deferPubWait, g_deferUploadWait, g_deferPageSkip, (unsigned long long)req->texKey, req->flushPage, req->flushClutPage);
@@ -2138,8 +2259,6 @@ static uint32_t flushCoverPages(uint32_t page)
         // fbp336's FBO is 1024x512 (256 pages) while the game uses it as 256x256 fbw 4 (32 pages); the wide cover made
         // every streamed texture in 336..592 (character sheets at 420+, CLUTs at 480/488) look flush-dependent.
         static const bool s_c2 = [](){ const char *v = std::getenv("PS2X_FLUSHCOVER2"); return !(v && v[0] == '0'); }();
-        if (g_deferByKey.size() > 4096u)     // sweep: drop entries whose request has been serviced and freed
-            for (auto it = g_deferByKey.begin(); it != g_deferByKey.end(); ) { if (it->second.expired()) it = g_deferByKey.erase(it); else ++it; }
         auto fit = g_fbpFmt.find(page);
         if (s_c2 && fit != g_fbpFmt.end() && fit->second.fbw > 0 && fit->second.maxY > 0)
         {
@@ -2249,6 +2368,66 @@ void GsGpuRenderer::serviceDecodeReq(TexDecodeReq &q)
     m_svcLo.store(q.coverLo); m_svcN.store((uint32_t)q.coverSeq.size()); m_svcLo2.store(q.coverLo2); m_svcN2.store((uint32_t)q.coverSeq2.size());
     struct SvcWindow { GsGpuRenderer *r; ~SvcWindow() { r->m_svcN.store(0); r->m_svcN2.store(0); r->m_svcLo.store(0xFFFFFFFFu); r->m_svcLo2.store(0xFFFFFFFFu); } } svcWindow{this};
     savePages(q.coverLo, q.coverSeq); savePages(q.coverLo2, q.coverSeq2);
+    static const bool s_ss3 = [](){ const char *v = std::getenv("PS2X_SRCSNAP3"); return !(v && v[0] == '0'); }();
+    // [ddmirror] PS2X_DDMIRROR (default on, =0 off): the read's view is built in the decode's PRIVATE copy -- post-time page
+    // snapshots + the flush MIRRORED into it (g_wbMirror) -- and live VRAM is never touched with old bytes. [srcsnap3]'s
+    // write-back into live VRAM had the right semantics but raced the guest's own sync decodes / local copies (white gi,
+    // missing panels, black frames live).
+    static const bool s_mir = [](){ const char *v = std::getenv("PS2X_DDMIRROR"); return v && v[0] && v[0] != '0'; }();   // opt-in: same garble as srcsnap3, and the per-service copy costs 26 -> 19 fps
+    static std::vector<uint8_t> s_scratch;
+    extern uint8_t *g_wbMirror;
+    if (s_mir && g_gsWb)
+    {
+        const size_t vsz = g_gsWb->vramSize(); const uint8_t *vr = g_gsWb->vramData();
+        if (s_scratch.size() != vsz) s_scratch.assign(vsz, 0u);
+        std::lock_guard<std::mutex> lk(m_mtx);   // uploads write VRAM under m_mtx on the guest side
+        auto copyPages = [&](uint32_t lo, uint32_t hi) {
+            if (lo == 0xFFFFFFFFu) return;
+            for (uint32_t pg = lo; pg <= hi && pg < kVramPages; ++pg)
+            { const size_t off = (size_t)pg * 8192u; if (off + 8192u <= vsz) std::memcpy(s_scratch.data() + off, vr + off, 8192u); } };
+        copyPages(q.pageLo, q.pageHi);
+        if (q.flushPage != 0xFFFFFFFFu) copyPages(q.flushPage, q.flushPage + std::max<uint32_t>(1u, (uint32_t)q.coverSeq.size()) - 1u);
+        if (q.flushClutPage != 0xFFFFFFFFu) copyPages(q.flushClutPage, q.flushClutPage + 1u);
+        { const uint32_t cp = (uint32_t)(q.tex0.cbp / 32u); copyPages(cp, cp + 1u); }
+        for (size_t si = 0; si < q.srcSnap.size() && si < q.srcSnapSeq.size(); ++si)
+        {   // pages the guest re-wrote since the post: the READ saw the snapshot bytes
+            const auto &sp = q.srcSnap[si];
+            if (sp.first >= kVramPages || (size_t)sp.first * 8192u + 8192u > vsz || sp.second.size() != 8192u) continue;
+            if (m_uploadSeq[sp.first] == q.srcSnapSeq[si]) continue;
+            std::memcpy(s_scratch.data() + (size_t)sp.first * 8192u, sp.second.data(), 8192u);
+        }
+        if (q.clutSnapPage != 0xFFFFFFFFu && q.clutSnap.size() == 16384u && (size_t)q.clutSnapPage * 8192u + 16384u <= vsz)
+        {   // [clutsnap] the READ's palette -- but only where the guest UPLOADED the page after the post. An RT-produced
+            // palette (BT3: pages 336/356-358 inside fbp336's span) is newer in live VRAM (in-order flushes) than at the post.
+            static const bool s_cg = [](){ const char *v = std::getenv("PS2X_CLUTSNAPGATE"); return v && v[0] && v[0] != '0'; }();   // default OFF: measured worse (palettes 357/358 read zero from live VRAM)
+            for (uint32_t k = 0; k < 2u; ++k)
+            {
+                const uint32_t pg = q.clutSnapPage + k;
+                if (pg >= kVramPages) break;
+                if (!s_cg || m_uploadSeq[pg] != q.clutSnapSeq[k])
+                    std::memcpy(s_scratch.data() + (size_t)pg * 8192u, q.clutSnap.data() + (size_t)k * 8192u, 8192u);
+            }
+        }
+        g_wbMirror = s_scratch.data();
+    }
+    struct MirrorScope { ~MirrorScope() { extern uint8_t *g_wbMirror; g_wbMirror = nullptr; } } mirrorScope;
+    static const bool s_ss3wb = [](){ const char *v = std::getenv("PS2X_SRCSNAP3WB"); return v && v[0] && v[0] != '0'; }();   // opt-in: writes old bytes into LIVE VRAM (raced the guest: white gi / black frames)
+    if (s_ss3 && s_ss3wb && !s_mir && g_gsWb)
+    {   // [srcsnap3] texture pages the guest re-wrote since the post: put the READ's bytes back for the flush + decode,
+        // keep the guest's bytes aside (restored with the cover pages after the decode; a page written again meanwhile wins)
+        uint8_t *vram = g_gsWb->vramData(); const size_t vsz = g_gsWb->vramSize();
+        std::lock_guard<std::mutex> lk(m_mtx);
+        for (size_t si = 0; si < q.srcSnap.size() && si < q.srcSnapSeq.size(); ++si)
+        {
+            const uint32_t pg = q.srcSnap[si].first; const size_t off = (size_t)pg * 8192u;
+            if (pg >= kVramPages || off + 8192u > vsz || q.srcSnap[si].second.size() != 8192u) continue;
+            if (m_uploadSeq[pg] == q.srcSnapSeq[si]) continue;
+            bool have = false; for (const auto &e : saved) if (e.page == pg) { have = true; break; }
+            if (!have) saved.push_back({pg, m_uploadSeq[pg], std::vector<uint8_t>(vram + off, vram + off + 8192u)});
+            std::memcpy(vram + off, q.srcSnap[si].second.data(), 8192u);
+            extern unsigned long g_ddSnapBack; ++g_ddSnapBack;
+        }
+    }
     auto releasePending = [&](uint32_t pg) {   // [deferpend] v1 order (the best-measured state): release right after the flush
         std::lock_guard<std::mutex> bk(g_barMx);
         auto it = g_deferPending.find(pg); if (it != g_deferPending.end() && --it->second <= 0) g_deferPending.erase(it); };
@@ -2269,7 +2448,69 @@ void GsGpuRenderer::serviceDecodeReq(TexDecodeReq &q)
     if (g_gsWb)
     {
         int subW = 0; std::vector<uint8_t> rgba;
-        g_gsWb->rasterizer().decodeDeferred(q, g_gsWb->vramData(), g_gsWb->vramSize(), subW, rgba);
+        // [ddsnap] decode from a SNAPSHOT of the flushed span, not live VRAM: the guest keeps uploading (HUD sheets are
+        // re-streamed 7x per frame into the fbp336 pages) while this runs, and a decode that reads live VRAM after such an
+        // upload sees next frame's sheet instead of the render target it was posted for (garbled HUD). PS2X_DDSNAP=0 = old.
+        static const bool s_snap = [](){ const char *v = std::getenv("PS2X_DDSNAP"); return !(v && v[0] == '0'); }();
+        uint8_t *decSrc = g_gsWb->vramData();
+        if (s_mir) { g_wbMirror = nullptr; decSrc = s_scratch.data(); }   // [ddmirror] the private copy already holds the read's view
+        else if (s_snap)
+        {
+            const size_t vsz = g_gsWb->vramSize();
+            if (s_scratch.size() != vsz) s_scratch.assign(vsz, 0u);
+            auto copyPages = [&](uint32_t lo, uint32_t hi) {
+                if (lo == 0xFFFFFFFFu) return;
+                for (uint32_t pg = lo; pg <= hi && pg < kVramPages; ++pg)
+                { const size_t off = (size_t)pg * 8192u; if (off + 8192u <= vsz) std::memcpy(s_scratch.data() + off, decSrc + off, 8192u); } };
+            {
+                std::lock_guard<std::mutex> lk(m_mtx);   // uploads write VRAM under m_mtx on the guest side
+                copyPages(q.pageLo, q.pageHi);
+                if (q.flushClutPage != 0xFFFFFFFFu) copyPages(q.flushClutPage, q.flushClutPage + 1u);
+                { const uint32_t cp = (uint32_t)(q.tex0.cbp / 32u); copyPages(cp, cp + 1u); }
+                if (q.clutSnapPage != 0xFFFFFFFFu && q.clutSnap.size() == 16384u && (size_t)q.clutSnapPage * 8192u + 16384u <= vsz)
+                    std::memcpy(s_scratch.data() + (size_t)q.clutSnapPage * 8192u, q.clutSnap.data(), 16384u);   // [clutsnap] palette of the READ, not of now
+                for (size_t si = 0; si < q.srcSnap.size(); ++si)   // [srcsnap] upload-fed source pages as they were at the READ
+                {   // [srcsnap2] only where the guest wrote the page AFTER the post; otherwise live VRAM (in-order flushes) is the read's view
+                    const auto &sp = q.srcSnap[si];
+                    static const bool s_ss2 = [](){ const char *v = std::getenv("PS2X_SRCSNAP2"); return !(v && v[0] == '0'); }();
+                    // [snapclobber] a page OUTSIDE this request's real FBO cover is upload-fed: the READ saw the snapshot, and a
+                    // deferred writeback landing on it later (fbp336's flush spans 336-391, zeroing the 8-bit HUD sheets at
+                    // 337-353) does not bump the upload seq -- so the snapshot must be used unconditionally there (measured:
+                    // sheet page zero live / 6716 bytes in the snapshot / seq unchanged -> black HUD). RT-cover pages keep the
+                    // flush and take the snapshot only where the guest re-uploaded after the post. PS2X_SNAPCLOBBER=0 = old.
+                    static const bool s_sc = [](){ const char *v = std::getenv("PS2X_SNAPCLOBBER"); return !(v && v[0] == '0'); }();
+                    const bool realCover = q.fmtValid && q.coverLo != 0xFFFFFFFFu && sp.first >= q.coverLo && sp.first < q.coverLo + (uint32_t)q.coverSeq.size();
+                    if (s_sc && !realCover) { /* unconditional overlay below */ }
+                    else if (s_ss3 && !s_ss3wb) { if (s_ss2 && si < q.srcSnapSeq.size() && sp.first < kVramPages && m_uploadSeq[sp.first] == q.srcSnapSeq[si]) continue; }
+                    else if (s_ss3) break;   // [srcsnap3] write-back mode: already in VRAM before the flush
+                    else if (s_ss2 && si < q.srcSnapSeq.size() && sp.first < kVramPages && m_uploadSeq[sp.first] == q.srcSnapSeq[si]) continue;
+                    if ((size_t)sp.first * 8192u + 8192u <= vsz && sp.second.size() == 8192u) std::memcpy(s_scratch.data() + (size_t)sp.first * 8192u, sp.second.data(), 8192u);
+                }
+            }
+            decSrc = s_scratch.data();
+        }
+        g_gsWb->rasterizer().decodeDeferred(q, decSrc, g_gsWb->vramSize(), subW, rgba);
+        {   // [svcprobe] PS2X_CLUTZERO=1: for the 8-bit sheet class, what did the decode actually read?
+            static const bool s_cz = [](){ const char *v = std::getenv("PS2X_CLUTZERO"); return v && v[0] && v[0] != '0'; }();
+            if (s_cz && (q.tex0.psm == 19u || q.tex0.psm == 20u) && q.tex0.cbp / 32u >= 356u && q.tex0.cbp / 32u <= 359u)
+            {
+                static unsigned long n = 0;
+                if (n++ < 60)
+                {
+                    const size_t vsz = g_gsWb->vramSize(); const size_t co = (size_t)q.tex0.cbp * 256u;
+                    size_t palNz = 0, sheetNz = 0, liveSheetNz = 0, snapNz = 0;
+                    if (co + 1024u <= vsz) for (size_t i = 0; i < 1024u; ++i) palNz += (decSrc[co + i] != 0u);
+                    const size_t so = (size_t)q.pageLo * 8192u;
+                    if (so + 8192u <= vsz) for (size_t i = 0; i < 8192u; ++i) { sheetNz += (decSrc[so + i] != 0u); liveSheetNz += (g_gsWb->vramData()[so + i] != 0u); }
+                    for (const auto &sp : q.srcSnap) if (sp.first == q.pageLo) { for (uint8_t b : sp.second) snapNz += (b != 0u); break; }
+                    unsigned long sr = 0, sa = 0; for (size_t i = 0; i + 3 < rgba.size(); i += 4) { sr += rgba[i]; sa += rgba[i + 3]; }
+                    const size_t px = std::max<size_t>(1, rgba.size() / 4);
+                    std::fprintf(stderr, "[svcprobe] psm %u pages %u-%u cbp %u: scratch pal nz %zu/1024 | sheet page %u nz scratch %zu live %zu postsnap %zu (snaps %zu, seq now %u post %u) | decode mean R %lu A %lu | src %s\n",
+                                 (unsigned)q.tex0.psm, q.pageLo, q.pageHi, q.tex0.cbp, palNz, q.pageLo, sheetNz, liveSheetNz, snapNz, q.srcSnap.size(),
+                                 m_uploadSeq[q.pageLo], q.srcSnapSeq.empty() ? 0u : q.srcSnapSeq[0], sr / px, sa / px, decSrc == g_gsWb->vramData() ? "LIVE" : "scratch");
+                }
+            }
+        }
         double meanA = -1.0;
         if (g_deferServed < 6ul && rgba.size() >= 4) { unsigned long sa = 0; for (size_t i = 3; i < rgba.size(); i += 4) sa += rgba[i]; meanA = (double)sa / (double)(rgba.size() / 4); }
         {   // [ddlog] PS2X_DEFERDEC_LOG=path: one line per serviced decode (page psm size mean RGBA + a content hash)
@@ -2292,8 +2533,12 @@ void GsGpuRenderer::serviceDecodeReq(TexDecodeReq &q)
     {   // restore the guest's newer pages (unless the guest wrote them again meanwhile)
         uint8_t *vram = g_gsWb->vramData();
         std::lock_guard<std::mutex> lk(m_mtx);
-        for (const Saved &e : saved)   // no guest write can have landed inside the window (uploads wait for it)
+        for (const Saved &e : saved)
+        {   // [ddrestore] uploads do NOT wait for the window by default: a page the guest wrote again meanwhile holds
+            // newer bytes than the copy we saved -- restoring the copy would LOSE that upload (stale HUD sheets).
+            if (m_uploadSeq[e.page] != e.seq) { extern unsigned long g_ddRestoreSkip; ++g_ddRestoreSkip; continue; }
             std::memcpy(vram + (size_t)e.page * 8192u, e.bytes.data(), 8192u);
+        }
     }
     q.served = true;
 }
@@ -2384,15 +2629,50 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
                 // not be deferred -- deferring it decoded the texture AFTER the guest re-streamed the page (garbled HUD,
                 // purple Goku, live only). Rule: last upload newer than the covering fbp's last render -> clean.
                 static const bool s_uw = [](){ const char *v = std::getenv("PS2X_DDUPLOADWINS"); return !(v && v[0] == '0'); }();
-                if (s_uw && dirty && page < kVramPages && !dirtyBefore)
+                if (s_uw && dirty && page < kVramPages)
                 {
-                    uint32_t cover = 0xFFFFFFFFu;
-                    for (const auto &kv : g_deferPending)
-                        if (kv.second > 0 && page >= kv.first && page < kv.first + flushCoverPages(kv.first)) { cover = kv.first; break; }
+                    // the covering fbp: the page itself when it IS an fbp (g_barDirty is keyed by fbp -- the HUD glyph
+                    // sheet at page 336 == fbp336 was always "dirty before" and slipped past this test), else the pending
+                    // flush whose cover contains it
+                    uint32_t cover = dirtyBefore ? page : 0xFFFFFFFFu;
+                    if (cover == 0xFFFFFFFFu)
+                        for (const auto &kv : g_deferPending)
+                            if (kv.second > 0 && page >= kv.first && page < kv.first + flushCoverPages(kv.first)) { cover = kv.first; break; }
                     if (cover != 0xFFFFFFFFu && cover < kVramPages && m_pageSeq[page] > m_fbpRenderSeq[cover])
                     { dirty = false; extern unsigned long g_ddUploadWins; ++g_ddUploadWins; }
+                    // [ddpostseq] the page's newest bytes are a guest upload made AFTER the newest pending post that covers
+                    // it: the service's flush saves+restores such pages ([pagesave]), so VRAM holds now exactly what the
+                    // sync path would read (flush at the read, then the upload). Deferring it instead decoded the page at
+                    // SERVICE time, after the game had re-streamed the next 8-bit HUD sheet into it (pages 338-352, CLUT
+                    // 356-358): every panel/digit read mixed sheets -- the garbled HUD. PS2X_DDPOSTSEQ=0 = old rule only.
+                    static const bool s_ps = [](){ const char *v = std::getenv("PS2X_DDPOSTSEQ"); return v && v[0] && v[0] != '0'; }();   // default OFF: pages 338-352 hold RT content too (panel frames) -> stale at the read (DDK)
+                    if (s_ps && dirty && !dirtyBefore && cover != 0xFFFFFFFFu)
+                    {
+                        auto ps = g_deferPostSeq.find(cover);
+                        if (ps != g_deferPostSeq.end() && m_pageSeq[page] > ps->second)
+                        { dirty = false; extern unsigned long g_ddUploadWins2; ++g_ddUploadWins2; }
+                    }
                 }
             }
+            {   // [ddgatelog] PS2X_DDGATELOG=1: why is a read of the fbp336 span deferred? (first 80 reads of pages 336..399)
+                static const bool s_gl = [](){ const char *v = std::getenv("PS2X_DDGATELOG"); return v && v[0] && v[0] != '0'; }();
+                static int n = 0;
+                if (s_gl && deferOut && dirty && page >= 336u && page < 400u && n < 120)
+                {
+                    ++n;
+                    uint32_t cover = dirtyBefore ? page : 0xFFFFFFFFu;
+                    if (cover == 0xFFFFFFFFu)
+                        for (const auto &kv : g_deferPending)
+                            if (kv.second > 0 && page >= kv.first && page < kv.first + flushCoverPages(kv.first)) { cover = kv.first; break; }
+                    extern uint32_t g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw;
+                    std::fprintf(stderr, "[ddgate] page %u dirtyB=%d pend=%d dirty=%d alpha=%d cover=%u pageSeq=%u renderSeq=%u writeSeq=%u tbp=%u cbp=%u psm=%u tbw=%u\n",
+                                 page, (int)dirtyBefore, (int)pend, (int)dirty, (int)wantsAlphaAsData, cover, m_pageSeq[page],
+                                 cover < kVramPages ? m_fbpRenderSeq[cover] : 0u, m_writeSeq, g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw);
+                }
+            }
+            if (ptHit(page, page) && g_ptN < ptMax())
+            {   extern uint32_t g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw; ++g_ptN;
+                std::fprintf(stderr, "[pt] %lu READ page=%u tbp=%u cbp=%u psm=%u tbw=%u dirtyB=%d pend=%d dirty=%d alpha=%d defer=%d seq=%u\n", g_ptN, page, g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw, (int)dirtyBefore, (int)pend, (int)dirty, (int)wantsAlphaAsData, (int)(deferOut != nullptr), m_writeSeq); }
             if (!dirty && !(wantsAlphaAsData && (s_barAlwaysAEnv || g_barAlphaStale.count(page)))) return;
             g_barDirty.erase(page);
             if (deferOut && ddPageAllowed(page))
@@ -3058,6 +3338,11 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
             std::fprintf(s_tl, "%dx%d pages %u-%u gl=%d mean %lu %lu %lu %lu hash %llx\n", w, h, pageLo, pageHi, (int)ps2xOnGlThread(), sr / px, sg / px, sb / px, sa / px, (unsigned long long)hh);
         }
     }
+    if (ptHit(pageLo, pageHi) && w > 0 && h > 0 && rgba.size() >= 4 && g_ptN < ptMax())
+    {   uint64_t hh = 1469598103934665603ull; unsigned long sa = 0;
+        for (size_t i = 0; i < rgba.size(); i += 64) { hh = (hh ^ rgba[i]) * 1099511628211ull; }
+        for (size_t i = 3; i < rgba.size(); i += 4) sa += rgba[i];
+        ++g_ptN; std::fprintf(stderr, "[pt] %lu DECODE %dx%d pages %u-%u gl=%d meanA=%lu hash=%llx\n", g_ptN, w, h, pageLo, pageHi, (int)ps2xOnGlThread(), sa / (rgba.size() / 4), (unsigned long long)hh); }
     (void)pageLo; (void)pageHi;
     std::lock_guard<std::mutex> lk(m_mtx);
     ++g_putTexCount;   // [cachestat]
@@ -4001,6 +4286,7 @@ void GsGpuRenderer::swapFrame()
             m_ready.swap(m_building);
         m_building.clear();
         ++g_publishGen; // a genuinely new frame -> present thread should re-render
+        { ++g_ptFrames; if (ptInit() && g_ptFrames >= ptFrom() && g_ptN < ptMax()) { ++g_ptN; std::fprintf(stderr, "[pt] %lu FRAME %lu seq=%u\n", g_ptN, g_ptFrames, m_writeSeq); } }
     }
 }
 
@@ -4020,11 +4306,18 @@ void GsGpuRenderer::onVramUpload(uint32_t dbpBlock, uint32_t sizeBlocks)
     uint32_t p1 = (dbpBlock + sizeBlocks) / 32u;
     if (p0 >= kVramPages) p0 = kVramPages - 1;
     if (p1 >= kVramPages) p1 = kVramPages - 1;
+    if (ptHit(p0, p1) && g_ptN < ptMax()) { ++g_ptN; std::fprintf(stderr, "[pt] %lu UP dbp=%u blocks=%u pages %u-%u seq=%u gl=%d\n", g_ptN, dbpBlock, sizeBlocks, p0, p1, m_writeSeq, (int)ps2xOnGlThread()); }
     for (uint32_t p = p0; p <= p1; ++p)
     {   // BOTH: a guest upload changes content AND is what srcUploaded keys on.
         m_pageSeq[p] = m_writeSeq;
         m_contentSeq[p] = m_writeSeq;
         if (!ps2xOnGlThread()) m_uploadSeq[p] = m_writeSeq;   // [pageskip] GUEST write only (the writeback path also calls onVramUpload via [wbstamp])
+        g_lastWriter[p] = ps2xOnGlThread() ? 2u : 1u;   // [lastwriter] 1 = guest upload, 2 = GL writeback stamp
+        {   // [pagelog] PS2X_PAGELOG=lo-hi: every guest upload / writeback stamp touching the page range, with the thread
+            static const std::pair<int,int> s_pl = [](){ std::pair<int,int> r{-1,-1}; if (const char *v = std::getenv("PS2X_PAGELOG")) std::sscanf(v, "%d-%d", &r.first, &r.second); return r; }();
+            if (s_pl.first >= 0 && (int)p >= s_pl.first && (int)p <= s_pl.second)
+            { static unsigned long n = 0; if (n++ < 400) std::fprintf(stderr, "[pagelog] %s page %u (frame %lu)\n", ps2xOnGlThread() ? "GL-stamp" : "GUEST-upload", p, (unsigned long)g_publishGen); }
+        }
     }
     { extern std::vector<std::pair<uint32_t,uint32_t>> g_pageStampSrc; if (g_pageStampSrc.size() < kVramPages) g_pageStampSrc.resize(kVramPages);
       for (uint32_t p = p0; p <= p1; ++p) g_pageStampSrc[p] = {dbpBlock, sizeBlocks}; }   // [seqattr] upload
