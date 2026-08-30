@@ -297,7 +297,8 @@ namespace
         // rlgl batch would be drawn with the NEW filter (the batch is flushed later). Draw them first. Without this
         // the same HUD glyph came out point- or bilinear-sampled depending on where the batch happened to break
         // (BARBLOCK's chunk pre-renders move the breaks -> the timer's left lobe alternated crisp/blurred).
-        rlDrawRenderBatchActive();
+        static const bool s_ff = [](){ const char *v = std::getenv("PS2X_FILTERFLUSH"); return !(v && v[0] == '0'); }();   // [filterflush] =0: old behaviour (A/B)
+        if (s_ff) rlDrawRenderBatchActive();
         SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
         g_texFilterState[t.id] = bilinear;
     }
@@ -2068,6 +2069,7 @@ static bool ddPageAllowed(uint32_t page)
     for (uint32_t p : s_pages) if (p == page) return true;
     return false;
 }
+unsigned long g_ddUploadWins = 0;   // [dduploadwins]
 unsigned long g_deferPosted = 0, g_deferServed = 0, g_deferGate = 0, g_deferLate = 0, g_deferPubWait = 0, g_deferUploadWait = 0, g_deferPageSkip = 0;   // [deferdec] stats
 static std::unordered_map<uint64_t, std::shared_ptr<TexDecodeReq>> g_deferByKey;   // [ddkey] key -> latest request (diag; guarded by m_mtx)
 extern GS *g_gsWb;   // [deferdec] the GS the writeback path uses (set on the first writeback)
@@ -2129,6 +2131,20 @@ static uint32_t flushCoverPages(uint32_t page)
 {
     auto it = g_fbos.find(page);
     if (it == g_fbos.end() || it->second.w <= 0 || it->second.h <= 0) return 128u;   // unknown yet: be conservative
+    {   // [flushcover2] cover what the game actually DRAWS (maxY rows at its stride/format), not the FBO allocation:
+        // fbp336's FBO is 1024x512 (256 pages) while the game uses it as 256x256 fbw 4 (32 pages); the wide cover made
+        // every streamed texture in 336..592 (character sheets at 420+, CLUTs at 480/488) look flush-dependent.
+        static const bool s_c2 = [](){ const char *v = std::getenv("PS2X_FLUSHCOVER2"); return !(v && v[0] == '0'); }();
+        auto fit = g_fbpFmt.find(page);
+        if (s_c2 && fit != g_fbpFmt.end() && fit->second.fbw > 0 && fit->second.maxY > 0)
+        {
+            const uint32_t ps = fit->second.psm;
+            const uint32_t bpp = (ps == 0x02u || ps == 0x0Au || ps == 0x32u || ps == 0x3Au) ? 16u : (ps == 0x13u || ps == 0x1Bu) ? 8u : (ps == 0x14u || ps == 0x24u || ps == 0x2Cu) ? 4u : 32u;
+            const uint64_t bytes = (uint64_t)fit->second.maxY * fit->second.fbw * 64u * bpp / 8u;
+            const uint32_t pages = (uint32_t)((bytes + 8191u) / 8192u);
+            if (pages > 0) return std::max(1u, pages);
+        }
+    }
     return (uint32_t)(((size_t)it->second.w * (size_t)it->second.h * 4u + 8191u) / 8192u);   // 4 bpp: conservative for 16-bit views
 }
 static bool flushPendingLocked(uint32_t page)
@@ -2356,7 +2372,22 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
             // read must not decode synchronously from it (that is what the rig, which flushes inline, never sees)
             const bool pend = flushPendingLocked(page);   // [flushcover]
             const bool dirtyBefore = g_barDirty.count(page) != 0;
-            const bool dirty = dirtyBefore || pend;
+            bool dirty = dirtyBefore || pend;
+            {   // [dduploadwins] the page may sit inside a render target's ADDRESS RANGE (flushCoverPages covers the whole
+                // FBO allocation: fbp336 = 256 pages) while its newest content is a guest UPLOAD (streamed character sheets,
+                // CLUT slots, HUD glyphs). Such a page holds uploaded bytes, not rendered ones: it needs no flush and must
+                // not be deferred -- deferring it decoded the texture AFTER the guest re-streamed the page (garbled HUD,
+                // purple Goku, live only). Rule: last upload newer than the covering fbp's last render -> clean.
+                static const bool s_uw = [](){ const char *v = std::getenv("PS2X_DDUPLOADWINS"); return !(v && v[0] == '0'); }();
+                if (s_uw && dirty && page < kVramPages && !dirtyBefore)
+                {
+                    uint32_t cover = 0xFFFFFFFFu;
+                    for (const auto &kv : g_deferPending)
+                        if (kv.second > 0 && page >= kv.first && page < kv.first + flushCoverPages(kv.first)) { cover = kv.first; break; }
+                    if (cover != 0xFFFFFFFFu && cover < kVramPages && m_pageSeq[page] > m_fbpRenderSeq[cover])
+                    { dirty = false; extern unsigned long g_ddUploadWins; ++g_ddUploadWins; }
+                }
+            }
             if (!dirty && !(wantsAlphaAsData && (s_barAlwaysAEnv || g_barAlphaStale.count(page)))) return;
             g_barDirty.erase(page);
             if (deferOut && ddPageAllowed(page))
@@ -3907,7 +3938,7 @@ void GsGpuRenderer::swapFrame()
             if (m_building[i].isDecode && m_building[i].decode && !m_building[i].decode->served) return true;   // bind an empty placeholder
         return false; };
     {
-        static const bool s_dd = [](){ const char *v = std::getenv("PS2X_DEFERDEC"); return v && v[0] && v[0] != '0'; }();
+        static const bool s_dd = [](){ const char *v = std::getenv("PS2X_DEFERDEC"); return v && v[0] && v[0] != '0'; }();   // opt-in: live corrupts streamed textures inside RT page ranges (2026-08-30), 27.7 fps when it works
         extern unsigned long g_deferPubWait; unsigned spins = 0;
         while (m_segSwapped || (s_dd && unservicedDecode()))
         {   // [segshadow] a segment render holds the list / [deferpub] the GL thread is still draining this frame's
@@ -9092,7 +9123,11 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         // triggers the flush, so requiring a prior flush only made the first frames wrong.
         static const bool s_barOnHere = [](){ const char *v = std::getenv("PS2X_BARRIER");
                                               return v && v[0] && v[0] != '0'; }();
-        const bool alphaOnlyWantsVram = s_barOnHere && (c.fbmsk == 0x00FFFFFFu) &&
+        // [alphaonlyfbo] PS2X_ALPHAONLYFBO=1: since AFLUSH/CT32ALPHA (2026-08-25) the FBO alpha IS the game's alpha field,
+        // so the alpha-only mask reads can sample the render target directly (via the rtsnap copy) instead of forcing a
+        // barrier flush + VRAM decode (the scene pages = the most expensive barriers: ~5/frame, ~5 ms).
+        static const bool s_aoFbo = [](){ const char *v = std::getenv("PS2X_ALPHAONLYFBO"); return v && v[0] && v[0] != '0'; }();
+        const bool alphaOnlyWantsVram = !s_aoFbo && s_barOnHere && (c.fbmsk == 0x00FFFFFFu) &&
                                         (c.srcTbp0 % 32u) == 0u;
 
         bool idxRt = false;   // sampling a live FBO's ALPHA through a CLUT (PSMT8H of an RT)
