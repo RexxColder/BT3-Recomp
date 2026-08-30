@@ -2399,8 +2399,15 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
             m_privRegs->display1 = value;
         {
             // DISPLAY1: DX[0:11] DY[12:22] MAGH[23:26] MAGV[27:28] DW[32:43] DH[44:54].
-            // If the game magnifies a narrow buffer to full screen, the software present
-            // honors it but the GPU present shows the raw buffer -> "tiling".
+            // Store the display width (buffer pixels) for the GPU present source rect.
+            // DW is in 64-pixel units: buffer width = (DW + 1) * 64.
+            if (GsGpuRenderer::enabled())
+            {
+                const uint32_t dw = (value >> 32) & 0xFFFu;
+                const uint32_t magh = (value >> 23) & 0xFu;
+                const int bufW = static_cast<int>((dw + 1) * 64u);
+                ps2GpuRenderer().setDisplayWidth(bufW);
+            }
             static const bool s_dl = [](){ const char *v = std::getenv("PS2X_GPU_DIAG"); return v && v[0] && v[0] != '0'; }();
             static uint64_t s_last = ~0ull; static int s_n = 0;
             if (s_dl && value != s_last && s_n < 12)
@@ -2440,6 +2447,13 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case 0x5c:
         if (m_privRegs)
             m_privRegs->display2 = value;
+        // BT3 uses output circuit 2 — store display width from DISPLAY2 as well.
+        if (GsGpuRenderer::enabled())
+        {
+            const uint32_t dw = (value >> 32) & 0xFFFu;
+            const int bufW = static_cast<int>((dw + 1) * 64u);
+            ps2GpuRenderer().setDisplayWidth(bufW);
+        }
         break;
     case 0x5f:
         if (m_privRegs)

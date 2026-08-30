@@ -199,6 +199,11 @@ public:
     // PS2X_ATLAS mode, where the display buffer occupies a sub-rect of the big atlas texture.
     int presentSrcX() const { return m_presentSrcX; }
     int presentSrcY() const { return m_presentSrcY; }
+    // GS DISPLAY1 register width (pixels) — authoritative display size, constant
+    // across double-buffer flips. Used as the present source rect width to avoid
+    // scissor-based cropping (3D zoom) and grow-only FBO flicker.
+    void setDisplayWidth(int w) { m_displayRegW = w; }
+    int displayWidthFromReg() const { return m_displayRegW; }
 
     uint64_t recordedThisSecond();
 
@@ -246,6 +251,7 @@ private:
     int m_dispW = 0, m_dispH = 0;
     int m_presentTexW = 0, m_presentTexH = 0;
     int m_presentSrcX = 0, m_presentSrcY = 0;
+    int m_displayRegW = 0;  // GS DISPLAY1 register width (pixels)
     uint32_t m_hintDisplayFbp = 0xFFFFFFFFu; // DISPFB1 fbp (the buffer the CRT scans out)
     uint32_t m_hintDisplayFbw = 0u;          // DISPFB1 fbw (display stride, 64px units)
     bool m_glInit = false;

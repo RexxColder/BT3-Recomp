@@ -3852,19 +3852,30 @@ void PS2Runtime::run()
             const int srcYOff = ps2GpuRenderer().presentSrcY();
             if (texW > 0) maxW = std::min(maxW, texW);
             if (texH > 0) maxH = std::min(maxH, texH - std::max(0, srcYOff));
-            // Use the actual FBO texture dimensions as the source rect. The scissor-derived
-            // displayWidth() can be SMALLER than the FBO in 3D scenes (composite draws 512px
-            // into a 640-wide buffer) or at higher render scales (scissor 1024 < FBO 1280),
-            // which incorrectly crops the source rect and zooms the image. The full texture
-            // matches the GS DISPLAY register (the hardware-authoritative display size).
-            // Fall back to displayWidth() if the texture is larger than maxW (grow-only FBO).
-            if (texW > 0 && texW <= maxW) presentWidth = static_cast<uint32_t>(texW);
-            else if (dw > 0 && dw <= maxW) presentWidth = static_cast<uint32_t>(dw);
-            const int availH = (texH > 0 && srcYOff >= 0) ? (texH - srcYOff) : 0;
-            if (availH > 0 && availH <= maxH) presentHeight = static_cast<uint32_t>(availH);
-            else if (dh > 0 && dh <= maxH) presentHeight = static_cast<uint32_t>(dh);
+            // Use the GS DISPLAY register width as the source rect — it is the
+            // hardware-authoritative display size, constant across double-buffer flips
+            // (avoids grow-only FBO flicker) and correct for 3D scenes where the
+            // scissor-derived displayWidth() is smaller than the actual display.
+            const int dispRegW = ps2GpuRenderer().displayWidthFromReg() * rs;
+            if (dispRegW > 0 && dispRegW <= maxW)
+                presentWidth = static_cast<uint32_t>(dispRegW);
+            else if (texW > 0 && texW <= maxW)
+                presentWidth = static_cast<uint32_t>(texW);
+            else if (dw > 0 && dw <= maxW)
+                presentWidth = static_cast<uint32_t>(dw);
+            // Height: same priority — DISPLAY register DH, then texH-srcY, then displayHeight.
+            const int dispRegH = static_cast<int>(DEFAULT_DISPLAY_HEIGHT) * rs;
+            if (dispRegH > 0 && dispRegH <= maxH)
+                presentHeight = static_cast<uint32_t>(dispRegH);
+            else {
+                const int availH = (texH > 0 && srcYOff >= 0) ? (texH - srcYOff) : 0;
+                if (availH > 0 && availH <= maxH)
+                    presentHeight = static_cast<uint32_t>(availH);
+                else if (dh > 0 && dh <= maxH)
+                    presentHeight = static_cast<uint32_t>(dh);
+            }
             static bool s_dlog = false;
-            if (!s_dlog && dw > 0 && std::getenv("PS2X_GPU_DIAG")) { s_dlog = true; std::cerr << "[gpupresent] disp=" << dw << "x" << dh << " -> present=" << presentWidth << "x" << presentHeight << std::endl; }
+            if (!s_dlog && dw > 0 && std::getenv("PS2X_GPU_DIAG")) { s_dlog = true; std::cerr << "[gpupresent] disp=" << dw << "x" << dh << " reg=" << dispRegW << " tex=" << texW << " -> present=" << presentWidth << "x" << presentHeight << std::endl; }
         }
         else
         {
