@@ -3961,14 +3961,10 @@ static bool gaExecShaderInit()
             "out vec4 finalColor;\n"
             "void main(){\n"
             "  ivec2 xy = ivec2(gl_FragCoord.xy);\n"
-            "  if (uStage == 9) {\n"   // CT16 re-view of a CT32 FBO: (x,y) -> word (x, y>>1), halfword = y&1 (ct16pair, sentinel-verified)
-            "    int wx = xy.x; int wy = xy.y >> 1;\n"            // CT32 coords in the fbw8 (512-wide) layout
-            "    int pg = (wy >> 5) * 8 + (wx >> 6);\n"           // page index (CT32 page = 64x32, 8 pages/row at fbw8)
-            "    int fpw = max(uXOff, 1);\n"                      // FBO width in pages (its ACTUAL layout)
-            "    ivec2 t = ivec2((pg % fpw) * 64 + (wx & 63), (pg / fpw) * 32 + (wy & 31));\n"
-            "    if (uSrcFlip == 1) t.y = uSrcH - 1 - t.y;\n"
+            "  if (uStage == 9) {\n"   // control-equivalent CT16 re-view: FLUSHASREAD writes pack5551(FBO px at (x,y))
+            "    ivec2 t = ivec2(xy.x, (uSrcFlip == 1) ? (uSrcH - 1 - xy.y) : xy.y);\n"   // identity, not a byte shuffle
             "    ivec4 F = ivec4(texelFetch(uSrcA, t, 0) * 255.0 + 0.5);\n"
-            "    int h = ((xy.y & 1) == 1) ? (F.b | (F.a << 8)) : (F.r | (F.g << 8));\n"
+            "    int h = (F.r >> 3) | ((F.g >> 3) << 5) | ((F.b >> 3) << 10) | ((F.a >> 7) << 15);\n"
             "    finalColor = vec4(float((h & 31) << 3), float(((h >> 5) & 31) << 3), float(((h >> 10) & 31) << 3), float(((h >> 15) & 1) << 7)) / 255.0;\n"
             "    return;\n"
             "  }\n"
@@ -9981,18 +9977,18 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 c.texaTa1 == 0u && c.texaAem &&
                 (c.dx1 - c.dx0) <= 33.0f && (c.destFbp == 0u || c.destFbp == 112u))
             {
-                // Demand-build the CT16 re-view of the f336 FBO when its render generation moved.
-                static unsigned long s_builtSeq = ~0ul;
+                // Rebuild the re-view at EVERY serve: a per-generation cache captured pre-chain
+                // FBO snapshots for the frame's earliest readers (ghost after-images of the
+                // previous pose). 96 fullscreen 512x448 passes/frame is GPU-trivial.
                 auto fit336 = g_fbos.find(336u);
                 const bool have336 = fit336 != g_fbos.end() && fit336->second.rt.texture.id != 0;
-                const unsigned long seq336 = (336u < kVramPages) ? (unsigned long)m_fbpRenderSeq[336] : 0ul;
-                if (have336 && seq336 != s_builtSeq &&
-                    gaBuildReviewTex(fit336->second.rt.texture, fit336->second.h))
+                bool built = false;
+                if (have336 && gaBuildReviewTex(fit336->second.rt.texture, fit336->second.h))
                 {
-                    s_builtSeq = seq336;
+                    built = true;
                     curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;   // the builder rebound FBO/shader state
                 }
-                if (s_builtSeq != seq336 || g_gaViewTex[g_gaCur].texture.id == 0)
+                if (!built || g_gaViewTex[g_gaCur].texture.id == 0)
                     goto gaNoFlip;   // could not build: fall back to the normal path
                 tex = g_gaViewTex[g_gaCur].texture; vflip = false; fromFbo = true;
                 static unsigned long n = 0;
