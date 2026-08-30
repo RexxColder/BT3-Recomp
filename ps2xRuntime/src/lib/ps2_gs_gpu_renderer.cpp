@@ -2123,6 +2123,11 @@ bool GsGpuRenderer::prerenderChunk()
         for (size_t i = m_segFrom; i < n; ++i)   // [deferdec] a chunk must not cross an unserved decode command
             if (m_building[i].isDecode && m_building[i].decode && !m_building[i].decode->served) { n = i; break; }
         if (n < m_segFrom || n - m_segFrom < (size_t)k) return false;
+        {   // [chunkcap] PS2X_PRERENDER_MAX (default 96, 0 = unbounded): a blocking barrier posted while a chunk renders waits for
+            // the whole chunk; chunks averaged 229 commands (bbstat: pickup 0.58 ms x 13 barriers = 7.5 ms of guest wait per frame).
+            static const size_t s_cap = [](){ const char *v = std::getenv("PS2X_PRERENDER_MAX"); return (size_t)(v && v[0] ? std::atoi(v) : 0); }();   // default 0: a 96 cap cut pickup 418 -> 378 ms but the barrier render leg grew 86 -> 160 (net worse)
+            if (s_cap && n - m_segFrom > s_cap) n = m_segFrom + s_cap;
+        }
         m_chunk.assign(m_building.begin() + (std::ptrdiff_t)m_segFrom, m_building.begin() + (std::ptrdiff_t)n);
         m_chunkBase = m_segFrom;
     }
