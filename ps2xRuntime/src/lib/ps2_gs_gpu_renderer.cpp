@@ -82,6 +82,9 @@ static const char *g_emitPath = "none";   // [emitpath] which emission branch th
 uint32_t g_barReqTbp = 0, g_barReqCbp = 0, g_barReqPsm = 0, g_barReqTbw = 0;
 unsigned long g_ddRtSkip = 0;   // [ddrtdirect 2]
 int g_recordAliasKind = 0;   // [gpualias] set around recordSpriteGPU for a CT16-view alias pass
+static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c);   // [gpualias] mode>=4: run the f336 chain GPU-side (defined before recordCmd)
+static bool g_gaViewReady = false;   // [gpualias] the view texture holds chain output
+static int g_gaCur = 0;              // [gpualias] ping-pong index
 std::atomic<uint64_t> g_guestBusyNs{0}, g_guestBusyFrames{0};   // [guestbusy] file scope: read by ps2_runtime.cpp
 extern unsigned long g_svcFlushSkip;   // [svcflushseq] defined below
 extern unsigned long g_linFetch, g_linMiss, g_linRefresh;   // [linvram] defined below
@@ -3730,6 +3733,184 @@ void GsGpuRenderer::flushStage()
             g_bbCv.notify_all();
     }
 }
+// ---------------------------------------------------------------------------
+// [gpualias] PS2X_GPUALIAS>=4 executor: BT3's fbp336 outline edge chain, run in
+// the CT16 view it was written for. The chain per frame (16x 32px columns each):
+//   clear (fbmsk 0, bm64 FIX=80, rgba 0)          -> halfword := 0
+//   base  (fbmsk ff000000, bm44, DECAL, ident UV) -> whole halfword := pack(blend44(clut[P8H idx]))
+//   subA  (fbmsk ffffff00 -> m16 ff00, bm62)      -> halfword bits 0-7  := pack(Cd - Cs)
+//   subB  (fbmsk ffff00ff -> m16 00ff, bm62, x+1) -> halfword bits 8-15 := pack(Cd - Cs(x+1))
+// Exact SW-writePixel semantics: blend in 8888 ints, pack to 5551, apply m16
+// against the packed dest, expand back. View texture stores expand(pack(x)).
+// P8H texel (u,v) = the ALPHA byte of f224's FBO at (u,v) (T8H page = CT32 page).
+extern "C" void glDisable(unsigned int cap);
+extern "C" void glDepthMask(unsigned char flag);
+static RenderTexture2D g_gaViewTex[2];
+static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
+{
+    static Shader sh{}; static bool init = false, bad = false;
+    static int locStage=-1, locM16=-1, locXOff=-1, locSrcFlip=-1, locSrcH=-1, locRect=-1, locSrcA=-1, locPal=-1, locDbg=-1;
+    if (bad) return false;
+    if (!init)
+    {
+        init = true;
+        static const char *vs =
+            "#version 330\n"
+            "in vec3 vertexPosition; in vec2 vertexTexCoord; in vec4 vertexColor;\n"
+            "out vec2 fragTexCoord; out vec4 fragColor;\n"
+            "uniform mat4 mvp;\n"
+            "void main(){ fragTexCoord = vertexTexCoord; fragColor = vertexColor; gl_Position = mvp * vec4(vertexPosition, 1.0); }\n";
+        static const char *fs =
+            "#version 330\n"
+            "uniform sampler2D texture0;\n"
+            "uniform sampler2D uSrcA;\n"
+            "uniform sampler2D uPal;\n"
+            "uniform int uStage;\n"
+            "uniform int uM16;\n"
+            "uniform int uXOff;\n"
+            "uniform int uSrcFlip;\n"
+            "uniform int uSrcH;\n"
+            "uniform ivec4 uRect;\n"
+            "uniform int uDbg;\n"
+            "out vec4 finalColor;\n"
+            "void main(){\n"
+            "  ivec2 xy = ivec2(gl_FragCoord.xy);\n"
+            "  vec4 pv = texelFetch(texture0, xy, 0);\n"
+            "  if (xy.x < uRect.x || xy.x >= uRect.z || xy.y < uRect.y || xy.y >= uRect.w) { finalColor = pv; return; }\n"
+            "  ivec4 P = ivec4(pv * 255.0 + 0.5);\n"
+            "  int d16 = (P.r >> 3) | ((P.g >> 3) << 5) | ((P.b >> 3) << 10) | ((P.a >> 7) << 15);\n"
+            "  ivec4 S = ivec4(0);\n"
+            "  if (uStage != 0) {\n"
+            "    ivec2 suv = ivec2(xy.x + uXOff, (uSrcFlip == 1) ? (uSrcH - 1 - xy.y) : xy.y);\n"
+            "    int idx = int(texelFetch(uSrcA, suv, 0).a * 255.0 + 0.5);\n"
+            "    ivec4 C = ivec4(texelFetch(uPal, ivec2(idx, 0), 0) * 255.0 + 0.5);\n"
+            "    if (uDbg == 2) { finalColor = vec4(vec3(float(idx) / 255.0), 1.0); return; }\n"
+            "    if (uDbg == 3) { finalColor = vec4(vec3(C.rgb) / 255.0, float(C.a) / 255.0); return; }\n"
+            "    if (uStage == 1) S.rgb = clamp((((C.rgb - P.rgb) * C.a) >> 7) + P.rgb, ivec3(0), ivec3(255));\n"
+            "    else             S.rgb = clamp(P.rgb - C.rgb, ivec3(0), ivec3(255));\n"
+            "    if (uStage == 1 && uXOff == 77) S = ivec4(255, 0, 255, 255);\n"   // [dbg] PS2X_GPUALIAS_DBG=1 pipeline probe
+            "    S.a = C.a;\n"
+            "    if (uDbg == 5) S.rgb = C.rgb;\n"
+            "    if (uDbg == 4) { finalColor = vec4(S) / 255.0; return; }\n"
+            "  }\n"
+            "  int s16 = (S.r >> 3) | ((S.g >> 3) << 5) | ((S.b >> 3) << 10) | ((S.a >> 7) << 15);\n"
+            "  int o = (s16 & ~uM16) | (d16 & uM16);\n"
+            "  finalColor = vec4(float((o & 31) << 3), float(((o >> 5) & 31) << 3), float(((o >> 10) & 31) << 3), float(((o >> 15) & 1) << 7)) / 255.0;\n"
+            "}\n";
+        sh = LoadShaderFromMemory(vs, fs);
+        if (sh.id == 0) { bad = true; std::fprintf(stderr, "[gpualias] exec: shader FAILED to build\n"); return false; }
+        locStage = GetShaderLocation(sh, "uStage"); locM16 = GetShaderLocation(sh, "uM16");
+        locXOff = GetShaderLocation(sh, "uXOff"); locSrcFlip = GetShaderLocation(sh, "uSrcFlip");
+        locSrcH = GetShaderLocation(sh, "uSrcH"); locRect = GetShaderLocation(sh, "uRect");
+        locSrcA = GetShaderLocation(sh, "uSrcA"); locPal = GetShaderLocation(sh, "uPal");
+        locDbg = GetShaderLocation(sh, "uDbg");
+        g_gaViewTex[0] = LoadRenderTexture(512, 448); g_gaViewTex[1] = LoadRenderTexture(512, 448);
+        if (g_gaViewTex[0].id == 0 || g_gaViewTex[1].id == 0) { bad = true; return false; }
+        SetTextureFilter(g_gaViewTex[0].texture, TEXTURE_FILTER_POINT);
+        SetTextureFilter(g_gaViewTex[1].texture, TEXTURE_FILTER_POINT);
+        std::fprintf(stderr, "[gpualias] exec: shader + 2x512x448 view textures ready\n");
+    }
+    static const int s_dbg = [](){ const char *v = std::getenv("PS2X_GPUALIAS_DBG"); return v && v[0] ? std::atoi(v) : 0; }();
+    int stage, m16, xoff = 0;
+    if (c.aliasKind == 2u)                 { stage = 0; m16 = 0x0000; }
+    else if (c.fbmsk == 0xFF000000u)       { stage = 1; m16 = 0x0000; if (s_dbg == 1) xoff = 77; }
+    else if (c.fbmsk == 0xFFFFFF00u)       { stage = 2; m16 = 0xFF00; }
+    else if (c.fbmsk == 0xFFFF00FFu)       { stage = 3; m16 = 0x00FF; xoff = (int)std::lround((double)c.su0 - (double)c.dx0); }
+    else return false;
+    Texture2D srcA{}; Texture2D pal{}; int srcH = 448;
+    if (stage != 0)
+    {
+        auto sit = g_fbos.find(224u);
+        if (sit == g_fbos.end() || sit->second.rt.texture.id == 0) return false;
+        srcA = sit->second.rt.texture; srcH = sit->second.h;
+        pal = palTextureFor(c.srcClutKey);
+        if (pal.id == 0) { static int n=0; if (n++<4) std::fprintf(stderr, "[gpualias] exec: no palette for key %llx\n", (unsigned long long)c.srcClutKey); return false; }
+    }
+    static const int s_flip = [](){ const char *v = std::getenv("PS2X_GPUALIAS_FLIP"); return v && v[0] ? std::atoi(v) : 1; }();
+    const int srcFlip = s_flip;
+    rlDrawRenderBatchActive();
+    const int dst = 1 - g_gaCur;
+    const int rect[4] = { (int)c.dx0, 0, (int)c.dx1, 448 };
+    BeginTextureMode(g_gaViewTex[dst]);
+    // State hygiene: the draw loop leaves per-draw GL state behind (glColorMask from FBMSK,
+    // scissor, depth). Any of them silently blanks this pass. Neutralize; restore after.
+    glColorMask(1, 1, 1, 1); glDisable(0x0B71u /*GL_DEPTH_TEST*/); glDepthMask(0); glDisable(0x0C11u /*GL_SCISSOR_TEST*/);
+    rlSetBlendFactors(1 /*GL_ONE*/, 0 /*GL_ZERO*/, 0x8006 /*GL_FUNC_ADD*/);
+    BeginBlendMode(BLEND_CUSTOM);
+    BeginShaderMode(sh);
+    SetShaderValue(sh, locStage, &stage, SHADER_UNIFORM_INT);
+    SetShaderValue(sh, locM16, &m16, SHADER_UNIFORM_INT);
+    SetShaderValue(sh, locXOff, &xoff, SHADER_UNIFORM_INT);
+    SetShaderValue(sh, locSrcFlip, &srcFlip, SHADER_UNIFORM_INT);
+    SetShaderValue(sh, locSrcH, &srcH, SHADER_UNIFORM_INT);
+    SetShaderValue(sh, locRect, rect, SHADER_UNIFORM_IVEC4);
+    SetShaderValue(sh, locDbg, &s_dbg, SHADER_UNIFORM_INT);
+    if (stage != 0)
+    {   // SetShaderValueTexture leaves the sampler at unit 0 (= texture0) in this stack -- see the
+        // [idxpal] block below. Bind explicit high units (above raylib's 0..4) and point the
+        // samplers at them by integer uniform, same fix as uPal there.
+        static const int kSrcUnit = 9, kPalUnit = 10;
+        glActiveTexture(0x84C0u + kSrcUnit); glBindTexture(0x0DE1u, srcA.id);
+        glActiveTexture(0x84C0u + kPalUnit); glBindTexture(0x0DE1u, pal.id);
+        glActiveTexture(0x84C0u);
+        SetShaderValue(sh, locSrcA, &kSrcUnit, SHADER_UNIFORM_INT);
+        SetShaderValue(sh, locPal, &kPalUnit, SHADER_UNIFORM_INT);
+        static int shown = 0;
+        if (shown < 1)
+        {   ++shown;
+            int uA = -9, uP = -9; glGetUniformiv(sh.id, locSrcA, &uA); glGetUniformiv(sh.id, locPal, &uP);
+            std::fprintf(stderr, "[gpualias] samplers after set: uSrcA=%d uPal=%d (want 9/10) srcA.id=%u pal.id=%u palw=%d palh=%d\n",
+                         uA, uP, srcA.id, pal.id, pal.width, pal.height);
+            Image pi = LoadImageFromTexture(pal);
+            {   // body-region index histogram of the actual source
+                Image si = LoadImageFromTexture(srcA);
+                int hist[256] = {0};
+                for (int y = 700; y < 1000 && y < si.height; y += 3)
+                    for (int x = 150; x < 400 && x < si.width; x += 3)
+                    { Color pc2 = GetImageColor(si, x, y); ++hist[pc2.a]; }
+                UnloadImage(si);
+                std::fprintf(stderr, "[gpualias] f224 alpha hist (rows 700-1000):");
+                for (int i2 = 0; i2 < 256; ++i2) if (hist[i2] > 40) std::fprintf(stderr, " %d:%d", i2, hist[i2]);
+                std::fprintf(stderr, "\n");
+            }
+            for (int ix = 0; ix < 256; ix += (ix < 16 ? 1 : 16))
+            { Color pc = GetImageColor(pi, ix % (pi.width > 0 ? pi.width : 1), ix / (pi.width > 0 ? pi.width : 1));
+              std::fprintf(stderr, "[gpualias] clut[%d] = %u,%u,%u,%u\n", ix, pc.r, pc.g, pc.b, pc.a); }
+            UnloadImage(pi);
+        }
+    }
+    DrawTexturePro(g_gaViewTex[g_gaCur].texture, Rectangle{0.0f, 0.0f, 512.0f, 448.0f},
+                   Rectangle{0.0f, 0.0f, 512.0f, 448.0f}, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+    EndShaderMode();
+    EndBlendMode();
+    EndTextureMode();
+    glDepthMask(1); glEnable(0x0B71u); glEnable(0x0C11u);   // restore loop expectations
+    g_gaCur = dst; g_gaViewReady = true;
+    {   // PS2X_GPUALIAS_DUMPSTAGE=1: export the view at each stage boundary, once per stage kind
+        static const bool s_ds = [](){ const char *v = std::getenv("PS2X_GPUALIAS_DUMPSTAGE"); return v && v[0] && v[0] != '0'; }();
+        static int lastStage = -1; static bool done[4] = {false,false,false,false};
+        static unsigned long ncalls = 0; ++ncalls;
+        if (s_ds && ncalls > 100)
+        {
+            if (lastStage >= 1 && stage != lastStage && !done[lastStage])
+            {
+                done[lastStage] = true; rlDrawRenderBatchActive();
+                char nm[96]; std::snprintf(nm, sizeof nm, "/home/z3/Desktop/bt3/work/ga_stage%d.png", lastStage);
+                Image vi = LoadImageFromTexture(g_gaViewTex[g_gaCur].texture); ExportImage(vi, nm); UnloadImage(vi);
+                std::fprintf(stderr, "[gpualias] stage-boundary dump: %s\n", nm);
+            }
+            if (stage == 3) { static int n3 = 0; if (n3++ < 3) std::fprintf(stderr, "[gpualias] stage3 xoff=%d su0=%.2f dx0=%.2f\n", xoff, c.su0, c.dx0); }
+            lastStage = stage;
+        }
+    }
+    {   static unsigned long n = 0; static unsigned long byStage[4] = {0,0,0,0}; ++byStage[stage & 3];
+        if (++n <= 8 || (n % 4000ul) == 0ul)
+            std::fprintf(stderr, "[gpualias] exec #%lu stage=%d x=[%d,%d) xoff=%d | s0=%lu s1=%lu s2=%lu s3=%lu\n",
+                         n, stage, rect[0], rect[2], xoff, byStage[0], byStage[1], byStage[2], byStage[3]);
+    }
+    return true;
+}
+
 void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
 {
     {   // [gpualias] tag commands recorded for a CT16-view alias pass
@@ -6732,12 +6913,17 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         {   // [gpualias] census-only for now: the SW raster + vramBlit still produce the result; log the shapes.
             static unsigned long n = 0; static unsigned long byKind[4] = {0,0,0,0};
             ++byKind[c.aliasKind & 3u];
-            if (++n <= 10 || (n % 2000ul) == 0ul)
-                std::fprintf(stderr, "[gpualias] #%lu kind=%u dest=f%u psm=%u fbmsk=%08x rect=(%.0f,%.0f)-(%.0f,%.0f) src=(%u,psm%u %dx%d) bm=%02x abe=%d | k1=%lu k2=%lu k3=%lu\n",
-                             n, c.aliasKind, c.destFbp, c.destPsm, c.fbmsk, c.dx0, c.dy0, c.dx1, c.dy1,
-                             c.srcTbp0, c.srcPsm, (int)c.srcTexW, (int)c.srcTexH, (unsigned)c.blendMode, c.abe ? 1 : 0,
+            static const int s_gaV = [](){ const char *v = std::getenv("PS2X_GPUALIAS"); return v && v[0] ? std::atoi(v) : 0; }();
+            if (s_gaV >= 3 || ++n <= 10 || (n % 2000ul) == 0ul)
+                std::fprintf(stderr, "[gpualias] #%lu kind=%u dest=f%u fbw%u psm=%u fbmsk=%08x rect=(%.0f,%.0f)-(%.0f,%.0f) uv=(%.1f,%.1f)-(%.1f,%.1f) src=(%u,psm%u %dx%d) bm=%02x fix=%02x abe=%d tfx=%u fst=%u rgba=%u,%u,%u,%u | k1=%lu k2=%lu k3=%lu\n",
+                             n, c.aliasKind, c.destFbp, c.destFbw, c.destPsm, c.fbmsk, c.dx0, c.dy0, c.dx1, c.dy1,
+                             c.su0, c.sv0, c.su1, c.sv1,
+                             c.srcTbp0, c.srcPsm, (int)c.srcTexW, (int)c.srcTexH, (unsigned)c.blendMode, (unsigned)c.blendFix, c.abe ? 1 : 0,
+                             (unsigned)c.tfx, (unsigned)c.fst, c.r, c.g, c.b, c.a,
                              byKind[1], byKind[2], byKind[3]);
-        }   // census only: FALL THROUGH to normal execution (identical output with GPUALIAS=1)
+            if (s_gaV >= 4 && !c.isTriangle && c.destFbp == 336u && (c.aliasKind == 2u || c.aliasKind == 3u))
+                if (gaExecAliasPass(c)) { curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu; continue; }
+        }   // otherwise census only: fall through to normal execution
         {   // [dofdump] PS2X_DOFDUMP=1: console's shadow silhouette (sil_a: 0/128 in fbp336 alpha) is born when the
             // DoF downsample sprites copy the SCENE into fbp336 -- the copy carries the scene alpha (128 under the
             // fighters on console). Dump OUR scene alpha at the frame's first such copy, and fbp336's alpha right after
@@ -9627,6 +9813,37 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         // sample that FBO (render-to-texture); else the decoded VRAM texture. FBO color
         // textures are bottom-up, so flag a V-flip.
         Texture2D tex = g_white; bool vflip = false; bool fromFbo = false;
+        {   // [gpualias] mode>=4: serve the CT16-view read of fbp336 (the edge-chain consumer) from the executor's view texture
+            static const int s_gaC = [](){ const char *v = std::getenv("PS2X_GPUALIAS"); return v && v[0] ? std::atoi(v) : 0; }();
+            if (s_gaC >= 4 && g_gaViewReady && !c.srcIndexed && c.srcTbp0 == 336u * 32u &&
+                (c.srcPsm == 0x02u || c.srcPsm == 0x0Au))
+            {
+                tex = g_gaViewTex[g_gaCur].texture; vflip = false; fromFbo = true;
+                static unsigned long n = 0;
+                {   // PS2X_GPUALIAS_DUMP=1: export the view + the f224 source once, for offline content checks
+                    static const bool s_gd = [](){ const char *v = std::getenv("PS2X_GPUALIAS_DUMP"); return v && v[0] && v[0] != '0'; }();
+                    static bool dumped = false;
+                    if (s_gd && !dumped && n == 99)
+                    {
+                        dumped = true;
+                        rlDrawRenderBatchActive();
+                        Image vi = LoadImageFromTexture(g_gaViewTex[g_gaCur].texture);
+                        ExportImage(vi, "/home/z3/Desktop/bt3/work/ga_view.png"); UnloadImage(vi);
+                        auto sit2 = g_fbos.find(224u);
+                        if (sit2 != g_fbos.end() && sit2->second.rt.texture.id != 0)
+                        { Image mi = LoadImageFromTexture(sit2->second.rt.texture);
+                          ExportImage(mi, "/home/z3/Desktop/bt3/work/ga_f224.png"); UnloadImage(mi); }
+                        std::fprintf(stderr, "[gpualias] dumped ga_view.png + ga_f224.png\n");
+                    }
+                }
+                if (++n <= 6 || (n % 2000ul) == 0ul)
+                    std::fprintf(stderr, "[gpualias] consumer flip #%lu: %dx%d uv=(%.1f,%.1f)-(%.1f,%.1f) dest=f%u tcc=%u ta0=%02x ta1=%02x aem=%d bm=%02x fix=%02x abe=%d tfx=%u\n",
+                                 n, c.srcTexW, c.srcTexH, c.su0, c.sv0, c.su1, c.sv1, c.destFbp,
+                                 (unsigned)c.tcc, (unsigned)c.texaTa0, (unsigned)c.texaTa1, c.texaAem ? 1 : 0,
+                                 (unsigned)c.blendMode, (unsigned)c.blendFix, c.abe ? 1 : 0, (unsigned)c.tfx);
+            }
+        }
+
         // A draw that writes ONLY the destination's alpha byte (fbmsk protects all of RGB) is
         // asking for the SOURCE's alpha. Our FBO's alpha is flat 255 -- we never had the game's
         // alpha field -- while VRAM's is the real one, rebuilt by the software alias pass
@@ -9867,7 +10084,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             std::fprintf(stderr, "[srcdiag] cfg noff=%d atlas=%d\n", s_noff ? 1 : 0, s_atlas ? 1 : 0);
             if (FILE *f = srcDiagFile()) { std::fprintf(f, "[srcdiag] cfg noff=%d atlas=%d\n", s_noff ? 1 : 0, s_atlas ? 1 : 0); std::fflush(f); } } }
         const char *srcHow = "untex";
-        if (!s_noff && !c.srcIndexed && (!c.srcUploaded || destAlphaLerp) && s_atlas && c.texKey != 0 && sf != c.destFbp && (c.srcTbp0 == sf * 32u) && g_atlasSlots.count(sf))
+        if (fromFbo) { /* [gpualias] the flip above already chose the texture */ }
+        else if (!s_noff && !c.srcIndexed && (!c.srcUploaded || destAlphaLerp) && s_atlas && c.texKey != 0 && sf != c.destFbp && (c.srcTbp0 == sf * 32u) && g_atlasSlots.count(sf))
         {
             // Composite: the source RT lives in the atlas at its slot. Sample g_atlas, remap UV/src
             // rect into that sub-rect (done in the sprite/triangle emit paths below).
@@ -11351,7 +11569,20 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                                        return v && v[0] && v[0] != '0'; }();
                     static const bool s_maskRaw = [](){ const char *v = std::getenv("PS2X_MASKRAW");
                                                         return v && v[0] && v[0] != '0'; }();
-                    const bool psmTexa = (c.srcPsm == 1u) || (s_texa16 && c.srcPsm == 2u);
+                    {   // PS2X_GPUALIAS_DUMP2=1: dump the texture the f336-CT16 consumer binds (control content baseline)
+            static const bool s_gd2 = [](){ const char *v = std::getenv("PS2X_GPUALIAS_DUMP2"); return v && v[0] && v[0] != '0'; }();
+            static bool d2 = false; static unsigned long n2 = 0;
+            if (s_gd2 && !d2 && !c.srcIndexed && c.srcTbp0 == 336u * 32u && (c.srcPsm == 0x02u || c.srcPsm == 0x0Au) && ++n2 == 99)
+            {
+                d2 = true; rlDrawRenderBatchActive();
+                if (tex.id != 0) { Image ti = LoadImageFromTexture(tex); ExportImage(ti, "/home/z3/Desktop/bt3/work/ga_ctl_tex.png"); UnloadImage(ti); }
+                std::fprintf(stderr, "[gpualias] dumped consumer-bound texture (id=%u %dx%d fromFbo=%d)\n", tex.id, tex.width, tex.height, fromFbo ? 1 : 0);
+            }
+        }
+                    const bool psmTexa = (c.srcPsm == 1u) || (s_texa16 && c.srcPsm == 2u)
+                        // [gpualias] the flipped CT16-view texture must get the same TEXA treatment the
+                        // CPU decode would have applied (bit15 -> ta0/ta1, AEM rgb==0 -> 0).
+                        || (c.srcPsm == 2u && tex.id != 0 && (tex.id == g_gaViewTex[0].texture.id || tex.id == g_gaViewTex[1].texture.id));
                     if (fromFbo && tex.id != 0) g_lastSampledFboTex = tex.id;   // [rtthazard]
                     if (fromFbo && tex.id != 0 && tex.id == g_lastRenderedFboTex)
                     {   // [texbarrier] this FBO was rendered to since we last sampled it (BT3: fighter B's silhouette mesh into
