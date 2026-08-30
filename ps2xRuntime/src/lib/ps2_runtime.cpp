@@ -3837,12 +3837,17 @@ void PS2Runtime::run()
             int dh = ps2GpuRenderer().displayHeight();
             if (dw > 0 && dw <= static_cast<int>(FB_WIDTH)) presentWidth = static_cast<uint32_t>(dw);
             if (dh > 0 && dh <= static_cast<int>(DEFAULT_DISPLAY_HEIGHT)) presentHeight = static_cast<uint32_t>(dh);
-            // Ensure present dimensions are at least the nominal framebuffer size.
-            // The scissor extent can be SMALLER than the FBO (e.g. game draws 512 wide
-            // into a 640-wide FBO); using the smaller value zooms in on the drawn region
-            // instead of showing the full frame like the software path does.
-            if (presentWidth < FB_WIDTH) presentWidth = FB_WIDTH;
-            if (presentHeight < DEFAULT_DISPLAY_HEIGHT) presentHeight = DEFAULT_DISPLAY_HEIGHT;
+            // Use the actual GL texture dimensions for the present crop. The scissor
+            // extent (m_dispW) can differ from the texture size, and forcing
+            // presentWidth to FB_WIDTH when the texture is smaller samples out-of-bounds.
+            // presentSrcX/Y already handle the vertical offset for atlas mode.
+            {
+                const int texW = ps2GpuRenderer().presentTexWidth();
+                const int texH = ps2GpuRenderer().presentTexHeight();
+                const int srcY = ps2GpuRenderer().presentSrcY();
+                if (texW > 0) presentWidth = static_cast<uint32_t>(texW);
+                if (texH > 0 && srcY >= 0) presentHeight = static_cast<uint32_t>(texH - srcY);
+            }
             static bool s_dlog = false;
             if (!s_dlog && dw > 0 && std::getenv("PS2X_GPU_DIAG")) { s_dlog = true; std::cerr << "[gpupresent] disp=" << dw << "x" << dh << " -> present=" << presentWidth << "x" << presentHeight << std::endl; }
         }
