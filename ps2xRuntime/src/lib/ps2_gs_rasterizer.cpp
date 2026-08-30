@@ -28,6 +28,7 @@ static thread_local int g_subDx0 = 0, g_subDxW = 0;   // [subdecode] decode wind
 #include <functional>
 #include <vector>
 #include <memory>
+extern "C" uint32_t ps2xDeferCoverFor(uint32_t page);   // [defercover] ps2_gs_gpu_renderer.cpp
 
 // [pixcenter] destinations that receive the GS-corner -> GL-centre half-pixel shift (display buffers only).
 static bool pixCenterDestOk(uint32_t fbp)
@@ -3869,7 +3870,12 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         if (deferTex || deferClut) texNeedDecode = true;   // [deferdec] GL-dirty source: the record-time hash saw stale VRAM
         // [deferpend] a page whose deferred flush is still queued is stale in VRAM: a read that needs a decode
         // (a different view / key of the same page) must queue behind that flush, never decode synchronously.
-        const bool pendTex = s_deferDec && !deferTex && texNeedDecode && r.flushPending(ctx.tex0.tbp0 / 32u) && GSRasterizer::decodeIsDeferrable(ctx.tex0.psm);
+        // [defercover] PS2X_DEFERCOVER (default on, =0 old): the pending flush that covers the page is what the post must
+        // flush (sync flushes fbp336 for a read of page 368; posting flushPage=368 flushed fbp368's own 128x128 FBO -> the
+        // timer plate got content sync never has); a BARSKIP page (502,504,368) is never posted, as sync never barriers it.
+        static const bool s_dcv = [](){ const char *v = std::getenv("PS2X_DEFERCOVER"); return !(v && v[0] == '0'); }();
+        const uint32_t pendCover = (s_deferDec && !deferTex && texNeedDecode) ? (s_dcv ? ps2xDeferCoverFor(ctx.tex0.tbp0 / 32u) : (r.flushPending(ctx.tex0.tbp0 / 32u) ? ctx.tex0.tbp0 / 32u : 0xFFFFFFFFu)) : 0xFFFFFFFFu;
+        const bool pendTex = s_deferDec && !deferTex && texNeedDecode && pendCover != 0xFFFFFFFFu && GSRasterizer::decodeIsDeferrable(ctx.tex0.psm);
         const bool pendClut = s_deferDec && !deferClut && texNeedDecode && (ctx.tex0.psm == GS_PSM_T8 || ctx.tex0.psm == GS_PSM_T8H || ctx.tex0.psm == GS_PSM_T4 || ctx.tex0.psm == GS_PSM_T4HL || ctx.tex0.psm == GS_PSM_T4HH) && r.flushPending(ctx.tex0.cbp / 32u);
         if (pendTex) deferTex = true;
         if (pendClut) deferClut = true;
@@ -3881,7 +3887,11 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             req->tex0 = ctx.tex0; req->clamp = ctx.clamp; req->texa = gs->m_texa; req->texclut = gs->m_texclut;
             req->texW = texW; req->texH = texH; req->rawAlphaDec = rawAlphaDec; req->texKey = texKey;
             req->pageLo = texPageLo; req->pageHi = texPageHi; req->subDxW = g_subDxW; req->subDx0 = g_subDx0;
-            req->flushPage = deferTex ? (ctx.tex0.tbp0 / 32u) : 0xFFFFFFFFu; req->flushAlpha = deferAlpha;
+            // [defercover] a pend-post flushes NOTHING: the sync barrier for a non-fbp page with nothing dirty flushes nothing
+            // (it decodes VRAM as uploaded); the post only orders the decode behind the pending flush of the covering fbp.
+            // Flushing the read's own page flushed fbp368's stray 128x128 FBO (timer plate wrong); flushing the cover
+            // (fbp336) re-clobbered the sheets and cost 60k flushes (11 fps).
+            req->flushPage = deferTex ? ((pendTex && s_dcv) ? 0xFFFFFFFFu : (ctx.tex0.tbp0 / 32u)) : 0xFFFFFFFFu; req->flushAlpha = deferAlpha;
             req->flushClutPage = deferClut ? (ctx.tex0.cbp / 32u) : 0xFFFFFFFFu;
             r.postDecode(std::move(req));
         }

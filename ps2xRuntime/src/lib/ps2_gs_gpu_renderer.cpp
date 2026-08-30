@@ -2278,6 +2278,22 @@ static bool flushPendingLocked(uint32_t page)
         if (kv.second > 0 && page >= kv.first && page < kv.first + flushCoverPages(kv.first)) return true;
     return false;
 }
+// [defercover] the fbp whose pending deferred flush covers `page` (the SYNC barrier flushes that fbp, never the page
+// itself: fbp336's 256x448 extent covers page 368, which is also a BARSKIP page). 0xFFFFFFFF = no pending cover, or a
+// BARSKIP page (sync never barriers those -> never post for them).
+extern "C" uint32_t ps2xDeferCoverFor(uint32_t page)
+{
+    static const std::unordered_set<uint32_t> s_skip = [](){ std::unordered_set<uint32_t> r; const char *v = std::getenv("PS2X_BARSKIP");
+        if (!v) v = "502,504,368";
+        if (v[0] == '-' || (v[0] == 'n' && v[1] == 'o')) return r;
+        for (const char *q = v; *q; ) { char *e = nullptr; long n = std::strtol(q, &e, 10); if (e == q) break; r.insert((uint32_t)n); q = (*e == ',') ? e + 1 : e; }
+        return r; }();
+    if (s_skip.count(page)) return 0xFFFFFFFFu;
+    std::lock_guard<std::mutex> bk(g_barMx);
+    for (const auto &kv : g_deferPending)
+        if (kv.second > 0 && page >= kv.first && page < kv.first + flushCoverPages(kv.first)) return kv.first;
+    return 0xFFFFFFFFu;
+}
 bool GsGpuRenderer::flushPending(uint32_t page)
 {   // [deferpend] [flushcover]
     std::lock_guard<std::mutex> bk(g_barMx);
