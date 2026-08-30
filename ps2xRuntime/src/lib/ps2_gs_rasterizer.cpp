@@ -3875,7 +3875,12 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         // timer plate got content sync never has); a BARSKIP page (502,504,368) is never posted, as sync never barriers it.
         static const bool s_dcv = [](){ const char *v = std::getenv("PS2X_DEFERCOVER"); return !(v && v[0] == '0'); }();
         const uint32_t pendCover = (s_deferDec && !deferTex && texNeedDecode) ? (s_dcv ? ps2xDeferCoverFor(ctx.tex0.tbp0 / 32u) : (r.flushPending(ctx.tex0.tbp0 / 32u) ? ctx.tex0.tbp0 / 32u : 0xFFFFFFFFu)) : 0xFFFFFFFFu;
-        const bool pendTex = s_deferDec && !deferTex && texNeedDecode && pendCover != 0xFFFFFFFFu && GSRasterizer::decodeIsDeferrable(ctx.tex0.psm);
+        // [pendsheet] PS2X_PENDSHEET=0 = old: a PSMT8/PSMT4 read is an uploaded sheet (RT-produced indexed reads are T8H/T4HH);
+        // sync never barriers a non-fbp page, so decode it NOW from VRAM (= the post-time bytes a deferred decode would use)
+        // instead of a post + page snapshots + a GL-thread decode (BT3: thousands of HUD sheet reads per run).
+        static const bool s_psh = [](){ const char *v = std::getenv("PS2X_PENDSHEET"); return !(v && v[0] == '0'); }();
+        const bool sheetPsm = s_psh && (ctx.tex0.psm == GS_PSM_T8 || ctx.tex0.psm == GS_PSM_T4);
+        const bool pendTex = s_deferDec && !deferTex && texNeedDecode && pendCover != 0xFFFFFFFFu && !sheetPsm && GSRasterizer::decodeIsDeferrable(ctx.tex0.psm);
         const bool pendClut = s_deferDec && !deferClut && texNeedDecode && (ctx.tex0.psm == GS_PSM_T8 || ctx.tex0.psm == GS_PSM_T8H || ctx.tex0.psm == GS_PSM_T4 || ctx.tex0.psm == GS_PSM_T4HL || ctx.tex0.psm == GS_PSM_T4HH) && r.flushPending(ctx.tex0.cbp / 32u);
         if (pendTex) deferTex = true;
         if (pendClut) deferClut = true;
