@@ -5406,6 +5406,11 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             {
                 const DrawCmd &c = cmds[ci];
                 if (c.sw <= 0 || c.sh <= 0) continue;
+                // [dispdest] the display size comes from draws into the DISPLAY buffers only: an outline-stack pass with a
+                // 512-row scissor into fbp224/336/the 512-tall RT view of 112 pushed m_dispH to 512 for one present -> the
+                // crop anchored 64 rows off (user's squish.webm; presentlog: 10 of 606 presents at srcY=0). PS2X_DISPDEST=0 = old.
+                static const bool s_dd = [](){ const char *v = std::getenv("PS2X_DISPDEST"); return !(v && v[0] == '0'); }();
+                if (s_dd && c.destFbp != 0u && c.destFbp != 112u) continue;
                 if (c.sx + c.sw > s_dW) s_dW = c.sx + c.sw;
                 if (c.sy + c.sh > s_dH) s_dH = c.sy + c.sh;
             }
@@ -13825,7 +13830,7 @@ if (done.size() < 14 && !done.count(c.texKey))
         // Completed-frame latch: always a finished game frame, never a mid-redraw buffer.
         outId = g_frontLatch.rt.texture.id;
         m_presentTexW = g_frontLatch.w; m_presentTexH = g_frontLatch.h;
-        const int dispH = (m_dispH > 0 && m_dispH <= m_presentTexH) ? m_dispH : m_presentTexH;
+        const int dispH = std::min(448, (m_dispH > 0 && m_dispH <= m_presentTexH) ? m_dispH : m_presentTexH);   // [dispanchor] the crop HEIGHT is clamped to 448 in the present (DEFAULT_DISPLAY_HEIGHT); the anchor must use the same value or a 512-row RT pass into fbp0/112 shifts the picture 64 rows for one present (squish.webm)
         m_presentSrcY = m_presentTexH - dispH;
     }
     else if (s_atlas && g_atlas.texture.id != 0 && g_atlasSlots.count(displayFbp))
@@ -13849,7 +13854,7 @@ if (done.size() < 14 && !done.count(c.texKey))
         // samples {srcY, -dispH} from the bottom-up texture, so anchor at texH - dispH — the same
         // formula the atlas branch uses. srcY=0 (the old behavior) only holds when texH == dispH;
         // in the fight it presented the frame shifted 64 rows (junk band at the bottom).
-        const int dispH = (m_dispH > 0 && m_dispH <= m_presentTexH) ? m_dispH : m_presentTexH;
+        const int dispH = std::min(448, (m_dispH > 0 && m_dispH <= m_presentTexH) ? m_dispH : m_presentTexH);   // [dispanchor] the crop HEIGHT is clamped to 448 in the present (DEFAULT_DISPLAY_HEIGHT); the anchor must use the same value or a 512-row RT pass into fbp0/112 shifts the picture 64 rows for one present (squish.webm)
         m_presentSrcY = m_presentTexH - dispH;
     }
 
