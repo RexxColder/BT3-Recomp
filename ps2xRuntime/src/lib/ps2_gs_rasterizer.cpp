@@ -3969,6 +3969,17 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 }
             }
         }
+        // [gpualias] mode>=4: reads the renderer serves from the view texture never use the
+        // decoded texture OR its version key -- skip resolveTextureVersion + decodeTexRGBA
+        // (pure guest-time waste, measured ~17%% of guest in decode). Env PS2X_GPUALIAS_DECSKIP=0
+        // restores the old behavior for A/B.
+        static const int s_gaDs4 = [](){ const char *v = std::getenv("PS2X_GPUALIAS"); return v && v[0] ? std::atoi(v) : 0; }();
+        static const bool s_gaDecSkip = [](){ const char *v = std::getenv("PS2X_GPUALIAS_DECSKIP"); return !(v && v[0] == '0'); }();
+        const bool gaServedRead = s_gaDs4 >= 4 && s_gaDecSkip && ctx.tex0.tbp0 == 10752u &&
+                                  (ctx.tex0.psm == 0x02u || ctx.tex0.psm == 0x0Au) &&
+                                  gs->m_texa.aem && gs->m_texa.ta1 == 0u &&
+                                  (gs->m_texa.ta0 == 0x30u ||
+                                   (gs->m_texa.ta0 == 0x80u && (ctx.frame.fbmsk & 0x00FFFFFFu) == 0x00FFFFFFu));
         // Resolve the CONTENT-VERSIONED key (see resolveTextureVersion): streamed materials
         // sharing one tbp0 get distinct cache entries instead of overwriting each other.
         bool texNeedDecode = false;
@@ -3976,7 +3987,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             const uint32_t pv = ctx.tex0.psm;
             g_resolveAlphaData = (pv == GS_PSM_T8 || pv == GS_PSM_T8H || pv == GS_PSM_T4 || pv == GS_PSM_T4HL || pv == GS_PSM_T4HH)
                                  || ((ctx.frame.fbmsk & 0x00ffffffu) == 0x00ffffffu); }
-        texKey = r.resolveTextureVersion(texKey, texPageLo, texPageHi, gs->m_vram, gs->m_vramSize, texNeedDecode);
+        if (!gaServedRead) texKey = r.resolveTextureVersion(texKey, texPageLo, texPageHi, gs->m_vram, gs->m_vramSize, texNeedDecode);
         if (deferTex || deferClut) texNeedDecode = true;   // [deferdec] GL-dirty source: the record-time hash saw stale VRAM
         // [deferpend] a page whose deferred flush is still queued is stale in VRAM: a read that needs a decode
         // (a different view / key of the same page) must queue behind that flush, never decode synchronously.
@@ -4028,7 +4039,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 }
             }
         }
-        else if (texNeedDecode)
+        else if (texNeedDecode && !gaServedRead)
         {
             TexDecodeSrc src;
             src.tex0 = &ctx.tex0; src.clamp = ctx.clamp; src.vram = gs->m_vram; src.vramSize = gs->m_vramSize;
