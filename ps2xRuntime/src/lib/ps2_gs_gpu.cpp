@@ -1878,6 +1878,8 @@ extern "C" unsigned ps2xVramDiffOutside(uint32_t fbp, uint32_t fbw, uint32_t psm
 // [ddmirror] when set, every pixel the masked writeback lands in VRAM is ALSO written into this buffer (same swizzle,
 // no page-skip mask): the deferred decode's private copy = post-time snapshots + the read-time flush, live VRAM untouched.
 uint8_t *g_wbMirror = nullptr;
+// [linvram] when set, every value the writeback stores also lands in this LINEAR image (row-major, stride g_wbLinearStride)
+uint32_t *g_wbLinear = nullptr; int g_wbLinearStride = 0;
 void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
                                const uint32_t *px, uint32_t fbmsk)
 {
@@ -1961,6 +1963,7 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
             const u32 n = GSMem::WriteRowCT32(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, px + PROW(y) + xs,   // [rowrel] src/mask relative to xs
                                               g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr);
             if (g_wbMirror) GSMem::WriteRowCT32(g_wbMirror, base, bw, (u32)xs, (u32)xe, (u32)y, px + PROW(y) + xs, g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr);   // [ddmirror] same skip mask: a page the guest uploaded after the read keeps its post-time snapshot
+            if (g_wbLinear) std::memcpy(g_wbLinear + (size_t)y * g_wbLinearStride + xs, px + PROW(y) + xs, (size_t)(xe - xs) * 4u);   // [linvram]
             if (n) { if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y; g_wbPixelsWritten += n; }
             continue;
         }
@@ -1975,6 +1978,7 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
             if (g_wbMirror) { const uint8_t *mk = g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr;
                               if (psm == 0x02u) GSMem::WriteRowCT16(g_wbMirror, base, bw, (u32)xs, (u32)xe, (u32)y, row16.data() + xs, mk);
                               else              GSMem::WriteRowCT16S(g_wbMirror, base, bw, (u32)xs, (u32)xe, (u32)y, row16.data() + xs, mk); }   // [ddmirror]
+            if (g_wbLinear) for (int x = xs; x < xe; ++x) g_wbLinear[(size_t)y * g_wbLinearStride + x] = row16[(size_t)x];   // [linvram]
             if (n) { if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y; g_wbPixelsWritten += n; }
             continue;
         }
@@ -2016,14 +2020,15 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
                 const uint32_t rgb = (ov & rgbMask) | (nv & ~rgbMask & 0x00FFFFFFu);
                 const uint32_t al  = (ov & 0xFF000000u) ? (ov & 0xFF000000u) : (nv & 0xFF000000u);
                 wfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y, rgb | al);
+                if (g_wbLinear) g_wbLinear[(size_t)y * g_wbLinearStride + x] = rgb | al;   // [linvram]
                 continue;
             }
             const bool p16 = s_wbPack16 && wbIs16(psm);
-            if (fbmsk == 0u) { wfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y, p16 ? wbPack16(nv) : nv); continue; }
+            if (fbmsk == 0u) { const uint32_t sv = p16 ? wbPack16(nv) : nv; wfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y, sv); if (g_wbLinear) g_wbLinear[(size_t)y * g_wbLinearStride + x] = sv; continue; }
             uint32_t ov = rfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y);
             if (p16) ov = wbUnpack16(ov & 0xFFFFu);
             const uint32_t mv = (ov & fbmsk) | (nv & ~fbmsk);
-            wfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y, p16 ? wbPack16(mv) : mv);
+            { const uint32_t sv = p16 ? wbPack16(mv) : mv; wfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y, sv); if (g_wbLinear) g_wbLinear[(size_t)y * g_wbLinearStride + x] = sv; }
         }
     }
     // A palette can BE a render target (BT3's outline CLUTs live in pages 499-500, which the

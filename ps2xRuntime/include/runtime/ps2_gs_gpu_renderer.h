@@ -20,6 +20,7 @@
 #include <mutex>
 
 struct TexDecodeReq;   // [deferdec]
+struct LinImg;   // [linvram] ps2_gs_gpu_renderer.cpp
 class GsGpuRenderer
 {
 public:
@@ -246,6 +247,8 @@ public:
                            bool wantsAlphaAsData = false, bool *deferOut = nullptr);   // [deferdec] deferOut: report "would wait" instead of waiting
     void postDecode(std::shared_ptr<TexDecodeReq> req);   // [deferdec]
     bool flushPending(uint32_t page);                    // [deferpend] a deferred flush of this page is queued but not yet serviced
+    void linRefresh(struct LinImg &img);   // [linvram] bring the linear image up to VRAM for pages the guest wrote
+    struct LinImg *linImageFor(uint32_t fbp, uint32_t psm, uint32_t fbw, int w, int h, bool create);   // [linvram]
     void waitPendingFlush(uint32_t page);                // [uploadwait] guest: block (bounded) until that flush has run -- before overwriting the page
     bool serviceNextDecode();                            // [deferdec] GL thread: render up to the next unserved decode command, then service it
     void serviceDecodeReq(TexDecodeReq &q);              // [deferdec] GL thread: flush page(s) -> decode -> putTexture

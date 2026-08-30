@@ -28,8 +28,12 @@ static thread_local int g_subDx0 = 0, g_subDxW = 0;   // [subdecode] decode wind
 #include <functional>
 #include <vector>
 #include <memory>
+static const struct AlphaLut { uint8_t v[256]; AlphaLut() { for (int i = 0; i < 256; ++i) v[i] = (uint8_t)std::min(255u, (unsigned)i * 255u / 128u); } uint8_t operator[](uint32_t i) const { return v[i & 0xFFu]; } } kAlpha128To255;   // [fastdec] GS alpha (128 = 1.0) -> texture alpha
 extern "C" uint32_t ps2xDeferCoverFor(uint32_t page);   // [defercover] ps2_gs_gpu_renderer.cpp
 extern "C" uint32_t ps2xDeferCoverFbp(uint32_t page);   // [clutcover] ps2_gs_gpu_renderer.cpp
+extern "C" bool ps2xLinearFetch(uint32_t tbp0, uint32_t psm, uint32_t tbw, uint32_t u0, int subW, int H, uint32_t *dst);   // [linvram]
+namespace GSMem { void ReadRowZ16(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst); void ReadRowZ16S(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst); }   // [fastdec] ps2_gs_memory.cpp
+namespace GSMem { void ReadRowP8(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u8* dst); void ReadRowP4(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u8* dst); }   // [fastdec]
 
 // [pixcenter] destinations that receive the GS-corner -> GL-centre half-pixel shift (display buffers only).
 static bool pixCenterDestOk(uint32_t fbp)
@@ -2958,23 +2962,26 @@ void GSRasterizer::decodeTexRGBA(GS *gs, TexDecodeSrc src, int texW, int texH, b
         // the fast path. Same flag here so all three decode paths agree.
         static const bool s_rawA4 = [](){ const char *v = std::getenv("PS2X_RAWTEXA");
                                           return v && v[0] && v[0] != '0'; }();
+                uint32_t clutR[16];   // [fastdec] palette with the alpha already rescaled
+        for (int i = 0; i < 16; ++i) { const uint32_t c = clut[i]; const uint32_t al = c >> 24; clutR[i] = (c & 0x00FFFFFFu) | ((uint32_t)(rawAlphaDec ? al : kAlpha128To255[al]) << 24); }
+        (void)vmask;
+        static const bool s_ft4 = [](){ const char *v = std::getenv("PS2X_FASTT4"); return !(v && v[0] == '0'); }();
+        const bool rowOk4 = s_ft4 && bw >= 2u;   // [fastdec] page = 128 px wide: a 64-px buffer (tbw 1) needs the exact per-texel address
         parallelRows(0, texH - 1, [&](int ty)
-        {
+        {   // [fastdec] one row of nibble indices through the page table, one 32-bit store per texel
+            uint32_t *drow = reinterpret_cast<uint32_t *>(dst + (size_t)ty * W * 4u);
+            if (rowOk4)
+            {
+                thread_local std::vector<uint8_t> idx; if (idx.size() < (size_t)W) idx.resize((size_t)W);
+                GSMem::ReadRowP4(vram, blk, bw, (u32)subX0, (u32)(subX0 + W), (u32)ty, idx.data());
+                for (int tx = 0; tx < W; ++tx) drow[tx] = clutR[idx[(size_t)tx] & 0x0Fu];
+                return;
+            }
             for (int tx = 0; tx < W; ++tx)
             {
                 const uint32_t na = GSPSMT4::addrPSMT4(blk, bw, static_cast<uint32_t>(tx + subX0), static_cast<uint32_t>(ty));
                 const uint8_t bval = vram[(na >> 1) & vmask];
-                const uint32_t idx = ((na & 1u) ? (bval >> 4) : (bval & 0x0Fu)) & 0x0Fu;
-                const uint32_t texel = clut[idx];
-                size_t o = (static_cast<size_t>(ty) * W + tx) * 4u;
-                dst[o + 0] = texel & 0xFF; dst[o + 1] = (texel >> 8) & 0xFF;
-                dst[o + 2] = (texel >> 16) & 0xFF;
-                // NOTE: expansion is UNCONDITIONAL here on purpose (RAWTEXA global
-                // raw wrecks the frame, MAE 11.96 -> 55.3) -- EXCEPT for [rawmask]
-                // alpha-as-data draws, whose alpha is an index, not a blend weight.
-                dst[o + 3] = rawAlphaDec
-                    ? static_cast<uint8_t>((texel >> 24) & 0xFFu)
-                    : static_cast<uint8_t>(std::min(255u, ((texel >> 24) & 0xFFu) * 255u / 128u));
+                drow[tx] = clutR[((na & 1u) ? (bval >> 4) : (bval & 0x0Fu)) & 0x0Fu];
             }
         });
     }
@@ -2990,18 +2997,24 @@ void GSRasterizer::decodeTexRGBA(GS *gs, TexDecodeSrc src, int texW, int texH, b
         // Split the rows across the (GPU-mode-idle) scanline pool -- each row writes
         // a disjoint RGBA span so it's race-free. This is the per-frame animated
         // background, so parallel detexture directly buys wall-clock / fps.
+                uint32_t clutR[256];   // [fastdec]
+        for (int i = 0; i < 256; ++i) { const uint32_t c = clut[i]; const uint32_t al = c >> 24; clutR[i] = (c & 0x00FFFFFFu) | ((uint32_t)(rawAlphaDec ? al : kAlpha128To255[al]) << 24); }
+        static const bool s_ft8 = [](){ const char *v = std::getenv("PS2X_FASTT8"); return !(v && v[0] == '0'); }();
+        const bool rowOk8 = s_ft8 && bw >= 2u;   // [fastdec] T8 page = 128 px wide (see T4)
         parallelRows(0, texH - 1, [&](int ty)
         {
+            uint32_t *drow = reinterpret_cast<uint32_t *>(dst + (size_t)ty * W * 4u);
+            if (rowOk8)
+            {
+                thread_local std::vector<uint8_t> idx; if (idx.size() < (size_t)W) idx.resize((size_t)W);
+                GSMem::ReadRowP8(vram, blk, bw, (u32)subX0, (u32)(subX0 + W), (u32)ty, idx.data());
+                for (int tx = 0; tx < W; ++tx) drow[tx] = clutR[idx[(size_t)tx]];
+                return;
+            }
             for (int tx = 0; tx < W; ++tx)
             {
                 const uint32_t off = GSPSMT8::addrPSMT8(blk, bw, static_cast<uint32_t>(tx + subX0), static_cast<uint32_t>(ty)) & vmask;
-                const uint32_t texel = clut[vram[off]];
-                size_t o = (static_cast<size_t>(ty) * W + tx) * 4u;
-                dst[o + 0] = texel & 0xFF; dst[o + 1] = (texel >> 8) & 0xFF;
-                dst[o + 2] = (texel >> 16) & 0xFF;
-                dst[o + 3] = rawAlphaDec
-                    ? static_cast<uint8_t>((texel >> 24) & 0xFFu)
-                    : static_cast<uint8_t>(std::min(255u, ((texel >> 24) & 0xFFu) * 255u / 128u));
+                drow[tx] = clutR[vram[off]];
             }
         });
     }
@@ -3048,7 +3061,35 @@ void GSRasterizer::decodeTexRGBA(GS *gs, TexDecodeSrc src, int texW, int texH, b
         std::vector<int> uIdx((size_t)subW);
         bool uContig = s_rowDec && subW > 0;
         for (int tx = 0; tx < subW; ++tx) { uIdx[(size_t)tx] = wrapC(tx + subX0, W, wms, minU, maxU); if (tx && uIdx[(size_t)tx] != uIdx[0] + tx) uContig = false; }
-        const bool rowRead = uContig && (pm == GS_PSM_CT32 || pm == GS_PSM_CT24 || pm == GS_PSM_CT16 || pm == GS_PSM_CT16S || kind == 2);
+        static const bool s_fz16 = [](){ const char *v = std::getenv("PS2X_FASTZ16"); return !(v && v[0] == '0'); }();
+        const bool rowRead = uContig && (pm == GS_PSM_CT32 || pm == GS_PSM_CT24 || pm == GS_PSM_CT16 || pm == GS_PSM_CT16S || (s_fz16 && (pm == GS_PSM_Z16 || pm == GS_PSM_Z16S)) || kind == 2);
+        // [fastdec] 16-bit texel -> RGBA8 through a 64K LUT cached per (psm, TEXA, raw-alpha): one lookup per texel
+        struct Lut16 { uint64_t key = ~0ull; std::vector<uint32_t> t; };
+        thread_local Lut16 lut16;
+        const uint32_t *lut16p = nullptr;
+        if (rowRead && kind == 1)
+        {
+            const uint64_t key = ((uint64_t)pm << 56) | ((uint64_t)(keepRaw2 ? 1u : 0u) << 55) | ((uint64_t)texaF.ta0 << 40) | ((uint64_t)texaF.ta1 << 32) | ((uint64_t)(texaF.aem ? 1u : 0u) << 31);
+            if (lut16.key != key)
+            {
+                lut16.t.resize(65536u);
+                for (uint32_t i = 0; i < 65536u; ++i) { const uint32_t texel = applyTexa(texaF, (uint8_t)pm, Rgba5551ToRgba8888((u16)i)); const uint32_t a = texel >> 24; lut16.t[i] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : kAlpha128To255[a]) << 24); }
+                lut16.key = key;
+            }
+            lut16p = lut16.t.data();
+        }
+        uint32_t clutR[256];   // [fastdec] palette with the alpha already rescaled (P8H row path: one lookup per texel)
+        if (rowRead && kind == 2) for (int i = 0; i < 256; ++i) { const uint32_t c = clutF[i]; const uint32_t a = c >> 24; clutR[i] = (c & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : kAlpha128To255[a]) << 24); }
+        // [linvram] render-target content: read the rows from the flush's LINEAR image instead of swizzled VRAM
+        // (live VRAM only -- a deferred decode's private scratch is not mirrored). Falls back per texture when the
+        // image does not exist / the view or stride differ.
+        thread_local std::vector<uint32_t> linBuf; bool linOk = false;
+        if (rowRead && (pm == GS_PSM_CT32 || pm == GS_PSM_CT16 || pm == GS_PSM_CT16S || kind == 2) && gs && vramF == gs->m_vram && H > 0 && subW > 0)   // gs == nullptr on the deferred (scratch) path
+        {
+            if (linBuf.size() < (size_t)subW * (size_t)H) linBuf.resize((size_t)subW * (size_t)H);
+            linOk = ps2xLinearFetch(src.tex0->tbp0, pm, src.tex0->tbw, (uint32_t)uIdx[0], subW, H, linBuf.data());
+        }
+        const uint32_t *const linData = linOk ? linBuf.data() : nullptr;   // plain local: the row lambdas run on POOL threads, where the thread_local above is a different (empty) object
         parallelRows(0, H - 1, [&](int ty)
         {
             const int v = wrapC(ty, H, wmt, minV, maxV);
@@ -3057,39 +3098,42 @@ void GSRasterizer::decodeTexRGBA(GS *gs, TexDecodeSrc src, int texW, int texH, b
                 const u32 u0 = (u32)uIdx[0], u1 = u0 + (u32)subW;
                 uint32_t *drow = reinterpret_cast<uint32_t *>(dst + (size_t)ty * subW * 4u);
                 thread_local std::vector<uint32_t> buf32; thread_local std::vector<uint16_t> buf16; thread_local std::vector<uint8_t> buf8;
+                const bool lin = linOk && v >= 0 && v < H;
+                const uint32_t *lrow = lin ? linData + (size_t)v * subW : nullptr;
                 if (kind == 0)
                 {
                     if (buf32.size() < (size_t)subW) buf32.resize((size_t)subW);
-                    GSMem::ReadRowCT32(vramF, blkF, bwF, u0, u1, (u32)v, buf32.data());
+                    const uint32_t *srow = lin ? lrow : buf32.data();
+                    if (!lin) GSMem::ReadRowCT32(vramF, blkF, bwF, u0, u1, (u32)v, buf32.data());
+                    if (pm == GS_PSM_CT32)
+                    {   // [fastdec] applyTexa is the identity for CT32: raw alpha = memcpy, else one LUT pass
+                        if (keepRaw2) std::memcpy(drow, srow, (size_t)subW * 4u);
+                        else for (int tx = 0; tx < subW; ++tx) { const uint32_t t = srow[tx]; drow[tx] = (t & 0x00FFFFFFu) | ((uint32_t)kAlpha128To255[t >> 24] << 24); }
+                    }
+                    else
                     for (int tx = 0; tx < subW; ++tx)
                     {
-                        const uint32_t texel = applyTexa(texaF, (uint8_t)pm, buf32[(size_t)tx]);
+                        const uint32_t texel = applyTexa(texaF, (uint8_t)pm, srow[tx]);
                         const uint32_t a = (texel >> 24) & 0xFFu;
-                        drow[tx] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : std::min(255u, a * 255u / 128u)) << 24);
+                        drow[tx] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : kAlpha128To255[a]) << 24);
                     }
                 }
                 else if (kind == 1)
                 {
                     if (buf16.size() < (size_t)subW) buf16.resize((size_t)subW);
-                    if (pm == GS_PSM_CT16S) GSMem::ReadRowCT16S(vramF, blkF, bwF, u0, u1, (u32)v, buf16.data());
+                    if (lin) { for (int tx = 0; tx < subW; ++tx) buf16[(size_t)tx] = (uint16_t)lrow[tx]; }
+                    else if (pm == GS_PSM_CT16S) GSMem::ReadRowCT16S(vramF, blkF, bwF, u0, u1, (u32)v, buf16.data());
+                    else if (pm == GS_PSM_Z16) GSMem::ReadRowZ16(vramF, blkF, bwF, u0, u1, (u32)v, buf16.data());
+                    else if (pm == GS_PSM_Z16S) GSMem::ReadRowZ16S(vramF, blkF, bwF, u0, u1, (u32)v, buf16.data());
                     else GSMem::ReadRowCT16(vramF, blkF, bwF, u0, u1, (u32)v, buf16.data());
-                    for (int tx = 0; tx < subW; ++tx)
-                    {
-                        const uint32_t texel = applyTexa(texaF, (uint8_t)pm, Rgba5551ToRgba8888(buf16[(size_t)tx]));
-                        const uint32_t a = (texel >> 24) & 0xFFu;
-                        drow[tx] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : std::min(255u, a * 255u / 128u)) << 24);
-                    }
+                    for (int tx = 0; tx < subW; ++tx) drow[tx] = lut16p[buf16[(size_t)tx]];   // [fastdec]
                 }
                 else
                 {
                     if (buf8.size() < (size_t)subW) buf8.resize((size_t)subW);
-                    GSMem::ReadRowP8H(vramF, blkF, bwF, u0, u1, (u32)v, buf8.data());
-                    for (int tx = 0; tx < subW; ++tx)
-                    {
-                        const uint32_t texel = clutF[buf8[(size_t)tx]];
-                        const uint32_t a = (texel >> 24) & 0xFFu;
-                        drow[tx] = (texel & 0x00FFFFFFu) | ((uint32_t)(keepRaw2 ? a : std::min(255u, a * 255u / 128u)) << 24);
-                    }
+                    if (lin) { for (int tx = 0; tx < subW; ++tx) buf8[(size_t)tx] = (uint8_t)(lrow[tx] >> 24); }
+                    else GSMem::ReadRowP8H(vramF, blkF, bwF, u0, u1, (u32)v, buf8.data());
+                    for (int tx = 0; tx < subW; ++tx) drow[tx] = clutR[buf8[(size_t)tx]];   // [fastdec] palette pre-rescaled once per texture
                 }
                 return;
             }

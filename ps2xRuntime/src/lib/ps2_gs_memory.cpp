@@ -294,6 +294,30 @@ namespace GSMem
         return n;
     }
     // [rowdecode] bulk row readers -- mirror the writers: page once per 64-px column, one table lookup per texel.
+    void ReadRowP8(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u8* dst)   // [fastdec] mirrors WriteRowP8
+    {
+        constexpr u32 kBlocks = P8Traits::BlocksPerPage(); constexpr auto kExt = P8Traits::PageExtent(); constexpr u32 kPixels = P8Traits::PixelsPerPage();
+        const auto &row = PageTableP8[bp % kBlocks][y % kExt.y];
+        u32 x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(P8Traits::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x) dst[x - x0] = data[(pageBase + row[x % kExt.x]) & (MEMORY_SIZE - 1u)];
+        }
+    }
+    void ReadRowP4(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u8* dst)   // [fastdec] 4 bpp: table entry = nibble address
+    {
+        constexpr u32 kBlocks = P4Traits::BlocksPerPage(); constexpr auto kExt = P4Traits::PageExtent(); constexpr u32 kPixels = P4Traits::PixelsPerPage();
+        const auto &row = PageTableP4[bp % kBlocks][y % kExt.y];
+        u32 x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(P4Traits::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x) { const usz na = pageBase + row[x % kExt.x]; const u8 b = data[(na >> 1) & (MEMORY_SIZE - 1u)]; dst[x - x0] = (na & 1u) ? (b >> 4) : (b & 0x0Fu); }
+        }
+    }
     void ReadRowCT32(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u32* dst)
     {
         constexpr u32 kBlocks = C32Traits::BlocksPerPage(); constexpr auto kExt = C32Traits::PageExtent(); constexpr u32 kPixels = C32Traits::PixelsPerPage();
@@ -332,6 +356,8 @@ namespace GSMem
         }
     }
     void ReadRowCT16(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst)  { readRow16<C16Traits>(PageTableC16, data, bp, bw, x0, x1, y, dst); }
+    void ReadRowZ16(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst)   { readRow16<Z16Traits>(PageTableZ16, data, bp, bw, x0, x1, y, dst); }   // [fastdec] the depth->alpha 1024x1024 read
+    void ReadRowZ16S(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst)  { readRow16<Z16STraits>(PageTableZ16S, data, bp, bw, x0, x1, y, dst); }
     void ReadRowCT16S(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst) { readRow16<C16STraits>(PageTableC16S, data, bp, bw, x0, x1, y, dst); }
 
     u32 WriteRowCT16(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask)
