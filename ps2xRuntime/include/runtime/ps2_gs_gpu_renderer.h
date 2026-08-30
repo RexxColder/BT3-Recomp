@@ -64,6 +64,8 @@ public:
         // without it later GPU draws depth-test against a buffer with no character in it and
         // paint bright quads on the ground.
         bool depthOnly = false;
+        bool isAliasPass = false;               // [gpualias] a CT16-view pass (rebuild/edge/clear) recorded for GPU execution
+        uint8_t aliasKind = 0;                  // [gpualias] 1 = Z16 rebuild, 2 = untextured clear, 3 = P8H edge
         bool isDecode = false;                  // [deferdec] not a draw: service a deferred texture decode here
         std::shared_ptr<TexDecodeReq> decode;   // [deferdec]
         // The pixels AS THEY WERE when the software run ended. Re-reading VRAM at render time
