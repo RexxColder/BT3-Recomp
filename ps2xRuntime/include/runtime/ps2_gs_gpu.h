@@ -208,7 +208,12 @@ struct TexDecodeReq
     bool served = false;   // set by the GL thread once decoded
     uint32_t coverLo = 0xFFFFFFFFu, coverLo2 = 0xFFFFFFFFu;   // [pageskip] first page of each flush's FBO cover
     std::vector<uint32_t> coverSeq, coverSeq2;                 // [pageskip] m_contentSeq of the covered pages at the read: pages the guest wrote after it are not overwritten by the flush
-    uint32_t zwbBp = 0, zwbPsm = 0, zwbBw = 0; double zwbZMax = 0.0;   // [zwbsnap] ZBUF state at the read: the flush must not use the guest's LATER zbuf
+    uint32_t zwbBp = 0, zwbPsm = 0, zwbBw = 0; double zwbZMax = 0.0;   // [zwbsnap] ZBUF state at the read: the flush must not use the guest's LATER z
+    bool fmtValid = false; uint32_t fmtFbw = 0, fmtPsm = 0; int fmtMaxX = 0, fmtMaxY = 0;   // [fmtsnap] the flushed fbp's FRAME format at the read: a deferred flush must not use the guest's LATER view (stride/psm/extent)buf
+    std::vector<uint8_t> clutSnap; uint32_t clutSnapPage = 0xFFFFFFFFu; uint32_t clutSnapSeq[2] = {0u, 0u};   // [ddmirror] upload seq of the 2 palette pages at the post   // [clutsnap] the CLUT page(s) as they were at the READ: streamed palette slots change 7x per frame
+    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> srcSnap;
+    std::vector<uint32_t> srcSnapSeq;   // [srcsnap2] m_uploadSeq of each srcSnap page at the post
+    std::vector<uint32_t> coverContentSeq;   // [cseqsnap] m_contentSeq[flushPage .. +256) at the post: the flush's shadow/band bookkeeping must see the READ's stamps, not the guest's later ones   // [srcsnap] source pages OUTSIDE the flush cover, as they were at the READ (upload-fed sheets that get re-streamed before the service)
 };
 
 struct GSPrimReg

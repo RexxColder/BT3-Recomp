@@ -1875,10 +1875,22 @@ extern "C" unsigned ps2xVramDiffOutside(uint32_t fbp, uint32_t fbw, uint32_t psm
     }
     return n;
 }
+// [ddmirror] when set, every pixel the masked writeback lands in VRAM is ALSO written into this buffer (same swizzle,
+// no page-skip mask): the deferred decode's private copy = post-time snapshots + the read-time flush, live VRAM untouched.
+uint8_t *g_wbMirror = nullptr;
 void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
                                const uint32_t *px, uint32_t fbmsk)
 {
     wbHudLog("masked", fbp, fbw, psm, w, h, GSInternal::framePageBaseToBlock(fbp), fbw ? fbw : 1u);
+    {   // [pagelog] writebacks whose page range touches PS2X_PAGELOG=lo-hi
+        static const std::pair<int,int> s_pl = [](){ std::pair<int,int> r{-1,-1}; if (const char *v = std::getenv("PS2X_PAGELOG")) std::sscanf(v, "%d-%d", &r.first, &r.second); return r; }();
+        if (s_pl.first >= 0)
+        {
+            const int rowBytes = (int)(fbw ? fbw : 1u) * 64 * ((psm == 2u || psm == 10u) ? 2 : 4);
+            const int lo = (int)fbp, hi = (int)fbp + (int)(((long)h * rowBytes + 8191) / 8192) - 1;
+            if (hi >= s_pl.first && lo <= s_pl.second) { static unsigned long n = 0; if (n++ < 400) std::fprintf(stderr, "[pagelog] WRITEBACK fbp=%u pages %d-%d psm=%u %dx%d fbmsk=%08x\n", fbp, lo, hi, psm, w, h, fbmsk); }
+        }
+    }
     ++g_ps2xWbGen;   // [hashmemo] any VRAM writeback invalidates memoised range hashes
     { GS *gsc = g_gsWb ? g_gsWb : g_fmvGs; if (gsc) gsc->invalidateClutCache(); }   // [clutwb] a flushed page may hold a rendered palette: force the CLUT cache to re-decode
 
@@ -1948,6 +1960,7 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
         {   // [rowct32] unmasked CT32 (the scene / mask page flushes): bulk row write
             const u32 n = GSMem::WriteRowCT32(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, px + PROW(y) + xs,   // [rowrel] src/mask relative to xs
                                               g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr);
+            if (g_wbMirror) GSMem::WriteRowCT32(g_wbMirror, base, bw, (u32)xs, (u32)xe, (u32)y, px + PROW(y) + xs, g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr);   // [ddmirror] same skip mask: a page the guest uploaded after the read keeps its post-time snapshot
             if (n) { if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y; g_wbPixelsWritten += n; }
             continue;
         }
@@ -1959,11 +1972,35 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
             const u32 n = (psm == 0x02u)
                 ? GSMem::WriteRowCT16(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, row16.data() + xs, g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr)
                 : GSMem::WriteRowCT16S(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, row16.data() + xs, g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr);
+            if (g_wbMirror) { const uint8_t *mk = g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr;
+                              if (psm == 0x02u) GSMem::WriteRowCT16(g_wbMirror, base, bw, (u32)xs, (u32)xe, (u32)y, row16.data() + xs, mk);
+                              else              GSMem::WriteRowCT16S(g_wbMirror, base, bw, (u32)xs, (u32)xe, (u32)y, row16.data() + xs, mk); }   // [ddmirror]
             if (n) { if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y; g_wbPixelsWritten += n; }
             continue;
         }
         for (int x = xs; x < xe; ++x)
         {
+            if (g_wbMirror && !(g_wbSkipMask && !g_wbSkipMask[(size_t)y * w + x]))
+            {   // [ddmirror] the same pixel into the private copy, masked against the COPY's own bytes, same skip mask as live
+                const uint32_t nvm = cvA(px[PROW(y) + x]);
+                const bool p16m = s_wbPack16 && wbIs16(psm);
+                if (g_wbAlphaFillOnly)
+                {
+                    const uint32_t ov = rfn(g_wbMirror, base, bw, (uint32_t)x, (uint32_t)y);
+                    const uint32_t rgbMask = fbmsk & 0x00FFFFFFu;
+                    const uint32_t rgb = (ov & rgbMask) | (nvm & ~rgbMask & 0x00FFFFFFu);
+                    const uint32_t al  = (ov & 0xFF000000u) ? (ov & 0xFF000000u) : (nvm & 0xFF000000u);
+                    wfn(g_wbMirror, base, bw, (uint32_t)x, (uint32_t)y, rgb | al);
+                }
+                else if (fbmsk == 0u) wfn(g_wbMirror, base, bw, (uint32_t)x, (uint32_t)y, p16m ? wbPack16(nvm) : nvm);
+                else
+                {
+                    uint32_t ov = rfn(g_wbMirror, base, bw, (uint32_t)x, (uint32_t)y);
+                    if (p16m) ov = wbUnpack16(ov & 0xFFFFu);
+                    const uint32_t mv = (ov & fbmsk) | (nvm & ~fbmsk);
+                    wfn(g_wbMirror, base, bw, (uint32_t)x, (uint32_t)y, p16m ? wbPack16(mv) : mv);
+                }
+            }
             if (g_wbSkipMask && !g_wbSkipMask[(size_t)y * w + x]) continue;
             if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y;
             ++g_wbPixelsWritten;
