@@ -3835,19 +3835,34 @@ void PS2Runtime::run()
             flipY = true;
             int dw = ps2GpuRenderer().displayWidth();
             int dh = ps2GpuRenderer().displayHeight();
-            if (dw > 0 && dw <= static_cast<int>(FB_WIDTH)) presentWidth = static_cast<uint32_t>(dw);
-            if (dh > 0 && dh <= static_cast<int>(DEFAULT_DISPLAY_HEIGHT)) presentHeight = static_cast<uint32_t>(dh);
-            // Use the actual GL texture dimensions for the present crop. The scissor
-            // extent (m_dispW) can differ from the texture size, and forcing
-            // presentWidth to FB_WIDTH when the texture is smaller samples out-of-bounds.
-            // presentSrcX/Y already handle the vertical offset for atlas mode.
-            {
-                const int texW = ps2GpuRenderer().presentTexWidth();
-                const int texH = ps2GpuRenderer().presentTexHeight();
-                const int srcY = ps2GpuRenderer().presentSrcY();
-                if (texW > 0) presentWidth = static_cast<uint32_t>(texW);
-                if (texH > 0 && srcY >= 0) presentHeight = static_cast<uint32_t>(texH - srcY);
-            }
+            // Sanity bound for dw/dh, scaled by the current Render Scale multiplier:
+            // displayWidth()/displayHeight() already include that multiplier (GsGpuRenderer
+            // multiplies m_dispW/m_dispH by it once the FBOs are sized), so this bound must
+            // scale too -- a fixed native-only cap silently discards the picked x2/x3/x4 right
+            // here every frame, which is why Render Scale had no visible effect ("no hay
+            // resoluciones"). Also never crop more than the FBO actually has: ensureFbo's
+            // grow-only sizing means presentTexWidth()/Height() can occasionally be smaller
+            // than a stale displayWidth() from a larger prior frame (e.g. right after a scene
+            // change), and cropping past the real texture reads garbage.
+            const int rs = std::max(1, GsGpuRenderer::renderScale());
+            int maxW = static_cast<int>(FB_WIDTH) * rs;
+            int maxH = static_cast<int>(DEFAULT_DISPLAY_HEIGHT) * rs;
+            const int texW = ps2GpuRenderer().presentTexWidth();
+            const int texH = ps2GpuRenderer().presentTexHeight();
+            const int srcYOff = ps2GpuRenderer().presentSrcY();
+            if (texW > 0) maxW = std::min(maxW, texW);
+            if (texH > 0) maxH = std::min(maxH, texH - std::max(0, srcYOff));
+            // Use the actual FBO texture dimensions as the source rect. The scissor-derived
+            // displayWidth() can be SMALLER than the FBO in 3D scenes (composite draws 512px
+            // into a 640-wide buffer) or at higher render scales (scissor 1024 < FBO 1280),
+            // which incorrectly crops the source rect and zooms the image. The full texture
+            // matches the GS DISPLAY register (the hardware-authoritative display size).
+            // Fall back to displayWidth() if the texture is larger than maxW (grow-only FBO).
+            if (texW > 0 && texW <= maxW) presentWidth = static_cast<uint32_t>(texW);
+            else if (dw > 0 && dw <= maxW) presentWidth = static_cast<uint32_t>(dw);
+            const int availH = (texH > 0 && srcYOff >= 0) ? (texH - srcYOff) : 0;
+            if (availH > 0 && availH <= maxH) presentHeight = static_cast<uint32_t>(availH);
+            else if (dh > 0 && dh <= maxH) presentHeight = static_cast<uint32_t>(dh);
             static bool s_dlog = false;
             if (!s_dlog && dw > 0 && std::getenv("PS2X_GPU_DIAG")) { s_dlog = true; std::cerr << "[gpupresent] disp=" << dw << "x" << dh << " -> present=" << presentWidth << "x" << presentHeight << std::endl; }
         }
