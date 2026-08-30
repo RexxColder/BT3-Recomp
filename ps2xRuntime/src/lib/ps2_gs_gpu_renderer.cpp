@@ -3962,7 +3962,11 @@ static bool gaExecShaderInit()
             "void main(){\n"
             "  ivec2 xy = ivec2(gl_FragCoord.xy);\n"
             "  if (uStage == 9) {\n"   // CT16 re-view of a CT32 FBO: (x,y) -> word (x, y>>1), halfword = y&1 (ct16pair, sentinel-verified)
-            "    ivec2 t = ivec2(xy.x, (uSrcFlip == 1) ? (uSrcH - 1 - (xy.y >> 1)) : (xy.y >> 1));\n"
+            "    int wx = xy.x; int wy = xy.y >> 1;\n"            // CT32 coords in the fbw8 (512-wide) layout
+            "    int pg = (wy >> 5) * 8 + (wx >> 6);\n"           // page index (CT32 page = 64x32, 8 pages/row at fbw8)
+            "    int fpw = max(uXOff, 1);\n"                      // FBO width in pages (its ACTUAL layout)
+            "    ivec2 t = ivec2((pg % fpw) * 64 + (wx & 63), (pg / fpw) * 32 + (wy & 31));\n"
+            "    if (uSrcFlip == 1) t.y = uSrcH - 1 - t.y;\n"
             "    ivec4 F = ivec4(texelFetch(uSrcA, t, 0) * 255.0 + 0.5);\n"
             "    int h = ((xy.y & 1) == 1) ? (F.b | (F.a << 8)) : (F.r | (F.g << 8));\n"
             "    finalColor = vec4(float((h & 31) << 3), float(((h >> 5) & 31) << 3), float(((h >> 10) & 31) << 3), float(((h >> 15) & 1) << 7)) / 255.0;\n"
@@ -4024,6 +4028,12 @@ static bool gaBuildReviewTex(const Texture2D &src, int srcH)
     BeginBlendMode(BLEND_CUSTOM);
     BeginShaderMode(sh);
     int stage = 9; SetShaderValue(sh, gaLocStage(), &stage, SHADER_UNIFORM_INT);
+    {   // the FBO's ACTUAL page layout: width in CT32 pages (64px each)
+        int fpw = src.width / 64; if (fpw < 1) fpw = 1;
+        SetShaderValue(sh, g_gaLoc[2] /*uXOff*/, &fpw, SHADER_UNIFORM_INT);
+        static int n = 0;
+        if (n++ < 4) std::fprintf(stderr, "[gpualias] review build: f336 FBO %dx%d (%d pages/row) srcH=%d\n", src.width, src.height, fpw, srcH);
+    }
     static const int s_flip = [](){ const char *v = std::getenv("PS2X_GPUALIAS_FLIP"); return v && v[0] ? std::atoi(v) : 1; }();
     int flip = s_flip; SetShaderValue(sh, gaLocSrcFlip(), &flip, SHADER_UNIFORM_INT);
     SetShaderValue(sh, gaLocSrcH(), &srcH, SHADER_UNIFORM_INT);
