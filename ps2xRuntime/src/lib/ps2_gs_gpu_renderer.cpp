@@ -9815,8 +9815,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         Texture2D tex = g_white; bool vflip = false; bool fromFbo = false;
         {   // [gpualias] mode>=4: serve the CT16-view read of fbp336 (the edge-chain consumer) from the executor's view texture
             static const int s_gaC = [](){ const char *v = std::getenv("PS2X_GPUALIAS"); return v && v[0] ? std::atoi(v) : 0; }();
+            // Page 336's CT16 view holds DIFFERENT content across the frame (HUD composite, DoF,
+            // edge map). Serve ONLY the ink composite -- its signature: bm 0x64 replace, TEXA
+            // (0x30, 0, aem=1), narrow column sprites into the scene. Everything else (HUD reads,
+            // menus) must keep the VRAM path or it composites the edge map as garbage.
             if (s_gaC >= 4 && g_gaViewReady && !c.srcIndexed && c.srcTbp0 == 336u * 32u &&
-                (c.srcPsm == 0x02u || c.srcPsm == 0x0Au))
+                (c.srcPsm == 0x02u || c.srcPsm == 0x0Au) && !c.isTriangle &&
+                c.blendMode == 0x64u && c.texaTa0 == 0x30u && c.texaTa1 == 0u && c.texaAem &&
+                (c.dx1 - c.dx0) <= 33.0f && (c.destFbp == 0u || c.destFbp == 112u))
             {
                 tex = g_gaViewTex[g_gaCur].texture; vflip = false; fromFbo = true;
                 static unsigned long n = 0;
