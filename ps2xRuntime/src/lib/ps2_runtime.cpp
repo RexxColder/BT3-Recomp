@@ -4177,7 +4177,13 @@ void PS2Runtime::run()
                 extern std::atomic<uint64_t> g_bt3FrameCount;
                 static uint64_t s_lastGameFrames = 0u;
                 uint64_t gameFrames = g_bt3FrameCount.load(std::memory_order_relaxed);
+                extern std::atomic<uint64_t> g_guestBusyNs, g_guestBusyFrames;
+                static uint64_t s_lastBusyNs = 0, s_lastBusyFrames = 0;
+                const uint64_t bn = g_guestBusyNs.load(std::memory_order_relaxed), bf = g_guestBusyFrames.load(std::memory_order_relaxed);
+                const double guestMs = (bf > s_lastBusyFrames) ? (double)(bn - s_lastBusyNs) / 1.0e6 / (double)(bf - s_lastBusyFrames) : 0.0;   // [guestbusy] ms of guest CPU per published frame
+                s_lastBusyNs = bn; s_lastBusyFrames = bf;
                 std::cerr << "[fps] GAME=" << (double)((gameFrames - s_lastGameFrames) / dt)
+                          << " guest_ms=" << guestMs
                           << " host=" << (uint32_t)(s_fpsFrames / dt)
                           << " prims/sec=" << (uint64_t)((prims - s_lastPrims) / dt)
                           << " Mpix/sec=" << (double)((pix - s_lastPix) / dt / 1.0e6)

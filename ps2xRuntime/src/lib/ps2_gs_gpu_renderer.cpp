@@ -1,3 +1,4 @@
+#include <time.h>
 #include <tuple>
 #include <deque>
 #include <condition_variable>
@@ -80,6 +81,7 @@ bool g_resolveAlphaData = false;        // set by the rasterizer around texture 
 static const char *g_emitPath = "none";   // [emitpath] which emission branch the current command took
 uint32_t g_barReqTbp = 0, g_barReqCbp = 0, g_barReqPsm = 0, g_barReqTbw = 0;
 unsigned long g_ddRtSkip = 0;   // [ddrtdirect 2]
+std::atomic<uint64_t> g_guestBusyNs{0}, g_guestBusyFrames{0};   // [guestbusy] file scope: read by ps2_runtime.cpp
 extern unsigned long g_svcFlushSkip;   // [svcflushseq] defined below
 extern unsigned long g_linFetch, g_linMiss, g_linRefresh;   // [linvram] defined below
 extern unsigned long g_ddMaxqWaits;   // [ddmaxq] defined below   // the draw whose texture resolve raised the barrier
@@ -4348,6 +4350,14 @@ void GsGpuRenderer::swapFrame()
 {
     flushStage();   // [recstage]
     g_gsGuestSwapCount.fetch_add(1, std::memory_order_relaxed);
+    {   // [guestbusy] the guest thread's CPU time per published frame (the game paces in whole vsyncs, so the fps counter
+        // hides everything between 33 and 50 ms; this is the number that says how far the frame is from 30 fps)
+        struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        static uint64_t s_last = 0;
+        if (s_last) { g_guestBusyNs.fetch_add(now - s_last, std::memory_order_relaxed); g_guestBusyFrames.fetch_add(1, std::memory_order_relaxed); }
+        s_last = now;
+    }
     {   // [tilecount] per-frame line
         static const bool s_tc = [](){ const char *v = std::getenv("PS2X_TILECOUNT"); return v && v[0] && v[0] != '0'; }();
         if (s_tc && g_tcFrames < 400) { ++g_tcFrames; std::fprintf(stderr, "[tilecount] frame %d: %d draws, mean tex lum %.1f alpha %.1f\n", g_tcFrames, g_tcCount, g_tcCount ? g_tcLum / g_tcCount : 0.0, g_tcCount ? g_tcAlpha / g_tcCount : 0.0); }
