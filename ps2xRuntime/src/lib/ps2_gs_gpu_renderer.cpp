@@ -78,7 +78,8 @@ static bool g_liveStageArmed = false;   // [livesync] stage barrier pages after 
 bool g_replayInWindow = false;          // replay main loop: true only inside FROM..TO (not warm)
 bool g_resolveAlphaData = false;        // set by the rasterizer around texture resolves of alpha-as-data draws
 static const char *g_emitPath = "none";   // [emitpath] which emission branch the current command took
-uint32_t g_barReqTbp = 0, g_barReqCbp = 0, g_barReqPsm = 0, g_barReqTbw = 0;   // the draw whose texture resolve raised the barrier
+uint32_t g_barReqTbp = 0, g_barReqCbp = 0, g_barReqPsm = 0, g_barReqTbw = 0;
+unsigned long g_ddRtSkip = 0;   // [ddrtdirect 2]   // the draw whose texture resolve raised the barrier
 static bool ps2xOnGlThread()
 {
     const size_t h = std::hash<std::thread::id>{}(std::this_thread::get_id());
@@ -2684,8 +2685,15 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
             // FBO-backed frame buffer is served by the draw path straight from the FBO texture in the sync build (its
             // decode is a dummy: fbp368's 128x128 timer plate hashes to one empty texture 3736x). Deferring it makes the
             // draw use the deferred decode instead of the live FBO -> the plate goes missing. Keep such reads synchronous.
-            static const bool s_rtd = [](){ const char *v = std::getenv("PS2X_DDRTDIRECT"); return !(v && v[0] == '0'); }();
-            const bool rtDirect = s_rtd && (g_barReqPsm == 0u || g_barReqPsm == 1u || g_barReqPsm == 2u || g_barReqPsm == 10u) && g_fbpFmt.find(page) != g_fbpFmt.end();
+            static const int s_rtd = [](){ const char *v = std::getenv("PS2X_DDRTDIRECT"); return v && v[0] ? std::atoi(v) : 2; }();   // 0 off, 1 = keep sync, 2 = SKIP (default)
+            const bool rtDirect = s_rtd != 0 && (g_barReqPsm == 0u || g_barReqPsm == 1u || g_barReqPsm == 2u || g_barReqPsm == 10u) && g_fbpFmt.find(page) != g_fbpFmt.end();
+            if (deferOut && rtDirect && s_rtd == 2)
+            {   // [ddrtdirect 2] no wait and no post: the draw samples the FBO texture, which the GL thread fills IN ORDER
+                // anyway; the page stays dirty so an indexed / CPU consumer still gets its flush at its own read.
+                extern unsigned long g_ddRtSkip; ++g_ddRtSkip;
+                static int n = 0; if (n < 3) { ++n; std::fprintf(stderr, "[deferdec] rt-direct skip: page %u psm %u (dirty stays)\n", page, g_barReqPsm); }
+                return;
+            }
             if (deferOut && !rtDirect && ddPageAllowed(page))
             {   // [deferdec] caller posts a decode command instead of waiting -- but only when the page has
                 // NEW draws since the last post: a pending-only page is already covered by the queued decode
