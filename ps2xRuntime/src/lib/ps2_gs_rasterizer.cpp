@@ -3690,7 +3690,14 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                     (s_ct32a && tex.psm == GS_PSM_CT32);
             { extern uint32_t g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw; g_barReqTbp = tex.tbp0; g_barReqCbp = tex.cbp; g_barReqPsm = tex.psm; g_barReqTbw = tex.tbw; }
             const bool deferOk = s_deferDec && GSRasterizer::decodeIsDeferrable(tex.psm);   // [deferdec]
-            ps2GpuRenderer().barrierBeforeRead(tex.tbp0, true, wantsAlpha, deferOk ? &deferTex : nullptr);
+            {   // [gpualias] mode>=4: the CT16-view read of fbp336 is served from the GPU view
+                // texture (renderer-side flip) -- the VRAM this barrier would flush+decode is
+                // never consumed for those draws, so skip the whole flush/readback round-trip.
+                static const int s_ga4 = [](){ const char *v = std::getenv("PS2X_GPUALIAS"); return v && v[0] ? std::atoi(v) : 0; }();
+                const bool gaServed = s_ga4 >= 4 && tex.tbp0 == 10752u && (tex.psm == 0x02u || tex.psm == 0x0Au);
+                if (!gaServed)
+                    ps2GpuRenderer().barrierBeforeRead(tex.tbp0, true, wantsAlpha, deferOk ? &deferTex : nullptr);
+            }
             deferAlpha = wantsAlpha;
             // The PALETTE too. BT3's outline/shadow CLUTs live in pages 499-500, which the game
             // RENDERS into -- so their VRAM copy is stale and every composite decoded a dead
