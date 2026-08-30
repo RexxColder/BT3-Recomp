@@ -1753,7 +1753,15 @@ void GSRasterizer::drawPrimitive(GS *gs)
         case GS_PRIM_TRIANGLE:
         case GS_PRIM_TRISTRIP:
         case GS_PRIM_TRIFAN:
-            recordSpriteGPU(gs); // handles both sprite (2 tris) and triangle (1 tri)
+            {   // [cpuclut] a palette-page sprite is blended in VRAM by the PS2X_CPUCLUT block below (exact GS blend
+                // against the uploaded palette). It must NOT also be recorded to the GPU: that created a 64x448 FBO
+                // for fbp480 holding a blend against garbage (the FBO never sees uploads), and the barrier flush
+                // then wrote that over the correct palette -> the hit character turned solid black and stayed so
+                // (every later CLUT read re-flushed the stale FBO). User capture hit.gs frame 614.
+                static const bool s_cclutG = [](){ const char *v = std::getenv("PS2X_CPUCLUT"); return !(v && v[0] == '0'); }();
+                const bool cpuClut = s_cclutG && ctx.frame.fbp == 480u && gs->m_prim.type == 6u && gs->m_prim.tme == 0;
+                if (!cpuClut) recordSpriteGPU(gs); // handles both sprite (2 tris) and triangle (1 tri)
+            }
             break;
         case GS_PRIM_LINE:
         case GS_PRIM_LINESTRIP:
