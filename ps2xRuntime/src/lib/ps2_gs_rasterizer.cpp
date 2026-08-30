@@ -29,6 +29,7 @@ static thread_local int g_subDx0 = 0, g_subDxW = 0;   // [subdecode] decode wind
 #include <vector>
 #include <memory>
 extern "C" uint32_t ps2xDeferCoverFor(uint32_t page);   // [defercover] ps2_gs_gpu_renderer.cpp
+extern "C" uint32_t ps2xDeferCoverFbp(uint32_t page);   // [clutcover] ps2_gs_gpu_renderer.cpp
 
 // [pixcenter] destinations that receive the GS-corner -> GL-centre half-pixel shift (display buffers only).
 static bool pixCenterDestOk(uint32_t fbp)
@@ -3897,8 +3898,26 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             // Flushing the read's own page flushed fbp368's stray 128x128 FBO (timer plate wrong); flushing the cover
             // (fbp336) re-clobbered the sheets and cost 60k flushes (11 fps).
             req->flushPage = deferTex ? ((pendTex && s_dcv) ? 0xFFFFFFFFu : (ctx.tex0.tbp0 / 32u)) : 0xFFFFFFFFu; req->flushAlpha = deferAlpha;
-            req->flushClutPage = deferClut ? (ctx.tex0.cbp / 32u) : 0xFFFFFFFFu;
+            {   // [clutcover] a pend-post's palette flush targets the fbp whose pending flush covers the CLUT page (fbp480 for
+                // BT3's rendered outline palettes at 499-500); the page itself has no FBO and the flush would bail.
+                static const bool s_cc = [](){ const char *v = std::getenv("PS2X_CLUTCOVER"); return !(v && v[0] == '0'); }();
+                req->flushClutPage = deferClut ? ((pendClut && s_cc) ? ps2xDeferCoverFbp(ctx.tex0.cbp / 32u) : (ctx.tex0.cbp / 32u)) : 0xFFFFFFFFu;
+            }
             r.postDecode(std::move(req));
+            {   // [ddmaxq] PS2X_DDMAXQ=K (default 4, 0 = unbounded): bound how far the guest runs ahead of the GL thread's decode
+                // services. Deep queues (GL thread slowed by another GPU client) are where every shared-page protection erodes
+                // (rig: full deferral clean at 30 fps, striped/garbled at 17-25); a shallow queue keeps the race window small.
+                static const int s_maxq = [](){ const char *v = std::getenv("PS2X_DDMAXQ"); return v && v[0] ? std::atoi(v) : 0; }();   // default 0: a bound of 2-4 removed the stripes under load but starved the HUD (late decodes -> placeholders)
+                extern unsigned long g_deferPosted, g_deferServed; extern unsigned long g_ddMaxqWaits;
+                if (s_maxq > 0 && g_deferPosted > g_deferServed + (unsigned long)s_maxq)
+                {
+                    ++g_ddMaxqWaits;
+                    const auto t0 = std::chrono::steady_clock::now();
+                    while (g_deferPosted > g_deferServed + (unsigned long)s_maxq
+                           && std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(40))
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+            }
         }
         else if (texNeedDecode)
         {

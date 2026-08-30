@@ -80,7 +80,8 @@ bool g_resolveAlphaData = false;        // set by the rasterizer around texture 
 static const char *g_emitPath = "none";   // [emitpath] which emission branch the current command took
 uint32_t g_barReqTbp = 0, g_barReqCbp = 0, g_barReqPsm = 0, g_barReqTbw = 0;
 unsigned long g_ddRtSkip = 0;   // [ddrtdirect 2]
-extern unsigned long g_svcFlushSkip;   // [svcflushseq] defined below   // the draw whose texture resolve raised the barrier
+extern unsigned long g_svcFlushSkip;   // [svcflushseq] defined below
+extern unsigned long g_ddMaxqWaits;   // [ddmaxq] defined below   // the draw whose texture resolve raised the barrier
 static bool ps2xOnGlThread()
 {
     const size_t h = std::hash<std::thread::id>{}(std::this_thread::get_id());
@@ -2237,7 +2238,7 @@ void GsGpuRenderer::postDecode(std::shared_ptr<TexDecodeReq> req)
         if (req->flushClutPage != 0xFFFFFFFFu) g_deferPostSeq[req->flushClutPage] = m_writeSeq;
     }
     ++g_deferPosted;
-    if (g_deferPosted <= 4ul || (g_deferPosted & 1023ul) == 0ul) std::fprintf(stderr, "[deferdec] svcskip %lu | posted %lu served %lu late %lu pubwait %lu upwait %lu pageskip %lu (key %llx page %u clut %u)\n", g_svcFlushSkip, g_deferPosted, g_deferServed, g_deferLate, g_deferPubWait, g_deferUploadWait, g_deferPageSkip, (unsigned long long)req->texKey, req->flushPage, req->flushClutPage);
+    if (g_deferPosted <= 4ul || (g_deferPosted & 1023ul) == 0ul) std::fprintf(stderr, "[deferdec] maxqwaits %lu svcskip %lu | posted %lu served %lu late %lu pubwait %lu upwait %lu pageskip %lu (key %llx page %u clut %u)\n", g_ddMaxqWaits, g_svcFlushSkip, g_deferPosted, g_deferServed, g_deferLate, g_deferPubWait, g_deferUploadWait, g_deferPageSkip, (unsigned long long)req->texKey, req->flushPage, req->flushClutPage);
     recordCmd(c);
     flushStage();   // the GL thread must be able to see the command in m_building right away
     static const bool s_ddRig = [](){ const char *v = std::getenv("PS2X_DEFERDEC_RIG"); return v && v[0] && v[0] != '0'; }();
@@ -2298,6 +2299,16 @@ extern "C" uint32_t ps2xDeferCoverFor(uint32_t page)
     if (s_skip.count(page)) return 0xFFFFFFFFu;
     return ps2GpuRenderer().flushPending(page) ? page : 0xFFFFFFFFu;   // (a pend-post flushes nothing, so the cover fbp itself is not needed)
 }
+// [clutcover] the fbp whose pending flush covers `page` (for a CLUT read: the palette at 499-500 is RENDERED into fbp480;
+// a pend-post that "flushes" page 499 bails (no FBO) and the decode uses last frame's palette from VRAM -> the dark
+// stripe columns that appear whenever the GL thread falls behind). Returns `page` when nothing pending covers it.
+extern "C" uint32_t ps2xDeferCoverFbp(uint32_t page)
+{
+    std::lock_guard<std::mutex> bk(g_barMx);
+    for (const auto &kv : g_deferPending)
+        if (kv.second > 0 && page >= kv.first && page < kv.first + flushCoverPages(kv.first)) return kv.first;
+    return page;
+}
 bool GsGpuRenderer::flushPending(uint32_t page)
 {   // [deferpend] [flushcover] -- with the barrier's own [dduploadwins] rule: a page the guest UPLOADED after the covering
     // fbp's last render holds game data, not RT content; sync decodes it from VRAM with no flush, so it is not "pending"
@@ -2315,6 +2326,7 @@ bool GsGpuRenderer::flushPending(uint32_t page)
     return false;
 }
 unsigned long g_pendUploadWins = 0;
+unsigned long g_ddMaxqWaits = 0;   // [ddmaxq]
 unsigned long g_svcFlushSkip = 0;   // [svcflushseq]
 void GsGpuRenderer::waitPendingFlush(uint32_t page)
 {   // [uploadwait] a guest VRAM write (image upload / local copy) into a page whose deferred flush is still
@@ -2469,7 +2481,7 @@ void GsGpuRenderer::serviceDecodeReq(TexDecodeReq &q)
     // glReadPixels on the GL thread) even when nothing had been rendered into it since the previous service. Same rule as
     // the end-of-frame loop: skip when the fbp's render seq is unchanged since the last service flush (and that flush
     // wrote alpha if this read wants it). VRAM already holds this render's content.
-    static const bool s_sfs = [](){ const char *v = std::getenv("PS2X_SVCFLUSHSEQ"); return !(v && v[0] == '0'); }();
+    static const bool s_sfs = [](){ const char *v = std::getenv("PS2X_SVCFLUSHSEQ"); return v && v[0] && v[0] != '0'; }();   // default OFF (2026-08-30 19:00): even post-ordered, the skip leaves dark stripe columns across the top band (rig strips, user's corrupt2.png) and the run WITHOUT it was faster (30 vs 24)
     struct LastSvc { uint32_t seq = 0; bool alpha = false; unsigned long postedAt = 0; };
     static std::unordered_map<uint64_t, LastSvc> s_lastSvc;   // (fbp, flush VIEW) -> last service flush: render seq, alpha written, posts so far
     extern unsigned long g_svcFlushSkip;
@@ -2742,7 +2754,7 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
             // FBO-backed frame buffer is served by the draw path straight from the FBO texture in the sync build (its
             // decode is a dummy: fbp368's 128x128 timer plate hashes to one empty texture 3736x). Deferring it makes the
             // draw use the deferred decode instead of the live FBO -> the plate goes missing. Keep such reads synchronous.
-            static const int s_rtd = [](){ const char *v = std::getenv("PS2X_DDRTDIRECT"); return v && v[0] ? std::atoi(v) : 0; }();   // default 0 since 2026-08-30 18:50: full deferral is census-clean now ([defercover]/[ddmirror]/[svcflushseq]) and the fastest (matrix: 23-24.6 vs 20 for mode 1 / sync); 1 = keep sync; 2 = skip (fast but stale composites)
+            static const int s_rtd = [](){ const char *v = std::getenv("PS2X_DDRTDIRECT"); return v && v[0] ? std::atoi(v) : 1; }();   // default 1 (2026-08-30 20:00): full deferral (0) is correct ONLY when the GL thread keeps up (clean at 30 fps runs, stripes/missing HUD whenever it lags: shared GPU); mode 1 = correct at sync speed; 2 = skip (fast, stale composites)
             const bool rtDirect = s_rtd != 0 && (g_barReqPsm == 0u || g_barReqPsm == 1u || g_barReqPsm == 2u || g_barReqPsm == 10u) && g_fbpFmt.find(page) != g_fbpFmt.end();
             if (deferOut && rtDirect && s_rtd == 2)
             {   // [ddrtdirect 2] no wait and no post: the draw samples the FBO texture, which the GL thread fills IN ORDER
