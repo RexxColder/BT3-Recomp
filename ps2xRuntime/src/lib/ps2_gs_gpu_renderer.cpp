@@ -2083,6 +2083,7 @@ bool GsGpuRenderer::serviceBlockingBarriers()
         m_flushAlphaNow = false;
         const auto tFl = std::chrono::steady_clock::now();
         g_bbPickup += std::chrono::duration<double, std::milli>(tPick - r.tPost).count();
+        { extern std::map<uint32_t, int> g_bbByPage; ++g_bbByPage[r.page]; }   // [bbstat] histogram
         g_bbRender += std::chrono::duration<double, std::milli>(tRend - tPick).count();
         g_bbFlush  += std::chrono::duration<double, std::milli>(tFl - tRend).count();
         { extern std::map<uint32_t, unsigned long> g_bbPageHist; extern std::map<uint32_t, double> g_bbPageMs; ++g_bbPageHist[r.page];
@@ -4332,6 +4333,7 @@ extern "C" void ps2xGsRecordVsync();   // PS2X_GS_RECORD (ps2_gs_gpu.cpp); a fun
                                        // extern "C" is a syntax error, it must live here
 double g_bsRender = 0, g_bsFlush = 0; int g_bsCount = 0;   // [barstat]
 double g_bbPickup = 0, g_bbRender = 0, g_bbFlush = 0, g_bbTotal = 0; int g_bbN = 0;   // [bbstat] blocking-barrier legs per frame (ms)
+std::map<uint32_t, int> g_bbByPage;   // [bbstat] blocking barriers by requested page
 double g_rsA = 0, g_rsB = 0, g_rsC = 0, g_rsD = 0, g_rsTot = 0;   // [secstat] segment-render sections: pre-census, census+reorder, draw loop, post, total
 double g_flDepth = 0, g_flRead = 0, g_flWrite = 0, g_flTot = 0;      // [secstat] flush sections
 unsigned long g_shRefresh = 0;   // [flushrectdiff]
@@ -4375,6 +4377,11 @@ void GsGpuRenderer::swapFrame()
             std::fprintf(stderr, "[barstat] frame: %d barriers, render %.1f ms, flush %.1f ms (gpufinish %.1f, readback %.1f, vramwrite %.1f) | cmds drawn %ld | pages:", g_bsCount, g_bsRender, g_bsFlush, g_bsFinish, g_bsReadback, g_bsWrite, g_bsCmds);
             { extern double g_bbPickup, g_bbRender, g_bbFlush, g_bbTotal; extern int g_bbN;
               { extern unsigned long g_preChunks, g_preCmds; std::fprintf(stderr, "[bbstat] blocking barriers %d: pickup %.1f  render %.1f  flush %.1f  resume %.1f  (guest-side total %.1f ms) | prerendered %lu chunks / %lu cmds\n", g_bbN, g_bbPickup, g_bbRender, g_bbFlush, g_bbTotal - g_bbPickup - g_bbRender - g_bbFlush, g_bbTotal, g_preChunks, g_preCmds); g_preChunks = g_preCmds = 0; }
+              { extern std::map<uint32_t, int> g_bbByPage; std::string bp; int shown = 0;
+                std::vector<std::pair<int,uint32_t>> v; for (auto &kv : g_bbByPage) v.push_back({kv.second, kv.first});
+                std::sort(v.rbegin(), v.rend());
+                for (auto &e2 : v) { if (++shown > 8) break; bp += " p" + std::to_string(e2.second) + ":" + std::to_string(e2.first); }
+                std::fprintf(stderr, "[bbpages]%s\n", bp.c_str()); g_bbByPage.clear(); }
   { extern std::map<uint32_t, unsigned long> g_bbPageHist; extern std::map<uint32_t, double> g_bbPageMs; extern unsigned long g_bbSkipped; std::fprintf(stderr, "[bbpages]"); for (auto &kv : g_bbPageHist) std::fprintf(stderr, " f%u:%lu(%.0fms)", kv.first, kv.second, g_bbPageMs[kv.first]); std::fprintf(stderr, " | skipped %lu\n", g_bbSkipped); g_bbPageHist.clear(); g_bbPageMs.clear(); g_bbSkipped = 0; }
               extern double g_rsA, g_rsB, g_rsC, g_rsD, g_rsTot, g_flDepth, g_flRead, g_flWrite, g_flTot;
   std::fprintf(stderr, "[secstat] render: pre %.0f  census+reorder %.0f  drawloop %.0f  post %.0f  (total %.0f) | flush: depth %.0f  read %.0f  write %.0f  other %.0f (total %.0f)\n",
