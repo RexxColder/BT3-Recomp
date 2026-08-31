@@ -1348,11 +1348,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             // EE builder of the unstable sun-lighting groups.
                             static const uint32_t s_pd2 = [](){ const char *v = std::getenv("PS2X_PALSRC");
                                                                 return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
-                            static int s_pn2 = 0;
+                            static int s_pn2 = 0;   // raised cap: slot-address logging needs many frames
                             static int s_expectPayload = 0;   // [palsrc] header seen; the NEXT big segment is the palette bytes
                             if (s_pd2 && s_expectPayload > 0 && !scratch && bytes >= 1024u && src < maxSz2)
                             {
                                 s_expectPayload = 0;
+                                // Slot-indexed payload-address log: if the ADDRESS a slot references
+                                // changes frame-to-frame, the game picks between STATIC light tables
+                                // and the chooser writes the display list, not the palette bytes.
+                                static int s_slot = 0; static uint32_t s_lastFirst = 0; static int s_pl = 0;
+                                if (s_pl < 600)
+                                {
+                                    if (s_lastFirst == 0) s_lastFirst = srcAddr;
+                                    // heuristic frame boundary: slot counter resets when we see the FIRST slot's addr class again
+                                    std::fprintf(stderr, "[palslot] %d 0x%08x len %u\n", s_slot++, srcAddr, bytes);
+                                    ++s_pl;
+                                }
                                 std::fprintf(stderr, "[palsrc] PAYLOAD at guest 0x%08x len %u\n", srcAddr, bytes);
                                 static const bool s_armP = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
                                                                  return v && v[0] && v[0] != '0'; }();
@@ -1364,7 +1375,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                     std::fprintf(stderr, "[palsrc] write-watch ARMED on PAYLOAD phys 0x%08x..0x%08x\n", src, src + alen);
                                 }
                             }
-                            if (s_pd2 && s_pn2 < 40 && !scratch && src < maxSz2 && bytes <= maxSz2 - src)
+                            if (s_pd2 && s_pn2 < 700 && !scratch && src < maxSz2 && bytes <= maxSz2 - src)
                             {
                                 const uint8_t *p2 = base2 + src;
                                 for (uint32_t off = 0; off + 16 <= bytes; off += 16)
@@ -1373,8 +1384,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                     std::memcpy(&lo, p2 + off, 8); std::memcpy(&hi, p2 + off + 8, 8);
                                     if ((hi & 0xFFull) == 0x50ull && ((lo >> 32) & 0x3FFFull) == s_pd2)
                                     {
-                                        std::fprintf(stderr, "[palsrc] #%d BITBLTBUF dbp=%u at guest 0x%08x (seg 0x%08x+%u len %u ch=%08x)\n",
-                                                     s_pn2, s_pd2, srcAddr + off, srcAddr, off, bytes, channelBase);
+                                        if (s_pn2 < 40)
+                                            std::fprintf(stderr, "[palsrc] #%d BITBLTBUF dbp=%u at guest 0x%08x (seg 0x%08x+%u len %u ch=%08x)\n",
+                                                         s_pn2, s_pd2, srcAddr + off, srcAddr, off, bytes, channelBase);
                                         s_expectPayload = 2;   // arm on the palette BYTES that follow, not this static header
                                         if (++s_pn2 >= 40) break;
                                     }
