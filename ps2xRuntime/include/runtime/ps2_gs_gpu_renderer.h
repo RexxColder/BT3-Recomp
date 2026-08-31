@@ -360,6 +360,7 @@ private:
     std::vector<std::vector<DrawCmd>> m_vecPool;
     std::vector<DrawCmd> m_cmdsScratch;   // [vecpool] renderAndGetTextureId command scratch   // [vecpool] emptied frame lists handed back by the GL thread so the guest reuses their capacity (a moved-out m_building regrew from 0 every frame: ~5% of the guest thread in DrawCmd moves)
     std::unordered_map<uint64_t, CachedTex> m_texCache;
+    std::vector<uint64_t> m_upQueue;   // [upqueue] keys with needsUpload set since the last drain (guarded by m_mtx)
     // [verfast] lock-free clean path for resolveTextureVersion: the guest keeps a mirror of "this verKey is decoded and
     // present"; the GL thread bumps m_texCacheEpoch whenever it removes cache entries, which drops the mirror.
     std::atomic<uint32_t> m_texCacheEpoch{0};

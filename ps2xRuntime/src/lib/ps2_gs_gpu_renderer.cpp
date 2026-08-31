@@ -3589,6 +3589,7 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
     ct.h = h;
     ct.decodeSeq = m_writeSeq;
     ct.needsUpload = true;
+    m_upQueue.push_back(key);   // [upqueue] O(1) here instead of an O(cache) scan per chunk render
     // Flag near-black textures (sampled): a fully stale/empty VRAM region decodes to black.
     // Used to skip fullscreen black WIPES of un-rendered regions in GPU mode (PS2X_SKIP_STALE_VRAM).
     {
@@ -5308,6 +5309,27 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // thread as pthread_mutex time). The bytes are swapped out here and swapped back after the
         // upload; a putTexture that lands in between sets needsUpload again and wins.
         s_ups.clear();
+        // [upqueue] renderAndGetTextureId runs once per CHUNK (thousands/sec); the full m_texCache
+        // scan here was ~10%% of the loop's self-time (one hot flag-test branch in perf annotate).
+        // Drain the queue putTexture feeds instead. PS2X_UPQUEUE=0 restores the scan; the TEXREUP
+        // debug env still forces the full scan (it re-uploads everything).
+        static const bool s_upq = [](){ const char *v = std::getenv("PS2X_UPQUEUE"); return !(v && v[0] == '0'); }();
+        if (s_upq && !s_reup)
+        {
+            for (uint64_t qk : m_upQueue)
+            {
+                auto qit = m_texCache.find(qk);
+                if (qit == m_texCache.end()) continue;
+                CachedTex &ct = qit->second;
+                if (!ct.needsUpload || ct.w <= 0 || ct.rgba.size() < (size_t)ct.w * ct.h * 4)
+                    continue;   // duplicate queue entry or invalid: the flag is the truth
+                PendingUp u; u.key = qk; u.w = ct.w; u.h = ct.h; u.rgba.swap(ct.rgba);
+                ct.needsUpload = false;
+                s_ups.push_back(std::move(u));
+            }
+            m_upQueue.clear();
+        }
+        else
         for (auto &kv : m_texCache)
         {
             CachedTex &ct = kv.second;
