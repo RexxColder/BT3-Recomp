@@ -1341,6 +1341,40 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             maxSz2 = PS2_RAM_SIZE;
                         }
 
+                        {   // [palsrc] PS2X_PALSRC=<dbp>: the CHAIN path (the one live BT3 uses).
+                            // Scan this tag segment for a BITBLTBUF write to the terrain-palette
+                            // block, log its guest address, and (PS2X_PALSRC_ARM=1) arm the guest
+                            // write-watch on the segment so next frame's rebuild backtraces the
+                            // EE builder of the unstable sun-lighting groups.
+                            static const uint32_t s_pd2 = [](){ const char *v = std::getenv("PS2X_PALSRC");
+                                                                return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
+                            static int s_pn2 = 0;
+                            if (s_pd2 && s_pn2 < 40 && !scratch && src < maxSz2 && bytes <= maxSz2 - src)
+                            {
+                                const uint8_t *p2 = base2 + src;
+                                for (uint32_t off = 0; off + 16 <= bytes; off += 16)
+                                {
+                                    uint64_t lo, hi;
+                                    std::memcpy(&lo, p2 + off, 8); std::memcpy(&hi, p2 + off + 8, 8);
+                                    if ((hi & 0xFFull) == 0x50ull && ((lo >> 32) & 0x3FFFull) == s_pd2)
+                                    {
+                                        std::fprintf(stderr, "[palsrc] #%d BITBLTBUF dbp=%u at guest 0x%08x (seg 0x%08x+%u len %u ch=%08x)\n",
+                                                     s_pn2, s_pd2, srcAddr + off, srcAddr, off, bytes, channelBase);
+                                        static const bool s_arm2 = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
+                                                                         return v && v[0] && v[0] != '0'; }();
+                                        if (s_arm2 && g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
+                                        {
+                                            g_ps2WatchHi.store((src + bytes) & 0x1FFFFFFFu, std::memory_order_relaxed);
+                                            g_ps2WatchLo.store(src & 0x1FFFFFFFu, std::memory_order_relaxed);
+                                            std::fprintf(stderr, "[palsrc] write-watch ARMED on phys 0x%08x..0x%08x\n",
+                                                         src, src + bytes);
+                                        }
+                                        if (++s_pn2 >= 40) break;
+                                    }
+                                }
+                            }
+                        }
+
                         // PS2X_ZEROSRC: the collapsed characters' bone data arrives at VU1 as ZEROS.
                         // Find the guest source: log VIF1 ref payloads that are entirely zero (first
                         // 128B) with their EE address. Histogram by 64KB region so one PCSX2 write-bp
