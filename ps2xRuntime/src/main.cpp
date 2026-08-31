@@ -155,7 +155,12 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
         static const bool s_noSeed = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_NOSEED"); return v && v[0] && v[0] != '0'; }();
         if (!s_noSeed && gs.vramData() && stateSize >= 4u * 1024 * 1024 && state + stateSize <= (size_t)sz)
         {
-            std::memcpy(gs.vramData(), d.data() + state, std::min<size_t>(4u * 1024 * 1024, gs.vramSize()));
+            // [vramseedfix] 2026-08-31: VRAM is the LAST 4MB of the state blob, not its head
+            // (gsvram.py layout, validated): seeding from `state` copied a 509-byte register
+            // prefix into VRAM and shifted every texel -- the mottled terrain on every
+            // console-dump replay. Live runs never seed; replays of PCSX2 dumps before this
+            // fix carried a corrupted static-texture base.
+            std::memcpy(gs.vramData(), d.data() + state + stateSize - 4u * 1024 * 1024, std::min<size_t>(4u * 1024 * 1024, gs.vramSize()));
             // Seeding VRAM behind the renderer's back leaves its texture/CLUT caches keyed to
             // content that no longer exists, so terrain tiles decode through stale palettes --
             // that is the red vertical striping the first port produced. Stamp the whole of
