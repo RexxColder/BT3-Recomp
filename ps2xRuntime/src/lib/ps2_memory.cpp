@@ -1435,16 +1435,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                     uint32_t w; std::memcpy(&w, pp + off, 4);
                                     // 6b: num>=4 — the ubiquitous num=3 cell-bbox headers crowded out
                                     // the log AND stole the arm; the matrix/uniform block is num 4..12.
-                                    if (((w & 0xFF000000u) == 0x6C000000u || (w & 0xFF000000u) == 0x7C000000u) && (w & 0x3FFu) < 16u && ((w >> 16) & 0xFFu) >= 4u)
+                                    // 6d: ANY unpack format (cmd 0x60-0x7F), addr<16, num>=4 — V4-32
+                                    // never carries the uniform rows; the camera block must ride
+                                    // V3-32/V4-16/etc. Log format byte too.
+                                    if ((w & 0xE0000000u) == 0x60000000u && (w & 0x3FFu) < 16u && ((w >> 16) & 0xFFu) >= 4u)
                                     {
                                         static int s_un = 0;
                                         const uint32_t num = (w >> 16) & 0xFFu, ad = w & 0x3FFu;
-                                        if (s_un < 60)
-                                        { std::fprintf(stderr, "[palsrc] UNPACK V4-32 num=%u addr=%u at guest 0x%08x (payload 0x%08x)\n", num, ad, srcAddr + off, srcAddr + off + 4); ++s_un; }
+                                        if (s_un < 80)
+                                        { std::fprintf(stderr, "[palsrc] UNPACK cmd=%02x num=%u addr=%u flg=%u at guest 0x%08x (payload 0x%08x)\n", (w >> 24) & 0xFFu, num, ad, (w >> 15) & 1u, srcAddr + off, srcAddr + off + 4); ++s_un; }
                                         static const bool s_armU = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
                                                                          return v && v[0] && v[0] != '0'; }();
                                         static uint32_t s_u6Lo = 0, s_u6Hi = 0;
-                                        if (s_armU && ad < 16u)
+                                        if (s_armU && ad < 16u && (w & 0xFF000000u) != 0x6C000000u && (w & 0xFF000000u) != 0x7C000000u)
                                         {
                                             if (s_u6Lo == 0u)
                                             {
