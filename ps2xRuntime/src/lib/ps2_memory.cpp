@@ -1420,6 +1420,43 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                     g_ps2WatchLo.store(s_sprLo, std::memory_order_relaxed);
                                 }
                             }
+                            // mode 6: the cull test's per-frame UNIFORMS (camera matrix/offset,
+                            // VU mem rows 0..15) arrive via an UNPACK V4-32 in a chain segment
+                            // never covered by modes 2-5. Scan payloads near the terrain section
+                            // for VIF `UNPACK V4-32 addr<16` codes, log them, and latch the watch
+                            // on the first such payload -> the EE uniform builder's pc/ra.
+                            static const bool s_geo6 = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
+                                                             return v && v[0] == '6'; }();
+                            if (s_pd2 && s_geo6 && s_pn2 > 0 && !scratch && src < maxSz2 && bytes >= 8u && bytes <= maxSz2 - src)
+                            {
+                                const uint8_t *pp = base2 + src;
+                                for (uint32_t off = 0; off + 8 <= bytes && off < 4096u; off += 4)
+                                {
+                                    uint32_t w; std::memcpy(&w, pp + off, 4);
+                                    if ((w & 0xFF000000u) == 0x6C000000u && (w & 0x3FFu) < 16u && ((w >> 16) & 0xFFu) >= 2u)
+                                    {
+                                        static int s_un = 0;
+                                        const uint32_t num = (w >> 16) & 0xFFu, ad = w & 0x3FFu;
+                                        if (s_un < 60)
+                                        { std::fprintf(stderr, "[palsrc] UNPACK V4-32 num=%u addr=%u at guest 0x%08x (payload 0x%08x)\n", num, ad, srcAddr + off, srcAddr + off + 4); ++s_un; }
+                                        static const bool s_armU = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
+                                                                         return v && v[0] && v[0] != '0'; }();
+                                        static uint32_t s_u6Lo = 0, s_u6Hi = 0;
+                                        if (s_armU && ad < 16u)
+                                        {
+                                            if (s_u6Lo == 0u)
+                                            {
+                                                s_u6Lo = (src + off + 4u) & 0x1FFFFFFFu;
+                                                s_u6Hi = (src + off + 4u + num * 16u) & 0x1FFFFFFFu;
+                                                std::fprintf(stderr, "[palsrc] write-watch ARMED on UNPACK payload 0x%08x..0x%08x\n", s_u6Lo, s_u6Hi);
+                                            }
+                                            g_ps2WatchHi.store(s_u6Hi, std::memory_order_relaxed);
+                                            g_ps2WatchLo.store(s_u6Lo, std::memory_order_relaxed);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
                             if (s_pd2 && s_geo && s_expectPayload > 0 && !scratch && bytes >= 32768u && src < maxSz2)
                             {
                                 s_expectPayload = 0;
