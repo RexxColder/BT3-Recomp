@@ -1350,7 +1350,26 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                                                 return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
                             static int s_pn2 = 0;   // raised cap: slot-address logging needs many frames
                             static int s_expectPayload = 0;   // [palsrc] header seen; the NEXT big segment is the palette bytes
-                            if (s_pd2 && s_expectPayload > 0 && !scratch && bytes >= 1024u && src < maxSz2)
+                            // PS2X_PALSRC_GEO=1: skip the palette payload and arm on the NEXT
+                            // BIG segment instead -- the group's GEOMETRY batch, rebuilt per frame
+                            // by the membership builder we want to backtrace.
+                            static const bool s_geo = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
+                                                            return v && v[0] && v[0] != '0'; }();
+                            if (s_pd2 && s_geo && s_expectPayload > 0 && !scratch && bytes >= 32768u && src < maxSz2)
+                            {
+                                s_expectPayload = 0;
+                                std::fprintf(stderr, "[palsrc] GEOMETRY seg at guest 0x%08x len %u\n", srcAddr, bytes);
+                                static const bool s_armG = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
+                                                                 return v && v[0] && v[0] != '0'; }();
+                                if (s_armG && g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
+                                {
+                                    const uint32_t alen = bytes < 4096u ? bytes : 4096u;
+                                    g_ps2WatchHi.store((src + alen) & 0x1FFFFFFFu, std::memory_order_relaxed);
+                                    g_ps2WatchLo.store(src & 0x1FFFFFFFu, std::memory_order_relaxed);
+                                    std::fprintf(stderr, "[palsrc] write-watch ARMED on GEOMETRY 0x%08x..0x%08x\n", src, src + alen);
+                                }
+                            }
+                            if (s_pd2 && !s_geo && s_expectPayload > 0 && !scratch && bytes >= 1024u && src < maxSz2)
                             {
                                 s_expectPayload = 0;
                                 // Slot-indexed payload-address log: if the ADDRESS a slot references
