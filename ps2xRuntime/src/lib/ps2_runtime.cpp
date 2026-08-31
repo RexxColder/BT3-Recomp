@@ -694,6 +694,7 @@ PS2Runtime::PS2Runtime()
     m_asyncCallbackStackTop = PS2_RAM_SIZE - kMainThreadStackReserve;
 }
 
+double g_fpPresent = 0, g_fpBar = 0, g_fpPre = 0, g_fpWait = 0, g_fpLoop = 0; int g_fpN = 0;   // [frameprof]
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
                                      DebugUiCallback drawCallback,
                                      DebugUiCallback shutdownCallback,
@@ -3984,7 +3985,30 @@ void PS2Runtime::run()
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
-        EndDrawing();
+        {   // [frameprof] PS2X_FRAMEPROF=1: where does the main-loop frame go? (display-path dips)
+            static const bool s_fp = [](){ const char *v = std::getenv("PS2X_FRAMEPROF"); return v && v[0] && v[0] != '0'; }();
+            extern double g_fpPresent, g_fpBar, g_fpPre, g_fpWait, g_fpLoop; extern int g_fpN;
+            const auto tP0 = std::chrono::steady_clock::now();
+            EndDrawing();
+            if (s_fp)
+            {
+                const auto t1 = std::chrono::steady_clock::now();
+                g_fpPresent += std::chrono::duration<double, std::milli>(t1 - tP0).count();
+                ++g_fpN;
+                static auto lastPrint = t1;
+                static auto lastLoop = t1;
+                g_fpLoop += std::chrono::duration<double, std::milli>(t1 - lastLoop).count(); lastLoop = t1;
+                if (std::chrono::duration<double>(t1 - lastPrint).count() >= 1.0)
+                {
+                    lastPrint = t1;
+                    const double n = (double)std::max(1, g_fpN);
+                    std::fprintf(stderr, "[frameprof] n=%d loop %.1f ms: present %.2f bar %.2f pre %.2f wait %.2f (other %.2f)\n",
+                                 g_fpN, g_fpLoop / n, g_fpPresent / n, g_fpBar / n, g_fpPre / n, g_fpWait / n,
+                                 (g_fpLoop - g_fpPresent - g_fpBar - g_fpPre - g_fpWait) / n);
+                    g_fpPresent = g_fpBar = g_fpPre = g_fpWait = g_fpLoop = 0; g_fpN = 0;
+                }
+            }
+        }
 
         // Drain any streaming PCM into the audio device. Must run on the render thread --
         // raylib's AudioStream calls are not safe to make from the guest threads that
@@ -4000,7 +4024,10 @@ void PS2Runtime::run()
             s_next += period;
             while ((now = std::chrono::steady_clock::now()) < s_next)
             {
-                if (!ps2GpuRenderer().serviceBlockingBarriers())
+                const auto tA = std::chrono::steady_clock::now();
+                const bool svcIdle = !ps2GpuRenderer().serviceBlockingBarriers();
+                { extern double g_fpBar; g_fpBar += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tA).count(); }
+                if (svcIdle)
                 {
                     // [pubbreak] a published frame is waiting: present it now instead of idling to the deadline.
                     // prerenderChunk() refuses to run while a list is pending (ordering), so every microsecond spent
@@ -4008,10 +4035,15 @@ void PS2Runtime::run()
                     // (outline SJ3: render leg 366 ms/60 frames vs 127 before the guest got faster).
                     static const bool s_pb = [](){ const char *v = std::getenv("PS2X_PUBBREAK"); return !(v && v[0] == '0'); }();
                     if (s_pb && ps2GpuRenderer().hasPendingFrame()) break;
-                    if (ps2GpuRenderer().prerenderChunk()) continue;   // [prerender] draw ahead while the guest records
+                    const auto tB = std::chrono::steady_clock::now();
+                    const bool didPre = ps2GpuRenderer().prerenderChunk();
+                    { extern double g_fpPre; g_fpPre += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tB).count(); }
+                    if (didPre) continue;   // [prerender] draw ahead while the guest records
 
                     const auto left = std::chrono::duration_cast<std::chrono::microseconds>(s_next - now).count();
+                    const auto tC = std::chrono::steady_clock::now();
                     ps2GpuRenderer().waitForBlockingBarrierRequest((int)std::max<long long>(1, left));   // cv-driven: wakes on a request, else sleeps to the frame deadline
+                    { extern double g_fpWait; g_fpWait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tC).count(); }
                 }
             }
         }
@@ -4177,13 +4209,16 @@ void PS2Runtime::run()
                 extern std::atomic<uint64_t> g_bt3FrameCount;
                 static uint64_t s_lastGameFrames = 0u;
                 uint64_t gameFrames = g_bt3FrameCount.load(std::memory_order_relaxed);
-                extern std::atomic<uint64_t> g_guestBusyNs, g_guestBusyFrames;
-                static uint64_t s_lastBusyNs = 0, s_lastBusyFrames = 0;
+                extern std::atomic<uint64_t> g_guestBusyNs, g_guestBusyFrames, g_guestWallNs;
+                static uint64_t s_lastBusyNs = 0, s_lastBusyFrames = 0, s_lastWallNs = 0;
                 const uint64_t bn = g_guestBusyNs.load(std::memory_order_relaxed), bf = g_guestBusyFrames.load(std::memory_order_relaxed);
+                const uint64_t wn = g_guestWallNs.load(std::memory_order_relaxed);
                 const double guestMs = (bf > s_lastBusyFrames) ? (double)(bn - s_lastBusyNs) / 1.0e6 / (double)(bf - s_lastBusyFrames) : 0.0;   // [guestbusy] ms of guest CPU per published frame
-                s_lastBusyNs = bn; s_lastBusyFrames = bf;
+                const double wallMs = (bf > s_lastBusyFrames) ? (double)(wn - s_lastWallNs) / 1.0e6 / (double)(bf - s_lastBusyFrames) : 0.0;   // [guestwall]
+                s_lastBusyNs = bn; s_lastBusyFrames = bf; s_lastWallNs = wn;
                 std::cerr << "[fps] GAME=" << (double)((gameFrames - s_lastGameFrames) / dt)
                           << " guest_ms=" << guestMs
+                          << " wall_ms=" << wallMs
                           << " host=" << (uint32_t)(s_fpsFrames / dt)
                           << " prims/sec=" << (uint64_t)((prims - s_lastPrims) / dt)
                           << " Mpix/sec=" << (double)((pix - s_lastPix) / dt / 1.0e6)
