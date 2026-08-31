@@ -12361,6 +12361,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         else if (s_abm == 3 && c.srcClutTbp >= 11390u && c.srcClutTbp <= 11440u && c.srcClutTbp != 11432u
                                  && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u)))
                             want128 = 1.0f;   // mountain/scenery shading family ONLY (the mount.png pale-tops classes); clouds (11432) + additives untouched
+                        else if (s_abm == 4 && c.srcClutTbp == 12992u && (c.srcPsm == 0x13u || c.srcPsm == 0x14u)
+                                 && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u)))
+                            want128 = 1.0f;   // TERRAIN family only: the 0x44 As-lerp at full GS strength = pure texture,
+                                              // erasing the half-mix underlayer darkening (predicted: dome 131->148, strip 112->127 = console)
+                        else if (s_abm == 5 && c.srcClutTbp != 12992u && c.srcClutTbp != 11472u && c.srcClutTbp != 11476u)
+                            want128 = 1.0f;   // DENYLIST scope (same-stream metrics GREF2): full GS factor everywhere EXCEPT
+                                              // terrain (12992: half-mix measured CLOSER to console; full = dark blob + darker hills)
+                                              // and the HUD gauge palettes (11472/11476). Sky/clouds land at G0.98 with this.
                         static float cur128 = -1.0f;
                         if (g_locABl128 >= 0 && want128 != cur128)
                         { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locABl128, &want128, SHADER_UNIFORM_FLOAT); cur128 = want128; }
