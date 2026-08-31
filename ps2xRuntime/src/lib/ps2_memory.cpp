@@ -1464,6 +1464,27 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                             std::fprintf(stderr, "[palsrc] #%d BITBLTBUF dbp=%u at guest 0x%08x (seg 0x%08x+%u len %u ch=%08x)\n",
                                                          s_pn2, s_pd2, srcAddr + off, srcAddr, off, bytes, channelBase);
                                         s_expectPayload = 8;   // mode2 logs several following segments; modes 0/1 consume it on the first match
+                                        // mode 4: watch the terrain DL HEADER SLOT REGION itself --
+                                        // every payload layer (palettes/tables/meshes/chunk lists)
+                                        // proved static; if membership lives in the DL ref-tags,
+                                        // their per-frame rewrite hits here. Armed at fight time
+                                        // (first terrain header), 1KB window, latched+re-asserted.
+                                        static const bool s_geo4 = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
+                                                                         return v && v[0] == '4'; }();
+                                        static const bool s_armH = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
+                                                                         return v && v[0] && v[0] != '0'; }();
+                                        if (s_geo4 && s_armH)
+                                        {
+                                            static uint32_t s_hdrLo = 0, s_hdrHi = 0;
+                                            if (s_hdrLo == 0u)
+                                            {
+                                                s_hdrLo = srcAddr & 0x1FFFFFFFu;
+                                                s_hdrHi = (srcAddr + 0x400u) & 0x1FFFFFFFu;
+                                                std::fprintf(stderr, "[palsrc] write-watch ARMED on DL HEADER region 0x%08x..0x%08x\n", s_hdrLo, s_hdrHi);
+                                            }
+                                            g_ps2WatchHi.store(s_hdrHi, std::memory_order_relaxed);
+                                            g_ps2WatchLo.store(s_hdrLo, std::memory_order_relaxed);
+                                        }
                                         if (++s_pn2 >= 40) break;
                                     }
                                 }
