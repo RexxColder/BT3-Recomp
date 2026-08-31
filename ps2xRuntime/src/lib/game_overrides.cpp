@@ -3015,6 +3015,23 @@ namespace
         if (dt >= 5.0) { std::fprintf(stderr, "[logicrate] %.1f fight updates/s (%u in %.1f s)\n", (double)n / dt, n, dt); s_n.store(0u); s_t0 = now; }
         if (g_orig115950) g_orig115950(rdram, ctx, runtime);
     }
+    PS2Runtime::RecompiledFunction g_orig2188b8 = nullptr;
+    void bt3TerrRoundScope(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // [terrround] PS2X_TERRROUND=1: run the terrain lighting-group matrix builder
+        // (sub_002188B8 and everything it calls: 120308 rotZ ACC chains, 120C40 concat,
+        // 11FFE8 sincos) under PS2/PCSX2 chop rounding (RZ+FTZ+DAZ). Surgical scope of
+        // the [eeround] finding: the classifier's last-bit math decides lighting-group
+        // membership at quantization boundaries; host round-nearest flips boundary
+        // chunks per frame (the moving dark/light terrain patches). Restores MXCSR on
+        // exit so nothing else in the frame is affected.
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_TERRROUND"); return v && v[0] && v[0] != '0'; }();
+        if (!s_on) { if (g_orig2188b8) g_orig2188b8(rdram, ctx, runtime); return; }
+        const unsigned int saved = _mm_getcsr();
+        _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8040u);
+        if (g_orig2188b8) g_orig2188b8(rdram, ctx, runtime);
+        _mm_setcsr(saved);
+    }
     void bt3ThunkStackWatch(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t sp = getRegU32(ctx, 29) & 0x1FFFFFFFu;
@@ -3768,6 +3785,8 @@ namespace
             {
                 g_orig2722c0 = runtime.lookupFunction(0x002722c0u);
                 if (g_orig2722c0) runtime.replaceFunction(0x002722c0u, &bt3ThunkStackWatch);
+                g_orig2188b8 = runtime.lookupFunction(0x002188b8u);   // [terrround]
+                if (g_orig2188b8) runtime.replaceFunction(0x002188b8u, &bt3TerrRoundScope);
             }
         }
         if (!std::getenv("PS2X_NO_DEMO_GUARD"))
