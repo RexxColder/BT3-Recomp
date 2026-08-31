@@ -1177,14 +1177,19 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         // source is directly recoverable, no map needed.
                         if (srcG == 0u && data >= m_rdram && data < m_rdram + PS2_RAM_SIZE)
                             srcG = (uint32_t)(data - m_rdram) + pos;
+                        // PS2X_ROWTRACE_CNT=<n>: log only unpacks of exactly n vectors (12 = the
+                        // per-frame view-matrix upload) — big budget for a per-frame value series.
+                        static const long s_rtCnt = [](){ const char *v = std::getenv("PS2X_ROWTRACE_CNT"); return v && v[0] ? std::atol(v) : -1; }();
+                        if (s_rtCnt >= 0 && (long)writeVectorCount != s_rtCnt) goto rowtrace_done;
                         static std::atomic<int> s_n{0};
-                        if (s_n.fetch_add(1) < 240)
+                        if (s_n.fetch_add(1) < (s_rtCnt >= 0 ? 4000 : 240))
                         {
                             float q0[4] = {0, 0, 0, 0};
                             if (pos + 16u <= sizeBytes) std::memcpy(q0, data + pos, 16);
                             std::fprintf(stderr, "[rowtrace] fr=%ld vuAddr=%u cnt=%u src=0x%08x q0=(%.3f %.3f %.3f %.3f)\n",
                                          fr, vuAddr, (unsigned)writeVectorCount, srcG, q0[0], q0[1], q0[2], q0[3]);
                         }
+                        rowtrace_done:;
                     }
                 }
             }
