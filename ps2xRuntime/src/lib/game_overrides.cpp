@@ -3017,12 +3017,19 @@ namespace
     }
     void bt3ThunkStackWatch(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t sp = getRegU32(ctx, 29) & 0x1FFFFFFFu;
-        const uint32_t lo = (sp - 16u) & 0x1FFFFFFFu;
-        g_ps2WatchHi.store(sp, std::memory_order_relaxed);
-        g_ps2WatchLo.store(lo, std::memory_order_relaxed);
+        // [watchgate] PS2X_THUNKWATCH=1 restores the stack write-watch around this thunk.
+        // Default OFF: the unconditional arm/disarm stole the global watch from every other
+        // probe (palsrc-geo flapped 32x/fight) and flooded ps2WatchReport with 113k lines.
+        static const bool s_tw = [](){ const char *v = std::getenv("PS2X_THUNKWATCH"); return v && v[0] && v[0] != '0'; }();
+        if (s_tw)
+        {
+            const uint32_t sp = getRegU32(ctx, 29) & 0x1FFFFFFFu;
+            const uint32_t lo = (sp - 16u) & 0x1FFFFFFFu;
+            g_ps2WatchHi.store(sp, std::memory_order_relaxed);
+            g_ps2WatchLo.store(lo, std::memory_order_relaxed);
+        }
         if (g_orig2722c0) g_orig2722c0(rdram, ctx, runtime);
-        g_ps2WatchLo.store(0u, std::memory_order_relaxed);
+        if (s_tw) g_ps2WatchLo.store(0u, std::memory_order_relaxed);
     }
     void bt3DemoWalkGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_002316d0
     {
