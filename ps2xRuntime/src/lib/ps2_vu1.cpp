@@ -1,3 +1,4 @@
+#include <unistd.h>
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gif_arbiter.h"
@@ -2497,7 +2498,18 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             {
                 extern std::atomic<uint64_t> g_bt3FrameCount;
                 const long fr = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
-                if (fr >= s_vc)
+                // PS2X_VUCELL_ARM=1: stay dormant until /tmp/ps2x_cell exists (touched
+                // externally when the artifact is ON SCREEN in a user-driven session).
+                static const bool s_armF = [](){ const char *v = std::getenv("PS2X_VUCELL_ARM"); return v && v[0] && v[0] != '0'; }();
+                static std::atomic<bool> s_go{false};
+                bool go = !s_armF || s_go.load(std::memory_order_relaxed);
+                if (!go && s_armF)
+                {
+                    static std::atomic<int> s_chk{0};
+                    if ((s_chk.fetch_add(1) & 127) == 0 && ::access("/tmp/ps2x_cell", F_OK) == 0)
+                    { s_go.store(true, std::memory_order_relaxed); go = true; std::fprintf(stderr, "[vucell] TRIGGERED\n"); }
+                }
+                if (go && fr >= s_vc)
                 {
                     static std::atomic<int> s_n{0};
                     if (s_n.fetch_add(1) < 800)
