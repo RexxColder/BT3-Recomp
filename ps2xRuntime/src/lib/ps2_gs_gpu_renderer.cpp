@@ -11538,6 +11538,18 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // Record what THIS draw leaves in the destination's alpha, for whoever reads it next.
             if (!c.isTransfer && c.destFbp < 512u && (c.fbmsk & 0xFF000000u) != 0xFF000000u)
                 g_fbpAlphaIsGsByte[c.destFbp] = idxRt;
+            {   // [scenesrv] how are the SCENE-page reads served? (the DoF copies = the barrier storm's f0/f112 half)
+                static const bool s_ss = [](){ const char *v = std::getenv("PS2X_SCENESRV"); return v && v[0] && v[0] != '0'; }();
+                if (s_ss && !c.isTransfer && !c.srcIndexed && (c.srcTbp0 == 0u || c.srcTbp0 == 3584u) && c.texKey != 0)
+                {
+                    static unsigned long n = 0; static std::map<std::string, unsigned long> h;
+                    ++h[srcHow ? srcHow : "?"];
+                    if ((++n % 500ul) == 1ul)
+                    { std::fprintf(stderr, "[scenesrv] #%lu src=%u dest=f%u psm=%u %dx%d how:", n, c.srcTbp0, c.destFbp, (unsigned)c.srcPsm, c.srcTexW, c.srcTexH);
+                      for (auto &kv : h) std::fprintf(stderr, " %s=%lu", kv.first.c_str(), kv.second);
+                      std::fprintf(stderr, "\n"); }
+                }
+            }
         }
         {   // Indexed render-target sampling: hand the shader the CLUT and switch it to
             // "index comes from the sampled ALPHA". Both uniforms are guarded on a valid
