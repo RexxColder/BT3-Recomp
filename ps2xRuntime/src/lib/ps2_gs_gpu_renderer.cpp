@@ -5262,8 +5262,6 @@ void GsGpuRenderer::ensureGl(int w, int h)
         g_locAScale = GetShaderLocation(g_shader, "uAScale");
         g_locTexa = GetShaderLocation(g_shader, "uTexa");
         g_locABl128 = GetShaderLocation(g_shader, "uABl128");
-        {   static const float on = [](){ const char *v = std::getenv("PS2X_ABLEND128"); return (v && v[0] && v[0] != '0') ? 1.0f : 0.0f; }();
-            if (g_locABl128 >= 0) SetShaderValue(g_shader, g_locABl128, &on, SHADER_UNIFORM_FLOAT); }
         g_locTfx = GetShaderLocation(g_shader, "uTfx");
         g_locProjClip = GetShaderLocation(g_shader, "uProjClip");
         g_locPerspQ = GetShaderLocation(g_shader, "uPerspQ");
@@ -12353,6 +12351,20 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                 glBindTexture(0x0DE1u, (unsigned)pt);
                             }
                         } }
+                    {   // [ablend128] mode 1 = all texture-alpha blends; mode 2 = EXCLUDE the additive
+                        // classes (0x48/0x68) whose accumulation doubles into blow-out (clouds) --
+                        // the As-LERP family (0x44 etc.) gets the GS-correct full factor.
+                        static const int s_abm = [](){ const char *v = std::getenv("PS2X_ABLEND128"); return v && v[0] ? std::atoi(v) : 0; }();
+                        float want128 = 0.0f;
+                        if (s_abm == 1) want128 = 1.0f;
+                        else if (s_abm == 2 && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u))) want128 = 1.0f;
+                        else if (s_abm == 3 && c.srcClutTbp >= 11390u && c.srcClutTbp <= 11440u && c.srcClutTbp != 11432u
+                                 && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u)))
+                            want128 = 1.0f;   // mountain/scenery shading family ONLY (the mount.png pale-tops classes); clouds (11432) + additives untouched
+                        static float cur128 = -1.0f;
+                        if (g_locABl128 >= 0 && want128 != cur128)
+                        { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locABl128, &want128, SHADER_UNIFORM_FLOAT); cur128 = want128; }
+                    }
                     const float mode = aofKeep ? 4.0f
                                      : (s_texaFbo && fromFbo && c.tcc && tex.id != 0
                                         && tex.id != g_white.id && psmTexa)
