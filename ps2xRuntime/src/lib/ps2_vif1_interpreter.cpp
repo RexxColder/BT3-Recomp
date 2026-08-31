@@ -1155,6 +1155,35 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 }
             }
 
+            // [rowtrace] PS2X_ROWTRACE=<minframe>: log every unpack whose EFFECTIVE target is
+            // VU rows 0-15 (the terrain micro's uniform block; entry 0 latches vf1-8/vf13-16
+            // from there) with its guest SOURCE address -- raw chain-byte scans missed the
+            // carrier, so observe at the only place effective addresses exist.
+            {
+                static const long s_rt = [](){ const char *v = std::getenv("PS2X_ROWTRACE"); return v && v[0] ? std::atol(v) : -1; }();
+                if (s_rt >= 0 && vuAddr < 16u)
+                {
+                    extern std::atomic<uint64_t> g_bt3FrameCount;
+                    const long fr = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
+                    if (fr >= s_rt)
+                    {
+                        uint32_t srcG = 0u;
+                        if (g_vif1QwcActive) srcG = g_vif1QwcSrcGuest + pos;
+                        else
+                            for (size_t mi = g_kickSrcMap.size(); mi > 0; --mi)
+                                if (g_kickSrcMap[mi - 1][0] <= pos)
+                                { srcG = g_kickSrcMap[mi - 1][1] + (pos - g_kickSrcMap[mi - 1][0]); break; }
+                        static std::atomic<int> s_n{0};
+                        if (s_n.fetch_add(1) < 240)
+                        {
+                            float q0[4] = {0, 0, 0, 0};
+                            if (pos + 16u <= sizeBytes) std::memcpy(q0, data + pos, 16);
+                            std::fprintf(stderr, "[rowtrace] fr=%ld vuAddr=%u cnt=%u src=0x%08x q0=(%.3f %.3f %.3f %.3f)\n",
+                                         fr, vuAddr, (unsigned)writeVectorCount, srcG, q0[0], q0[1], q0[2], q0[3]);
+                        }
+                    }
+                }
+            }
             // PS2X_KICKHIST: record this unpack in the rolling ring for spike-kick forensics.
             if (g_unpackRingEnabled() && vn == 3u && vl == 0u)
             {
