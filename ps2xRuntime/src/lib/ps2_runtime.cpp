@@ -3670,6 +3670,17 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        // [eeround] PS2X_EEROUND=1: run the guest thread's float math (EE FPU and
+        // VU0-macro ops, both SSE in recompiled code) under RZ+FTZ+DAZ — PCSX2's
+        // default EE/VU "Chop/Zero" rounding. Host default (round-nearest,
+        // denormals) diverges from console in the last bits of every FPU/VU0
+        // chain; the terrain lighting-group matrix path (sub_002188B8 ->
+        // sub_00120308/120C40 vmula/vmadda ACC chains) consumes exactly such
+        // math, and boundary chunks flip groups on those last bits.
+        {
+            static const bool s_eeRound = [](){ const char *v = std::getenv("PS2X_EEROUND"); return v && v[0] && v[0] != '0'; }();
+            if (s_eeRound) _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
+        }
         try
         {
             dispatchLoop(m_memory.getRDRAM(), &m_cpuContext);
