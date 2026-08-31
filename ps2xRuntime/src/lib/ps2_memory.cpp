@@ -1349,6 +1349,21 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             static const uint32_t s_pd2 = [](){ const char *v = std::getenv("PS2X_PALSRC");
                                                                 return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
                             static int s_pn2 = 0;
+                            static int s_expectPayload = 0;   // [palsrc] header seen; the NEXT big segment is the palette bytes
+                            if (s_pd2 && s_expectPayload > 0 && !scratch && bytes >= 1024u && src < maxSz2)
+                            {
+                                s_expectPayload = 0;
+                                std::fprintf(stderr, "[palsrc] PAYLOAD at guest 0x%08x len %u\n", srcAddr, bytes);
+                                static const bool s_armP = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
+                                                                 return v && v[0] && v[0] != '0'; }();
+                                if (s_armP && g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
+                                {
+                                    const uint32_t alen = bytes < 1024u ? bytes : 1024u;
+                                    g_ps2WatchHi.store((src + alen) & 0x1FFFFFFFu, std::memory_order_relaxed);
+                                    g_ps2WatchLo.store(src & 0x1FFFFFFFu, std::memory_order_relaxed);
+                                    std::fprintf(stderr, "[palsrc] write-watch ARMED on PAYLOAD phys 0x%08x..0x%08x\n", src, src + alen);
+                                }
+                            }
                             if (s_pd2 && s_pn2 < 40 && !scratch && src < maxSz2 && bytes <= maxSz2 - src)
                             {
                                 const uint8_t *p2 = base2 + src;
@@ -1360,15 +1375,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                     {
                                         std::fprintf(stderr, "[palsrc] #%d BITBLTBUF dbp=%u at guest 0x%08x (seg 0x%08x+%u len %u ch=%08x)\n",
                                                      s_pn2, s_pd2, srcAddr + off, srcAddr, off, bytes, channelBase);
-                                        static const bool s_arm2 = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
-                                                                         return v && v[0] && v[0] != '0'; }();
-                                        if (s_arm2 && g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
-                                        {
-                                            g_ps2WatchHi.store((src + bytes) & 0x1FFFFFFFu, std::memory_order_relaxed);
-                                            g_ps2WatchLo.store(src & 0x1FFFFFFFu, std::memory_order_relaxed);
-                                            std::fprintf(stderr, "[palsrc] write-watch ARMED on phys 0x%08x..0x%08x\n",
-                                                         src, src + bytes);
-                                        }
+                                        s_expectPayload = 2;   // arm on the palette BYTES that follow, not this static header
                                         if (++s_pn2 >= 40) break;
                                     }
                                 }
