@@ -4093,7 +4093,19 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             }
         }
         if (changed)
-            ps2GpuRenderer().onVramUpload(dbp, static_cast<uint32_t>(dbw) * rrh); bumpPageUploadGen(dbp, static_cast<uint32_t>(dbw) * rrh);   // [clutpagegen]
+            ps2GpuRenderer().onVramUpload(dbp, static_cast<uint32_t>(dbw) * rrh);
+        // [atomicclut] bump the CLUT-page generation only when the TRANSFER COMPLETES, not per
+        // GIF IMAGE packet: a palette upload spanning multiple packets used to bump the gen on
+        // every chunk, so an interleaved draw's ensureClutCache rebuilt from HALF-WRITTEN VRAM.
+        // Measured on the user's hillmove.gs: 16% of terrain draws paired with palette contents
+        // that never existed in the stream (blends of adjacent versions) = the moving dark/light
+        // terrain patches. Consumers of m_pageUploadGen = the CLUT cache key only.
+        // PS2X_ATOMICCLUT=0 restores the per-chunk bump.
+        {
+            static const bool s_atomic = [](){ const char *v = std::getenv("PS2X_ATOMICCLUT"); return !(v && v[0] == '0'); }();
+            if (!s_atomic || m_transferState.copied_pixels >= m_transferState.total_pixels)
+                bumpPageUploadGen(dbp, static_cast<uint32_t>(dbw) * rrh);   // [clutpagegen]
+        }
     }
 
     {

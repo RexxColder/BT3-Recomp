@@ -3832,6 +3832,21 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     std::fprintf(stderr, "[clutdump] cbp=%u csa=%u: mean RGB (%lu,%lu,%lu) bright(>96) %lu/256 | alpha distinct %zu | e[0]=%08x e[1]=%08x e[5]=%08x e[128]=%08x e[255]=%08x\n",
                                  tex.cbp, tex.csa, sr / 256, sg / 256, sb / 256, bright, ah.size(), gs->m_clutCache[0], gs->m_clutCache[1], gs->m_clutCache[5], gs->m_clutCache[128], gs->m_clutCache[255]); }
             }
+            {   // [palpair] PS2X_PALPAIR=1: which palette content does each terrain draw pair with?
+                // Sampled every 200th terrain draw; diff offline vs the gsparse upload-order truth.
+                static const bool s_pp2 = [](){ const char *v = std::getenv("PS2X_PALPAIR"); return v && v[0] && v[0] != '0'; }();
+                if (s_pp2 && tex.cbp == 12992u)
+                {
+                    static unsigned long pn = 0; ++pn;
+                    if ((pn % 200ul) == 1ul)
+                    {
+                        unsigned long sum = 0;
+                        for (int i2 = 0; i2 < 256; ++i2)
+                        { const uint32_t e = gs->m_clutCache[i2]; sum += (e & 0xFF) + ((e >> 8) & 0xFF) + ((e >> 16) & 0xFF); }
+                        std::fprintf(stderr, "[palpair] %lu %.1f\n", pn, sum / 768.0);
+                    }
+                }
+            }
             const int nclut = (psmv == GS_PSM_T4 || psmv == GS_PSM_T4HL || psmv == GS_PSM_T4HH) ? 16 : 256;
             mix(nclut == 16 ? gs->m_clutCacheHash16 : gs->m_clutCacheHash256);   // [cluthash] same dependence, one mix
         }
