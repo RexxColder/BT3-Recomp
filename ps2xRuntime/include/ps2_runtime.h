@@ -282,12 +282,19 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     const char *op,
                                     const R5900Context *ctx)
 {
+    // Range variant of the guest write-watch: stub memcpy/memset/strcpy write guest RAM
+    // host-side, invisible to the per-store macros -- this was a NO-OP, which made every
+    // block-copied buffer (e.g. the terrain-palette payload, 2026-09-01) unwatchable.
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    const uint32_t _wlo = g_ps2WatchLo.load(std::memory_order_relaxed);
+    if (_wlo != 0u && size != 0u)
+    {
+        const uint32_t a0 = guestAddr & 0x1FFFFFFFu;
+        const uint32_t a1 = a0 + size;
+        const uint32_t hi = g_ps2WatchHi.load(std::memory_order_relaxed);
+        if (a0 < hi && a1 > _wlo)
+            ps2WatchReport(a0, size, 0u, 0u, op, ctx);
+    }
 }
 
 struct PS2SoundDriverCompatLayout
