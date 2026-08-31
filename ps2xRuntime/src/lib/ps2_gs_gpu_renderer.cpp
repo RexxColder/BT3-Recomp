@@ -11576,7 +11576,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                                const double f = v ? std::atof(v) : 0.0; return (float)((f > 0.0 && f < 1.0) ? f : 1.0f); }();
             static const float s_tanchor = [](){ const char *v = std::getenv("PS2X_TERRSOFT_ANCHOR");
                                                  const double f = v ? std::atof(v) : 0.0; return (float)((f > 0.0) ? f : 112.0); }();
-            if (s_tsoft < 1.0f && c.isTriangle && !c.isTransfer && c.srcPsm == 0x13u && c.srcClutTbp == 12992u
+            if (s_tsoft < 1.0f && c.isTriangle && !c.isTransfer && (c.srcPsm == 0x13u || c.srcPsm == 0x14u) && c.srcClutTbp == 12992u
                 && (c.destFbp == 0u || c.destFbp == 112u))
                 for (int k4 = 0; k4 < 3; ++k4)
                 {   auto &t4 = const_cast<GsGpuRenderer::DrawCmd &>(c).tri[k4];
