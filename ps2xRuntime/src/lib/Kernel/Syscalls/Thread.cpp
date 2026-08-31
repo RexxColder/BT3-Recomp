@@ -1,3 +1,4 @@
+#include <xmmintrin.h>
 #include "Common.h"
 #include "Thread.h"
 
@@ -379,6 +380,10 @@ namespace ps2_syscalls
             {
                 std::string name = "PS2Thread_" + std::to_string(tid);
                 ThreadNaming::SetCurrentThreadName(name);
+                {   // [eeround] guest threads run recompiled FPU/VU0 math too
+                    static const bool s_eeRound = [](){ const char *v = std::getenv("PS2X_EEROUND"); return v && v[0] && v[0] != '0'; }();
+                    if (s_eeRound) _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
+                }
             }
             R5900Context threadCtxCopy{};
             R5900Context *threadCtx = &threadCtxCopy;
