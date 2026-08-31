@@ -1173,6 +1173,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                             for (size_t mi = g_kickSrcMap.size(); mi > 0; --mi)
                                 if (g_kickSrcMap[mi - 1][0] <= pos)
                                 { srcG = g_kickSrcMap[mi - 1][1] + (pos - g_kickSrcMap[mi - 1][0]); break; }
+                        // map empty on this feed path: when `data` points into guest RAM the
+                        // source is directly recoverable, no map needed.
+                        if (srcG == 0u && data >= m_rdram && data < m_rdram + PS2_RAM_SIZE)
+                            srcG = (uint32_t)(data - m_rdram) + pos;
                         static std::atomic<int> s_n{0};
                         if (s_n.fetch_add(1) < 240)
                         {
