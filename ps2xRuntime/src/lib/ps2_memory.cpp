@@ -1361,7 +1361,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             // writes as 0x10000000+off). Log EVERY segment after a terrain header with
                             // its scratch flag, and latch+re-assert the watch on the FIRST SPR segment.
                             static const bool s_geo2 = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
-                                                             return v && (v[0] == '2' || v[0] == '3'); }();
+                                                             return v && (v[0] == '2' || v[0] == '3' || v[0] == '5'); }();
                             static const bool s_geo3 = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
                                                              return v && v[0] == '3'; }();
                             if (s_pd2 && s_geo2 && s_expectPayload > 0)
@@ -1373,6 +1373,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                 static const bool s_armS = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
                                                                  return v && v[0] && v[0] != '0'; }();
                                 static uint32_t s_sprLo = 0, s_sprHi = 0;
+                                // mode 5: after modes 3/4 proved chunk lists AND DL headers static,
+                                // the last unwatched terrain-chain class = the small 512..1023B
+                                // segments (0x0104f290 len 992, 0x01050ad0 len 704) — the natural
+                                // per-frame UNIFORM blocks for the terrain VU1 micro. Arm there.
+                                static const bool s_geo5 = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
+                                                                 return v && v[0] == '5'; }();
+                                if (s_geo5 && s_armS && !scratch && bytes >= 512u && bytes < 1024u && src < maxSz2)
+                                {
+                                    static uint32_t s_uLo = 0, s_uHi = 0;
+                                    if (s_uLo == 0u)
+                                    {
+                                        s_uLo = src & 0x1FFFFFFFu;
+                                        s_uHi = (src + bytes) & 0x1FFFFFFFu;
+                                        std::fprintf(stderr, "[palsrc] write-watch ARMED on UNIFORM seg 0x%08x..0x%08x len %u\n", s_uLo, s_uHi, bytes);
+                                    }
+                                    g_ps2WatchHi.store(s_uHi, std::memory_order_relaxed);
+                                    g_ps2WatchLo.store(s_uLo, std::memory_order_relaxed);
+                                }
                                 // mode 3: PALG4 census showed ZERO scratch segments; the unwatched
                                 // size class = the ~22 per-group MID-SIZE chunk-list segments
                                 // (1K..24K RAM). Arm the latched watch on the first 2K..32K one.
