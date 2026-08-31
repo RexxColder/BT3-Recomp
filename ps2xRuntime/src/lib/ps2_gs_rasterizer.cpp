@@ -3708,7 +3708,8 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 // never consumed for those draws, so skip the whole flush/readback round-trip.
                 static const int s_ga4 = [](){ const char *v = std::getenv("PS2X_GPUALIAS"); return v && v[0] ? std::atoi(v) : 0; }();
                 static const bool s_noskip = [](){ const char *v = std::getenv("PS2X_GPUALIAS_NOSKIP"); return v && v[0] && v[0] != '0'; }();   // A/B: keep the flush (its VRAM bytes feed OTHER readers)
-                static const bool s_aliasZon = [](){ const char *v = std::getenv("PS2X_ALIASZ"); return v && v[0] && v[0] != '0'; }();
+                static const bool s_aliasZon = [](){ const char *v = std::getenv("PS2X_ALIASZ"); if (v && v[0] && v[0] != '0') return true;
+                                                      const char *w = std::getenv("PS2X_ALIASZSW"); return w && w[0] && w[0] != '0'; }();   // [dofmask] ALIASZSW = barrier/SW side only (GPU gate keeps dropping -> no stripes)
                 const bool gaZ16Dropped = !s_aliasZon && tex.tbp0 == 7168u &&
                                           (tex.psm == 0x30u || tex.psm == 0x31u || tex.psm == 0x32u);   // kind1 reads: the draw is ALIASSKIP-dropped, decode+flush feed nothing
                 static const bool s_aoFbo2 = [](){ const char *v = std::getenv("PS2X_ALPHAONLYFBO"); return v && v[0] && v[0] != '0'; }();
@@ -3991,7 +3992,8 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         // restores the old behavior for A/B.
         static const int s_gaDs4 = [](){ const char *v = std::getenv("PS2X_GPUALIAS"); return v && v[0] ? std::atoi(v) : 0; }();
         static const bool s_gaDecSkip = [](){ const char *v = std::getenv("PS2X_GPUALIAS_DECSKIP"); return !(v && v[0] == '0'); }();
-        static const bool s_gaAliasZ2 = [](){ const char *v = std::getenv("PS2X_ALIASZ"); return v && v[0] && v[0] != '0'; }();
+        static const bool s_gaAliasZ2 = [](){ const char *v = std::getenv("PS2X_ALIASZ"); if (v && v[0] && v[0] != '0') return true;
+                                              const char *w = std::getenv("PS2X_ALIASZSW"); return w && w[0] && w[0] != '0'; }();   // [dofmask] see ALIASZSW above
         const bool gaZ16DropRead = s_gaDs4 >= 4 && s_gaDecSkip && !s_gaAliasZ2 && ctx.tex0.tbp0 == 7168u &&
                                    (ctx.tex0.psm == 0x30u || ctx.tex0.psm == 0x31u || ctx.tex0.psm == 0x32u);
         const bool gaServedRead = gaZ16DropRead || (s_gaDs4 >= 4 && s_gaDecSkip && ctx.tex0.tbp0 == 10752u &&
