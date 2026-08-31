@@ -914,7 +914,8 @@ namespace
         // mode 3 (PS2X_MASKRAW=1): pass the SAMPLED alpha through untouched, so the buffer we
         // write becomes a direct readout of what the sampler sees. A constant here means the
         // fetch is wrong (UVs/size/routing); a graded one means the expansion is wrong.
-        "    if (uTexa.w > 2.5) { }\n"
+        "    if (uTexa.w > 3.5) { t.a = min(t.a * 1.9921875, 1.0); }\n"   // mode 4 [alphaonlyfbo]: keep sampled alpha, decode-matching x255/128 rescale
+        "    else if (uTexa.w > 2.5) { }\n"
         "    else if (uTexa.w > 1.5) {\n"
         "      float px = stq.x * float(textureSize(texture0, 0).x);\n"
         "      bool odd = fract(px) >= 0.5;\n"
@@ -11544,6 +11545,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 {
                     static unsigned long n = 0; static std::map<std::string, unsigned long> h;
                     ++h[srcHow ? srcHow : "?"];
+                    {   // why do the decoded-mode ones miss the FBO branch?
+                        static unsigned long nd = 0;
+                        if (srcHow && srcHow[0] == 'd' && ++nd <= 12)
+                            std::fprintf(stderr, "[scenesrv-dec] src=%u dest=f%u psm=%u %dx%d up=%d rend=%d idx=%d tri=%d abe=%d bm=%02x key=%llx\n",
+                                         c.srcTbp0, c.destFbp, (unsigned)c.srcPsm, c.srcTexW, c.srcTexH,
+                                         c.srcUploaded ? 1 : 0, c.srcRendered ? 1 : 0, c.srcIndexed ? 1 : 0,
+                                         (int)c.isTriangle, c.abe ? 1 : 0, (unsigned)c.blendMode, (unsigned long long)c.texKey);
+                    }
                     if ((++n % 500ul) == 1ul)
                     { std::fprintf(stderr, "[scenesrv] #%lu src=%u dest=f%u psm=%u %dx%d how:", n, c.srcTbp0, c.destFbp, (unsigned)c.srcPsm, c.srcTexW, c.srcTexH);
                       for (auto &kv : h) std::fprintf(stderr, " %s=%lu", kv.first.c_str(), kv.second);
@@ -11934,7 +11943,15 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         if (s_tb) { rlDrawRenderBatchActive(); ps2xTextureBarrier(); }
                         g_lastRenderedFboTex = 0;
                     }
-                    const float mode = (s_texaFbo && fromFbo && c.tcc && tex.id != 0
+                    // [alphaonlyfbo] the scene-alpha extraction reads (fbmsk 00FFFFFF, CT32 scene src)
+                    // must KEEP the sampled FBO alpha with the decode path's x255/128 rescale --
+                    // mode 1's ta0-substitution flattened the mask and killed the outline rim.
+                    static const bool s_aoFbo3 = [](){ const char *v = std::getenv("PS2X_ALPHAONLYFBO"); return v && v[0] && v[0] != '0'; }();
+                    const bool aofKeep = s_aoFbo3 && fromFbo && c.fbmsk == 0x00FFFFFFu &&
+                                         (c.srcPsm == 0u || c.srcPsm == 1u) &&
+                                         (c.srcTbp0 == 0u || c.srcTbp0 == 3584u) && tex.id != 0 && tex.id != g_white.id;
+                    const float mode = aofKeep ? 4.0f
+                                     : (s_texaFbo && fromFbo && c.tcc && tex.id != 0
                                         && tex.id != g_white.id && psmTexa)
                                      ? ((c.srcPsm == 2u) ? (s_maskRaw ? 3.0f : 2.0f) : 1.0f) : 0.0f;
                     {   // [texadecal] PS2X_BLOBTEX=1: the shadow-decal class's TEXA clause values.
