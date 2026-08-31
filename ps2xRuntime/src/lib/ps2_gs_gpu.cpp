@@ -4094,6 +4094,19 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         }
         if (changed)
             ps2GpuRenderer().onVramUpload(dbp, static_cast<uint32_t>(dbw) * rrh);
+        {   // [groupviz] PS2X_GROUPVIZ=<dbp>: per-frame ordinal of palette uploads to this block;
+            // the rasterizer tints each palette by it -> replay frames become group maps.
+            static const uint32_t s_gvDbp = [](){ const char *v = std::getenv("PS2X_GROUPVIZ");
+                                                  return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
+            if (s_gvDbp && dbp == s_gvDbp)
+            {
+                extern int g_ps2ReplayVsync;
+                extern uint32_t g_gvGroupOrdinal;
+                static int s_lastVs = -1;
+                if (g_ps2ReplayVsync != s_lastVs) { s_lastVs = g_ps2ReplayVsync; g_gvGroupOrdinal = 0; }
+                ++g_gvGroupOrdinal;
+            }
+        }
         // [atomicclut] bump the CLUT-page generation only when the TRANSFER COMPLETES, not per
         // GIF IMAGE packet: a palette upload spanning multiple packets used to bump the gen on
         // every chunk, so an interleaved draw's ensureClutCache rebuilt from HALF-WRITTEN VRAM.

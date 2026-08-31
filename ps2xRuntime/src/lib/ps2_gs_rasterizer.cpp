@@ -2805,6 +2805,8 @@ int GSRasterizer::fillClutFrom(uint32_t *out, uint8_t *vram, const GSTexaReg &te
     return count;
 }
 
+uint32_t g_gvGroupOrdinal = 0;   // [groupviz] palette-upload ordinal within the current frame
+
 void GSRasterizer::ensureClutCache(GS *gs)
 {
     const auto &tex = gs->activeContext().tex0;
@@ -2841,6 +2843,20 @@ void GSRasterizer::ensureClutCache(GS *gs)
         return; // cache already valid for this palette state
 
     fillClutFrom(gs->m_clutCache, gs->m_vram, gs->m_texa, gs->m_texclut, tex);   // [deferdec] shared with the GL-thread decode
+    {   // [groupviz] PS2X_GROUPVIZ=<cbp>: replace this palette with a solid ID color per
+        // upload ordinal -> the rendered frame maps lighting groups to colors.
+        extern uint32_t g_gvGroupOrdinal;
+        static const uint32_t s_gv = [](){ const char *v = std::getenv("PS2X_GROUPVIZ");
+                                           return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
+        if (s_gv && tex.cbp == s_gv)
+        {
+            static const uint32_t pal[12] = {0xFF4040FFu,0xFF40FF40u,0xFFFF4040u,0xFF40FFFFu,
+                                             0xFFFF40FFu,0xFFFFFF40u,0xFF9060FFu,0xFF60FF90u,
+                                             0xFFFF9060u,0xFF6090FFu,0xFF90FF60u,0xFFC0C0C0u};
+            const uint32_t col = pal[g_gvGroupOrdinal % 12u] & 0x80FFFFFFu;
+            for (int i = 0; i < 256; ++i) gs->m_clutCache[i] = col;
+        }
+    }
     gs->m_clutCacheKey = key;
     {   // [cluthash] hash the rebuilt palette once (was: 256 serial FNV mixes per textured draw = 8% of the guest thread)
         uint64_t hh = 1469598103934665603ull;
