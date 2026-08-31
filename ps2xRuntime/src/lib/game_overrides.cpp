@@ -3027,6 +3027,8 @@ namespace
         // exit so nothing else in the frame is affected.
         static const bool s_on = [](){ const char *v = std::getenv("PS2X_TERRROUND"); return v && v[0] && v[0] != '0'; }();
         if (!s_on) { if (g_orig2188b8) g_orig2188b8(rdram, ctx, runtime); return; }
+        static std::atomic<int> s_engaged{0};
+        if (s_engaged.fetch_add(1) == 0) std::fprintf(stderr, "[terrround] ENGAGED (chop rounding scoped to the terrain group classifier)\n");
         const unsigned int saved = _mm_getcsr();
         _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8040u);
         if (g_orig2188b8) g_orig2188b8(rdram, ctx, runtime);
