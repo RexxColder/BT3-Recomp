@@ -3711,13 +3711,18 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 static const bool s_aliasZon = [](){ const char *v = std::getenv("PS2X_ALIASZ"); return v && v[0] && v[0] != '0'; }();
                 const bool gaZ16Dropped = !s_aliasZon && tex.tbp0 == 7168u &&
                                           (tex.psm == 0x30u || tex.psm == 0x31u || tex.psm == 0x32u);   // kind1 reads: the draw is ALIASSKIP-dropped, decode+flush feed nothing
+                static const bool s_aoFbo2 = [](){ const char *v = std::getenv("PS2X_ALPHAONLYFBO"); return v && v[0] && v[0] != '0'; }();
+                const bool gaAlphaOnlyFbo = s_aoFbo2 &&
+                                            gs->activeContext().frame.fbmsk == 0x00FFFFFFu &&
+                                            (tex.tbp0 == 0u || tex.tbp0 == 3584u) &&
+                                            (tex.psm == 0x00u || tex.psm == 0x01u);   // [alphaonlyfbo] the renderer serves these from the rtsnap FBO copy; the scene flush feeds nothing for them
                 const bool gaServed = !s_noskip && s_ga4 >= 4 && ((tex.tbp0 == 10752u && (tex.psm == 0x02u || tex.psm == 0x0Au))
                     // ink-composite signature ONLY (must mirror the renderer flip): other CT16
                     // readers of page 336 (HUD composite, menus) still need the VRAM round-trip.
                     && gs->m_texa.aem && gs->m_texa.ta1 == 0u
                     && (gs->m_texa.ta0 == 0x30u ||
                         (gs->m_texa.ta0 == 0x80u && (gs->activeContext().frame.fbmsk & 0x00FFFFFFu) == 0x00FFFFFFu))
-                    || gaZ16Dropped);
+                    || gaZ16Dropped || gaAlphaOnlyFbo);
                 if (!gaServed)
                 {
                     {   // [gpualias] census the CT16 readers of f336 we do NOT serve (the striping class?)
