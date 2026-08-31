@@ -1355,6 +1355,35 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             // by the membership builder we want to backtrace.
                             static const bool s_geo = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
                                                             return v && v[0] && v[0] != '0'; }();
+                            // PS2X_PALSRC_GEO=2: the RAM batches proved static (PALG3: zero writes,
+                            // full store tracing). The per-frame membership data is suspected SPR-resident
+                            // (chain reads scratchpad directly via SPR-flagged tags; StoreN traces SPR
+                            // writes as 0x10000000+off). Log EVERY segment after a terrain header with
+                            // its scratch flag, and latch+re-assert the watch on the FIRST SPR segment.
+                            static const bool s_geo2 = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
+                                                             return v && v[0] == '2'; }();
+                            if (s_pd2 && s_geo2 && s_expectPayload > 0)
+                            {
+                                static int s_sn = 0;
+                                if (s_sn < 400)
+                                { std::fprintf(stderr, "[palsrc] SEG scratch=%d addr=0x%08x len %u\n", scratch?1:0, srcAddr, bytes); ++s_sn; }
+                                --s_expectPayload;
+                                static const bool s_armS = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
+                                                                 return v && v[0] && v[0] != '0'; }();
+                                static uint32_t s_sprLo = 0, s_sprHi = 0;
+                                if (s_armS && scratch && src < maxSz2)
+                                {
+                                    if (s_sprLo == 0u)
+                                    {
+                                        const uint32_t alen = bytes < 1024u ? bytes : 1024u;
+                                        s_sprLo = 0x10000000u + src;
+                                        s_sprHi = 0x10000000u + src + alen;
+                                        std::fprintf(stderr, "[palsrc] write-watch ARMED on SPR seg 0x%08x..0x%08x (spr off 0x%x)\n", s_sprLo, s_sprHi, src);
+                                    }
+                                    g_ps2WatchHi.store(s_sprHi, std::memory_order_relaxed);
+                                    g_ps2WatchLo.store(s_sprLo, std::memory_order_relaxed);
+                                }
+                            }
                             if (s_pd2 && s_geo && s_expectPayload > 0 && !scratch && bytes >= 32768u && src < maxSz2)
                             {
                                 s_expectPayload = 0;
@@ -1416,7 +1445,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                         if (s_pn2 < 40)
                                             std::fprintf(stderr, "[palsrc] #%d BITBLTBUF dbp=%u at guest 0x%08x (seg 0x%08x+%u len %u ch=%08x)\n",
                                                          s_pn2, s_pd2, srcAddr + off, srcAddr, off, bytes, channelBase);
-                                        s_expectPayload = 2;   // arm on the palette BYTES that follow, not this static header
+                                        s_expectPayload = 8;   // mode2 logs several following segments; modes 0/1 consume it on the first match
                                         if (++s_pn2 >= 40) break;
                                     }
                                 }
