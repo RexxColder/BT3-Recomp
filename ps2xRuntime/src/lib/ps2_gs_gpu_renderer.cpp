@@ -2877,6 +2877,23 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
                     }
                 }
             }
+            {   // [bargate336] PS2X_BARGATE336=1: EVERY dirty read of the f336 span on the blocking
+                // path (the [ddgatelog] probe below is defer-gated and dead without DEFERDEC).
+                static const bool s_bg336 = [](){ const char *v = std::getenv("PS2X_BARGATE336"); return v && v[0] && v[0] != '0'; }();
+                static int nbg = 0;
+                if (s_bg336 && dirty && page >= 336u && page < 400u && nbg < 250)
+                {
+                    ++nbg;
+                    uint32_t cover = dirtyBefore ? page : 0xFFFFFFFFu;
+                    if (cover == 0xFFFFFFFFu)
+                        for (const auto &kv : g_deferPending)
+                            if (kv.second > 0 && page >= kv.first && page < kv.first + flushCoverPages(kv.first)) { cover = kv.first; break; }
+                    extern uint32_t g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw;
+                    std::fprintf(stderr, "[bargate336] page %u dirtyB=%d pend=%d cover=%u pageSeq=%u renderSeq336=%u tbp=%u psm=%u tbw=%u\n",
+                                 page, (int)dirtyBefore, (int)pend, cover, m_pageSeq[page],
+                                 m_fbpRenderSeq[336], g_barReqTbp, g_barReqPsm, g_barReqTbw);
+                }
+            }
             {   // [ddgatelog] PS2X_DDGATELOG=1: why is a read of the fbp336 span deferred? (first 80 reads of pages 336..399)
                 static const bool s_gl = [](){ const char *v = std::getenv("PS2X_DDGATELOG"); return v && v[0] && v[0] != '0'; }();
                 static int n = 0;

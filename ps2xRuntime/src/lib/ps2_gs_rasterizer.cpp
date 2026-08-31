@@ -3716,6 +3716,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 const bool gaSceneCT32 = s_sceneSkip &&
                                          (tex.tbp0 == 0u || tex.tbp0 == 3584u) &&
                                          (tex.psm == 0x00u || tex.psm == 0x01u);   // [sceneskip] scene CT32 reads are FBO-served; with alpha-only served + Z16S dropped, the scene flush feeds nothing
+                static const bool s_f336Skip = [](){ const char *v = std::getenv("PS2X_F336SKIP"); return v && v[0] && v[0] != '0'; }();
+                const bool gaF336Self = s_f336Skip && tex.tbp0 == 10752u &&
+                                        (tex.psm == 0x00u || tex.psm == 0x01u);   // [f336skip] the DoF chain reading back its own downsample buffer (fbw4 CT32/CT24) -- FBO-served RT self-reads; measured as ALL of f336's dirty barriers (bargate336: 250/250 psm 0/1, zero T8)
                 const bool gaAlphaOnlyFbo = s_aoFbo2 &&
                                             gs->activeContext().frame.fbmsk == 0x00FFFFFFu &&
                                             (tex.tbp0 == 0u || tex.tbp0 == 3584u) &&
@@ -3726,7 +3729,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     && gs->m_texa.aem && gs->m_texa.ta1 == 0u
                     && (gs->m_texa.ta0 == 0x30u ||
                         (gs->m_texa.ta0 == 0x80u && (gs->activeContext().frame.fbmsk & 0x00FFFFFFu) == 0x00FFFFFFu))
-                    || gaZ16Dropped || gaAlphaOnlyFbo || gaSceneCT32);
+                    || gaZ16Dropped || gaAlphaOnlyFbo || gaSceneCT32 || gaF336Self);
                 if (!gaServed)
                 {
                     {   // [gpualias] census the CT16 readers of f336 we do NOT serve (the striping class?)
