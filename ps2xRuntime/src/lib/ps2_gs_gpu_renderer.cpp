@@ -11538,6 +11538,31 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             }
         }
 
+        {   // [terrtri] first N terrain triangles at the exec loop: are the three vertex
+            // colours equal (flat) or varying (gouraud-recorded)?
+            static const bool s_tt = [](){ const char *v = std::getenv("PS2X_TERRTRI"); return v && v[0] && v[0] != '0'; }();
+            static unsigned long tn = 0, tneq = 0;
+            if (s_tt && c.isTriangle && !c.isTransfer && c.srcPsm == 0x13u && c.srcClutTbp == 12992u
+                && (c.destFbp == 0u || c.destFbp == 112u))
+            {
+                ++tn;
+                if (c.tri[0].r != c.tri[2].r || c.tri[1].r != c.tri[2].r) ++tneq;
+                if (tn <= 8 || (tn % 100000ul) == 0ul)
+                    std::fprintf(stderr, "[terrtri] #%lu cols r=(%u,%u,%u) unequal=%lu/%lu\n",
+                                 tn, c.tri[0].r, c.tri[1].r, c.tri[2].r, tneq, tn);
+            }
+            // PS2X_TERRFLAT=1: FLAT-shade the terrain class at the exec loop (GS IIP=0
+            // last-vertex convention) -- the record path renders these Gouraud (81% unequal
+            // colours measured) and the interpolation smears BT3's noisy flat-lit values
+            // into the moving dark/light patches. Class-scoped test lever; if it kills the
+            // patches, the proper fix is plumbing effective-IIP through DrawCmd.
+            static const bool s_tflat = [](){ const char *v = std::getenv("PS2X_TERRFLAT"); return v && v[0] && v[0] != '0'; }();
+            if (s_tflat && c.isTriangle && !c.isTransfer && c.srcPsm == 0x13u && c.srcClutTbp == 12992u
+                && (c.destFbp == 0u || c.destFbp == 112u))
+                for (int k3 = 0; k3 < 2; ++k3)
+                {   auto &t3 = const_cast<GsGpuRenderer::DrawCmd &>(c).tri[k3];
+                    t3.r = c.tri[2].r; t3.g = c.tri[2].g; t3.b = c.tri[2].b; t3.a = c.tri[2].a; }
+        }
         // [chartri]: dump full state of the first N character-texture triangles (the fight's
         // 0x64 opaque pass that records but never shows) — coords/scissor/color/fbmsk decide
         // between collapsed geometry, scissor kill, and state kill. seq = index in this

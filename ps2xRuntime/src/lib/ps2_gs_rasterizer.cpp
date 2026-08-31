@@ -4638,6 +4638,30 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             if (s_depthOn) cmd.tri[i].z = zNorm(v);
             colorBytes(v, cmd.tri[i].r, cmd.tri[i].g, cmd.tri[i].b, cmd.tri[i].a);
         }
+        {   // [flattri] GS IIP=0 = FLAT shading: the whole triangle takes the LAST vertex's
+            // colour. We recorded per-vertex colours and rendered them Gouraud, which smears
+            // BT3's noisy flat-lit terrain colours (console-identical data, verified vs
+            // ref_native.gs) into large soft dark/light patches on hills -- the "moving
+            // dark areas". Console's flat facets are ~6px and read as grass texture instead.
+            // The line path already did this (colU/iip above); triangles now match.
+            // PS2X_FLATTRI=0 restores the old Gouraud-always behaviour.
+            static const bool s_flatTri = [](){ const char *v = std::getenv("PS2X_FLATTRI"); return !(v && v[0] == '0'); }();
+            {   static const bool s_ftd = [](){ const char *v = std::getenv("PS2X_FLATTRIDIAG"); return v && v[0] && v[0] != '0'; }();
+                static unsigned long fn2 = 0, neq = 0;
+                if (s_ftd && !gs->m_prim.iip && tme && ctx.tex0.psm == 0x13)
+                {
+                    ++fn2;
+                    if (cmd.tri[0].r != cmd.tri[2].r || cmd.tri[1].r != cmd.tri[2].r) ++neq;
+                    if (fn2 <= 6 || (fn2 % 100000ul) == 0ul)
+                        std::fprintf(stderr, "[flattridiag] #%lu tri cols r=(%u,%u,%u) unequal-so-far=%lu/%lu\n",
+                                     fn2, cmd.tri[0].r, cmd.tri[1].r, cmd.tri[2].r, neq, fn2);
+                }
+            }
+            if (s_flatTri && !gs->m_prim.iip)
+                for (int k2 = 0; k2 < 2; ++k2)
+                { cmd.tri[k2].r = cmd.tri[2].r; cmd.tri[k2].g = cmd.tri[2].g;
+                  cmd.tri[k2].b = cmd.tri[2].b; cmd.tri[k2].a = cmd.tri[2].a; }
+        }
         // [wedgerec2] (PS2X_WEDGEREC): THE intro-pan wedge signature nailed by the F9 capture
         // (gen2687 ci=673-675 etc): a huge far-z terrain-textured clip-fan whose verts pin at
         // BOTH guard clamps (x=-1499 left, ~2010 right-edge apex) with z<0.001. Dump the
