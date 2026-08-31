@@ -11248,7 +11248,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // 336 into the scene) actually see? Reads the DEST FBO alpha right before the draw.
             static const bool s_da = [](){ const char *v = std::getenv("PS2X_DOFAD"); return v && v[0] && v[0] != '0'; }();
             static int daN = 0;
-            if (s_da && g_replayInWindow && daN < 3 && !c.isTransfer && c.srcTbp0 == 10752u && c.srcPsm == 0u
+            static const int s_daMode = [](){ const char *v = std::getenv("PS2X_DOFAD"); return v && v[0] ? std::atoi(v) : 0; }();
+            if (s_da && (g_replayInWindow || s_daMode >= 4) && daN < 3 && !c.isTransfer && c.srcTbp0 == 10752u && c.srcPsm == 0u
                 && c.blendMode == 0x54 && (c.destFbp == 0u || c.destFbp == 112u) && g_fbos.count(c.destFbp))
             {
                 ++daN;
