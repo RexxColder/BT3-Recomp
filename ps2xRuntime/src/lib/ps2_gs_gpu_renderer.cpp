@@ -781,6 +781,7 @@ namespace
     int g_locPerspQ = -1;
     int g_locRegion = -1;   // [region]
     float g_curTexa[4] = {1.0f, 1.0f, 0.0f, 0.0f};   // [texacache] last uTexa pushed -- every writer must update it
+    int g_locABl128 = -1;   // [ablend128]
     const GsGpuRenderer::DrawCmd *g_curDecalCmd = nullptr;
     bool g_decalUViz = false; float g_decalUVizMode = 1.f;   // [decaldbg 6/7]
     RenderTexture2D g_decalSnap = {0}; unsigned g_decalSnapSrcTex = 0;   // [decalsync 3] silhouette snapshot
@@ -844,7 +845,8 @@ namespace
         // shader's pre-clamp alpha == GS Af/128; uAref is passed as AREF/128 to match.
         "uniform float uTcc;\n"
         "uniform float uASplit;\n"   // GS TEX0.TCC: 0 = texture is RGB-only, alpha from the vertex
-        "uniform vec4 uTexa;\n"  // GS TEXA (ta0, ta1, aem, mode) for render-target sources
+        "uniform vec4 uTexa;\n"
+        "uniform float uABl128;\n"  // GS TEXA (ta0, ta1, aem, mode) for render-target sources
         "uniform float uTfx;\n"   // GS TEX0.TFX: 0=MODULATE 1=DECAL
         "uniform float uProjClip;\n" // shadow decal: discard outside the projection
         "uniform float uAScale;\n" // 128/255: store alpha as a GS byte, not an opacity
@@ -975,7 +977,13 @@ namespace
         // PS2X_ALPHA128 halved every blend: it fixed the stored byte by breaking the factor.
         // With dual-source blending the RGB factors read blendAlpha (SRC1_ALPHA), so the two are
         // finally independent.
-        "  float aBlend = clamp(c.a, 0.0, 1.0);\n"
+        // [ablend128] PS2X_ABLEND128=1: GS blend-factor convention for TEXTURE-sourced alpha.
+        // aBlend must be GS_As/128 (1.0 == GS 128). The vertex path already encodes GS 128 as
+        // 1.0, but texture/CLUT alpha arrives as GSbyte/255 -- so every texture-alpha blend
+        // factor ran at ~half the GS strength (measured: the mountain-shading CLUT's alpha-127
+        // darkening applied at 0.498 instead of 0.992 -> "light geometry" on scenery; water
+        // tints likewise). uABl128 scales the tcc=1 texture path by 255/128.
+        "  float aBlend = clamp((uABl128 > 0.5 && uTcc > 0.5) ? min(c.a * 1.9921875, 1.0) : c.a, 0.0, 1.0);\n"
         // PS2X_ASPLIT: uAScale (128/255) must apply ONLY to the VERTEX-derived alpha. Our
         // vertex alpha encodes a GS 128 as 255, so it needs the rescale; but the CLUT decode
         // already yields the GS byte directly (measured: a character texture decodes to a
@@ -5253,6 +5261,9 @@ void GsGpuRenderer::ensureGl(int w, int h)
         if (g_locSubScale >= 0) { float one = 1.0f; SetShaderValue(g_shader, g_locSubScale, &one, SHADER_UNIFORM_FLOAT); }
         g_locAScale = GetShaderLocation(g_shader, "uAScale");
         g_locTexa = GetShaderLocation(g_shader, "uTexa");
+        g_locABl128 = GetShaderLocation(g_shader, "uABl128");
+        {   static const float on = [](){ const char *v = std::getenv("PS2X_ABLEND128"); return (v && v[0] && v[0] != '0') ? 1.0f : 0.0f; }();
+            if (g_locABl128 >= 0) SetShaderValue(g_shader, g_locABl128, &on, SHADER_UNIFORM_FLOAT); }
         g_locTfx = GetShaderLocation(g_shader, "uTfx");
         g_locProjClip = GetShaderLocation(g_shader, "uProjClip");
         g_locPerspQ = GetShaderLocation(g_shader, "uPerspQ");
