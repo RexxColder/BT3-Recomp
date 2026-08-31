@@ -2486,6 +2486,29 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         uint8_t it = VIT(instr);
         if (it != 0)
             m_state.vi[it] = (int32_t)(m_state.clip & 0xFFFu);
+        // [vucell] PS2X_VUCELL=<minframe>: observe the terrain walker's per-cell cull
+        // decision AS IT IS MADE — the FCGET at pc 0xa88/0x928 reads both bbox-corner
+        // CLIP judgments. Log the raw judgments, the plane masks, and the corner
+        // coordinates feeding them; the torn-dither alternation must appear in these
+        // values, naming the divergent term directly.
+        {
+            static const long s_vc = [](){ const char *v = std::getenv("PS2X_VUCELL"); return v && v[0] ? std::atol(v) : -1; }();
+            if (s_vc >= 0 && (m_state.pc == 0xa88u || m_state.pc == 0x928u))
+            {
+                extern std::atomic<uint64_t> g_bt3FrameCount;
+                const long fr = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
+                if (fr >= s_vc)
+                {
+                    static std::atomic<int> s_n{0};
+                    if (s_n.fetch_add(1) < 800)
+                        std::fprintf(stderr, "[vucell] fr=%ld pc=0x%x clip=%06x vi5=%d vi6=%d vi7=%d vi10=%d vi11=%d c1=(%.1f,%.1f,%.1f,%.3f) c2=(%.1f,%.1f,%.1f,%.3f)\n",
+                                     fr, m_state.pc, m_state.clip & 0xFFFFFFu,
+                                     m_state.vi[5], m_state.vi[6], m_state.vi[7], m_state.vi[10], m_state.vi[11],
+                                     m_state.vf[17][0], m_state.vf[17][1], m_state.vf[17][2], m_state.vf[17][3],
+                                     m_state.vf[21][0], m_state.vf[21][1], m_state.vf[21][2], m_state.vf[21][3]);
+                }
+            }
+        }
         return;
     }
     case 0x20: // B (unconditional branch)
