@@ -2356,6 +2356,40 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
             
         m_seenGifCopy = true;
         m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+        {   // [palsrc] PS2X_PALSRC=<dbp>: log the GUEST source address of GIF packets that set
+            // BITBLTBUF to this destination block -- the EE-side buffer the game builds its
+            // terrain palettes in. Feed the address to the write-watch to catch the BUILDER
+            // function (the unstable sun-lighting group assignment, 2026-09-01).
+            static const uint32_t s_pd = [](){ const char *v = std::getenv("PS2X_PALSRC");
+                                               return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
+            static int s_pn = 0;
+            if (s_pd && s_pn < 40)
+            {
+                const uint8_t *p = m_rdram + srcPhysAddr;
+                for (uint32_t off = 0; off + 16 <= chunk; off += 16)
+                {
+                    uint64_t lo, hi;
+                    std::memcpy(&lo, p + off, 8); std::memcpy(&hi, p + off + 8, 8);
+                    if ((hi & 0xFFull) == 0x50ull && ((lo >> 32) & 0x3FFFull) == s_pd)
+                    {
+                        std::fprintf(stderr, "[palsrc] #%d BITBLTBUF dbp=%u at guest %#x (packet %#x+%u len %u)\n",
+                                     s_pn, s_pd, srcPhysAddr + off, srcPhysAddr, off, chunk);
+                        // PS2X_PALSRC_ARM=1: arm the guest write-watch on this packet region --
+                        // next frame's rebuild of the palette buffer backtraces its EE writer.
+                        static const bool s_arm = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
+                                                        return v && v[0] && v[0] != '0'; }();
+                        if (s_arm && g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
+                        {
+                            g_ps2WatchHi.store((srcPhysAddr + chunk) & 0x1FFFFFFFu, std::memory_order_relaxed);
+                            g_ps2WatchLo.store(srcPhysAddr & 0x1FFFFFFFu, std::memory_order_relaxed);
+                            std::fprintf(stderr, "[palsrc] write-watch ARMED on %#x..%#x\n",
+                                         srcPhysAddr, srcPhysAddr + chunk);
+                        }
+                        if (++s_pn >= 40) break;
+                    }
+                }
+            }
+        }
         submitGifPacket(GifPathId::Path3, m_rdram + srcPhysAddr, chunk);
         
         bytesLeft -= chunk;
