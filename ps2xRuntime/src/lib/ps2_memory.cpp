@@ -1435,7 +1435,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                     uint32_t w; std::memcpy(&w, pp + off, 4);
                                     // 6b: num>=4 — the ubiquitous num=3 cell-bbox headers crowded out
                                     // the log AND stole the arm; the matrix/uniform block is num 4..12.
-                                    if ((w & 0xFF000000u) == 0x6C000000u && (w & 0x3FFu) < 16u && ((w >> 16) & 0xFFu) >= 4u)
+                                    if (((w & 0xFF000000u) == 0x6C000000u || (w & 0xFF000000u) == 0x7C000000u) && (w & 0x3FFu) < 16u && ((w >> 16) & 0xFFu) >= 4u)
                                     {
                                         static int s_un = 0;
                                         const uint32_t num = (w >> 16) & 0xFFu, ad = w & 0x3FFu;
