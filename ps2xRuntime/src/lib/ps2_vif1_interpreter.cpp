@@ -1155,6 +1155,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 }
             }
 
+            // [cycletrace] PS2X_CYCLETRACE=<minframe>: log S-format and MASKED unpacks with
+            // their full cycle state (cmd/CL/WL/mode/mask) — the terrain per-cell param
+            // streams; decides whether fill-mode (WL>CL) semantics are in play there.
+            {
+                static const long s_ct = [](){ const char *v = std::getenv("PS2X_CYCLETRACE"); return v && v[0] ? std::atol(v) : -1; }();
+                if (s_ct >= 0 && (vn == 0u || maskEnable))
+                {
+                    extern std::atomic<uint64_t> g_bt3FrameCount;
+                    const long fr = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
+                    if (fr >= s_ct)
+                    {
+                        static std::atomic<int> s_cn{0};
+                        if (s_cn.fetch_add(1) < 100)
+                            std::fprintf(stderr, "[cycletrace] fr=%ld cmd=%02x vn=%d vl=%d m=%d vuAddr=%u cnt=%u cl=%u wl=%u mode=%u mask=%08x tops=%u\n",
+                                         fr, (unsigned)((imm >> 24) & 0xFFu) | 0x60u, (int)vn, (int)vl, maskEnable ? 1 : 0,
+                                         vuAddr, (unsigned)writeVectorCount, cl, wl, vif1_regs.mode & 3u, vif1_regs.mask, vif1_regs.tops & 0x3FFu);
+                    }
+                }
+            }
             // [rowtrace] PS2X_ROWTRACE=<minframe>: log every unpack whose EFFECTIVE target is
             // VU rows 0-15 (the terrain micro's uniform block; entry 0 latches vf1-8/vf13-16
             // from there) with its guest SOURCE address -- raw chain-byte scans missed the
