@@ -101,6 +101,7 @@ uint32_t g_gaClutData[256];                    // [gpualias] SW-chain palette sn
 std::atomic<unsigned> g_gaClutSeq{0};
 static unsigned long g_gaExecCount = 0;       // [gpualias] chain passes executed (staleness tracking)
 std::atomic<uint64_t> g_guestBusyNs{0}, g_guestBusyFrames{0};   // [guestbusy] file scope: read by ps2_runtime.cpp
+std::atomic<uint64_t> g_guestWallNs{0};   // [guestwall] wall time between publishes (CPU + blocked)
 extern unsigned long g_svcFlushSkip;   // [svcflushseq] defined below
 extern unsigned long g_linFetch, g_linMiss, g_linRefresh;   // [linvram] defined below
 extern unsigned long g_ddMaxqWaits;   // [ddmaxq] defined below   // the draw whose texture resolve raised the barrier
@@ -4794,6 +4795,14 @@ void GsGpuRenderer::swapFrame()
         static uint64_t s_last = 0;
         if (s_last) { g_guestBusyNs.fetch_add(now - s_last, std::memory_order_relaxed); g_guestBusyFrames.fetch_add(1, std::memory_order_relaxed); }
         s_last = now;
+        {   // [guestwall] wall clock twin: CPU-vs-wall gap = time BLOCKED (barriers, publish waits)
+            struct timespec tw; clock_gettime(CLOCK_MONOTONIC, &tw);
+            const uint64_t noww = (uint64_t)tw.tv_sec * 1000000000ull + (uint64_t)tw.tv_nsec;
+            static uint64_t s_lastW = 0;
+            extern std::atomic<uint64_t> g_guestWallNs;
+            if (s_lastW) g_guestWallNs.fetch_add(noww - s_lastW, std::memory_order_relaxed);
+            s_lastW = noww;
+        }
     }
     {   // [tilecount] per-frame line
         static const bool s_tc = [](){ const char *v = std::getenv("PS2X_TILECOUNT"); return v && v[0] && v[0] != '0'; }();
@@ -5316,8 +5325,21 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         static const bool s_upq = [](){ const char *v = std::getenv("PS2X_UPQUEUE"); return !(v && v[0] == '0'); }();
         if (s_upq && !s_reup)
         {
+            // [upbudget] PS2X_UPBUDGET_KB (default 4096, 0 = unbounded): cap the texture bytes
+            // uploaded per render call. Terrain streaming on camera spins bursts many textures
+            // at once; uploading them inside one prerender chunk stretches that chunk and every
+            // barrier request arriving meanwhile waits it out -- the guest's WALL frame blows
+            // past 33.3 ms while its CPU time stays flat (the movement dips). Leftovers stay
+            // queued (needsUpload keeps them true) and go out on the next calls.
+            // DEFAULT OFF: with a cap, draws in the SAME call referencing a deferred texture hit
+            // the missing-texture drop (menu elements vanished). Needs upload-before-use ordering
+            // before it can default on.
+            static const size_t s_budget = [](){ const char *v = std::getenv("PS2X_UPBUDGET_KB");
+                                                 return (size_t)(v && v[0] ? std::atol(v) : 0) * 1024u; }();
+            size_t spent = 0, taken = 0;
             for (uint64_t qk : m_upQueue)
             {
+                ++taken;
                 auto qit = m_texCache.find(qk);
                 if (qit == m_texCache.end()) continue;
                 CachedTex &ct = qit->second;
@@ -5325,9 +5347,11 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     continue;   // duplicate queue entry or invalid: the flag is the truth
                 PendingUp u; u.key = qk; u.w = ct.w; u.h = ct.h; u.rgba.swap(ct.rgba);
                 ct.needsUpload = false;
+                spent += u.rgba.size();
                 s_ups.push_back(std::move(u));
+                if (s_budget && spent >= s_budget) break;   // leftovers keep their queue slots
             }
-            m_upQueue.clear();
+            m_upQueue.erase(m_upQueue.begin(), m_upQueue.begin() + (std::ptrdiff_t)taken);
         }
         else
         for (auto &kv : m_texCache)
