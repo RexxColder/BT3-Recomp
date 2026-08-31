@@ -2850,10 +2850,17 @@ void GSRasterizer::ensureClutCache(GS *gs)
                                            return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
         if (s_gv && tex.cbp == s_gv)
         {
-            static const uint32_t pal[12] = {0xFF4040FFu,0xFF40FF40u,0xFFFF4040u,0xFF40FFFFu,
-                                             0xFFFF40FFu,0xFFFFFF40u,0xFF9060FFu,0xFF60FF90u,
-                                             0xFFFF9060u,0xFF6090FFu,0xFF90FF60u,0xFFC0C0C0u};
-            const uint32_t col = pal[g_gvGroupOrdinal % 12u] & 0x80FFFFFFu;
+            // v2: derive the ID color from the palette's ACTUAL MEAN (light level), not the
+            // upload ordinal -- comparable across streams whose slot counts differ.
+            unsigned long sum = 0;
+            for (int i = 0; i < 256; ++i)
+            { const uint32_t e = gs->m_clutCache[i]; sum += (e & 0xFF) + ((e >> 8) & 0xFF) + ((e >> 16) & 0xFF); }
+            const int mean = (int)(sum / 768u);              // ~45..140 for the terrain groups
+            const int band = std::min(11, std::max(0, (mean - 45) / 8));   // 12 bands x 8 levels
+            static const uint32_t pal[12] = {0xFF2020C0u,0xFF2060FFu,0xFF20C0FFu,0xFF20FFC0u,
+                                             0xFF20FF40u,0xFF80FF20u,0xFFE0FF20u,0xFFFFC020u,
+                                             0xFFFF8020u,0xFFFF4020u,0xFFFF20A0u,0xFFFF20FFu};
+            const uint32_t col = pal[band] & 0x80FFFFFFu;
             for (int i = 0; i < 256; ++i) gs->m_clutCache[i] = col;
         }
     }
