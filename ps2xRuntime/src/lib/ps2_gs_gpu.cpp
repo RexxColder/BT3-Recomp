@@ -4102,7 +4102,11 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         // terrain patches. Consumers of m_pageUploadGen = the CLUT cache key only.
         // PS2X_ATOMICCLUT=0 restores the per-chunk bump.
         {
-            static const bool s_atomic = [](){ const char *v = std::getenv("PS2X_ATOMICCLUT"); return !(v && v[0] == '0'); }();
+            // DEFAULT OFF (2026-09-01): shipped default-on it broke LIVE menus (overbright) -- a
+        // palette upload whose transfer never satisfies copied>=total leaves the page
+        // generation stale forever. It also never fixed anything real (the "rogue" pairings
+        // it targeted were authentic 64-byte palette patches). Opt-in for experiments only.
+        static const bool s_atomic = [](){ const char *v = std::getenv("PS2X_ATOMICCLUT"); return v && v[0] && v[0] != '0'; }();
             if (!s_atomic || m_transferState.copied_pixels >= m_transferState.total_pixels)
                 bumpPageUploadGen(dbp, static_cast<uint32_t>(dbw) * rrh);   // [clutpagegen]
         }
