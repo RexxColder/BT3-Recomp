@@ -95,6 +95,7 @@ extern "C" void glDrawBuffer(unsigned int buf);
 extern "C" void glTexParameteri(unsigned int target, unsigned int pname, int param);
 extern "C" void glGetTexParameteriv(unsigned int target, unsigned int pname, int *params);
 extern "C" void glUniform1i(int location, int v0);
+extern "C" void glUniform1f(int location, float v0);
 extern "C" void glViewport(int x, int y, int w, int h);
 static RenderTexture2D g_gaViewTex[2];         // [gpualias] ping-pong CT16 view of the chain output
 uint32_t g_gaClutData[256];                    // [gpualias] SW-chain palette snapshot (guest writes)
@@ -251,6 +252,9 @@ extern "C"
     void glEndQuery(unsigned int target);
     void glGetQueryObjectuiv(unsigned int id, unsigned int pname, unsigned int *params);
     void glGetBooleanv(unsigned int pname, unsigned char *params);
+    unsigned int glGetError(void);
+    void glReadPixels(int x, int y, int w, int h, unsigned int format, unsigned int type, void *data);
+    void glGetFramebufferAttachmentParameteriv(unsigned int target, unsigned int attachment, unsigned int pname, int *params);
 }
 #ifndef GL_NEVER
 #define GL_NEVER   0x0200
@@ -263,6 +267,7 @@ extern "C"
 #endif
 
 extern int g_ps2ReplayVsync;   // main.cpp: replay vsync counter ([slice] FBO recency)
+unsigned long g_dbgDepthClears = 0, g_dbgDepthWriteDraws = 0;   // [dofmask] depth-path liveness
 namespace
 {
     // PS2X_GPU_DEPTH: enable GS Z-test in the GPU replay. Default OFF -> the proven 2D
@@ -643,7 +648,9 @@ namespace
             static const bool s_nodepth = [](){ const char *v = std::getenv("PS2X_NODEPTH_RT"); return v && v[0] && v[0] != '0'; }();
             static const bool s_zTex = [](){ const char *v = std::getenv("PS2X_ZTEX");
                                              return v && v[0] && v[0] != '0'; }();
-            if (s_zTex)
+            static const bool s_dofMaskAttach = [](){ const char *v = std::getenv("PS2X_DOFMASK");
+                                                      return v && v[0] && v[0] != '0'; }();   // [dofmask] the mask pass needs the sampleable depth ATTACHMENT (zTexBind stays ZTEX-gated)
+            if (s_zTex || s_dofMaskAttach)
             {
                 RenderTexture2D t{};
                 t.id = rlLoadFramebuffer();
@@ -1992,6 +1999,20 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
         }
         std::string lst; for (uint32_t pg = g_ptLo; pg <= g_ptHi && pg < kVramPages; ++pg) if (hitp[pg]) { anyHit = true; lst += std::to_string(pg) + " "; }
         if (anyHit && g_ptN < ptMax()) { ++g_ptN; std::fprintf(stderr, "[pt] %lu FLUSH fbp=%u psm=%u fbw=%u %dx%d mask=%08x svc=%d ranged=%d pagesHit: %s\n", g_ptN, fbp, psmF, fbwF, w, h, wbMask, (int)(m_zwbOverride != nullptr), (int)(g_wbRowRange != nullptr), lst.c_str()); }
+    }
+    {   // [dofflog] PS2X_DOFFLOG=1: per-flush alpha histogram of the bytes about to land in VRAM
+        // for the DoF-relevant pages -- differential between an engaged (ALIASZ) and a
+        // non-engaged (DOFMASK) run finds the first divergent carrier.
+        static const bool s_dfl = [](){ const char *v = std::getenv("PS2X_DOFFLOG"); return v && v[0] && v[0] != '0'; }();
+        if (s_dfl && (fbp == 0u || fbp == 112u || fbp == 224u || fbp == 336u))
+        {
+            unsigned long a0 = 0, aLo = 0, aMid = 0, aHi = 0, a255 = 0;
+            for (size_t i = 0; i < px.size(); i += 11)
+            { const unsigned char v = px[i] >> 24; if (v == 0) ++a0; else if (v < 96) ++aLo; else if (v < 160) ++aMid; else if (v < 255) ++aHi; else ++a255; }
+            static unsigned long fn = 0;
+            std::fprintf(stderr, "[dofflog] #%lu flush f%u %dx%d mask=%08x alphaNow=%d A: 0=%lu lo=%lu mid=%lu hi=%lu 255=%lu\n",
+                         ++fn, fbp, w, h, wbMask, (int)m_flushAlphaNow, a0, aLo, aMid, aHi, a255);
+        }
     }
     {   // [linvram] mirror this writeback into the fbp's linear image (view = this flush's psm/fbw; size = the FBO)
         static const bool s_lv = [](){ const char *v = std::getenv("PS2X_LINVRAM"); return v && v[0] && v[0] != '0'; }();   // opt-in: correct, but the swizzle was ~10% of the decode and the page refreshes (sheets rewritten every frame inside the RT spans) cost more
@@ -4178,6 +4199,162 @@ static bool gaBuildReviewTex(const Texture2D &src, int srcH, int ta0, int ta1, i
     return true;
 }
 
+// [dofmask] PS2X_DOFMASK=1: the PROPER kind1 -- BT3 builds its DoF far-field mask by writing
+// Z bits 14-15 into the scene's CT16-view alpha bits (32 CT16 column strips, high halves only =
+// CT32 alpha bits 6-7, RGB untouched). The GPU approximation of those strips paints red columns
+// (ALIASSKIP exists to drop them) and dropping them kills the DoF entirely (razor-sharp
+// mountains vs console's creamy blur). This pass replaces the strips with the exact semantics:
+// alpha bits 6-7 := depth bits 14-15 (rawZ = depth * zMax / zScale), bits 0-5 preserved via
+// same-texel RMW, color untouched by colormask. The AOF serving samples scene alpha from the
+// FBO, so these writes feed the DoF composite directly.
+extern double g_zwbZMax;
+static double g_zwbZMaxRead() { return g_zwbZMax; }
+static bool gaDofMaskPass(uint32_t destFbp)
+{
+    static unsigned int prog = 0; static int locC = -1, locD = -1, locM = -1; static bool bad = false;
+    if (bad || g_sharedDepthTex == 0) return false;
+    auto fit = g_fbos.find(destFbp);
+    if (fit == g_fbos.end() || fit->second.rt.texture.id == 0) return false;
+    if (prog == 0)
+    {
+        static const char *vs =
+            "#version 330\n"
+            "void main(){ vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+            "             gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+        static const char *fs =
+            "#version 330\n"
+            "uniform sampler2D uColor;\n"
+            "uniform sampler2D uDepth;\n"
+            "uniform float uZDiv;\n"   // (zMax/zScale)/32768: parity of floor = rawZ bit 15 (kind1 DECAL TEXA: ta1=0x80/ta0=0)
+            "out vec4 finalColor;\n"
+            "void main(){\n"
+            "  ivec2 xy = ivec2(gl_FragCoord.xy);\n"
+            "  float d = clamp(texelFetch(uDepth, xy, 0).r, 0.0, 0.999999);\n"
+            "  int bit15 = int(mod(floor(d * uZDiv), 2.0));\n"
+            "  finalColor = vec4(0.0, 0.0, 0.0, bit15 == 1 ? 1.0 : 0.0);\n"   // ALPHA128: the FBO stores GS bytes x255/128 -- GS 0x80 lives as 255 here; writing 128 became GS 0x40 = wrong band
+
+            "}\n";
+        Shader sh2 = LoadShaderFromMemory(vs, fs);
+        if (sh2.id == 0) { bad = true; return false; }
+        prog = sh2.id;
+        locC = GetShaderLocation(sh2, "uColor"); locD = GetShaderLocation(sh2, "uDepth");
+        locM = GetShaderLocation(sh2, "uZDiv");
+        std::fprintf(stderr, "[dofmask] pass ready (prog %u, depthTex %u)\n", prog, g_sharedDepthTex);
+    }
+    rlDrawRenderBatchActive();
+    ps2xTextureBarrier();   // prior scene writes must be visible to the same-texel RMW fetch
+    int prevProg = 0, prevFbo = 0, prevVp[4] = {0,0,0,0}, prevActive = 0, prevTex0 = 0, prevVao = 0;
+    unsigned char prevCM[4] = {1,1,1,1};
+    glGetIntegerv(0x8B8D, &prevProg); glGetIntegerv(0x8CA6, &prevFbo);
+    glGetIntegerv(0x0BA2, prevVp);    glGetIntegerv(0x84E0, &prevActive);
+    glGetIntegerv(0x85B5, &prevVao);
+    const bool hadBlend = glIsEnabled(0x0BE2) != 0, hadDepth = glIsEnabled(0x0B71) != 0;
+    const bool hadScis = glIsEnabled(0x0C11) != 0, hadCull = glIsEnabled(0x0B44) != 0;
+    unsigned char hadDM = 1; glGetBooleanv(0x0B72, &hadDM);
+    glGetBooleanv(0x0C23, prevCM);
+    glActiveTexture(0x84C0u); glGetIntegerv(0x8069, &prevTex0);
+    static unsigned int myVao = 0; if (myVao == 0) glGenVertexArrays(1, &myVao);
+    glBindFramebuffer(0x8D40u, fit->second.rt.id);
+    glViewport(0, 0, fit->second.w, fit->second.h);
+    glDisable(0x0BE2u); glDisable(0x0B71u); glDisable(0x0C11u); glDisable(0x0B44u);
+    glDepthMask(0); glColorMask(0, 0, 0, 1);   // ALPHA ONLY: color corruption impossible
+    glDrawBuffer(0x8CE0u);
+    glActiveTexture(0x84C0u); glBindTexture(0x0DE1u, fit->second.rt.texture.id);
+    glActiveTexture(0x84C1u); glBindTexture(0x0DE1u, g_sharedDepthTex);
+    glActiveTexture(0x84C0u);
+    glUseProgram(prog);
+    glUniform1i(locC, 0); glUniform1i(locD, 1);
+    {   static const double s_zScaleR = [](){ const char *v = std::getenv("PS2X_ZSCALE");
+                                              const double f = v ? std::atof(v) : 0.0; return (f > 0.0) ? f : 1.0; }();
+        const float zdiv = (float)(((g_zwbZMax > 0.0 ? g_zwbZMax : 4294967296.0) / s_zScaleR) / 32768.0);
+        glUniform1f(locM, zdiv);
+    }
+    glBindVertexArray(myVao);
+    glDrawArrays(0x0004u, 0, 3);
+    glBindVertexArray((unsigned)prevVao);
+    glUseProgram((unsigned)prevProg);
+    glActiveTexture(0x84C1u); glBindTexture(0x0DE1u, 0);
+    glActiveTexture(0x84C0u); glBindTexture(0x0DE1u, (unsigned)prevTex0);
+    glActiveTexture((unsigned)prevActive);
+    glBindFramebuffer(0x8D40u, (unsigned)prevFbo);
+    glViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
+    if (hadBlend) glEnable(0x0BE2u);
+    if (hadDepth) glEnable(0x0B71u);
+    if (hadScis) glEnable(0x0C11u);
+    if (hadCull) glEnable(0x0B44u);
+    glDepthMask(hadDM); glColorMask(prevCM[0], prevCM[1], prevCM[2], prevCM[3]);
+    ps2xTextureBarrier();   // downstream samples of this FBO must see the new alpha
+    {   // one-shot: the mask band coverage (console expects ~63% far-field on the reference scene)
+        static int shown = 0; ++shown;
+        if (shown == 60 || shown == 61)
+        {
+            std::vector<unsigned char> px((size_t)fit->second.w * 4);
+            int bands[4] = {0,0,0,0};
+            for (int y = 8; y < fit->second.h; y += 16)
+            {
+                glBindFramebuffer(0x8D40u, fit->second.rt.id);
+                glReadPixels(0, y, fit->second.w, 1, 0x1908, 0x1401, px.data());
+                for (int x = 0; x < fit->second.w; ++x) ++bands[(px[(size_t)x * 4 + 3] >> 6) & 3];
+            }
+            glBindFramebuffer(0x8D40u, (unsigned)prevFbo);
+            std::fprintf(stderr, "[dofmask] f%u band histogram (3 rows): b0=%d b1=%d b2=%d b3=%d zmax=%.0f\n",
+                         destFbp, bands[0], bands[1], bands[2], bands[3], (double)g_zwbZMaxRead());
+            {   // [dofmask] raw depth readback: settles empty-vs-uniform ambiguity
+                {   int att = -1;
+                    glGetFramebufferAttachmentParameteriv(0x8D40u /*DRAW_FB*/, 0x8D00u /*DEPTH_ATTACHMENT*/,
+                                                          0x8CD1u /*OBJECT_NAME*/, &att);
+                    std::fprintf(stderr, "[dofmask] f%u fboDepthAttach=%d sharedTex=%u err=%d\n",
+                                 destFbp, att, g_sharedDepthTex, glGetError());
+                }
+                std::vector<float> dz((size_t)g_sharedDepthW * g_sharedDepthH, -1.0f);
+                {   // read the BOUND FBO's depth attachment directly (glReadPixels: attachment truth)
+                    glReadPixels(0, 0, fit->second.w, fit->second.h, 0x1902u, 0x1406u, dz.data());
+                }
+                glBindTexture(0x0DE1u, g_sharedDepthTex);
+                glBindTexture(0x0DE1u, fit->second.rt.texture.id);
+                float mn = 2.0f, mx = -2.0f; double sum = 0.0; size_t n = 0;
+                for (int y = 0; y < fit->second.h; y += 8)
+                    for (int x = 0; x < fit->second.w; x += 8)
+                    { float v = dz[(size_t)y * g_sharedDepthW + x]; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; ++n; }
+                { extern unsigned long g_dbgDepthClears, g_dbgDepthWriteDraws;
+                  const char *ev = std::getenv("PS2X_GPU_DEPTH");
+                  std::fprintf(stderr, "[dofmask] depthOn=%d env=%s clears=%lu writeStates=%lu\n",
+                               (int)depthEnabled(), ev ? ev : "(null)", g_dbgDepthClears, g_dbgDepthWriteDraws); }
+                std::fprintf(stderr, "[dofmask] f%u depth raw: min=%.8f max=%.8f mean=%.8f col320:", destFbp, mn, mx, sum / (double)n);
+                for (int y = 60; y < fit->second.h; y += 64)
+                    std::fprintf(stderr, " %.6f", dz[(size_t)y * g_sharedDepthW + 320]);
+                std::fprintf(stderr, "\n");
+                auto f224 = g_fbos.find(224u);
+                if (f224 != g_fbos.end() && f224->second.rt.id != 0)
+                {   // did the mask survive E224 into the f224 FBO alpha?
+                    const int fw = f224->second.w, fh = f224->second.h;
+                    std::vector<unsigned char> px((size_t)fw * fh * 4);
+                    int pf = 0; glGetIntegerv(0x8CA6, &pf);
+                    glBindFramebuffer(0x8D40u, f224->second.rt.id);
+                    glReadPixels(0, 0, fw, fh, 0x1908u /*RGBA*/, 0x1401u /*UBYTE*/, px.data());
+                    glBindFramebuffer(0x8D40u, (unsigned)pf);
+                    // 6-bucket histogram; GL row 0 = BOTTOM. GS rows 0-447 of the mask = GL rows 576-1023
+                    // per the executor-era finding, so bucket the mask region separately.
+                    unsigned long all6[6] = {0,0,0,0,0,0}, msk6[6] = {0,0,0,0,0,0};
+                    auto bkt = [](unsigned char v) { return v == 0 ? 0 : v < 64 ? 1 : v < 128 ? 2 : v < 192 ? 3 : v < 255 ? 4 : 5; };
+                    for (int yy = 0; yy < fh; yy += 3)
+                        for (int xx = 0; xx < fw; xx += 3)
+                        {   const unsigned char v = px[((size_t)yy * fw + xx) * 4 + 3];
+                            ++all6[bkt(v)]; if (yy >= 576) ++msk6[bkt(v)]; }
+                    std::fprintf(stderr, "[dofmask] f224 alpha (%dx%d) all: 0=%lu lo=%lu mid=%lu hi=%lu vhi=%lu 255=%lu | maskRows: 0=%lu lo=%lu mid=%lu hi=%lu vhi=%lu 255=%lu\n",
+                                 fw, fh, all6[0], all6[1], all6[2], all6[3], all6[4], all6[5],
+                                 msk6[0], msk6[1], msk6[2], msk6[3], msk6[4], msk6[5]);
+                }
+            }
+        }
+    }
+    ++g_glEnterSeq[destFbp];   // [dofmask] rtsnap coherence: consumers sample a snapshot refreshed only
+                               // when this seq moves (beginFbp bumps it on real entry; a raw GL pass must
+                               // bump it too, or every downstream read serves the PRE-MASK copy -- measured
+                               // as byte-identical output across different mask contents)
+    return true;
+}
+
 void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
 {
     {   // [gpualias] tag commands recorded for a CT16-view alias pass
@@ -6300,7 +6477,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         const int wantWrite = write ? 1 : 0;
         if (wantTest == curDepthTest && wantFunc == curDepthFunc && wantWrite == curDepthWrite) return;
         rlDrawRenderBatchActive(); // flush before changing GL depth state
-        if (test) { rlEnableDepthTest(); glDepthFunc(glDepthFuncFor(func)); }
+        if (test) { rlEnableDepthTest(); glDepthFunc(glDepthFuncFor(func));
+                    if (write) { extern unsigned long g_dbgDepthWriteDraws; ++g_dbgDepthWriteDraws; } }
         else rlDisableDepthTest();
         if (write) rlEnableDepthMask(); else rlDisableDepthMask();
         curDepthTest = wantTest; curDepthFunc = wantFunc; curDepthWrite = wantWrite;
@@ -6575,6 +6753,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             rlDrawRenderBatchActive();
             glClearDepth(0.0);
             glClear(GL_DEPTH_BUFFER_BIT);
+            { extern unsigned long g_dbgDepthClears; ++g_dbgDepthClears; }
             glClearDepth(1.0); // restore raylib's default clear-depth
         }
         BeginShaderMode(g_shader);      // PS2 ÷128 modulate (overbright-capable)
@@ -7193,6 +7372,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         { applyDepth(dc.depthTest, 1u /*ALWAYS*/, dc.depthWrite); return; }
         if (s_maskNoDepth && g_zwbBp != 0u && dc.destFbp == g_zwbBp) applyDepth(false, 1u, false);
         else applyDepth(dc.depthTest, dc.depthFunc, dc.depthWrite);
+        {   static int n = 0;
+            if (dc.depthTest && dc.depthWrite && n < 6)
+            { ++n; std::fprintf(stderr, "[dofmask] depth-write draw: destFbp=%u tri=%d func=%u\n",
+                                dc.destFbp, (int)dc.isTriangle, (unsigned)dc.depthFunc); } }
     };
     const bool segResume = m_segActive && reorderBuf.empty() &&
                            (m_segMode || nLists == 1) && m_segFrom <= DC.size();
@@ -7238,6 +7421,27 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                              c.srcTbp0, c.srcPsm, (int)c.srcTexW, (int)c.srcTexH, (unsigned)c.blendMode, (unsigned)c.blendFix, c.abe ? 1 : 0,
                              (unsigned)c.tfx, (unsigned)c.fst, c.r, c.g, c.b, c.a,
                              byKind[1], byKind[2], byKind[3]);
+            {   // [dofmask] the proper kind1: replace the dropped strips with the depth-mask pass
+                static const bool s_dofMask = [](){ const char *v = std::getenv("PS2X_DOFMASK"); return v && v[0] && v[0] != '0'; }();
+                if (s_dofMask && c.isAliasPass && c.aliasKind == 1u && !c.isTriangle &&
+                    (c.destFbp == 0u || c.destFbp == 112u))
+                {
+                    static uint32_t doneGen[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+                    const int slot = (c.destFbp == 0u) ? 0 : 1;
+                    if (doneGen[slot] != g_curGen)
+                    {
+                        if (gaDofMaskPass(c.destFbp))
+                        {   doneGen[slot] = g_curGen;
+                            // [dofmask] mark the page dirty: svcFlush skips a flush when
+                            // m_fbpRenderSeq is unchanged, so a raw pass that leaves it alone
+                            // never gets its alpha AFLUSH-pushed to VRAM -- and the SW DoF
+                            // chain (T4 composite = 100% VRAM decode) never sees the mask.
+                            ++m_fbpRenderSeq[c.destFbp];
+                        }
+                    }
+                    continue;   // the strip draws are replaced by the pass (they were dropped anyway)
+                }
+            }
             if (s_gaV >= 6 && !c.isTriangle && c.destFbp == 336u && (c.aliasKind == 2u || c.aliasKind == 3u))   // mode 6 = console-exact chain (dev); mode 4 = control-equivalent re-view
                 if (gaExecAliasPass(c)) { curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu; continue; }
         }   // otherwise census only: fall through to normal execution
@@ -7683,7 +7887,12 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 // displayed buffer, which is not this.
                 static const bool s_aliasZ = [](){ const char *v = std::getenv("PS2X_ALIASZ");
                                                    return v && v[0] && v[0] != '0'; }();
-                const bool zRebuild = s_aliasZ && (c.srcPsm == 0x30u || c.srcPsm == 0x31u || c.srcPsm == 0x32u);
+                static const bool s_aliasZA = [](){ const char *v = std::getenv("PS2X_ALIASZA");
+                                                    return v && v[0] && v[0] != '0'; }();   // [dofmask] alpha-only variant: real strips, no colour garbage
+                const bool zClass = (c.srcPsm == 0x30u || c.srcPsm == 0x31u || c.srcPsm == 0x32u);
+                const bool zRebuild = (s_aliasZ || s_aliasZA) && zClass;
+                if (s_aliasZA && !s_aliasZ && zClass && !c.isTransfer)
+                    const_cast<GsGpuRenderer::DrawCmd &>(c).fbmsk |= 0x00FFFFFFu;   // block RGB entirely: the strips carry the DoF mask in ALPHA; their bits 14-23 colour garbage was the red-stripe artifact
                 if (partialMask && !zRebuild) { PS2X_GATE_HIT(); continue; }
             }
         }
@@ -11967,6 +12176,31 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     const bool aofKeep = s_aoFbo3 && fromFbo && c.fbmsk == 0x00FFFFFFu &&
                                          (c.srcPsm == 0u || c.srcPsm == 1u) &&
                                          (c.srcTbp0 == 0u || c.srcTbp0 == 3584u) && tex.id != 0 && tex.id != g_white.id;
+                    {   static unsigned long nk = 0; if (aofKeep) ++nk;
+                        if (aofKeep && (nk <= 2 || (nk >= 60 && nk < 63)))
+                        {   std::fprintf(stderr, "[dofmask] aofKeep serve #%lu: tex.id=%u src=%u dest=%u live=%u snap=%u\n",
+                                         nk, tex.id, c.srcTbp0, c.destFbp,
+                                         g_fbos.count(c.srcTbp0 / 32u) ? g_fbos[c.srcTbp0 / 32u].rt.texture.id : 0u,
+                                         g_rtSnap.count(c.srcTbp0 / 32u) ? g_rtSnap[c.srcTbp0 / 32u].texture.id : 0u);
+                            if (tex.id != 0)
+                            {   // what alpha does the serve's texture ACTUALLY hold right now?
+                                rlDrawRenderBatchActive();
+                                int tw = 0, th = 0, pt = 0; glGetIntegerv(0x8069, &pt);
+                                glBindTexture(0x0DE1u, tex.id);
+                                glGetTexLevelParameteriv(0x0DE1u, 0, 0x1000 /*WIDTH*/, &tw);
+                                glGetTexLevelParameteriv(0x0DE1u, 0, 0x1001 /*HEIGHT*/, &th);
+                                if (tw > 0 && th > 0 && tw <= 2048 && th <= 2048)
+                                {   std::vector<unsigned char> tp((size_t)tw * th * 4);
+                                    glGetTexImage(0x0DE1u, 0, 0x1908u, 0x1401u, tp.data());
+                                    unsigned long b6[6] = {0,0,0,0,0,0};
+                                    for (size_t i = 3; i < tp.size(); i += 4 * 5)
+                                    { unsigned char v = tp[i]; ++b6[v == 0 ? 0 : v < 64 ? 1 : v < 128 ? 2 : v < 192 ? 3 : v < 255 ? 4 : 5]; }
+                                    std::fprintf(stderr, "[dofmask]   sampled tex %ux%u alpha: 0=%lu lo=%lu mid=%lu hi=%lu vhi=%lu 255=%lu\n",
+                                                 tw, th, b6[0], b6[1], b6[2], b6[3], b6[4], b6[5]);
+                                }
+                                glBindTexture(0x0DE1u, (unsigned)pt);
+                            }
+                        } }
                     const float mode = aofKeep ? 4.0f
                                      : (s_texaFbo && fromFbo && c.tcc && tex.id != 0
                                         && tex.id != g_white.id && psmTexa)
