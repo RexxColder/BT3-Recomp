@@ -4230,8 +4230,8 @@ static bool gaDofMaskPass(uint32_t destFbp)
             "void main(){\n"
             "  ivec2 xy = ivec2(gl_FragCoord.xy);\n"
             "  float d = clamp(texelFetch(uDepth, xy, 0).r, 0.0, 0.999999);\n"
-            "  int bit15 = int(mod(floor(d * uZDiv), 2.0));\n"
-            "  finalColor = vec4(0.0, 0.0, 0.0, bit15 == 1 ? 1.0 : 0.0);\n"   // ALPHA128: the FBO stores GS bytes x255/128 -- GS 0x80 lives as 255 here; writing 128 became GS 0x40 = wrong band
+            "  float w = clamp(1.0 - d * uZDiv, 0.0, 1.0);\n"   // uZDiv = zMax/(zScale*zFar): rawZ/zFar; GS z is larger=nearer, so far field (small z) -> w=1 = full blur weight
+            "  finalColor = vec4(0.0, 0.0, 0.0, w);\n"   // graded Ad for the bm-0x54 lerp; bit15 parity BANDED the ground (dofmask_geo) because BT3's far z sits below 32768
 
             "}\n";
         Shader sh2 = LoadShaderFromMemory(vs, fs);
@@ -4266,7 +4266,9 @@ static bool gaDofMaskPass(uint32_t destFbp)
     glUniform1i(locC, 0); glUniform1i(locD, 1);
     {   static const double s_zScaleR = [](){ const char *v = std::getenv("PS2X_ZSCALE");
                                               const double f = v ? std::atof(v) : 0.0; return (f > 0.0) ? f : 1.0; }();
-        const float zdiv = (float)(((g_zwbZMax > 0.0 ? g_zwbZMax : 4294967296.0) / s_zScaleR) / 32768.0);
+        static const double s_zFar = [](){ const char *v = std::getenv("PS2X_DOFZFAR");
+                                           const double f = v ? std::atof(v) : 0.0; return (f > 0.0) ? f : 100000.0; }();   // rawZ at which blur weight reaches 0 (env-tunable, no rebuild)
+        const float zdiv = (float)((g_zwbZMax > 0.0 ? g_zwbZMax : 4294967296.0) / (s_zScaleR * s_zFar));
         glUniform1f(locM, zdiv);
     }
     glBindVertexArray(myVao);
@@ -7422,8 +7424,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                              (unsigned)c.tfx, (unsigned)c.fst, c.r, c.g, c.b, c.a,
                              byKind[1], byKind[2], byKind[3]);
             {   // [dofmask] the proper kind1: replace the dropped strips with the depth-mask pass
-                static const bool s_dofMask = [](){ const char *v = std::getenv("PS2X_DOFMASK"); return v && v[0] && v[0] != '0'; }();
-                if (s_dofMask && c.isAliasPass && c.aliasKind == 1u && !c.isTriangle &&
+                static const int s_dofMask = [](){ const char *v = std::getenv("PS2X_DOFMASK"); return v && v[0] ? std::atoi(v) : 0; }();
+                if (s_dofMask == 1 && c.isAliasPass && c.aliasKind == 1u && !c.isTriangle &&
                     (c.destFbp == 0u || c.destFbp == 112u))
                 {
                     static uint32_t doneGen[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
@@ -7445,6 +7447,26 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (s_gaV >= 6 && !c.isTriangle && c.destFbp == 336u && (c.aliasKind == 2u || c.aliasKind == 3u))   // mode 6 = console-exact chain (dev); mode 4 = control-equivalent re-view
                 if (gaExecAliasPass(c)) { curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu; continue; }
         }   // otherwise census only: fall through to normal execution
+        {   // [dofmask] mode 2: re-stamp the depth mask AT THE BLUR COMPOSITE. BARGATE's exempted
+            // outline strips rewrite the scene alpha (the bm-0x54 composite's Ad weight) AFTER the
+            // game's own mask slot, so stamping at the kind1 slot (mode 1) gets wiped. Stamp on the
+            // FIRST composite draw per dest per gen instead -- after the strips, before Ad is read.
+            static const int s_dm2 = [](){ const char *v = std::getenv("PS2X_DOFMASK"); return v && v[0] ? std::atoi(v) : 0; }();
+            if (s_dm2 == 2 && !c.isTransfer && !c.isDecode && c.abe && c.blendMode == 0x54u &&
+                c.srcTbp0 == 10752u && c.srcPsm == 0x00u && (c.destFbp == 0u || c.destFbp == 112u))
+                // ^ the REAL DoF composite (the PS2X_NODOF gate's own signature): f336-region CT32
+                //   256x256 sampled back into the scene with (Cs-Cd)*Ad+Cd -- Ad = scene alpha.
+            {
+                static uint32_t doneGen2[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+                const int slot = (c.destFbp == 0u) ? 0 : 1;
+                if (doneGen2[slot] != g_curGen && gaDofMaskPass(c.destFbp))
+                {
+                    doneGen2[slot] = g_curGen;
+                    ++m_fbpRenderSeq[c.destFbp];
+                }
+                // NO continue: the composite draw itself must still emit.
+            }
+        }
         {   // [dofdump] PS2X_DOFDUMP=1: console's shadow silhouette (sil_a: 0/128 in fbp336 alpha) is born when the
             // DoF downsample sprites copy the SCENE into fbp336 -- the copy carries the scene alpha (128 under the
             // fighters on console). Dump OUR scene alpha at the frame's first such copy, and fbp336's alpha right after
@@ -11164,6 +11186,64 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 }
             }
         }
+        {   // [dofad] mode 2: pre/post framebuffer readback around the composite -- does the
+            // draw CHANGE the mountains band at all? (Ad, source, emission all measure correct;
+            // this isolates the blend physics vs downstream overwrite.)
+            static const int s_da2 = [](){ const char *v = std::getenv("PS2X_DOFAD"); return v && v[0] ? std::atoi(v) : 0; }();
+            static int s_pp = 0; static std::vector<unsigned char> s_pre;
+            static uint32_t s_preFbp = 0;
+            auto bandRead = [&](uint32_t fbp2, std::vector<unsigned char> &out) {
+                auto f2 = g_fbos.find(fbp2); if (f2 == g_fbos.end() || !f2->second.rt.texture.id) return false;
+                rlDrawRenderBatchActive();
+                const int bw = 360, bh = 150; out.resize((size_t)bw * bh * 4);
+                int pf = 0; glGetIntegerv(0x8CA6, &pf);
+                glBindFramebuffer(0x8D40u, f2->second.rt.id);
+                glReadPixels(60, f2->second.h - 180, bw, bh, 0x1908, 0x1401, out.data());
+                glBindFramebuffer(0x8D40u, (unsigned)pf); return true;
+            };
+            if (s_da2 == 3 && g_replayInWindow && s_pp < 2 && !c.isTransfer && c.srcTbp0 == 10752u && c.srcPsm == 0u
+                && c.blendMode == 0x54 && (c.destFbp == 0u || c.destFbp == 112u))
+            {   // DOFAD=3: dump the dest FBO ALPHA as grayscale png -- WHERE is the mask?
+                auto f3 = g_fbos.find(c.destFbp);
+                if (f3 != g_fbos.end() && f3->second.rt.texture.id)
+                {
+                    rlDrawRenderBatchActive();
+                    const int w3 = f3->second.w, h3 = f3->second.h;
+                    std::vector<unsigned char> px3((size_t)w3 * h3 * 4);
+                    int pf3 = 0; glGetIntegerv(0x8CA6, &pf3);
+                    glBindFramebuffer(0x8D40u, f3->second.rt.id);
+                    glReadPixels(0, 0, w3, h3, 0x1908, 0x1401, px3.data());
+                    glBindFramebuffer(0x8D40u, (unsigned)pf3);
+                    Image im3 = GenImageColor(w3, h3, BLACK);
+                    for (int y = 0; y < h3; ++y) for (int x = 0; x < w3; ++x)
+                    { const unsigned char av = px3[((size_t)(h3 - 1 - y) * w3 + x) * 4 + 3];
+                      ImageDrawPixel(&im3, x, y, Color{av, av, av, 255}); }
+                    char nm3[128]; std::snprintf(nm3, sizeof nm3, "/home/z3/Desktop/bt3/work/dofmask_geo_f%u_%d.png", c.destFbp, ++s_pp);
+                    ExportImage(im3, nm3); UnloadImage(im3);
+                    std::fprintf(stderr, "[dofad3] wrote %s\n", nm3);
+                }
+            }
+            if (s_da2 == 2 && s_pp < 6 && !c.isTransfer && c.srcTbp0 == 10752u && c.srcPsm == 0u
+                && c.blendMode == 0x54 && (c.destFbp == 0u || c.destFbp == 112u) && s_pre.empty())
+            { if (bandRead(c.destFbp, s_pre)) s_preFbp = c.destFbp; }
+            else if (s_da2 == 2 && !s_pre.empty() &&
+                     !(!c.isTransfer && c.srcTbp0 == 10752u && c.srcPsm == 0u && c.blendMode == 0x54 &&
+                       (c.destFbp == 0u || c.destFbp == 112u)))
+            {   // first non-composite command after the run of composite strips: post-read + diff
+                std::vector<unsigned char> post;
+                if (bandRead(s_preFbp, post) && post.size() == s_pre.size())
+                {
+                    unsigned long n = 0, ch = 0; double sum = 0;
+                    for (size_t i = 0; i < post.size(); i += 4)
+                    { const int d0 = std::abs((int)post[i] - (int)s_pre[i]) + std::abs((int)post[i+1] - (int)s_pre[i+1]) + std::abs((int)post[i+2] - (int)s_pre[i+2]);
+                      ++n; if (d0 > 12) ++ch; sum += d0; }
+                    ++s_pp;
+                    std::fprintf(stderr, "[dofad2] #%d composite run on f%u: band delta mean=%.2f changed=%.1f%%\n",
+                                 s_pp, s_preFbp, n ? sum / n : 0, n ? 100.0 * ch / n : 0);
+                }
+                s_pre.clear();
+            }
+        }
         {   // [dofad] PS2X_DOFAD=1: what dest alpha does the DoF Ad-lerp (bm 0x54, CT32 from page
             // 336 into the scene) actually see? Reads the DEST FBO alpha right before the draw.
             static const bool s_da = [](){ const char *v = std::getenv("PS2X_DOFAD"); return v && v[0] && v[0] != '0'; }();
@@ -11189,6 +11269,26 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     std::fprintf(stderr, "[dofad] #%d DoF 0x54 into f%u (%dx%d): dest alpha before:", daN, c.destFbp, w, h);
                     for (size_t i = 0; i < t.size() && i < 6; ++i) std::fprintf(stderr, " %u:%.1f%%", t[i].second, 100.0 * t[i].first / (double)n);
                     std::fprintf(stderr, "  | draw fbmsk=%08x abe=%d fix=%u\n", c.fbmsk, (int)c.abe, (unsigned)c.blendFix);
+                }
+                {   // source side: what does the f336 FBO hold in the sampled sub-rect?
+                    auto sit = g_fbos.find(336u);
+                    if (sit != g_fbos.end() && sit->second.rt.texture.id != 0)
+                    {
+                        const int sw2 = sit->second.w, sh2 = sit->second.h;
+                        std::vector<uint32_t> sb((size_t)sw2 * sh2);
+                        rlEnableFramebuffer(sit->second.rt.id);
+                        glReadPixels(0, 0, sw2, sh2, 0x1908, 0x1401, sb.data());
+                        auto stat = [&](int x0, int y0, int x1, int y1, const char *nm) {
+                            unsigned long n = 0, nz = 0; unsigned mx = 0; double sum = 0;
+                            for (int y = y0; y < y1 && y < sh2; y += 2) for (int x = x0; x < x1 && x < sw2; x += 2)
+                            { const uint32_t v = sb[(size_t)(sh2 - 1 - y) * sw2 + x]; const unsigned r = v & 0xFF, gch = (v >> 8) & 0xFF, bch = (v >> 16) & 0xFF;
+                              const unsigned m = std::max(r, std::max(gch, bch)); ++n; if (m) ++nz; if (m > mx) mx = m; sum += m; }
+                            std::fprintf(stderr, "[dofad]   src f336 (%dx%d) %s: nz=%.1f%% max=%u mean=%.1f | uv=(%.0f,%.0f)-(%.0f,%.0f)\n",
+                                         sw2, sh2, nm, n ? 100.0 * nz / n : 0, mx, n ? sum / n : 0, c.su0, c.sv0, c.su1, c.sv1);
+                        };
+                        stat(0, 0, 256, 256, "rows0-255");
+                        stat((int)c.su0, (int)c.sv0, (int)c.su1, (int)c.sv1, "sampledUV");
+                    }
                 }
             }
         }
