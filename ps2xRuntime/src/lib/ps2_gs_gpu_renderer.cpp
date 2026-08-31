@@ -11556,6 +11556,21 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // colours measured) and the interpolation smears BT3's noisy flat-lit values
             // into the moving dark/light patches. Class-scoped test lever; if it kills the
             // patches, the proper fix is plumbing effective-IIP through DrawCmd.
+            // PS2X_TERRSOFT=<k>: compress the terrain class's per-vertex shading amplitude
+            // toward an anchor level (PS2X_TERRSOFT_ANCHOR, default 112 = the class mean).
+            // The flat-lit gray bands are GAME-AUTHENTIC (console-identical data) but our
+            // pipeline shows them harder than console; scaling (c-anchor)*k keeps the
+            // lighting's shape while shrinking the distracting patch contrast. 1.0/unset = off.
+            static const float s_tsoft = [](){ const char *v = std::getenv("PS2X_TERRSOFT");
+                                               const double f = v ? std::atof(v) : 0.0; return (float)((f > 0.0 && f < 1.0) ? f : 1.0f); }();
+            static const float s_tanchor = [](){ const char *v = std::getenv("PS2X_TERRSOFT_ANCHOR");
+                                                 const double f = v ? std::atof(v) : 0.0; return (float)((f > 0.0) ? f : 112.0); }();
+            if (s_tsoft < 1.0f && c.isTriangle && !c.isTransfer && c.srcPsm == 0x13u && c.srcClutTbp == 12992u
+                && (c.destFbp == 0u || c.destFbp == 112u))
+                for (int k4 = 0; k4 < 3; ++k4)
+                {   auto &t4 = const_cast<GsGpuRenderer::DrawCmd &>(c).tri[k4];
+                    auto sq = [&](uint8_t &ch) { ch = (uint8_t)std::max(0.0f, std::min(255.0f, s_tanchor + ((float)ch - s_tanchor) * s_tsoft)); };
+                    sq(t4.r); sq(t4.g); sq(t4.b); }
             static const bool s_tflat = [](){ const char *v = std::getenv("PS2X_TERRFLAT"); return v && v[0] && v[0] != '0'; }();
             if (s_tflat && c.isTriangle && !c.isTransfer && c.srcPsm == 0x13u && c.srcClutTbp == 12992u
                 && (c.destFbp == 0u || c.destFbp == 112u))
