@@ -1,3 +1,4 @@
+#include "ps2_runtime_macros.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_calls.h"
@@ -3037,7 +3038,7 @@ namespace
                 const uint8_t *pp = getMemPtr(rdram, (a0 + 0x80u) & 0x1FFFFFFFu);
                 if (pp && std::memcmp(pp, s_paleHead, 16) == 0)
                 {
-                    setRegU32(ctx, 4, 0x1446480u);
+                    SET_GPR_U32(ctx, 4, 0x1446480u);
                     static std::atomic<uint32_t> s_rr{0};
                     if (s_rr.fetch_add(1) < 8u)
                         std::fprintf(stderr, "[forcerich] fr=%llu redirected 0x%x -> 0x1446480\n",
