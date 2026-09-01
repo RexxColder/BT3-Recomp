@@ -660,6 +660,7 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
 // across planes, so the clipper builds different fans than hardware = the SPS
 // wedges/slivers present in BOTH renderers. Run VU1 under RZ+FTZ+DAZ like PCSX2's
 // default "VU Round Mode: Chop/Zero". PS2X_VUROUND=0 restores host rounding (A/B).
+extern std::atomic<uint64_t> g_bt3FrameCount; // [vudaz] frame gate (defined in ps2_runtime.cpp)
 namespace
 {
     struct VuRoundScope
@@ -678,12 +679,8 @@ namespace
                 // both directions (a wholesale data difference on denormal-encoded values).
                 static const long s_dazFr = [](){ const char *v = std::getenv("PS2X_VUDAZ"); return v && v[0] ? std::atol(v) : -1; }();
                 uint32_t extra = 0x8040u;
-                if (s_dazFr >= 0)
-                {
-                    extern std::atomic<uint64_t> g_bt3FrameCount;
-                    if ((long)g_bt3FrameCount.load(std::memory_order_relaxed) >= s_dazFr)
-                        extra = 0u;
-                }
+                if (s_dazFr >= 0 && (long)::g_bt3FrameCount.load(std::memory_order_relaxed) >= s_dazFr)
+                    extra = 0u;
                 // RZ (round toward zero) | FTZ | DAZ (unless [vudaz] active)
                 _mm_setcsr((saved & ~0xE040u) | 0x6000u | extra);
             }
