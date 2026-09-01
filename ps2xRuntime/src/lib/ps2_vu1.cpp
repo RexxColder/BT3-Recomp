@@ -3363,6 +3363,19 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                                 std::snprintf(buf, sizeof buf, " ABS%u(%.4g,%.4g,%.4g,%.4g)", q, f[0], f[1], f[2], f[3]);
                                 ln += buf;
                             }
+                            if (g_unpackRingEnabled())
+                            {
+                                ln += " | unpacks:";
+                                for (uint32_t k = 0; k < 16u; ++k)
+                                {
+                                    const auto &r = g_unpackRing[(g_unpackRingPos + 16u + k) & 31u];
+                                    if (!r.cnt) continue;
+                                    char buf[64];
+                                    std::snprintf(buf, sizeof buf, " d%u c%u %s0x%x", r.destQw, r.cnt,
+                                                  r.spr == 0u ? "q" : "e", r.srcGuest);
+                                    ln += buf;
+                                }
+                            }
                             std::fprintf(stderr, "%s\n", ln.c_str());
                         }
                     }
