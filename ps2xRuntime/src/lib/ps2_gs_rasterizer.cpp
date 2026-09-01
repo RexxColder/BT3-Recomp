@@ -4206,7 +4206,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         // tile edges and washes the distant strata (replay-verified: PS2X_BILINEAR=0 restores
         // console banding); scope the point-sampling so gradients elsewhere keep bilinear.
         static const bool s_tp = [](){ const char *v = std::getenv("PS2X_TERRAINPOINT"); return v && v[0] && v[0] != '0'; }();
-        if (s_tp && (ctx.tex0.psm == 19u || ctx.tex0.psm == 20u) && (ctx.tex0.cbp == 12992u || ctx.tex0.cbp == 15620u || ctx.tex0.cbp == 15628u))
+        if (s_tp && (ctx.tex0.psm == 19u || ctx.tex0.psm == 20u) && (ctx.tex0.cbp == 12992u || (ctx.tex0.cbp >= 15616u && ctx.tex0.cbp <= 15640u)))
         {
             cmd.bilinear = false;
             static unsigned long s_tpn = 0;
