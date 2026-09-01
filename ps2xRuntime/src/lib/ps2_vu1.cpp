@@ -3380,6 +3380,32 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                         }
                     }
                 }
+                // [vurows12] PS2X_VUROWS12=1 (A/B): VU1 const rows 12-17 are ZERO on ours but hold a
+                // second matrix set on console (init-time upload our port never performs) — the zero
+                // matrix makes the terrain micro's far-pass clip/interp emit the unclipped pale spray.
+                // Inject console's rows (savestate-derived) once whenever they read all-zero.
+                {
+                    static const bool s_vr = [](){ const char *v = std::getenv("PS2X_VUROWS12"); return v && v[0] && v[0] != '0'; }();
+                    if (s_vr && dataSize >= 18u * 16u)
+                    {
+                        float z[4]; std::memcpy(z, vuData + 12u * 16u, 16);
+                        if (z[0] == 0.0f && z[1] == 0.0f && z[2] == 0.0f && z[3] == 0.0f)
+                        {
+                            static const float kRows[6][4] = {
+                                { 1.19209e-07f, -1.0f, -1.19209e-07f, 0.0f },
+                                { 0.0f, 1.19209e-07f, -1.0f, 0.0f },
+                                { 1.0f, 1.19209e-07f, 1.42109e-14f, 0.0f },
+                                { 61.284f, 51.4229f, 998.653f, 1.0f },
+                                { 0.055f, 0.0f, 0.0f, 0.0f },
+                                { -6082.26f, 0.0f, 0.0f, 0.0f },
+                            };
+                            std::memcpy(vuData + 12u * 16u, kRows, sizeof kRows);
+                            static std::atomic<uint32_t> s_vn{0};
+                            if (s_vn.fetch_add(1) < 4u)
+                                std::fprintf(stderr, "[vurows12] injected rows 12-17 (were zero)\n");
+                        }
+                    }
+                }
                 if (s_kickStat && verts >= 3u)
                 {
                     const bool dotKick = distinct <= 1u;
