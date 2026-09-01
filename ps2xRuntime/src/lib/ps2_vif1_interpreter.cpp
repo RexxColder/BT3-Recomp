@@ -702,7 +702,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                             uint64_t plo, phi;
                             std::memcpy(&plo, data + pos + o, 8); std::memcpy(&phi, data + pos + o + 8, 8);
                             const uint32_t u2dbp = (uint32_t)((plo >> 32) & 0x3FFFu);
-                            if ((phi & 0xFFu) == 0x50u && u2dbp == 12992u)
+                            if ((phi & 0xFFu) == 0x50u && u2dbp == 10752u && qwCount > 4096u)
                             {
                                 uint32_t srcG = 0u;
                                 if (g_vif1QwcActive) srcG = g_vif1QwcSrcGuest + pos + o;
@@ -712,20 +712,26 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                                                  u2dbp, (uint32_t)(plo & 0x3FFFu), (uint32_t)((plo >> 24) & 0x3Fu), srcG, qwCount);
                                 // capture the CLUT payload + its guest address once: the IMAGE data follows
                                 // in the VIF stream — dump the next 2KB of stream bytes with their srcG base.
-                                if (u2dbp == 12992u)
                                 {
                                     static std::atomic<bool> s_pd{false}; bool e2 = false;
                                     if (s_pd.compare_exchange_strong(e2, true))
                                     {
-                                        const uint32_t avail = (sizeBytes > pos + o) ? (uint32_t)(sizeBytes - pos - o) : 0u;
-                                        const uint32_t nb = avail < 2048u ? avail : 2048u;
-                                        if (FILE *f = std::fopen("/home/z3/Desktop/bt3/work/clutsrc.bin", "wb"))
+                                        // the sheet IMAGE payload follows the header block; take a distinctive
+                                        // 64-byte sample from past the A+D block and find its guest RAM home.
+                                        const uint32_t sampOff = pos + o + 112u;
+                                        if (sampOff + 64u <= sizeBytes)
                                         {
-                                            uint32_t h[4] = { srcG, nb, qwCount, 0u };
-                                            std::fwrite(h, 4, 4, f);
-                                            std::fwrite(data + pos + o, 1, nb, f);
-                                            std::fclose(f);
-                                            std::fprintf(stderr, "[upsrc2] clutsrc.bin written: srcG=0x%08x nb=%u\n", srcG, nb);
+                                            const uint8_t *needle = data + sampOff;
+                                            int hits = 0;
+                                            for (uint32_t a = 0; a + 64u <= PS2_RAM_SIZE && hits < 3; a += 16u)
+                                            {
+                                                if (std::memcmp(m_rdram + a, needle, 64) == 0)
+                                                {
+                                                    ++hits;
+                                                    std::fprintf(stderr, "[upsrc2] SHEET payload sample found in RAM at 0x%08x (sampOff=%u)\n", a, sampOff);
+                                                }
+                                            }
+                                            if (!hits) std::fprintf(stderr, "[upsrc2] SHEET sample not found in RAM (staged/SPR?)\n");
                                         }
                                     }
                                 }
