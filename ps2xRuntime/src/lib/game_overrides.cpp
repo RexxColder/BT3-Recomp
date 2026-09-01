@@ -3105,6 +3105,23 @@ namespace
         }
         if (g_i337Orig) g_i337Orig(rdram, ctx, runtime);
     }
+    // [init114] PS2X_INIT114=1: hook stage-init table binder FUN_00114c60 — does it run, with
+    // what object, per run? (resident texture table bind is nondeterministic across runs.)
+    PS2Runtime::RecompiledFunction g_i114Orig = nullptr;
+    void bt3Init114Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u);
+        if (n < 20u)
+        {
+            auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *pp = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (pp) std::memcpy(&v, pp, 4); return v; };
+            const uint32_t a0 = getRegU32(ctx, 4);
+            std::fprintf(stderr, "[init114] #%u fr=%llu a0=0x%x ra=0x%x [a0+0x58]=0x%x [a0+0x5C]=0x%x [a0+0x54]=0x%x\n",
+                         n, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
+                         a0, getRegU32(ctx, 31), a0 ? r32(a0+0x58) : 0u, a0 ? r32(a0+0x5C) : 0u, a0 ? r32(a0+0x54) : 0u);
+        }
+        if (g_i114Orig) g_i114Orig(rdram, ctx, runtime);
+    }
     void bt3StageGateArm(PS2Runtime &runtime)
     {
         PS2Runtime::RecompiledFunction fns[] = { &bt3StageGateFn<0>, &bt3StageGateFn<1>, &bt3StageGateFn<2>, &bt3StageGateFn<3> };
@@ -4100,6 +4117,12 @@ namespace
             runtime.replaceFunction(0x00100ab8u, &bt3FrameKick);
         if (const char *v = std::getenv("PS2X_STAGEGATE"); v && v[0] && v[0] != '0')
             bt3StageGateArm(runtime);
+        if (const char *v = std::getenv("PS2X_INIT114"); v && v[0] && v[0] != '0')
+        {
+            g_i114Orig = runtime.lookupFunction(0x00114c60u);
+            if (g_i114Orig) runtime.replaceFunction(0x00114c60u, &bt3Init114Probe);
+            std::fprintf(stderr, "[init114] hook %s\n", g_i114Orig ? "ok" : "MISSING");
+        }
         if (const char *v = std::getenv("PS2X_INST337"); v && v[0] && v[0] != '0')
         {
             const uint32_t idx337 = (0x337090u - 0x334C00u) / 4u;
