@@ -393,6 +393,20 @@ namespace ps2_syscalls
             // context leaves it (0,0,0,0), which poisons every VU0 macro-mode matrix (the
             // identity basis is built by rotating vf0). Seed the constant for this thread.
             threadCtx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+                {
+                    // [vf0basis] PS2X_VF0BASIS=1: seed the persistent VU0 identity basis rows the
+                    // game establishes once via FUN_00120088 (MR32 chain) — hardware shares ONE
+                    // physical VU0 across threads; per-thread contexts otherwise start them zero
+                    // and func_121E50's normalize drops z^2 (vf3.x==0) => terrain band tears.
+                    static const bool s_vb = [](){ const char *v = std::getenv("PS2X_VF0BASIS"); return v && v[0] && v[0] != '0'; }();
+                    if (s_vb)
+                    {
+                        threadCtx->vu0_vf[1] = _mm_set_ps(0.0f, 1.0f, 0.0f, 0.0f); // (0,0,1,0)
+                        threadCtx->vu0_vf[2] = _mm_set_ps(0.0f, 0.0f, 1.0f, 0.0f); // (0,1,0,0)
+                        threadCtx->vu0_vf[3] = _mm_set_ps(0.0f, 0.0f, 0.0f, 1.0f); // (1,0,0,0)
+                    }
+                }
+
 
             {
                 std::lock_guard<std::mutex> lock(info->m);
