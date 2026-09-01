@@ -3054,6 +3054,22 @@ namespace
     // site computing the (wrong) intra-pak offsets for the terrain band sheet.
     // [sprq] PS2X_SPRQ=1: log the DMA queue-driver FUN_002bb098 calls whose args reference
     // the resident stage pak (0x103f9c0+6.2MB) — the queuer's ra = who computes the offsets.
+    // [wlk] PS2X_WLK=1: hook the pak walker f_399b18 (OVERLAY function — replaceFunction
+    // rejects overlay addresses, so patch g_ps2OverlayFunctionTable[slot] directly).
+    PS2Runtime::RecompiledFunction g_origWalker = nullptr;
+    void bt3WalkerProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Log entries only (pc==0x399b18); continuation dispatches re-enter mid-function.
+        if (ctx->pc == 0x399b18u)
+        {
+            static std::atomic<int> s_w{0};
+            if (s_w.fetch_add(1) < 40)
+                std::fprintf(stderr, "[wlk] a0=0x%x a1=0x%x a2=0x%x a3=0x%x ra=0x%x\n",
+                             getRegU32(ctx,4), getRegU32(ctx,5), getRegU32(ctx,6), getRegU32(ctx,7),
+                             getRegU32(ctx,31));
+        }
+        if (g_origWalker) g_origWalker(rdram, ctx, runtime);
+    }
     PS2Runtime::RecompiledFunction g_orig2bb098 = nullptr;
     void bt3SprQProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -3980,6 +3996,20 @@ namespace
                 if (g_orig2722c0) runtime.replaceFunction(0x002722c0u, &bt3ThunkStackWatch);
                 g_orig2188b8 = runtime.lookupFunction(0x002188b8u);   // [terrround]
                 if (g_orig2188b8) runtime.replaceFunction(0x002188b8u, &bt3TerrRoundScope);
+                if (std::getenv("PS2X_WLK"))
+                {
+                    extern PS2Runtime::RecompiledFunction g_ps2OverlayFunctionTable[];
+                    extern const uint32_t g_ps2OverlayFunctionTableBase;
+                    extern const uint32_t g_ps2OverlayFunctionTableSlotCount;
+                    const uint32_t slot = (0x399b18u - g_ps2OverlayFunctionTableBase) / 4u;
+                    if (slot < g_ps2OverlayFunctionTableSlotCount && g_ps2OverlayFunctionTable[slot])
+                    {
+                        g_origWalker = g_ps2OverlayFunctionTable[slot];
+                        g_ps2OverlayFunctionTable[slot] = &bt3WalkerProbe;
+                        std::fprintf(stderr, "[wlk] walker hook installed (slot %u)\n", slot);
+                    }
+                    else std::fprintf(stderr, "[wlk] hook FAILED (slot %u base 0x%x)\n", slot, g_ps2OverlayFunctionTableBase);
+                }
                 if (std::getenv("PS2X_SPRQ"))
                 {
                     g_orig2bb098 = runtime.lookupFunction(0x002bb098u);   // [sprq]
