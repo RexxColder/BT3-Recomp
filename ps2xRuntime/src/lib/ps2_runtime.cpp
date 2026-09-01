@@ -106,6 +106,10 @@ std::atomic<uint32_t> g_bt3DrawMethod{0};
 void ps2ValueWatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo,
                          const char *op, const R5900Context *ctx)
 {
+    {   // [vwfr] frame stamp for every value-watch hit (pairs with the [vwatch] line that follows)
+        extern std::atomic<uint64_t> g_bt3FrameCount;
+        std::fprintf(stderr, "[vwfr] fr=%llu\n", (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed));
+    }
     {   // [vwdump] one-shot hexdump around value-watch hits landing in the frame-DL region
         const uint32_t a_ = guestAddr & 0x1FFFFFFFu;
         uint8_t *rd_ = ps2GetRdramHostPtr();

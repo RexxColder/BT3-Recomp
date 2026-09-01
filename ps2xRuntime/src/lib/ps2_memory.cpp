@@ -1784,9 +1784,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             if (s_cw2 && channelBase == 0x10009000u)
                             {
                                 static std::atomic<uint32_t> s_st{0}, s_ar{0};
-                                if (tagsProcessed == 1 && s_st.fetch_add(1) < 3000u)
-                                    std::fprintf(stderr, "[chain] START tag@0x%08x id=%u qwc=%u\n",
+                                if (tagsProcessed == 1 && s_st.fetch_add(1) < 200000u)
+                                {
+                                    extern std::atomic<uint64_t> g_bt3FrameCount;
+                                    std::fprintf(stderr, "[chain] START fr=%llu tag@0x%08x id=%u qwc=%u\n",
+                                                 (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
                                                  currentTagAddr, id, (unsigned)tagQwc);
+                                }
                                 if (currentTagAddr >= 0x6e0000u && currentTagAddr < 0x6e6000u && s_ar.fetch_add(1) < 400u)
                                     std::fprintf(stderr, "[chain] ARENA-VISIT tag@0x%08x id=%u qwc=%u (tag #%d)\n",
                                                  currentTagAddr, id, (unsigned)tagQwc, tagsProcessed);
