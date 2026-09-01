@@ -3026,6 +3026,25 @@ namespace
                 std::fprintf(stderr, "[carousel] fr=%llu ref=0x%x len=0x%x ra=0x%x\n",
                              (unsigned long long)fr, a0, a1, ra);
         }
+        // [forcerich] PS2X_FORCERICH=1 (A/B): when the REF payload is the PALE texture
+        // (content match), redirect the REF to the pak's RICH copy at 0x1446480. Diagnostic:
+        // proves the pale slot is the visible washed hillside and the fix direction.
+        {
+            static const bool s_fr2 = [](){ const char *v = std::getenv("PS2X_FORCERICH"); return v && v[0] && v[0] != '0'; }();
+            static const uint8_t s_paleHead[16] = {0xda,0xe0,0xf3,0xdc,0xdc,0xe2,0xf3,0xdc,0xda,0xe7,0xed,0xe2,0xdc,0xe5,0xe5,0xe0};
+            if (s_fr2 && a1 == 0x10080u)
+            {
+                const uint8_t *pp = getMemPtr(rdram, (a0 + 0x80u) & 0x1FFFFFFFu);
+                if (pp && std::memcmp(pp, s_paleHead, 16) == 0)
+                {
+                    setRegU32(ctx, 4, 0x1446480u);
+                    static std::atomic<uint32_t> s_rr{0};
+                    if (s_rr.fetch_add(1) < 8u)
+                        std::fprintf(stderr, "[forcerich] fr=%llu redirected 0x%x -> 0x1446480\n",
+                                     (unsigned long long)fr, a0);
+                }
+            }
+        }
         if (g_caOrig) g_caOrig(rdram, ctx, runtime);
     }
     // [tblcen] PS2X_TBLCEN=1: census of sub_0010C520(table, idx, arg) calls — which TABLE
