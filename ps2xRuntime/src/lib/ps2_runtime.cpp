@@ -3057,6 +3057,7 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
 }
 
 thread_local uint32_t g_schedLastPc = 0, g_schedLastRa = 0;   // [schedwhy] per guest thread, updated per dispatch
+extern std::atomic<uint32_t> g_bt3StateLive; // defined below; [eeround2] gate
 void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
 {
     uint32_t lastPc = std::numeric_limits<uint32_t>::max();
@@ -3086,6 +3087,26 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
     while (!isStopRequested())
     {
         const uint32_t pc = ctx->pc;
+        // [eeround2] PS2X_EEROUND2=1: EE chop+FTZ/DAZ only while in-fight (bt3state 0x2d).
+        // EEROUND (global, at thread start) was falsified on runs now known to be rig flakes;
+        // this variant flips MXCSR at the dispatch boundary from the live state gate.
+        {
+            static const bool s_eer2 = [](){ const char *v = std::getenv("PS2X_EEROUND2"); return v && v[0] && v[0] != '0'; }();
+            if (s_eer2)
+            {
+                const bool want = g_bt3StateLive.load(std::memory_order_relaxed) == 0x2du;
+                static thread_local bool s_eer2Cur = false;
+                if (want != s_eer2Cur)
+                {
+                    s_eer2Cur = want;
+                    if (want) _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
+                    else      _mm_setcsr(_mm_getcsr() & ~0xE040u);
+                    static std::atomic<bool> s_eer2Said{false}; bool e = false;
+                    if (want && s_eer2Said.compare_exchange_strong(e, true))
+                        std::fprintf(stderr, "[eeround2] ACTIVE (state=0x2d): EE chop+FTZ\n");
+                }
+            }
+        }
 
         if (schedMain && (fairnessCounter % kFairnessYieldInterval) == 0u && fairnessCounter != 0u)
         {
