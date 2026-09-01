@@ -663,7 +663,21 @@ static void vucell2Dump(uint32_t pc, const float (*vf)[4])
     static const long s_fr = [](){ const char *v = std::getenv("PS2X_VUCELL2"); return v && v[0] ? std::atol(v) : -1; }();
     if (s_fr < 0) return;
     const uint32_t ext = g_curCodeSize;
-    if (!((ext == 0xc78u && pc == 0x1f8u) || (ext == 0xe18u && pc == 0x2c8u))) return;
+    // one-shot pc-convention diagnostic: what (ext,pc) pairs reach SQ in the walkers?
+    if (ext == 0xc78u || ext == 0xe18u)
+    {
+        static std::atomic<int> s_dg{0};
+        if (s_dg.load(std::memory_order_relaxed) < 12)
+        {
+            static std::mutex s_dm; static std::set<uint64_t> s_seen;
+            std::lock_guard<std::mutex> lk(s_dm);
+            if (s_seen.insert(((uint64_t)ext << 32) | pc).second && s_dg.fetch_add(1) < 12)
+                std::fprintf(stderr, "[vucell2-pc] ext=0x%x sq-pc=0x%x\n", ext, pc);
+        }
+    }
+    const bool hit = (ext == 0xc78u && (pc == 0x1f8u || pc == 0x1f0u || pc == 0x200u))
+                  || (ext == 0xe18u && (pc == 0x2c8u || pc == 0x2c0u || pc == 0x2d0u));
+    if (!hit) return;
     extern std::atomic<uint64_t> g_bt3FrameCount;
     const long fr = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
     if (fr < s_fr) return;
