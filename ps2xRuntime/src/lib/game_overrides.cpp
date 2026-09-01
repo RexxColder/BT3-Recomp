@@ -2785,7 +2785,18 @@ namespace
             if (p300) { uint32_t cur; std::memcpy(&cur, p300, 4); if (cur == 0u) std::memcpy(p300, &tgt, 4); }
             if (p304) { uint32_t cur; std::memcpy(&cur, p304, 4); if (cur == 0u) std::memcpy(p304, &tgt, 4); }
         }
-        if (g_orig23d510) g_orig23d510(rdram, ctx, runtime);
+        // [camround] PS2X_CAMROUND=1: run the camera update under PS2/PCSX2 chop rounding.
+        // PALG37 proved CLIP flags bit-faithful; the divergent input = the per-frame matrix
+        // values this function produces (host rounding upstream of the TERRROUND scope).
+        static const bool s_camRound = [](){ const char *v = std::getenv("PS2X_CAMROUND"); return v && v[0] && v[0] != '0'; }();
+        if (s_camRound)
+        {
+            const unsigned int saved = _mm_getcsr();
+            _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8040u);
+            if (g_orig23d510) g_orig23d510(rdram, ctx, runtime);
+            _mm_setcsr(saved);
+        }
+        else if (g_orig23d510) g_orig23d510(rdram, ctx, runtime);
     }
 
     // PS2X_CAMENABLE: the camera-tracking enable (func_23DF38) is gated at 0x1c6e30 by
@@ -3014,21 +3025,6 @@ namespace
         const double dt = std::chrono::duration<double>(now - s_t0).count();
         if (dt >= 5.0) { std::fprintf(stderr, "[logicrate] %.1f fight updates/s (%u in %.1f s)\n", (double)n / dt, n, dt); s_n.store(0u); s_t0 = now; }
         if (g_orig115950) g_orig115950(rdram, ctx, runtime);
-    }
-    PS2Runtime::RecompiledFunction g_orig23d510 = nullptr;
-    void bt3CamRoundScope(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        // [camround] PS2X_CAMROUND=1: run the gameplay-camera update (FUN_0023d510 — builds
-        // the camera world matrix that becomes vf16-19 and every per-frame DL matrix) under
-        // PS2/PCSX2 chop rounding. Companion to [terrround]: PALG37 proved the CLIP flags
-        // bit-faithful, leaving the per-frame MATRIX VALUES as the only divergent input —
-        // and this producer ran at host rounding while TERRROUND chopped only the consumer.
-        static const bool s_on = [](){ const char *v = std::getenv("PS2X_CAMROUND"); return v && v[0] && v[0] != '0'; }();
-        if (!s_on) { if (g_orig23d510) g_orig23d510(rdram, ctx, runtime); return; }
-        const unsigned int saved = _mm_getcsr();
-        _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8040u);
-        if (g_orig23d510) g_orig23d510(rdram, ctx, runtime);
-        _mm_setcsr(saved);
     }
     PS2Runtime::RecompiledFunction g_orig2188b8 = nullptr;
     void bt3TerrRoundScope(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -3811,8 +3807,6 @@ namespace
                 if (g_orig2722c0) runtime.replaceFunction(0x002722c0u, &bt3ThunkStackWatch);
                 g_orig2188b8 = runtime.lookupFunction(0x002188b8u);   // [terrround]
                 if (g_orig2188b8) runtime.replaceFunction(0x002188b8u, &bt3TerrRoundScope);
-                g_orig23d510 = runtime.lookupFunction(0x0023d510u);   // [camround]
-                if (g_orig23d510) runtime.replaceFunction(0x0023d510u, &bt3CamRoundScope);
             }
         }
         if (!std::getenv("PS2X_NO_DEMO_GUARD"))
