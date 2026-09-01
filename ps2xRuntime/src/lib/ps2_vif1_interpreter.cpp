@@ -53,6 +53,7 @@ namespace { std::atomic<uint64_t> g_vifUnpackNs{0}; std::atomic<uint64_t> g_vifU
     std::atomic<int> g_mtxSeqN{-1}; // -1 = not armed; >=0 = events logged
 }
 
+thread_local bool g_upsrcArmSheet = false;   // [upsrc2]
 enum VIFCmd : uint8_t
 {
     VIF_NOP = 0x00,
@@ -636,6 +637,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             if (qwCount > 0)
             {
+                // [upsrc2] armed by a BITBLTBUF dbp=10752 header DIRECT: sample THIS payload
+                // (the sheet image data) and find its guest RAM home by memmem.
+                if (g_upsrcArmSheet && qwCount >= 1024u)
+                {
+                    g_upsrcArmSheet = false;
+                    static std::atomic<int> s_sc{0};
+                    if (s_sc.fetch_add(1) < 3 && pos + 80u + 64u <= sizeBytes)
+                    {
+                        const uint8_t *needle = data + pos + 80u;   // past the IMAGE GIFtag region
+                        int hits = 0;
+                        for (uint32_t a = 0; a + 64u <= PS2_RAM_SIZE && hits < 3; a += 16u)
+                            if (std::memcmp(m_rdram + a, needle, 64) == 0)
+                            {
+                                ++hits;
+                                std::fprintf(stderr, "[upsrc2] SHEET payload found in RAM at 0x%08x (qwc=%u)\n", a, qwCount);
+                            }
+                        if (!hits) std::fprintf(stderr, "[upsrc2] SHEET sample not in RAM (qwc=%u; staged/SPR?)\n", qwCount);
+                    }
+                }
                 // PS2X_VIFTEX: the terrain draw DIRECTs (TEX0 tbp0 10816/10880/10944/10992)
                 // exist in EE RAM, the chain walker visits their tags, offline sim parses them
                 // — yet the GS never sees those TEX0s. Log when a DIRECT containing one passes
@@ -702,7 +722,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                             uint64_t plo, phi;
                             std::memcpy(&plo, data + pos + o, 8); std::memcpy(&phi, data + pos + o + 8, 8);
                             const uint32_t u2dbp = (uint32_t)((plo >> 32) & 0x3FFFu);
-                            if ((phi & 0xFFu) == 0x50u && u2dbp == 10752u && qwCount > 4096u)
+                            if ((phi & 0xFFu) == 0x50u && u2dbp == 10752u)
                             {
                                 uint32_t srcG = 0u;
                                 if (g_vif1QwcActive) srcG = g_vif1QwcSrcGuest + pos + o;
@@ -712,29 +732,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                                                  u2dbp, (uint32_t)(plo & 0x3FFFu), (uint32_t)((plo >> 24) & 0x3Fu), srcG, qwCount);
                                 // capture the CLUT payload + its guest address once: the IMAGE data follows
                                 // in the VIF stream — dump the next 2KB of stream bytes with their srcG base.
-                                {
-                                    static std::atomic<bool> s_pd{false}; bool e2 = false;
-                                    if (s_pd.compare_exchange_strong(e2, true))
-                                    {
-                                        // the sheet IMAGE payload follows the header block; take a distinctive
-                                        // 64-byte sample from past the A+D block and find its guest RAM home.
-                                        const uint32_t sampOff = pos + o + 112u;
-                                        if (sampOff + 64u <= sizeBytes)
-                                        {
-                                            const uint8_t *needle = data + sampOff;
-                                            int hits = 0;
-                                            for (uint32_t a = 0; a + 64u <= PS2_RAM_SIZE && hits < 3; a += 16u)
-                                            {
-                                                if (std::memcmp(m_rdram + a, needle, 64) == 0)
-                                                {
-                                                    ++hits;
-                                                    std::fprintf(stderr, "[upsrc2] SHEET payload sample found in RAM at 0x%08x (sampOff=%u)\n", a, sampOff);
-                                                }
-                                            }
-                                            if (!hits) std::fprintf(stderr, "[upsrc2] SHEET sample not found in RAM (staged/SPR?)\n");
-                                        }
-                                    }
-                                }
+                                g_upsrcArmSheet = true;   // payload arrives in the NEXT big DIRECT
                             }
                         }
                     }
