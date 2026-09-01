@@ -3024,7 +3024,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             if (s_kickStat || g_spikeKick || g_blinkProbe || s_skyKick)
             {
                 uint32_t off2 = addr, verts = 0, distinct = 0, primSeen = 99;
-                uint64_t seen[6]; uint64_t firstXy = 0;
+                uint64_t seen[6]; uint64_t firstXy = 0; uint32_t firstR=0, firstG=0, firstB=0; bool firstRgbaSeen=false;
                 uint32_t minX = 0xFFFFu, maxX = 0u, minY = 0xFFFFu, maxY = 0u;
                 bool skyTexSeen = false;
                 uint32_t badVerts = 0; // adc=0 verts with wrapped-negative z (mirror-junk class)
@@ -3095,6 +3095,14 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                                             }
                                         }
                                     }
+                                }
+                                if (desc == 1u && !firstRgbaSeen)
+                                {
+                                    const uint64_t c01 = read64Wrap(off2 + 16u + (v * nr + r) * 16u);
+                                    firstR = (uint32_t)(c01 & 0xFFu); firstG = (uint32_t)((c01 >> 32) & 0xFFu);
+                                    const uint64_t c23 = read64Wrap(off2 + 16u + (v * nr + r) * 16u + 8u);
+                                    firstB = (uint32_t)(c23 & 0xFFu);
+                                    firstRgbaSeen = true;
                                 }
                                 if (desc != 4u && desc != 5u) continue;
                                 const uint64_t w01 = read64Wrap(off2 + 16u + (v * nr + r) * 16u);
@@ -3315,6 +3323,35 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                         t.lastFrame = frame;
                     }
                     t.cur += verts;
+                }
+                // [chunkpair] PS2X_CHUNKPAIR=1: pair each strip-batch's OUTPUT color with its
+                // INPUT rows — dump VU rows [top..top+10] for the first dark kicks and first lit
+                // kicks (dark = first vertex RGBAQ luminance < 0x40).
+                {
+                    static const bool s_cp = [](){ const char *v = std::getenv("PS2X_CHUNKPAIR"); return v && v[0] && v[0] != '0'; }();
+                    if (s_cp && verts >= 3u && firstRgbaSeen)
+                    {
+                        const uint32_t lum = (firstR + firstG + firstB) / 3u;
+                        const bool dark = lum < 0x40u;
+                        static std::atomic<int> s_dk{0}, s_lt{0};
+                        int idx = dark ? s_dk.fetch_add(1) : s_lt.fetch_add(1);
+                        if (idx < 6)
+                        {
+                            std::string ln = std::string("[chunkpair] ") + (dark ? "DARK" : "LIT ") +
+                                " lum=" + std::to_string(lum) + " top=" + std::to_string(m_state.top & 0x3FFu) + " rows:";
+                            for (uint32_t q = 0; q < 10u; ++q)
+                            {
+                                float f[4];
+                                const uint32_t qa = (((m_state.top & 0x3FFu) + q) & 0x3FFu) * 16u;
+                                if (qa + 16u <= dataSize) std::memcpy(f, vuData + qa, 16);
+                                else { f[0]=f[1]=f[2]=f[3]=0; }
+                                char buf[96];
+                                std::snprintf(buf, sizeof buf, " q%u(%.4g,%.4g,%.4g,%.4g)", q, f[0], f[1], f[2], f[3]);
+                                ln += buf;
+                            }
+                            std::fprintf(stderr, "%s\n", ln.c_str());
+                        }
+                    }
                 }
                 if (s_kickStat && verts >= 3u)
                 {
