@@ -643,6 +643,36 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 {
                     g_upsrcArmSheet = false;
                     static std::atomic<int> s_sc{0};
+                    {   // [upsrc3 2026-09-01] dump the WHOLE armed payload once + multi-window RAM base vote
+                        static std::atomic<bool> s_dumped{false};
+                        bool exp=false;
+                        if (s_dumped.compare_exchange_strong(exp,true))
+                        {
+                            const uint32_t lim3 = std::min(sizeBytes - pos, qwCount * 16u);
+                            if (FILE *f = std::fopen("/home/z3/Desktop/bt3/work/upload_payload.bin","wb"))
+                            { std::fwrite(data + pos, 1, lim3, f); std::fclose(f);
+                              std::fprintf(stderr, "[upsrc3] payload dumped (%u bytes)\n", lim3); }
+                            // vote: 10 entropy-checked windows spread across the payload; base = home - windowOff
+                            int votes = 0; uint32_t base0 = 0; int agree = 0;
+                            for (int wnd = 0; wnd < 10; ++wnd)
+                            {
+                                const uint32_t wo = 256u + (uint32_t)wnd * (lim3 > 4096u ? (lim3 - 512u) / 10u : 64u);
+                                if (wo + 64u > lim3) break;
+                                bool seen[256]={}; int di=0;
+                                for (int i=0;i<64;++i){ const uint8_t b=data[pos+wo+i]; if(!seen[b]){seen[b]=true;++di;} }
+                                if (di < 16) continue;
+                                for (uint32_t a = 0; a + 64u <= PS2_RAM_SIZE; a += 16u)
+                                    if (std::memcmp(m_rdram + a, data + pos + wo, 64) == 0)
+                                    {
+                                        const uint32_t b2 = a - (wo & ~15u);
+                                        std::fprintf(stderr, "[upsrc3] wnd+0x%x home=0x%08x base=0x%08x\n", wo, a, b2);
+                                        ++votes; if (!base0) { base0 = b2; agree = 1; } else if (b2 == base0) ++agree;
+                                        break;
+                                    }
+                            }
+                            std::fprintf(stderr, "[upsrc3] votes=%d agree=%d base0=0x%08x\n", votes, agree, base0);
+                        }
+                    }
                     if (s_sc.fetch_add(1) < 3 && pos + 80u + 64u <= sizeBytes)
                     {
                         // [upsrc2-fix 2026-09-01] STRONG needle: the old fixed payload+80 window could be
