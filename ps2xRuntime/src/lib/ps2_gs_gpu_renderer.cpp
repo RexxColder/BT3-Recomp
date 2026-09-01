@@ -4391,6 +4391,21 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
             if (fr_ >= lf + 60u && s_lastFr.compare_exchange_strong(lf, fr_))
                 std::fprintf(stderr, "[farymin] fr=%llu minY=%d above110=%u tot=%u\n",
                              (unsigned long long)fr_, s_minY.exchange(99999), s_above.exchange(0u), s_tot.exchange(0u));
+            {   // [fspray] dump full draw state of deep-spray triangles (minY < -100 px)
+                if (myi < -100)
+                {
+                    static std::atomic<uint32_t> s_fs{0};
+                    const uint32_t n_ = s_fs.fetch_add(1);
+                    if (n_ < 12u || (n_ % 4096u) < 2u)
+                        std::fprintf(stderr, "[fspray] fr=%llu destFbp=%u fbw=%u tbp0=%u texKey=%016llx z=%.4f v0=(%.1f,%.1f,%.3f) v1=(%.1f,%.1f,%.3f) v2=(%.1f,%.1f,%.3f) a=(%u,%u,%u)\n",
+                                     (unsigned long long)fr_, c.destFbp, c.destFbw, c.srcTbp0,
+                                     (unsigned long long)c.texKey, c.z,
+                                     c.tri[0].x, c.tri[0].y, c.tri[0].z,
+                                     c.tri[1].x, c.tri[1].y, c.tri[1].z,
+                                     c.tri[2].x, c.tri[2].y, c.tri[2].z,
+                                     c.tri[0].a, c.tri[1].a, c.tri[2].a);
+                }
+            }
         }
     }
     {   // PS2X_EDGEVIZ=4: BT3's outline is painted by an UNTEXTURED bm0x52 sprite
