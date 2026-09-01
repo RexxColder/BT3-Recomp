@@ -4676,7 +4676,8 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             // per-pixel divide there uses a q we got wrong and wrecks the sky.
             const bool perspThis = s_perspQ &&
                 (s_perspMode == 5 ? (shadowDecalClass && [](){ static const bool r = [](){ const char *v = std::getenv("PS2X_DECALRAW"); return v && v[0] == '1'; }(); return r; }())
-                 : s_perspMode == 6 ? ((ctx.tex0.psm == 19u || ctx.tex0.psm == 20u) && (ctx.tex0.cbp == 12992u || (ctx.tex0.cbp >= 15616u && ctx.tex0.cbp <= 15640u)))   // [grassq] ground/hills family only: per-pixel S/Q (perspSafe-guarded) to stop affine texture swim
+                 : s_perspMode == 6 ? ((ctx.tex0.psm == 19u || ctx.tex0.psm == 20u) && ctx.tex0.cbp == 12992u
+                                        && std::min(std::min(std::fabs(gs->m_vtxQueue[0].q), std::fabs(gs->m_vtxQueue[1].q)), std::fabs(gs->m_vtxQueue[2].q)) > 0.01f)   // [grassq] NEAR ground only (q>0.01): per-pixel S/Q stops the affine texture swim; far tris (tiny q) keep the per-vertex quotient -- their affine error is invisible and tiny-q division smears
                  : s_perspMode == 4 ? (ctx.tex0.tbp0 != 10752u)
                  : s_perspMode == 3 ? (ctx.tex0.tbp0 == 10752u || ctx.tex0.tbp0 == 15680u)
                  : s_perspMode == 2 ? true
