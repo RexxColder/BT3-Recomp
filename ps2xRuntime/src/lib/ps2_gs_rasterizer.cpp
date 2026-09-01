@@ -2953,7 +2953,13 @@ void GSRasterizer::ensureClutCache(GS *gs)
                 (void)calls;
             }
             static bool done = false;
-            if (!done)
+            // PS2X_CLUTDUMP_N=<n>: dump on the nth rebuild instead of the first — the first
+            // bind lands in the fight fade-in, where the lighting-scaled palette is dark.
+            static const unsigned long s_cdN = [](){ const char *v = std::getenv("PS2X_CLUTDUMP_N");
+                                                     return v && v[0] ? std::strtoul(v, nullptr, 0) : 1ul; }();
+            static unsigned long s_cdSeen = 0;
+            if (!done && ++s_cdSeen < s_cdN) { /* not yet */ }
+            else if (!done)
             {
                 done = true;
                 char pth[192];
