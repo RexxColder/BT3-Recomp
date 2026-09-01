@@ -645,7 +645,27 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     static std::atomic<int> s_sc{0};
                     if (s_sc.fetch_add(1) < 3 && pos + 80u + 64u <= sizeBytes)
                     {
-                        const uint8_t *needle = data + pos + 80u;   // past the IMAGE GIFtag region
+                        // [upsrc2-fix 2026-09-01] STRONG needle: the old fixed payload+80 window could be
+                        // all-zero, matching the first zero block in RAM (0x53d3a0 mirage — 3 runs, byte
+                        // watch showed pure zeros there). Skip forward to a 64B window with >=16 distinct
+                        // byte values before searching; also search SPR (scratchpad DMA sources never
+                        // touch main RAM and their stores take the traceless special path).
+                        const uint8_t *needle = data + pos + 80u;
+                        {
+                            const uint32_t lim2 = std::min(sizeBytes - pos, qwCount * 16u);
+                            for (uint32_t w = 80u; w + 64u <= lim2 && w < 4096u; w += 16u)
+                            {
+                                bool seen[256] = {}; int distinct = 0;
+                                for (int i = 0; i < 64; ++i) { const uint8_t b = data[pos + w + i]; if (!seen[b]) { seen[b] = true; ++distinct; } }
+                                if (distinct >= 16) { needle = data + pos + w; break; }
+                            }
+                        }
+                        {   // scratchpad scan (16KB) — inline accessor from runtime/ps2_memory.h
+                            if (uint8_t *sp = ps2GetScratchpadHostPtr())
+                                for (uint32_t a = 0; a + 64u <= 16384u; a += 16u)
+                                    if (std::memcmp(sp + a, needle, 64) == 0)
+                                    { std::fprintf(stderr, "[upsrc2] SHEET payload found in SPR at 0x%04x (qwc=%u)\n", a, qwCount); break; }
+                        }
                         int hits = 0;
                         for (uint32_t a = 0; a + 64u <= PS2_RAM_SIZE && hits < 3; a += 16u)
                             if (std::memcmp(m_rdram + a, needle, 64) == 0)
