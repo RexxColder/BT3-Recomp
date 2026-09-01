@@ -2188,7 +2188,7 @@ static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData,
             {
                 static std::atomic<int> s_n2{0};
                 if (s_n2.fetch_add(1) < 800)
-                    std::fprintf(stderr, "[vucell] fr=%ld pc=0x%x clip=%06x vi5=%d vi6=%d vi7=%d vi10=%d vi11=%d c1=(%.1f,%.1f,%.1f,%.3f) c2=(%.1f,%.1f,%.1f,%.3f)\n",
+                    std::fprintf(stderr, "[vucell] fr=%ld pc=0x%x clip=%06x vi5=%d vi6=%d vi7=%d vi10=%d vi11=%d c1=(%.9g,%.9g,%.9g,%.9g) c2=(%.9g,%.9g,%.9g,%.9g)\n",
                                  fr, st.pc, st.clip & 0xFFFFFFu,
                                  st.vi[5], st.vi[6], st.vi[7], st.vi[10], st.vi[11],
                                  st.vf[17][0], st.vf[17][1], st.vf[17][2], st.vf[17][3],
@@ -2598,7 +2598,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 {
                     static std::atomic<int> s_n{0};
                     if (s_n.fetch_add(1) < 800)
-                        std::fprintf(stderr, "[vucell] fr=%ld pc=0x%x clip=%06x vi5=%d vi6=%d vi7=%d vi10=%d vi11=%d c1=(%.1f,%.1f,%.1f,%.3f) c2=(%.1f,%.1f,%.1f,%.3f)\n",
+                        std::fprintf(stderr, "[vucell] fr=%ld pc=0x%x clip=%06x vi5=%d vi6=%d vi7=%d vi10=%d vi11=%d c1=(%.9g,%.9g,%.9g,%.9g) c2=(%.9g,%.9g,%.9g,%.9g)\n",
                                      fr, m_state.pc, m_state.clip & 0xFFFFFFu,
                                      m_state.vi[5], m_state.vi[6], m_state.vi[7], m_state.vi[10], m_state.vi[11],
                                      m_state.vf[17][0], m_state.vf[17][1], m_state.vf[17][2], m_state.vf[17][3],
