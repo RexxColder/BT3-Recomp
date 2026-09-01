@@ -3088,6 +3088,23 @@ namespace
         }
         if (g_tcOrig) g_tcOrig(rdram, ctx, runtime);
     }
+    // [inst337] PS2X_INST337=1: hook overlay f_337090 (streamed-chunk INSTALL: decode+bind).
+    // Logs each install's task object head — which chunks install, which never do.
+    PS2Runtime::RecompiledFunction g_i337Orig = nullptr;
+    void bt3Inst337Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u);
+        const uint32_t a0 = getRegU32(ctx, 4), ra = getRegU32(ctx, 31);
+        if (n < 80u)
+        {
+            auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *pp = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (pp) std::memcpy(&v, pp, 4); return v; };
+            std::fprintf(stderr, "[inst337] #%u fr=%llu a0=0x%x ra=0x%x w0=0x%x w4=0x%x w8=0x%x wC=0x%x w10=0x%x\n",
+                         n, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), a0, ra,
+                         a0 ? r32(a0) : 0u, a0 ? r32(a0+4) : 0u, a0 ? r32(a0+8) : 0u, a0 ? r32(a0+0xC) : 0u, a0 ? r32(a0+0x10) : 0u);
+        }
+        if (g_i337Orig) g_i337Orig(rdram, ctx, runtime);
+    }
     void bt3StageGateArm(PS2Runtime &runtime)
     {
         PS2Runtime::RecompiledFunction fns[] = { &bt3StageGateFn<0>, &bt3StageGateFn<1>, &bt3StageGateFn<2>, &bt3StageGateFn<3> };
@@ -4083,6 +4100,13 @@ namespace
             runtime.replaceFunction(0x00100ab8u, &bt3FrameKick);
         if (const char *v = std::getenv("PS2X_STAGEGATE"); v && v[0] && v[0] != '0')
             bt3StageGateArm(runtime);
+        if (const char *v = std::getenv("PS2X_INST337"); v && v[0] && v[0] != '0')
+        {
+            const uint32_t idx337 = (0x337090u - 0x334C00u) / 4u;
+            g_i337Orig = g_ps2OverlayFunctionTable[idx337];
+            g_ps2OverlayFunctionTable[idx337] = &bt3Inst337Probe;
+            std::fprintf(stderr, "[inst337] overlay hook %s\n", g_i337Orig ? "ok" : "MISSING");
+        }
         if (const char *v = std::getenv("PS2X_TBLCEN"); v && v[0] && v[0] != '0')
         {
             g_tcOrig = runtime.lookupFunction(0x0010c520u);
