@@ -1317,6 +1317,26 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     }
                 }
             }
+            {   // [row12w] PS2X_ROW12LOG=1: log every V4-32 unpack whose dest range covers row 12
+                static const bool s_r12w = [](){ const char *v = std::getenv("PS2X_ROW12LOG"); return v && v[0] && v[0] != '0'; }();
+                if (s_r12w && vn == 3u && vl == 0u && vuAddr <= 12u && vuAddr + writeVectorCount > 12u)
+                {
+                    extern std::atomic<uint64_t> g_bt3FrameCount;
+                    const uint64_t fr_ = g_bt3FrameCount.load(std::memory_order_relaxed);
+                    if (fr_ >= 4400u)
+                    {
+                        static std::atomic<uint32_t> s_n{0};
+                        if (s_n.fetch_add(1) < 300u)
+                        {
+                            uint32_t r12v = 0;
+                            const size_t off_ = pos + (size_t)(12u - vuAddr) * 16u;
+                            if (off_ + 4u <= sizeBytes) std::memcpy(&r12v, data + off_, 4);
+                            std::fprintf(stderr, "[row12w] fr=%llu dest=%u cnt=%u m=%d row12src=%08x\n",
+                                         (unsigned long long)fr_, vuAddr, (unsigned)writeVectorCount, maskEnable ? 1 : 0, r12v);
+                        }
+                    }
+                }
+            }
             // PS2X_KICKHIST: record this unpack in the rolling ring for spike-kick forensics.
             if (g_unpackRingEnabled() && vn == 3u && vl == 0u)
             {
