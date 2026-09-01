@@ -27,24 +27,7 @@ extern bool g_vif1QwcActive;
 // VIF parse and the resulting VU1 run share a thread in both sync and async modes, so
 // thread_local is safe.
 struct Vif1UnpackRec { uint32_t destQw, cnt, srcGuest, spr; uint64_t frame; };
-thread_local Vif1UnpackRec g_unpackRing[32] = {}
-                        {   // [cunp] PS2X_CUNP=1: constants unpack census — dest row 0, cnt 12..32
-                            static const bool s_cu = [](){ const char *v = std::getenv("PS2X_CUNP"); return v && v[0] && v[0] != '0'; }();
-                            if (s_cu)
-                            {
-                                extern std::atomic<uint64_t> g_bt3FrameCount;
-                                const uint64_t fr_ = g_bt3FrameCount.load(std::memory_order_relaxed);
-                                const auto &rr = g_unpackRing[(g_unpackRingPos + 31u) & 31u];
-                                if (fr_ >= 3900u && rr.destQw == 0u && rr.cnt >= 12u && rr.cnt <= 32u)
-                                {
-                                    static std::atomic<uint32_t> s_cn{0};
-                                    if (s_cn.fetch_add(1) < 40u)
-                                        std::fprintf(stderr, "[cunp] fr=%llu dest=%u cnt=%u src=%s0x%08x\n",
-                                                     (unsigned long long)fr_, rr.destQw, rr.cnt,
-                                                     rr.spr == 0u ? "q" : "e", rr.srcGuest);
-                                }
-                            }
-                        };
+thread_local Vif1UnpackRec g_unpackRing[32] = {};
 thread_local uint32_t g_unpackRingPos = 0;
 bool g_unpackRingEnabled()
 {
