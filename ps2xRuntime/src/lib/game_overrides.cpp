@@ -3445,6 +3445,31 @@ namespace
         // would only advance when the next SE command happened to arrive.
         seServiceVoices(runtime);
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
+        // [sheetwatch] PS2X_SHEETWATCH=1: per-frame content watch on the terrain band sheet
+        // buffer (0x53d3a0) — prints the frame whenever the first 64 bytes change.
+        {
+            static const bool s_sw2 = [](){ const char *v = std::getenv("PS2X_SHEETWATCH"); return v && v[0] && v[0] != '0'; }();
+            if (s_sw2)
+            {
+                static uint8_t s_last[64]; static bool s_have = false; static int s_prints = 0;
+                if (const uint8_t *ps = getMemPtr(rdram, 0x53d3a0u))
+                {
+                    if (!s_have || std::memcmp(s_last, ps, 64) != 0)
+                    {
+                        std::memcpy(s_last, ps, 64); 
+                        if (s_prints < 40)
+                        {
+                            ++s_prints;
+                            char hx[40]; for (int i = 0; i < 16; ++i) std::snprintf(hx + i*2, 4, "%02x", ps[i]);
+                            std::fprintf(stderr, "[sheetwatch] fr=%llu changed%s first16=%s\n",
+                                         (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
+                                         s_have ? "" : " (first)", hx);
+                        }
+                        s_have = true;
+                    }
+                }
+            }
+        }
         // ***** PER-FRAME CD FILE-SERVER PUMP (PS2X_CDPUMP, default ON) *****
         // The in-fight STAGE-CHUNK streaming (near-LOD terrain, collision) polls its
         // completion through paths that never tick the CRI CD file server FUN_0028a3b0 —
