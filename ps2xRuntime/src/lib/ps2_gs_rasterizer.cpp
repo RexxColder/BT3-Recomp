@@ -4917,7 +4917,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 // invisible on minified textures but the NEAR ground is MAGNIFIED (1 texel =
                 // several screen px), so its residual affine error swims with camera motion
                 // ("grass feels like water"). Unset = off (generic caps).
-                static int s_gcap = 7; static float s_gerr = 0.35f;
+                static int s_gcap = 7; static float s_gerr = 1.2f;   // [grasspx] err cap in SCREEN PIXELS for the grass class (texels for the others); 1.2 measured visually identical to 0.8 on the near ground (diff 0.21) while running at the grass-off fps ceiling (36.7 vs 28.5 at 0.8)
                 // DEFAULT ON (user-accepted 2026-09-02, "grass feels like water" fixed): unset = 6,0.7
                 // for every indexed STQ terrain draw (psm 19/20, any CLUT — the palette base is
                 // stage-specific). PS2X_GRASSSUB=0 disables; =<d>,<e> overrides the caps.
@@ -5038,7 +5038,23 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                         static const bool s_dsub = [](){ const char *v = std::getenv("PS2X_DECALSUB"); return v && std::sscanf(v, "%d,%f", &s_dcap, &s_derr) == 2; }();
                         (void)s_dsub;
                         const int depthCap = shadowDecalClass ? s_dcap : (grassClass ? s_gcap : 5); const float errCap = shadowDecalClass ? s_derr : (grassClass ? s_gerr : 3.0f);
-                        if (it.depth >= depthCap || (it.depth > 0 && pieceErr(it.a, it.b, it.c) <= errCap))
+                        float pieceCap = errCap;
+                        if (grassClass)
+                        {   // [grasspx] convert the SCREEN-PIXEL cap to this piece's texel scale: the near
+                            // ground magnifies texels (tight cap where swim was visible) while far terrain
+                            // minifies them (its sub-pixel affine error never mattered — stop immediately;
+                            // always-subdivide-everything cost ~12 fps: 36.5 -> 23.8 in the fight A/B).
+                            const float exPx = std::max({it.a.x, it.b.x, it.c.x}) - std::min({it.a.x, it.b.x, it.c.x});
+                            const float eyPx = std::max({it.a.y, it.b.y, it.c.y}) - std::min({it.a.y, it.b.y, it.c.y});
+                            const float extPx = std::max(exPx, eyPx);
+                            auto uv = [&](const SV &v, float &u, float &t2){ const float q = (std::fabs(v.q) > 1e-6f) ? v.q : 1.0f; u = v.s / q * (float)texW; t2 = v.t / q * (float)texH; };
+                            float u0,v0,u1,v1,u2,v2; uv(it.a,u0,v0); uv(it.b,u1,v1); uv(it.c,u2,v2);
+                            const float uvSpan = std::max(std::max({u0,u1,u2}) - std::min({u0,u1,u2}),
+                                                          std::max({v0,v1,v2}) - std::min({v0,v1,v2}));
+                            const float pxPerTex = (uvSpan > 1e-3f) ? (extPx / uvSpan) : 1.0f;
+                            pieceCap = s_gerr / std::max(pxPerTex, 1e-3f);   // err_texels * pxPerTex <= s_gerr px
+                        }
+                        if (it.depth >= depthCap || (it.depth > 0 && pieceErr(it.a, it.b, it.c) <= pieceCap))
                         {
                             emitTri(it.a, it.b, it.c);
                             continue;
