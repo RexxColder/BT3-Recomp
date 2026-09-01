@@ -2525,6 +2525,32 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
 
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
+    // [upsrc3] PS2X_UPSRC=1: all-paths scan for BITBLTBUF selecting the band sheet (10752)
+    // or band CLUT (12992) — reports the packet's path + guest source when recoverable.
+    {
+        static const bool s_u3 = [](){ const char *v = std::getenv("PS2X_UPSRC"); return v && v[0] && v[0] != '0'; }();
+        if (s_u3 && data && sizeBytes >= 32u)
+        {
+            static std::atomic<int> s_un3{0};
+            for (uint32_t o = 0; o + 16u <= sizeBytes && o < 16384u && s_un3.load(std::memory_order_relaxed) < 30; o += 16u)
+            {
+                uint64_t plo, phi;
+                std::memcpy(&plo, data + o, 8); std::memcpy(&phi, data + o + 8, 8);
+                if ((phi & 0xFFu) == 0x50u)
+                {
+                    const uint32_t dbp3 = (uint32_t)((plo >> 32) & 0x3FFFu);
+                    if (dbp3 == 10752u || dbp3 == 12992u)
+                    {
+                        uint32_t srcG = 0u;
+                        if (data >= m_rdram && data < m_rdram + PS2_RAM_SIZE) srcG = (uint32_t)(data - m_rdram) + o;
+                        if (s_un3.fetch_add(1) < 30)
+                            std::fprintf(stderr, "[upsrc3] path%d BITBLTBUF dbp=%u sbp=%u srcG=0x%08x size=%u off=%u\n",
+                                         (int)pathId, dbp3, (uint32_t)(plo & 0x3FFFu), srcG, sizeBytes, o);
+                    }
+                }
+            }
+        }
+    }
     if (!data || sizeBytes < 16)
         return;
 

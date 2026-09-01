@@ -2951,6 +2951,23 @@ void GSRasterizer::ensureClutCache(GS *gs)
                     std::fprintf(stderr, "[clutdump] cbp=%u rebuild #%lu distinct-palettes=%zu%s\n",
                                  tex.cbp, rebuilds, seen.size(), isNew ? "  (NEW)" : "");
                 (void)calls;
+                // PS2X_CLUTDUMP_ALL=1: write EVERY distinct palette (cap 32) to numbered files —
+                // this cbp hosts several materials; single dumps compare the wrong pairs.
+                static const bool s_cda = [](){ const char *v = std::getenv("PS2X_CLUTDUMP_ALL"); return v && v[0] && v[0] != '0'; }();
+                if (s_cda && isNew && seen.size() <= 32)
+                {
+                    char pth2[192];
+                    std::snprintf(pth2, sizeof pth2, "/home/z3/Desktop/bt3/work/clutdump_%u_%02zu.bin", tex.cbp, seen.size());
+                    if (FILE *f2 = std::fopen(pth2, "wb"))
+                    {
+                        uint32_t hdr2[4] = {tex.cbp, tex.cpsm, tex.csm, tex.csa};
+                        std::fwrite(hdr2, 4, 4, f2);
+                        std::fwrite(gs->m_clutCache, 4, 256, f2);
+                        const size_t off2 = (size_t)tex.cbp * 256;
+                        if (off2 + 1024 <= gs->m_vramSize) std::fwrite(gs->m_vram + off2, 1, 1024, f2);
+                        std::fclose(f2);
+                    }
+                }
             }
             static bool done = false;
             // PS2X_CLUTDUMP_N=<n>: dump on the nth rebuild instead of the first — the first
