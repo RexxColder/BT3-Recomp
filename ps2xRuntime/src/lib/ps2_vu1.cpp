@@ -2463,6 +2463,26 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             }
             g_vuCodeDumpReq.store(true, std::memory_order_relaxed);
         }
+        // [vucell] slow-path FCAND probe — the strip-clip gate the fight actually executes.
+        {
+            static const long s_vcf = [](){ const char *v = std::getenv("PS2X_VUCELL"); return v && v[0] ? std::atol(v) : -1; }();
+            if (s_vcf >= 0)
+            {
+                extern std::atomic<uint64_t> g_bt3FrameCount;
+                if ((long)g_bt3FrameCount.load(std::memory_order_relaxed) >= s_vcf)
+                {
+                    static std::atomic<int> s_n3{0};
+                    const int n = s_n3.fetch_add(1);
+                    if (n < 40)
+                        std::fprintf(stderr, "[vucell-pc] slowFCAND pc=0x%x imm=%06x clip=%06x vi1=%d\n", m_state.pc, imm24, m_state.clip & 0xFFFFFFu, (int)m_state.vi[1]);
+                    if (n < 840)
+                        std::fprintf(stderr, "[vucell] fr=%ld pc=0x%x clip=%06x vi1=%d w20=%.4f w21=%.4f w22=%.4f w23=%.4f x20=%.1f y20=%.1f\n",
+                                     (long)g_bt3FrameCount.load(std::memory_order_relaxed), m_state.pc, m_state.clip & 0xFFFFFFu, (int)m_state.vi[1],
+                                     m_state.vf[20][3], m_state.vf[21][3], m_state.vf[22][3], m_state.vf[23][3],
+                                     m_state.vf[20][0], m_state.vf[20][1]);
+                }
+            }
+        }
         return;
     }
     case 0x13: // FCOR
