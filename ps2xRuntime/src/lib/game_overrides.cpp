@@ -3072,7 +3072,7 @@ namespace
     {
         const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), ra = getRegU32(ctx, 31);
         const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
-        if (fr >= 1600u)
+        if (fr >= 4300u)
         {
             static std::mutex s_mx; static std::set<uint64_t> s_seen; static std::atomic<uint32_t> s_n{0};
             const uint64_t key = ((uint64_t)a0 << 16) | (a1 & 0xFFFFu);
