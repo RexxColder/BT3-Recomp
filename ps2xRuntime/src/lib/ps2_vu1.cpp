@@ -1070,6 +1070,26 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
     g_curStartPc = m_state.pc; // entry PC of this run (for PS2X_KICKSTAT attribution)
     g_curVuCode = vuCode; g_curCodeSize = codeSize; // for the spike microcode snapshot
+    {   // [row12] PS2X_ROW12LOG=1: at each micro entry, log variant sig + rows12-16 state
+        static const bool s_r12 = [](){ const char *v = std::getenv("PS2X_ROW12LOG"); return v && v[0] && v[0] != '0'; }();
+        if (s_r12)
+        {
+            extern std::atomic<uint64_t> g_bt3FrameCount;
+            const uint64_t fr_ = g_bt3FrameCount.load(std::memory_order_relaxed);
+            if (fr_ >= 4400u)
+            {
+                static std::atomic<uint32_t> s_n{0};
+                if (s_n.fetch_add(1) < 300u)
+                {
+                    uint32_t sig_ = 0; if (codeSize >= 0x44u) std::memcpy(&sig_, vuCode + 0x40u, 4);
+                    bool nz_ = false;
+                    for (uint32_t i = 12u*16u; i < 17u*16u && i < dataSize; ++i) if (vuData[i]) { nz_ = true; break; }
+                    std::fprintf(stderr, "[row12] fr=%llu entry=%u sig=%08x rows12-16=%s\n",
+                                 (unsigned long long)fr_, m_state.pc, sig_, nz_ ? "NONZERO" : "ZERO");
+                }
+            }
+        }
+    }
     static const bool s_skyKickShadow = [](){ const char *v = std::getenv("PS2X_SKYKICK"); if (v && v[0] && v[0] != '0') return true;
                                               const char *w = std::getenv("PS2X_WEDGEREC"); return w && w[0] && w[0] != '0'; }();
     if (g_spikeKick || s_skyKickShadow)
