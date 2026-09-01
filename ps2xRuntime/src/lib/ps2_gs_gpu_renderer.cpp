@@ -4374,7 +4374,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     }
     std::unique_lock<std::mutex> lk(m_mtx, std::defer_lock);
     if (s_recStage <= 0) lk.lock();
-    DrawCmd c = cmd;
+    const DrawCmd &c = cmd;   // [cmdref] read-only alias: the 328B copy (3 shared_ptr refcounts) ran per draw; the single real copy now happens at push
     {   // [farskip] PS2X_FARSKIP=1: drop the far-terrain pass (psm20/clut12992) entirely —
         // if the pale wash disappears, the wash IS this pass (texture-sampling suspect).
         static const bool s_fsk = [](){ const char *v = std::getenv("PS2X_FARSKIP"); return v && v[0] && v[0] != '0'; }();
@@ -4994,7 +4994,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     }
     if (s_recStage <= 0)
     {
-        (m_segSwapped ? m_buildingShadow : m_building).push_back(std::move(c));   // [cmdmove] one copy instead of two; [segshadow]
+        (m_segSwapped ? m_buildingShadow : m_building).push_back(cmd);   // [cmdref] single copy straight into the list; [segshadow]
         {   // [prerender] wake the GL thread once a chunk's worth of new commands is waiting
             const int k = prerenderK();
             if (k > 0 && m_building.size() > m_segFrom && ((m_building.size() - m_segFrom) % (size_t)k) == 0u && !g_preReady.exchange(true))
@@ -5003,7 +5003,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     }
     else
     {
-        m_stage.push_back(std::move(c));
+        m_stage.push_back(cmd);   // [cmdref]
         if (m_stage.size() >= (size_t)s_recStage) flushStage();   // lk is not held on this branch
     }
     ++m_recordCount;
@@ -5505,6 +5505,19 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             size_t total = 0;
             for (const auto &l : m_pending) total += l.size();
             cmds.reserve(total);
+            // [listswap] single-list fast path (the common case): steal the list's buffer with a
+            // swap instead of moving 40k x 328B DrawCmds one by one (plus their shared_ptr
+            // refcount traffic and destructor sweep). Capacities still circulate: the emptied
+            // scratch buffer goes back to the vecpool via the swapped-out list.
+            if (m_pending.size() == 1 && cmds.empty())
+            {
+                auto &l = m_pending[0];
+                listStarts.push_back(0);
+                listGens.push_back(m_pendingGen.empty() ? 0u : m_pendingGen[0]);
+                cmds.swap(l);
+                if (m_vecPool.size() < 4) { l.clear(); m_vecPool.push_back(std::move(l)); }
+            }
+            else
             for (size_t li = 0; li < m_pending.size(); ++li)
             {
                 auto &l = m_pending[li];
