@@ -702,7 +702,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                             uint64_t plo, phi;
                             std::memcpy(&plo, data + pos + o, 8); std::memcpy(&phi, data + pos + o + 8, 8);
                             const uint32_t u2dbp = (uint32_t)((plo >> 32) & 0x3FFFu);
-                            if ((phi & 0xFFu) == 0x50u && (u2dbp == 10752u || u2dbp == 12992u))
+                            if ((phi & 0xFFu) == 0x50u && u2dbp == 12992u)
                             {
                                 uint32_t srcG = 0u;
                                 if (g_vif1QwcActive) srcG = g_vif1QwcSrcGuest + pos + o;
