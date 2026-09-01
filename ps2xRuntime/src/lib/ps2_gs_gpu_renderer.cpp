@@ -2826,27 +2826,6 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
     if (!s_bar || !m_glInit) return;
     if (requireAligned && (srcBlock % 32u) != 0u) return;
     const uint32_t page = srcBlock / 32u;
-    {   // [barwho] PS2X_BARWHO=1: census of the read classes that still reach the barrier —
-        // (page, reader psm, reader tbp0) via the g_barReq* globals the call sites publish.
-        static const bool s_bw = [](){ const char *v = std::getenv("PS2X_BARWHO"); return v && v[0] && v[0] != '0'; }();
-        if (s_bw)
-        {
-            extern uint32_t g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw;
-            static std::map<uint64_t, unsigned long> s_h; static std::mutex s_m; static unsigned long s_n = 0;
-            std::lock_guard<std::mutex> lk(s_m);
-            ++s_h[((uint64_t)page << 32) | ((uint64_t)g_barReqPsm << 16) | (g_barReqTbp & 0xFFFFu)];
-            if ((++s_n % 1000ul) == 0ul)
-            {
-                std::vector<std::pair<unsigned long,uint64_t>> v; for (auto &kv : s_h) v.push_back({kv.second, kv.first});
-                std::sort(v.rbegin(), v.rend());
-                std::fprintf(stderr, "[barwho]");
-                int shown = 0;
-                for (auto &e : v) { if (++shown > 10) break;
-                    std::fprintf(stderr, " f%llu/psm%llx/tbp%llu:%lu", (unsigned long long)(e.second >> 32), (unsigned long long)((e.second >> 16) & 0xFFFFu), (unsigned long long)(e.second & 0xFFFFu), e.first); }
-                std::fprintf(stderr, " (n=%lu)\n", s_n);
-            }
-        }
-    }
     {   // [barskip] PS2X_BARSKIP=p1,p2,...: no barrier for reads of these pages, on EVERY path
         // (guest blocking, non-blocking, replay inline). Rig parity says whether a page's reads
         // are already served correctly by the FBO path without the VRAM round trip.
@@ -2964,6 +2943,27 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
             {   extern uint32_t g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw; ++g_ptN;
                 std::fprintf(stderr, "[pt] %lu READ page=%u tbp=%u cbp=%u psm=%u tbw=%u dirtyB=%d pend=%d dirty=%d alpha=%d defer=%d seq=%u\n", g_ptN, page, g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw, (int)dirtyBefore, (int)pend, (int)dirty, (int)wantsAlphaAsData, (int)(deferOut != nullptr), m_writeSeq); }
             if (!dirty && !(wantsAlphaAsData && (s_barAlwaysAEnv || g_barAlphaStale.count(page)))) return;
+            {   // [barwho] PS2X_BARWHO=1: census of the reads that ACTUALLY block (post dirty-verdict) —
+                // (page, reader psm, reader tbp0) via the g_barReq* globals the call sites publish.
+                static const bool s_bw = [](){ const char *v = std::getenv("PS2X_BARWHO"); return v && v[0] && v[0] != '0'; }();
+                if (s_bw)
+                {
+                    extern uint32_t g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw;
+                    static std::map<uint64_t, unsigned long> s_h; static std::mutex s_m; static unsigned long s_n = 0;
+                    std::lock_guard<std::mutex> lk2(s_m);
+                    ++s_h[((uint64_t)page << 32) | ((uint64_t)g_barReqPsm << 16) | (g_barReqTbp & 0xFFFFu)];
+                    if ((++s_n % 400ul) == 0ul)
+                    {
+                        std::vector<std::pair<unsigned long,uint64_t>> v2; for (auto &kv : s_h) v2.push_back({kv.second, kv.first});
+                        std::sort(v2.rbegin(), v2.rend());
+                        std::fprintf(stderr, "[barwho]");
+                        int shown = 0;
+                        for (auto &e : v2) { if (++shown > 10) break;
+                            std::fprintf(stderr, " f%llu/psm%llx/tbp%llu:%lu", (unsigned long long)(e.second >> 32), (unsigned long long)((e.second >> 16) & 0xFFFFu), (unsigned long long)(e.second & 0xFFFFu), e.first); }
+                        std::fprintf(stderr, " (n=%lu)\n", s_n);
+                    }
+                }
+            }
             g_barDirty.erase(page);
             // [ddrtdirect] PS2X_DDRTDIRECT (default on, =0 off): a NON-INDEXED read (CT32/24/16) of a page that is itself an
             // FBO-backed frame buffer is served by the draw path straight from the FBO texture in the sync build (its
