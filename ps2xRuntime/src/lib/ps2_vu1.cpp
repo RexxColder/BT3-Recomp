@@ -661,6 +661,7 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
 // wedges/slivers present in BOTH renderers. Run VU1 under RZ+FTZ+DAZ like PCSX2's
 // default "VU Round Mode: Chop/Zero". PS2X_VUROUND=0 restores host rounding (A/B).
 extern std::atomic<uint64_t> g_bt3FrameCount; // [vudaz] frame gate (defined in ps2_runtime.cpp)
+extern std::atomic<uint32_t> g_bt3StateLive;  // [vudaz] fight-state gate (status probe, ps2_runtime.cpp)
 namespace
 {
     struct VuRoundScope
@@ -679,11 +680,14 @@ namespace
                 // both directions (a wholesale data difference on denormal-encoded values).
                 static const long s_dazFr = [](){ const char *v = std::getenv("PS2X_VUDAZ"); return v && v[0] ? std::atol(v) : -1; }();
                 uint32_t extra = 0x8040u;
-                if (s_dazFr >= 0 && (long)::g_bt3FrameCount.load(std::memory_order_relaxed) >= s_dazFr)
+                if (s_dazFr >= 0 && ::g_bt3StateLive.load(std::memory_order_relaxed) == 0x2du
+                    && (long)::g_bt3FrameCount.load(std::memory_order_relaxed) >= s_dazFr)
                 {
+                    // fight-state gate: frame-only gating engaged during MENUS and derailed the
+                    // boot path into the 0x3ab950 wild-pc loop (14 GB log). 0x2d = in-fight.
                     extra = 0u;
                     static bool s_dazSaid = false;
-                    if (!s_dazSaid) { s_dazSaid = true; std::fprintf(stderr, "[vudaz] ACTIVE from fr%ld: RZ kept, FTZ/DAZ dropped\n", s_dazFr); }
+                    if (!s_dazSaid) { s_dazSaid = true; std::fprintf(stderr, "[vudaz] ACTIVE (state=0x2d, fr>=%ld): RZ kept, FTZ/DAZ dropped\n", s_dazFr); }
                 }
                 // RZ (round toward zero) | FTZ | DAZ (unless [vudaz] active)
                 _mm_setcsr((saved & ~0xE040u) | 0x6000u | extra);
