@@ -1076,10 +1076,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         {
             extern std::atomic<uint64_t> g_bt3FrameCount;
             const uint64_t fr_ = g_bt3FrameCount.load(std::memory_order_relaxed);
-            if (fr_ >= 4400u)
+            if ((fr_ % 600u) < 2u)
             {
                 static std::atomic<uint32_t> s_n{0};
-                if (s_n.fetch_add(1) < 300u)
+                if (s_n.fetch_add(1) < 4000u)
                 {
                     uint32_t sig_ = 0; if (codeSize >= 0x44u) std::memcpy(&sig_, vuCode + 0x40u, 4);
                     bool nz_ = false;
