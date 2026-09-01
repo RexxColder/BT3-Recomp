@@ -4912,6 +4912,14 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     if (!(sv[i].q > 0.0f)) qOk = false;
                     qMin = std::min(qMin, sv[i].q); qMax = std::max(qMax, sv[i].q);
                 }
+                // [grasssub] PS2X_GRASSSUB=<depthCap>,<errTexels>: tighter subdivision for the
+                // ground/hills family (psm19/20, CLUT 12992). The generic 3-texel error cap is
+                // invisible on minified textures but the NEAR ground is MAGNIFIED (1 texel =
+                // several screen px), so its residual affine error swims with camera motion
+                // ("grass feels like water"). Unset = off (generic caps).
+                static int s_gcap = 6; static float s_gerr = 0.7f;
+                static const bool s_gsub = [](){ const char *v = std::getenv("PS2X_GRASSSUB"); return v && std::sscanf(v, "%d,%f", &s_gcap, &s_gerr) == 2; }();
+                const bool grassClass = s_gsub && (ctx.tex0.psm == 19u || ctx.tex0.psm == 20u) && ctx.tex0.cbp == 12992u;
                 // Only bother when there is real perspective across the triangle AND it is
                 // large on screen — flat-q or small tris are exact enough affinely.
                 const float ex = std::max({sv[0].x, sv[1].x, sv[2].x}) - std::min({sv[0].x, sv[1].x, sv[2].x});
@@ -4953,7 +4961,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     }
                 }
                 if (s_decalQ && shadowDecalClass && !qOk) uvErrTexels = 1e9f;
-                if ((qOk || shadowDecalClass) && uvErrTexels > 3.0f && cmd.tri[0].q == 1.0f)
+                if ((qOk || shadowDecalClass) && uvErrTexels > (grassClass ? s_gerr : 3.0f) && cmd.tri[0].q == 1.0f)
                 {
                     auto emitTri = [&](const SV &a, const SV &b, const SV &c2)
                     {
@@ -5023,7 +5031,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                         static int s_dcap = 7; static float s_derr = 3.0f;
                         static const bool s_dsub = [](){ const char *v = std::getenv("PS2X_DECALSUB"); return v && std::sscanf(v, "%d,%f", &s_dcap, &s_derr) == 2; }();
                         (void)s_dsub;
-                        const int depthCap = shadowDecalClass ? s_dcap : 5; const float errCap = shadowDecalClass ? s_derr : 3.0f;
+                        const int depthCap = shadowDecalClass ? s_dcap : (grassClass ? s_gcap : 5); const float errCap = shadowDecalClass ? s_derr : (grassClass ? s_gerr : 3.0f);
                         if (it.depth >= depthCap || (it.depth > 0 && pieceErr(it.a, it.b, it.c) <= errCap))
                         {
                             emitTri(it.a, it.b, it.c);
