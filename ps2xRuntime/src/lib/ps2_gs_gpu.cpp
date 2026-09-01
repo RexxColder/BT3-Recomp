@@ -3264,6 +3264,21 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         }
         m_transferState.copied_pixels = 0;
 
+        {   // [up10752] PS2X_UP10752=1: per-frame ORDER of uploads into the band-sheet block —
+            // two tenants (entry-4 slice vs the real sheet) target dbp 10752; last writer wins.
+            static const bool s_u7 = [](){ const char *v = std::getenv("PS2X_UP10752"); return v && v[0] && v[0] != '0'; }();
+            if (s_u7 && m_trxdir == 0u && m_bitbltbuf.dbp == 10752u)
+            {
+                extern std::atomic<uint64_t> g_bt3FrameCount;
+                static std::atomic<uint32_t> s_n7{0};
+                if (s_n7.fetch_add(1) < 400u)
+                    std::fprintf(stderr, "[up10752] fr=%llu dpsm=%u dbw=%u rr=%ux%u dsax=%u dsay=%u\n",
+                                 (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
+                                 (unsigned)m_bitbltbuf.dpsm, (unsigned)m_bitbltbuf.dbw,
+                                 (unsigned)m_trxreg.rrw, (unsigned)m_trxreg.rrh,
+                                 (unsigned)m_trxpos.dsax, (unsigned)m_trxpos.dsay);
+            }
+        }
         if (m_trxdir == 2 && m_vram)
         {
             performLocalToLocalTransfer();
