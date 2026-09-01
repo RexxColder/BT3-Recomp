@@ -3052,6 +3052,24 @@ namespace
     // [pakcpy] PS2X_PAKCPY=1: log memcpy (func_2A9A1C) calls whose SOURCE lies inside the
     // bulk-loaded stage pak at 0x103f9c0 (+6.2MB) — src pak-offset + ra = the walker call
     // site computing the (wrong) intra-pak offsets for the terrain band sheet.
+    // [sprq] PS2X_SPRQ=1: log the DMA queue-driver FUN_002bb098 calls whose args reference
+    // the resident stage pak (0x103f9c0+6.2MB) — the queuer's ra = who computes the offsets.
+    PS2Runtime::RecompiledFunction g_orig2bb098 = nullptr;
+    void bt3SprQProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a[4] = { getRegU32(ctx,4)&0x1FFFFFFFu, getRegU32(ctx,5)&0x1FFFFFFFu,
+                                getRegU32(ctx,6)&0x1FFFFFFFu, getRegU32(ctx,7)&0x1FFFFFFFu };
+        bool pak = false;
+        for (int i = 0; i < 4; ++i) if (a[i] >= 0x103f9c0u && a[i] < 0x1631140u) pak = true;
+        if (pak)
+        {
+            static std::atomic<int> s_q{0};
+            if (s_q.fetch_add(1) < 60)
+                std::fprintf(stderr, "[sprq] a0=0x%x a1=0x%x a2=0x%x a3=0x%x ra=0x%x\n",
+                             a[0], a[1], a[2], a[3], getRegU32(ctx, 31));
+        }
+        if (g_orig2bb098) g_orig2bb098(rdram, ctx, runtime);
+    }
     PS2Runtime::RecompiledFunction g_orig2a9a1c = nullptr;
     void bt3PakCpyProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -3958,6 +3976,11 @@ namespace
                 if (g_orig2722c0) runtime.replaceFunction(0x002722c0u, &bt3ThunkStackWatch);
                 g_orig2188b8 = runtime.lookupFunction(0x002188b8u);   // [terrround]
                 if (g_orig2188b8) runtime.replaceFunction(0x002188b8u, &bt3TerrRoundScope);
+                if (std::getenv("PS2X_SPRQ"))
+                {
+                    g_orig2bb098 = runtime.lookupFunction(0x002bb098u);   // [sprq]
+                    if (g_orig2bb098) runtime.replaceFunction(0x002bb098u, &bt3SprQProbe);
+                }
                 if (std::getenv("PS2X_PAKCPY"))
                 {
                     g_orig2a9a1c = runtime.lookupFunction(0x002a9a1cu);   // [pakcpy]
