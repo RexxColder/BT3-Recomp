@@ -23,6 +23,11 @@
 #include <unordered_map>
 #include <cstring>
 
+// [wlk] overlay-table externs (file scope — block-scope extern inside the anon namespace mislinks)
+extern PS2Runtime::RecompiledFunction g_ps2OverlayFunctionTable[];
+extern const uint32_t g_ps2OverlayFunctionTableBase;
+extern const uint32_t g_ps2OverlayFunctionTableSlotCount;
+
 // Live host input (keyboard + gamepad) as a 16-bit active-low PS2 button word +
 // analog bytes. Defined in src/lib/pad_config.cpp. `player` selects the profile
 // (0..3); BT3 routes socket 0 -> player 0, socket 1 -> player 1.
@@ -3998,9 +4003,6 @@ namespace
                 if (g_orig2188b8) runtime.replaceFunction(0x002188b8u, &bt3TerrRoundScope);
                 if (std::getenv("PS2X_WLK"))
                 {
-                    extern PS2Runtime::RecompiledFunction g_ps2OverlayFunctionTable[];
-                    extern const uint32_t g_ps2OverlayFunctionTableBase;
-                    extern const uint32_t g_ps2OverlayFunctionTableSlotCount;
                     const uint32_t slot = (0x399b18u - g_ps2OverlayFunctionTableBase) / 4u;
                     if (slot < g_ps2OverlayFunctionTableSlotCount && g_ps2OverlayFunctionTable[slot])
                     {
