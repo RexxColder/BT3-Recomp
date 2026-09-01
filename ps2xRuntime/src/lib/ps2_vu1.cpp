@@ -680,7 +680,11 @@ namespace
                 static const long s_dazFr = [](){ const char *v = std::getenv("PS2X_VUDAZ"); return v && v[0] ? std::atol(v) : -1; }();
                 uint32_t extra = 0x8040u;
                 if (s_dazFr >= 0 && (long)::g_bt3FrameCount.load(std::memory_order_relaxed) >= s_dazFr)
+                {
                     extra = 0u;
+                    static bool s_dazSaid = false;
+                    if (!s_dazSaid) { s_dazSaid = true; std::fprintf(stderr, "[vudaz] ACTIVE from fr%ld: RZ kept, FTZ/DAZ dropped\n", s_dazFr); }
+                }
                 // RZ (round toward zero) | FTZ | DAZ (unless [vudaz] active)
                 _mm_setcsr((saved & ~0xE040u) | 0x6000u | extra);
             }
