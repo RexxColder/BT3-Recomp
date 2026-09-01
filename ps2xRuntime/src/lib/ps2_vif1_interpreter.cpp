@@ -697,7 +697,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     {
                         static std::atomic<int> s_un2{0};
                         const uint32_t lim = qwCount * 16u;
-                        for (uint32_t o = 0; o + 32u <= lim && o < 8192u && s_un2.load(std::memory_order_relaxed) < 24; o += 16u)
+                        for (uint32_t o = 0; o + 16u <= lim && o < 8192u && s_un2.load(std::memory_order_relaxed) < 24; o += 16u)
                         {
                             uint64_t plo, phi;
                             std::memcpy(&plo, data + pos + o, 8); std::memcpy(&phi, data + pos + o + 8, 8);
@@ -710,6 +710,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                                 if (s_un2.fetch_add(1) < 24)
                                     std::fprintf(stderr, "[upsrc2] BITBLTBUF dbp=%u sbp=%u spsm=%u srcG=0x%08x qwc=%u\n",
                                                  u2dbp, (uint32_t)(plo & 0x3FFFu), (uint32_t)((plo >> 24) & 0x3Fu), srcG, qwCount);
+                                // capture the CLUT payload + its guest address once: the IMAGE data follows
+                                // in the VIF stream — dump the next 2KB of stream bytes with their srcG base.
+                                if (u2dbp == 12992u)
+                                {
+                                    static std::atomic<bool> s_pd{false}; bool e2 = false;
+                                    if (s_pd.compare_exchange_strong(e2, true))
+                                    {
+                                        const uint32_t avail = (sizeBytes > pos + o) ? (uint32_t)(sizeBytes - pos - o) : 0u;
+                                        const uint32_t nb = avail < 2048u ? avail : 2048u;
+                                        if (FILE *f = std::fopen("/home/z3/Desktop/bt3/work/clutsrc.bin", "wb"))
+                                        {
+                                            uint32_t h[4] = { srcG, nb, qwCount, 0u };
+                                            std::fwrite(h, 4, 4, f);
+                                            std::fwrite(data + pos + o, 1, nb, f);
+                                            std::fclose(f);
+                                            std::fprintf(stderr, "[upsrc2] clutsrc.bin written: srcG=0x%08x nb=%u\n", srcG, nb);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
