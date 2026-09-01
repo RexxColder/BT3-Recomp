@@ -16,6 +16,7 @@
 #include <iostream>
 #include <mutex>
 #include <map>
+#include <set>
 #include <atomic>
 #include <chrono>
 #include <optional>
@@ -3027,6 +3028,25 @@ namespace
         }
         if (g_caOrig) g_caOrig(rdram, ctx, runtime);
     }
+    // [tblcen] PS2X_TBLCEN=1: census of sub_0010C520(table, idx, arg) calls — which TABLE
+    // (resident 0x135a620-family vs streamed-chunk tables) serves each carousel slot per frame.
+    PS2Runtime::RecompiledFunction g_tcOrig = nullptr;
+    void bt3TblCenProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), ra = getRegU32(ctx, 31);
+        const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+        if (fr >= 1600u)
+        {
+            static std::mutex s_mx; static std::set<uint64_t> s_seen; static std::atomic<uint32_t> s_n{0};
+            const uint64_t key = ((uint64_t)a0 << 16) | (a1 & 0xFFFFu);
+            bool fresh=false;
+            { std::lock_guard<std::mutex> lk(s_mx); fresh = s_seen.insert(key).second; }
+            if (fresh && s_n.fetch_add(1) < 120u)
+                std::fprintf(stderr, "[tblcen] fr=%llu table=0x%x idx=%u ra=0x%x\n",
+                             (unsigned long long)fr, a0, a1, ra);
+        }
+        if (g_tcOrig) g_tcOrig(rdram, ctx, runtime);
+    }
     void bt3StageGateArm(PS2Runtime &runtime)
     {
         PS2Runtime::RecompiledFunction fns[] = { &bt3StageGateFn<0>, &bt3StageGateFn<1>, &bt3StageGateFn<2>, &bt3StageGateFn<3> };
@@ -4015,6 +4035,12 @@ namespace
             runtime.replaceFunction(0x00100ab8u, &bt3FrameKick);
         if (const char *v = std::getenv("PS2X_STAGEGATE"); v && v[0] && v[0] != '0')
             bt3StageGateArm(runtime);
+        if (const char *v = std::getenv("PS2X_TBLCEN"); v && v[0] && v[0] != '0')
+        {
+            g_tcOrig = runtime.lookupFunction(0x0010c520u);
+            if (g_tcOrig) runtime.replaceFunction(0x0010c520u, &bt3TblCenProbe);
+            std::fprintf(stderr, "[tblcen] hook %s\n", g_tcOrig ? "ok" : "MISSING");
+        }
         if (const char *v = std::getenv("PS2X_CAROUSEL"); v && v[0] && v[0] != '0')
         {
             g_caOrig = runtime.lookupFunction(0x00100738u);
