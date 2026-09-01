@@ -13062,6 +13062,27 @@ if (done.size() < 14 && !done.count(c.texKey))
         // Collapse an axis-aligned VRAM-textured triangle-pair into a sprite quad (crisp
         // thin edges). Skip for FBO sources (handled by the generic paths below).
         if (groundShadowOn() && isTerrainDraw(c)) { ++accFor(g_curGen).terrain; g_sceneFbp = c.destFbp; }
+        {   // [farymin] PS2X_FARYMIN=1: per-frame min screen-Y of far-pass terrain (psm20, clut 12992)
+            // triangles — console's stream shows a hard floor (~114 px); unclipped spray above it is
+            // the pale wash. Numeric A/B metric for CLIP semantics candidates.
+            static const bool s_fym = [](){ const char *v = std::getenv("PS2X_FARYMIN"); return v && v[0] && v[0] != '0'; }();
+            if (s_fym && c.isTriangle && c.srcPsm == 20u && c.srcClutTbp == 12992u && !c.isTransfer)
+            {
+                static std::atomic<int> s_minY{99999}; static std::atomic<uint32_t> s_above{0}, s_tot{0}; static std::atomic<uint64_t> s_lastFr{0};
+                extern std::atomic<uint64_t> g_bt3FrameCount;
+                const uint64_t fr_ = g_bt3FrameCount.load(std::memory_order_relaxed);
+                float my = c.tri[0].y; for (int k = 1; k < 3; ++k) my = std::min(my, c.tri[k].y);
+                int myi = (int)my;
+                int cur = s_minY.load(); while (myi < cur && !s_minY.compare_exchange_weak(cur, myi)) {}
+                s_tot.fetch_add(1u); if (myi < 110) s_above.fetch_add(1u);
+                uint64_t lf = s_lastFr.load();
+                if (fr_ >= lf + 60u && s_lastFr.compare_exchange_strong(lf, fr_))
+                {
+                    std::fprintf(stderr, "[farymin] fr=%llu minY=%d above110=%u tot=%u\n",
+                                 (unsigned long long)fr_, s_minY.exchange(99999), s_above.exchange(0u), s_tot.exchange(0u));
+                }
+            }
+        }
         if (groundShadowOn() && isFighterDraw(c)) blobAccumulate(c);   // [groundshadow] v6: accumulate only; the draw happens at the list's last command
         {   // [shadowdecal] PS2X_SHADOWDECAL=0 skips the game's ground-shadow decal pass (floor-tile triangles sampling the
             // 256x256 PSMCT24 view of page 336 with TEXA AEM, vtxA=63, bm 0x44, DATE on). Its source is the mask chain we
