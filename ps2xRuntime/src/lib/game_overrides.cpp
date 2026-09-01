@@ -2968,6 +2968,39 @@ namespace
         if (sl.orig) sl.orig(rdram, ctx, runtime);
         if (say && (I == 5 || I == 0)) std::fprintf(stderr, "[shadowprobe] %s #%u -> v0=0x%x shCtx=0x%x\n", sl.name, n, getRegU32(ctx, 2), r32(gp - 0x595Cu));
     }
+    // [stagegate] PS2X_STAGEGATE=1: does the stage-bank upload dispatcher (sub_00115DE0) run
+    // per frame, and do its emitters (116770/116860/116970) ever fire? Logs the obj flag gate
+    // [gp-0x5690]+8 bit0 that early-exits the dispatcher. (Terrain-sheet-never-uploaded hunt.)
+    struct SgSlot { uint32_t addr; const char *name; PS2Runtime::RecompiledFunction orig; std::atomic<uint32_t> n; };
+    SgSlot g_sgProbe[4] = {
+        { 0x00115de0u, "dispatch(115de0)", nullptr, {0} }, { 0x00116770u, "emit(116770)", nullptr, {0} },
+        { 0x00116860u, "emit(116860)", nullptr, {0} }, { 0x00116970u, "emit(116970)", nullptr, {0} },
+    };
+    template <int I> void bt3StageGateFn(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SgSlot &sl = g_sgProbe[I];
+        const uint32_t n = sl.n.fetch_add(1u);
+        auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *p = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (p) std::memcpy(&v, p, 4); return v; };
+        const uint32_t gp = getRegU32(ctx, 28);
+        const uint32_t g5690 = r32(gp - 0x5690u);
+        const bool say = n < 8u || (n % 2000u) == 0u;
+        if (say)
+            std::fprintf(stderr, "[stagegate] %s #%u fr=%llu a0=0x%x ra=0x%x [gp-5690]=0x%x +8=0x%x +1C=0x%x\n",
+                         sl.name, n, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
+                         getRegU32(ctx, 4), getRegU32(ctx, 31), g5690,
+                         g5690 ? r32(g5690 + 8u) : 0u, g5690 ? r32(g5690 + 0x1Cu) : 0u);
+        if (sl.orig) sl.orig(rdram, ctx, runtime);
+    }
+    void bt3StageGateArm(PS2Runtime &runtime)
+    {
+        PS2Runtime::RecompiledFunction fns[] = { &bt3StageGateFn<0>, &bt3StageGateFn<1>, &bt3StageGateFn<2>, &bt3StageGateFn<3> };
+        for (int i = 0; i < 4; ++i)
+        {
+            g_sgProbe[i].orig = runtime.lookupFunction(g_sgProbe[i].addr);
+            if (g_sgProbe[i].orig) runtime.replaceFunction(g_sgProbe[i].addr, fns[i]);
+            std::fprintf(stderr, "[stagegate] hook %s %s\n", g_sgProbe[i].name, g_sgProbe[i].orig ? "ok" : "MISSING");
+        }
+    }
     void bt3ShadowProbeArm(PS2Runtime &runtime)
     {
         PS2Runtime::RecompiledFunction fns[] = { &bt3ShadowProbeFn<0>, &bt3ShadowProbeFn<1>, &bt3ShadowProbeFn<2>, &bt3ShadowProbeFn<3>, &bt3ShadowProbeFn<4>, &bt3ShadowProbeFn<5>,
@@ -3944,6 +3977,8 @@ namespace
         g_orig100ab8 = runtime.lookupFunction(0x00100ab8u);
         if (g_orig100ab8)
             runtime.replaceFunction(0x00100ab8u, &bt3FrameKick);
+        if (const char *v = std::getenv("PS2X_STAGEGATE"); v && v[0] && v[0] != '0')
+            bt3StageGateArm(runtime);
         // Resource-ready probe hook (only logs under PS2X_LOADPROBE; passthrough otherwise).
         g_orig252d78 = runtime.lookupFunction(0x00252d78u);
         if (g_orig252d78)
