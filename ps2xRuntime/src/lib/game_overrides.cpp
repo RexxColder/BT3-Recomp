@@ -3061,6 +3061,19 @@ namespace
     // the resident stage pak (0x103f9c0+6.2MB) — the queuer's ra = who computes the offsets.
     // [wlk] PS2X_WLK=1: hook the pak walker f_399b18 (OVERLAY function — replaceFunction
     // rejects overlay addresses, so patch g_ps2OverlayFunctionTable[slot] directly).
+    // [upb] PS2X_UPB=1: hook the terrain upload-builder family — log entry args + ra.
+    PS2Runtime::RecompiledFunction g_orig13c300 = nullptr, g_orig13c638 = nullptr, g_orig13ca80 = nullptr;
+    static void upbLog(const char *tag, R5900Context *ctx)
+    {
+        static std::atomic<int> s_u{0};
+        if (s_u.fetch_add(1) < 48)
+            std::fprintf(stderr, "[upb] %s a0=0x%x a1=0x%x a2=0x%x a3=0x%x t0=0x%x ra=0x%x\n",
+                         tag, getRegU32(ctx,4), getRegU32(ctx,5), getRegU32(ctx,6), getRegU32(ctx,7),
+                         getRegU32(ctx,8), getRegU32(ctx,31));
+    }
+    void bt3Upb13c300(uint8_t *r, R5900Context *c, PS2Runtime *rt) { upbLog("13c300", c); if (g_orig13c300) g_orig13c300(r, c, rt); }
+    void bt3Upb13c638(uint8_t *r, R5900Context *c, PS2Runtime *rt) { upbLog("13c638", c); if (g_orig13c638) g_orig13c638(r, c, rt); }
+    void bt3Upb13ca80(uint8_t *r, R5900Context *c, PS2Runtime *rt) { upbLog("13ca80", c); if (g_orig13ca80) g_orig13ca80(r, c, rt); }
     PS2Runtime::RecompiledFunction g_origWalker = nullptr;
     void bt3WalkerProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -4001,6 +4014,15 @@ namespace
                 if (g_orig2722c0) runtime.replaceFunction(0x002722c0u, &bt3ThunkStackWatch);
                 g_orig2188b8 = runtime.lookupFunction(0x002188b8u);   // [terrround]
                 if (g_orig2188b8) runtime.replaceFunction(0x002188b8u, &bt3TerrRoundScope);
+                if (std::getenv("PS2X_UPB"))
+                {
+                    g_orig13c300 = runtime.lookupFunction(0x0013c300u);
+                    if (g_orig13c300) runtime.replaceFunction(0x0013c300u, &bt3Upb13c300);
+                    g_orig13c638 = runtime.lookupFunction(0x0013c638u);
+                    if (g_orig13c638) runtime.replaceFunction(0x0013c638u, &bt3Upb13c638);
+                    g_orig13ca80 = runtime.lookupFunction(0x0013ca80u);
+                    if (g_orig13ca80) runtime.replaceFunction(0x0013ca80u, &bt3Upb13ca80);
+                }
                 if (std::getenv("PS2X_WLK"))
                 {
                     const uint32_t slot = (0x399b18u - g_ps2OverlayFunctionTableBase) / 4u;
