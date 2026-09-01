@@ -81,6 +81,14 @@ inline void ps2SetScratchpadHostPtr(uint8_t *ptr)
     ps2ScratchpadHostPtrStorage().store(ptr, std::memory_order_relaxed);
 }
 
+inline uint8_t *&ps2RdramHostPtrRef()
+{
+    static uint8_t *s_rdram = nullptr;
+    return s_rdram;
+}
+inline void ps2SetRdramHostPtr(uint8_t *ptr) { ps2RdramHostPtrRef() = ptr; }
+inline uint8_t *ps2GetRdramHostPtr() { return ps2RdramHostPtrRef(); }
+
 inline uint8_t *ps2GetScratchpadHostPtr()
 {
     return ps2ScratchpadHostPtrStorage().load(std::memory_order_relaxed);

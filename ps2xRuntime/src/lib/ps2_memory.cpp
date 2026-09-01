@@ -356,6 +356,7 @@ bool PS2Memory::initialize(size_t ramSize)
         m_scratchpad = new uint8_t[PS2_SCRATCHPAD_SIZE];
         std::memset(m_scratchpad, 0, PS2_SCRATCHPAD_SIZE);
         ps2SetScratchpadHostPtr(m_scratchpad);
+        ps2SetRdramHostPtr(m_rdram);
 
         // Initialize EE TLB entries (R5900 has 48 entries).
         m_tlbEntries.assign(48, TLBEntry{0, 0, 0, false});
