@@ -2146,6 +2146,17 @@ static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData,
         if (e.loA != 0) st.vi[e.loA] = (int32_t)(st.clip & 0xFFFu);
         // [vucell] fast-path twin of the execLower probe (see case 0x1C there).
         static const long s_vc2 = [](){ const char *v = std::getenv("PS2X_VUCELL"); return v && v[0] ? std::atol(v) : -1; }();
+        // pc-convention discovery: log the first 40 FCGET executions at ANY pc.
+        if (s_vc2 >= 0)
+        {
+            extern std::atomic<uint64_t> g_bt3FrameCount;
+            if ((long)g_bt3FrameCount.load(std::memory_order_relaxed) >= s_vc2)
+            {
+                static std::atomic<int> s_any{0};
+                if (s_any.fetch_add(1) < 40)
+                    std::fprintf(stderr, "[vucell-pc] fastFCGET pc=0x%x vit=%d clip=%06x\n", st.pc, (int)e.loA, st.clip & 0xFFFFFFu);
+            }
+        }
         if (s_vc2 >= 0 && (st.pc == 0xa88u || st.pc == 0x928u))
         {
             extern std::atomic<uint64_t> g_bt3FrameCount;
@@ -2524,6 +2535,16 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         // values, naming the divergent term directly.
         {
             static const long s_vc = [](){ const char *v = std::getenv("PS2X_VUCELL"); return v && v[0] ? std::atol(v) : -1; }();
+            if (s_vc >= 0)
+            {
+                extern std::atomic<uint64_t> g_bt3FrameCount;
+                if ((long)g_bt3FrameCount.load(std::memory_order_relaxed) >= s_vc)
+                {
+                    static std::atomic<int> s_any2{0};
+                    if (s_any2.fetch_add(1) < 40)
+                        std::fprintf(stderr, "[vucell-pc] slowFCGET pc=0x%x vit=%d clip=%06x\n", m_state.pc, (int)it, m_state.clip & 0xFFFFFFu);
+                }
+            }
             if (s_vc >= 0 && (m_state.pc == 0xa88u || m_state.pc == 0x928u))
             {
                 extern std::atomic<uint64_t> g_bt3FrameCount;
