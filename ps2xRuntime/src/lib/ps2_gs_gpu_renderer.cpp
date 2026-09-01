@@ -4375,6 +4375,12 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     std::unique_lock<std::mutex> lk(m_mtx, std::defer_lock);
     if (s_recStage <= 0) lk.lock();
     DrawCmd c = cmd;
+    {   // [farskip] PS2X_FARSKIP=1: drop the far-terrain pass (psm20/clut12992) entirely —
+        // if the pale wash disappears, the wash IS this pass (texture-sampling suspect).
+        static const bool s_fsk = [](){ const char *v = std::getenv("PS2X_FARSKIP"); return v && v[0] && v[0] != '0'; }();
+        if (s_fsk && c.isTriangle && c.srcPsm == 20u && c.srcClutTbp == 12992u && !c.isTransfer)
+            return;
+    }
     {   // [farymin] PS2X_FARYMIN=1: per-frame min screen-Y of far-pass terrain (psm20, clut 12992)
         // triangles at RECORD time — console floors at ~114px; spray above = the pale wash.
         static const bool s_fym = [](){ const char *v = std::getenv("PS2X_FARYMIN"); return v && v[0] && v[0] != '0'; }();
