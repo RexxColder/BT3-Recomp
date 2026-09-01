@@ -690,6 +690,29 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                             o += nloop * 16u;
                     }
                 }
+                {   // [upsrc2] PS2X_UPSRC=1: guest source of the band-sheet upload — scan DIRECT
+                    // payloads for A+D BITBLTBUF with DBP==10752 and report the guest src address.
+                    static const bool s_u2 = [](){ const char *v = std::getenv("PS2X_UPSRC"); return v && v[0] && v[0] != '0'; }();
+                    if (s_u2)
+                    {
+                        static std::atomic<int> s_un2{0};
+                        const uint32_t lim = qwCount * 16u;
+                        for (uint32_t o = 0; o + 32u <= lim && o < 8192u && s_un2.load(std::memory_order_relaxed) < 24; o += 16u)
+                        {
+                            uint64_t plo, phi;
+                            std::memcpy(&plo, data + pos + o, 8); std::memcpy(&phi, data + pos + o + 8, 8);
+                            if ((phi & 0xFFu) == 0x50u && ((plo >> 32) & 0x3FFFu) == 10752u)
+                            {
+                                uint32_t srcG = 0u;
+                                if (g_vif1QwcActive) srcG = g_vif1QwcSrcGuest + pos + o;
+                                else if (data >= m_rdram && data < m_rdram + PS2_RAM_SIZE) srcG = (uint32_t)(data - m_rdram) + pos + o;
+                                if (s_un2.fetch_add(1) < 24)
+                                    std::fprintf(stderr, "[upsrc2] BITBLTBUF dbp=10752 sbp=%u spsm=%u srcG=0x%08x qwc=%u\n",
+                                                 (uint32_t)(plo & 0x3FFFu), (uint32_t)((plo >> 24) & 0x3Fu), srcG, qwCount);
+                            }
+                        }
+                    }
+                }
                 {   // [shadowpass] detect the Pass-1 context in DIRECT A+D packets
                     static const bool s_sp = [](){ const char *v = std::getenv("PS2X_SHADOWPASS"); return v && v[0] && v[0] != '0'; }();
                     if (s_sp)
