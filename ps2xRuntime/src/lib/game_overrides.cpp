@@ -3035,14 +3035,22 @@ namespace
             static const uint8_t s_paleHead[16] = {0xda,0xe0,0xf3,0xdc,0xdc,0xe2,0xf3,0xdc,0xda,0xe7,0xed,0xe2,0xdc,0xe5,0xe5,0xe0};
             if (s_fr2 && a1 == 0x10080u)
             {
-                const uint8_t *pp = getMemPtr(rdram, (a0 + 0x80u) & 0x1FFFFFFFu);
-                if (pp && std::memcmp(pp, s_paleHead, 16) == 0)
+                for (uint32_t off = 0x50u; off <= 0xA0u; off += 0x10u)
                 {
-                    SET_GPR_U32(ctx, 4, 0x1446480u);
-                    static std::atomic<uint32_t> s_rr{0};
-                    if (s_rr.fetch_add(1) < 8u)
-                        std::fprintf(stderr, "[forcerich] fr=%llu redirected 0x%x -> 0x1446480\n",
-                                     (unsigned long long)fr, a0);
+                    uint8_t *pp = getMemPtr(rdram, (a0 + off) & 0x1FFFFFFFu);
+                    if (pp && std::memcmp(pp, s_paleHead, 16) == 0)
+                    {
+                        const uint8_t *rich = getMemPtr(rdram, 0x1446500u); // pak pale->rich payload swap
+                        if (rich)
+                        {
+                            std::memcpy(pp, rich, 0x10000u);
+                            static std::atomic<uint32_t> s_rr{0};
+                            if (s_rr.fetch_add(1) < 8u)
+                                std::fprintf(stderr, "[forcerich] fr=%llu payload swap at 0x%x+0x%x\n",
+                                             (unsigned long long)fr, a0, off);
+                        }
+                        break;
+                    }
                 }
             }
         }
