@@ -654,6 +654,32 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
     applyDestClamped(m_state.acc, result, dest);
 }
 
+
+// [vucell2] differential band-input capture: at the walker's per-vertex color store
+// (SQ vf26,-3(vi7): pc 0x1f8 in the 0xc78 walker, 0x2c8 in 0xe18), dump the full input
+// set for offline exact-RZ float32 vs float64 recompute of the band math.
+static void vucell2Dump(uint32_t pc, const float (*vf)[4])
+{
+    static const long s_fr = [](){ const char *v = std::getenv("PS2X_VUCELL2"); return v && v[0] ? std::atol(v) : -1; }();
+    if (s_fr < 0) return;
+    const uint32_t ext = g_curCodeSize;
+    if (!((ext == 0xc78u && pc == 0x1f8u) || (ext == 0xe18u && pc == 0x2c8u))) return;
+    const long fr = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
+    if (fr < s_fr) return;
+    static std::atomic<uint32_t> s_n{0};
+    const uint32_t n = s_n.fetch_add(1u);
+    if (n >= 60000u) return;
+    static std::mutex s_m; static FILE *s_f = nullptr;
+    std::lock_guard<std::mutex> lk(s_m);
+    if (!s_f) { s_f = std::fopen("/home/z3/Desktop/bt3/work/vucell2.bin", "wb");
+                std::fprintf(stderr, "[vucell2] capture armed (fr>=%ld ext=0x%x)\n", s_fr, ext); }
+    if (!s_f) return;
+    uint32_t hdr[4] = { (uint32_t)fr, pc, ext, 0u };
+    std::fwrite(hdr, 1, 16, s_f);
+    const int regs[10] = { 26, 20, 1, 2, 3, 4, 5, 6, 7, 8 };
+    for (int r : regs) std::fwrite(vf[r], 1, 16, s_f);
+    if ((n % 10000u) == 0u) std::fflush(s_f);
+}
 // PS2 VU FMACs round toward ZERO (truncate) and flush denormals; host default is
 // round-to-nearest. BT3's stage/water geometry rides the clip planes within ~0.4%
 // (verified: CLIPin z=140.627 vs w=141.226) — nearest-rounding flips such vertices
@@ -2099,6 +2125,7 @@ static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData,
     }
     case VU_LO_SQ:
     {
+        vucell2Dump(st.pc, st.vf);
         uint32_t addr = ((uint32_t)(int32_t)(st.vi[e.loB] + e.loImm)) * 16u;
         addr &= (dataSize - 1);
         if (addr + 16 <= dataSize)
@@ -2414,6 +2441,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x01: // SQ (Store Quadword to VU data memory)
     {
+        vucell2Dump(m_state.pc, m_state.vf);
         uint8_t is = FS(instr);      // VF source
         uint8_t it = VIT(instr);     // VI base
         uint8_t dest = (instr >> 21) & 0xF;
