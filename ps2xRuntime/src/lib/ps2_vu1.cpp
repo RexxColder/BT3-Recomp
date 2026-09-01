@@ -1201,14 +1201,34 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             {   // verbatim from the interpreter's CLIP (incl. the [clippipe] 4-cycle latency model)
                 const float *vs = m_state.vf[e.upFs];
                 const float *vt = m_state.vf[e.upFt];
-                const float w = std::fabs(vt[3]);
+                // [clipint] PS2X_CLIPINT=1: PCSX2-exact CLIP — integer sign-magnitude compares
+                // with denormal-w promotion (VUops.cpp _vuCLIP). Covers denormal/NaN/-0 edges that
+                // float fabs/> under FTZ/DAZ judges differently.
+                static const bool s_clipInt = [](){ const char *v = std::getenv("PS2X_CLIPINT"); return v && v[0] && v[0] != '0'; }();
                 uint32_t flags = 0;
+                if (s_clipInt)
+                {
+                    int32_t value; std::memcpy(&value, &vt[3], 4);
+                    value = (value & 0x7f800000) ? (value & 0x7fffffff) : 0x007fffff;
+                    int32_t xi, yi, zi;
+                    std::memcpy(&xi, &vs[0], 4); std::memcpy(&yi, &vs[1], 4); std::memcpy(&zi, &vs[2], 4);
+                    if ((int32_t)(xi ^ 0x00000000) > value) flags |= 0x01;
+                    if ((int32_t)(xi ^ 0x80000000) > value) flags |= 0x02;
+                    if ((int32_t)(yi ^ 0x00000000) > value) flags |= 0x04;
+                    if ((int32_t)(yi ^ 0x80000000) > value) flags |= 0x08;
+                    if ((int32_t)(zi ^ 0x00000000) > value) flags |= 0x10;
+                    if ((int32_t)(zi ^ 0x80000000) > value) flags |= 0x20;
+                }
+                else
+                {
+                float w = std::fabs(vt[3]);
                 if (vs[0] > +w) flags |= 0x01;
                 if (vs[0] < -w) flags |= 0x02;
                 if (vs[1] > +w) flags |= 0x04;
                 if (vs[1] < -w) flags |= 0x08;
                 if (vs[2] > +w) flags |= 0x10;
                 if (vs[2] < -w) flags |= 0x20;
+                }
                 const uint32_t base = (g_clipWait > 0u) ? g_pendingClip : m_state.clip;
                 const uint32_t nv = ((base << 6) | flags) & 0xFFFFFFu;
                 if (g_clipPipe)
@@ -1888,14 +1908,34 @@ void VU1Interpreter::execUpper(uint32_t instr)
             return;
         case 0x1F: // CLIP
         {
-            float w = std::fabs(vt[3]);
+            // [clipint] PS2X_CLIPINT=1: PCSX2-exact CLIP — integer sign-magnitude compares
+            // with denormal-w promotion (VUops.cpp _vuCLIP). Covers denormal/NaN/-0 edges that
+            // float fabs/> under FTZ/DAZ judges differently.
+            static const bool s_clipInt = [](){ const char *v = std::getenv("PS2X_CLIPINT"); return v && v[0] && v[0] != '0'; }();
             uint32_t flags = 0;
+            if (s_clipInt)
+            {
+                int32_t value; std::memcpy(&value, &vt[3], 4);
+                value = (value & 0x7f800000) ? (value & 0x7fffffff) : 0x007fffff;
+                int32_t xi, yi, zi;
+                std::memcpy(&xi, &vs[0], 4); std::memcpy(&yi, &vs[1], 4); std::memcpy(&zi, &vs[2], 4);
+                if ((int32_t)(xi ^ 0x00000000) > value) flags |= 0x01;
+                if ((int32_t)(xi ^ 0x80000000) > value) flags |= 0x02;
+                if ((int32_t)(yi ^ 0x00000000) > value) flags |= 0x04;
+                if ((int32_t)(yi ^ 0x80000000) > value) flags |= 0x08;
+                if ((int32_t)(zi ^ 0x00000000) > value) flags |= 0x10;
+                if ((int32_t)(zi ^ 0x80000000) > value) flags |= 0x20;
+            }
+            else
+            {
+            float w = std::fabs(vt[3]);
             if (vs[0] > +w) flags |= 0x01;
             if (vs[0] < -w) flags |= 0x02;
             if (vs[1] > +w) flags |= 0x04;
             if (vs[1] < -w) flags |= 0x08;
             if (vs[2] > +w) flags |= 0x10;
             if (vs[2] < -w) flags |= 0x20;
+            }
             {
                 // Shift from the architectural FUTURE value (pending if one is in flight) so
                 // back-to-back CLIPs accumulate correctly; visibility is still delayed.
