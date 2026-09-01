@@ -663,21 +663,28 @@ static void vucell2Dump(uint32_t pc, const float (*vf)[4])
 {
     static const long s_fr = [](){ const char *v = std::getenv("PS2X_VUCELL2"); return v && v[0] ? std::atol(v) : -1; }();
     if (s_fr < 0) return;
-    const uint32_t ext = g_curCodeSize;
-    // one-shot pc-convention diagnostic: what (ext,pc) pairs reach SQ in the walkers?
-    if (ext == 0xc78u || ext == 0xe18u)
+    // identify the walker by CODE CONTENT (g_curCodeSize is the 16KB upload size, never the
+    // program extent): the FTOI0|FCAND word pair at the probe offset is unique per walker.
+    const uint8_t *code = g_curVuCode;
+    if (!code) return;
+    uint64_t qc = 0, qe = 0;
+    std::memcpy(&qc, code + 0x1d0, 8);
+    std::memcpy(&qe, code + 0x2a8, 8);
+    const bool isC78 = (qc == 0x01faa97c2400003full);
+    const bool isE18 = (qe == 0x01faa97c2400003full);
+    if (!isC78 && !isE18) return;
     {
         static std::atomic<int> s_dg{0};
         if (s_dg.load(std::memory_order_relaxed) < 12)
         {
             static std::mutex s_dm; static std::set<uint64_t> s_seen;
             std::lock_guard<std::mutex> lk(s_dm);
-            if (s_seen.insert(((uint64_t)ext << 32) | pc).second && s_dg.fetch_add(1) < 12)
-                std::fprintf(stderr, "[vucell2-pc] ext=0x%x sq-pc=0x%x\n", ext, pc);
+            if (s_seen.insert(((uint64_t)(isC78 ? 1 : 2) << 32) | pc).second && s_dg.fetch_add(1) < 12)
+                std::fprintf(stderr, "[vucell2-pc] walker=%s sq-pc=0x%x\n", isC78 ? "c78" : "e18", pc);
         }
     }
-    const bool hit = (ext == 0xc78u && (pc == 0x1f8u || pc == 0x1f0u || pc == 0x200u))
-                  || (ext == 0xe18u && (pc == 0x2c8u || pc == 0x2c0u || pc == 0x2d0u));
+    const bool hit = (isC78 && pc >= 0x1f0u && pc <= 0x200u)
+                  || (isE18 && pc >= 0x2c0u && pc <= 0x2d0u);
     if (!hit) return;
     extern std::atomic<uint64_t> g_bt3FrameCount;
     const long fr = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
@@ -688,9 +695,9 @@ static void vucell2Dump(uint32_t pc, const float (*vf)[4])
     static std::mutex s_m; static FILE *s_f = nullptr;
     std::lock_guard<std::mutex> lk(s_m);
     if (!s_f) { s_f = std::fopen("/home/z3/Desktop/bt3/work/vucell2.bin", "wb");
-                std::fprintf(stderr, "[vucell2] capture armed (fr>=%ld ext=0x%x)\n", s_fr, ext); }
+                std::fprintf(stderr, "[vucell2] capture armed (fr>=%ld)\n", s_fr); }
     if (!s_f) return;
-    uint32_t hdr[4] = { (uint32_t)fr, pc, ext, 0u };
+    uint32_t hdr[4] = { (uint32_t)fr, pc, isC78 ? 0xc78u : 0xe18u, 0u };
     std::fwrite(hdr, 1, 16, s_f);
     const int regs[10] = { 26, 20, 1, 2, 3, 4, 5, 6, 7, 8 };
     for (int r : regs) std::fwrite(vf[r], 1, 16, s_f);
