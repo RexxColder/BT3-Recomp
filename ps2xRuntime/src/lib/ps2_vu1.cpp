@@ -3057,6 +3057,45 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                                         (aw & 0x3FFFu) == 10752u && ((aw >> 26) & 0xFu) == 10u)
                                         skyTexSeen = true;
                                 }
+                                // [vucell3] PS2X_VUCELL3=<minframe>: log the terrain walkers' A+D TEX0
+                                // writes — the band choice IS the CLUT row (CSA) selected per strip.
+                                if (desc == 0x0Eu)
+                                {
+                                    static const long s_v3 = [](){ const char *e = std::getenv("PS2X_VUCELL3"); return e && e[0] ? std::atol(e) : -1; }();
+                                    if (s_v3 >= 0 && g_curVuCode)
+                                    {
+                                        uint64_t sigc = 0, sige = 0;
+                                        std::memcpy(&sigc, g_curVuCode + 0x1d0, 8);
+                                        std::memcpy(&sige, g_curVuCode + 0x2a8, 8);
+                                        const bool isWalker = (sigc == 0x01faa97c2400003full) || (sige == 0x01faa97c2400003full);
+                                        if (isWalker)
+                                        {
+                                            extern std::atomic<uint64_t> g_bt3FrameCount;
+                                            const long fr3 = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
+                                            if (fr3 >= s_v3)
+                                            {
+                                                const uint64_t adData = read64Wrap(off2 + 16u + (v * nr + r) * 16u);
+                                                const uint64_t adReg  = read64Wrap(off2 + 16u + (v * nr + r) * 16u + 8u) & 0xFFu;
+                                                if (adReg == 0x06u || adReg == 0x16u)
+                                                {
+                                                    const uint32_t csa = (uint32_t)((adData >> 56) & 0x1Fu);
+                                                    const uint32_t cbp = (uint32_t)((adData >> 37) & 0x3FFFu);
+                                                    static std::mutex s_m3; static std::map<uint32_t,uint32_t> s_h3; static std::atomic<uint32_t> s_n3{0};
+                                                    std::lock_guard<std::mutex> lk(s_m3);
+                                                    ++s_h3[csa];
+                                                    const uint32_t n3 = s_n3.fetch_add(1u) + 1u;
+                                                    if (n3 <= 4u || (n3 % 4000u) == 0u)
+                                                    {
+                                                        std::string ln = "[vucell3] fr=" + std::to_string(fr3) + " n=" + std::to_string(n3)
+                                                          + " reg=0x" + std::to_string(adReg) + " cbp=" + std::to_string(cbp) + " csa-hist:";
+                                                        for (auto &kv : s_h3) ln += " " + std::to_string(kv.first) + "x" + std::to_string(kv.second);
+                                                        std::fprintf(stderr, "%s\n", ln.c_str());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 if (desc != 4u && desc != 5u) continue;
                                 const uint64_t w01 = read64Wrap(off2 + 16u + (v * nr + r) * 16u);
                                 const uint64_t xy = w01 & 0xFFFF0000FFFFull;
