@@ -3049,6 +3049,25 @@ namespace
     }
     // [slotprobe] PS2X_SLOTPROBE=1: histogram of FUN_0024f860 returns (terrain constant-slot
     // selector; -1 = no valid streamed record => caller falls back / stale constants).
+    // [pakcpy] PS2X_PAKCPY=1: log memcpy (func_2A9A1C) calls whose SOURCE lies inside the
+    // bulk-loaded stage pak at 0x103f9c0 (+6.2MB) — src pak-offset + ra = the walker call
+    // site computing the (wrong) intra-pak offsets for the terrain band sheet.
+    PS2Runtime::RecompiledFunction g_orig2a9a1c = nullptr;
+    void bt3PakCpyProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t dst = getRegU32(ctx, 4) & 0x1FFFFFFFu;
+        const uint32_t src = getRegU32(ctx, 5) & 0x1FFFFFFFu;
+        const uint32_t n   = getRegU32(ctx, 6);
+        const uint32_t ra  = getRegU32(ctx, 31);
+        if (src >= 0x103f9c0u && src < 0x103f9c0u + 0x5f1780u && n >= 1024u)
+        {
+            static std::atomic<int> s_pn{0};
+            if (s_pn.fetch_add(1) < 60)
+                std::fprintf(stderr, "[pakcpy] src=0x%x (pak+0x%x) dst=0x%x n=%u ra=0x%x\n",
+                             src, src - 0x103f9c0u, dst, n, ra);
+        }
+        if (g_orig2a9a1c) g_orig2a9a1c(rdram, ctx, runtime);
+    }
     PS2Runtime::RecompiledFunction g_orig24f860 = nullptr;
     thread_local uint32_t g_slotProbeObj = 0;
     void bt3SlotProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -3939,6 +3958,11 @@ namespace
                 if (g_orig2722c0) runtime.replaceFunction(0x002722c0u, &bt3ThunkStackWatch);
                 g_orig2188b8 = runtime.lookupFunction(0x002188b8u);   // [terrround]
                 if (g_orig2188b8) runtime.replaceFunction(0x002188b8u, &bt3TerrRoundScope);
+                if (std::getenv("PS2X_PAKCPY"))
+                {
+                    g_orig2a9a1c = runtime.lookupFunction(0x002a9a1cu);   // [pakcpy]
+                    if (g_orig2a9a1c) runtime.replaceFunction(0x002a9a1cu, &bt3PakCpyProbe);
+                }
                 if (std::getenv("PS2X_SLOTPROBE"))
                 {
                     g_orig24f860 = runtime.lookupFunction(0x0024f860u);   // [slotprobe]
