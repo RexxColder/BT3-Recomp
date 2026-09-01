@@ -3121,6 +3121,11 @@ namespace
                          a0, getRegU32(ctx, 31), a0 ? r32(a0+0x58) : 0u, a0 ? r32(a0+0x5C) : 0u, a0 ? r32(a0+0x54) : 0u);
         }
         if (g_i114Orig) g_i114Orig(rdram, ctx, runtime);
+        {   // post-call: did this init bind the texture table? read rec0 ptr directly.
+            auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *pp = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (pp) std::memcpy(&v, pp, 4); return v; };
+            std::fprintf(stderr, "[init114] POST rec0ptr[0x135a658]=0x%x rec14=0x%x\n",
+                         r32(0x135a658u), r32(0x135a658u + 14u*64u));
+        }
     }
     void bt3StageGateArm(PS2Runtime &runtime)
     {
@@ -3680,6 +3685,20 @@ namespace
         // would only advance when the next SE command happened to arrive.
         seServiceVoices(runtime);
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
+        {   // [init114] lifecycle: periodic read of the resident texture table rec0/rec14 ptrs
+            static const bool s_i14 = [](){ const char *v = std::getenv("PS2X_INIT114"); return v && v[0] && v[0] != '0'; }();
+            if (s_i14)
+            {
+                const uint64_t fr_ = g_bt3FrameCount.load(std::memory_order_relaxed);
+                static std::atomic<uint32_t> s_pn{0};
+                if ((fr_ % 300u) == 0u && s_pn.fetch_add(1) < 40u)
+                {
+                    auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *pp = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (pp) std::memcpy(&v, pp, 4); return v; };
+                    std::fprintf(stderr, "[tbl-life] fr=%llu rec0=0x%x rec14=0x%x rec15=0x%x\n",
+                                 (unsigned long long)fr_, r32(0x135a658u), r32(0x135a658u + 14u*64u), r32(0x135a658u + 15u*64u));
+                }
+            }
+        }
         // [ramdump] PS2X_RAMDUMP=<hexaddr>,<hexbytes>,<frame>: one-shot guest RAM dump to work/ramdump.bin
         {
             static const std::string s_rd = [](){ const char *v = std::getenv("PS2X_RAMDUMP"); return std::string(v ? v : ""); }();
