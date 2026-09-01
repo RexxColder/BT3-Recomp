@@ -4918,8 +4918,14 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 // several screen px), so its residual affine error swims with camera motion
                 // ("grass feels like water"). Unset = off (generic caps).
                 static int s_gcap = 6; static float s_gerr = 0.7f;
-                static const bool s_gsub = [](){ const char *v = std::getenv("PS2X_GRASSSUB"); return v && std::sscanf(v, "%d,%f", &s_gcap, &s_gerr) == 2; }();
-                const bool grassClass = s_gsub && (ctx.tex0.psm == 19u || ctx.tex0.psm == 20u) && ctx.tex0.cbp == 12992u;
+                // DEFAULT ON (user-accepted 2026-09-02, "grass feels like water" fixed): unset = 6,0.7
+                // for every indexed STQ terrain draw (psm 19/20, any CLUT — the palette base is
+                // stage-specific). PS2X_GRASSSUB=0 disables; =<d>,<e> overrides the caps.
+                static const bool s_gsub = [](){ const char *v = std::getenv("PS2X_GRASSSUB");
+                    if (!v || !v[0]) return true;
+                    if (v[0] == '0' && !v[1]) return false;
+                    std::sscanf(v, "%d,%f", &s_gcap, &s_gerr); return true; }();
+                const bool grassClass = s_gsub && (ctx.tex0.psm == 19u || ctx.tex0.psm == 20u);
                 // Only bother when there is real perspective across the triangle AND it is
                 // large on screen — flat-q or small tris are exact enough affinely.
                 const float ex = std::max({sv[0].x, sv[1].x, sv[2].x}) - std::min({sv[0].x, sv[1].x, sv[2].x});
