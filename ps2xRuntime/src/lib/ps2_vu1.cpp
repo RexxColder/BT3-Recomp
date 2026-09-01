@@ -3021,7 +3021,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             // position = DOT kick (collapses to a point). Tallied per microprogram entry PC and
             // per prim type. (v1 only looked at the first sub-packet and missed the strip tags.)
             static const bool s_skyKick = [](){ const char *v = std::getenv("PS2X_SKYKICK"); return v && v[0] && v[0] != '0'; }();
-            if (s_kickStat || g_spikeKick || g_blinkProbe || s_skyKick)
+            static const bool s_chunkPair = [](){ const char *v = std::getenv("PS2X_CHUNKPAIR"); return v && v[0] && v[0] != '0'; }();
+            if (s_kickStat || g_spikeKick || g_blinkProbe || s_skyKick || s_chunkPair)
             {
                 uint32_t off2 = addr, verts = 0, distinct = 0, primSeen = 99;
                 uint64_t seen[6]; uint64_t firstXy = 0; uint32_t firstR=0, firstG=0, firstB=0; bool firstRgbaSeen=false;
@@ -3328,16 +3329,21 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 // INPUT rows — dump VU rows [top..top+10] for the first dark kicks and first lit
                 // kicks (dark = first vertex RGBAQ luminance < 0x40).
                 {
-                    static const bool s_cp = [](){ const char *v = std::getenv("PS2X_CHUNKPAIR"); return v && v[0] && v[0] != '0'; }();
-                    if (s_cp && verts >= 3u && firstRgbaSeen)
+                    extern std::atomic<uint64_t> g_bt3FrameCount;
+                    const uint64_t cpFr = g_bt3FrameCount.load(std::memory_order_relaxed);
+                    const uint32_t maxC = firstR > firstG ? firstR : firstG, minC = firstR < firstG ? firstR : firstG;
+                    const bool gray = (maxC > firstB ? maxC : firstB) - (minC < firstB ? minC : firstB) <= 12u;
+                    if (s_chunkPair && verts >= 20u && firstRgbaSeen && gray && cpFr >= 1600u)
                     {
                         const uint32_t lum = (firstR + firstG + firstB) / 3u;
                         const bool dark = lum < 0x40u;
                         static std::atomic<int> s_dk{0}, s_lt{0};
                         int idx = dark ? s_dk.fetch_add(1) : s_lt.fetch_add(1);
-                        if (idx < 6)
+                        if (idx < 8)
                         {
                             std::string ln = std::string("[chunkpair] ") + (dark ? "DARK" : "LIT ") +
+                                " fr=" + std::to_string(cpFr) + " pc=" + std::to_string(g_curStartPc) +
+                                " verts=" + std::to_string(verts) +
                                 " lum=" + std::to_string(lum) + " top=" + std::to_string(m_state.top & 0x3FFu) + " rows:";
                             for (uint32_t q = 0; q < 10u; ++q)
                             {
@@ -3347,6 +3353,14 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                                 else { f[0]=f[1]=f[2]=f[3]=0; }
                                 char buf[96];
                                 std::snprintf(buf, sizeof buf, " q%u(%.4g,%.4g,%.4g,%.4g)", q, f[0], f[1], f[2], f[3]);
+                                ln += buf;
+                            }
+                            for (uint32_t q = 0; q < 4u; ++q)
+                            {
+                                float f[4];
+                                std::memcpy(f, vuData + q * 16u, 16);
+                                char buf[96];
+                                std::snprintf(buf, sizeof buf, " ABS%u(%.4g,%.4g,%.4g,%.4g)", q, f[0], f[1], f[2], f[3]);
                                 ln += buf;
                             }
                             std::fprintf(stderr, "%s\n", ln.c_str());
