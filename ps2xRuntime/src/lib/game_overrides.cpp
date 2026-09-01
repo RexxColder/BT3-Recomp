@@ -3027,6 +3027,26 @@ namespace
         if (dt >= 5.0) { std::fprintf(stderr, "[logicrate] %.1f fight updates/s (%u in %.1f s)\n", (double)n / dt, n, dt); s_n.store(0u); s_t0 = now; }
         if (g_orig115950) g_orig115950(rdram, ctx, runtime);
     }
+    // [vf3probe] PS2X_VF3PROBE=1: print the persistent VU0 basis rows (vf1-vf3) as seen by
+    // the DL emitter FUN_00111358 — hardware shares ONE physical VU0 across threads; our
+    // per-thread contexts zero-init all but vf0. vf3.x==0 here breaks func_121E50's
+    // normalize (length drops z) => slope-dependent band misassignment.
+    PS2Runtime::RecompiledFunction g_orig111358 = nullptr;
+    void bt3Vf3Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<int> s_n{0};
+        if (s_n.fetch_add(1) < 24)
+        {
+            float b[12];
+            std::memcpy(&b[0], &ctx->vu0_vf[1], 16);
+            std::memcpy(&b[4], &ctx->vu0_vf[2], 16);
+            std::memcpy(&b[8], &ctx->vu0_vf[3], 16);
+            std::fprintf(stderr, "[vf3probe] tid=%zx vf1=(%g %g %g %g) vf2=(%g %g %g %g) vf3=(%g %g %g %g)\n",
+                         std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFu,
+                         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11]);
+        }
+        if (g_orig111358) g_orig111358(rdram, ctx, runtime);
+    }
     PS2Runtime::RecompiledFunction g_orig2188b8 = nullptr;
     void bt3TerrRoundScope(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -3830,6 +3850,11 @@ namespace
                 if (g_orig2722c0) runtime.replaceFunction(0x002722c0u, &bt3ThunkStackWatch);
                 g_orig2188b8 = runtime.lookupFunction(0x002188b8u);   // [terrround]
                 if (g_orig2188b8) runtime.replaceFunction(0x002188b8u, &bt3TerrRoundScope);
+                if (std::getenv("PS2X_VF3PROBE"))
+                {
+                    g_orig111358 = runtime.lookupFunction(0x00111358u);   // [vf3probe]
+                    if (g_orig111358) runtime.replaceFunction(0x00111358u, &bt3Vf3Probe);
+                }
             }
         }
         if (!std::getenv("PS2X_NO_DEMO_GUARD"))
