@@ -4374,7 +4374,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     }
     std::unique_lock<std::mutex> lk(m_mtx, std::defer_lock);
     if (s_recStage <= 0) lk.lock();
-    const DrawCmd &c = cmd;   // [cmdref] read-only alias: the 328B copy (3 shared_ptr refcounts) ran per draw; the single real copy now happens at push
+    DrawCmd &c = const_cast<DrawCmd &>(cmd);   // [cmdref] alias, not a copy: the 328B copy (3 shared_ptr refcounts) ran per draw; the single real copy happens at push. Env-gated mutators (edgeviz/NODOF/NOSHCOMP/NOWIPE...) now write the caller cmd — idempotent per draw class, and callers reassign fields per draw.
     {   // [farskip] PS2X_FARSKIP=1: drop the far-terrain pass (psm20/clut12992) entirely —
         // if the pale wash disappears, the wash IS this pass (texture-sampling suspect).
         static const bool s_fsk = [](){ const char *v = std::getenv("PS2X_FARSKIP"); return v && v[0] && v[0] != '0'; }();
@@ -4429,23 +4429,24 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
             if ((++fired % 16ul) == 1ul)
                 std::fprintf(stderr, "[edgeviz] mode %d fired on the darkener, dest f%u (#%lu)\n",
                              s_ev, c.destFbp, fired);
+            DrawCmd &mc = const_cast<DrawCmd &>(cmd);   // [cmdref] diagnostic mode mutates the caller cmd (same as the gpualias tag)
             // mode 5: neutralise the darkener entirely (FIX=0 -> Cd - Cs*0 = Cd). If the frame is
             // byte-identical with it gone, the pass contributes NOTHING despite Ad measuring
             // 0.188 on 1261 pixels, which puts the fault in the blend factors, not the mask.
             // mode 5 was a BAD control: eq==1 (0x62) ignores blendFix, so this is Cd - Cs at full
             // strength, not the no-op it was meant to be. Kept only as a documented trap.
-            if (s_ev == 5) { c.blendMode = 0x62; c.blendFix = 0; c.abe = true; }
+            if (s_ev == 5) { mc.blendMode = 0x62; mc.blendFix = 0; mc.abe = true; }
             // mode 6: the honest control -- disable the draw so it contributes nothing at all.
-            else if (s_ev == 6) { c.abe = false; c.fbmsk = 0xFFFFFFFFu; }
+            else if (s_ev == 6) { mc.abe = false; mc.fbmsk = 0xFFFFFFFFu; }
             // mode 7: keep the darkening but stop the sprite STAMPING alpha over its strip
             // (alpha coverage measured 0.55% -> 93.8% across the 16 sprites purely from this).
-            else if (s_ev == 7) { c.fbmsk |= 0xFF000000u; }
+            else if (s_ev == 7) { mc.fbmsk |= 0xFF000000u; }
             // mode 4: paint RED weighted by Ad, so Ad>0 shows up directly.
             else if (s_ev == 4)
             {
-                c.blendMode = 0x54; c.blendFix = 128; c.abe = true;
-                c.r = 255; c.g = 0; c.b = 0;
-                for (int k = 0; k < 3; ++k) { c.tri[k].r = 255; c.tri[k].g = 0; c.tri[k].b = 0; }
+                mc.blendMode = 0x54; mc.blendFix = 128; mc.abe = true;
+                mc.r = 255; mc.g = 0; mc.b = 0;
+                for (int k = 0; k < 3; ++k) { mc.tri[k].r = 255; mc.tri[k].g = 0; mc.tri[k].b = 0; }
             }
         }
         {   // PS2X_NODOF=1: drop the fbp336 CT32 composites (bm 0x54 / 0x68) that run AFTER the
