@@ -1860,6 +1860,28 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
+                        {   // [chaintrace] PS2X_CHAINTRACE=<hexframe>: one-shot FULL tag listing of the
+                            // first VIF1 chain walked at/after that frame (find where the walk diverges
+                            // from the built sheet-upload segment).
+                            static const long s_ctFr = [](){ const char *v = std::getenv("PS2X_CHAINTRACE"); return v && v[0] ? std::strtol(v, nullptr, 16) : -1; }();
+                            if (s_ctFr >= 0 && channelBase == 0x10009000u)
+                            {
+                                extern std::atomic<uint64_t> g_bt3FrameCount;
+                                static std::atomic<int> s_ctState{0}; // 0=waiting 1=tracing 2=done
+                                static std::atomic<uint32_t> s_ctLines{0};
+                                int st0 = s_ctState.load(std::memory_order_relaxed);
+                                if (st0 == 0 && (long)g_bt3FrameCount.load(std::memory_order_relaxed) >= s_ctFr && tagsProcessed == 1)
+                                    { s_ctState.store(1); s_ctLines.store(0); std::fprintf(stderr, "[chaintrace] BEGIN fr=%llu\n", (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed)); }
+                                if (s_ctState.load(std::memory_order_relaxed) == 1)
+                                {
+                                    if (s_ctLines.fetch_add(1) < 3000u)
+                                        std::fprintf(stderr, "[chaintrace] #%d tag@0x%08x id=%u qwc=%u next=0x%08x\n",
+                                                     tagsProcessed, currentTagAddr, id, (unsigned)tagQwc, tagAddr);
+                                    if (endChain || id == 7u)
+                                        { s_ctState.store(2); std::fprintf(stderr, "[chaintrace] END after %d tags\n", tagsProcessed); }
+                                }
+                            }
+                        }
                         const bool compactVifLocalTag =
                             (channelBase == 0x10009000u || channelBase == 0x10008000u) &&
                             (id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
