@@ -161,6 +161,21 @@ namespace ps2_stubs
 
         CdReadArgs selected{a0, a1, a2, "a0/a1/a2"};
         bool ok = tryRead(selected);
+        // [cddst] PS2X_CDDST=<lo>:<hi> (hex): UNCAPPED log of reads whose dst intersects the
+        // range — the general [cdread] log's 6000-line budget hides in-fight deliveries.
+        {
+            static const std::string s_cw = [](){ const char *v = std::getenv("PS2X_CDDST"); return std::string(v ? v : ""); }();
+            static uint32_t w_lo = 0, w_hi = 0;
+            static const bool s_wok = !s_cw.empty() && std::sscanf(s_cw.c_str(), "%x:%x", &w_lo, &w_hi) == 2;
+            if (ok && s_wok)
+            {
+                const uint32_t d0 = selected.buf & 0x1FFFFFFFu;
+                const uint32_t d1 = d0 + selected.sectors * 2048u;
+                if (d0 < w_hi && d1 > w_lo)
+                    std::fprintf(stderr, "[cddst] lbn=0x%x sectors=%u dst=0x%x..0x%x ra=0x%x\n",
+                                 selected.lbn, selected.sectors, d0, d1, getRegU32(ctx, 31));
+            }
+        }
         {   // [cdreadlog] every read that landed: destination range + which argument layout, so a late/misplaced read
             // can be matched against a corrupted object (loader wild-jump hunt). First 6000 only.
             static std::atomic<uint32_t> s_cl{0};
