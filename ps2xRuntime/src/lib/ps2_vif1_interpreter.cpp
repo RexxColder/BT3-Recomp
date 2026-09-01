@@ -697,7 +697,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     {
                         static std::atomic<int> s_un2{0};
                         const uint32_t lim = qwCount * 16u;
-                        for (uint32_t o = 0; o + 16u <= lim && o < 8192u && s_un2.load(std::memory_order_relaxed) < 24; o += 16u)
+                        for (uint32_t o = 0; o + 16u <= lim && s_un2.load(std::memory_order_relaxed) < 24; o += 16u)
                         {
                             uint64_t plo, phi;
                             std::memcpy(&plo, data + pos + o, 8); std::memcpy(&phi, data + pos + o + 8, 8);
