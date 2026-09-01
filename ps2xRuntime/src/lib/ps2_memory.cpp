@@ -1872,6 +1872,21 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                 appendData(currentTagAddr + 16u, tagQwc);
                             else
                                 appendData(dataAddr, tagQwc);
+                            // [sheettag] PS2X_SHEETTAG=1: log VIF1 chain tags whose data lies in the
+                            // pak band-sheet region or the entry-4 default block — shows whether the
+                            // per-frame upload chain REFs the real sheet (0x139bxxx) or the default.
+                            static const bool s_st = [](){ const char *v = std::getenv("PS2X_SHEETTAG"); return v && v[0] && v[0] != '0'; }();
+                            if (s_st && channelBase == 0x10009000u)
+                            {
+                                const uint32_t da = (compactVifLocalTag ? currentTagAddr + 16u : dataAddr) & 0x1FFFFFFFu;
+                                if ((da >= 0x1398000u && da < 0x13a0000u) || (da >= 0x534000u && da < 0x558000u))
+                                {
+                                    static std::atomic<uint32_t> s_stn{0};
+                                    if (s_stn.fetch_add(1) < 200u)
+                                        std::fprintf(stderr, "[sheettag] id=%u data=0x%08x qwc=%u tag@0x%08x\n",
+                                                     id, da, (unsigned)tagQwc, currentTagAddr);
+                                }
+                            }
                         }
                         if (irq && tieEnabled)
                         {
