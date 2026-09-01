@@ -3129,12 +3129,15 @@ namespace
     void bt3Force14Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5);
+        const uint64_t frF = g_bt3FrameCount.load(std::memory_order_relaxed);
         static std::atomic<uint32_t> s_n{0};
-        const uint32_t n = s_n.fetch_add(1u);
-        if (n < 10u)
-            std::fprintf(stderr, "[force14] #%u fr=%llu a0=0x%x a1=%u ra=0x%x\n",
-                         n, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
-                         a0, a1, getRegU32(ctx, 31));
+        if (frF >= 4300u)
+        {
+            const uint32_t n = s_n.fetch_add(1u);
+            if (n < 40u)
+                std::fprintf(stderr, "[force14] #%u fr=%llu a0=0x%x a1=%u ra=0x%x\n",
+                             n, (unsigned long long)frF, a0, a1, getRegU32(ctx, 31));
+        }
         if (a0 == 0x135a620u && a1 == 15u)
         {
             SET_GPR_U32(ctx, 5, 14u);
