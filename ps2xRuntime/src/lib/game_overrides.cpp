@@ -3123,6 +3123,28 @@ namespace
                          r32(0x135a658u), r32(0x135a658u + 14u*64u));
         }
     }
+    // [force14] PS2X_FORCE14=1 (A/B): at the resident-table record append sub_0010A218,
+    // remap record idx 15 (PALE texture state) -> 14 (RICH) — console holds 14 at this camera.
+    PS2Runtime::RecompiledFunction g_f14Orig = nullptr;
+    void bt3Force14Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5);
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u);
+        if (n < 10u)
+            std::fprintf(stderr, "[force14] #%u fr=%llu a0=0x%x a1=%u ra=0x%x\n",
+                         n, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
+                         a0, a1, getRegU32(ctx, 31));
+        if (a0 == 0x135a620u && a1 == 15u)
+        {
+            SET_GPR_U32(ctx, 5, 14u);
+            static std::atomic<uint32_t> s_r{0};
+            if (s_r.fetch_add(1u) < 6u)
+                std::fprintf(stderr, "[force14] remapped idx 15->14 (fr=%llu)\n",
+                             (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed));
+        }
+        if (g_f14Orig) g_f14Orig(rdram, ctx, runtime);
+    }
     void bt3StageGateArm(PS2Runtime &runtime)
     {
         PS2Runtime::RecompiledFunction fns[] = { &bt3StageGateFn<0>, &bt3StageGateFn<1>, &bt3StageGateFn<2>, &bt3StageGateFn<3> };
@@ -4132,6 +4154,12 @@ namespace
             runtime.replaceFunction(0x00100ab8u, &bt3FrameKick);
         if (const char *v = std::getenv("PS2X_STAGEGATE"); v && v[0] && v[0] != '0')
             bt3StageGateArm(runtime);
+        if (const char *v = std::getenv("PS2X_FORCE14"); v && v[0] && v[0] != '0')
+        {
+            g_f14Orig = runtime.lookupFunction(0x0010a218u);
+            if (g_f14Orig) runtime.replaceFunction(0x0010a218u, &bt3Force14Probe);
+            std::fprintf(stderr, "[force14] hook %s\n", g_f14Orig ? "ok" : "MISSING");
+        }
         if (const char *v = std::getenv("PS2X_INIT114"); v && v[0] && v[0] != '0')
         {
             g_i114Orig = runtime.lookupFunction(0x00114c60u);
