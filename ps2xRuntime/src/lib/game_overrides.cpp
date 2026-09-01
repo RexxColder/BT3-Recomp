@@ -3018,10 +3018,10 @@ namespace
     {
         const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), ra = getRegU32(ctx, 31);
         const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
-        if (a1 >= 0x4000u && fr >= 1600u && a0 >= 0x103f9c0u && a0 < 0x1640000u)
+        if (a1 >= 0x4000u && fr >= 1600u)
         {
             static std::atomic<uint32_t> s_n{0};
-            if (s_n.fetch_add(1) < 120u)
+            if (s_n.fetch_add(1) < 400u)
                 std::fprintf(stderr, "[carousel] fr=%llu ref=0x%x len=0x%x ra=0x%x\n",
                              (unsigned long long)fr, a0, a1, ra);
         }
