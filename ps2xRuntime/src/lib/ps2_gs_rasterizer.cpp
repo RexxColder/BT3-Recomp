@@ -4201,6 +4201,13 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     cmd.destFbw = ctx.frame.fbw;
     cmd.destPsm = static_cast<uint8_t>(ctx.frame.psm);
     cmd.bilinear = ((ctx.tex1 >> 5) & 1u) != 0u;   // GS TEX1.MMAG
+    {   // [terrainpoint] PS2X_TERRAINPOINT=1: force point sampling for the terrain/hills palette
+        // class (psm19/20, CLUT 12992). GL bilinear on this tiled carousel sheet bleeds across
+        // tile edges and washes the distant strata (replay-verified: PS2X_BILINEAR=0 restores
+        // console banding); scope the point-sampling so gradients elsewhere keep bilinear.
+        static const bool s_tp = [](){ const char *v = std::getenv("PS2X_TERRAINPOINT"); return v && v[0] && v[0] != '0'; }();
+        if (s_tp && cmd.srcIndexed && ctx.tex0.cbp == 12992u) cmd.bilinear = false;
+    }
     cmd.srcTbp0 = tme ? ctx.tex0.tbp0 : 0u;
     cmd.srcTexW = tme ? (g_subDxW ? g_subDxW : texW) : 0;   // [subdecode]
     cmd.srcTexH = tme ? texH : 0;
