@@ -2776,9 +2776,10 @@ namespace
     PS2Runtime::RecompiledFunction g_orig23d510 = nullptr;
     void bt3CamForce(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_0023d510
     {
+        static const bool s_camForce = [](){ const char *v = std::getenv("PS2X_CAMFORCE"); return v && v[0] && v[0] != '0'; }();
         const uint32_t base = g_bt3CamBase.load(std::memory_order_relaxed);
         const uint32_t tgt  = g_bt3CamTarget.load(std::memory_order_relaxed);
-        if (base && tgt)
+        if (s_camForce && base && tgt)
         {
             uint8_t *p300 = getMemPtr(rdram, (base + 0x300u) & 0x1FFFFFFFu);
             uint8_t *p304 = getMemPtr(rdram, (base + 0x304u) & 0x1FFFFFFFu);
@@ -3852,7 +3853,7 @@ namespace
                 h.orig = runtime.lookupFunction(h.addr);
                 if (h.orig) runtime.replaceFunction(h.addr, &bt3CamSetterProbe);
             }
-            if (std::getenv("PS2X_CAMFORCE"))
+            if (std::getenv("PS2X_CAMFORCE") || std::getenv("PS2X_CAMROUND"))   // [camround] shares the hook
             {
                 g_orig23d510 = runtime.lookupFunction(0x0023d510u);
                 if (g_orig23d510) runtime.replaceFunction(0x0023d510u, &bt3CamForce);
