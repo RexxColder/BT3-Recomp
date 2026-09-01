@@ -2834,8 +2834,13 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
                 const uint32_t n4 = s_n4.fetch_add(1u) + 1u;
                 if (n4 <= 3u || (n4 % 5000u) == 0u)
                 {
+                    char raw[64];
+                    std::snprintf(raw, sizeof raw, " tbp0=%u tbw=%u tpsm=%u tw=%u th=%u",
+                                  (uint32_t)(value & 0x3FFFu), (uint32_t)((value >> 14) & 0x3Fu),
+                                  (uint32_t)((value >> 20) & 0x3Fu), (uint32_t)((value >> 26) & 0xFu),
+                                  (uint32_t)((value >> 30) & 0xFu));
                     std::string ln = "[vucell4] fr=" + std::to_string(fr4) + " n=" + std::to_string(n4)
-                        + " psm=" + std::to_string((uint32_t)((value >> 51) & 0xFu)) + " csa-hist:";
+                        + " psm=" + std::to_string((uint32_t)((value >> 51) & 0xFu)) + raw + " csa-hist:";
                     for (auto &kv : s_h4) ln += " " + std::to_string(kv.first) + "x" + std::to_string(kv.second);
                     std::fprintf(stderr, "%s\n", ln.c_str());
                 }
