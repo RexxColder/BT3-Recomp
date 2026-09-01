@@ -1076,16 +1076,16 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         {
             extern std::atomic<uint64_t> g_bt3FrameCount;
             const uint64_t fr_ = g_bt3FrameCount.load(std::memory_order_relaxed);
-            if ((fr_ % 600u) < 2u)
+            uint32_t sig_ = 0; if (codeSize >= 0x44u) std::memcpy(&sig_, vuCode + 0x40u, 4);
+            if (sig_ == 0x01ed000cu)
             {
                 static std::atomic<uint32_t> s_n{0};
                 if (s_n.fetch_add(1) < 4000u)
                 {
-                    uint32_t sig_ = 0; if (codeSize >= 0x44u) std::memcpy(&sig_, vuCode + 0x40u, 4);
-                    bool nz_ = false;
-                    for (uint32_t i = 12u*16u; i < 17u*16u && i < dataSize; ++i) if (vuData[i]) { nz_ = true; break; }
-                    std::fprintf(stderr, "[row12] fr=%llu entry=%u sig=%08x rows12-16=%s\n",
-                                 (unsigned long long)fr_, m_state.pc, sig_, nz_ ? "NONZERO" : "ZERO");
+                    uint32_t r12x = 0, r15x = 0;
+                    if (dataSize >= 16u*16u) { std::memcpy(&r12x, vuData + 12u*16u, 4); std::memcpy(&r15x, vuData + 15u*16u, 4); }
+                    std::fprintf(stderr, "[row12] fr=%llu entry=%u r12x=%08x r15x=%08x\n",
+                                 (unsigned long long)fr_, m_state.pc, r12x, r15x);
                 }
             }
         }
