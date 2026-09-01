@@ -3720,6 +3720,26 @@ namespace
                 }
             }
         }
+        // [valscan] PS2X_VALSCAN=<hexval>: one-shot full-RAM scans for a 32-bit value at
+        // fr>=4400 and fr>=4460 -- finds the constants source struct + DL copies without store tracing.
+        {
+            static const uint32_t s_vsv = [](){ const char *v = std::getenv("PS2X_VALSCAN"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 16) : 0u; }();
+            static int s_vsn = 0;
+            const uint64_t vfr_ = g_bt3FrameCount.load(std::memory_order_relaxed);
+            if (s_vsv && ((s_vsn == 0 && vfr_ >= 4400u) || (s_vsn == 1 && vfr_ >= 4460u)))
+            {
+                ++s_vsn;
+                const uint32_t *w = reinterpret_cast<const uint32_t *>(rdram);
+                uint32_t hits = 0;
+                for (uint32_t i = 0; i < (32u * 1024u * 1024u) / 4u; ++i)
+                    if (w[i] == s_vsv)
+                    {
+                        if (hits < 40u) std::fprintf(stderr, "[valscan] fr=%llu addr=0x%08x\n", (unsigned long long)vfr_, i * 4u);
+                        ++hits;
+                    }
+                std::fprintf(stderr, "[valscan] fr=%llu total=%u\n", (unsigned long long)vfr_, hits);
+            }
+        }
         // [ramdump] PS2X_RAMDUMP=<hexaddr>,<hexbytes>,<frame>: one-shot guest RAM dump to work/ramdump.bin
         {
             static const std::string s_rd = [](){ const char *v = std::getenv("PS2X_RAMDUMP"); return std::string(v ? v : ""); }();
