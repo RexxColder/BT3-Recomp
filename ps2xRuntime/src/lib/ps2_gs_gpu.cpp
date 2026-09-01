@@ -2816,6 +2816,32 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
             }
         }
     }
+    // [vucell4] PS2X_VUCELL4=<minframe>: per-strip terrain BAND choice = the CLUT row (CSA)
+    // in TEX0 writes whose CBP is the terrain band palette (12992). Histogram of csa values.
+    {
+        static const long s_v4 = [](){ const char *v = std::getenv("PS2X_VUCELL4"); return v && v[0] ? std::atol(v) : -1; }();
+        if (s_v4 >= 0 && (regAddr == GS_REG_TEX0_1 || regAddr == GS_REG_TEX0_2) &&
+            (uint32_t)((value >> 37) & 0x3FFFu) == 12992u)
+        {
+            extern std::atomic<uint64_t> g_bt3FrameCount;
+            const long fr4 = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
+            if (fr4 >= s_v4)
+            {
+                const uint32_t csa = (uint32_t)((value >> 56) & 0x1Fu);
+                static std::mutex s_m4; static std::map<uint32_t,uint32_t> s_h4; static std::atomic<uint32_t> s_n4{0};
+                std::lock_guard<std::mutex> lk4(s_m4);
+                ++s_h4[csa];
+                const uint32_t n4 = s_n4.fetch_add(1u) + 1u;
+                if (n4 <= 3u || (n4 % 5000u) == 0u)
+                {
+                    std::string ln = "[vucell4] fr=" + std::to_string(fr4) + " n=" + std::to_string(n4)
+                        + " psm=" + std::to_string((uint32_t)((value >> 51) & 0xFu)) + " csa-hist:";
+                    for (auto &kv : s_h4) ln += " " + std::to_string(kv.first) + "x" + std::to_string(kv.second);
+                    std::fprintf(stderr, "%s\n", ln.c_str());
+                }
+            }
+        }
+    }
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||
