@@ -4375,6 +4375,24 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     std::unique_lock<std::mutex> lk(m_mtx, std::defer_lock);
     if (s_recStage <= 0) lk.lock();
     DrawCmd c = cmd;
+    {   // [farymin] PS2X_FARYMIN=1: per-frame min screen-Y of far-pass terrain (psm20, clut 12992)
+        // triangles at RECORD time — console's stream floors at ~114px; spray above = the pale wash.
+        static const bool s_fym = [](){ const char *v = std::getenv("PS2X_FARYMIN"); return v && v[0] && v[0] != '0'; }();
+        if (s_fym && c.isTriangle && c.srcPsm == 20u && c.srcClutTbp == 12992u && !c.isTransfer)
+        {
+            static std::atomic<int> s_minY{99999}; static std::atomic<uint32_t> s_above{0}, s_tot{0}; static std::atomic<uint64_t> s_lastFr{0};
+            extern std::atomic<uint64_t> g_bt3FrameCount;
+            const uint64_t fr_ = g_bt3FrameCount.load(std::memory_order_relaxed);
+            float my = c.tri[0].y; for (int k = 1; k < 3; ++k) my = std::min(my, c.tri[k].y);
+            int myi = (int)my;
+            int cur = s_minY.load(); while (myi < cur && !s_minY.compare_exchange_weak(cur, myi)) {}
+            s_tot.fetch_add(1u); if (myi < 110) s_above.fetch_add(1u);
+            uint64_t lf = s_lastFr.load();
+            if (fr_ >= lf + 60u && s_lastFr.compare_exchange_strong(lf, fr_))
+                std::fprintf(stderr, "[farymin] fr=%llu minY=%d above110=%u tot=%u\n",
+                             (unsigned long long)fr_, s_minY.exchange(99999), s_above.exchange(0u), s_tot.exchange(0u));
+        }
+    }
     {   // PS2X_EDGEVIZ=4: BT3's outline is painted by an UNTEXTURED bm0x52 sprite
         // (Cd - Cs*Ad, vertex colour 100) whose Ad the CT16/TEXA edge passes wrote a few draws
         // earlier. Repoint that pass at 0x54 (Cs*Ad + Cd*(1-Ad)) with Cs = RED: red then appears
@@ -13062,25 +13080,6 @@ if (done.size() < 14 && !done.count(c.texKey))
         // Collapse an axis-aligned VRAM-textured triangle-pair into a sprite quad (crisp
         // thin edges). Skip for FBO sources (handled by the generic paths below).
         if (groundShadowOn() && isTerrainDraw(c)) { ++accFor(g_curGen).terrain; g_sceneFbp = c.destFbp; }
-        {   // [farymin] PS2X_FARYMIN=1: per-frame min screen-Y of far-pass terrain (psm20, clut 12992)
-            // triangles — console's stream shows a hard floor (~114 px); unclipped spray above it is
-            // the pale wash. Numeric A/B metric for CLIP semantics candidates.
-            static const bool s_fym = [](){ const char *v = std::getenv("PS2X_FARYMIN"); return v && v[0] && v[0] != '0'; }();
-            if (s_fym && c.isTriangle && c.srcPsm == 20u && c.srcClutTbp == 12992u && !c.isTransfer)
-            {
-                static std::atomic<int> s_minY{99999}; static std::atomic<uint32_t> s_above{0}, s_tot{0}; static std::atomic<uint64_t> s_lastFr{0};
-                extern std::atomic<uint64_t> g_bt3FrameCount;
-                const uint64_t fr_ = g_bt3FrameCount.load(std::memory_order_relaxed);
-                float my = c.tri[0].y; for (int k = 1; k < 3; ++k) my = std::min(my, c.tri[k].y);
-                int myi = (int)my;
-                int cur = s_minY.load(); while (myi < cur && !s_minY.compare_exchange_weak(cur, myi)) {}
-                s_tot.fetch_add(1u); if (myi < 110) s_above.fetch_add(1u);
-                uint64_t lf = s_lastFr.load();
-                if (fr_ >= lf + 60u && s_lastFr.compare_exchange_strong(lf, fr_))
-                {
-                    std::fprintf(stderr, "[farymin] fr=%llu minY=%d above110=%u tot=%u\n",
-                                 (unsigned long long)fr_, s_minY.exchange(99999), s_above.exchange(0u), s_tot.exchange(0u));
-                }
             }
         }
         if (groundShadowOn() && isFighterDraw(c)) blobAccumulate(c);   // [groundshadow] v6: accumulate only; the draw happens at the list's last command
