@@ -2130,6 +2130,20 @@ static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData,
     // [vufast2] flag / jump / integer memory ops, mirroring the interpreter cases
     case VU_LO_FCAND:
     {
+        // [vucell-pc] FCAND discovery (per-vertex cull path)
+        static const long s_vcf = [](){ const char *v = std::getenv("PS2X_VUCELL"); return v && v[0] ? std::atol(v) : -1; }();
+        if (s_vcf >= 0)
+        {
+            extern std::atomic<uint64_t> g_bt3FrameCount;
+            if ((long)g_bt3FrameCount.load(std::memory_order_relaxed) >= s_vcf)
+            {
+                static std::atomic<int> s_fa{0};
+                if (s_fa.fetch_add(1) < 40)
+                    std::fprintf(stderr, "[vucell-pc] fastFCAND pc=0x%x clip=%06x vi1=%d\n", st.pc, st.clip & 0xFFFFFFu, st.vi[1]);
+            }
+        }
+    }
+    {
         const uint32_t imm24 = (uint32_t)(uint16_t)e.loImm | ((uint32_t)e.loA << 16);
         st.vi[1] = ((st.clip & imm24) != 0u) ? 1 : 0;
         ++g_fcandN; if (st.vi[1]) ++g_fcandNZ;   // the interpreter's probe counters (its one-shot log/dump stay on the slow path)
