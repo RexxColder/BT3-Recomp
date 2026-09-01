@@ -4917,7 +4917,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 // invisible on minified textures but the NEAR ground is MAGNIFIED (1 texel =
                 // several screen px), so its residual affine error swims with camera motion
                 // ("grass feels like water"). Unset = off (generic caps).
-                static int s_gcap = 6; static float s_gerr = 0.7f;
+                static int s_gcap = 7; static float s_gerr = 0.35f;
                 // DEFAULT ON (user-accepted 2026-09-02, "grass feels like water" fixed): unset = 6,0.7
                 // for every indexed STQ terrain draw (psm 19/20, any CLUT — the palette base is
                 // stage-specific). PS2X_GRASSSUB=0 disables; =<d>,<e> overrides the caps.
@@ -4967,7 +4967,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     }
                 }
                 if (s_decalQ && shadowDecalClass && !qOk) uvErrTexels = 1e9f;
-                if ((qOk || shadowDecalClass) && uvErrTexels > (grassClass ? s_gerr : 3.0f) && cmd.tri[0].q == 1.0f)
+                if ((qOk || shadowDecalClass) && uvErrTexels > (grassClass ? 0.0f : 3.0f) && cmd.tri[0].q == 1.0f)
                 {
                     auto emitTri = [&](const SV &a, const SV &b, const SV &c2)
                     {
