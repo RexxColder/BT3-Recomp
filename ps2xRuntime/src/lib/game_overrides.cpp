@@ -3050,18 +3050,49 @@ namespace
     // [slotprobe] PS2X_SLOTPROBE=1: histogram of FUN_0024f860 returns (terrain constant-slot
     // selector; -1 = no valid streamed record => caller falls back / stale constants).
     PS2Runtime::RecompiledFunction g_orig24f860 = nullptr;
+    thread_local uint32_t g_slotProbeObj = 0;
     void bt3SlotProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        g_slotProbeObj = getRegU32(ctx, 4) & 0x1FFFFFFFu;
         if (g_orig24f860) g_orig24f860(rdram, ctx, runtime);
         const int32_t r = (int32_t)getRegU32(ctx, 2);
-        static std::mutex s_m; static std::map<int32_t, uint32_t> s_h; static std::atomic<uint32_t> s_n{0};
+        // why-analysis: walk the chain the selector walked (a0 preserved? a0 may be clobbered — use s-reg? read from entry
+        // instead: the wrapper runs AFTER orig, a0 might be stale; capture BEFORE the call would be better, but a0 is
+        // callee-preserved-enough here in practice: FUN_0024f860 keeps obj in v1. Use the captured entry value.)
+        static std::mutex s_m; static std::map<int32_t, uint32_t> s_h; static std::map<int,uint32_t> s_why; static std::atomic<uint32_t> s_n{0};
         std::lock_guard<std::mutex> lk(s_m);
         ++s_h[r];
+        if (r < 0)
+        {
+            int why = -9; uint32_t rec = 0, idx = 0, pay = 0;
+            const uint32_t obj = g_slotProbeObj;
+            if (obj)
+            {
+                const uint8_t *po = getMemPtr(rdram, obj);
+                if (po) std::memcpy(&rec, po + 0x1664, 4);
+                if (!rec) why = 0;                        // record chain empty
+                else
+                {
+                    const uint8_t *pr = getMemPtr(rdram, rec & 0x1FFFFFFFu);
+                    if (pr) std::memcpy(&idx, pr + 0x1C, 4);
+                    if (idx == 0 || idx > 100u) why = 1;  // index invalid
+                    else
+                    {
+                        const uint8_t *pp = getMemPtr(rdram, obj + 0x18u + (idx - 1u) * 4u);
+                        if (pp) std::memcpy(&pay, pp + 0x44, 4);
+                        why = pay ? 3 : 2;                // 2 = payload null, 3 = ??? (should have succeeded)
+                    }
+                }
+            }
+            ++s_why[why];
+        }
         const uint32_t n = s_n.fetch_add(1u) + 1u;
         if ((n % 2000u) == 1u)
         {
             std::string line = "[slotprobe] n=" + std::to_string(n) + " hist:";
             for (auto &kv : s_h) line += " " + std::to_string(kv.first) + "x" + std::to_string(kv.second);
+            line += " why:";
+            for (auto &kv : s_why) line += " w" + std::to_string(kv.first) + "x" + std::to_string(kv.second);
             std::fprintf(stderr, "%s\n", line.c_str());
         }
     }
