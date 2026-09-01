@@ -3033,18 +3033,14 @@ namespace
         {
             static const bool s_fr2 = [](){ const char *v = std::getenv("PS2X_FORCERICH"); return v && v[0] && v[0] != '0'; }();
             static const uint8_t s_paleHead[16] = {0xda,0xe0,0xf3,0xdc,0xdc,0xe2,0xf3,0xdc,0xda,0xe7,0xed,0xe2,0xdc,0xe5,0xe5,0xe0};
-            if (a1 == 0x10080u)
-            {   // diagnostic: log the 64KB slot's head WHENEVER IT CHANGES (does it ever load?)
-                static std::atomic<uint64_t> s_lastH{0};
+            if (a1 == 0x10080u && fr >= 4300u)
+            {   // FIGHT-TIME truth: what does the 64KB slot hold after binds settle?
                 static std::atomic<uint32_t> s_dg{0};
                 const uint8_t *dp = getMemPtr(rdram, (a0 + 0x80u) & 0x1FFFFFFFu);
-                if (dp)
-                {
-                    uint64_t h; std::memcpy(&h, dp, 8);
-                    if (h != s_lastH.exchange(h) && s_dg.fetch_add(1) < 40u)
-                        std::fprintf(stderr, "[fr-dbg] fr=%llu a0=0x%x head@+80=%016llx CHANGED\n",
-                                     (unsigned long long)fr, a0, (unsigned long long)h);
-                }
+                if (dp && s_dg.fetch_add(1) < 12u)
+                    std::fprintf(stderr, "[fr-dbg] fr=%llu a0=0x%x head@+80=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                                 (unsigned long long)fr, a0, dp[0],dp[1],dp[2],dp[3],dp[4],dp[5],dp[6],dp[7],
+                                 dp[8],dp[9],dp[10],dp[11],dp[12],dp[13],dp[14],dp[15]);
             }
             if (s_fr2 && a1 >= 0x8000u)
             {
