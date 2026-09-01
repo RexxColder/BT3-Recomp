@@ -3033,7 +3033,7 @@ namespace
         {
             static const bool s_fr2 = [](){ const char *v = std::getenv("PS2X_FORCERICH"); return v && v[0] && v[0] != '0'; }();
             static const uint8_t s_paleHead[16] = {0xda,0xe0,0xf3,0xdc,0xdc,0xe2,0xf3,0xdc,0xda,0xe7,0xed,0xe2,0xdc,0xe5,0xe5,0xe0};
-            if (s_fr2 && a1 == 0x10080u)
+            if (a1 == 0x10080u)
             {   // diagnostic: what does the 64KB blob actually hold this run?
                 static std::atomic<uint32_t> s_dg{0};
                 const uint8_t *dp = getMemPtr(rdram, (a0 + 0x80u) & 0x1FFFFFFFu);
@@ -3698,15 +3698,22 @@ namespace
             Bt3CdTickGuard tickGuard;
             if (s_pump && tickGuard.engaged && runtime->hasFunction(0x0028a3b0u))
             {
-                R5900Context tctx = *ctx;           // inherit gp/sp
-                tctx.r[31] = _mm_setzero_si128();   // ra = 0 => run until return
-                tctx.pc = 0x0028a3b0u;              // CD file-server tick
-                uint32_t steps = 0u;
-                while (tctx.pc != 0u && steps++ < 2000000u)
+                // PS2X_CDPUMP_N: tick the server N times per frame (default 1). The server is a
+                // state machine advancing ~one stage per tick; 1/frame starves multi-stage chunk
+                // requests (terrain texture slots stay 0xFE fill — the pale-terrain root).
+                static const uint32_t s_pumpN = [](){ const char *v = std::getenv("PS2X_CDPUMP_N"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 1u; }();
+                for (uint32_t pn = 0; pn < s_pumpN; ++pn)
                 {
-                    PS2Runtime::RecompiledFunction step = runtime->lookupFunction(tctx.pc);
-                    if (!step) break;
-                    step(rdram, &tctx, runtime);
+                    R5900Context tctx = *ctx;           // inherit gp/sp
+                    tctx.r[31] = _mm_setzero_si128();   // ra = 0 => run until return
+                    tctx.pc = 0x0028a3b0u;              // CD file-server tick
+                    uint32_t steps = 0u;
+                    while (tctx.pc != 0u && steps++ < 2000000u)
+                    {
+                        PS2Runtime::RecompiledFunction step = runtime->lookupFunction(tctx.pc);
+                        if (!step) break;
+                        step(rdram, &tctx, runtime);
+                    }
                 }
                 s_bt3CdTicking = false;
             }
