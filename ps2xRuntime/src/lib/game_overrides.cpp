@@ -3037,6 +3037,28 @@ namespace
         // membership at quantization boundaries; host round-nearest flips boundary
         // chunks per frame (the moving dark/light terrain patches). Restores MXCSR on
         // exit so nothing else in the frame is affected.
+        // [nodecb] PS2X_NODECB=1: census of scene-graph node draw callbacks ([node+0x34],
+        // consumed by jalr at 0x2189c0) — the band choice lives in these, not in 2188B8 itself.
+        static const bool s_cb = [](){ const char *v = std::getenv("PS2X_NODECB"); return v && v[0] && v[0] != '0'; }();
+        if (s_cb)
+        {
+            const uint32_t node = getRegU32(ctx, 4) & 0x1FFFFFFFu;
+            uint32_t cb = 0, flags = 0, ang = 0;
+            if (const uint8_t *pn = getMemPtr(rdram, node))
+            {
+                std::memcpy(&flags, pn + 0x00, 4);
+                std::memcpy(&ang,   pn + 0x04, 4);
+                std::memcpy(&cb,    pn + 0x34, 4);
+            }
+            static std::mutex s_m; static std::map<uint32_t, uint32_t> s_seen; static std::atomic<int> s_pr{0};
+            std::lock_guard<std::mutex> lk(s_m);
+            if (++s_seen[cb] == 1 && s_pr.fetch_add(1) < 40)
+            {
+                float af; std::memcpy(&af, &ang, 4);
+                std::fprintf(stderr, "[nodecb] NEW cb=0x%06x node=0x%06x flags=0x%x ang=%.4g (unique=%zu)\n",
+                             cb, node, flags, af, s_seen.size());
+            }
+        }
         static const bool s_on = [](){ const char *v = std::getenv("PS2X_TERRROUND"); return v && v[0] && v[0] != '0'; }();
         if (!s_on) { if (g_orig2188b8) g_orig2188b8(rdram, ctx, runtime); return; }
         static std::atomic<int> s_engaged{0};
