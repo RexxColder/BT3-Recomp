@@ -268,7 +268,25 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     }
     const uint32_t _vw = g_ps2ValueWatch.load(std::memory_order_relaxed);
     if (_vw != 0u && (uint32_t)valueLo == _vw)
+    {
         ps2ValueWatchReport(guestAddr & 0x1FFFFFFFu, size, valueLo, op, ctx);
+        // [vwdump] one-shot context hexdump when the watched value lands in the frame-DL region.
+        const uint32_t a_ = guestAddr & 0x1FFFFFFFu;
+        if (rdram && a_ >= 0x600000u && a_ < 0x800000u)
+        {
+            static std::atomic<int> s_vwd{0};
+            if (s_vwd.fetch_add(1) < 2)
+            {
+                const uint32_t b_ = (a_ - 0x80u) & ~0xFu;
+                for (uint32_t o_ = 0; o_ < 0x140u; o_ += 16u)
+                {
+                    const uint8_t *q_ = rdram + b_ + o_;
+                    uint32_t w_[4]; std::memcpy(w_, q_, 16);
+                    std::fprintf(stderr, "[vwdump] 0x%08x: %08x %08x %08x %08x\n", b_ + o_, w_[0], w_[1], w_[2], w_[3]);
+                }
+            }
+        }
+    }
     (void)size;
     (void)valueLo;
     (void)valueHi;
