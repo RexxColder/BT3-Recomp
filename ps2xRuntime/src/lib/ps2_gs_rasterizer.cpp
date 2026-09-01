@@ -4205,8 +4205,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         // class (psm19/20, CLUT 12992). GL bilinear on this tiled carousel sheet bleeds across
         // tile edges and washes the distant strata (replay-verified: PS2X_BILINEAR=0 restores
         // console banding); scope the point-sampling so gradients elsewhere keep bilinear.
-        static const bool s_tp = [](){ const char *v = std::getenv("PS2X_TERRAINPOINT"); return v && v[0] && v[0] != '0'; }();
-        if (s_tp && (ctx.tex0.psm == 19u || ctx.tex0.psm == 20u) && (ctx.tex0.cbp == 12992u || (ctx.tex0.cbp >= 15616u && ctx.tex0.cbp <= 15640u)))
+        static const int s_tp = [](){ const char *v = std::getenv("PS2X_TERRAINPOINT"); return v && v[0] ? std::atoi(v) : 0; }();
+        if ((s_tp == 1 && (ctx.tex0.psm == 19u || ctx.tex0.psm == 20u) && (ctx.tex0.cbp == 12992u || (ctx.tex0.cbp >= 15616u && ctx.tex0.cbp <= 15640u)))
+            || (s_tp == 2 && (ctx.tex0.psm == 19u || ctx.tex0.psm == 20u)))
         {
             cmd.bilinear = false;
             static unsigned long s_tpn = 0;
