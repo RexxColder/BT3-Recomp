@@ -3488,6 +3488,10 @@ namespace
             static uint32_t ra_=0, rb_=0, rf_=0;
             static const bool s_rok = !s_rd.empty() && std::sscanf(s_rd.c_str(), "%x,%x,%x", &ra_, &rb_, &rf_) == 3;
             static bool s_rdone = false;
+            { static bool s_said = false;
+              if (!s_said && !s_rd.empty()) { s_said = true;
+                std::fprintf(stderr, "[ramdump] cfg='%s' ok=%d addr=0x%x bytes=0x%x frGate=%u\n",
+                             s_rd.c_str(), (int)s_rok, ra_, rb_, rf_); } }
             if (s_rok && !s_rdone && g_bt3FrameCount.load(std::memory_order_relaxed) >= rf_)
             {
                 s_rdone = true;
