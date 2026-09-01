@@ -3010,6 +3010,23 @@ namespace
                          a0, cur, ra, back ? "  <== ROLLBACK" : "");
         if (g_rbOrig) g_rbOrig(rdram, ctx, runtime);
     }
+    // [carousel] PS2X_CAROUSEL=1: hook the DL blob-append func_1006E8(src,size) and log large
+    // appends (the block-10752 texture carousel) with src + caller — names the selection site
+    // that picks pak+0x417000 (pale) instead of pak+0x406b40 (correct).
+    PS2Runtime::RecompiledFunction g_caOrig = nullptr;
+    void bt3CarouselProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), ra = getRegU32(ctx, 31);
+        const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+        if (a1 >= 0x4000u && fr >= 1600u)
+        {
+            static std::atomic<uint32_t> s_n{0};
+            if (s_n.fetch_add(1) < 80u)
+                std::fprintf(stderr, "[carousel] fr=%llu src=0x%x size=0x%x ra=0x%x\n",
+                             (unsigned long long)fr, a0, a1, ra);
+        }
+        if (g_caOrig) g_caOrig(rdram, ctx, runtime);
+    }
     void bt3StageGateArm(PS2Runtime &runtime)
     {
         PS2Runtime::RecompiledFunction fns[] = { &bt3StageGateFn<0>, &bt3StageGateFn<1>, &bt3StageGateFn<2>, &bt3StageGateFn<3> };
@@ -3998,6 +4015,12 @@ namespace
             runtime.replaceFunction(0x00100ab8u, &bt3FrameKick);
         if (const char *v = std::getenv("PS2X_STAGEGATE"); v && v[0] && v[0] != '0')
             bt3StageGateArm(runtime);
+        if (const char *v = std::getenv("PS2X_CAROUSEL"); v && v[0] && v[0] != '0')
+        {
+            g_caOrig = runtime.lookupFunction(0x001006e8u);
+            if (g_caOrig) runtime.replaceFunction(0x001006e8u, &bt3CarouselProbe);
+            std::fprintf(stderr, "[carousel] hook %s\n", g_caOrig ? "ok" : "MISSING");
+        }
         if (const char *v = std::getenv("PS2X_ROLLBACK"); v && v[0] && v[0] != '0')
         {
             g_rbOrig = runtime.lookupFunction(0x00100890u);
