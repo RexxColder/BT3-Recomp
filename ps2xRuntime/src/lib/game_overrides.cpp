@@ -2991,6 +2991,25 @@ namespace
                          g5690 ? r32(g5690 + 8u) : 0u, g5690 ? r32(g5690 + 0x1Cu) : 0u);
         if (sl.orig) sl.orig(rdram, ctx, runtime);
     }
+    // [rollback] PS2X_ROLLBACK=1: hook the DL finalizer sub_00100890(end). It sets the shared
+    // cursor [gp-0x59D8] = end; if end < current cursor that is a CURSOR ROLLBACK — the event
+    // that lets later passes overwrite the stage-sheet upload. Log the caller (ra).
+    PS2Runtime::RecompiledFunction g_rbOrig = nullptr;
+    void bt3RollbackProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u);
+        const uint32_t gp = getRegU32(ctx, 28), a0 = getRegU32(ctx, 4), ra = getRegU32(ctx, 31);
+        uint32_t cur = 0;
+        if (const uint8_t *pp = getMemPtr(rdram, (gp - 0x59D8u) & 0x1FFFFFFFu)) std::memcpy(&cur, pp, 4);
+        const bool back = a0 < cur;
+        static std::atomic<uint32_t> s_bk{0};
+        if (n < 4u || (back && s_bk.fetch_add(1u) < 30u))
+            std::fprintf(stderr, "[rollback] #%u fr=%llu end=0x%x cursor=0x%x ra=0x%x%s\n",
+                         n, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
+                         a0, cur, ra, back ? "  <== ROLLBACK" : "");
+        if (g_rbOrig) g_rbOrig(rdram, ctx, runtime);
+    }
     void bt3StageGateArm(PS2Runtime &runtime)
     {
         PS2Runtime::RecompiledFunction fns[] = { &bt3StageGateFn<0>, &bt3StageGateFn<1>, &bt3StageGateFn<2>, &bt3StageGateFn<3> };
@@ -3979,6 +3998,12 @@ namespace
             runtime.replaceFunction(0x00100ab8u, &bt3FrameKick);
         if (const char *v = std::getenv("PS2X_STAGEGATE"); v && v[0] && v[0] != '0')
             bt3StageGateArm(runtime);
+        if (const char *v = std::getenv("PS2X_ROLLBACK"); v && v[0] && v[0] != '0')
+        {
+            g_rbOrig = runtime.lookupFunction(0x00100890u);
+            if (g_rbOrig) runtime.replaceFunction(0x00100890u, &bt3RollbackProbe);
+            std::fprintf(stderr, "[rollback] hook %s\n", g_rbOrig ? "ok" : "MISSING");
+        }
         // Resource-ready probe hook (only logs under PS2X_LOADPROBE; passthrough otherwise).
         g_orig252d78 = runtime.lookupFunction(0x00252d78u);
         if (g_orig252d78)
