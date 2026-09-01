@@ -643,15 +643,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 {
                     g_upsrcArmSheet = false;
                     static std::atomic<int> s_sc{0};
-                    {   // [upsrc3 2026-09-01] dump the WHOLE armed payload once + multi-window RAM base vote
-                        static std::atomic<bool> s_dumped{false};
-                        bool exp=false;
-                        if (s_dumped.compare_exchange_strong(exp,true))
+                    {   // [upsrc3 2026-09-01] dump the first SIX armed payloads + multi-window RAM base vote
+                        static std::atomic<int> s_dumpN{0};
+                        const int dn = s_dumpN.fetch_add(1);
+                        if (dn < 6)
                         {
                             const uint32_t lim3 = std::min(sizeBytes - pos, qwCount * 16u);
-                            if (FILE *f = std::fopen("/home/z3/Desktop/bt3/work/upload_payload.bin","wb"))
+                            char pth3[96];
+                            std::snprintf(pth3, sizeof pth3, "/home/z3/Desktop/bt3/work/upload_payload_%d.bin", dn);
+                            if (FILE *f = std::fopen(pth3,"wb"))
                             { std::fwrite(data + pos, 1, lim3, f); std::fclose(f);
-                              std::fprintf(stderr, "[upsrc3] payload dumped (%u bytes)\n", lim3); }
+                              std::fprintf(stderr, "[upsrc3] payload %d dumped (%u bytes)\n", dn, lim3); }
                             // vote: 10 entropy-checked windows spread across the payload; base = home - windowOff
                             int votes = 0; uint32_t base0 = 0; int agree = 0;
                             for (int wnd = 0; wnd < 10; ++wnd)
