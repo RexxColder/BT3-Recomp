@@ -673,8 +673,19 @@ namespace
             if (active)
             {
                 saved = _mm_getcsr();
-                // RZ (round toward zero) | FTZ | DAZ
-                _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8040u);
+                // [vudaz] PS2X_VUDAZ=<minframe>: from that frame on, keep RZ but DROP FTZ/DAZ —
+                // PCSX2's reference VU path preserves denormal bit patterns; ours flushed them
+                // both directions (a wholesale data difference on denormal-encoded values).
+                static const long s_dazFr = [](){ const char *v = std::getenv("PS2X_VUDAZ"); return v && v[0] ? std::atol(v) : -1; }();
+                uint32_t extra = 0x8040u;
+                if (s_dazFr >= 0)
+                {
+                    extern std::atomic<uint64_t> g_bt3FrameCount;
+                    if ((long)g_bt3FrameCount.load(std::memory_order_relaxed) >= s_dazFr)
+                        extra = 0u;
+                }
+                // RZ (round toward zero) | FTZ | DAZ (unless [vudaz] active)
+                _mm_setcsr((saved & ~0xE040u) | 0x6000u | extra);
             }
         }
         ~VuRoundScope() { if (active) _mm_setcsr(saved); }
