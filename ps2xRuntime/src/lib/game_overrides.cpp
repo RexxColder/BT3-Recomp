@@ -3445,6 +3445,21 @@ namespace
         // would only advance when the next SE command happened to arrive.
         seServiceVoices(runtime);
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
+        // [ramdump] PS2X_RAMDUMP=<hexaddr>,<hexbytes>,<frame>: one-shot guest RAM dump to work/ramdump.bin
+        {
+            static const std::string s_rd = [](){ const char *v = std::getenv("PS2X_RAMDUMP"); return std::string(v ? v : ""); }();
+            static uint32_t ra_=0, rb_=0, rf_=0;
+            static const bool s_rok = !s_rd.empty() && std::sscanf(s_rd.c_str(), "%x,%x,%x", &ra_, &rb_, &rf_) == 3;
+            static bool s_rdone = false;
+            if (s_rok && !s_rdone && g_bt3FrameCount.load(std::memory_order_relaxed) >= rf_)
+            {
+                s_rdone = true;
+                if (const uint8_t *pr = getMemPtr(rdram, ra_))
+                    if (FILE *f = std::fopen("/home/z3/Desktop/bt3/work/ramdump.bin", "wb"))
+                    { std::fwrite(pr, 1, rb_, f); std::fclose(f);
+                      std::fprintf(stderr, "[ramdump] 0x%x +0x%x written at fr=%u\n", ra_, rb_, rf_); }
+            }
+        }
         // [sheetwatch] PS2X_SHEETWATCH=1: per-frame content watch on the terrain band sheet
         // buffer (0x53d3a0) — prints the frame whenever the first 64 bytes change.
         {
