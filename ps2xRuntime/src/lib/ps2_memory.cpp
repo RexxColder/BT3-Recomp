@@ -2198,6 +2198,21 @@ void PS2Memory::processPendingTransfers()
                         break;
                     m_seenGifCopy = true;
                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+                    // [upsrc] PS2X_UPSRC=1: find the guest RAM source of the terrain band-sheet
+                    // upload — scan PATH3 chunks for an A+D BITBLTBUF with DBP==10752, report srcPhys.
+                    if ([](){ static const char *s_env = std::getenv("PS2X_UPSRC"); return s_env; }()) {
+                        static std::atomic<int> s_us{0};
+                        for (uint32_t o = 0; o + 16 <= chunk && s_us.load(std::memory_order_relaxed) < 24; o += 16) {
+                            uint64_t d0, d1;
+                            std::memcpy(&d0, m_rdram + srcPhys + o, 8);
+                            std::memcpy(&d1, m_rdram + srcPhys + o + 8, 8);
+                            if ((d1 & 0xFFu) == 0x50u && ((d0 >> 32) & 0x3FFFu) == 10752u) {
+                                if (s_us.fetch_add(1) < 24)
+                                    fprintf(stderr, "[upsrc] BITBLTBUF dbp=10752 sbp=%u spsm=%u at srcPhys=0x%08x +%u chunk=%u\n",
+                                        (uint32_t)(d0 & 0x3FFFu), (uint32_t)((d0 >> 24) & 0x3Fu), srcPhys, o, chunk);
+                            }
+                        }
+                    }
                     if ([](){ static const char *s_env = std::getenv("PS2X_GIFSRC"); return s_env; }()) {
                         // Scan the packet for a HUD-texture TEX0 (tbp0 in [10752,11264], psm=19)
                         // and report the EE source address the sprite engine built it at.
