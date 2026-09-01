@@ -915,6 +915,14 @@ namespace ps2_stubs
         // then re-uploads that garbage later -> persistent VRAM texture corruption).
         fenceAsyncKickForGsAccess(runtime);
         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
+        ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "storeimg", nullptr);
+        {   // [storeimg] every VRAM->RAM download: the un-hooked guest-RAM writer class (found 2026-09-01)
+            static const bool s_si = [](){ const char *v = std::getenv("PS2X_STOREIMG"); return v && v[0] && v[0] != '0'; }();
+            if (s_si)
+                std::fprintf(stderr, "[storeimg] sbp=%u psm=%u fbw=%u w=%u h=%u dst=0x%08x bytes=%u\n",
+                             sbp, (uint32_t)img.psm, fbw, (uint32_t)img.width, (uint32_t)img.height,
+                             dstAddr, totalImageBytes);
+        }
         runtime->guestFree(pktAddr);
 
         setReturnS32(ctx, 0);
