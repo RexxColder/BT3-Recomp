@@ -1204,7 +1204,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 // [clipint] PS2X_CLIPINT=1: PCSX2-exact CLIP — integer sign-magnitude compares
                 // with denormal-w promotion (VUops.cpp _vuCLIP). Covers denormal/NaN/-0 edges that
                 // float fabs/> under FTZ/DAZ judges differently.
-                static const bool s_clipInt = [](){ const char *v = std::getenv("PS2X_CLIPINT"); return v && v[0] && v[0] != '0'; }();
+                static const long s_clipIntFr = [](){ const char *v = std::getenv("PS2X_CLIPINT"); return v && v[0] ? std::atol(v) : -1; }();
+            bool s_clipInt = false;
+            if (s_clipIntFr >= 0)
+            {
+                extern std::atomic<uint64_t> g_bt3FrameCount;
+                s_clipInt = (long)g_bt3FrameCount.load(std::memory_order_relaxed) >= s_clipIntFr;
+            }
                 uint32_t flags = 0;
                 if (s_clipInt)
                 {
@@ -1911,7 +1917,13 @@ void VU1Interpreter::execUpper(uint32_t instr)
             // [clipint] PS2X_CLIPINT=1: PCSX2-exact CLIP — integer sign-magnitude compares
             // with denormal-w promotion (VUops.cpp _vuCLIP). Covers denormal/NaN/-0 edges that
             // float fabs/> under FTZ/DAZ judges differently.
-            static const bool s_clipInt = [](){ const char *v = std::getenv("PS2X_CLIPINT"); return v && v[0] && v[0] != '0'; }();
+            static const long s_clipIntFr = [](){ const char *v = std::getenv("PS2X_CLIPINT"); return v && v[0] ? std::atol(v) : -1; }();
+            bool s_clipInt = false;
+            if (s_clipIntFr >= 0)
+            {
+                extern std::atomic<uint64_t> g_bt3FrameCount;
+                s_clipInt = (long)g_bt3FrameCount.load(std::memory_order_relaxed) >= s_clipIntFr;
+            }
             uint32_t flags = 0;
             if (s_clipInt)
             {
