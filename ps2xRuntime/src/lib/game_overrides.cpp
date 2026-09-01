@@ -3018,11 +3018,11 @@ namespace
     {
         const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), ra = getRegU32(ctx, 31);
         const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
-        if (a1 >= 0x4000u && fr >= 1600u)
+        if (a1 >= 0x4000u && fr >= 1600u && a0 >= 0x103f9c0u && a0 < 0x1640000u)
         {
             static std::atomic<uint32_t> s_n{0};
-            if (s_n.fetch_add(1) < 80u)
-                std::fprintf(stderr, "[carousel] fr=%llu src=0x%x size=0x%x ra=0x%x\n",
+            if (s_n.fetch_add(1) < 120u)
+                std::fprintf(stderr, "[carousel] fr=%llu ref=0x%x len=0x%x ra=0x%x\n",
                              (unsigned long long)fr, a0, a1, ra);
         }
         if (g_caOrig) g_caOrig(rdram, ctx, runtime);
@@ -4017,8 +4017,8 @@ namespace
             bt3StageGateArm(runtime);
         if (const char *v = std::getenv("PS2X_CAROUSEL"); v && v[0] && v[0] != '0')
         {
-            g_caOrig = runtime.lookupFunction(0x001006e8u);
-            if (g_caOrig) runtime.replaceFunction(0x001006e8u, &bt3CarouselProbe);
+            g_caOrig = runtime.lookupFunction(0x00100738u);
+            if (g_caOrig) runtime.replaceFunction(0x00100738u, &bt3CarouselProbe);
             std::fprintf(stderr, "[carousel] hook %s\n", g_caOrig ? "ok" : "MISSING");
         }
         if (const char *v = std::getenv("PS2X_ROLLBACK"); v && v[0] && v[0] != '0')
