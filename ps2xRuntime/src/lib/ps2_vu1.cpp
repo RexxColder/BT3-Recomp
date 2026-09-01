@@ -664,6 +664,7 @@ static void vucell2Dump(uint32_t pc, const float (*vf)[4])
     if (s_fr < 0) return;
     const uint32_t ext = g_curCodeSize;
     if (!((ext == 0xc78u && pc == 0x1f8u) || (ext == 0xe18u && pc == 0x2c8u))) return;
+    extern std::atomic<uint64_t> g_bt3FrameCount;
     const long fr = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
     if (fr < s_fr) return;
     static std::atomic<uint32_t> s_n{0};
