@@ -1,3 +1,4 @@
+#include "runtime/ps2_memory.h"
 #include <iomanip>
 #include <cstdlib>
 #if !defined(_WIN32)
@@ -105,6 +106,23 @@ std::atomic<uint32_t> g_bt3DrawMethod{0};
 void ps2ValueWatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo,
                          const char *op, const R5900Context *ctx)
 {
+    {   // [vwdump] one-shot hexdump around value-watch hits landing in the frame-DL region
+        const uint32_t a_ = guestAddr & 0x1FFFFFFFu;
+        uint8_t *rd_ = ps2GetRdramHostPtr();
+        if (rd_ && a_ >= 0x600000u && a_ < 0x800000u)
+        {
+            static std::atomic<int> s_vwd{0};
+            if (s_vwd.fetch_add(1) < 2)
+            {
+                const uint32_t b_ = (a_ - 0x80u) & ~0xFu;
+                for (uint32_t o_ = 0; o_ < 0x140u; o_ += 16u)
+                {
+                    uint32_t w_[4]; std::memcpy(w_, rd_ + b_ + o_, 16);
+                    std::fprintf(stderr, "[vwdump] 0x%08x: %08x %08x %08x %08x\n", b_ + o_, w_[0], w_[1], w_[2], w_[3]);
+                }
+            }
+        }
+    }
     static std::atomic<uint32_t> s_n{0};
     const uint32_t n = s_n.fetch_add(1);
     if (n < 400u)
