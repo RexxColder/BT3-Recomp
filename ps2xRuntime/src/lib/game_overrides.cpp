@@ -3138,7 +3138,7 @@ namespace
                 std::fprintf(stderr, "[force14] #%u fr=%llu a0=0x%x a1=%u ra=0x%x\n",
                              n, (unsigned long long)frF, a0, a1, getRegU32(ctx, 31));
         }
-        if (a0 == 0x135a620u && a1 == 15u)
+        if (a0 == 0x135a5c0u && a1 == 15u)
         {
             SET_GPR_U32(ctx, 5, 14u);
             static std::atomic<uint32_t> s_r{0};
