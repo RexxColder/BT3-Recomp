@@ -4376,7 +4376,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     if (s_recStage <= 0) lk.lock();
     DrawCmd c = cmd;
     {   // [farymin] PS2X_FARYMIN=1: per-frame min screen-Y of far-pass terrain (psm20, clut 12992)
-        // triangles at RECORD time — console's stream floors at ~114px; spray above = the pale wash.
+        // triangles at RECORD time — console floors at ~114px; spray above = the pale wash.
         static const bool s_fym = [](){ const char *v = std::getenv("PS2X_FARYMIN"); return v && v[0] && v[0] != '0'; }();
         if (s_fym && c.isTriangle && c.srcPsm == 20u && c.srcClutTbp == 12992u && !c.isTransfer)
         {
@@ -13080,8 +13080,6 @@ if (done.size() < 14 && !done.count(c.texKey))
         // Collapse an axis-aligned VRAM-textured triangle-pair into a sprite quad (crisp
         // thin edges). Skip for FBO sources (handled by the generic paths below).
         if (groundShadowOn() && isTerrainDraw(c)) { ++accFor(g_curGen).terrain; g_sceneFbp = c.destFbp; }
-            }
-        }
         if (groundShadowOn() && isFighterDraw(c)) blobAccumulate(c);   // [groundshadow] v6: accumulate only; the draw happens at the list's last command
         {   // [shadowdecal] PS2X_SHADOWDECAL=0 skips the game's ground-shadow decal pass (floor-tile triangles sampling the
             // 256x256 PSMCT24 view of page 336 with TEXA AEM, vtxA=63, bm 0x44, DATE on). Its source is the mask chain we
