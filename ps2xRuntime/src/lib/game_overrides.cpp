@@ -3047,6 +3047,24 @@ namespace
         }
         if (g_orig111358) g_orig111358(rdram, ctx, runtime);
     }
+    // [slotprobe] PS2X_SLOTPROBE=1: histogram of FUN_0024f860 returns (terrain constant-slot
+    // selector; -1 = no valid streamed record => caller falls back / stale constants).
+    PS2Runtime::RecompiledFunction g_orig24f860 = nullptr;
+    void bt3SlotProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_orig24f860) g_orig24f860(rdram, ctx, runtime);
+        const int32_t r = (int32_t)getRegU32(ctx, 2);
+        static std::mutex s_m; static std::map<int32_t, uint32_t> s_h; static std::atomic<uint32_t> s_n{0};
+        std::lock_guard<std::mutex> lk(s_m);
+        ++s_h[r];
+        const uint32_t n = s_n.fetch_add(1u) + 1u;
+        if ((n % 2000u) == 1u)
+        {
+            std::string line = "[slotprobe] n=" + std::to_string(n) + " hist:";
+            for (auto &kv : s_h) line += " " + std::to_string(kv.first) + "x" + std::to_string(kv.second);
+            std::fprintf(stderr, "%s\n", line.c_str());
+        }
+    }
     PS2Runtime::RecompiledFunction g_orig2188b8 = nullptr;
     void bt3TerrRoundScope(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -3850,6 +3868,11 @@ namespace
                 if (g_orig2722c0) runtime.replaceFunction(0x002722c0u, &bt3ThunkStackWatch);
                 g_orig2188b8 = runtime.lookupFunction(0x002188b8u);   // [terrround]
                 if (g_orig2188b8) runtime.replaceFunction(0x002188b8u, &bt3TerrRoundScope);
+                if (std::getenv("PS2X_SLOTPROBE"))
+                {
+                    g_orig24f860 = runtime.lookupFunction(0x0024f860u);   // [slotprobe]
+                    if (g_orig24f860) runtime.replaceFunction(0x0024f860u, &bt3SlotProbe);
+                }
                 if (std::getenv("PS2X_VF3PROBE"))
                 {
                     g_orig111358 = runtime.lookupFunction(0x00111358u);   // [vf3probe]
