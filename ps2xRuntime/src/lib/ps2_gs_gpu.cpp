@@ -2828,11 +2828,25 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
             if (fr4 >= s_v4)
             {
                 const uint32_t csa = (uint32_t)((value >> 56) & 0x1Fu);
+                // bind-time palette content: mean RGB of the VRAM palette at cbp 12992 (linear bytes)
+                uint32_t pm = 0, pt = 0;
+                {
+                    const size_t off = (size_t)12992 * 256;
+                    if (off + 1024 <= m_vramSize)
+                    {
+                        uint32_t s0 = 0, s1 = 0;
+                        for (int i = 0; i < 224; ++i) { const uint8_t *e = m_vram + off + i*4; s0 += e[0]+e[1]+e[2]; }
+                        for (int i = 224; i < 256; ++i) { const uint8_t *e = m_vram + off + i*4; s1 += e[0]+e[1]+e[2]; }
+                        pm = s0 / (224*3); pt = s1 / (32*3);
+                    }
+                }
                 static std::mutex s_m4; static std::map<uint32_t,uint32_t> s_h4; static std::atomic<uint32_t> s_n4{0};
+                static std::atomic<uint64_t> s_pmSum{0}, s_ptSum{0};
                 std::lock_guard<std::mutex> lk4(s_m4);
                 ++s_h4[csa];
+                s_pmSum.fetch_add(pm); s_ptSum.fetch_add(pt);
                 const uint32_t n4 = s_n4.fetch_add(1u) + 1u;
-                if (n4 <= 3u || (n4 % 5000u) == 0u)
+                if (n4 <= 3u || (n4 % 200u) == 0u)
                 {
                     char raw[64];
                     std::snprintf(raw, sizeof raw, " tbp0=%u tbw=%u tpsm=%u tw=%u th=%u",
@@ -2840,7 +2854,9 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
                                   (uint32_t)((value >> 20) & 0x3Fu), (uint32_t)((value >> 26) & 0xFu),
                                   (uint32_t)((value >> 30) & 0xFu));
                     std::string ln = "[vucell4] fr=" + std::to_string(fr4) + " n=" + std::to_string(n4)
-                        + " psm=" + std::to_string((uint32_t)((value >> 51) & 0xFu)) + raw + " csa-hist:";
+                        + " tpsm=" + std::to_string((uint32_t)((value >> 20) & 0x3Fu))
+                        + " palMean=" + std::to_string(pm) + " palTop=" + std::to_string(pt)
+                        + " avgMean=" + std::to_string(s_pmSum.load()/n4) + " avgTop=" + std::to_string(s_ptSum.load()/n4) + raw + " csa-hist:";
                     for (auto &kv : s_h4) ln += " " + std::to_string(kv.first) + "x" + std::to_string(kv.second);
                     std::fprintf(stderr, "%s\n", ln.c_str());
                 }
