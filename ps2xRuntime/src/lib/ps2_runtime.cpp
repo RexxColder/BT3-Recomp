@@ -120,6 +120,12 @@ void ps2ValueWatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo,
                     uint32_t w_[4]; std::memcpy(w_, rd_ + b_ + o_, 16);
                     std::fprintf(stderr, "[vwdump] 0x%08x: %08x %08x %08x %08x\n", b_ + o_, w_[0], w_[1], w_[2], w_[3]);
                 }
+                // [clobcatch] arm the store-watch on the REF tag qword: the next writer that
+                // touches it before the kick is the clobberer (prints as [camwrite] with pc/ra).
+                g_ps2WatchLo.store((a_ - 4u) & ~0xFu, std::memory_order_relaxed);
+                g_ps2WatchHi.store(((a_ - 4u) & ~0xFu) + 0x10u, std::memory_order_relaxed);
+                g_ps2WatchAll.store(1u, std::memory_order_relaxed);
+                std::fprintf(stderr, "[clobcatch] armed 0x%08x..+0x10\n", (a_ - 4u) & ~0xFu);
             }
         }
     }
