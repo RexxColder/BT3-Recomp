@@ -1,3 +1,4 @@
+#include <set>
 #include <unistd.h>
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_gs_gpu.h"
