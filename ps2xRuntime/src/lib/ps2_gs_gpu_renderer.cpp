@@ -4374,7 +4374,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     }
     std::unique_lock<std::mutex> lk(m_mtx, std::defer_lock);
     if (s_recStage <= 0) lk.lock();
-    DrawCmd &c = const_cast<DrawCmd &>(cmd);   // [cmdref] alias, not a copy: the 328B copy (3 shared_ptr refcounts) ran per draw; the single real copy happens at push. Env-gated mutators (edgeviz/NODOF/NOSHCOMP/NOWIPE...) now write the caller cmd — idempotent per draw class, and callers reassign fields per draw.
+    DrawCmd c = cmd;   // [cmdref-revert] the alias let env-gated mutators (NOSHCOMP in play.sh!) poison the CALLER'S reused cmd -> fbmsk=ALL stuck -> HUD vanished in live play. Local copy restored; keep [listswap].
     {   // [farskip] PS2X_FARSKIP=1: drop the far-terrain pass (psm20/clut12992) entirely —
         // if the pale wash disappears, the wash IS this pass (texture-sampling suspect).
         static const bool s_fsk = [](){ const char *v = std::getenv("PS2X_FARSKIP"); return v && v[0] && v[0] != '0'; }();
@@ -4429,7 +4429,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
             if ((++fired % 16ul) == 1ul)
                 std::fprintf(stderr, "[edgeviz] mode %d fired on the darkener, dest f%u (#%lu)\n",
                              s_ev, c.destFbp, fired);
-            DrawCmd &mc = const_cast<DrawCmd &>(cmd);   // [cmdref] diagnostic mode mutates the caller cmd (same as the gpualias tag)
+            DrawCmd &mc = c;   // mutate the local copy
             // mode 5: neutralise the darkener entirely (FIX=0 -> Cd - Cs*0 = Cd). If the frame is
             // byte-identical with it gone, the pass contributes NOTHING despite Ad measuring
             // 0.188 on 1261 pixels, which puts the fault in the blend factors, not the mask.
@@ -4995,7 +4995,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     }
     if (s_recStage <= 0)
     {
-        (m_segSwapped ? m_buildingShadow : m_building).push_back(cmd);   // [cmdref] single copy straight into the list; [segshadow]
+        (m_segSwapped ? m_buildingShadow : m_building).push_back(std::move(c));   // [cmdmove]; [segshadow]
         {   // [prerender] wake the GL thread once a chunk's worth of new commands is waiting
             const int k = prerenderK();
             if (k > 0 && m_building.size() > m_segFrom && ((m_building.size() - m_segFrom) % (size_t)k) == 0u && !g_preReady.exchange(true))
@@ -5004,7 +5004,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     }
     else
     {
-        m_stage.push_back(cmd);   // [cmdref]
+        m_stage.push_back(std::move(c));
         if (m_stage.size() >= (size_t)s_recStage) flushStage();   // lk is not held on this branch
     }
     ++m_recordCount;
