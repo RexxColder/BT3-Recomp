@@ -50,7 +50,9 @@ static inline void ps2xWatchStore(uint32_t address, const void *bytes, uint32_t 
     if (!hit && !s_custom) { const uint32_t *w = reinterpret_cast<const uint32_t *>(bytes);
         for (uint32_t i = 0; i < n / 4u; ++i) if (w[i] == 0x44db523du) { hit = true; break; } }
     if (!hit) return;
-    static int s_n = 0; if (s_n++ >= 60) return;
+    static const uint32_t s_frMin = [](){ const char *v = std::getenv("PS2X_WATCH_FRMIN"); return v ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
+    if (s_frMin) { extern std::atomic<uint64_t> g_bt3FrameCount; if (g_bt3FrameCount.load(std::memory_order_relaxed) < s_frMin) return; }
+    static int s_n = 0; if (s_n++ >= 120) return;
     const uint32_t *w = reinterpret_cast<const uint32_t *>(bytes);
     std::fprintf(stderr, "[watch] store EEva=0x%08x n=%u val0=0x%08x -- backtrace:\n", address, n, w[0]);
 #if !defined(_WIN32)
