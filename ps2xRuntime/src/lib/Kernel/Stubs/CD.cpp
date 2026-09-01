@@ -156,7 +156,11 @@ namespace ps2_stubs
                     }
                 }
             }
-            return readCdSectors(lbn, args.sectors, rdram + offset, bytes);
+            {
+                const bool ok_ = readCdSectors(lbn, args.sectors, rdram + offset, bytes);
+                if (ok_) ps2TraceGuestRangeWrite(rdram, offset, (uint32_t)bytes, "cdread", ctx);
+                return ok_;
+            }
         };
 
         CdReadArgs selected{a0, a1, a2, "a0/a1/a2"};
@@ -466,7 +470,9 @@ namespace ps2_stubs
                 bytes = maxBytes;
             }
 
-            if (!readCdSectors(lbn, sectors, rdram + offset, bytes))
+            if (readCdSectors(lbn, sectors, rdram + offset, bytes))
+                ps2TraceGuestRangeWrite(rdram, offset, (uint32_t)bytes, "cdchain", ctx);
+            else if (true)
             {
                 ok = false;
                 break;
@@ -700,6 +706,7 @@ namespace ps2_stubs
         const bool ok = (sectors > 0u) && readCdSectors(readLbn, sectors, rdram + offset, bytes);
         if (ok)
         {
+            ps2TraceGuestRangeWrite(rdram, offset, (uint32_t)bytes, "cdstream", ctx);
             g_cdStreamingLbn += sectors;
             if (requestedBytes > bytes)
             {
