@@ -2141,7 +2141,37 @@ static bool execLowerFast(VU1State &st, const VuDecodeEntry &e, uint8_t *vuData,
         st.vi[1] = ((st.clip | imm24) == 0xFFFFFFu) ? 1 : 0;
         return true;
     }
-    case VU_LO_FCGET: if (e.loA != 0) st.vi[e.loA] = (int32_t)(st.clip & 0xFFFu); return true;
+    case VU_LO_FCGET:
+    {
+        if (e.loA != 0) st.vi[e.loA] = (int32_t)(st.clip & 0xFFFu);
+        // [vucell] fast-path twin of the execLower probe (see case 0x1C there).
+        static const long s_vc2 = [](){ const char *v = std::getenv("PS2X_VUCELL"); return v && v[0] ? std::atol(v) : -1; }();
+        if (s_vc2 >= 0 && (st.pc == 0xa88u || st.pc == 0x928u))
+        {
+            extern std::atomic<uint64_t> g_bt3FrameCount;
+            const long fr = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
+            static const bool s_armF2 = [](){ const char *v = std::getenv("PS2X_VUCELL_ARM"); return v && v[0] && v[0] != '0'; }();
+            static std::atomic<bool> s_go2{false};
+            bool go = !s_armF2 || s_go2.load(std::memory_order_relaxed);
+            if (!go && s_armF2)
+            {
+                static std::atomic<int> s_chk2{0};
+                if ((s_chk2.fetch_add(1) & 127) == 0 && ::access("/tmp/ps2x_cell", F_OK) == 0)
+                { s_go2.store(true, std::memory_order_relaxed); go = true; std::fprintf(stderr, "[vucell] TRIGGERED\n"); }
+            }
+            if (go && fr >= s_vc2)
+            {
+                static std::atomic<int> s_n2{0};
+                if (s_n2.fetch_add(1) < 800)
+                    std::fprintf(stderr, "[vucell] fr=%ld pc=0x%x clip=%06x vi5=%d vi6=%d vi7=%d vi10=%d vi11=%d c1=(%.1f,%.1f,%.1f,%.3f) c2=(%.1f,%.1f,%.1f,%.3f)\n",
+                                 fr, st.pc, st.clip & 0xFFFFFFu,
+                                 st.vi[5], st.vi[6], st.vi[7], st.vi[10], st.vi[11],
+                                 st.vf[17][0], st.vf[17][1], st.vf[17][2], st.vf[17][3],
+                                 st.vf[21][0], st.vf[21][1], st.vf[21][2], st.vf[21][3]);
+            }
+        }
+        return true;
+    }
     case VU_LO_JR:   { st.branchTarget = ((uint32_t)(uint16_t)st.vi[e.loB] * 8u) & 0x3FFF; st.branchPending = true; st.branchDelay = 1; return true; }
     case VU_LO_JALR: { const uint32_t target = ((uint32_t)(uint16_t)st.vi[e.loB] * 8u) & 0x3FFF; if (e.loA != 0) st.vi[e.loA] = (int32_t)((st.pc + 16) / 8);
                        st.branchTarget = target; st.branchPending = true; st.branchDelay = 1; return true; }
