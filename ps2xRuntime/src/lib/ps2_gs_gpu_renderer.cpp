@@ -368,7 +368,8 @@ namespace
     // depthTex: PS2X_ZTEX attaches depth as a sampleable TEXTURE (not a renderbuffer), because
     // BT3 READS the Z buffer as a texture -- fbp224 IS the depth buffer (ZBP=224 on every draw),
     // and the outline is an edge detect over it.
-    struct Fbo { RenderTexture2D rt{}; int w = 0, h = 0; unsigned int depthTex = 0; int lastDraw = -1; /* [slice] replay vsync of last use */ };
+    struct Fbo { RenderTexture2D rt{}; int w = 0, h = 0; unsigned int depthTex = 0; int lastDraw = -1; /* [slice] replay vsync of last use */
+                 int scale = 1; RenderTexture2D stag{}; unsigned stagSeq = 0; /* [rscale] physical = logical*scale; stag = 1x staging + freshness */ };
     // [bilinear] GS TEX1.MMAG per-draw filter. The GS filters magnified textures bilinearly
     // when MMAG is set (BT3 sets it on 99.4% of draws, with no mipmaps -- MXL is 0), so
     // forcing every texture to GL_NEAREST reads back blocky. It shows most where the game
@@ -653,11 +654,42 @@ namespace
         {
             rlDrawRenderBatchActive();
             glBindFramebuffer(0x8CA8 /*READ*/, f.rt.id); glBindFramebuffer(0x8CA9 /*DRAW*/, snap.id);
-            glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, 0x4000 /*COLOR*/, 0x2600 /*NEAREST*/);
+            // [rscale] source rect is PHYSICAL; NEAREST decimation (snapshot consumers read
+            // pixels as DATA -- palette indices -- so no blending of values).
+            glBlitFramebuffer(0, 0, w * f.scale, h * f.scale, 0, 0, w, h, 0x4000 /*COLOR*/, 0x2600 /*NEAREST*/);
             g_rtSnapSeq[fbp] = seq; ++g_rtSnapBlits;
         }
         glBindFramebuffer(0x8D40 /*FRAMEBUFFER*/, (unsigned)prev);
         return snap.texture;
+    }
+    // [rscale] internal render scale N (PS2X_RENDERSCALE, 1..4): the SCENE buffers
+    // (fbp0/112) allocate at N x native and draw through an rlScalef(N) modelview, so
+    // every command keeps native coordinates. All pixel-as-data machinery (masks, ink,
+    // writebacks) stays 1x; boundaries downsample.
+    int rsN() { return GsGpuRenderer::renderScale(); }   // live: overlay setter or PS2X_RENDERSCALE
+    bool rsScaledFbp(uint32_t fbp) { return rsN() > 1 && (fbp == 0u || fbp == 112u); }
+    std::unordered_map<unsigned, int> g_rsTexScale;   // texture id -> scale (scaled FBOs only)
+    std::unordered_map<unsigned, uint32_t> g_rsTexFbo;   // texture id -> fbp (scaled FBOs only)
+    int rsTexScale(unsigned id) { auto it = g_rsTexScale.find(id); return it == g_rsTexScale.end() ? 1 : it->second; }
+    // Rebind READ framebuffer to a 1x staging copy (area-downsampled) so logical-coordinate
+    // glReadPixels reads stay exact for scaled FBOs.
+    const RenderTexture2D &rsDownsampled(const Fbo &f)
+    {   // RAW-GL ONLY (callable inside raw passes): blit the physical FBO into the
+        // pre-created 1x staging; restores the DRAW binding; no rlgl calls here.
+        int prevDraw = 0; glGetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &prevDraw);
+        glBindFramebuffer(0x8CA8 /*READ*/, f.rt.id);
+        glBindFramebuffer(0x8CA9 /*DRAW*/, f.stag.id);
+        glBlitFramebuffer(0, 0, f.w * f.scale, f.h * f.scale, 0, 0, f.w, f.h,
+                          0x4000 /*COLOR_BUFFER_BIT*/, 0x2601 /*LINEAR*/);
+        glBindFramebuffer(0x8CA9 /*DRAW*/, (unsigned)prevDraw);
+        return f.stag;
+    }
+    void rsBindReadDownsampled(const Fbo &f)
+    {
+        if (f.scale <= 1) return;
+        rlDrawRenderBatchActive();   // reader contexts are rlgl-safe; flush before raw binds
+        const RenderTexture2D &st = rsDownsampled(f);
+        glBindFramebuffer(0x8CA8 /*READ*/, st.id);
     }
     Fbo &ensureFbo(uint32_t fbp, int w, int h)
     {
@@ -699,7 +731,8 @@ namespace
         // black-cleared) every publish — so the bloom downsample sampled a freshly-wiped fbp0
         // (all-black fbp336 -> black glow overlay over the fight). Keep the largest allocation;
         // only recreate when the request GROWS beyond it (mirrors the atlas monotonic-max fix).
-        if (f.rt.texture.id != 0 && w <= f.w && h <= f.h)
+        if (f.rt.texture.id != 0 && w <= f.w && h <= f.h
+            && f.scale == (rsScaledFbp(fbp) ? rsN() : 1))   // [rscale] live scale change recreates
             return f;
         if (f.rt.texture.id != 0)
         {
@@ -710,7 +743,9 @@ namespace
         }
         if (f.w != w || f.h != h || f.rt.texture.id == 0)
         {
-            if (f.rt.texture.id != 0) { ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); }
+            if (f.rt.texture.id != 0) { g_rsTexScale.erase(f.rt.texture.id); ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); }
+            const int rsA = rsScaledFbp(fbp) ? rsN() : 1;
+            const int wA = w * rsA, hA = h * rsA;
             // PS2X_NODEPTH_RT: create COLOR-ONLY FBOs (no depth renderbuffer). raylib's
             // LoadRenderTexture always attaches a depth renderbuffer; a bad/large depth
             // attachment is a classic cause of "binding this FBO corrupts everything after".
@@ -727,9 +762,9 @@ namespace
                 if (t.id != 0)
                 {
                     rlEnableFramebuffer(t.id);
-                    t.texture.id = rlLoadTexture(nullptr, w, h, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1);
+                    t.texture.id = rlLoadTexture(nullptr, wA, hA, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1);
                     ps2xForgetTexId(t.texture.id);   // [filtercache]
-                    t.texture.width = w; t.texture.height = h; t.texture.mipmaps = 1;
+                    t.texture.width = wA; t.texture.height = hA; t.texture.mipmaps = 1;
                     t.texture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
                     rlFramebufferAttach(t.id, t.texture.id, RL_ATTACHMENT_COLOR_CHANNEL0, RL_ATTACHMENT_TEXTURE2D, 0);
                     // false => a real depth TEXTURE, which can be sampled later. SHARED across
@@ -743,9 +778,9 @@ namespace
                     // re-attach to the one already created -- refusing to attach when the second
                     // buffer is taller left the frame that renders into it with NO depth at all,
                     // which is why the writeback read 0 from frame 2 onwards.
-                    if (isSceneFbp && (g_sharedDepthTex == 0 || w > g_sharedDepthW || h > g_sharedDepthH))
+                    if (isSceneFbp && (g_sharedDepthTex == 0 || wA > g_sharedDepthW || hA > g_sharedDepthH))
                     {
-                        const int dw = std::max(w, g_sharedDepthW), dh = std::max(h, g_sharedDepthH);
+                        const int dw = std::max(wA, g_sharedDepthW), dh = std::max(hA, g_sharedDepthH);
                         // D32F, not raylib's D24 (PS2X_D32F=0 restores). BT3's raw Z is ~50k-120k
                         // out of 2^32: a 24-bit INTEGER depth buffer quantizes that to 256-int
                         // steps, so the VRAM Z writeback (page 224), the Z->CT16 alpha rebuild
@@ -801,9 +836,9 @@ namespace
                 if (t.id != 0)
                 {
                     rlEnableFramebuffer(t.id);
-                    t.texture.id = rlLoadTexture(nullptr, w, h, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1);
+                    t.texture.id = rlLoadTexture(nullptr, wA, hA, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1);
                     ps2xForgetTexId(t.texture.id);   // [filtercache]
-                    t.texture.width = w; t.texture.height = h; t.texture.mipmaps = 1;
+                    t.texture.width = wA; t.texture.height = hA; t.texture.mipmaps = 1;
                     t.texture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
                     t.depth.id = 0; // no depth attachment
                     rlFramebufferAttach(t.id, t.texture.id, RL_ATTACHMENT_COLOR_CHANNEL0, RL_ATTACHMENT_TEXTURE2D, 0);
@@ -814,8 +849,17 @@ namespace
                 f.rt = t;
             }
             else
-                f.rt = LoadRenderTexture(w, h);
-            f.w = w; f.h = h;
+                f.rt = LoadRenderTexture(wA, hA);
+            f.w = w; f.h = h; f.scale = rsA;
+            if (rsA > 1)
+            {
+                g_rsTexScale[f.rt.texture.id] = rsA;
+                g_rsTexFbo[f.rt.texture.id] = fbp;
+                if (f.stag.texture.id != 0) { ps2xForgetRtTexId(f.stag.texture.id); UnloadRenderTexture(f.stag); }
+                f.stag = LoadRenderTexture(w, h);
+                SetTextureFilter(f.stag.texture, TEXTURE_FILTER_POINT);
+                ps2xForgetTexId(f.stag.texture.id);
+            }
             SetTextureFilter(f.rt.texture, TEXTURE_FILTER_POINT);
             // Clear ONCE on creation. PS2 framebuffers/render targets persist across
             // frames (the game clears explicitly by drawing); auto-clearing every frame
@@ -1507,13 +1551,21 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
                 // not -- so the Z field went into VRAM mirrored, and every consumer of it (the
                 // scene-alpha rebuild, the mask, the outline strokes) landed upside down.
                 // Take the TOP h rows (GL rows zh-1 down to zh-h) in GS order.
-                const int wbH = std::min(zh, zf->second.h);
+                // [rscale] the shared depth is PHYSICAL-sized; VRAM wants native rows.
+                // Stride-decimate (never average depth) while flipping to GS order.
+                const int zN = std::max(1, zf->second.scale);
+                const int zwL = zw / zN, zhL = zh / zN;
+                const int wbH = std::min(zhL, zf->second.h);
                 static std::vector<float> zflip;
-                zflip.resize((size_t)zw * wbH);
+                zflip.resize((size_t)zwL * wbH);
                 for (int y = 0; y < wbH; ++y)
-                    std::memcpy(&zflip[(size_t)y * zw], &zb[(size_t)(zh - 1 - y) * zw],
-                                (size_t)zw * sizeof(float));
-                ps2xWritebackDepthToVram(zwbBp, zwbBw, zwbPsm, zw, wbH, zflip.data(), zwbZMax);
+                {
+                    const float *srcRow = &zb[(size_t)(zh - 1 - y * zN) * zw];
+                    float *dstRow = &zflip[(size_t)y * zwL];
+                    if (zN == 1) std::memcpy(dstRow, srcRow, (size_t)zwL * sizeof(float));
+                    else for (int x = 0; x < zwL; ++x) dstRow[x] = srcRow[(size_t)x * zN];
+                }
+                ps2xWritebackDepthToVram(zwbBp, zwbBw, zwbPsm, zwL, wbH, zflip.data(), zwbZMax);
                 if (s_bd)
                 {
                     static int n = 0;
@@ -1670,6 +1722,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
     }
     rlDrawRenderBatchActive();
     rlEnableFramebuffer(it->second.rt.id);
+    rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
     {   // [rbsplit] PS2X_RBSPLIT=1: how much of a readback stall is the GPU finishing the segment (glFinish) vs the transfer
         static const bool s_rbs = [](){ const char *v = std::getenv("PS2X_RBSPLIT"); return !(v && v[0] == '0'); }();   // default ON: the driver's synchronous glReadPixels stalled ~20 ms/frame; glFinish first makes the whole readback ~5.5 ms/frame (rig 20 -> 23 fps)
         if (s_rbs) { extern double g_bsFinish; const auto tf = std::chrono::steady_clock::now(); glFinish(); g_bsFinish += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count(); }
@@ -3177,6 +3230,7 @@ void GsGpuRenderer::reportFboAlpha(uint32_t fbp, const char *when)
     std::vector<uint32_t> px((size_t)w * h, 0u);
     rlDrawRenderBatchActive();
     rlEnableFramebuffer(it->second.rt.id);
+    rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
     glReadPixels(0, it->second.h - h, w, h, 0x1908, 0x1401, px.data());
     rlDisableFramebuffer();
     unsigned hist[256] = {0};
@@ -3349,6 +3403,7 @@ void GsGpuRenderer::swOutlineEnd()
         std::vector<uint32_t> fbo((size_t)w * h, 0u);
         rlDrawRenderBatchActive();
         rlEnableFramebuffer(it->second.rt.id);
+        rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
         glReadPixels(0, it->second.h - h, w, h, 0x1908, 0x1401, fbo.data());
         rlDisableFramebuffer();
         for (int y = 0; y < h / 2; ++y)   // glReadPixels is bottom-up; VRAM rows are top-down
@@ -3588,6 +3643,7 @@ static void ps2xDbgCol0(const char *tag, int idx)
     const int w = it->second.w, h = it->second.h; std::vector<uint32_t> b((size_t)w * h);
     int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
     rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, b.data());
+    rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
     if (prevFB) rlEnableFramebuffer((unsigned)prevFB);
     unsigned long n = 0, sum = 0; for (int y = 0; y < 448 && y < h; ++y) for (int x = 0; x < 32 && x < w; ++x) { ++n; sum += b[(size_t)(h - 1 - y) * w + x] >> 24; }
     std::fprintf(stderr, "[segchk] %s #%d f224 col0 mean alpha: %.1f\n", tag, idx, n ? (double)sum / n : -1.0);
@@ -3604,6 +3660,7 @@ void GsGpuRenderer::renderRange(int fbWidth, int fbHeight)
         const int w = it->second.w, h = it->second.h; std::vector<uint32_t> b((size_t)w * h);
         int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
         rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, b.data());
+        rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
         if (prevFB) rlEnableFramebuffer((unsigned)prevFB); else rlDisableFramebuffer();
         unsigned long n = 0, sum = 0; for (int y = 0; y < 448 && y < h; ++y) for (int x = 0; x < 32 && x < w; ++x) { ++n; sum += b[(size_t)(h - 1 - y) * w + x] >> 24; }
         return n ? (double)sum / n : -1.0; };
@@ -4520,7 +4577,8 @@ static Texture2D p8hTwinFor(uint64_t clutKey)
     const uint32_t seq = g_glEnterSeq[224u];
     if (s_twSeq[clutKey] != seq)
     {
-        if (!gaBuildP8hTwin(fit->second.rt.texture, fit->second.h, pal, rt)) return Texture2D{};
+        if (!gaBuildP8hTwin(fit->second.scale > 1 ? rsDownsampled(fit->second).texture : fit->second.rt.texture,
+                            fit->second.h, pal, rt)) return Texture2D{};   // [rscale] the twin decodes pixels as data: 1x view
         s_twSeq[clutKey] = seq;
     }
     return rt.texture;
@@ -4583,7 +4641,7 @@ static bool gaDofMaskPass(uint32_t destFbp)
     glActiveTexture(0x84C0u); glGetIntegerv(0x8069, &prevTex0);
     static unsigned int myVao = 0; if (myVao == 0) glGenVertexArrays(1, &myVao);
     glBindFramebuffer(0x8D40u, fit->second.rt.id);
-    glViewport(0, 0, fit->second.w, fit->second.h);
+    glViewport(0, 0, fit->second.w * fit->second.scale, fit->second.h * fit->second.scale);   // [rscale]
     glDisable(0x0BE2u); glDisable(0x0B71u); glDisable(0x0C11u); glDisable(0x0B44u);
     glDepthMask(0); glColorMask(0, 0, 0, 1);   // ALPHA ONLY: color corruption impossible
     glDrawBuffer(0x8CE0u);
@@ -7211,6 +7269,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         Fbo &f = ensureFbo(rf, w, h);
         curRealFbp = rf;
         BeginTextureMode(f.rt);
+        if (f.scale > 1) rlScalef((float)f.scale, (float)f.scale, 1.0f);   // [rscale] native coords -> Nx pixels
         ++g_glEnterSeq[rf];   // [rtsnap]
         g_lastRenderedFboTex = f.rt.texture.id;   // [texbarrier] sampling this texture later needs a barrier
         if (g_lastSampledFboTex != 0 && g_lastSampledFboTex == f.rt.texture.id)
@@ -7220,7 +7279,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             if (s_hz == "barrier") { rlDrawRenderBatchActive(); glBindTexture(0x0DE1, 0); ps2xTextureBarrier(); }
             else if (s_hz == "finish") { rlDrawRenderBatchActive(); glFinish(); }
             else if (s_hz == "read") { rlDrawRenderBatchActive(); uint32_t px = 0; glReadPixels(0, 0, 1, 1, 0x1908, 0x1401, &px); }
-            else if (s_hz == "rebind") { rlDrawRenderBatchActive(); EndTextureMode(); BeginTextureMode(f.rt); }
+            else if (s_hz == "rebind") { rlDrawRenderBatchActive(); EndTextureMode(); BeginTextureMode(f.rt);
+                                          if (f.scale > 1) rlScalef((float)f.scale, (float)f.scale, 1.0f); }
         }
         // PS2X_FBO_CHECK: is this FBO actually complete? An incomplete big FBO would corrupt all
         // subsequent GL draws (the fbp224/336 poison). Logged once per fbp.
@@ -7301,7 +7361,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             }
             Fbo &f = g_fbos[curRealFbp]; // dimensions of the ACTUAL bound FBO (merged partner has no own entry)
             const bool full = (sx <= 0 && sy <= 0 && sw >= f.w && sh >= f.h);
-            if (!full && sw > 0 && sh > 0) { rlEnableScissorTest(); rlScissor(sx, f.h - (sy + sh), sw, sh); }
+            const int rsS = f.scale;   // [rscale] GL scissor is raw physical pixels
+            if (!full && sw > 0 && sh > 0) { rlEnableScissorTest(); rlScissor(sx * rsS, (f.h - (sy + sh)) * rsS, sw * rsS, sh * rsS); }
             else rlDisableScissorTest();
         }
     };
@@ -7380,7 +7441,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             }
             BeginTextureMode(cp.rt);
             // src height negative -> straight (un-flipped) copy so cp matches rt's stored orientation.
-            DrawTexturePro(it->second.rt.texture, Rectangle{0, 0, (float)cw, -(float)ch},
+            DrawTexturePro(it->second.rt.texture,
+                           Rectangle{0, 0, (float)(cw * it->second.scale), -(float)(ch * it->second.scale)},   // [rscale] physical src
                            Rectangle{0, 0, (float)cw, (float)ch}, Vector2{0, 0}, 0.0f, WHITE);
             EndTextureMode();
         }
@@ -7771,7 +7833,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // Blending OFF for the copy: the scene buffers' alpha is junk (opaque game draws
         // legitimately leave a~0), alpha-blending the copy would erase the frame.
         rlDisableColorBlend();
-        DrawTexturePro(lit->second.rt.texture, Rectangle{0, 0, (float)cw, -(float)ch},
+        DrawTexturePro(lit->second.rt.texture,
+                       Rectangle{0, 0, (float)(cw * lit->second.scale), -(float)(ch * lit->second.scale)},   // [rscale] physical src
                        Rectangle{0, 0, (float)cw, (float)ch}, Vector2{0, 0}, 0.0f, WHITE);
         rlDrawRenderBatchActive();
         rlEnableColorBlend();
@@ -8286,6 +8349,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     const int w = it->second.w, h = it->second.h;
                     std::vector<uint32_t> buf((size_t)w * h);
                     rlEnableFramebuffer(it->second.rt.id);
+                    rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                     glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                     curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;   // force a REAL re-bind before the next draw (probe bound another FBO)
                     std::map<unsigned, unsigned long> hist; unsigned long nz = 0;
@@ -8474,6 +8538,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                 const int w = it->second.w, h = it->second.h;
                                 std::vector<uint32_t> buf((size_t)w * h);
                                 rlEnableFramebuffer(it->second.rt.id);
+                                rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                                 glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                                 char path[256];
                                 std::snprintf(path, sizeof(path), "%s/fboend_%d_%d.bin",
@@ -9069,16 +9134,22 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (c.xDY + c.xH > dh) dh = c.xDY + c.xH;
                 Fbo &dstF = ensureFbo(c.xDstFbp, dw, dh);
                 BeginTextureMode(dstF.rt);
+                if (dstF.scale > 1) rlScalef((float)dstF.scale, (float)dstF.scale, 1.0f);   // [rscale]
                 // Both FBOs are bottom-up; negative src height flips to preserve orientation.
                 // Same partial-rect band selection as the sprite composites: source rows
                 // [xSY .. xSY+xH] live at texture rows [texH-xSY-xH .. texH-xSY], so anchor the
                 // negative-height rect at texH - xSY - xH (identical to the old rect only for
                 // full-height transfers, which is why the logo blits worked).
-                const float srcTexH = static_cast<float>(sit->second.rt.texture.height);
+                // [rscale] transfers from a scaled source go through the area-averaged 1x
+                // staging: sampling the 2x texture point-filtered at 1x rate DECIMATED the
+                // f336 strip copies -- flattened far terrain, dotted ink outlines, dead blur.
+                const bool xSrcScaled = sit->second.scale > 1;
+                const Texture2D &xtex = xSrcScaled ? rsDownsampled(sit->second).texture : sit->second.rt.texture;
+                const float srcTexH = static_cast<float>(xtex.height);
                 Rectangle sr{static_cast<float>(c.xSX), srcTexH - static_cast<float>(c.xSY) - static_cast<float>(c.xH),
                              static_cast<float>(c.xW), -static_cast<float>(c.xH)};
                 Rectangle dr{static_cast<float>(c.xDX), static_cast<float>(c.xDY), static_cast<float>(c.xW), static_cast<float>(c.xH)};
-                DrawTexturePro(sit->second.rt.texture, sr, dr, Vector2{0, 0}, 0.0f, WHITE);
+                DrawTexturePro(xtex, sr, dr, Vector2{0, 0}, 0.0f, WHITE);
                 EndTextureMode();
             }
             curFbp = 0xFFFFFFFFu; // force rebind for the next draw
@@ -10316,6 +10387,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         const int w = it->second.w, h = it->second.h;
                         std::vector<uint32_t> buf((size_t)w * h);
                         rlEnableFramebuffer(it->second.rt.id);
+                        rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                         rlDisableFramebuffer();
                         std::map<unsigned, unsigned long> hist; unsigned long nz = 0;
@@ -10350,6 +10422,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         const int w = it->second.w, h = it->second.h;
                         std::vector<uint32_t> buf((size_t)w * h);
                         rlEnableFramebuffer(it->second.rt.id);
+                        rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                         rlDisableFramebuffer();
                         std::map<unsigned, unsigned long> hist;
@@ -10395,6 +10468,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         const int w = it->second.w, h = it->second.h;
                         std::vector<uint32_t> buf((size_t)w * h);
                         rlEnableFramebuffer(it->second.rt.id);
+                        rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                         rlDisableFramebuffer();
                         std::map<unsigned, unsigned long> hist;
@@ -10487,6 +10561,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         const int w = it->second.w, h = it->second.h;
                         std::vector<uint32_t> buf((size_t)w * h);
                         rlEnableFramebuffer(it->second.rt.id);
+                        rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                         rlDisableFramebuffer();
                         unsigned long orange = 0;
@@ -10530,6 +10605,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         const int w = std::min(it->second.w, 512), h = std::min(it->second.h, 448);
                         std::vector<uint32_t> buf((size_t)w * h);
                         rlEnableFramebuffer(it->second.rt.id);
+                        rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                         rlDisableFramebuffer();
                         Image im = GenImageColor(w, h, BLACK);
@@ -10565,6 +10641,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         const int w = it->second.w, h = it->second.h;
                         std::vector<uint32_t> buf((size_t)w * h);
                         rlEnableFramebuffer(it->second.rt.id);
+                        rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                         rlDisableFramebuffer();
                         Image im = GenImageColor(w, h, BLACK);
@@ -10630,6 +10707,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         if (w <= 0 || h <= 0) continue;
                         std::vector<uint32_t> buf((size_t)w * h);
                         rlEnableFramebuffer(it->second.rt.id);
+                        rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                         rlDisableFramebuffer();
                         unsigned long nz = 0, tot = 0; std::map<unsigned, unsigned long> hist;
@@ -11359,8 +11437,22 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                             zb2.assign((size_t)zw * zh, 0.0f);
                             glBindTexture(0x0DE1u, zf->second.depthTex);
                             glGetTexImage(0x0DE1u, 0, 0x1902u, 0x1406u, zb2.data());
-                            const int wbH = std::min(zh, zf->second.h);
-                            ps2xWritebackDepthToVram(g_zwbBp, g_zwbBw, g_zwbPsm, zw, wbH, zb2.data(), s_zwbMax2_use);
+                            // [rscale] the shared depth is PHYSICAL-sized; VRAM wants native
+                            // rows. Stride-decimate (never average depth) to logical dims.
+                            const int zN = std::max(1, zf->second.scale);
+                            const int zwL = zw / zN, zhL = zh / zN;
+                            static std::vector<float> zbL;
+                            const float *wbPtr = zb2.data(); int wbW = zw, wbHphys = zh;
+                            if (zN > 1)
+                            {
+                                zbL.assign((size_t)zwL * zhL, 0.0f);
+                                for (int y = 0; y < zhL; ++y)
+                                    for (int x = 0; x < zwL; ++x)
+                                        zbL[(size_t)y * zwL + x] = zb2[(size_t)(y * zN) * zw + (size_t)x * zN];
+                                wbPtr = zbL.data(); wbW = zwL; wbHphys = zhL;
+                            }
+                            const int wbH = std::min(wbHphys, zf->second.h);
+                            ps2xWritebackDepthToVram(g_zwbBp, g_zwbBw, g_zwbPsm, wbW, wbH, wbPtr, s_zwbMax2_use);
                             double mn = 1e9, mx = -1e9;
                             for (float v2 : zb2) { mn = std::min(mn, (double)v2); mx = std::max(mx, (double)v2); }
                             static int zn2 = 0;
@@ -13327,6 +13419,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                 const int w = it->second.w, h = it->second.h;
                                 std::vector<uint32_t> buf((size_t)w * h);
                                 rlEnableFramebuffer(it->second.rt.id);
+                                rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                                 glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                                 char path[256];
                                 std::snprintf(path, sizeof(path), "%s/fbolive_%d.bin",
@@ -13391,6 +13484,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                 const int w = it->second.w, h = it->second.h;
                                 std::vector<uint32_t> buf((size_t)w * h);
                                 rlEnableFramebuffer(it->second.rt.id);
+                                rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                                 glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                                 char path[256];
                                 std::snprintf(path, sizeof(path), "%s/fboout_%d.bin",
@@ -13570,6 +13664,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                     const int w = it->second.w, h = it->second.h;
                                     std::vector<uint32_t> buf((size_t)w * h);
                                     rlEnableFramebuffer(it->second.rt.id);
+                                    rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                                     glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                                     std::map<unsigned,size_t> hist;
                                     for (auto v2 : buf) ++hist[(v2 >> 24) & 0xFF];
@@ -14064,6 +14159,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                     rlDrawRenderBatchActive();
                                     const int w = it->second.w, h = it->second.h; std::vector<uint32_t> buf((size_t)w * h);
                                     rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
+                                    rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                                     unsigned long nz = 0; for (int y = 0; y < std::min(h, 256); ++y) for (int x = 0; x < std::min(w, 256); ++x) if (buf[(size_t)(h - 1 - y) * w + x] & 0x00FFFFFFu) ++nz;
                                     std::fprintf(stderr, "[f336census]   >> region before this %s run: %lu nonzero px (fbo id %u tex %u)\n", kind == 0 ? "tri" : kind == 1 ? "spr" : kind == 2 ? "DECAL" : "xfer", nz, it->second.rt.id, it->second.rt.texture.id);
                                 }
@@ -14197,6 +14293,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         rlDrawRenderBatchActive();
                         const int w = it->second.w, h = it->second.h; std::vector<uint32_t> buf((size_t)w * h);
                         rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
+                        rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         unsigned long mag = 0; for (uint32_t v : buf) { const unsigned r = v & 0xFF, g = (v >> 8) & 0xFF, b = (v >> 16) & 0xFF; if (r > 150 && b > 150 && g < 80) ++mag; }
                         Image ic = GenImageColor(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) { const uint32_t v = buf[(size_t)y * w + x]; ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255}); }
@@ -14221,6 +14318,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             const int w = it->second.w, h = it->second.h;
                             std::vector<uint32_t> buf((size_t)w * h);
                             rlEnableFramebuffer(it->second.rt.id);
+                            rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                             glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                             curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                             unsigned long nz = 0, nzA = 0; const int cw = std::min(w, 256), chh = std::min(h, 256);
@@ -14260,6 +14358,30 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
+                {   // [rscale] cross-scale sampling: a scaled source drawn into an UNSCALED
+                    // target at logical rate point-decimates (dotted ink outlines, flattened
+                    // far terrain, dead blur chain). Serve the area-averaged 1x staging.
+                    const int tsS = rsTexScale(tex.id);
+                    if (tsS > 1)
+                    {
+                        const int dScale = (curRealFbp != 0xFFFFFFFFu && g_fbos.count(curRealFbp)) ? g_fbos[curRealFbp].scale : 1;
+                        auto fIt = g_rsTexFbo.find(tex.id);
+                        if (dScale == 1 && fIt != g_rsTexFbo.end())
+                        {
+                            Fbo &sf = g_fbos[fIt->second];
+                            if (sf.stag.texture.id != 0)
+                            {
+                                if (sf.stagSeq != g_glEnterSeq[fIt->second])
+                                {
+                                    rlDrawRenderBatchActive();
+                                    rsDownsampled(sf);
+                                    sf.stagSeq = g_glEnterSeq[fIt->second];
+                                }
+                                tex = sf.stag.texture;
+                            }
+                        }
+                    }
+                }
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
                     // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
@@ -14525,7 +14647,9 @@ if (done.size() < 14 && !done.count(c.texKey))
                 // chain is tuned against the shifted sampling.
                 const float hoA = (fromFbo && !(idxRt && ps2xIdxHoOff()) && c.bilinear && dwA > 0.0f && std::fabs(swA - dwA) <= 0.51f)
                                 ? ps2xHalfTexel() : 0.0f;
-                if (c.texKey != 0 || fromFbo) { u0 = (c.su0 - hoA) / tw; u1 = (c.su1 - hoA) / tw; v0 = (c.sv0 - hoA) / th; v1 = (c.sv1 - hoA) / th; if (fromFbo) { v0 = 1.0f - v0; v1 = 1.0f - v1; } }
+                const float tsL = (float)rsTexScale(tex.id);   // [rscale] su/sv are LOGICAL texels
+                const float twL = tw / tsL, thL = th / tsL;
+                if (c.texKey != 0 || fromFbo) { u0 = (c.su0 - hoA) / twL; u1 = (c.su1 - hoA) / twL; v0 = (c.sv0 - hoA) / thL; v1 = (c.sv1 - hoA) / thL; if (fromFbo) { v0 = 1.0f - v0; v1 = 1.0f - v1; } }
                 else { u0 = 0; v0 = 0; u1 = 1; v1 = 1; }
                 {
                     static const bool s_hop = [](){ const char *v = std::getenv("PS2X_HOP336"); return v && v[0] && v[0] != '0'; }();
@@ -14595,6 +14719,30 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
+                {   // [rscale] cross-scale sampling: a scaled source drawn into an UNSCALED
+                    // target at logical rate point-decimates (dotted ink outlines, flattened
+                    // far terrain, dead blur chain). Serve the area-averaged 1x staging.
+                    const int tsS = rsTexScale(tex.id);
+                    if (tsS > 1)
+                    {
+                        const int dScale = (curRealFbp != 0xFFFFFFFFu && g_fbos.count(curRealFbp)) ? g_fbos[curRealFbp].scale : 1;
+                        auto fIt = g_rsTexFbo.find(tex.id);
+                        if (dScale == 1 && fIt != g_rsTexFbo.end())
+                        {
+                            Fbo &sf = g_fbos[fIt->second];
+                            if (sf.stag.texture.id != 0)
+                            {
+                                if (sf.stagSeq != g_glEnterSeq[fIt->second])
+                                {
+                                    rlDrawRenderBatchActive();
+                                    rsDownsampled(sf);
+                                    sf.stagSeq = g_glEnterSeq[fIt->second];
+                                }
+                                tex = sf.stag.texture;
+                            }
+                        }
+                    }
+                }
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
                     // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
@@ -14723,7 +14871,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (s_fsOld)
                     src = Rectangle{sx0, c.sv0, sx1 - sx0, -(c.sv1 - c.sv0)};
                 else
-                    src = Rectangle{sx0, (float)tex.height - std::max(c.sv0, c.sv1) + hoB, sx1 - sx0, -(c.sv1 - c.sv0)};
+                    src = Rectangle{sx0, (float)tex.height / (float)rsTexScale(tex.id) - std::max(c.sv0, c.sv1) + hoB, sx1 - sx0, -(c.sv1 - c.sv0)};   // [rscale] logical space
             }
             else if (c.texKey != 0)
                 src = Rectangle{c.su0, c.sv0, c.su1 - c.su0, c.sv1 - c.sv0};
@@ -14792,6 +14940,30 @@ if (done.size() < 14 && !done.count(c.texKey))
                     }
                 }
             }
+                {   // [rscale] cross-scale sampling: a scaled source drawn into an UNSCALED
+                    // target at logical rate point-decimates (dotted ink outlines, flattened
+                    // far terrain, dead blur chain). Serve the area-averaged 1x staging.
+                    const int tsS = rsTexScale(tex.id);
+                    if (tsS > 1)
+                    {
+                        const int dScale = (curRealFbp != 0xFFFFFFFFu && g_fbos.count(curRealFbp)) ? g_fbos[curRealFbp].scale : 1;
+                        auto fIt = g_rsTexFbo.find(tex.id);
+                        if (dScale == 1 && fIt != g_rsTexFbo.end())
+                        {
+                            Fbo &sf = g_fbos[fIt->second];
+                            if (sf.stag.texture.id != 0)
+                            {
+                                if (sf.stagSeq != g_glEnterSeq[fIt->second])
+                                {
+                                    rlDrawRenderBatchActive();
+                                    rsDownsampled(sf);
+                                    sf.stagSeq = g_glEnterSeq[fIt->second];
+                                }
+                                tex = sf.stag.texture;
+                            }
+                        }
+                    }
+                }
             ps2xApplyTexFilter(tex, c.bilinear);
         if (c.destFbp == 224u && c.texKey != 0) g_f224Mark = 40;
             {   // [emit224] PS2X_REACH=1: does a textured fbp224 draw reach the actual GL call?
@@ -14816,6 +14988,11 @@ if (done.size() < 14 && !done.count(c.texKey))
                                          c.destFbp, c.srcPsm, (unsigned)c.blendMode, c.fbmsk, c.r, c.g, c.b, c.a, tex.id, curRealFbp, src.x, src.y, src.width, src.height, dst.x, dst.y, dst.width, dst.height); }
             }
             g_emitPath = "drawTexProB";
+            {   // [rscale] src rects above are LOGICAL texels; raylib normalizes by the
+                // PHYSICAL texture dims -- pre-scale for scaled FBO sources.
+                const int tsP = rsTexScale(tex.id);
+                if (tsP > 1) { src.x *= tsP; src.y *= tsP; src.width *= tsP; src.height *= tsP; }
+            }
             DrawTexturePro(tex, src, dst, Vector2{0, 0}, 0.0f, Color{c.r, c.g, c.b, c.a});
             { static const bool s_sk3 = [](){ const char *v = std::getenv("PS2X_SEGCHK"); return v && v[0] && v[0] != '0'; }();
               static int n5 = 0; if (s_sk3 && c.destFbp == 224u && c.texKey && n5 < 6) ps2xDbgCol0("after-DrawTexturePro", ++n5); }
@@ -14993,6 +15170,30 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
+                {   // [rscale] cross-scale sampling: a scaled source drawn into an UNSCALED
+                    // target at logical rate point-decimates (dotted ink outlines, flattened
+                    // far terrain, dead blur chain). Serve the area-averaged 1x staging.
+                    const int tsS = rsTexScale(tex.id);
+                    if (tsS > 1)
+                    {
+                        const int dScale = (curRealFbp != 0xFFFFFFFFu && g_fbos.count(curRealFbp)) ? g_fbos[curRealFbp].scale : 1;
+                        auto fIt = g_rsTexFbo.find(tex.id);
+                        if (dScale == 1 && fIt != g_rsTexFbo.end())
+                        {
+                            Fbo &sf = g_fbos[fIt->second];
+                            if (sf.stag.texture.id != 0)
+                            {
+                                if (sf.stagSeq != g_glEnterSeq[fIt->second])
+                                {
+                                    rlDrawRenderBatchActive();
+                                    rsDownsampled(sf);
+                                    sf.stagSeq = g_glEnterSeq[fIt->second];
+                                }
+                                tex = sf.stag.texture;
+                            }
+                        }
+                    }
+                }
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
                     // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
@@ -15217,6 +15418,30 @@ if (done.size() < 14 && !done.count(c.texKey))
                         if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
+                {   // [rscale] cross-scale sampling: a scaled source drawn into an UNSCALED
+                    // target at logical rate point-decimates (dotted ink outlines, flattened
+                    // far terrain, dead blur chain). Serve the area-averaged 1x staging.
+                    const int tsS = rsTexScale(tex.id);
+                    if (tsS > 1)
+                    {
+                        const int dScale = (curRealFbp != 0xFFFFFFFFu && g_fbos.count(curRealFbp)) ? g_fbos[curRealFbp].scale : 1;
+                        auto fIt = g_rsTexFbo.find(tex.id);
+                        if (dScale == 1 && fIt != g_rsTexFbo.end())
+                        {
+                            Fbo &sf = g_fbos[fIt->second];
+                            if (sf.stag.texture.id != 0)
+                            {
+                                if (sf.stagSeq != g_glEnterSeq[fIt->second])
+                                {
+                                    rlDrawRenderBatchActive();
+                                    rsDownsampled(sf);
+                                    sf.stagSeq = g_glEnterSeq[fIt->second];
+                                }
+                                tex = sf.stag.texture;
+                            }
+                        }
+                    }
+                }
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
                     // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
@@ -15499,6 +15724,30 @@ if (done.size() < 14 && !done.count(c.texKey))
                         if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
+                {   // [rscale] cross-scale sampling: a scaled source drawn into an UNSCALED
+                    // target at logical rate point-decimates (dotted ink outlines, flattened
+                    // far terrain, dead blur chain). Serve the area-averaged 1x staging.
+                    const int tsS = rsTexScale(tex.id);
+                    if (tsS > 1)
+                    {
+                        const int dScale = (curRealFbp != 0xFFFFFFFFu && g_fbos.count(curRealFbp)) ? g_fbos[curRealFbp].scale : 1;
+                        auto fIt = g_rsTexFbo.find(tex.id);
+                        if (dScale == 1 && fIt != g_rsTexFbo.end())
+                        {
+                            Fbo &sf = g_fbos[fIt->second];
+                            if (sf.stag.texture.id != 0)
+                            {
+                                if (sf.stagSeq != g_glEnterSeq[fIt->second])
+                                {
+                                    rlDrawRenderBatchActive();
+                                    rsDownsampled(sf);
+                                    sf.stagSeq = g_glEnterSeq[fIt->second];
+                                }
+                                tex = sf.stag.texture;
+                            }
+                        }
+                    }
+                }
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
                     // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
@@ -15524,6 +15773,30 @@ if (done.size() < 14 && !done.count(c.texKey))
                         if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
+                {   // [rscale] cross-scale sampling: a scaled source drawn into an UNSCALED
+                    // target at logical rate point-decimates (dotted ink outlines, flattened
+                    // far terrain, dead blur chain). Serve the area-averaged 1x staging.
+                    const int tsS = rsTexScale(tex.id);
+                    if (tsS > 1)
+                    {
+                        const int dScale = (curRealFbp != 0xFFFFFFFFu && g_fbos.count(curRealFbp)) ? g_fbos[curRealFbp].scale : 1;
+                        auto fIt = g_rsTexFbo.find(tex.id);
+                        if (dScale == 1 && fIt != g_rsTexFbo.end())
+                        {
+                            Fbo &sf = g_fbos[fIt->second];
+                            if (sf.stag.texture.id != 0)
+                            {
+                                if (sf.stagSeq != g_glEnterSeq[fIt->second])
+                                {
+                                    rlDrawRenderBatchActive();
+                                    rsDownsampled(sf);
+                                    sf.stagSeq = g_glEnterSeq[fIt->second];
+                                }
+                                tex = sf.stag.texture;
+                            }
+                        }
+                    }
+                }
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
                     // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
@@ -15552,6 +15825,30 @@ if (done.size() < 14 && !done.count(c.texKey))
                         if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
+                {   // [rscale] cross-scale sampling: a scaled source drawn into an UNSCALED
+                    // target at logical rate point-decimates (dotted ink outlines, flattened
+                    // far terrain, dead blur chain). Serve the area-averaged 1x staging.
+                    const int tsS = rsTexScale(tex.id);
+                    if (tsS > 1)
+                    {
+                        const int dScale = (curRealFbp != 0xFFFFFFFFu && g_fbos.count(curRealFbp)) ? g_fbos[curRealFbp].scale : 1;
+                        auto fIt = g_rsTexFbo.find(tex.id);
+                        if (dScale == 1 && fIt != g_rsTexFbo.end())
+                        {
+                            Fbo &sf = g_fbos[fIt->second];
+                            if (sf.stag.texture.id != 0)
+                            {
+                                if (sf.stagSeq != g_glEnterSeq[fIt->second])
+                                {
+                                    rlDrawRenderBatchActive();
+                                    rsDownsampled(sf);
+                                    sf.stagSeq = g_glEnterSeq[fIt->second];
+                                }
+                                tex = sf.stag.texture;
+                            }
+                        }
+                    }
+                }
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
                     // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
@@ -16265,6 +16562,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (w <= 0 || h <= 0) continue;
                 px.resize((size_t)w * h);
                 rlEnableFramebuffer(it->second.rt.id);
+                rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                 glReadPixels(0, 0, w, h, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, px.data());
                 rlDisableFramebuffer();
                 // glReadPixels is bottom-up; VRAM rows are top-down.
@@ -16339,6 +16637,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 static std::vector<uint32_t> buf;
                 buf.resize((size_t)w * h);
                 rlEnableFramebuffer(it->second.rt.id);
+                rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                 glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                 rlDisableFramebuffer();
                 unsigned long nz = 0, tot = 0, sum = 0; unsigned amax = 0;
