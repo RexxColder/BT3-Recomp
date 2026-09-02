@@ -14148,7 +14148,14 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
-                ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
+                ps2xApplyTexFilter(tex, c.bilinear
+                    // [maskpoint] alpha-only MASK writers that the widescreen HUD map has
+                    // rescaled must sample POINT: at 1:1 (4:3) bilinear lands on texel
+                    // centers and the DATE mask stays binary, but squeezed quads sample
+                    // between texels -- the soft alpha edge leaks through our lerp-blend
+                    // DATE approximation as pale strips at both mask edges (PCSX2's true
+                    // threshold test is immune; user: "only shows up in widescreen").
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
                     rlBegin(RL_QUADS);
                     for (int k = 0; k < 4; ++k)
@@ -14473,7 +14480,14 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
-                ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
+                ps2xApplyTexFilter(tex, c.bilinear
+                    // [maskpoint] alpha-only MASK writers that the widescreen HUD map has
+                    // rescaled must sample POINT: at 1:1 (4:3) bilinear lands on texel
+                    // centers and the DATE mask stays binary, but squeezed quads sample
+                    // between texels -- the soft alpha edge leaks through our lerp-blend
+                    // DATE approximation as pale strips at both mask edges (PCSX2's true
+                    // threshold test is immune; user: "only shows up in widescreen").
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                 rlBegin(RL_QUADS);
                 {   // [emitA] PS2X_CMPWR=1: the vertex alpha actually emitted for the mask composites
                     static const bool s_ea = [](){ const char *v = std::getenv("PS2X_CMPWR"); return v && v[0] && v[0] != '0'; }();
@@ -14861,7 +14875,14 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
-                ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
+                ps2xApplyTexFilter(tex, c.bilinear
+                    // [maskpoint] alpha-only MASK writers that the widescreen HUD map has
+                    // rescaled must sample POINT: at 1:1 (4:3) bilinear lands on texel
+                    // centers and the DATE mask stays binary, but squeezed quads sample
+                    // between texels -- the soft alpha edge leaks through our lerp-blend
+                    // DATE approximation as pale strips at both mask edges (PCSX2's true
+                    // threshold test is immune; user: "only shows up in widescreen").
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
                     rlBegin(RL_QUADS);
                     rlColor4ub(255, 255, 255, 255);
@@ -15075,7 +15096,14 @@ if (done.size() < 14 && !done.count(c.texKey))
                         if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
-                ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
+                ps2xApplyTexFilter(tex, c.bilinear
+                    // [maskpoint] alpha-only MASK writers that the widescreen HUD map has
+                    // rescaled must sample POINT: at 1:1 (4:3) bilinear lands on texel
+                    // centers and the DATE mask stays binary, but squeezed quads sample
+                    // between texels -- the soft alpha edge leaks through our lerp-blend
+                    // DATE approximation as pale strips at both mask edges (PCSX2's true
+                    // threshold test is immune; user: "only shows up in widescreen").
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                         rlCheckRenderBatchLimit(4);
                         rlBegin(RL_QUADS);
                         const int qd[4] = {0, 1, 2, 2};
@@ -15126,7 +15154,14 @@ if (done.size() < 14 && !done.count(c.texKey))
                 }
             }
             if (c.texKey != 0 && c.srcTbp0 >= 13000u && c.srcTbp0 < 14100u) ++g_charSingleN;
-            ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
+            ps2xApplyTexFilter(tex, c.bilinear
+                    // [maskpoint] alpha-only MASK writers that the widescreen HUD map has
+                    // rescaled must sample POINT: at 1:1 (4:3) bilinear lands on texel
+                    // centers and the DATE mask stays binary, but squeezed quads sample
+                    // between texels -- the soft alpha edge leaks through our lerp-blend
+                    // DATE approximation as pale strips at both mask edges (PCSX2's true
+                    // threshold test is immune; user: "only shows up in widescreen").
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
             rlCheckRenderBatchLimit(4);
             {   // [region] declared/actual clamp for RT-sourced draws (see uRegion)
                 static int s_locUViz = -2; if (s_locUViz == -2) s_locUViz = GetShaderLocation(g_shader, "uUViz");
@@ -15337,7 +15372,14 @@ if (done.size() < 14 && !done.count(c.texKey))
                         if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
-                ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
+                ps2xApplyTexFilter(tex, c.bilinear
+                    // [maskpoint] alpha-only MASK writers that the widescreen HUD map has
+                    // rescaled must sample POINT: at 1:1 (4:3) bilinear lands on texel
+                    // centers and the DATE mask stays binary, but squeezed quads sample
+                    // between texels -- the soft alpha edge leaks through our lerp-blend
+                    // DATE approximation as pale strips at both mask edges (PCSX2's true
+                    // threshold test is immune; user: "only shows up in widescreen").
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -15352,7 +15394,14 @@ if (done.size() < 14 && !done.count(c.texKey))
                         if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
-                ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
+                ps2xApplyTexFilter(tex, c.bilinear
+                    // [maskpoint] alpha-only MASK writers that the widescreen HUD map has
+                    // rescaled must sample POINT: at 1:1 (4:3) bilinear lands on texel
+                    // centers and the DATE mask stays binary, but squeezed quads sample
+                    // between texels -- the soft alpha edge leaks through our lerp-blend
+                    // DATE approximation as pale strips at both mask edges (PCSX2's true
+                    // threshold test is immune; user: "only shows up in widescreen").
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -15370,7 +15419,14 @@ if (done.size() < 14 && !done.count(c.texKey))
                         if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
-                ps2xApplyTexFilter(tex, c.bilinear); rlSetTexture(tex.id);
+                ps2xApplyTexFilter(tex, c.bilinear
+                    // [maskpoint] alpha-only MASK writers that the widescreen HUD map has
+                    // rescaled must sample POINT: at 1:1 (4:3) bilinear lands on texel
+                    // centers and the DATE mask stays binary, but squeezed quads sample
+                    // between texels -- the soft alpha edge leaks through our lerp-blend
+                    // DATE approximation as pale strips at both mask edges (PCSX2's true
+                    // threshold test is immune; user: "only shows up in widescreen").
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(128, 128, 128, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
