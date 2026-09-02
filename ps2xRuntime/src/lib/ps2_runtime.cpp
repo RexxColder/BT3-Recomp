@@ -40,6 +40,9 @@ float g_ps2xWsLui = 0.75f;
 // [wshud] the widescreen aspect scale itself (1.0 = off), read by the GPU renderer to
 // pre-squeeze HUD sprites so the present stretch restores their true proportions.
 float g_ps2xWsScale = 1.0f;
+// [wshud] per-frame squeeze factor for HUD geometry, computed at present time from the
+// ACTUAL present mapping (desired authentic h-scale / widescreen h-scale). 1.0 = off.
+float g_ps2xWsHudInv = 1.0f;
 #include "rlgl.h" // rlSetBlendFactorsSeparate for the blend-free present blit
 namespace ps2_syscalls { bool bt3WakeThreadByEntry(uint32_t entry); }
 
@@ -4114,10 +4117,14 @@ void PS2Runtime::run()
         // letterbox (the rig's boot screen-matching references were captured that way).
         {
             static const bool s_sqpix = [](){ const char *v = std::getenv("PS2X_SQPIX"); return v && v[0] && v[0] != '0'; }();
+            static const float s_pixk = [](){ const char *v = std::getenv("PS2X_PIXK"); const float f = v ? (float)std::atof(v) : 1.08f; return (f > 0.5f && f < 2.0f) ? f : 1.08f; }();
             if (!s_sqpix)
-            {
-                dstHeight = std::min((float)screenHeight, (float)screenWidth * 0.75f);
-                dstWidth = dstHeight * (4.0f / 3.0f);
+            {   // measured against a native-4:3 Wii longplay capture: authentic TV pixels are
+                // ~8% wider than square (portrait-frame k=1.076, infinity-glyph k=1.095) --
+                // NOT the full 4:3-of-the-crop stretch (that overshot ~13%).
+                const float ls = std::min((float)screenWidth / (srcWidth * s_pixk), (float)screenHeight / (float)srcHeight);
+                dstWidth = srcWidth * s_pixk * ls;
+                dstHeight = srcHeight * ls;
             }
         }
         // [overlay] Widescreen: stretch to fill instead of letterboxing.
@@ -4126,6 +4133,20 @@ void PS2Runtime::run()
         {
             dstWidth = screenWidth;
             dstHeight = screenHeight;
+            // [wshud] target: HUD elements keep authentic proportions (square-pixel x k)
+            // under the full-window stretch. inv = desired h-scale / actual h-scale.
+            static const float s_pixk2 = [](){ const char *v = std::getenv("PS2X_PIXK"); const float f = v ? (float)std::atof(v) : 1.08f; return (f > 0.5f && f < 2.0f) ? f : 1.08f; }();
+            extern float g_ps2xWsHudInv;
+            const float hEff = dstWidth / (float)srcWidth;
+            const float vEff = dstHeight / (float)srcHeight;
+            float inv = (vEff * s_pixk2) / hEff;
+            if (inv < 0.4f) inv = 0.4f; if (inv > 1.0f) inv = 1.0f;
+            g_ps2xWsHudInv = inv;
+        }
+        else
+        {
+            extern float g_ps2xWsHudInv;
+            g_ps2xWsHudInv = 1.0f;   // letterbox mode: no HUD squeeze
         }
 #endif
         // Atlas mode presents a sub-rect of the big atlas texture -> crop from the display slot origin.

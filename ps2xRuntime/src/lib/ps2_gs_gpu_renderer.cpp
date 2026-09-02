@@ -7819,11 +7819,9 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
     // 2=center-anchored (whole HUD compresses toward center), 0=off.
     float wsHudInv = 1.0f;
     static const int s_wshudMode = [](){ const char *v = std::getenv("PS2X_WSHUD"); return v ? std::atoi(v) : 1; }();
-    static const float s_wsBandA = [](){ const char *v = std::getenv("PS2X_WSHUDBANDS"); float a = 0.40f, b = 0.60f; if (v) std::sscanf(v, "%f,%f", &a, &b); return a; }();
-    static const float s_wsBandB = [](){ const char *v = std::getenv("PS2X_WSHUDBANDS"); float a = 0.40f, b = 0.60f; if (v) std::sscanf(v, "%f,%f", &a, &b); return b; }();
     {
-        extern float g_ps2xWsScale;
-        if (s_wshudMode > 0 && g_ps2xWsScale > 1.001f)
+        extern float g_ps2xWsHudInv;
+        if (s_wshudMode > 0 && g_ps2xWsHudInv < 0.999f)
         {
             // "scene present" latch: any depth-COMPARED triangle in this frame's lists. In
             // segment mode later segments (the HUD tail) may hold no triangles, so the latch
@@ -7834,7 +7832,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (!s_wsHas3d)
                 for (const DrawCmd &pc : DC)
                     if (pc.isTriangle && !pc.isTransfer && pc.depthTest && pc.depthFunc >= 2u) { s_wsHas3d = true; break; }
-            if (s_wsHas3d) wsHudInv = 1.0f / g_ps2xWsScale;
+            if (s_wsHas3d) wsHudInv = g_ps2xWsHudInv;
         }
     }
     const size_t ciEnd = std::min(DC.size(), m_stopAt);   // [deferdec] split point
@@ -7845,39 +7843,60 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // fields, to pick the HUD-vs-ink discriminator from data instead of guesses.
             static const bool s_wl = [](){ const char *v = std::getenv("PS2X_WSHUDLOG"); return v && v[0] && v[0] != '0'; }();
             static int s_wln = 0;
-            if (s_wl && wsHudInv != 1.0f && s_wln < 250 && !c.isTriangle && !c.isTransfer
+            if (s_wl && wsHudInv != 1.0f && s_wln < 400 && c.isTriangle && c.fst == 1u && !c.isTransfer
                 && !c.isVramBlit && !c.isDecode && !c.isAliasPass && (c.destFbp == 0u || c.destFbp == 112u))
             {
                 ++s_wln;
-                std::fprintf(stderr, "[wshudlog] #%d d=%u dpsm=%u dx=(%.0f..%.0f) dy=(%.0f..%.0f) tbp=%u spsm=%u rend=%d upl=%d idx=%d tex=%d fst=%u dt=%d df=%u abe=%d bm=%02x fbmsk=%08x date=%d\n",
-                             s_wln, c.destFbp, (unsigned)c.destPsm, c.dx0, c.dx1, c.dy0, c.dy1,
+                float tx0=c.tri[0].x, tx1=tx0, ty0=c.tri[0].y, ty1=ty0;
+                for (int ti=1; ti<3; ++ti) { tx0=std::min(tx0,c.tri[ti].x); tx1=std::max(tx1,c.tri[ti].x);
+                                             ty0=std::min(ty0,c.tri[ti].y); ty1=std::max(ty1,c.tri[ti].y); }
+                std::fprintf(stderr, "[wshudlog] T#%d d=%u dpsm=%u x=(%.0f..%.0f) y=(%.0f..%.0f) z=%.4f tbp=%u spsm=%u rend=%d upl=%d idx=%d tex=%d dt=%d df=%u abe=%d bm=%02x fbmsk=%08x date=%d\n",
+                             s_wln, c.destFbp, (unsigned)c.destPsm, tx0, tx1, ty0, ty1, c.tri[0].z,
                              c.srcTbp0, (unsigned)c.srcPsm, c.srcRendered?1:0, c.srcUploaded?1:0,
-                             c.srcIndexed?1:0, c.texKey?1:0, (unsigned)c.fst, c.depthTest?1:0,
+                             c.srcIndexed?1:0, c.texKey?1:0, c.depthTest?1:0,
                              (unsigned)c.depthFunc, c.abe?1:0, (unsigned)c.blendMode, c.fbmsk, c.dateEnable?1:0);
             }
         }
-        if (wsHudInv != 1.0f && !c.wsHudApplied && !c.isTriangle && !c.isTransfer && !c.isVramBlit
+        if (wsHudInv != 1.0f && !c.wsHudApplied && !c.isTransfer && !c.isVramBlit
             && !c.isDecode && !c.isAliasPass && (c.destFbp == 0u || c.destFbp == 112u)
-            && (c.destPsm == 0u || c.destPsm == 1u)
-            && (!c.depthTest || c.depthFunc == 1u))
+            && (c.destPsm == 0u || c.destPsm == 1u))
         {
+            // Center-anchored squeeze (one continuous linear map -- BT3's top bar is a chain
+            // of adjacent quads spanning the whole screen, so any multi-anchor map would tear
+            // it at the seams). The [wshudlog] census gives the HUD signature:
+            //   triangles: fst=1 (direct UV) at z EXACTLY 0, sampling uploaded art;
+            //   sprite path kept for other 2D overlays (subtitles), same short/narrow caps;
+            //   full-height passes (outline ink / masks / barriers) and full-width 2D
+            //   (fades, FMV) stay untouched.
             const float W = (c.destFbw >= 320u && c.destFbw <= 1024u) ? (float)c.destFbw : 640.0f;
-            const float sprW = c.dx1 - c.dx0;
-            // Height cap: the outline-ink / mask / barrier passes are FULL-HEIGHT column
-            // strips (dy 0..448 in the [wshudlog] census) -- squeezing them paints a
-            // displaced outline ghost. HUD elements are all short. (srcRendered was tried
-            // as the discriminator first, but HUD sprites carry it too and went unsqueezed.)
-            const float sprH = c.dy1 - c.dy0;
-            if (sprW > 0.0f && sprW < 0.8f * W && sprH > 0.0f && sprH < 300.0f)
+            DrawCmd &mc = const_cast<DrawCmd &>(c);
+            const float half = 0.5f * W;
+            if (!c.isTriangle)
             {
-                DrawCmd &mc = const_cast<DrawCmd &>(c);
-                const float cx = 0.5f * (c.dx0 + c.dx1);
-                const float anchor = (s_wshudMode == 2) ? 0.5f * W
-                                   : (cx < s_wsBandA * W) ? 0.0f
-                                   : (cx > s_wsBandB * W) ? W : 0.5f * W;
-                mc.dx0 = anchor + (c.dx0 - anchor) * wsHudInv;
-                mc.dx1 = anchor + (c.dx1 - anchor) * wsHudInv;
-                mc.wsHudApplied = true;
+                const float sprW = c.dx1 - c.dx0, sprH = c.dy1 - c.dy0;
+                if (sprW > 0.0f && sprW < 0.8f * W && sprH > 0.0f && sprH < 300.0f
+                    && (!c.depthTest || c.depthFunc == 1u))
+                {
+                    mc.dx0 = half + (c.dx0 - half) * wsHudInv;
+                    mc.dx1 = half + (c.dx1 - half) * wsHudInv;
+                    mc.wsHudApplied = true;
+                }
+            }
+            else if (c.fst == 1u
+                     && c.tri[0].z == 0.0f && c.tri[1].z == 0.0f && c.tri[2].z == 0.0f)
+            {
+                float tx0 = c.tri[0].x, tx1 = tx0, ty0 = c.tri[0].y, ty1 = ty0;
+                for (int ti = 1; ti < 3; ++ti)
+                {
+                    tx0 = std::min(tx0, c.tri[ti].x); tx1 = std::max(tx1, c.tri[ti].x);
+                    ty0 = std::min(ty0, c.tri[ti].y); ty1 = std::max(ty1, c.tri[ti].y);
+                }
+                if (tx1 - tx0 < 0.8f * W && ty1 - ty0 < 300.0f)
+                {
+                    for (int ti = 0; ti < 3; ++ti)
+                        mc.tri[ti].x = half + (c.tri[ti].x - half) * wsHudInv;
+                    mc.wsHudApplied = true;
+                }
             }
         }
         if (c.isDecode)
