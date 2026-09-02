@@ -351,6 +351,18 @@ void PS2SettingsOverlay::toggleVisible()
     }
 }
 
+// [envwins] An env var the USER set explicitly (present, and not one main() defaulted --
+// PS2X_DEFAULTED lists those) outranks the saved INI: play.sh-style launches and A/B runs
+// must behave as commanded regardless of what the overlay saved last session.
+static bool envUserSet(const char *name)
+{
+    if (!std::getenv(name)) return false;
+    const char *d = std::getenv("PS2X_DEFAULTED");
+    if (!d) return true;
+    std::string needle = std::string(",") + name + ",";
+    return std::string(d).find(needle) == std::string::npos;
+}
+
 void PS2SettingsOverlay::loadSettings()
 {
     // [defaults-sync] Seed from LIVE runtime state (env + main()'s baked defaults) so a
@@ -399,23 +411,23 @@ void PS2SettingsOverlay::loadSettings()
             else if (section == "video")
             {
                 if (key == "gpu_renderer")
-                    m_settings.gpuRenderer = (val == "1" || val == "true");
+                    { if (!envUserSet("PS2X_GPU")) m_settings.gpuRenderer = (val == "1" || val == "true"); }
                 else if (key == "glow")
-                    m_settings.glow = (val == "1" || val == "true");
+                    { if (!envUserSet("PS2X_GLOW")) m_settings.glow = (val == "1" || val == "true"); }
                 else if (key == "postfx")
-                    m_settings.postfx = (val == "1" || val == "true");
+                    { if (!envUserSet("PS2X_POSTFX")) m_settings.postfx = (val == "1" || val == "true"); }
                 else if (key == "bilinear")
-                    m_settings.bilinear = (val == "1" || val == "true");
+                    { if (!envUserSet("PS2X_BILINEAR")) m_settings.bilinear = (val == "1" || val == "true"); }
                 else if (key == "halftexel")
-                    m_settings.halfTexel = (val == "1" || val == "true");
+                    { if (!envUserSet("PS2X_HALFTEXEL")) m_settings.halfTexel = (val == "1" || val == "true"); }
                 else if (key == "skippost")
-                    m_settings.skipPost = (val == "1" || val == "true");
+                    { if (!envUserSet("PS2X_SKIPPOST")) m_settings.skipPost = (val == "1" || val == "true"); }
                 else if (key == "skip_stale_vram")
-                    m_settings.skipStaleVram = (val == "1" || val == "true");
+                    { if (!envUserSet("PS2X_SKIP_STALE_VRAM")) m_settings.skipStaleVram = (val == "1" || val == "true"); }
                 else if (key == "render_scale")
                 {
                     int s = std::atoi(val.c_str());
-                    m_settings.renderScale = (s >= 1 && s <= 4) ? s : 1;
+                    if (!envUserSet("PS2X_RENDER_SCALE")) m_settings.renderScale = (s >= 1 && s <= 4) ? s : 1;
                 }
                 else if (key == "fullscreen")
                     m_settings.fullscreen = (val == "1" || val == "true");
@@ -1031,11 +1043,11 @@ void PS2SettingsOverlay::drawVideoTab()
     sectionHeader("RENDERER");
     if (toggleSwitch("GPU Renderer (OpenGL)", &m_settings.gpuRenderer))
         m_dirty = true;
-    if (toggleSwitch("Glow (Bloom)", &m_settings.glow))
-        m_dirty = true;
+    ImGui::TextDisabled("Takes full effect after restart.");
+    // (Glow / Skip Post / Half-Texel / Skip Stale VRAM toggles removed: replay A/B
+    //  measured them at 0.000 frame diff in fights -- their draw classes are
+    //  superseded by the current serving pipeline. Env vars still work for devs.)
     if (toggleSwitch("Post-FX", &m_settings.postfx))
-        m_dirty = true;
-    if (toggleSwitch("Skip Post-Processing", &m_settings.skipPost))
         m_dirty = true;
 
     // (Render Scale UI removed in this integration: the scaling machinery's per-draw
@@ -1044,13 +1056,9 @@ void PS2SettingsOverlay::drawVideoTab()
     sectionHeader("FILTERING");
     if (toggleSwitch("Bilinear Filter", &m_settings.bilinear))
         m_dirty = true;
-    if (toggleSwitch("Half-Texel Correction", &m_settings.halfTexel))
-        m_dirty = true;
 
     // Display
     sectionHeader("DISPLAY");
-    if (toggleSwitch("Skip Stale VRAM", &m_settings.skipStaleVram))
-        m_dirty = true;
     if (toggleSwitch("Fullscreen", &m_settings.fullscreen))
     {
         ToggleFullscreen();
