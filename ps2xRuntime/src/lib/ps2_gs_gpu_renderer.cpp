@@ -4707,7 +4707,22 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
             const float kk = ((g_ps2xWsSrcW >= 320.0f && g_ps2xWsSrcW <= 1024.0f) ? g_ps2xWsSrcW : 512.0f) / 512.0f;
             const float cuts[4] = {168.f * kk, 216.f * kk, 296.f * kk, 344.f * kk};
             float mnx = cmd.tri[0].x, mxx = mnx;
-            for (int i = 1; i < 3; ++i) { mnx = std::min(mnx, cmd.tri[i].x); mxx = std::max(mxx, cmd.tri[i].x); }
+            float mny = cmd.tri[0].y, mxy = mny;
+            for (int i = 1; i < 3; ++i)
+            {
+                mnx = std::min(mnx, cmd.tri[i].x); mxx = std::max(mxx, cmd.tri[i].x);
+                mny = std::min(mny, cmd.tri[i].y); mxy = std::max(mxy, cmd.tri[i].y);
+            }
+            // Thin bar-like quads (health/ki bars, fill masks, damage flashes: ~16px tall)
+            // must NOT be split: their shine/flash gradients are authored to stretch
+            // uniformly, and piecewise pieces stretch at different rates -- the gradient
+            // chops into visible lighter/darker sections at the cut columns (user's
+            // health2.png). Their VERTICES still map exactly (endpoints anchored right);
+            // the featureless interior stretching uniformly is the correct look. Only the
+            // tall composite quads (backdrops with the plaque/pip art baked in, 64px) need
+            // subdivision.
+            if (mxy - mny <= 40.0f) { /* fall through unsplit */ }
+            else {
             bool crosses = false;
             for (float cx : cuts) if (cx > mnx + 0.01f && cx < mxx - 0.01f) { crosses = true; break; }
             if (crosses)
@@ -4766,6 +4781,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
                         }
                     return;
                 }
+            }
             }
         }
     }
