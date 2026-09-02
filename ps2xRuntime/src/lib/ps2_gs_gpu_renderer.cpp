@@ -7823,16 +7823,32 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         extern float g_ps2xWsHudInv;
         if (s_wshudMode > 0 && g_ps2xWsHudInv < 0.999f)
         {
-            // "scene present" latch: any depth-COMPARED triangle in this frame's lists. In
-            // segment mode later segments (the HUD tail) may hold no triangles, so the latch
-            // carries across segments of the same published generation.
-            static uint64_t s_wsGen = ~0ull; static bool s_wsHas3d = false;
-            const uint64_t gen = m_segMode ? g_publishGen : ~0ull;
-            if (!m_segMode || s_wsGen != gen) { s_wsGen = gen; s_wsHas3d = false; }
-            if (!s_wsHas3d)
+            // "scene present" gate with HYSTERESIS, decided from PREVIOUS frames only.
+            // Deciding from the current frame's prefix flickered: in live segment mode the
+            // HUD tail can execute before any scene triangle has entered the published
+            // prefix, so frames whose segment boundary fell badly drew the HUD unsqueezed
+            // (user-visible snap). Now: a frame that contained a depth-compared triangle
+            // arms the squeeze for FOLLOWING frames; it stays armed until several
+            // consecutive frames without one (menus/boot never arm it; the transition
+            // lag is a few frames and invisible).
+            static uint64_t s_wsGen = ~0ull;
+            static unsigned long s_wsCallGen = 0;
+            static bool s_wsFrameHad3d = false, s_wsActive = false;
+            static int s_wsNo3dRun = 0;
+            const uint64_t gen = m_segMode ? g_publishGen : (uint64_t)(++s_wsCallGen);
+            if (s_wsGen != gen)
+            {   // frame boundary: fold the finished frame's verdict into the sticky state
+                if (s_wsGen != ~0ull)
+                {
+                    if (s_wsFrameHad3d) { s_wsActive = true; s_wsNo3dRun = 0; }
+                    else if (++s_wsNo3dRun >= 5) s_wsActive = false;
+                }
+                s_wsGen = gen; s_wsFrameHad3d = false;
+            }
+            if (!s_wsFrameHad3d)
                 for (const DrawCmd &pc : DC)
-                    if (pc.isTriangle && !pc.isTransfer && pc.depthTest && pc.depthFunc >= 2u) { s_wsHas3d = true; break; }
-            if (s_wsHas3d) wsHudInv = g_ps2xWsHudInv;
+                    if (pc.isTriangle && !pc.isTransfer && pc.depthTest && pc.depthFunc >= 2u) { s_wsFrameHad3d = true; break; }
+            if (s_wsActive) wsHudInv = g_ps2xWsHudInv;
         }
     }
     const size_t ciEnd = std::min(DC.size(), m_stopAt);   // [deferdec] split point
