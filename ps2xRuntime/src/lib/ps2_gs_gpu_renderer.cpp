@@ -4706,7 +4706,12 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
         {
             extern float g_ps2xWsSrcW;
             const float kk = ((g_ps2xWsSrcW >= 320.0f && g_ps2xWsSrcW <= 1024.0f) ? g_ps2xWsSrcW : 512.0f) / 512.0f;
-            const float cuts[4] = {168.f * kk, 216.f * kk, 296.f * kk, 344.f * kk};
+            // unit boundaries + quarter points inside each bridge: every layer (trough,
+            // fill, mask, flash) is cut at the SAME absolute planes, so between adjacent
+            // cuts all layers are linear over the same interval with identical endpoint
+            // mapping -- exact alignment by construction, wherever the sliders sit.
+            const float cuts[10] = {168.f * kk, 180.f * kk, 192.f * kk, 204.f * kk, 216.f * kk,
+                                    296.f * kk, 308.f * kk, 320.f * kk, 332.f * kk, 344.f * kk};
             float mnx = cmd.tri[0].x, mxx = mnx;
             float mny = cmd.tri[0].y, mxy = mny;
             for (int i = 1; i < 3; ++i)
@@ -4722,7 +4727,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
             // the featureless interior stretching uniformly is the correct look. Only the
             // tall composite quads (backdrops with the plaque/pip art baked in, 64px) need
             // subdivision.
-            if (mxy - mny <= 40.0f || mxy >= 96.0f) { /* fall through unsplit (thin bars / non-HUD) */ }
+            if (mxy >= 96.0f) { /* non-HUD (pause menus, mid-screen 2D): never split */ }
             else {
             bool crosses = false;
             for (float cx : cuts) if (cx > mnx + 0.01f && cx < mxx - 0.01f) { crosses = true; break; }
@@ -7952,10 +7957,23 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (t1 > t2 - 2.f) t1 = t2 - 2.f;
             if (t3 > t4 - 2.f) t4 = t3 + 2.f;
         }
+        // Bridges are cubic Hermite with endpoint slope = inv: the stretch rate ramps
+        // smoothly from the rigid units into the bridge instead of stepping (an abrupt
+        // 0.8 -> 1.9 slope step is what made split bar art look slabby). Monotone for
+        // any tb > ta since inv <= 3 * mean slope.
+        auto bridge = [&](float x, float a, float b, float ta, float tb) -> float
+        {
+            const float span = b - a;
+            const float T = (x - a) / span;
+            const float m = inv * span;
+            const float T2 = T * T, T3 = T2 * T;
+            return (2*T3 - 3*T2 + 1) * ta + (T3 - 2*T2 + T) * m
+                 + (-2*T3 + 3*T2) * tb + (T3 - T2) * m;
+        };
         if (x <= s1) return t0 + x * inv;
-        if (x <= s2) return t1 + (x - s1) * (t2 - t1) / (s2 - s1);
+        if (x <= s2) return bridge(x, s1, s2, t1, t2);
         if (x <= s3) return t2 + (x - s2) * inv;
-        if (x <= s4) return t3 + (x - s3) * (t4 - t3) / (s4 - s3);
+        if (x <= s4) return bridge(x, s3, s4, t3, t4);
         return t4 + (x - s4) * inv;
     };
     // [wshud] Aspect-aware HUD: in true-widescreen the 3D scene is pre-squeezed by the
