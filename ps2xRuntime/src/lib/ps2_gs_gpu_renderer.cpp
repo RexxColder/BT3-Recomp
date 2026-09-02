@@ -184,6 +184,7 @@ int  GsGpuRenderer::renderScale()
     if (v < 0)
     {
         const char *e = std::getenv("PS2X_RENDER_SCALE");
+        if (!e || !e[0]) e = std::getenv("PS2X_RENDERSCALE");   // accept both spellings
         v = e && e[0] ? std::atoi(e) : 1;
         if (v < 1) v = 1; if (v > 4) v = 4;
         g_uiRenderScale.store(v, std::memory_order_relaxed);
