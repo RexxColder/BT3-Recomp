@@ -100,6 +100,23 @@ PATCHES = [
         "insert_after_anchor": COND_PULSE_CLEAR,
         "extra_include": "#include <cstdlib>\n",
     },
+    {
+        # [truews] Aspect-aware widescreen: after the projection lui (0x3F40 = 0.75) in
+        # sub_00130BA8, override $at with full-precision 0.75/scale from the live window
+        # aspect (g_ps2xWsLui, ps2_runtime.cpp). Generalizes the community pnach, which
+        # could only rewrite the upper immediate (0x3F10) and only for 16:9.
+        "file": "sub_00130BA8_0x130ba8.cpp",
+        "marker": "[bt3 patch: truews]",
+        "anchor": (
+            "    // 0x130bf0: 0x3c013f40  lui         $at, 0x3F40\n"
+            "    ctx->pc = 0x130bf0u;\n"
+            "    SET_GPR_S32(ctx, 1, (int32_t)((uint32_t)16192 << 16));"
+        ),
+        "insert_after_anchor": """
+    // [bt3 patch: truews] aspect-aware widescreen: override the 0.75 projection constant
+    // with full-precision 0.75/scale from the live window aspect (0.75 exact = disabled).
+    { extern float g_ps2xWsLui; if (g_ps2xWsLui != 0.75f) { uint32_t b_; std::memcpy(&b_, &g_ps2xWsLui, 4); SET_GPR_S32(ctx, 1, (int32_t)b_); } }""",
+    },
 ]
 
 

@@ -311,6 +311,10 @@ void PS2SettingsOverlay::initialize()
         ? (std::filesystem::current_path() / kConfigFileName).string()
         : (std::filesystem::path(s_configDir) / kConfigFileName).string();
     loadSettings();
+    // Apply the saved window size (before any fullscreen toggle, so it sizes the
+    // windowed state the user returns to). 0 = keep the default host window.
+    if (m_settings.windowW >= 320 && m_settings.windowH >= 240)
+        SetWindowSize(m_settings.windowW, m_settings.windowH);
     // Apply fullscreen on startup if the INI says so (or the default is true).
     if (m_settings.fullscreen)
         ToggleFullscreen();
@@ -441,6 +445,10 @@ void PS2SettingsOverlay::loadSettings()
                     m_settings.fullscreen = (val == "1" || val == "true");
                 else if (key == "widescreen")
                     m_settings.widescreen = (val == "1" || val == "true");
+                else if (key == "window_w")
+                    m_settings.windowW = std::atoi(val.c_str());
+                else if (key == "window_h")
+                    m_settings.windowH = std::atoi(val.c_str());
             }
             else if (section == "controllers")
             {
@@ -547,6 +555,8 @@ void PS2SettingsOverlay::saveSettings() const
     file << "dof_blur=" << (m_settings.dofBlur ? "1" : "0") << "\n";
     file << "dof_zfar=" << m_settings.dofZFar << "\n";
     file << "fullscreen=" << (m_settings.fullscreen ? "1" : "0") << "\n";
+    file << "window_w=" << m_settings.windowW << "\n";
+    file << "window_h=" << m_settings.windowH << "\n";
     file << "widescreen=" << (m_settings.widescreen ? "1" : "0") << "\n\n";
 
     file << "[controllers]\n";
@@ -1108,10 +1118,44 @@ void PS2SettingsOverlay::drawVideoTab()
         ToggleFullscreen();
         m_dirty = true;
     }
-    if (toggleSwitch("Widescreen (16:9)", &m_settings.widescreen))
+    if (toggleSwitch("Widescreen (true FOV)", &m_settings.widescreen))
     {
         s_widescreen = m_settings.widescreen;
         m_dirty = true;
+    }
+
+    // Window-size presets. The projection FOV follows the window aspect (see [truews]
+    // in ps2_runtime.cpp), so wider windows genuinely show more stage.
+    {
+        static const int kRes[][2] = {{1280, 720}, {1600, 900}, {1920, 1080},
+                                      {2560, 1440}, {3440, 1440}, {1024, 768}};
+        static const char *kResNames[] = {"1280 x 720", "1600 x 900", "1920 x 1080",
+                                          "2560 x 1440", "3440 x 1440 (ultrawide)", "1024 x 768 (4:3)"};
+        constexpr int kResCount = 6;
+        int cur = -1;
+        const int w = GetScreenWidth(), h = GetScreenHeight();
+        for (int i = 0; i < kResCount; ++i)
+            if (kRes[i][0] == w && kRes[i][1] == h) { cur = i; break; }
+        char curLabel[32];
+        std::snprintf(curLabel, sizeof(curLabel), "%d x %d", w, h);
+        ImGui::TextUnformatted("Window Size");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        if (ImGui::BeginCombo("##winsize", cur >= 0 ? kResNames[cur] : curLabel))
+        {
+            for (int i = 0; i < kResCount; ++i)
+            {
+                if (ImGui::Selectable(kResNames[i], i == cur) && i != cur && !IsWindowFullscreen())
+                {
+                    SetWindowSize(kRes[i][0], kRes[i][1]);
+                    m_settings.windowW = kRes[i][0];
+                    m_settings.windowH = kRes[i][1];
+                    m_dirty = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (IsWindowFullscreen())
+            ImGui::TextDisabled("(windowed mode only)");
     }
 }
 

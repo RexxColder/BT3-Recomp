@@ -22,6 +22,8 @@
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
 #include "ps2_settings_overlay.h"
+// [truews] 0.75/scale for the patched projection lui in sub_00130BA8 (0.75 = disabled).
+float g_ps2xWsLui = 0.75f;
 #include "rlgl.h" // rlSetBlendFactorsSeparate for the blend-free present blit
 namespace ps2_syscalls { bool bt3WakeThreadByEntry(uint32_t entry); }
 
@@ -3990,6 +3992,47 @@ void PS2Runtime::run()
         // GPU mode: render the recorded GS command list into the FBO and present that
         // (its texture is bottom-up, so flip Y). Software mode: upload guest VRAM.
         const bool gpuMode = GsGpuRenderer::enabled();
+#if !defined(PLATFORM_VITA)
+        {   // [truews] aspect-aware TRUE widescreen. Generalizes the community 16:9 hack
+            // (SLUS-21678_428113C2.pnach: FOV floats @2fe4cc/@2fe594 x4/3, lui 0.75->0.5625
+            // @130bf0) to the ACTUAL window aspect: scale = aspect/(4:3). Originals are
+            // captured before the first poke so toggling OFF restores them exactly; the lui
+            // gets full-precision 0.75/scale via g_ps2xWsLui (the pnach could only patch the
+            // upper 16 bits).
+            static float s_wsOrig1 = 0.0f, s_wsOrig2 = 0.0f;
+            float wsScale = 1.0f;
+            if (PS2SettingsOverlay::isWidescreen())
+            {
+                const float wsA = (float)GetScreenWidth() / (float)std::max(1, GetScreenHeight());
+                wsScale = wsA / (4.0f / 3.0f);
+                if (wsScale < 1.0f) wsScale = 1.0f;
+                if (wsScale > 2.5f) wsScale = 2.5f;
+            }
+            if (const char *wsF = std::getenv("PS2X_WSFORCE"))
+            {   // [wsforce] rig override: force the scale regardless of toggle/window aspect
+                const float f = (float)std::atof(wsF);
+                if (f >= 1.0f && f <= 2.5f) wsScale = f;
+            }
+            if (uint8_t *wsRd = m_memory.getRDRAM())
+            {
+                float *wp1 = reinterpret_cast<float *>(wsRd + 0x2fe4cc);
+                float *wp2 = reinterpret_cast<float *>(wsRd + 0x2fe594);
+                if (s_wsOrig1 == 0.0f && *wp1 > 0.5f && *wp1 < 2.0f) s_wsOrig1 = *wp1;
+                if (s_wsOrig2 == 0.0f && *wp2 > 100.0f && *wp2 < 500.0f) s_wsOrig2 = *wp2;
+                if (s_wsOrig1 != 0.0f) *wp1 = s_wsOrig1 * wsScale;
+                if (s_wsOrig2 != 0.0f) *wp2 = s_wsOrig2 * wsScale;
+            }
+            extern float g_ps2xWsLui;
+            g_ps2xWsLui = 0.75f / wsScale;
+            static float s_wsLast = -1.0f;
+            if (wsScale != s_wsLast)
+            {
+                s_wsLast = wsScale;
+                std::fprintf(stderr, "[truews] scale=%.4f window=%dx%d orig=(%.4f, %.2f)\n",
+                             wsScale, GetScreenWidth(), GetScreenHeight(), s_wsOrig1, s_wsOrig2);
+            }
+        }
+#endif
         Texture2D presentTex = frameTex;
         bool flipY = false;
         if (gpuMode)
