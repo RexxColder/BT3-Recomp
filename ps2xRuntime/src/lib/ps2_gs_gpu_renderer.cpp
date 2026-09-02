@@ -14383,16 +14383,11 @@ if (done.size() < 14 && !done.count(c.texKey))
                     }
                 }
                 ps2xApplyTexFilter(tex, c.bilinear
-                    // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
-                    // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
-                    // ALPHA stays binary, but squeezed quads sample between texels and
-                    // write SOFT alpha -- and the backdrop/fill layers (open fbmsk) write
-                    // alpha too, not just the dedicated masks. GS DATE reads only bit7
-                    // (binary at any softness); our lerp-blend approximation leaks
-                    // proportionally at every soft edge = dark sections at the bar ends,
-                    // flash bleeding both ways. User: only in true widescreen, ANY layout
-                    // (= the one thing all layouts share, the in-FBO squeeze).
-                    && !c.wsHudApplied); rlSetTexture(tex.id);
+                    // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
+                    // [datebin] snap binarizes the gate before every gated draw now, so
+                    // the other squeezed HUD art can sample bilinear again -- point-forcing
+                    // everything aliased the HUD at render scale (2x shimmer).
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
                     rlBegin(RL_QUADS);
                     for (int k = 0; k < 4; ++k)
@@ -14744,16 +14739,11 @@ if (done.size() < 14 && !done.count(c.texKey))
                     }
                 }
                 ps2xApplyTexFilter(tex, c.bilinear
-                    // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
-                    // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
-                    // ALPHA stays binary, but squeezed quads sample between texels and
-                    // write SOFT alpha -- and the backdrop/fill layers (open fbmsk) write
-                    // alpha too, not just the dedicated masks. GS DATE reads only bit7
-                    // (binary at any softness); our lerp-blend approximation leaks
-                    // proportionally at every soft edge = dark sections at the bar ends,
-                    // flash bleeding both ways. User: only in true widescreen, ANY layout
-                    // (= the one thing all layouts share, the in-FBO squeeze).
-                    && !c.wsHudApplied); rlSetTexture(tex.id);
+                    // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
+                    // [datebin] snap binarizes the gate before every gated draw now, so
+                    // the other squeezed HUD art can sample bilinear again -- point-forcing
+                    // everything aliased the HUD at render scale (2x shimmer).
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                 rlBegin(RL_QUADS);
                 {   // [emitA] PS2X_CMPWR=1: the vertex alpha actually emitted for the mask composites
                     static const bool s_ea = [](){ const char *v = std::getenv("PS2X_CMPWR"); return v && v[0] && v[0] != '0'; }();
@@ -15195,16 +15185,11 @@ if (done.size() < 14 && !done.count(c.texKey))
                     }
                 }
                 ps2xApplyTexFilter(tex, c.bilinear
-                    // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
-                    // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
-                    // ALPHA stays binary, but squeezed quads sample between texels and
-                    // write SOFT alpha -- and the backdrop/fill layers (open fbmsk) write
-                    // alpha too, not just the dedicated masks. GS DATE reads only bit7
-                    // (binary at any softness); our lerp-blend approximation leaks
-                    // proportionally at every soft edge = dark sections at the bar ends,
-                    // flash bleeding both ways. User: only in true widescreen, ANY layout
-                    // (= the one thing all layouts share, the in-FBO squeeze).
-                    && !c.wsHudApplied); rlSetTexture(tex.id);
+                    // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
+                    // [datebin] snap binarizes the gate before every gated draw now, so
+                    // the other squeezed HUD art can sample bilinear again -- point-forcing
+                    // everything aliased the HUD at render scale (2x shimmer).
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
                     rlBegin(RL_QUADS);
                     rlColor4ub(255, 255, 255, 255);
@@ -15443,16 +15428,11 @@ if (done.size() < 14 && !done.count(c.texKey))
                     }
                 }
                 ps2xApplyTexFilter(tex, c.bilinear
-                    // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
-                    // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
-                    // ALPHA stays binary, but squeezed quads sample between texels and
-                    // write SOFT alpha -- and the backdrop/fill layers (open fbmsk) write
-                    // alpha too, not just the dedicated masks. GS DATE reads only bit7
-                    // (binary at any softness); our lerp-blend approximation leaks
-                    // proportionally at every soft edge = dark sections at the bar ends,
-                    // flash bleeding both ways. User: only in true widescreen, ANY layout
-                    // (= the one thing all layouts share, the in-FBO squeeze).
-                    && !c.wsHudApplied); rlSetTexture(tex.id);
+                    // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
+                    // [datebin] snap binarizes the gate before every gated draw now, so
+                    // the other squeezed HUD art can sample bilinear again -- point-forcing
+                    // everything aliased the HUD at render scale (2x shimmer).
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                         rlCheckRenderBatchLimit(4);
                         rlBegin(RL_QUADS);
                         const int qd[4] = {0, 1, 2, 2};
@@ -15504,16 +15484,11 @@ if (done.size() < 14 && !done.count(c.texKey))
             }
             if (c.texKey != 0 && c.srcTbp0 >= 13000u && c.srcTbp0 < 14100u) ++g_charSingleN;
             ps2xApplyTexFilter(tex, c.bilinear
-                    // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
-                    // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
-                    // ALPHA stays binary, but squeezed quads sample between texels and
-                    // write SOFT alpha -- and the backdrop/fill layers (open fbmsk) write
-                    // alpha too, not just the dedicated masks. GS DATE reads only bit7
-                    // (binary at any softness); our lerp-blend approximation leaks
-                    // proportionally at every soft edge = dark sections at the bar ends,
-                    // flash bleeding both ways. User: only in true widescreen, ANY layout
-                    // (= the one thing all layouts share, the in-FBO squeeze).
-                    && !c.wsHudApplied); rlSetTexture(tex.id);
+                    // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
+                    // [datebin] snap binarizes the gate before every gated draw now, so
+                    // the other squeezed HUD art can sample bilinear again -- point-forcing
+                    // everything aliased the HUD at render scale (2x shimmer).
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
             rlCheckRenderBatchLimit(4);
             {   // [region] declared/actual clamp for RT-sourced draws (see uRegion)
                 static int s_locUViz = -2; if (s_locUViz == -2) s_locUViz = GetShaderLocation(g_shader, "uUViz");
@@ -15749,16 +15724,11 @@ if (done.size() < 14 && !done.count(c.texKey))
                     }
                 }
                 ps2xApplyTexFilter(tex, c.bilinear
-                    // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
-                    // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
-                    // ALPHA stays binary, but squeezed quads sample between texels and
-                    // write SOFT alpha -- and the backdrop/fill layers (open fbmsk) write
-                    // alpha too, not just the dedicated masks. GS DATE reads only bit7
-                    // (binary at any softness); our lerp-blend approximation leaks
-                    // proportionally at every soft edge = dark sections at the bar ends,
-                    // flash bleeding both ways. User: only in true widescreen, ANY layout
-                    // (= the one thing all layouts share, the in-FBO squeeze).
-                    && !c.wsHudApplied); rlSetTexture(tex.id);
+                    // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
+                    // [datebin] snap binarizes the gate before every gated draw now, so
+                    // the other squeezed HUD art can sample bilinear again -- point-forcing
+                    // everything aliased the HUD at render scale (2x shimmer).
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -15798,16 +15768,11 @@ if (done.size() < 14 && !done.count(c.texKey))
                     }
                 }
                 ps2xApplyTexFilter(tex, c.bilinear
-                    // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
-                    // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
-                    // ALPHA stays binary, but squeezed quads sample between texels and
-                    // write SOFT alpha -- and the backdrop/fill layers (open fbmsk) write
-                    // alpha too, not just the dedicated masks. GS DATE reads only bit7
-                    // (binary at any softness); our lerp-blend approximation leaks
-                    // proportionally at every soft edge = dark sections at the bar ends,
-                    // flash bleeding both ways. User: only in true widescreen, ANY layout
-                    // (= the one thing all layouts share, the in-FBO squeeze).
-                    && !c.wsHudApplied); rlSetTexture(tex.id);
+                    // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
+                    // [datebin] snap binarizes the gate before every gated draw now, so
+                    // the other squeezed HUD art can sample bilinear again -- point-forcing
+                    // everything aliased the HUD at render scale (2x shimmer).
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -15850,16 +15815,11 @@ if (done.size() < 14 && !done.count(c.texKey))
                     }
                 }
                 ps2xApplyTexFilter(tex, c.bilinear
-                    // [maskpoint] EVERY draw the widescreen HUD map has rescaled samples
-                    // POINT: at 1:1 (4:3) bilinear lands on texel centers and all written
-                    // ALPHA stays binary, but squeezed quads sample between texels and
-                    // write SOFT alpha -- and the backdrop/fill layers (open fbmsk) write
-                    // alpha too, not just the dedicated masks. GS DATE reads only bit7
-                    // (binary at any softness); our lerp-blend approximation leaks
-                    // proportionally at every soft edge = dark sections at the bar ends,
-                    // flash bleeding both ways. User: only in true widescreen, ANY layout
-                    // (= the one thing all layouts share, the in-FBO squeeze).
-                    && !c.wsHudApplied); rlSetTexture(tex.id);
+                    // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
+                    // [datebin] snap binarizes the gate before every gated draw now, so
+                    // the other squeezed HUD art can sample bilinear again -- point-forcing
+                    // everything aliased the HUD at render scale (2x shimmer).
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(128, 128, 128, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);

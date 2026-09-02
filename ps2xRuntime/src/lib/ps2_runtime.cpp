@@ -4169,6 +4169,12 @@ void PS2Runtime::run()
         // the final blit would punch the frame transparent to the clear color.
         rlSetBlendFactorsSeparate(0x0001 /*GL_ONE*/, 0x0000 /*GL_ZERO*/, 0x0001, 0x0000, 0x8006 /*GL_FUNC_ADD*/, 0x8006);
         BeginBlendMode(BLEND_CUSTOM_SEPARATE);
+        // [rscale] present the scaled scene with LINEAR sampling: at render scale N the
+        // texture is N x native, and any non-integer window ratio point-decimates --
+        // ground shake at 720p windows, HUD shimmer at 1080p. The renderer re-applies
+        // its own per-draw filters, so this only affects the present.
+        if (GsGpuRenderer::renderScale() > 1)
+            SetTextureFilter(presentTex, TEXTURE_FILTER_BILINEAR);
         DrawTexturePro(presentTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         EndBlendMode();
         {   // [presentlog] PS2X_PRESENTLOG=1: print every CHANGE of the present geometry (a 60 Hz alternation shows as a
