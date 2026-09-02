@@ -7807,10 +7807,60 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                              (int)!reorderBuf.empty());
         }
     }
+    // [wshud] Aspect-aware HUD: in true-widescreen the 3D scene is pre-squeezed by the
+    // projection patch and un-squeezed at present; screen-space HUD sprites get no such
+    // pre-squeeze and come out stretched. Squeeze them here, per sprite, anchored to the
+    // nearest screen edge (left band -> left edge, right band -> right edge, middle ->
+    // center) so portraits/bars keep their corners AND their proportions. Exemptions:
+    // full-width 2D (fades, FMV, menu backdrops keep filling the window), transfers/alias/
+    // decode bookkeeping, and depth-COMPARED sprites (screen-space overlays test ALWAYS or
+    // not at all). Only frames that contain a depth-tested 3D scene are touched, so menus
+    // and boot screens stay exactly as before. PS2X_WSHUD: 1=edge-anchored (default),
+    // 2=center-anchored (whole HUD compresses toward center), 0=off.
+    float wsHudInv = 1.0f;
+    static const int s_wshudMode = [](){ const char *v = std::getenv("PS2X_WSHUD"); return v ? std::atoi(v) : 1; }();
+    static const float s_wsBandA = [](){ const char *v = std::getenv("PS2X_WSHUDBANDS"); float a = 0.40f, b = 0.60f; if (v) std::sscanf(v, "%f,%f", &a, &b); return a; }();
+    static const float s_wsBandB = [](){ const char *v = std::getenv("PS2X_WSHUDBANDS"); float a = 0.40f, b = 0.60f; if (v) std::sscanf(v, "%f,%f", &a, &b); return b; }();
+    {
+        extern float g_ps2xWsScale;
+        if (s_wshudMode > 0 && g_ps2xWsScale > 1.001f)
+        {
+            // "scene present" latch: any depth-COMPARED triangle in this frame's lists. In
+            // segment mode later segments (the HUD tail) may hold no triangles, so the latch
+            // carries across segments of the same published generation.
+            static uint64_t s_wsGen = ~0ull; static bool s_wsHas3d = false;
+            const uint64_t gen = m_segMode ? g_publishGen : ~0ull;
+            if (!m_segMode || s_wsGen != gen) { s_wsGen = gen; s_wsHas3d = false; }
+            if (!s_wsHas3d)
+                for (const DrawCmd &pc : DC)
+                    if (pc.isTriangle && !pc.isTransfer && pc.depthTest && pc.depthFunc >= 2u) { s_wsHas3d = true; break; }
+            if (s_wsHas3d) wsHudInv = 1.0f / g_ps2xWsScale;
+        }
+    }
     const size_t ciEnd = std::min(DC.size(), m_stopAt);   // [deferdec] split point
     for (size_t ci = ciStart; ci < ciEnd; ++ci)
     {
         const DrawCmd &c = DC[ci];
+        if (wsHudInv != 1.0f && !c.wsHudApplied && !c.isTriangle && !c.isTransfer && !c.isVramBlit
+            && !c.isDecode && !c.isAliasPass && (c.destFbp == 0u || c.destFbp == 112u)
+            && (c.destPsm == 0u || c.destPsm == 1u)
+            && !c.srcRendered
+            && (!c.depthTest || c.depthFunc == 1u))
+        {
+            const float W = (c.destFbw >= 320u && c.destFbw <= 1024u) ? (float)c.destFbw : 640.0f;
+            const float sprW = c.dx1 - c.dx0;
+            if (sprW > 0.0f && sprW < 0.8f * W)
+            {
+                DrawCmd &mc = const_cast<DrawCmd &>(c);
+                const float cx = 0.5f * (c.dx0 + c.dx1);
+                const float anchor = (s_wshudMode == 2) ? 0.5f * W
+                                   : (cx < s_wsBandA * W) ? 0.0f
+                                   : (cx > s_wsBandB * W) ? W : 0.5f * W;
+                mc.dx0 = anchor + (c.dx0 - anchor) * wsHudInv;
+                mc.dx1 = anchor + (c.dx1 - anchor) * wsHudInv;
+                mc.wsHudApplied = true;
+            }
+        }
         if (c.isDecode)
         {   // [deferdec] decode commands are serviced OUTSIDE the loop (serviceNextDecode splits the
             // render here so the flush sees a finished segment). Reaching one unserviced means the
