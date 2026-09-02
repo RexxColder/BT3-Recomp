@@ -3442,6 +3442,20 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case 0x5c:
         if (m_privRegs)
             m_privRegs->display2 = value;
+        {   // [display2] same census as [display1] -- BT3 scans out via circuit 2, and the
+            // CRTC MAGH here is the authoritative "how wide does the TV draw this buffer".
+            static const bool s_d2 = [](){ const char *v = std::getenv("PS2X_GPU_DIAG"); return v && v[0] && v[0] != '0'; }();
+            static uint64_t s_l2 = ~0ull; static int s_n2 = 0;
+            if (s_d2 && value != s_l2 && s_n2 < 24)
+            {
+                s_l2 = value; ++s_n2;
+                const uint32_t dx = value & 0xFFFu, dy = (value >> 12) & 0x7FFu;
+                const uint32_t magh = (value >> 23) & 0xFu, magv = (value >> 27) & 0x3u;
+                const uint32_t dw = (value >> 32) & 0xFFFu, dh = (value >> 44) & 0x7FFu;
+                std::fprintf(stderr, "[display2] DX=%u DY=%u MAGH=%u MAGV=%u DW=%u DH=%u -> visible %ux%u (magh+1=%u)\n",
+                             dx, dy, magh, magv, dw, dh, (dw + 1) / (magh + 1), (dh + 1) / (magv + 1), magh + 1);
+            }
+        }
         break;
     case 0x5f:
         if (m_privRegs)
