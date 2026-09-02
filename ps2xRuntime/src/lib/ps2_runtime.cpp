@@ -4097,6 +4097,30 @@ void PS2Runtime::run()
                 }
             }
         }
+        {   // [ftspike] PS2X_FTSPIKE=1: PER-FRAME time spikes. The [fps] line is a ~1s average;
+            // a 29.9 mean can hide 50-80 ms hitch frames that FEEL like dips ("the dips are
+            // noticable" with min-28.8 logs). Tracks inter-present deltas: per second prints
+            // the worst frame, a bucket histogram, and the count of frames over 40/50 ms.
+            static const bool s_fts = [](){ const char *v = std::getenv("PS2X_FTSPIKE"); return v && v[0] && v[0] != '0'; }();
+            if (s_fts)
+            {
+                static auto last = std::chrono::steady_clock::now();
+                static auto lastPr = last;
+                static double mx = 0; static int n = 0, b25 = 0, b33 = 0, b40 = 0, b50 = 0, b80 = 0;
+                const auto now = std::chrono::steady_clock::now();
+                const double dt = std::chrono::duration<double, std::milli>(now - last).count();
+                last = now; ++n;
+                if (dt > mx) mx = dt;
+                if (dt > 80.0) ++b80; else if (dt > 50.0) ++b50; else if (dt > 40.0) ++b40; else if (dt > 34.5) ++b33; else if (dt > 26.0) ++b25;
+                if (std::chrono::duration<double>(now - lastPr).count() >= 1.0)
+                {
+                    lastPr = now;
+                    std::fprintf(stderr, "[ftspike] n=%d max=%.1fms  >26:%d >34.5:%d >40:%d >50:%d >80:%d\n",
+                                 n, mx, b25, b33, b40, b50, b80);
+                    mx = 0; n = 0; b25 = b33 = b40 = b50 = b80 = 0;
+                }
+            }
+        }
 
         // Drain any streaming PCM into the audio device. Must run on the render thread --
         // raylib's AudioStream calls are not safe to make from the guest threads that
