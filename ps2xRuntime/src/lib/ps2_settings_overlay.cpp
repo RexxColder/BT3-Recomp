@@ -1133,6 +1133,20 @@ void PS2SettingsOverlay::drawVideoTab()
     // (Render Scale UI removed in this integration: the scaling machinery's per-draw
     // cost regressed the fight loop; the setting is still persisted for a future port.)
     // Filtering
+    sectionHeader("QUALITY");
+    {   // internal render scale: scene buffers render at N x native (1x = PS2-native)
+        static const char *kScales[] = {"Native (1x)", "2x", "3x", "4x"};
+        int rsIdx = m_settings.renderScale - 1;
+        if (rsIdx < 0) rsIdx = 0; if (rsIdx > 3) rsIdx = 3;
+        ImGui::TextUnformatted("Internal Resolution");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        if (ImGui::Combo("##renderscale", &rsIdx, kScales, 4))
+        {
+            m_settings.renderScale = rsIdx + 1;
+            GsGpuRenderer::setRenderScale(m_settings.renderScale);
+            m_dirty = true;
+        }
+    }
     sectionHeader("FILTERING");
     if (toggleSwitch("Bilinear Filter", &m_settings.bilinear))
         m_dirty = true;
