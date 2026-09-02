@@ -4698,7 +4698,8 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
         static const int s_envLayout = [](){ const char *v = std::getenv("PS2X_WSHUDLAYOUT"); return v ? std::atoi(v) : 0; }();
         const int liveLayout = g_wsHudLayout.load(std::memory_order_relaxed);
         const int effLayout = (liveLayout >= 0) ? liveLayout : s_envLayout;
-        if (effLayout >= 1 && g_ps2xWsHudInv < 0.999f && cmd.isTriangle && cmd.fst == 1u && !cmd.isTransfer
+        if (effLayout >= 1 && g_ps2xWsHudInv < 0.999f && cmd.isTriangle && cmd.fst == 1u
+            && cmd.srcTbp0 >= 10752u && cmd.srcTbp0 <= 11328u && !cmd.isTransfer
             && !cmd.isVramBlit && !cmd.isDecode
             && (cmd.destFbp == 0u || cmd.destFbp == 112u) && (cmd.destPsm == 0u || cmd.destPsm == 1u)
             && cmd.tri[0].z == 0.0f && cmd.tri[1].z == 0.0f && cmd.tri[2].z == 0.0f)
@@ -4721,7 +4722,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
             // the featureless interior stretching uniformly is the correct look. Only the
             // tall composite quads (backdrops with the plaque/pip art baked in, 64px) need
             // subdivision.
-            if (mxy - mny <= 40.0f) { /* fall through unsplit */ }
+            if (mxy - mny <= 40.0f || mxy >= 96.0f) { /* fall through unsplit (thin bars / non-HUD) */ }
             else {
             bool crosses = false;
             for (float cx : cuts) if (cx > mnx + 0.01f && cx < mxx - 0.01f) { crosses = true; break; }
@@ -8009,8 +8010,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // fields, to pick the HUD-vs-ink discriminator from data instead of guesses.
             static const bool s_wl = [](){ const char *v = std::getenv("PS2X_WSHUDLOG"); return v && v[0] && v[0] != '0'; }();
             static int s_wln = 0;
+            static const float s_wlY = [](){ const char *v = std::getenv("PS2X_WSHUDLOGY"); return v ? (float)std::atof(v) : -1000.0f; }();
             if (s_wl && wsHudInv != 1.0f && s_wln < 400 && c.isTriangle && c.fst == 1u && !c.isTransfer
-                && !c.isVramBlit && !c.isDecode && !c.isAliasPass && (c.destFbp == 0u || c.destFbp == 112u))
+                && !c.isVramBlit && !c.isDecode && !c.isAliasPass && (c.destFbp == 0u || c.destFbp == 112u)
+                && c.tri[0].y >= s_wlY)
             {
                 ++s_wln;
                 float tx0=c.tri[0].x, tx1=tx0, ty0=c.tri[0].y, ty1=ty0;
@@ -8041,6 +8044,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             {
                 const float sprW = c.dx1 - c.dx0, sprH = c.dy1 - c.dy0;
                 if (sprW > 0.0f && sprW < 0.8f * W && sprH > 0.0f && sprH < 300.0f
+                    && c.dy1 < 96.0f
+                    && c.srcTbp0 >= 10752u && c.srcTbp0 <= 11328u
                     && (!c.depthTest || c.depthFunc == 1u))
                 {
                     mc.dx0 = wsMapX(c.dx0, W, wsHudInv);
@@ -8049,7 +8054,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 }
             }
             else if (c.fst == 1u
-                     && c.tri[0].z == 0.0f && c.tri[1].z == 0.0f && c.tri[2].z == 0.0f)
+                     && c.tri[0].z == 0.0f && c.tri[1].z == 0.0f && c.tri[2].z == 0.0f
+                     && c.srcTbp0 >= 10752u && c.srcTbp0 <= 11328u)
             {
                 float tx0 = c.tri[0].x, tx1 = tx0, ty0 = c.tri[0].y, ty1 = ty0;
                 for (int ti = 1; ti < 3; ++ti)
@@ -8057,7 +8063,11 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     tx0 = std::min(tx0, c.tri[ti].x); tx1 = std::max(tx1, c.tri[ti].x);
                     ty0 = std::min(ty0, c.tri[ti].y); ty1 = std::max(ty1, c.tri[ti].y);
                 }
-                if (tx1 - tx0 < 0.8f * W && ty1 - ty0 < 300.0f)
+                // top-band only: BT3's fight HUD lives entirely in the top ~90 game px
+                // (census max y=88; there is no bottom HUD strip). The pause menu / combo
+                // counters / any mid-screen 2D share fst/z/tbp with the HUD -- the y band
+                // is the reliable discriminator.
+                if (tx1 - tx0 < 0.8f * W && ty1 - ty0 < 300.0f && ty1 < 96.0f)
                 {
                     for (int ti = 0; ti < 3; ++ti)
                         mc.tri[ti].x = wsMapX(c.tri[ti].x, W, wsHudInv);
