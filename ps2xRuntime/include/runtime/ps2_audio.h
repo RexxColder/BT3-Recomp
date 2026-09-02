@@ -85,7 +85,20 @@ public:
     void stopAll();
     void setAudioReady(bool ready) { m_audioReady = ready; }
 
+    static void setMasterVolume(float v) { s_masterVolume = v; }
+    static float masterVolume() { return s_masterVolume; }
+
+    // Per-category volume (multiplied on top of master). Music = the BGM stereo pair
+    // (streams 0+1); SFX = mono streams (voices, effects) and VAG one-shots.
+    static void setMusicVolume(float v) { s_musicVolume = v; }
+    static float musicVolume() { return s_musicVolume; }
+    static void setSfxVolume(float v) { s_sfxVolume = v; }
+    static float sfxVolume() { return s_sfxVolume; }
+
 private:
+    static float s_masterVolume;
+    static float s_musicVolume;
+    static float s_sfxVolume;
     struct DecodedSample
     {
         std::vector<int16_t> pcm;

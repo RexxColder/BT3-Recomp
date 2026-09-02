@@ -143,12 +143,58 @@ static unsigned long g_ptN = 0;
 // Published from beginFbp so flushPageToVram can find a merged buffer's real storage.
 std::unordered_map<uint32_t, uint32_t> g_realFbpMap;
 
-// GS texel-corner vs GL texel-centre addressing. 0.5 texel, or 0 with PS2X_HALFTEXEL=0.
+// [uitoggles] backing state: -1 = uninitialized (env read on first use -- AFTER main()'s
+// baked-defaults setenv block), else 0/1. Atomics: the overlay writes from the present
+// thread while the guest thread reads.
+#include <atomic>
+namespace {
+    std::atomic<int> g_uiGpu{-1}, g_uiGlow{-1}, g_uiPostfx{-1}, g_uiBilinear{-1},
+                     g_uiHalfTexel{-1}, g_uiSkipPost{-1}, g_uiSkipStaleVram{-1};
+    std::atomic<int> g_uiRenderScale{-1};
+    bool uiFlag(std::atomic<int> &a, const char *env, bool defOn)
+    {
+        int v = a.load(std::memory_order_relaxed);
+        if (v < 0)
+        {
+            const char *e = std::getenv(env);
+            v = e && e[0] ? (e[0] != '0') : (defOn ? 1 : 0);
+            a.store(v, std::memory_order_relaxed);
+        }
+        return v != 0;
+    }
+}
+bool GsGpuRenderer::glowEnabled()          { return uiFlag(g_uiGlow, "PS2X_GLOW", false); }
+void GsGpuRenderer::setGlow(bool v)        { g_uiGlow.store(v ? 1 : 0); }
+bool GsGpuRenderer::postfxEnabled()        { return uiFlag(g_uiPostfx, "PS2X_POSTFX", false); }
+void GsGpuRenderer::setPostfx(bool v)      { g_uiPostfx.store(v ? 1 : 0); }
+bool GsGpuRenderer::bilinearEnabled()      { return uiFlag(g_uiBilinear, "PS2X_BILINEAR", true); }
+void GsGpuRenderer::setBilinear(bool v)    { g_uiBilinear.store(v ? 1 : 0); }
+bool GsGpuRenderer::halfTexelEnabled()     { return uiFlag(g_uiHalfTexel, "PS2X_HALFTEXEL", true); }
+void GsGpuRenderer::setHalfTexel(bool v)   { g_uiHalfTexel.store(v ? 1 : 0); }
+bool GsGpuRenderer::skipPostEnabled()      { return uiFlag(g_uiSkipPost, "PS2X_SKIPPOST", false); }
+void GsGpuRenderer::setSkipPost(bool v)    { g_uiSkipPost.store(v ? 1 : 0); }
+bool GsGpuRenderer::skipStaleVramEnabled() { return uiFlag(g_uiSkipStaleVram, "PS2X_SKIP_STALE_VRAM", false); }
+void GsGpuRenderer::setSkipStaleVram(bool v) { g_uiSkipStaleVram.store(v ? 1 : 0); }
+int  GsGpuRenderer::renderScale()
+{
+    int v = g_uiRenderScale.load(std::memory_order_relaxed);
+    if (v < 0)
+    {
+        const char *e = std::getenv("PS2X_RENDER_SCALE");
+        v = e && e[0] ? std::atoi(e) : 1;
+        if (v < 1) v = 1; if (v > 4) v = 4;
+        g_uiRenderScale.store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
+void GsGpuRenderer::setRenderScale(int s)  { if (s < 1) s = 1; if (s > 4) s = 4; g_uiRenderScale.store(s); }
+void GsGpuRenderer::setEnabled(bool v)     { g_uiGpu.store(v ? 1 : 0); }
+
+// GS texel-corner vs GL texel-centre addressing. 0.5 texel, or 0 with PS2X_HALFTEXEL=0
+// (or the overlay's Half-Texel toggle).
 static float ps2xHalfTexel()
 {
-    static const float s_half = [](){ const char *v = std::getenv("PS2X_HALFTEXEL");
-                                      return (v && v[0] == '0') ? 0.0f : 0.5f; }();
-    return s_half;
+    return GsGpuRenderer::halfTexelEnabled() ? 0.5f : 0.0f;
 }
 
 // GL 1.4 core; raylib/rlgl does not wrap constant-color blending. Linux libGL exports
@@ -324,7 +370,7 @@ namespace
     }
     void ps2xApplyTexFilter(Texture2D &t, bool bilinear)
     {
-        static const bool s_on = [](){ const char *v = std::getenv("PS2X_BILINEAR"); return !(v && v[0] == '0'); }();
+        const bool s_on = GsGpuRenderer::bilinearEnabled();   // [uitoggles]
         if (!s_on || t.id == 0) return;
         // [filtercache] the "already applied" shortcut. Was default OFF (2026-08-27) because the
         // cache went stale whenever a GL id was recycled (alternate frames point- vs bilinear).
@@ -1017,11 +1063,7 @@ namespace
 
 bool GsGpuRenderer::enabled()
 {
-    static const bool on = []() {
-        const char *v = std::getenv("PS2X_GPU");
-        return v && v[0] && v[0] != '0';
-    }();
-    return on;
+    return uiFlag(g_uiGpu, "PS2X_GPU", false);
 }
 
 GsGpuRenderer &ps2GpuRenderer()
@@ -11159,7 +11201,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // into (sf is never a destFbp) -- in GPU mode that region is stale/black (the game
             // rendered it via GS-to-VRAM which we don't do), so the draw is a black fullscreen
             // WIPE that erases the overlays/HUD. Skipping it lets the overlays survive on screen.
-            static const bool s_skv = [](){ const char *v = std::getenv("PS2X_SKIP_STALE_VRAM"); return v && v[0] && v[0] != '0'; }();
+            const bool s_skv = GsGpuRenderer::skipStaleVramEnabled();   // [uitoggles]
             if (s_skv && c.srcTbp0 && sf != 0u && destArea.find(sf) == destArea.end())
             {
                 // Only skip if this draw is a LARGE, NEAR-BLACK blit of a never-rendered region
@@ -11182,7 +11224,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // (fbp0/fbp112), covering most of the display. On real GS they posterize the
             // rendered scene; in GPU mode that VRAM is stale gray, so the quad paints flat
             // gray over the whole textured 3D scene.
-            static const bool s_skipPost = [](){ const char *v = std::getenv("PS2X_SKIPPOST"); return v && v[0] && v[0] != '0'; }();
+            const bool s_skipPost = GsGpuRenderer::skipPostEnabled();   // [uitoggles]
             if (s_skipPost && c.srcIndexed && destArea.count(c.srcTbp0 / 32u))
             {
                 float ax0, ay0, ax1, ay1;
@@ -12409,7 +12451,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         // black screen. Until the intermediate passes are exact, skip subtractive draws that sample
         // an RT (direct drop-shadows, which don't sample RTs, still render).
         {
-            static const bool s_glow = [](){ const char *v = std::getenv("PS2X_GLOW"); return v && v[0] && v[0] != '0'; }();
+            const bool s_glow = GsGpuRenderer::glowEnabled();   // [uitoggles]
             if (!s_glow && fromFbo && c.abe && ((c.blendMode & 3u) == 2u) && (((c.blendMode >> 4) & 3u) == 2u))
                 { PS2X_GATE_HIT(); continue; } // A=zero, C=FIX -> subtractive family
             // PS2X_NOSUB: diagnostic — skip ALL subtractive draws. Chars colored -> the subtract
@@ -12446,7 +12488,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // overlay chain). Until the bloom intermediate passes are numerically right, these
             // paint the (black/degenerate) bloom result over the whole fight. Skip any LARGE
             // fromFbo draw so the scene stays visible; small composites (portraits etc.) pass.
-            static const bool s_postfx = [](){ const char *v = std::getenv("PS2X_POSTFX"); return v && v[0] && v[0] != '0'; }();
+            const bool s_postfx = GsGpuRenderer::postfxEnabled();   // [uitoggles]
             if (!s_postfx)
             {
                 // The glow/feedback composite paints the scene buffers in NARROW COLUMN STRIPS

@@ -25,6 +25,19 @@ class GsGpuRenderer
 {
 public:
     static bool enabled(); // PS2X_GPU=1 (cached)
+    // [uitoggles] Live-toggleable knobs for the settings overlay. Getters lazy-init from
+    // the env on first call (which is after main()'s baked-defaults block), so PS2X_*
+    // defaults and overrides keep working; setters flip them at runtime.
+    static void setEnabled(bool v);
+    static bool glowEnabled();      static void setGlow(bool v);
+    static bool postfxEnabled();    static void setPostfx(bool v);
+    static bool bilinearEnabled();  static void setBilinear(bool v);
+    static bool halfTexelEnabled(); static void setHalfTexel(bool v);
+    static bool skipPostEnabled();  static void setSkipPost(bool v);
+    static bool skipStaleVramEnabled(); static void setSkipStaleVram(bool v);
+    // Stored/persisted only for the overlay's config; the scaling machinery itself is
+    // NOT ported (its per-draw copy cost regressed the fight loop) -- always renders 1x.
+    static int renderScale();       static void setRenderScale(int s);
 
     // A draw command is either an axis-aligned SPRITE quad (rendered with the proven
     // DrawTexturePro path) or a TRIANGLE (rendered with rlgl). One ordered list keeps

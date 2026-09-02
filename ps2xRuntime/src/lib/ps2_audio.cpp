@@ -10,6 +10,10 @@
 #include <map>
 #include <vector>
 
+float PS2AudioBackend::s_masterVolume = 1.0f;
+float PS2AudioBackend::s_musicVolume = 1.0f;
+float PS2AudioBackend::s_sfxVolume = 1.0f;
+
 namespace
 {
     std::vector<uint8_t> buildWavFromPcm(const int16_t *pcm, size_t sampleCount, uint32_t sampleRate)
@@ -562,14 +566,15 @@ void PS2AudioBackend::serviceStreams()
 
         if (L.started)
         {
+            const float musicVol = s_masterVolume * s_musicVolume;
             std::vector<int16_t> inter(kStreamChunkFrames * 2u);
             while (IsAudioStreamProcessed(s) &&
                    std::min(L.ring.size(), R.ring.size()) >= kStreamChunkFrames)
             {
                 for (size_t i = 0; i < kStreamChunkFrames; ++i)
                 {
-                    inter[i * 2u] = L.ring[i];
-                    inter[i * 2u + 1u] = R.ring[i];
+                    inter[i * 2u]     = static_cast<int16_t>(L.ring[i] * musicVol);
+                    inter[i * 2u + 1u] = static_cast<int16_t>(R.ring[i] * musicVol);
                 }
                 UpdateAudioStream(s, inter.data(), static_cast<int>(kStreamChunkFrames));
                 L.ring.erase(L.ring.begin(), L.ring.begin() + static_cast<long>(kStreamChunkFrames));
@@ -725,8 +730,21 @@ void PS2AudioBackend::serviceStreams()
             const size_t chunk = kStreamChunkFrames * s_channels;
             if (st.ring.size() < chunk)
                 break;
-            // UpdateAudioStream counts FRAMES, not samples.
-            UpdateAudioStream(s, st.ring.data(), static_cast<int>(kStreamChunkFrames));
+            // Apply SFX volume (master * sfx) to this chunk. Mono streams carry voices and
+            // effects; scaling here is cheaper than a second ring pass.
+            const float sfxVol = s_masterVolume * s_sfxVolume;
+            if (sfxVol < 0.999f || sfxVol > 1.001f)
+            {
+                std::vector<int16_t> scaled(st.ring.begin(), st.ring.begin() + static_cast<long>(chunk));
+                for (auto &v : scaled) v = static_cast<int16_t>(v * sfxVol);
+                // UpdateAudioStream counts FRAMES, not samples.
+                UpdateAudioStream(s, scaled.data(), static_cast<int>(kStreamChunkFrames));
+            }
+            else
+            {
+                // UpdateAudioStream counts FRAMES, not samples.
+                UpdateAudioStream(s, st.ring.data(), static_cast<int>(kStreamChunkFrames));
+            }
             st.ring.erase(st.ring.begin(), st.ring.begin() + static_cast<long>(chunk));
             st.fed += chunk;
             static std::atomic<uint32_t> f{0};
@@ -827,7 +845,7 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
     Sound snd = LoadSoundFromWave(wave);
     UnloadWave(wave);
     SetSoundPitch(snd, pitch);
-    SetSoundVolume(snd, volume);
+    SetSoundVolume(snd, volume * s_masterVolume * s_sfxVolume);
     m_impl->activeSounds.push_back({snd, sampleKey});
     PlaySound(snd);
 #endif
