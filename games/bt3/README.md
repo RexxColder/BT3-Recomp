@@ -43,10 +43,12 @@ engine's 30 fps cap. Known issues: stray textured triangle popups in arenas
 (render-to-texture pass mismatch), shadow blending differences, some stage-texture
 glitches in GPU mode, occasional arm-pose flip during ki charge.
 
-Useful environment switches (all optional): `PS2X_GPU=1` GPU renderer (omit for the
-software rasterizer), `PS2X_ASYNC_KICK=1` render-thread pipeline (large fps win),
-`PS2X_SCHED=1` cooperative guest scheduler, `PS2X_TIMERMULT=4` timer speedup,
-`PS2X_HLE_ACOS=0` revert to the recompiled acosf.
+Useful environment switches (all optional — the validated playing configuration is
+built in as defaults): `PS2X_GPU=0` falls back to the software rasterizer,
+`PS2X_DOFZFAR=<z>` tunes the depth-of-field reach (default 200000), and
+`PS2X_NODEFAULTS=1` starts the bare engine with no defaults (debugging); any
+individual `PS2X_*` flag can still be overridden or `=0`-disabled.
+`PS2X_ASYNC_KICK=1` raises average fps but adds 80–157 ms hitch frames — not recommended.
 
 ## How the port stays reproducible
 

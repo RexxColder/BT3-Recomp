@@ -67,8 +67,6 @@ The setup script prints the exact command when it finishes.
 ```sh
 cd build/ps2xRuntime
 env PS2X_CD_IMAGE="/path/to/your/bt3-usa.iso" \
-    PS2X_BT3_CDTICK=1 PS2X_SCHED=1 PS2X_GPU=1 PS2X_GPU_DEPTH=1 \
-    PS2X_ASYNC_KICK=1 PS2X_TIMERMULT=4 \
     ./ps2EntryRunner ../../games/bt3/work/SLUS_216.78
 ```
 
@@ -77,17 +75,10 @@ env PS2X_CD_IMAGE="/path/to/your/bt3-usa.iso" \
 ```
 cd build\ps2xRuntime\Release
 set PS2X_CD_IMAGE=C:\path\to\your\bt3-usa.iso
-set PS2X_BT3_CDTICK=1
-set PS2X_SCHED=1
-set PS2X_GPU=1
-set PS2X_GPU_DEPTH=1
-set PS2X_ASYNC_KICK=1
-set PS2X_TIMERMULT=4
 ps2EntryRunner.exe ..\..\..\games\bt3\work\SLUS_216.78
 ```
 
 Gamepads are supported (GLFW mappings; tested with an 8BitDo pad — close Steam
-first if it grabs the controller). Omit `PS2X_GPU=1`/`PS2X_GPU_DEPTH=1` to use
 the software rasterizer instead of the OpenGL renderer.
 
 ## Status
