@@ -8103,7 +8103,12 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // mask machinery (scene-time) has consumed real scene alpha. PS2X_DATEBIN=0
             // disables.
             static const bool s_dbin = [](){ const char *v = std::getenv("PS2X_DATEBIN"); return !(v && v[0] == '0'); }();
-            if (s_dbin && wsHudInv != 1.0f && !dateSnapDone && c.dateEnable && c.fst == 1u
+            // snap before EVERY gated draw, not once per frame: the game interleaves
+            // mask writes and gated draws per element, so alpha written after a single
+            // early snap reaches the gate raw (a 128-write reads as a 50% leak in the
+            // lerp while hardware bit7 says full pass) -- the residual wash the user
+            // kept seeing. The snap is idempotent on already-binary alpha.
+            if (s_dbin && wsHudInv != 1.0f && c.dateEnable && c.fst == 1u
                 && !c.isTransfer && !c.isVramBlit && !c.isDecode && !c.isAliasPass
                 && (c.destFbp == 0u || c.destFbp == 112u))
             {
