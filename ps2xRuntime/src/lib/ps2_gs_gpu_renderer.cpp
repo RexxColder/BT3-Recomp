@@ -7508,6 +7508,11 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             }
             // fst==1 only: HUD/2D draws (direct UV). Terrain/3D STQ draws use DATE with
             // dithered masks + vertex-alpha gradients — the lerp override wrecks those.
+            // [datefst0] EXCEPT triangles fully inside the snapped top band: the damage
+            // flash's outer element is an fst=0 DATE draw (datm=0) that console hides via
+            // the gate; painting it ungated was the spurious red strip at the stretched
+            // bar's outer end (hidden under the cluster art in centered by coincidence).
+            // Post-[datebin] the band's dest alpha is binary, so the lerp is exact there.
             if (s_date && bc.dateEnable && bc.fst && srcA >= 128u && binaryAlpha)
             {
                 abe = true;
@@ -7942,16 +7947,13 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         const float k = W / 512.0f;
         auto cen = [&](float s){ return half + (s - half) * inv; };
         if (wsLayout <= 0) return cen(x);
-        // unit boundaries at the TRUE ART SEAMS (census + reference footage): clusters end
-        // where the bar window begins (124), the plaque spans 216..296, bars end at 444.
-        // Boundaries INSIDE the bar art were the root of the "dark sections": the bar's
-        // authored pale-lead/dark-end shading stretched at different rates on one bar.
-        // With seam-aligned boundaries each bar stretches uniformly end-to-end, like a
-        // 16:9-stretched bar on hardware.
-        // mirror-symmetric: clusters 124 wide each ([0..124] / [388..512]), bars 92 wide
-        // each ([124..216] / [296..388]) -- s4=444 stretched the right pips (x 404..450).
+        // Seam-aligned stretch layout: clusters [0..124]/[388..512] and plaque [216..296]
+        // rigid at slope inv; the bars stretch uniformly to bridge (art seams from the
+        // census; mirror-symmetric). Known accepted quirk in stretched layouts: the
+        // damage flash can appear at both bar ends (an fst=0 helper family the game
+        // hides via coverage that no per-draw mapping preserves -- five approaches
+        // falsified; see 2026-09-03 memory).
         const float s1 = 124.f*k, s2 = 216.f*k, s3 = 296.f*k, s4 = 388.f*k;
-        // unit target edges; layout 1 = pinned, layout 2 = pinned + custom offsets
         float t0 = 0.f, t1 = s1 * inv;
         float t2 = cen(s2), t3 = cen(s3);
         float t4 = W - (W - s4) * inv, t5 = W;
@@ -7960,14 +7962,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             t0 += wsOffL*k; t1 += wsOffL*k;
             t2 += wsOffC*k; t3 += wsOffC*k;
             t4 += wsOffR*k; t5 += wsOffR*k;
-            // keep monotonic: clamp unit edges so bridges never invert
             if (t1 > t2 - 2.f) t1 = t2 - 2.f;
             if (t3 > t4 - 2.f) t4 = t3 + 2.f;
         }
-        // Bridges (= the bars) are plain LINEAR: one uniform stretch across the whole
-        // bar span keeps its authored shading (pale lead, dark end, slash angle) scaling
-        // together. Smoothing the slope here was wrong -- it deliberately made stretch
-        // non-uniform inside the bar, redistributing the shading regions.
+        (void)t5;
         if (x <= s1) return t0 + x * inv;
         if (x <= s2) return t1 + (x - s1) * (t2 - t1) / (s2 - s1);
         if (x <= s3) return t2 + (x - s2) * inv;
@@ -8121,7 +8119,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 rlSetBlendFactorsSeparate(1 /*ONE*/, 1 /*ONE*/, 1 /*ONE*/, 1 /*ONE*/,
                                           0x8006 /*FUNC_ADD*/, 0x800B /*FUNC_REVERSE_SUBTRACT*/);
                 rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
-                DrawRectangle(0, 0, (int)bw + 2, 100, Color{0, 0, 0, 127});
+                DrawRectangle(0, 0, (int)bw + 2, 56, Color{0, 0, 0, 127});
                 rlDrawRenderBatchActive();
                 // passes 2..9: dstA = clamp(2*dstA)
                 rlSetBlendMode(RL_BLEND_ALPHA);
@@ -8130,7 +8128,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
                 for (int dp = 0; dp < 8; ++dp)
                 {
-                    DrawRectangle(0, 0, (int)bw + 2, 100, Color{0, 0, 0, 255});
+                    DrawRectangle(0, 0, (int)bw + 2, 56, Color{0, 0, 0, 255});
                     rlDrawRenderBatchActive();
                 }
                 rlColorMask(true, true, true, true);
@@ -8162,6 +8160,17 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 {
                     mc.dx0 = wsMapX(c.dx0, W, wsHudInv);
                     mc.dx1 = wsMapX(c.dx1, W, wsHudInv);
+                    // [wsscissor] the GS scissor must follow the map: the game sets tight
+                    // scissors around the bar for its mask writes, and a stretched bar
+                    // extends PAST the unmapped scissor -- the mask's outer strip clips
+                    // off, leaving garbage gate state exactly there (the user's spurious
+                    // flash at the outer end, only when the bar is expanded past default).
+                    {
+                        const float sx0 = wsMapX((float)c.sx, W, wsHudInv);
+                        const float sx1 = wsMapX((float)(c.sx + c.sw), W, wsHudInv);
+                        mc.sx = (int)std::floor(sx0);
+                        mc.sw = (int)std::ceil(sx1) - mc.sx;
+                    }
                     mc.wsHudApplied = true;
                 }
             }
@@ -8188,6 +8197,12 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 {
                     for (int ti = 0; ti < 3; ++ti)
                         mc.tri[ti].x = wsMapX(c.tri[ti].x, W, wsHudInv);
+                    {   // [wsscissor] see sprite branch
+                        const float sx0 = wsMapX((float)c.sx, W, wsHudInv);
+                        const float sx1 = wsMapX((float)(c.sx + c.sw), W, wsHudInv);
+                        mc.sx = (int)std::floor(sx0);
+                        mc.sw = (int)std::ceil(sx1) - mc.sx;
+                    }
                     mc.wsHudApplied = true;
                 }
             }
@@ -12773,6 +12788,20 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if ((s_dlLive >= 0 || s_dlAt >= 0.0) && !c.isTriangle)
                     std::fprintf(stderr, "[dlg] d=%u dy=(%.0f..%.0f) dx=(%.0f..%.0f) sv=(%.1f..%.1f) su=(%.1f..%.1f) abe=%d bm=%02x z=%.3f dtest=%d\n",
                                  c.destFbp, c.dy0, c.dy1, c.dx0, c.dx1, c.sv0, c.sv1, c.su0, c.su1, c.abe?1:0, (unsigned)c.blendMode, c.z, c.depthTest?1:0);
+                if ((s_dlLive >= 0 || s_dlAt >= 0.0) && c.isTriangle && (c.destFbp == 0u || c.destFbp == 112u))
+                {   // [dlt] tri geometry AFTER the layout map: the final FBO-space footprint,
+                    // for pinpointing which draw paints a given band pixel.
+                    float tx0=c.tri[0].x, tx1=tx0, ty0=c.tri[0].y, ty1=ty0;
+                    for (int ti=1; ti<3; ++ti) { tx0=std::min(tx0,c.tri[ti].x); tx1=std::max(tx1,c.tri[ti].x);
+                                                 ty0=std::min(ty0,c.tri[ti].y); ty1=std::max(ty1,c.tri[ti].y); }
+                    if (ty0 < 100.0f)
+                        std::fprintf(stderr, "[dlt] d=%u x=(%.0f..%.0f) y=(%.0f..%.0f) rgba=%u,%u,%u,%u tbp=%u spsm=%u fst=%u date=%d datm=%u bm=%02x fbmsk=%08x abe=%d hud=%d\n",
+                                     c.destFbp, tx0, tx1, ty0, ty1,
+                                     c.tri[0].r, c.tri[0].g, c.tri[0].b, c.tri[0].a,
+                                     c.srcTbp0, (unsigned)c.srcPsm, (unsigned)c.fst,
+                                     c.dateEnable?1:0, (unsigned)c.dateMode,
+                                     (unsigned)c.blendMode, c.fbmsk, c.abe?1:0, c.wsHudApplied?1:0);
+                }
                 if (idxRt && c.destFbp == 336u)
                 {   // [dlx] ACTUAL GL state at a served import: write mask + blend factors.
                     rlDrawRenderBatchActive();

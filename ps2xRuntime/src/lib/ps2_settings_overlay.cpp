@@ -1170,6 +1170,8 @@ void PS2SettingsOverlay::drawVideoTab()
             if (ch) { pushHudLayout(m_settings); m_dirty = true; }
             ImGui::TextDisabled("offsets from the edge-pinned layout; bars auto-stretch");
         }
+        if (m_settings.hudLayout != 0)
+            ImGui::TextDisabled("note: in stretched layouts the damage flash can briefly show at both bar ends");
     }
 
     // Window-size presets. The projection FOV follows the window aspect (see [truews]
