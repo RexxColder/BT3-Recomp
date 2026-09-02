@@ -424,6 +424,31 @@ int main(int argc, char *argv[])
     std::signal(SIGTERM, ps2xGsRecordOnSignal);
     setupTerminateLogger();
 
+    // ---- BT3 defaults ----------------------------------------------------------
+    // The validated playing configuration (GPU path + outline/ink chain + graded DoF
+    // + the barrier-elimination serving + grass anti-swim) used to require ~25 env
+    // vars; a bare run gave the stripped software renderer. Bake them in as DEFAULTS:
+    // setenv(..., 0) never overwrites, so every PS2X_* override still works exactly
+    // as before (including =0 to disable a single flag).
+    // PS2X_NODEFAULTS=1 skips the whole block (bare engine, for debugging).
+    if (!std::getenv("PS2X_NODEFAULTS"))
+    {
+        auto def = [](const char *n, const char *v) { setenv(n, v, 0); };
+        def("PS2X_GPU", "1"); def("PS2X_GPU_DEPTH", "1"); def("PS2X_ZSCALE", "256");
+        def("PS2X_TEXAKEY", "1"); def("PS2X_BARGATE", "1"); def("PS2X_NOSHCOMP", "1");
+        def("PS2X_FLUSHCT32", "1"); def("PS2X_ALPHA128", "1"); def("PS2X_DUALSRC", "1");
+        def("PS2X_ASPLIT", "1"); def("PS2X_FBODIRTY", "1"); def("PS2X_BARRIER", "1");
+        def("PS2X_AFLUSH", "1"); def("PS2X_CT32ALPHA", "1"); def("PS2X_EDGEWRAP", "1");
+        def("PS2X_TEXCACHEMB", "64"); def("PS2X_BARBLOCK", "1");
+        def("PS2X_GPUALIAS", "4"); def("PS2X_DOFMASK", "2"); def("PS2X_DOFZFAR", "200000");
+        def("PS2X_ALPHAONLYFBO", "1"); def("PS2X_SCENESKIP", "1"); def("PS2X_F336SKIP", "1");
+        def("PS2X_IDXRT", "1"); def("PS2X_IDXONLY", "1"); def("PS2X_MASKBUILDSKIP", "1");
+        def("PS2X_P8TWIN", "1"); def("PS2X_SHCOMPSKIP", "15972,16012,16004,16008,16016,16020,16024");
+        def("PS2X_BT3_CDTICK", "1"); def("PS2X_SCHED", "1"); def("PS2X_FORCE_MC", "1");
+        // Deliberately NOT defaulted: PS2X_BARSTAT (diagnostic spam), PS2X_ASYNC_KICK
+        // (better averages but 80-157ms hitch frames -- measured), PS2X_TIMERMULT.
+    }
+
     try
     {
         std::filesystem::path pathObj = getExecutablePath(argc, argv);
