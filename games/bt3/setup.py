@@ -204,20 +204,12 @@ Done. Run with:
 
   cd {runner.parent}
   {env_line}\\
-      PS2X_BT3_CDTICK=1 PS2X_SCHED=1 PS2X_GPU=1 PS2X_GPU_DEPTH=1 \\
-      PS2X_ASYNC_KICK=1 PS2X_TIMERMULT=4 \\
       {runner} {elf}
 """ if not IS_WINDOWS else f"""
 Done. Run with (cmd.exe):
 
   cd {runner.parent}
   set PS2X_CD_IMAGE=<path to your BT3 ISO>
-  set PS2X_BT3_CDTICK=1
-  set PS2X_SCHED=1
-  set PS2X_GPU=1
-  set PS2X_GPU_DEPTH=1
-  set PS2X_ASYNC_KICK=1
-  set PS2X_TIMERMULT=4
   {runner} {elf}
 """)
 
