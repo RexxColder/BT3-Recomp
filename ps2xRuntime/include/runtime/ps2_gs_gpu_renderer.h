@@ -41,6 +41,10 @@ public:
     // Cel outline (ink rim + darkener) and character shadow decals, live-toggleable.
     static bool outlineEnabled();   static void setOutline(bool v);
     static bool shadowsEnabled();   static void setShadows(bool v);
+    // Depth-of-field blur (the graded far-field mask stamp) + its reach (rawZ at which
+    // blur weight reaches 0; larger = blur starts further away). Live-toggleable.
+    static bool dofBlurEnabled();   static void setDofBlur(bool v);
+    static int  dofZFar();          static void setDofZFar(int z);
 
     // A draw command is either an axis-aligned SPRITE quad (rendered with the proven
     // DrawTexturePro path) or a TRIANGLE (rendered with rlgl). One ordered list keeps

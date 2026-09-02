@@ -433,6 +433,10 @@ void PS2SettingsOverlay::loadSettings()
                 { if (!envUserSet("PS2X_OUTLINE")) m_settings.outline = (val == "1" || val == "true"); }
                 else if (key == "shadows")
                 { if (!envUserSet("PS2X_SHADOWS")) m_settings.shadows = (val == "1" || val == "true"); }
+                else if (key == "dof_blur")
+                { if (!envUserSet("PS2X_DOFMASK")) m_settings.dofBlur = (val == "1" || val == "true"); }
+                else if (key == "dof_zfar")
+                { if (!envUserSet("PS2X_DOFZFAR")) m_settings.dofZFar = std::clamp(std::atoi(val.c_str()), 20000, 800000); }
                 else if (key == "fullscreen")
                     m_settings.fullscreen = (val == "1" || val == "true");
                 else if (key == "widescreen")
@@ -540,6 +544,8 @@ void PS2SettingsOverlay::saveSettings() const
     file << "render_scale=" << m_settings.renderScale << "\n";
     file << "outline=" << (m_settings.outline ? "1" : "0") << "\n";
     file << "shadows=" << (m_settings.shadows ? "1" : "0") << "\n";
+    file << "dof_blur=" << (m_settings.dofBlur ? "1" : "0") << "\n";
+    file << "dof_zfar=" << m_settings.dofZFar << "\n";
     file << "fullscreen=" << (m_settings.fullscreen ? "1" : "0") << "\n";
     file << "widescreen=" << (m_settings.widescreen ? "1" : "0") << "\n\n";
 
@@ -601,6 +607,8 @@ void PS2SettingsOverlay::syncFromRuntime()
     m_settings.renderScale = GsGpuRenderer::renderScale();
     m_settings.outline = GsGpuRenderer::outlineEnabled();
     m_settings.shadows = GsGpuRenderer::shadowsEnabled();
+    m_settings.dofBlur = GsGpuRenderer::dofBlurEnabled();
+    m_settings.dofZFar = GsGpuRenderer::dofZFar();
 }
 
 void PS2SettingsOverlay::applySettings()
@@ -619,6 +627,8 @@ void PS2SettingsOverlay::applySettings()
     GsGpuRenderer::setRenderScale(m_settings.renderScale);
     GsGpuRenderer::setOutline(m_settings.outline);
     GsGpuRenderer::setShadows(m_settings.shadows);
+    GsGpuRenderer::setDofBlur(m_settings.dofBlur);
+    GsGpuRenderer::setDofZFar(m_settings.dofZFar);
     applyDeadzone();
 
     // Apply selected device to PadConfig
@@ -1063,6 +1073,21 @@ void PS2SettingsOverlay::drawVideoTab()
         m_dirty = true;
     if (toggleSwitch("Character Shadows", &m_settings.shadows))
         m_dirty = true;
+    if (toggleSwitch("Depth-of-Field Blur", &m_settings.dofBlur))
+        m_dirty = true;
+    if (m_settings.dofBlur)
+    {
+        ImGui::Text("Blur Reach");
+        ImGui::SameLine(120);
+        ImGui::SetNextItemWidth(220);
+        int reach = m_settings.dofZFar / 1000;   // present in "k" units for a readable slider
+        if (ImGui::SliderInt("##dofreach", &reach, 50, 400, "%d k", ImGuiSliderFlags_AlwaysClamp))
+        {
+            m_settings.dofZFar = reach * 1000;
+            m_dirty = true;
+        }
+        ImGui::TextDisabled("Lower = blur reaches nearer to the camera. 200k matches the console look.");
+    }
     // (Glow / Skip Post / Half-Texel / Skip Stale VRAM toggles removed: replay A/B
     //  measured them at 0.000 frame diff in fights -- their draw classes are
     //  superseded by the current serving pipeline. Env vars still work for devs.)

@@ -193,6 +193,21 @@ namespace { std::atomic<int> g_uiOutline{-1}, g_uiShadows{-1}; }
 bool GsGpuRenderer::outlineEnabled()       { return uiFlag(g_uiOutline, "PS2X_OUTLINE", true); }
 void GsGpuRenderer::setOutline(bool v)     { g_uiOutline.store(v ? 1 : 0); }
 bool GsGpuRenderer::shadowsEnabled()       { return uiFlag(g_uiShadows, "PS2X_SHADOWS", true); }
+namespace { std::atomic<int> g_uiDofBlur{-1}, g_uiDofZFar{-1}; }
+bool GsGpuRenderer::dofBlurEnabled()
+{
+    int v = g_uiDofBlur.load(std::memory_order_relaxed);
+    if (v < 0) { const char *e = std::getenv("PS2X_DOFMASK"); v = (e && std::atoi(e) == 2) ? 1 : 0; g_uiDofBlur.store(v, std::memory_order_relaxed); }
+    return v != 0;
+}
+void GsGpuRenderer::setDofBlur(bool v)     { g_uiDofBlur.store(v ? 1 : 0); }
+int GsGpuRenderer::dofZFar()
+{
+    int v = g_uiDofZFar.load(std::memory_order_relaxed);
+    if (v < 0) { const char *e = std::getenv("PS2X_DOFZFAR"); v = e && e[0] ? std::atoi(e) : 200000; if (v < 20000) v = 20000; if (v > 800000) v = 800000; g_uiDofZFar.store(v, std::memory_order_relaxed); }
+    return v;
+}
+void GsGpuRenderer::setDofZFar(int z)      { if (z < 20000) z = 20000; if (z > 800000) z = 800000; g_uiDofZFar.store(z); }
 void GsGpuRenderer::setShadows(bool v)     { g_uiShadows.store(v ? 1 : 0); }
 
 // GS texel-corner vs GL texel-centre addressing. 0.5 texel, or 0 with PS2X_HALFTEXEL=0
@@ -4565,8 +4580,7 @@ static bool gaDofMaskPass(uint32_t destFbp)
     glUniform1i(locC, 0); glUniform1i(locD, 1);
     {   static const double s_zScaleR = [](){ const char *v = std::getenv("PS2X_ZSCALE");
                                               const double f = v ? std::atof(v) : 0.0; return (f > 0.0) ? f : 1.0; }();
-        static const double s_zFar = [](){ const char *v = std::getenv("PS2X_DOFZFAR");
-                                           const double f = v ? std::atof(v) : 0.0; return (f > 0.0) ? f : 100000.0; }();   // rawZ at which blur weight reaches 0 (env-tunable, no rebuild)
+        const double s_zFar = (double)GsGpuRenderer::dofZFar();   // [uitoggles] live blur-reach slider
         const float zdiv = (float)((g_zwbZMax > 0.0 ? g_zwbZMax : 4294967296.0) / (s_zScaleR * s_zFar));
         glUniform1f(locM, zdiv);
     }
@@ -7815,8 +7829,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // outline strips rewrite the scene alpha (the bm-0x54 composite's Ad weight) AFTER the
             // game's own mask slot, so stamping at the kind1 slot (mode 1) gets wiped. Stamp on the
             // FIRST composite draw per dest per gen instead -- after the strips, before Ad is read.
-            static const int s_dm2 = [](){ const char *v = std::getenv("PS2X_DOFMASK"); return v && v[0] ? std::atoi(v) : 0; }();
-            if (s_dm2 == 2 && !c.isTransfer && !c.isDecode && c.abe && c.blendMode == 0x54u &&
+            if (GsGpuRenderer::dofBlurEnabled() && !c.isTransfer && !c.isDecode && c.abe && c.blendMode == 0x54u &&
                 c.srcTbp0 == 10752u && c.srcPsm == 0x00u && (c.destFbp == 0u || c.destFbp == 112u))
                 // ^ the REAL DoF composite (the PS2X_NODOF gate's own signature): f336-region CT32
                 //   256x256 sampled back into the scene with (Cs-Cd)*Ad+Cd -- Ad = scene alpha.
