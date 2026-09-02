@@ -1,3 +1,4 @@
+#include <filesystem>
 #include "runtime/ps2_memory.h"
 #include <iomanip>
 #include <cstdlib>
@@ -22,8 +23,23 @@
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
 #include "ps2_settings_overlay.h"
+// [wstrig] rig lever: PS2X_WSTRIG=<path> forces widescreen ON while <path> exists, so a
+// drive can boot with the calibrated 4:3 screen-matching and flip to true widescreen at
+// fight time (touch the file + resize the window). Checked once a second.
+static bool wsTrigActive()
+{
+    static const char *s_p = std::getenv("PS2X_WSTRIG");
+    if (!s_p || !s_p[0]) return false;
+    static double s_last = -1.0; static bool s_on = false;
+    const double now = GetTime();
+    if (now - s_last > 1.0) { s_last = now; s_on = std::filesystem::exists(s_p); }
+    return s_on;
+}
 // [truews] 0.75/scale for the patched projection lui in sub_00130BA8 (0.75 = disabled).
 float g_ps2xWsLui = 0.75f;
+// [wshud] the widescreen aspect scale itself (1.0 = off), read by the GPU renderer to
+// pre-squeeze HUD sprites so the present stretch restores their true proportions.
+float g_ps2xWsScale = 1.0f;
 #include "rlgl.h" // rlSetBlendFactorsSeparate for the blend-free present blit
 namespace ps2_syscalls { bool bt3WakeThreadByEntry(uint32_t entry); }
 
@@ -4001,7 +4017,7 @@ void PS2Runtime::run()
             // upper 16 bits).
             static float s_wsOrig1 = 0.0f, s_wsOrig2 = 0.0f;
             float wsScale = 1.0f;
-            if (PS2SettingsOverlay::isWidescreen())
+            if (PS2SettingsOverlay::isWidescreen() || wsTrigActive())
             {
                 const float wsA = (float)GetScreenWidth() / (float)std::max(1, GetScreenHeight());
                 wsScale = wsA / (4.0f / 3.0f);
@@ -4024,6 +4040,8 @@ void PS2Runtime::run()
             }
             extern float g_ps2xWsLui;
             g_ps2xWsLui = 0.75f / wsScale;
+            extern float g_ps2xWsScale;
+            g_ps2xWsScale = wsScale;
             static float s_wsLast = -1.0f;
             if (wsScale != s_wsLast)
             {
@@ -4090,7 +4108,7 @@ void PS2Runtime::run()
         float dstHeight = srcHeight * scale;
         // [overlay] Widescreen: stretch to fill instead of letterboxing.
 #if !defined(PLATFORM_VITA)
-        if (PS2SettingsOverlay::isWidescreen())
+        if (PS2SettingsOverlay::isWidescreen() || wsTrigActive())
         {
             dstWidth = screenWidth;
             dstHeight = screenHeight;
