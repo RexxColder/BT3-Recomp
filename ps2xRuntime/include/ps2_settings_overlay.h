@@ -30,6 +30,8 @@ public:
         bool widescreen = false;
         bool outline = true;
         bool shadows = true;
+        bool dofBlur = true;
+        int dofZFar = 200000;
         // Overlay launch / close binding. Each is a SET of inputs that must ALL be held
         // together (1+ entries). Captured with a 3s hold during binding.
         std::vector<int> overlayPadBtns = {13, 15};  // default: Select (Back) + Start
