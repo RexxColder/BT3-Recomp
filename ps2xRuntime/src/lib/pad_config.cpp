@@ -638,6 +638,10 @@ namespace ps2_stubs
         return cfg;
     }
 
+    bool PadConfig::s_inputSuspended = false;
+    void PadConfig::setInputSuspended(bool suspended) { s_inputSuspended = suspended; }
+    bool PadConfig::inputSuspended() { return s_inputSuspended; }
+
     PadPlayerConfig PadConfig::snapshot(size_t p) const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -883,6 +887,11 @@ namespace ps2_stubs
             return pkt;
         }
 
+        // [overlay] settings overlay open: swallow pad input so it never reaches the game.
+        if (s_inputSuspended)
+        {
+            return pkt;
+        }
         ensureGamepadMappings();
         if (!IsWindowReady())
         {

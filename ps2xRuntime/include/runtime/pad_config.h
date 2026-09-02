@@ -100,6 +100,10 @@ namespace ps2_stubs
         static constexpr size_t kPlayerCount = 4;
 
         static PadConfig &instance();
+        // [overlay] Suspend gamepad->guest input while the settings overlay is open, so
+        // pad navigation of the overlay never bleeds into the running game.
+        static void setInputSuspended(bool suspended);
+        static bool inputSuspended();
 
         // Thread-safe snapshot / mutators (the guest thread reads via poll(), the
         // configurator UI writes via these; both hold the internal mutex).
@@ -126,6 +130,7 @@ namespace ps2_stubs
         PadConfig &operator=(const PadConfig &) = delete;
 
         mutable std::mutex m_mutex;
+        static bool s_inputSuspended;
         std::array<PadPlayerConfig, kPlayerCount> m_players;
         std::string m_dir;
         bool m_loaded = false;

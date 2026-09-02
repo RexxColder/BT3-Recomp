@@ -37,6 +37,7 @@ namespace ps2_stubs
         bool isButtonDown(int gamepadButton) const;
         bool isButtonPressed(int gamepadButton);
         float getAxis(int gamepadAxis) const;
+        float getRawAxis(int gamepadAxis) const; // raw normalized, no deadzone -- for bind capture
         int buttonCount() const;
         int axisCount() const;
 

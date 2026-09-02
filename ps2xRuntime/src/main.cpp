@@ -1,8 +1,8 @@
 #include "ps2_runtime.h"
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "games_database.h"
-#if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
-#include "ps2_debug_panel.h"
+#if !defined(PLATFORM_VITA)
+#include "ps2_settings_overlay.h"
 #endif
 
 #ifdef _DEBUG
@@ -472,25 +472,26 @@ int main(int argc, char *argv[])
         }
 
         PS2Runtime runtime;
-#if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+#if !defined(PLATFORM_VITA)
         // This hook is to prevent leak rlimgui deps to recompiler etc
-        PS2DebugPanel debugPanel;
+        PS2SettingsOverlay settingsOverlay;
+        settingsOverlay.preloadSettings();
         runtime.setDebugUiCallbacks(
             [](PS2Runtime &rt, void *userData)
             {
                 (void)rt;
-                static_cast<PS2DebugPanel *>(userData)->initialize();
+                static_cast<PS2SettingsOverlay *>(userData)->initialize();
             },
             [](PS2Runtime &rt, void *userData)
             {
-                static_cast<PS2DebugPanel *>(userData)->draw(rt);
+                static_cast<PS2SettingsOverlay *>(userData)->draw(rt);
             },
             [](PS2Runtime &rt, void *userData)
             {
                 (void)rt;
-                static_cast<PS2DebugPanel *>(userData)->shutdown();
+                static_cast<PS2SettingsOverlay *>(userData)->shutdown();
             },
-            &debugPanel);
+            &settingsOverlay);
 #endif
         if (!runtime.initialize(windowTitle.c_str()))
         {

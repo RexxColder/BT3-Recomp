@@ -579,6 +579,26 @@ namespace ps2_stubs
         return m_axis[gamepadAxis];
     }
 
+    float PadEvdevLinux::getRawAxis(int gamepadAxis) const
+    {
+        if (gamepadAxis < 0 || gamepadAxis >= (int)m_axis.size())
+            return 0.0f;
+        const int raw = m_absRaw[gamepadAxis];
+        const int min = m_absMin[gamepadAxis];
+        const int max = m_absMax[gamepadAxis];
+        if (max <= min)
+            return 0.0f;
+        if (min >= 0)
+        {
+            // Unsigned axis (e.g. triggers 0..65535): rest is at min, not at the midpoint.
+            const float half = std::max(static_cast<float>(max - min), 1.0f);
+            return std::clamp((static_cast<float>(raw) - min) / half, 0.0f, 1.0f);
+        }
+        const float center = (min + max) * 0.5f;
+        const float half = std::max(static_cast<float>(max - center), 1.0f);
+        return std::clamp((static_cast<float>(raw) - center) / half, -1.0f, 1.0f);
+    }
+
     int PadEvdevLinux::buttonCount() const
     {
         return m_buttonCount;

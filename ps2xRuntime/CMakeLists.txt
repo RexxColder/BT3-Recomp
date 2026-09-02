@@ -505,9 +505,16 @@ target_link_libraries(ps2EntryRunner
 
 if(NOT PS2X_IS_VITA)
     target_sources(ps2EntryRunner PRIVATE
-        src/lib/ps2_debug_panel.cpp
+        src/lib/ps2_settings_overlay.cpp
     )
     target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
+    # Stage the settings-overlay assets (font) next to the executable.
+    add_custom_command(TARGET ps2EntryRunner POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+            "$<TARGET_FILE_DIR:ps2EntryRunner>/assets"
+        COMMENT "Staging overlay assets (fonts) next to ps2EntryRunner"
+    )
     target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
 endif()
 

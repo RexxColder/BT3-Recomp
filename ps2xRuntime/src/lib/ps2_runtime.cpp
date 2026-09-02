@@ -21,6 +21,7 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#include "ps2_settings_overlay.h"
 #include "rlgl.h" // rlSetBlendFactorsSeparate for the blend-free present blit
 namespace ps2_syscalls { bool bt3WakeThreadByEntry(uint32_t entry); }
 
@@ -4039,8 +4040,16 @@ void PS2Runtime::run()
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
         const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        float dstWidth = srcWidth * scale;
+        float dstHeight = srcHeight * scale;
+        // [overlay] Widescreen: stretch to fill instead of letterboxing.
+#if !defined(PLATFORM_VITA)
+        if (PS2SettingsOverlay::isWidescreen())
+        {
+            dstWidth = screenWidth;
+            dstHeight = screenHeight;
+        }
+#endif
         // Atlas mode presents a sub-rect of the big atlas texture -> crop from the display slot origin.
         const float srcX = flipY ? static_cast<float>(ps2GpuRenderer().presentSrcX()) : 0.0f;
         const float srcY = flipY ? static_cast<float>(ps2GpuRenderer().presentSrcY()) : 0.0f;
