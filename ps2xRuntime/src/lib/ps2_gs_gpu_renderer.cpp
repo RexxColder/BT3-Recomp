@@ -4699,7 +4699,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
         const int liveLayout = g_wsHudLayout.load(std::memory_order_relaxed);
         const int effLayout = (liveLayout >= 0) ? liveLayout : s_envLayout;
         if (effLayout >= 1 && g_ps2xWsHudInv < 0.999f && cmd.isTriangle && cmd.fst == 1u
-            && cmd.srcTbp0 >= 10752u && cmd.srcTbp0 <= 11328u && !cmd.isTransfer
+            && !cmd.isTransfer
             && !cmd.isVramBlit && !cmd.isDecode
             && (cmd.destFbp == 0u || cmd.destFbp == 112u) && (cmd.destPsm == 0u || cmd.destPsm == 1u)
             && cmd.tri[0].z == 0.0f && cmd.tri[1].z == 0.0f && cmd.tri[2].z == 0.0f)
@@ -7985,6 +7985,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
     // and boot screens stay exactly as before. PS2X_WSHUD: 1=edge-anchored (default),
     // 2=center-anchored (whole HUD compresses toward center), 0=off.
     float wsHudInv = 1.0f;
+    bool dateSnapDone = false;   // [datebin] once per render call (re-snap is idempotent)
     static const int s_wshudMode = [](){ const char *v = std::getenv("PS2X_WSHUD"); return v ? std::atoi(v) : 1; }();
     {
         extern float g_ps2xWsHudInv;
@@ -8043,6 +8044,37 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                  c.fbmsk, c.dateEnable?1:0, (unsigned)c.dateMode);
                 }
             }
+            {   // [wshudlog-miss] the COMPLEMENT: draws into the top HUD band that FAIL a
+                // squeeze gate -- the un-squeezed layer must be in here, with its reason.
+                static int s_wlm = 0;
+                if (s_wl && wsHudInv != 1.0f && s_wlm < 200 && c.isTriangle && !c.isTransfer
+                    && !c.isVramBlit && !c.isDecode && !c.isAliasPass
+                    && (c.destFbp == 0u || c.destFbp == 112u))
+                {
+                    float tx0=c.tri[0].x, tx1=tx0, ty0=c.tri[0].y, ty1=ty0;
+                    for (int ti=1; ti<3; ++ti) { tx0=std::min(tx0,c.tri[ti].x); tx1=std::max(tx1,c.tri[ti].x);
+                                                 ty0=std::min(ty0,c.tri[ti].y); ty1=std::max(ty1,c.tri[ti].y); }
+                    extern float g_ps2xWsSrcW;
+                    const float Wm = (g_ps2xWsSrcW >= 320.0f && g_ps2xWsSrcW <= 1024.0f) ? g_ps2xWsSrcW : 512.0f;
+                    const bool inBand = ty0 < 96.0f && ty1 > 0.0f;
+                    char why[64] = ""; int wn = 0;
+                    if (c.fst != 1u) wn += std::snprintf(why+wn, sizeof(why)-wn, "fst0 ");
+                    if (!(c.tri[0].z == 0.0f && c.tri[1].z == 0.0f && c.tri[2].z == 0.0f)) wn += std::snprintf(why+wn, sizeof(why)-wn, "z!=0 ");
+                    if (!(c.srcTbp0 >= 10752u && c.srcTbp0 <= 11328u)) wn += std::snprintf(why+wn, sizeof(why)-wn, "tbp ");
+                    if (!(c.destPsm == 0u || c.destPsm == 1u)) wn += std::snprintf(why+wn, sizeof(why)-wn, "psm ");
+                    if (!(ty1 < 96.0f)) wn += std::snprintf(why+wn, sizeof(why)-wn, "tall ");
+                    if (!(tx1 - tx0 < 0.8f * Wm)) wn += std::snprintf(why+wn, sizeof(why)-wn, "wide ");
+                    if (c.wsHudApplied) wn += std::snprintf(why+wn, sizeof(why)-wn, "applied ");
+                    if (inBand && why[0])
+                    {
+                        ++s_wlm;
+                        std::fprintf(stderr, "[wshudmiss] #%d WHY=[%s] d=%u dpsm=%u x=(%.0f..%.0f) y=(%.0f..%.0f) z=%.6g tbp=%u spsm=%u tex=%d fst=%u abe=%d bm=%02x fbmsk=%08x date=%d\n",
+                                     s_wlm, why, c.destFbp, (unsigned)c.destPsm, tx0, tx1, ty0, ty1, c.tri[0].z,
+                                     c.srcTbp0, (unsigned)c.srcPsm, c.texKey?1:0, (unsigned)c.fst,
+                                     c.abe?1:0, (unsigned)c.blendMode, c.fbmsk, c.dateEnable?1:0);
+                    }
+                }
+            }
             if (s_wl && wsHudInv != 1.0f && s_wln < 400 && c.isTriangle && c.fst == 1u && !c.isTransfer
                 && !c.isVramBlit && !c.isDecode && !c.isAliasPass && (c.destFbp == 0u || c.destFbp == 112u)
                 && c.tri[0].y >= s_wlY
@@ -8058,6 +8090,48 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                              c.srcTbp0, (unsigned)c.srcPsm, c.srcRendered?1:0, c.srcUploaded?1:0,
                              c.srcIndexed?1:0, c.texKey?1:0, c.depthTest?1:0,
                              (unsigned)c.depthFunc, c.abe?1:0, (unsigned)c.blendMode, c.fbmsk, c.dateEnable?1:0);
+            }
+        }
+        {   // [datebin] GS DATE tests ONLY alpha bit7 (>=0x80: binary); our blend
+            // approximation is proportional to the full alpha value. Under the bar the
+            // framebuffer holds leftover SCENE alpha -- flat 43 in 4:3 (uniform 17% leak,
+            // invisible) but a 166-gradient slab + 253 blobs in widescreen (the projection
+            // shift slides different sky/effect alpha under the bar) = the visible dark/
+            // washed bar ends. Before the frame's first DATE-gated HUD draw, snap the HUD
+            // band's alpha to hardware semantics: one clamped subtract of 127/255, then
+            // eight saturating doublings (>=128 -> 255, else 0). Runs after the outline/
+            // mask machinery (scene-time) has consumed real scene alpha. PS2X_DATEBIN=0
+            // disables.
+            static const bool s_dbin = [](){ const char *v = std::getenv("PS2X_DATEBIN"); return !(v && v[0] == '0'); }();
+            if (s_dbin && wsHudInv != 1.0f && !dateSnapDone && c.dateEnable && c.fst == 1u
+                && !c.isTransfer && !c.isVramBlit && !c.isDecode && !c.isAliasPass
+                && (c.destFbp == 0u || c.destFbp == 112u))
+            {
+                dateSnapDone = true;
+                rlDrawRenderBatchActive();
+                const float bw = (g_ps2xWsSrcW >= 320.0f && g_ps2xWsSrcW <= 1024.0f) ? g_ps2xWsSrcW : 512.0f;
+                rlColorMask(false, false, false, true);
+                // pass 1: dstA = clamp(dstA - 127/255)
+                rlSetBlendMode(RL_BLEND_ALPHA);
+                rlSetBlendFactorsSeparate(1 /*ONE*/, 1 /*ONE*/, 1 /*ONE*/, 1 /*ONE*/,
+                                          0x8006 /*FUNC_ADD*/, 0x800B /*FUNC_REVERSE_SUBTRACT*/);
+                rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
+                DrawRectangle(0, 0, (int)bw + 2, 100, Color{0, 0, 0, 127});
+                rlDrawRenderBatchActive();
+                // passes 2..9: dstA = clamp(2*dstA)
+                rlSetBlendMode(RL_BLEND_ALPHA);
+                rlSetBlendFactorsSeparate(1, 1, 0x0304 /*DST_ALPHA*/, 1 /*ONE*/,
+                                          0x8006, 0x8006);
+                rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
+                for (int dp = 0; dp < 8; ++dp)
+                {
+                    DrawRectangle(0, 0, (int)bw + 2, 100, Color{0, 0, 0, 255});
+                    rlDrawRenderBatchActive();
+                }
+                rlColorMask(true, true, true, true);
+                curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;   // force blend reapply
+                static int s_dbn = 0;
+                if (s_dbn < 3) { ++s_dbn; std::fprintf(stderr, "[datebin] snapped HUD band alpha (w=%.0f)\n", bw); }
             }
         }
         if (wsHudInv != 1.0f && !c.wsHudApplied && !c.isTransfer && !c.isVramBlit
@@ -8079,7 +8153,6 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 const float sprW = c.dx1 - c.dx0, sprH = c.dy1 - c.dy0;
                 if (sprW > 0.0f && sprW < 0.8f * W && sprH > 0.0f && sprH < 300.0f
                     && c.dy1 < 96.0f
-                    && c.srcTbp0 >= 10752u && c.srcTbp0 <= 11328u
                     && (!c.depthTest || c.depthFunc == 1u))
                 {
                     mc.dx0 = wsMapX(c.dx0, W, wsHudInv);
@@ -8088,8 +8161,13 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 }
             }
             else if (c.fst == 1u
-                     && c.tri[0].z == 0.0f && c.tri[1].z == 0.0f && c.tri[2].z == 0.0f
-                     && c.srcTbp0 >= 10752u && c.srcTbp0 <= 11328u)
+                     // no tbp gate: the UNTEXTURED alpha-zeroer/solid quads in the DATE
+                     // chain have no meaningful srcTbp0 -- gating on it left their alpha
+                     // writes UNSQUEEZED, corrupting the dest-alpha gate exactly in the
+                     // two end bands between squeezed and unsqueezed extents (the user's
+                     // dark bar ends; DATE=0 A/B proved the gate was the painter). The
+                     // pause menu is excluded by the y band, which is what actually works.
+                     && c.tri[0].z == 0.0f && c.tri[1].z == 0.0f && c.tri[2].z == 0.0f)
             {
                 float tx0 = c.tri[0].x, tx1 = tx0, ty0 = c.tri[0].y, ty1 = ty0;
                 for (int ti = 1; ti < 3; ++ti)
