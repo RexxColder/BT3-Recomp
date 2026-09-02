@@ -3770,13 +3770,27 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                             gs->activeContext().frame.fbmsk == 0x00FFFFFFu &&
                                             (tex.tbp0 == 0u || tex.tbp0 == 3584u) &&
                                             (tex.psm == 0x00u || tex.psm == 0x01u);   // [alphaonlyfbo] the renderer serves these from the rtsnap FBO copy; the scene flush feeds nothing for them
+                static const bool s_mbSkip = [](){ const char *v = std::getenv("PS2X_MASKBUILDSKIP"); return v && v[0] && v[0] != '0'; }();
+                const bool gaMaskBuild = s_mbSkip && tex.psm == GS_PSM_T8H && (tex.tbp0 == 0u || tex.tbp0 == 3584u);   // [idxrt] mask-build reads served from the scene FBO (pair with PS2X_IDXRT=1 PS2X_IDXONLY=1)
+                static const std::vector<uint32_t> s_shcCbps = [](){
+                    // PS2X_SHCOMPSKIP: "1" = {15972} (the NOSHCOMP-neutered composite class);
+                    // or an explicit comma list of cbps whose f224 PSMT8H reads are FBO-served
+                    // (must mirror the renderer's idxOnlyGate serve set!).
+                    std::vector<uint32_t> v; const char *e = std::getenv("PS2X_SHCOMPSKIP");
+                    if (!e || !e[0] || e[0] == '0') return v;
+                    if (!std::strchr(e, ',')) { if (std::atoi(e) == 1) { v.push_back(15972u); return v; } }
+                    const char *p = e;
+                    while (*p) { char *q = nullptr; unsigned long x = std::strtoul(p, &q, 10); if (q == p) break; v.push_back((uint32_t)x); p = (*q == ',') ? q + 1 : q; }
+                    return v; }();
+                const bool gaShcomp = !s_shcCbps.empty() && tex.psm == GS_PSM_T8H && tex.tbp0 == 7168u &&
+                                      std::find(s_shcCbps.begin(), s_shcCbps.end(), tex.cbp) != s_shcCbps.end();
                 const bool gaServed = !s_noskip && s_ga4 >= 4 && ((tex.tbp0 == 10752u && (tex.psm == 0x02u || tex.psm == 0x0Au))
                     // ink-composite signature ONLY (must mirror the renderer flip): other CT16
                     // readers of page 336 (HUD composite, menus) still need the VRAM round-trip.
                     && gs->m_texa.aem && gs->m_texa.ta1 == 0u
                     && (gs->m_texa.ta0 == 0x30u ||
                         (gs->m_texa.ta0 == 0x80u && (gs->activeContext().frame.fbmsk & 0x00FFFFFFu) == 0x00FFFFFFu))
-                    || gaZ16Dropped || gaAlphaOnlyFbo || gaSceneCT32 || gaF336Self);
+                    || gaZ16Dropped || gaAlphaOnlyFbo || gaSceneCT32 || gaF336Self || gaMaskBuild || gaShcomp);
                 if (!gaServed)
                 {
                     {   // [gpualias] census the CT16 readers of f336 we do NOT serve (the striping class?)
@@ -3790,6 +3804,23 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                              gs->activeContext().frame.fbp, (unsigned)gs->activeContext().frame.psm,
                                              gs->activeContext().frame.fbmsk, (unsigned)gs->m_prim.type,
                                              1u << gs->activeContext().tex0.tw, 1u << gs->activeContext().tex0.th);
+                        }
+                    }
+                    {   // [barwho2] PS2X_BARWHO2=1: per-(tbp,cbp) census of the PSMT8H reads that
+                        // still take the VRAM round-trip -- sizes the NOSHCOMP-neutered share.
+                        static const bool s_bw2 = [](){ const char *v = std::getenv("PS2X_BARWHO2"); return v && v[0] && v[0] != '0'; }();
+                        if (s_bw2 && tex.psm == GS_PSM_T8H)
+                        {
+                            static std::map<uint64_t, unsigned long> h; static unsigned long n = 0;
+                            ++h[((uint64_t)tex.tbp0 << 32) | tex.cbp];
+                            if (++n <= 16 || (n % 400ul) == 0ul)
+                            {
+                                std::fprintf(stderr, "[barwho2] #%lu tbp=%u cbp=%u dest=f%u fbmsk=%08x prim=%u |", n,
+                                             tex.tbp0, tex.cbp, (unsigned)gs->activeContext().frame.fbp,
+                                             gs->activeContext().frame.fbmsk, (unsigned)gs->m_prim.type);
+                                for (auto &kv : h) std::fprintf(stderr, " %u/%u=%lu", (unsigned)(kv.first >> 32), (unsigned)(kv.first & 0xffffffffu), kv.second);
+                                std::fprintf(stderr, "\n");
+                            }
                         }
                     }
                     ps2GpuRenderer().barrierBeforeRead(tex.tbp0, true, wantsAlpha, deferOk ? &deferTex : nullptr);
@@ -4969,6 +5000,11 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 if (s_decalQ && shadowDecalClass && !qOk) uvErrTexels = 1e9f;
                 if ((qOk || shadowDecalClass) && uvErrTexels > (grassClass ? 0.0f : 3.0f) && cmd.tri[0].q == 1.0f)
                 {
+                    static const int s_gbB = [](){ const char *v = std::getenv("PS2X_GRASSBUDGET");
+                                                   return v && v[0] ? std::atoi(v) : 1200; }();   // [grassbudget]
+                    static thread_local int s_gbCount = 0;
+                    static thread_local float s_gbScale = 1.0f;
+                    static thread_local std::chrono::steady_clock::time_point s_gbT0{};
                     auto emitTri = [&](const SV &a, const SV &b, const SV &c2)
                     {
                         const SV *vv[3] = {&a, &b, &c2};
@@ -4992,6 +5028,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                             cmd.tri[i].r = vv[i]->r; cmd.tri[i].g = vv[i]->g; cmd.tri[i].b = vv[i]->b; cmd.tri[i].a = vv[i]->a;
                         }
                         r.recordCmd(cmd);
+                        if (grassClass) ++s_gbCount;   // [grassbudget]
                     };
                     auto mid = [](const SV &a, const SV &b)
                     {
@@ -5005,8 +5042,13 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     // Iterative 4-way subdivision, terminating per PIECE as soon as its own
                     // affine error drops under the texel threshold (error shrinks ~4x per
                     // level, so this converges in 1-3 levels; depth cap is a backstop).
-                    auto pieceErr = [&](const SV &a, const SV &b, const SV &c2) -> float
-                    {
+                    // [grassdiv] perf: this loop was the top block of recordSpriteGPU in the
+                    // spin-dip profile (the annotate's divss cluster around s_gerr). The err and
+                    // cap formulas below share the per-vertex reciprocals (3 divides) instead of
+                    // recomputing s/q per edge per pass (~20 divides/piece before).
+                    auto pieceErr = [&](const SV &a, const SV &b, const SV &c2,
+                                        const float *ru, const float *rv) -> float
+                    {   // ru/rv = per-vertex s/q, t/q (atlas units) precomputed by the caller
                         float err = 0.0f;
                         const SV *pv[3] = {&a, &b, &c2};
                         for (int e = 0; e < 3; ++e)
@@ -5014,12 +5056,32 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                             const SV &A = *pv[e], &B = *pv[(e + 1) % 3];
                             const float qm = (A.q + B.q) * 0.5f;
                             if (qm <= 0.0f) continue;
-                            const float du = std::fabs((A.s / A.q + B.s / B.q) * 0.5f - ((A.s + B.s) * 0.5f) / qm) * static_cast<float>(texW);
-                            const float dv = std::fabs((A.t / A.q + B.t / B.q) * 0.5f - ((A.t + B.t) * 0.5f) / qm) * static_cast<float>(texH);
+                            const float rqm = 1.0f / qm;
+                            const int e2 = (e + 1) % 3;
+                            const float du = std::fabs((ru[e] + ru[e2]) * 0.5f - (A.s + B.s) * 0.5f * rqm) * static_cast<float>(texW);
+                            const float dv = std::fabs((rv[e] + rv[e2]) * 0.5f - (A.t + B.t) * 0.5f * rqm) * static_cast<float>(texH);
                             err = std::max({err, du, dv});
                         }
                         return err;
                     };
+                    // [grassbudget] load governor: the spin-dip class (sweep+X drops to ~20 fps)
+                    // is ENTIRELY the grass-piece record volume (GRASSSUB=0 sweep = 29.96/29.0,
+                    // zero dips). Pieces emitted in the current ~33 ms window scale the NEXT
+                    // window's error cap: standing still emits few pieces (full anti-swim
+                    // quality -- exactly where swim is visible), a camera spin coarsens the cap
+                    // instead of dropping frames (motion masks the residual swim).
+                    // PS2X_GRASSBUDGET=<pieces> (default 1200; 0 = governor off).
+                    if (s_gbB > 0)
+                    {
+                        const auto nowG = std::chrono::steady_clock::now();
+                        if (s_gbT0.time_since_epoch().count() == 0) s_gbT0 = nowG;
+                        else if (nowG - s_gbT0 > std::chrono::milliseconds(33))
+                        {
+                            if (s_gbCount > s_gbB)              s_gbScale = std::min(s_gbScale * 1.3f, 8.0f);
+                            else if (s_gbCount < s_gbB / 2)     s_gbScale = std::max(s_gbScale * 0.8f, 1.0f);
+                            s_gbCount = 0; s_gbT0 = nowG;
+                        }
+                    }
                     struct Item { SV a, b, c; int depth; };
                     static thread_local std::vector<Item> s_work;
                     s_work.clear();
@@ -5038,26 +5100,40 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                         static const bool s_dsub = [](){ const char *v = std::getenv("PS2X_DECALSUB"); return v && std::sscanf(v, "%d,%f", &s_dcap, &s_derr) == 2; }();
                         (void)s_dsub;
                         const int depthCap = shadowDecalClass ? s_dcap : (grassClass ? s_gcap : 5); const float errCap = shadowDecalClass ? s_derr : (grassClass ? s_gerr : 3.0f);
-                        float pieceCap = errCap;
-                        if (grassClass)
-                        {   // [grasspx] convert the SCREEN-PIXEL cap to this piece's texel scale: the near
-                            // ground magnifies texels (tight cap where swim was visible) while far terrain
-                            // minifies them (its sub-pixel affine error never mattered — stop immediately;
-                            // always-subdivide-everything cost ~12 fps: 36.5 -> 23.8 in the fight A/B).
-                            const float exPx = std::max({it.a.x, it.b.x, it.c.x}) - std::min({it.a.x, it.b.x, it.c.x});
-                            const float eyPx = std::max({it.a.y, it.b.y, it.c.y}) - std::min({it.a.y, it.b.y, it.c.y});
-                            const float extPx = std::max(exPx, eyPx);
-                            auto uv = [&](const SV &v, float &u, float &t2){ const float q = (std::fabs(v.q) > 1e-6f) ? v.q : 1.0f; u = v.s / q * (float)texW; t2 = v.t / q * (float)texH; };
-                            float u0,v0,u1,v1,u2,v2; uv(it.a,u0,v0); uv(it.b,u1,v1); uv(it.c,u2,v2);
-                            const float uvSpan = std::max(std::max({u0,u1,u2}) - std::min({u0,u1,u2}),
-                                                          std::max({v0,v1,v2}) - std::min({v0,v1,v2}));
-                            const float pxPerTex = (uvSpan > 1e-3f) ? (extPx / uvSpan) : 1.0f;
-                            pieceCap = s_gerr / std::max(pxPerTex, 1e-3f);   // err_texels * pxPerTex <= s_gerr px
-                        }
-                        if (it.depth >= depthCap || (it.depth > 0 && pieceErr(it.a, it.b, it.c) <= pieceCap))
-                        {
-                            emitTri(it.a, it.b, it.c);
-                            continue;
+                        if (it.depth >= depthCap) { emitTri(it.a, it.b, it.c); continue; }   // [grassdiv] no math needed
+                        if (it.depth > 0)
+                        {   // [grassdiv] the root always splits (it.depth > 0 emit guard -- the
+                            // grasspop fix), so its cap/err math was pure waste; and both passes
+                            // now share the per-vertex s/q, t/q reciprocals computed once here.
+                            const SV *pv[3] = {&it.a, &it.b, &it.c};
+                            float ru[3], rv[3];
+                            for (int i3 = 0; i3 < 3; ++i3)
+                            {
+                                const float q = (std::fabs(pv[i3]->q) > 1e-6f) ? pv[i3]->q : 1.0f;
+                                const float rq = 1.0f / q;
+                                ru[i3] = pv[i3]->s * rq; rv[i3] = pv[i3]->t * rq;
+                            }
+                            float pieceCap = errCap;
+                            if (grassClass)
+                            {   // [grasspx] convert the SCREEN-PIXEL cap to this piece's texel scale: the near
+                                // ground magnifies texels (tight cap where swim was visible) while far terrain
+                                // minifies them (its sub-pixel affine error never mattered — stop immediately;
+                                // always-subdivide-everything cost ~12 fps: 36.5 -> 23.8 in the fight A/B).
+                                const float exPx = std::max({it.a.x, it.b.x, it.c.x}) - std::min({it.a.x, it.b.x, it.c.x});
+                                const float eyPx = std::max({it.a.y, it.b.y, it.c.y}) - std::min({it.a.y, it.b.y, it.c.y});
+                                const float extPx = std::max(exPx, eyPx);
+                                const float u0 = ru[0] * (float)texW, u1 = ru[1] * (float)texW, u2 = ru[2] * (float)texW;
+                                const float v0 = rv[0] * (float)texH, v1 = rv[1] * (float)texH, v2 = rv[2] * (float)texH;
+                                const float uvSpan = std::max(std::max({u0,u1,u2}) - std::min({u0,u1,u2}),
+                                                              std::max({v0,v1,v2}) - std::min({v0,v1,v2}));
+                                const float pxPerTex = (uvSpan > 1e-3f) ? (extPx / uvSpan) : 1.0f;
+                                pieceCap = (s_gerr * s_gbScale) / std::max(pxPerTex, 1e-3f);   // err_texels * pxPerTex <= s_gerr*scale px  [grassbudget]
+                            }
+                            if (pieceErr(it.a, it.b, it.c, ru, rv) <= pieceCap)
+                            {
+                                emitTri(it.a, it.b, it.c);
+                                continue;
+                            }
                         }
                         const SV ab = mid(it.a, it.b), bc = mid(it.b, it.c), ca = mid(it.c, it.a);
                         s_work.push_back({it.a, ab, ca, it.depth + 1});
