@@ -1429,6 +1429,17 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
             g_barPending.push_back(fbp);
         return;
     }
+    {   // [flushuploadwins] Same rule as the latch writeback's wbgate: a page the GUEST
+        // uploaded MORE RECENTLY than we rendered holds fresher truth than our FBO. The
+        // opening FMV uploads MPEG frames into the display page every frame, and the
+        // barrier flush was overwriting them with stale row-inverted FBO content -- the
+        // "flipped ghost layer" (PS2X_BARRIER=0 movie = clean, proving the writer).
+        // Fights are unaffected: scene pages are render-newer every frame ([dduploadwins]
+        // forensics measured renders newer 250/250 there).
+        static const bool s_fuw = [](){ const char *v = std::getenv("PS2X_FLUSHUPLOADWINS"); return !(v && v[0] == '0'); }();
+        if (s_fuw && fbp < kVramPages && !(m_fbpRenderSeq[fbp] > m_pageSeq[fbp]))
+            return;
+    }
     extern void ps2xWritebackToVramMasked(uint32_t, uint32_t, uint32_t, int, int, const uint32_t *, uint32_t);
     static const bool s_bd = [](){ const char *v = std::getenv("PS2X_BARDIAG");
                                    return v && v[0] && v[0] != '0'; }();
@@ -5426,6 +5437,15 @@ void GsGpuRenderer::swapFrame()
                                        return v && v[0] && v[0] != '0'; }();
         if (s_fs) { static int n = 0; if (n < 4000)
             std::fprintf(stderr, "[framesize] swapFrame #%d publishing %zu cmds\n", ++n, m_building.size()); }
+        if (s_fs && m_building.size() >= 1 && m_building.size() <= 3)
+        {   // [fmvcmd] tiny publishes (the FMV cadence): identify the command(s)
+            static int n4 = 0;
+            if (n4 < 40) { ++n4;
+                for (const DrawCmd &c : m_building)
+                    std::fprintf(stderr, "[fmvcmd] dest=f%u src=%u psm=%u tri=%d transfer=%d vramblit=%d snap=%d dst=(%.0f,%.0f)-(%.0f,%.0f) tex=%dx%d key=%d\n",
+                                 c.destFbp, c.srcTbp0, (unsigned)c.srcPsm, (int)c.isTriangle, (int)c.isTransfer, (int)c.isVramBlit,
+                                 c.vramSnap ? 1 : 0, c.dx0, c.dy0, c.dx1, c.dy1, c.srcTexW, c.srcTexH, c.texKey ? 1 : 0); }
+        }
     }
     std::unique_lock<std::mutex> lk(m_mtx);
     auto unservicedDecode = [&]() -> bool {   // [deferpub] a decode command published unserviced can only be
@@ -7653,6 +7673,15 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 char lp[128];
                 std::snprintf(lp, sizeof lp, "/home/z3/Desktop/bt3/work/probefb_latch%u.ppm", s_ln);
                 dumpBoundFbo(lp, cw, ch);
+            }
+            {   // [latchdump2] PS2X_LATCHDUMP2=<startCapture>: 16 consecutive latch captures
+                static const long s_ld2 = [](){ const char *v = std::getenv("PS2X_LATCHDUMP2"); return v && v[0] ? std::atol(v) : -1; }();
+                if (s_ld2 >= 0 && s_ln > (unsigned)s_ld2 && s_ln <= (unsigned)s_ld2 + 16)
+                {
+                    char lp[160];
+                    std::snprintf(lp, sizeof lp, "/home/z3/Desktop/bt3/work/latchd/l%04u_f%u.ppm", s_ln, xfbp);
+                    dumpBoundFbo(lp, cw, ch);
+                }
             }
             static std::chrono::steady_clock::time_point s_lt = psxNow();
             static unsigned s_lsec = 0;
@@ -12332,8 +12361,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // control-vs-serve stream diff can name the first divergent draw instead of another
             // theory. Fields chosen to fingerprint routing, not content.
             static const bool s_dl = [](){ const char *v = std::getenv("PS2X_DRAWLOG"); return v && v[0] && v[0] != '0'; }();
+            static const long s_dlLive = [](){ const char *v = std::getenv("PS2X_DRAWLOG_LIVE"); return v && v[0] ? std::atol(v) : -1; }();
+            static unsigned long s_dlSeen = 0; ++s_dlSeen;
             extern bool g_replayInWindow;
-            if (s_dl && g_replayInWindow)
+            static const double s_dlAt = [](){ const char *v = std::getenv("PS2X_DRAWLOG_AT"); return v && v[0] ? std::atof(v) : -1.0; }();
+            static const auto s_dlT0 = std::chrono::steady_clock::now();
+            const double dlElapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_dlT0).count();
+            if ((s_dl && g_replayInWindow) || (s_dlLive >= 0 && s_dlSeen > (unsigned long)s_dlLive && s_dlSeen < (unsigned long)s_dlLive + 3000)
+                || (s_dlAt >= 0.0 && dlElapsed >= s_dlAt && dlElapsed < s_dlAt + 2.0))
             {
                 {   // [texmap] once per generation: decode texture ids to their owners.
                     static uint32_t lastG = 0xFFFFFFFFu;
@@ -12354,6 +12389,9 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                              ++dseq, c.destFbp, c.srcTbp0, (unsigned)c.srcPsm, c.fbmsk, (unsigned)c.blendMode,
                              c.abe ? 1 : 0, (int)c.isTriangle, c.texKey ? 1 : 0, fromFbo ? 1 : 0,
                              idxRt ? 1 : 0, gaServed ? 1 : 0, tex.id, tex.width, tex.height);
+                if ((s_dlLive >= 0 || s_dlAt >= 0.0) && !c.isTriangle)
+                    std::fprintf(stderr, "[dlg] d=%u dy=(%.0f..%.0f) dx=(%.0f..%.0f) sv=(%.1f..%.1f) su=(%.1f..%.1f) abe=%d bm=%02x z=%.3f dtest=%d\n",
+                                 c.destFbp, c.dy0, c.dy1, c.dx0, c.dx1, c.sv0, c.sv1, c.su0, c.su1, c.abe?1:0, (unsigned)c.blendMode, c.z, c.depthTest?1:0);
                 if (idxRt && c.destFbp == 336u)
                 {   // [dlx] ACTUAL GL state at a served import: write mask + blend factors.
                     rlDrawRenderBatchActive();
@@ -12367,6 +12405,28 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     std::fprintf(stderr, "[dlx] m=%08x wm=%d%d%d%d blend=%d src=%04x dst=%04x srcA=%04x dstA=%04x\n",
                                  c.fbmsk, wm[0], wm[1], wm[2], wm[3], be, bs, bd, bsa, bda);
                 }
+            }
+        }
+        {   // [fmvself] A fullscreen SELF-READ sprite of a display buffer (src page == dest
+            // fbp, CT32/CT24, resolved to the DECODE path) is an identity copy on console.
+            // When the buffer's FBO content is NEWER than any upload (render-wins), the VRAM
+            // it decodes is STALE -- SCENESKIP deliberately skips the flush for this class --
+            // and the draw paints an old, row-inverted frame over the live one: the opening
+            // FMV's "flipped ghost layer". The console-equivalent result of the identity copy
+            // is no visible change, so drop it. Uploaded full-screen art (the pre-title
+            // still) keeps the decode: its uploads are newer than the renders.
+            static const bool s_fmvSelf = [](){ const char *v = std::getenv("PS2X_FMVSELF"); return !(v && v[0] == '0'); }();
+            const uint32_t fmvSrcFbp = c.srcTbp0 / 32u;
+            if (s_fmvSelf && !c.isTransfer && !c.isTriangle && c.texKey != 0 && !fromFbo && !idxRt && !gaServed
+                && (c.srcPsm == 0u || c.srcPsm == 1u) && c.destFbp < kVramPages && fmvSrcFbp < kVramPages
+                && (c.srcTbp0 % 32u) == 0u
+                && (c.dx1 - c.dx0) >= 400.0f && (c.dy1 - c.dy0) >= 300.0f
+                && m_fbpRenderSeq[fmvSrcFbp] > m_pageSeq[fmvSrcFbp]
+                && g_fbos.count(fmvSrcFbp) && g_fbos[fmvSrcFbp].rt.texture.id != 0)
+            {
+                if (fmvSrcFbp == c.destFbp) { PS2X_GATE_HIT(); continue; }   // identity copy: no-op on console
+                // Cross-buffer copies keep the decode path for now: serving them from the
+                // source FBO here blacked the movie (wrong band of the taller f112 FBO).
             }
         }
         {   // Indexed render-target sampling: hand the shader the CLUT and switch it to
@@ -15462,6 +15522,14 @@ if (done.size() < 14 && !done.count(c.texKey))
     // fbp0 + fbp112 + the presented texture (all keyed by publish gen) and one metadata line —
     // reconcile every buffer against what the window shows. No more cross-frame guessing.
     {
+        {   // [presfor] PS2X_PRESFOR=<startFrame>: per-present selection log for a 3000-frame window
+            static const long s_pf3 = [](){ const char *v = std::getenv("PS2X_PRESFOR"); return v && v[0] ? std::atol(v) : -1; }();
+            static unsigned long s_pfN = 0; ++s_pfN;
+            if (s_pf3 >= 0 && s_pfN > (unsigned long)s_pf3 && s_pfN < (unsigned long)s_pf3 + 3000)
+                std::fprintf(stderr, "[presfor] n=%lu gen=%u cmds=%zu disp=f%u outId=%u hint=%u texWH=%dx%d srcY=%d dispWH=%dx%d\n",
+                             s_pfN, frameGen, cmds.size(), displayFbp, outId, m_hintDisplayFbp,
+                             m_presentTexW, m_presentTexH, m_presentSrcY, m_dispW, m_dispH);
+        }
         if (g_forensicThisFrame)
         {
             Texture2D pt{}; pt.id = outId; pt.width = m_presentTexW; pt.height = m_presentTexH;
