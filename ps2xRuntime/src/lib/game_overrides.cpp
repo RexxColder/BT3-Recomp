@@ -1,3 +1,4 @@
+#include "ps2_runtime_macros.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_calls.h"
@@ -16,11 +17,18 @@
 #include <iostream>
 #include <mutex>
 #include <map>
+#include <set>
 #include <atomic>
+#include <chrono>
 #include <optional>
 #include <vector>
 #include <unordered_map>
 #include <cstring>
+
+// [wlk] overlay-table externs (file scope — block-scope extern inside the anon namespace mislinks)
+extern PS2Runtime::RecompiledFunction g_ps2OverlayFunctionTable[];
+extern const uint32_t g_ps2OverlayFunctionTableBase;
+extern const uint32_t g_ps2OverlayFunctionTableSlotCount;
 
 // Live host input (keyboard + gamepad) as a 16-bit active-low PS2 button word +
 // analog bytes. Defined in src/lib/pad_config.cpp. `player` selects the profile
@@ -2447,7 +2455,8 @@ namespace
     // read) -> 1 with no 2 or 3 observed for the new read at all, so any rule based on the last
     // polled value cannot see it.
     struct Bt3DevDone { std::atomic<uint32_t> dev{0u}; std::atomic<uint32_t> reported{1u};
-                        std::atomic<uint32_t> stream{0u}; std::atomic<uint32_t> idleWait{0u}; };
+                        std::atomic<uint32_t> stream{0u}; std::atomic<uint32_t> idleWait{0u};
+                        std::atomic<uint32_t> activeReq{0u}; };   // [cdedge2] pending request ([stream+8]) the device was seen busy/done for
     inline Bt3DevDone *bt3DevSlot(uint32_t dev)
     {
         static Bt3DevDone s_slots[8];
@@ -2501,7 +2510,19 @@ namespace
                 // stops it substituting the value -- the A/B that says whether the fix is the
                 // substitution or just the extra frame per poll shifting the race.
                 static const bool s_edgeFix = [](){ const char *v = std::getenv("PS2X_CDEDGE"); return !(v && v[0] == '0'); }();
-                if (waiting && s_edgeFix)
+                static const bool s_edge2 = [](){ const char *v = std::getenv("PS2X_CDEDGE2"); return v && v[0] && v[0] != '0'; }();   // opt-in (see the pump)
+                uint32_t pendNow = 0u;
+                if (stream) { if (const uint8_t *pp = getConstMemPtr(rdram, stream + 8u)) std::memcpy(&pendNow, pp, sizeof(pendNow)); }
+                if (waiting && s_edgeFix && s_edge2 && ds->activeReq.load(std::memory_order_relaxed) != pendNow)
+                {   // [cdedge2] the device has not been seen working on THIS request: it is queued, not done.
+                    // Hardware never shows idle here (the IOP starts the read at submission) -> report busy.
+                    state = 2u;
+                    static std::atomic<uint32_t> s_b{0};
+                    const uint32_t k = s_b.fetch_add(1u);
+                    if (k < 8u || (k % 200u) == 0u)
+                        std::fprintf(stderr, "[cdstate] #%u dev=0x%x idle before request 0x%x was started (stream 0x%x); reporting BUSY, not done\n", k, handle, pendNow, stream);
+                }
+                else if (waiting && s_edgeFix)
                 {
                     state = 3u;
                     static std::atomic<uint32_t> s_n{0};
@@ -2524,6 +2545,61 @@ namespace
         setReturnU32(ctx, state);
     }
 
+    // Run the CD file-server tick (FUN_0028a3b0) inline on the calling guest thread.
+    // [dispatchpump] when the CD server last ran (any path); the dispatch-loop pump only fires when this is stale
+    static std::atomic<int64_t> g_lastCdTickNs{0};
+    extern "C" bool ps2xCdTickStale(unsigned ms)
+    {
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t last = g_lastCdTickNs.load(std::memory_order_relaxed);
+        return last == 0 || (now - last) > (int64_t)ms * 1000000LL;
+    }
+    static void bt3RunCdTickInline(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_lastCdTickNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);   // [dispatchpump]
+        R5900Context tctx = *ctx;             // inherit gp/sp
+        tctx.r[31] = _mm_setzero_si128();     // ra = 0 => run until return
+        tctx.pc = 0x0028a3b0u;                // CD file-server tick
+        uint32_t steps = 0u;
+        while (tctx.pc != 0u && steps++ < 2000000u)
+        {
+            PS2Runtime::RecompiledFunction step = runtime->lookupFunction(tctx.pc);
+            if (!step) break;
+            step(rdram, &tctx, runtime);
+        }
+    }
+    // [spinpump] Called by the dispatch loop when a guest thread has re-dispatched at the same pc for
+    // thousands of iterations (a busy-poll). The CD file server only advances from the read-poll hook,
+    // so a thread polling MEMORY for a load result (the walkers at 0x1149a0 / 0x1134a0 / 0x256e00 with
+    // every loader thread blocked) deadlocks: nothing ticks the server, no completion, no populate.
+    // Hardware preempts the poller with the IOP completion. Emulate it: tick the server here, then
+    // yield the guest token so a woken loader thread can run. PS2X_SPINPUMP=0 disables.
+    // [dispatchpump] tick the CD file server WITHOUT sleeping (the dispatch-loop pump runs during fights too)
+    extern "C" void ps2xCdTickOnly(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (!runtime || !runtime->hasFunction(0x0028a3b0u)) return;
+        Bt3CdTickGuard tickGuard;
+        if (tickGuard.engaged) { bt3RunCdTickInline(rdram, ctx, runtime); s_bt3CdTicking = false; }
+    }
+    extern "C" void *ps2xGuestWaitBegin();
+    extern "C" void ps2xGuestWaitEnd(void *);
+    extern "C" void ps2xSpinPump(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_SPINPUMP"); return !(v && v[0] == '0'); }();
+        if (!s_on || !runtime || !runtime->hasFunction(0x0028a3b0u)) return;
+        {
+            Bt3CdTickGuard tickGuard;
+            if (tickGuard.engaged) { bt3RunCdTickInline(rdram, ctx, runtime); s_bt3CdTicking = false; }
+        }
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t k = s_n.fetch_add(1u);
+        if (k < 6u || (k % 5000u) == 0u)
+            std::fprintf(stderr, "[spinpump] guest thread spinning at pc 0x%x: ticked the CD server + yielded (x%u)\n", ctx->pc, k + 1u);
+        void *scope = ps2xGuestWaitBegin();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ps2xGuestWaitEnd(scope);
+    }
+
     PS2Runtime::RecompiledFunction g_orig26b900 = nullptr;
     void bt3AfsStatusPoll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_0026b900
     {
@@ -2540,19 +2616,33 @@ namespace
         }
         Bt3CdTickGuard tickGuard;
         bt3NoteCdTickSkipped(!tickGuard.engaged, "afsStatusPoll");
+        // [cdedge2] which request is the device working on? Snapshot the pending request and the
+        // device read-state around the tick; if the device is busy/done at either end, that request
+        // has genuinely been started -- the only case in which "idle" later means "completed".
+        // The request-identity snapshot never distinguished requests ([stream+8] is the same buffer) and its
+        // two device-state calls (a full R5900Context copy each) run on every poll: OFF by default now.
+        static const bool s_edge2Pump = [](){ const char *v = std::getenv("PS2X_CDEDGE2"); return v && v[0] && v[0] != '0'; }();
+        uint32_t cdDev = 0u, pendBefore = 0u, stBefore = 1u;
+        if (s_edge2Pump)
+        { if (const uint8_t *pdev = getConstMemPtr(rdram, handle + 4u)) std::memcpy(&cdDev, pdev, sizeof(cdDev));
+          if (const uint8_t *pp = getConstMemPtr(rdram, handle + 8u)) std::memcpy(&pendBefore, pp, sizeof(pendBefore)); }
+        auto devState = [&](uint32_t dev) -> uint32_t {
+            if (!g_orig270dd0 || dev == 0u) return 1u;
+            R5900Context t = *ctx; t.r[4] = _mm_set_epi64x(0, (int64_t)(int32_t)dev); t.r[31] = _mm_setzero_si128(); t.pc = 0x00270dd0u;
+            g_orig270dd0(rdram, &t, runtime);
+            return getRegU32(&t, 2);
+        };
+        if (tickGuard.engaged && cdDev) stBefore = devState(cdDev);
         if (tickGuard.engaged && handle != 0u && runtime->hasFunction(0x0028a3b0u))
         {
-            R5900Context tctx = *ctx;             // inherit gp/sp
-            tctx.r[31] = _mm_setzero_si128();     // ra = 0 => run until return
-            tctx.pc = 0x0028a3b0u;                // CD file-server tick
-            uint32_t steps = 0u;
-            while (tctx.pc != 0u && steps++ < 2000000u)
-            {
-                PS2Runtime::RecompiledFunction step = runtime->lookupFunction(tctx.pc);
-                if (!step) break;
-                step(rdram, &tctx, runtime);
-            }
+            bt3RunCdTickInline(rdram, ctx, runtime);
             s_bt3CdTicking = false;
+            if (cdDev && pendBefore)
+            {
+                const uint32_t stAfter = devState(cdDev);
+                if (stBefore == 2u || stBefore == 3u || stAfter == 2u || stAfter == 3u)
+                    if (Bt3DevDone *slot = bt3DevSlot(cdDev)) slot->activeReq.store(pendBefore, std::memory_order_relaxed);
+            }
         }
         if (g_orig26b900)
             g_orig26b900(rdram, ctx, runtime); // returns int8 *(handle+1) (now advanced)
@@ -2693,16 +2783,28 @@ namespace
     PS2Runtime::RecompiledFunction g_orig23d510 = nullptr;
     void bt3CamForce(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_0023d510
     {
+        static const bool s_camForce = [](){ const char *v = std::getenv("PS2X_CAMFORCE"); return v && v[0] && v[0] != '0'; }();
         const uint32_t base = g_bt3CamBase.load(std::memory_order_relaxed);
         const uint32_t tgt  = g_bt3CamTarget.load(std::memory_order_relaxed);
-        if (base && tgt)
+        if (s_camForce && base && tgt)
         {
             uint8_t *p300 = getMemPtr(rdram, (base + 0x300u) & 0x1FFFFFFFu);
             uint8_t *p304 = getMemPtr(rdram, (base + 0x304u) & 0x1FFFFFFFu);
             if (p300) { uint32_t cur; std::memcpy(&cur, p300, 4); if (cur == 0u) std::memcpy(p300, &tgt, 4); }
             if (p304) { uint32_t cur; std::memcpy(&cur, p304, 4); if (cur == 0u) std::memcpy(p304, &tgt, 4); }
         }
-        if (g_orig23d510) g_orig23d510(rdram, ctx, runtime);
+        // [camround] PS2X_CAMROUND=1: run the camera update under PS2/PCSX2 chop rounding.
+        // PALG37 proved CLIP flags bit-faithful; the divergent input = the per-frame matrix
+        // values this function produces (host rounding upstream of the TERRROUND scope).
+        static const bool s_camRound = [](){ const char *v = std::getenv("PS2X_CAMROUND"); return v && v[0] && v[0] != '0'; }();
+        if (s_camRound)
+        {
+            const unsigned int saved = _mm_getcsr();
+            _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8040u);
+            if (g_orig23d510) g_orig23d510(rdram, ctx, runtime);
+            _mm_setcsr(saved);
+        }
+        else if (g_orig23d510) g_orig23d510(rdram, ctx, runtime);
     }
 
     // PS2X_CAMENABLE: the camera-tracking enable (func_23DF38) is gated at 0x1c6e30 by
@@ -2795,12 +2897,532 @@ namespace
     }
 
     PS2Runtime::RecompiledFunction g_orig2316d0 = nullptr;
+    // [thunkwatch] sub_002722C0 = `sd ra,0(sp); ld ra,0(sp); j func_2892F0 (jr ra)`: the reloaded $ra comes back as
+    // garbage (0x30d49 / 0x30d71) in ~1 of 5 fight loads -> the loader thread's stack slot is overwritten between
+    // two adjacent instructions. Arm the write-watch on exactly that slot for the duration of the thunk so the
+    // store hook names the writer (guest pc). PS2X_THUNKWATCH=0 disables.
+    // [fixupprobe] FUN_0010a028 = the loader's pointer-fixup loop (bank offsets -> absolute pointers). The loading hang's
+    // corrupting store (pc 0x10a074 -> 0x2c9360) came from here with base a1 = 0x02f60500. Log every call's inputs.
+    struct FixupRing { uint32_t n, a0, a1, a2, ra, cnt, entOff, sp; };
+    FixupRing g_fixupRing[16] = {};
+    uint32_t g_fixupRingPos = 0;
+    PS2Runtime::RecompiledFunction g_orig10a028 = nullptr;
+    void bt3FixupProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6), ra = getRegU32(ctx, 31);
+        auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *p = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (p) std::memcpy(&v, p, 4); return v; };
+        static std::atomic<uint32_t> s_n{0}; const uint32_t n = s_n.fetch_add(1u);
+        {   // [fixupring] keep the LAST 16 calls (the first-40 log never contains the hang's own call);
+            // ps2xFixupRingDump() prints them from the [status] line when the game sits at 0 fps.
+            static std::mutex s_rm; std::lock_guard<std::mutex> lk(s_rm);
+            FixupRing &r = g_fixupRing[g_fixupRingPos++ & 15u];
+            r.n = n; r.a0 = a0; r.a1 = a1; r.a2 = a2; r.ra = ra; r.cnt = r32(a2); r.entOff = r32(a2 + 4u); r.sp = getRegU32(ctx, 29);
+        }
+        if (n < 40u)
+            std::fprintf(stderr, "[fixupprobe] #%u a0=0x%x a1=0x%x a2=0x%x ra=0x%x hdr[0..4]=%08x %08x %08x %08x %08x  a1[0..3]=%08x %08x %08x %08x  sp=0x%x\n",
+                         n, a0, a1, a2, ra, r32(a2), r32(a2 + 4u), r32(a2 + 8u), r32(a2 + 12u), r32(a2 + 16u), r32(a1), r32(a1 + 4u), r32(a1 + 8u), r32(a1 + 12u), getRegU32(ctx, 29));
+        {   // [fixupguard] the hung runs called this with a base 0x37000 past the real pack (stale pointer): the "header"
+            // there is sample data, so the entry pointer becomes garbage and the loop writes over the sound stream block
+            // 0x2c9350. Refuse a fixup whose header is implausible: count > 1024 or entries outside [a1, a1 + 2 MB).
+            static const bool s_guard = [](){ const char *v = std::getenv("PS2X_FIXUPGUARD"); return !(v && v[0] == '0'); }();
+            const uint32_t cnt = r32(a2), entOff = r32(a2 + 4u) * 4u;
+            const uint32_t entBase = (a1 + entOff) & 0x1FFFFFFFu, a1m = a1 & 0x1FFFFFFFu;
+            if (s_guard && (cnt > 1024u || entBase < a1m || entBase - a1m > 0x200000u || (a1 & 0x1FFFFFFFu) >= 0x2000000u))
+            {
+                std::fprintf(stderr, "[fixupguard] REJECTED fixup #%u: a1=0x%x a2=0x%x count=%u entries@+0x%x (garbage header) -- skipping to protect 0x2c9350\n", n, a1, a2, cnt, entOff);
+                return;
+            }
+        }
+        if (g_orig10a028) g_orig10a028(rdram, ctx, runtime);
+    }
+
+    // [shadowprobe] PS2X_SHADOWPROBE=1: the game's character-shadow pipeline (Pass 1 silhouette microcode into fbp336 +
+    // Pass 2 floor decal) never runs its silhouette pass under our runtime (no triangle ever hits fbp336, the shadow
+    // microcode pieces at 0x2c2d30/0x2c3080/0x2c3380 never upload). Static chain: sub_00115290 creates the shadow
+    // system ([gp-0x595C] = ctx, gated on [[gp-0x5154]+0x24]) <- 0x23fc80; 0x115de0 (model draw driver) -> 0x115478
+    // (bails when [gp-0x595C]==0 or [[gp-0x5690]+8]&1) -> returns 8 -> 0x115c98 -> sub_001231E0 (silhouette
+    // microcode). Log entries + the gates to see which link breaks.
+    struct ShadowProbeSlot { uint32_t addr; const char *name; PS2Runtime::RecompiledFunction orig; std::atomic<uint32_t> n; };
+    ShadowProbeSlot g_shProbe[] = {
+        { 0x00115290u, "create(115290)", nullptr, {0} }, { 0x00115370u, "destroy(115370)", nullptr, {0} },
+        { 0x0023fc80u, "creator-caller(23fc80)", nullptr, {0} }, { 0x0023fc40u, "23fc40", nullptr, {0} },
+        { 0x00115de0u, "drawdriver(115de0)", nullptr, {0} }, { 0x00115478u, "gate(115478)", nullptr, {0} },
+        { 0x00115c98u, "silhouette(115c98)", nullptr, {0} }, { 0x00114508u, "114508", nullptr, {0} },
+        { 0x0010fd98u, "10fd98", nullptr, {0} }, { 0x001231e0u, "mcode(1231e0)", nullptr, {0} },
+        { 0x00123d50u, "mcode(123d50)", nullptr, {0} }, { 0x00123e40u, "mcode(123e40)", nullptr, {0} },
+        // functions that form FRAME=0x00040150 (fbp336 fbw4 = the Pass-1 shadow-silhouette target, pcsx2dump draw 1849)
+        { 0x00103600u, "frame336(103600)", nullptr, {0} }, { 0x00104060u, "frame336(104060)", nullptr, {0} },
+        { 0x00247d98u, "frame336(247d98)", nullptr, {0} }, { 0x00107ee0u, "frame336(107ee0)", nullptr, {0} },
+        { 0x00113c08u, "frame336(113c08)", nullptr, {0} }, { 0x00244890u, "frame336(244890)", nullptr, {0} },
+    };
+    template <int I> void bt3ShadowProbeFn(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ShadowProbeSlot &sl = g_shProbe[I];
+        const uint32_t n = sl.n.fetch_add(1u);
+        auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *p = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (p) std::memcpy(&v, p, 4); return v; };
+        const uint32_t gp = getRegU32(ctx, 28), a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6), ra = getRegU32(ctx, 31);
+        const uint32_t shCtx = r32(gp - 0x595Cu), g5690 = r32(gp - 0x5690u), g5154 = r32(gp - 0x5154u);
+        const bool say = n < 6u || (n % 2000u) == 0u;
+        if (say)
+            std::fprintf(stderr, "[shadowprobe] %s #%u a0=0x%x a1=0x%x a2=0x%x ra=0x%x | shCtx[gp-595C]=0x%x  [gp-5690]=0x%x +8=0x%x  [gp-5154]=0x%x +24=0x%x (+24/+28=0x%x/0x%x)\n",
+                         sl.name, n, a0, a1, a2, ra, shCtx, g5690, g5690 ? r32(g5690 + 8u) : 0u, g5154, g5154 ? r32(g5154 + 0x24u) : 0u,
+                         (g5154 && r32(g5154 + 0x24u)) ? r32(r32(g5154 + 0x24u) + 0x24u) : 0u, (g5154 && r32(g5154 + 0x24u)) ? r32(r32(g5154 + 0x24u) + 0x28u) : 0u);
+        if (sl.orig) sl.orig(rdram, ctx, runtime);
+        if (say && (I == 5 || I == 0)) std::fprintf(stderr, "[shadowprobe] %s #%u -> v0=0x%x shCtx=0x%x\n", sl.name, n, getRegU32(ctx, 2), r32(gp - 0x595Cu));
+    }
+    // [stagegate] PS2X_STAGEGATE=1: does the stage-bank upload dispatcher (sub_00115DE0) run
+    // per frame, and do its emitters (116770/116860/116970) ever fire? Logs the obj flag gate
+    // [gp-0x5690]+8 bit0 that early-exits the dispatcher. (Terrain-sheet-never-uploaded hunt.)
+    struct SgSlot { uint32_t addr; const char *name; PS2Runtime::RecompiledFunction orig; std::atomic<uint32_t> n; };
+    SgSlot g_sgProbe[4] = {
+        { 0x00115de0u, "dispatch(115de0)", nullptr, {0} }, { 0x00116770u, "emit(116770)", nullptr, {0} },
+        { 0x00116860u, "emit(116860)", nullptr, {0} }, { 0x00116970u, "emit(116970)", nullptr, {0} },
+    };
+    template <int I> void bt3StageGateFn(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SgSlot &sl = g_sgProbe[I];
+        const uint32_t n = sl.n.fetch_add(1u);
+        auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *p = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (p) std::memcpy(&v, p, 4); return v; };
+        const uint32_t gp = getRegU32(ctx, 28);
+        const uint32_t g5690 = r32(gp - 0x5690u);
+        const bool say = n < 8u || (n % 2000u) == 0u;
+        if (say)
+            std::fprintf(stderr, "[stagegate] %s #%u fr=%llu a0=0x%x ra=0x%x [gp-5690]=0x%x +8=0x%x +1C=0x%x\n",
+                         sl.name, n, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
+                         getRegU32(ctx, 4), getRegU32(ctx, 31), g5690,
+                         g5690 ? r32(g5690 + 8u) : 0u, g5690 ? r32(g5690 + 0x1Cu) : 0u);
+        if (sl.orig) sl.orig(rdram, ctx, runtime);
+    }
+    // [rollback] PS2X_ROLLBACK=1: hook the DL finalizer sub_00100890(end). It sets the shared
+    // cursor [gp-0x59D8] = end; if end < current cursor that is a CURSOR ROLLBACK — the event
+    // that lets later passes overwrite the stage-sheet upload. Log the caller (ra).
+    PS2Runtime::RecompiledFunction g_rbOrig = nullptr;
+    void bt3RollbackProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u);
+        const uint32_t gp = getRegU32(ctx, 28), a0 = getRegU32(ctx, 4), ra = getRegU32(ctx, 31);
+        uint32_t cur = 0;
+        if (const uint8_t *pp = getMemPtr(rdram, (gp - 0x59D8u) & 0x1FFFFFFFu)) std::memcpy(&cur, pp, 4);
+        const bool back = a0 < cur;
+        static std::atomic<uint32_t> s_bk{0};
+        if (n < 4u || (back && s_bk.fetch_add(1u) < 30u))
+            std::fprintf(stderr, "[rollback] #%u fr=%llu end=0x%x cursor=0x%x ra=0x%x%s\n",
+                         n, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
+                         a0, cur, ra, back ? "  <== ROLLBACK" : "");
+        if (g_rbOrig) g_rbOrig(rdram, ctx, runtime);
+    }
+    // [carousel] PS2X_CAROUSEL=1: hook the DL blob-append func_1006E8(src,size) and log large
+    // appends (the block-10752 texture carousel) with src + caller — names the selection site
+    // that picks pak+0x417000 (pale) instead of pak+0x406b40 (correct).
+    PS2Runtime::RecompiledFunction g_caOrig = nullptr;
+    void bt3CarouselProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), ra = getRegU32(ctx, 31);
+        const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+        if (a1 >= 0x4000u && fr >= 1600u)
+        {
+            static std::atomic<uint32_t> s_n{0};
+            if (s_n.fetch_add(1) < 400u)
+                std::fprintf(stderr, "[carousel] fr=%llu ref=0x%x len=0x%x ra=0x%x\n",
+                             (unsigned long long)fr, a0, a1, ra);
+        }
+        // [forcerich] PS2X_FORCERICH=1 (A/B): when the REF payload is the PALE texture
+        // (content match), redirect the REF to the pak's RICH copy at 0x1446480. Diagnostic:
+        // proves the pale slot is the visible washed hillside and the fix direction.
+        {
+            static const bool s_fr2 = [](){ const char *v = std::getenv("PS2X_FORCERICH"); return v && v[0] && v[0] != '0'; }();
+            static const uint8_t s_paleHead[16] = {0xda,0xe0,0xf3,0xdc,0xdc,0xe2,0xf3,0xdc,0xda,0xe7,0xed,0xe2,0xdc,0xe5,0xe5,0xe0};
+            if (a0 >= 0xac4300u && a0 < 0xbc4300u && fr >= 4300u)
+            {   // FIGHT-TIME truth: stream-range REF appends after binds settle (any length)
+                static std::atomic<uint32_t> s_dg{0};
+                const uint8_t *dp = getMemPtr(rdram, (a0 + 0x80u) & 0x1FFFFFFFu);
+                if (dp && s_dg.fetch_add(1) < 12u)
+                    std::fprintf(stderr, "[fr-dbg] fr=%llu a0=0x%x len=0x%x head@+80=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                                 (unsigned long long)fr, a0, a1, dp[0],dp[1],dp[2],dp[3],dp[4],dp[5],dp[6],dp[7],
+                                 dp[8],dp[9],dp[10],dp[11],dp[12],dp[13],dp[14],dp[15]);
+            }
+            if (s_fr2 && a1 >= 0x8000u)
+            {
+                for (uint32_t off = 0x50u; off <= 0xA0u; off += 0x10u)
+                {
+                    uint8_t *pp = getMemPtr(rdram, (a0 + off) & 0x1FFFFFFFu);
+                    if (pp && std::memcmp(pp, s_paleHead, 16) == 0)
+                    {
+                        const uint8_t *rich = getMemPtr(rdram, 0x1446500u); // pak pale->rich payload swap
+                        if (rich)
+                        {
+                            std::memcpy(pp, rich, 0x10000u);
+                            static std::atomic<uint32_t> s_rr{0};
+                            if (s_rr.fetch_add(1) < 8u)
+                                std::fprintf(stderr, "[forcerich] fr=%llu payload swap at 0x%x+0x%x\n",
+                                             (unsigned long long)fr, a0, off);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if (g_caOrig) g_caOrig(rdram, ctx, runtime);
+    }
+    // [tblcen] PS2X_TBLCEN=1: census of sub_0010C520(table, idx, arg) calls — which TABLE
+    // (resident 0x135a620-family vs streamed-chunk tables) serves each carousel slot per frame.
+    PS2Runtime::RecompiledFunction g_tcOrig = nullptr;
+    void bt3TblCenProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), ra = getRegU32(ctx, 31);
+        const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+        if (fr >= 4300u)
+        {
+            static std::mutex s_mx; static std::set<uint64_t> s_seen; static std::atomic<uint32_t> s_n{0};
+            const uint64_t key = ((uint64_t)a0 << 16) | (a1 & 0xFFFFu);
+            bool fresh=false;
+            { std::lock_guard<std::mutex> lk(s_mx); fresh = s_seen.insert(key).second; }
+            if (fresh && s_n.fetch_add(1) < 120u)
+                std::fprintf(stderr, "[tblcen] fr=%llu table=0x%x idx=%u ra=0x%x\n",
+                             (unsigned long long)fr, a0, a1, ra);
+        }
+        if (g_tcOrig) g_tcOrig(rdram, ctx, runtime);
+    }
+    // [inst337] PS2X_INST337=1: hook overlay f_337090 (streamed-chunk INSTALL: decode+bind).
+    // Logs each install's task object head — which chunks install, which never do.
+    PS2Runtime::RecompiledFunction g_i337Orig = nullptr;
+    void bt3Inst337Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u);
+        const uint32_t a0 = getRegU32(ctx, 4), ra = getRegU32(ctx, 31);
+        if (n < 80u)
+        {
+            auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *pp = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (pp) std::memcpy(&v, pp, 4); return v; };
+            std::fprintf(stderr, "[inst337] #%u fr=%llu a0=0x%x ra=0x%x w0=0x%x w4=0x%x w8=0x%x wC=0x%x w10=0x%x\n",
+                         n, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), a0, ra,
+                         a0 ? r32(a0) : 0u, a0 ? r32(a0+4) : 0u, a0 ? r32(a0+8) : 0u, a0 ? r32(a0+0xC) : 0u, a0 ? r32(a0+0x10) : 0u);
+        }
+        if (g_i337Orig) g_i337Orig(rdram, ctx, runtime);
+    }
+    // [init114] PS2X_INIT114=1: hook stage-init table binder FUN_00114c60 — does it run, with
+    // what object, per run? (resident texture table bind is nondeterministic across runs.)
+    PS2Runtime::RecompiledFunction g_i114Orig = nullptr;
+    void bt3Init114Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u);
+        if (n < 20u)
+        {
+            auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *pp = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (pp) std::memcpy(&v, pp, 4); return v; };
+            const uint32_t a0 = getRegU32(ctx, 4);
+            std::fprintf(stderr, "[init114] #%u fr=%llu a0=0x%x ra=0x%x [a0+0x58]=0x%x [a0+0x5C]=0x%x [a0+0x54]=0x%x\n",
+                         n, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
+                         a0, getRegU32(ctx, 31), a0 ? r32(a0+0x58) : 0u, a0 ? r32(a0+0x5C) : 0u, a0 ? r32(a0+0x54) : 0u);
+        }
+        if (g_i114Orig) g_i114Orig(rdram, ctx, runtime);
+        {   // post-call: did this init bind the texture table? read rec0 ptr directly.
+            auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *pp = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (pp) std::memcpy(&v, pp, 4); return v; };
+            std::fprintf(stderr, "[init114] POST rec0ptr[0x135a658]=0x%x rec14=0x%x\n",
+                         r32(0x135a658u), r32(0x135a658u + 14u*64u));
+        }
+    }
+    // [force14] PS2X_FORCE14=1 (A/B): at the resident-table record append sub_0010A218,
+    // remap record idx 15 (PALE texture state) -> 14 (RICH) — console holds 14 at this camera.
+    PS2Runtime::RecompiledFunction g_f14Orig = nullptr;
+    void bt3Force14Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5);
+        const uint64_t frF = g_bt3FrameCount.load(std::memory_order_relaxed);
+        static std::atomic<uint32_t> s_n{0};
+        if (frF >= 4300u)
+        {
+            const uint32_t n = s_n.fetch_add(1u);
+            if (n < 40u)
+                std::fprintf(stderr, "[force14] #%u fr=%llu a0=0x%x a1=%u ra=0x%x\n",
+                             n, (unsigned long long)frF, a0, a1, getRegU32(ctx, 31));
+        }
+        if (a0 == 0x135a5c0u && a1 == 15u)
+        {
+            SET_GPR_U32(ctx, 5, 14u);
+            static std::atomic<uint32_t> s_r{0};
+            if (s_r.fetch_add(1u) < 6u)
+                std::fprintf(stderr, "[force14] remapped idx 15->14 (fr=%llu)\n",
+                             (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed));
+        }
+        if (g_f14Orig) g_f14Orig(rdram, ctx, runtime);
+    }
+    void bt3StageGateArm(PS2Runtime &runtime)
+    {
+        PS2Runtime::RecompiledFunction fns[] = { &bt3StageGateFn<0>, &bt3StageGateFn<1>, &bt3StageGateFn<2>, &bt3StageGateFn<3> };
+        for (int i = 0; i < 4; ++i)
+        {
+            g_sgProbe[i].orig = runtime.lookupFunction(g_sgProbe[i].addr);
+            if (g_sgProbe[i].orig) runtime.replaceFunction(g_sgProbe[i].addr, fns[i]);
+            std::fprintf(stderr, "[stagegate] hook %s %s\n", g_sgProbe[i].name, g_sgProbe[i].orig ? "ok" : "MISSING");
+        }
+    }
+    void bt3ShadowProbeArm(PS2Runtime &runtime)
+    {
+        PS2Runtime::RecompiledFunction fns[] = { &bt3ShadowProbeFn<0>, &bt3ShadowProbeFn<1>, &bt3ShadowProbeFn<2>, &bt3ShadowProbeFn<3>, &bt3ShadowProbeFn<4>, &bt3ShadowProbeFn<5>,
+                                                 &bt3ShadowProbeFn<6>, &bt3ShadowProbeFn<7>, &bt3ShadowProbeFn<8>, &bt3ShadowProbeFn<9>, &bt3ShadowProbeFn<10>, &bt3ShadowProbeFn<11>,
+                                                 &bt3ShadowProbeFn<12>, &bt3ShadowProbeFn<13>, &bt3ShadowProbeFn<14>, &bt3ShadowProbeFn<15>, &bt3ShadowProbeFn<16>, &bt3ShadowProbeFn<17> };
+        for (int i = 0; i < 18; ++i)
+        {
+            g_shProbe[i].orig = runtime.lookupFunction(g_shProbe[i].addr);
+            if (g_shProbe[i].orig) runtime.replaceFunction(g_shProbe[i].addr, fns[i]);
+            std::fprintf(stderr, "[shadowprobe] hook %s %s\n", g_shProbe[i].name, g_shProbe[i].orig ? "ok" : "MISSING");
+        }
+    }
+    void bt3FixupRingDumpImpl()
+    {
+        static uint32_t s_lastPos = 0;
+        if (g_fixupRingPos == s_lastPos) return;   // nothing new since the last status line
+        s_lastPos = g_fixupRingPos;
+        std::fprintf(stderr, "[fixupring] last %u fixup calls (newest last):\n", g_fixupRingPos < 16u ? g_fixupRingPos : 16u);
+        const uint32_t start = g_fixupRingPos >= 16u ? g_fixupRingPos - 16u : 0u;
+        for (uint32_t i = start; i < g_fixupRingPos; ++i)
+        {
+            const FixupRing &r = g_fixupRing[i & 15u];
+            std::fprintf(stderr, "[fixupring]   #%u a0=0x%x a1=0x%x a2=0x%x ra=0x%x count=%u entOff=0x%x sp=0x%x\n", r.n, r.a0, r.a1, r.a2, r.ra, r.cnt, r.entOff * 4u, r.sp);
+        }
+    }
+    extern "C" void ps2xFixupRingDump() { bt3FixupRingDumpImpl(); }
+    PS2Runtime::RecompiledFunction g_orig2722c0 = nullptr;
+    // [vstep] PS2X_VSTEP=<n>: override the fight loop's hard-coded frame step (0x12bce4 passes a0=2 to
+    // func_102060 -> func_23D160 (30 Hz counter cadence) and func_264D98 (wait until the per-frame vblank
+    // counter reaches a0)). n=1 = render every vblank. [logicrate] counts func_115950 (the per-frame fight
+    // update) per second so a step-1 run can be checked for double-speed logic.
+    PS2Runtime::RecompiledFunction g_orig102060 = nullptr, g_orig115950 = nullptr;
+    void bt3VStep(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const int s_step = [](){ const char *v = std::getenv("PS2X_VSTEP"); return v && v[0] ? std::atoi(v) : 0; }();
+        if (s_step > 0 && getRegU32(ctx, 4) == 2u) ctx->r[4] = _mm_set_epi64x(0, (int64_t)s_step);   // $a0 = step
+        if (g_orig102060) g_orig102060(rdram, ctx, runtime);
+    }
+    // [vstepprobe] func_264D98(a0): the frame wait. Print a0, the per-frame vblank counter [gp-0x5148] at entry,
+    // and the vsync ticks elapsed inside the call, for the first calls and then every 300th.
+    PS2Runtime::RecompiledFunction g_orig264d98 = nullptr;
+    void bt3WaitProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u);
+        const uint32_t gp = getRegU32(ctx, 28);
+        uint32_t cnt = 0; { const uint8_t *p = getMemPtr(rdram, (gp - 0x5148u) & 0x1FFFFFFFu); if (p) std::memcpy(&cnt, p, 4); }
+        const uint32_t a0 = getRegU32(ctx, 4);
+        const uint64_t t0 = ps2_syscalls::GetCurrentVSyncTick();
+        if (g_orig264d98) g_orig264d98(rdram, ctx, runtime);
+        const uint64_t t1 = ps2_syscalls::GetCurrentVSyncTick();
+        if (n < 24u || (n % 300u) == 0u)
+            std::fprintf(stderr, "[vstepprobe] #%u a0=%u counter@entry=%u ticks_in_wait=%llu\n", n, a0, cnt, (unsigned long long)(t1 - t0));
+    }
+    void bt3LogicRate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        static auto s_t0 = std::chrono::steady_clock::now();
+        const uint32_t n = s_n.fetch_add(1u) + 1u;
+        const auto now = std::chrono::steady_clock::now();
+        const double dt = std::chrono::duration<double>(now - s_t0).count();
+        if (dt >= 5.0) { std::fprintf(stderr, "[logicrate] %.1f fight updates/s (%u in %.1f s)\n", (double)n / dt, n, dt); s_n.store(0u); s_t0 = now; }
+        if (g_orig115950) g_orig115950(rdram, ctx, runtime);
+    }
+    // [vf3probe] PS2X_VF3PROBE=1: print the persistent VU0 basis rows (vf1-vf3) as seen by
+    // the DL emitter FUN_00111358 — hardware shares ONE physical VU0 across threads; our
+    // per-thread contexts zero-init all but vf0. vf3.x==0 here breaks func_121E50's
+    // normalize (length drops z) => slope-dependent band misassignment.
+    PS2Runtime::RecompiledFunction g_orig111358 = nullptr;
+    void bt3Vf3Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<int> s_n{0};
+        if (s_n.fetch_add(1) < 24)
+        {
+            float b[12];
+            std::memcpy(&b[0], &ctx->vu0_vf[1], 16);
+            std::memcpy(&b[4], &ctx->vu0_vf[2], 16);
+            std::memcpy(&b[8], &ctx->vu0_vf[3], 16);
+            std::fprintf(stderr, "[vf3probe] tid=%zx vf1=(%g %g %g %g) vf2=(%g %g %g %g) vf3=(%g %g %g %g)\n",
+                         std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFu,
+                         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11]);
+        }
+        if (g_orig111358) g_orig111358(rdram, ctx, runtime);
+    }
+    // [slotprobe] PS2X_SLOTPROBE=1: histogram of FUN_0024f860 returns (terrain constant-slot
+    // selector; -1 = no valid streamed record => caller falls back / stale constants).
+    // [pakcpy] PS2X_PAKCPY=1: log memcpy (func_2A9A1C) calls whose SOURCE lies inside the
+    // bulk-loaded stage pak at 0x103f9c0 (+6.2MB) — src pak-offset + ra = the walker call
+    // site computing the (wrong) intra-pak offsets for the terrain band sheet.
+    // [sprq] PS2X_SPRQ=1: log the DMA queue-driver FUN_002bb098 calls whose args reference
+    // the resident stage pak (0x103f9c0+6.2MB) — the queuer's ra = who computes the offsets.
+    // [wlk] PS2X_WLK=1: hook the pak walker f_399b18 (OVERLAY function — replaceFunction
+    // rejects overlay addresses, so patch g_ps2OverlayFunctionTable[slot] directly).
+    // [upb] PS2X_UPB=1: hook the terrain upload-builder family — log entry args + ra.
+    PS2Runtime::RecompiledFunction g_orig13c300 = nullptr, g_orig13c638 = nullptr, g_orig13ca80 = nullptr;
+    static void upbLog(const char *tag, R5900Context *ctx)
+    {
+        static std::atomic<int> s_u{0};
+        if (s_u.fetch_add(1) < 48)
+            std::fprintf(stderr, "[upb] %s a0=0x%x a1=0x%x a2=0x%x a3=0x%x t0=0x%x ra=0x%x\n",
+                         tag, getRegU32(ctx,4), getRegU32(ctx,5), getRegU32(ctx,6), getRegU32(ctx,7),
+                         getRegU32(ctx,8), getRegU32(ctx,31));
+    }
+    void bt3Upb13c300(uint8_t *r, R5900Context *c, PS2Runtime *rt) { upbLog("13c300", c); if (g_orig13c300) g_orig13c300(r, c, rt); }
+    void bt3Upb13c638(uint8_t *r, R5900Context *c, PS2Runtime *rt) { upbLog("13c638", c); if (g_orig13c638) g_orig13c638(r, c, rt); }
+    void bt3Upb13ca80(uint8_t *r, R5900Context *c, PS2Runtime *rt) { upbLog("13ca80", c); if (g_orig13ca80) g_orig13ca80(r, c, rt); }
+    PS2Runtime::RecompiledFunction g_origWalker = nullptr;
+    void bt3WalkerProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Log entries only (pc==0x399b18); continuation dispatches re-enter mid-function.
+        if (ctx->pc == 0x399b18u)
+        {
+            static std::atomic<int> s_w{0};
+            if (s_w.fetch_add(1) < 40)
+                std::fprintf(stderr, "[wlk] a0=0x%x a1=0x%x a2=0x%x a3=0x%x ra=0x%x\n",
+                             getRegU32(ctx,4), getRegU32(ctx,5), getRegU32(ctx,6), getRegU32(ctx,7),
+                             getRegU32(ctx,31));
+        }
+        if (g_origWalker) g_origWalker(rdram, ctx, runtime);
+    }
+    PS2Runtime::RecompiledFunction g_orig2bb098 = nullptr;
+    void bt3SprQProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a[4] = { getRegU32(ctx,4)&0x1FFFFFFFu, getRegU32(ctx,5)&0x1FFFFFFFu,
+                                getRegU32(ctx,6)&0x1FFFFFFFu, getRegU32(ctx,7)&0x1FFFFFFFu };
+        bool pak = false;
+        for (int i = 0; i < 4; ++i) if (a[i] >= 0x103f9c0u && a[i] < 0x1631140u) pak = true;
+        if (pak)
+        {
+            static std::atomic<int> s_q{0};
+            if (s_q.fetch_add(1) < 60)
+                std::fprintf(stderr, "[sprq] a0=0x%x a1=0x%x a2=0x%x a3=0x%x ra=0x%x\n",
+                             a[0], a[1], a[2], a[3], getRegU32(ctx, 31));
+        }
+        if (g_orig2bb098) g_orig2bb098(rdram, ctx, runtime);
+    }
+    PS2Runtime::RecompiledFunction g_orig2a9a1c = nullptr;
+    void bt3PakCpyProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t dst = getRegU32(ctx, 4) & 0x1FFFFFFFu;
+        const uint32_t src = getRegU32(ctx, 5) & 0x1FFFFFFFu;
+        const uint32_t n   = getRegU32(ctx, 6);
+        const uint32_t ra  = getRegU32(ctx, 31);
+        if (src >= 0x103f9c0u && src < 0x103f9c0u + 0x5f1780u && n >= 1024u)
+        {
+            static std::atomic<int> s_pn{0};
+            if (s_pn.fetch_add(1) < 60)
+                std::fprintf(stderr, "[pakcpy] src=0x%x (pak+0x%x) dst=0x%x n=%u ra=0x%x\n",
+                             src, src - 0x103f9c0u, dst, n, ra);
+        }
+        if (g_orig2a9a1c) g_orig2a9a1c(rdram, ctx, runtime);
+    }
+    PS2Runtime::RecompiledFunction g_orig24f860 = nullptr;
+    thread_local uint32_t g_slotProbeObj = 0;
+    void bt3SlotProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_slotProbeObj = getRegU32(ctx, 4) & 0x1FFFFFFFu;
+        if (g_orig24f860) g_orig24f860(rdram, ctx, runtime);
+        const int32_t r = (int32_t)getRegU32(ctx, 2);
+        // why-analysis: walk the chain the selector walked (a0 preserved? a0 may be clobbered — use s-reg? read from entry
+        // instead: the wrapper runs AFTER orig, a0 might be stale; capture BEFORE the call would be better, but a0 is
+        // callee-preserved-enough here in practice: FUN_0024f860 keeps obj in v1. Use the captured entry value.)
+        static std::mutex s_m; static std::map<int32_t, uint32_t> s_h; static std::map<int,uint32_t> s_why; static std::atomic<uint32_t> s_n{0};
+        std::lock_guard<std::mutex> lk(s_m);
+        ++s_h[r];
+        if (r < 0)
+        {
+            int why = -9; uint32_t rec = 0, idx = 0, pay = 0;
+            const uint32_t obj = g_slotProbeObj;
+            if (obj)
+            {
+                const uint8_t *po = getMemPtr(rdram, obj);
+                if (po) std::memcpy(&rec, po + 0x1664, 4);
+                if (!rec) why = 0;                        // record chain empty
+                else
+                {
+                    const uint8_t *pr = getMemPtr(rdram, rec & 0x1FFFFFFFu);
+                    if (pr) std::memcpy(&idx, pr + 0x1C, 4);
+                    if (idx == 0 || idx > 100u) why = 1;  // index invalid
+                    else
+                    {
+                        const uint8_t *pp = getMemPtr(rdram, obj + 0x18u + (idx - 1u) * 4u);
+                        if (pp) std::memcpy(&pay, pp + 0x44, 4);
+                        why = pay ? 3 : 2;                // 2 = payload null, 3 = ??? (should have succeeded)
+                    }
+                }
+            }
+            ++s_why[why];
+        }
+        const uint32_t n = s_n.fetch_add(1u) + 1u;
+        if ((n % 2000u) == 1u)
+        {
+            std::string line = "[slotprobe] n=" + std::to_string(n) + " hist:";
+            for (auto &kv : s_h) line += " " + std::to_string(kv.first) + "x" + std::to_string(kv.second);
+            line += " why:";
+            for (auto &kv : s_why) line += " w" + std::to_string(kv.first) + "x" + std::to_string(kv.second);
+            std::fprintf(stderr, "%s\n", line.c_str());
+        }
+    }
+    PS2Runtime::RecompiledFunction g_orig2188b8 = nullptr;
+    void bt3TerrRoundScope(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // [terrround] PS2X_TERRROUND=1: run the terrain lighting-group matrix builder
+        // (sub_002188B8 and everything it calls: 120308 rotZ ACC chains, 120C40 concat,
+        // 11FFE8 sincos) under PS2/PCSX2 chop rounding (RZ+FTZ+DAZ). Surgical scope of
+        // the [eeround] finding: the classifier's last-bit math decides lighting-group
+        // membership at quantization boundaries; host round-nearest flips boundary
+        // chunks per frame (the moving dark/light terrain patches). Restores MXCSR on
+        // exit so nothing else in the frame is affected.
+        // [nodecb] PS2X_NODECB=1: census of scene-graph node draw callbacks ([node+0x34],
+        // consumed by jalr at 0x2189c0) — the band choice lives in these, not in 2188B8 itself.
+        static const bool s_cb = [](){ const char *v = std::getenv("PS2X_NODECB"); return v && v[0] && v[0] != '0'; }();
+        if (s_cb)
+        {
+            const uint32_t node = getRegU32(ctx, 4) & 0x1FFFFFFFu;
+            uint32_t cb = 0, flags = 0, ang = 0;
+            if (const uint8_t *pn = getMemPtr(rdram, node))
+            {
+                std::memcpy(&flags, pn + 0x00, 4);
+                std::memcpy(&ang,   pn + 0x04, 4);
+                std::memcpy(&cb,    pn + 0x34, 4);
+            }
+            static std::mutex s_m; static std::map<uint32_t, uint32_t> s_seen; static std::atomic<int> s_pr{0};
+            std::lock_guard<std::mutex> lk(s_m);
+            if (++s_seen[cb] == 1 && s_pr.fetch_add(1) < 40)
+            {
+                float af; std::memcpy(&af, &ang, 4);
+                std::fprintf(stderr, "[nodecb] NEW cb=0x%06x node=0x%06x flags=0x%x ang=%.4g (unique=%zu)\n",
+                             cb, node, flags, af, s_seen.size());
+            }
+        }
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_TERRROUND"); return v && v[0] && v[0] != '0'; }();
+        if (!s_on) { if (g_orig2188b8) g_orig2188b8(rdram, ctx, runtime); return; }
+        static std::atomic<int> s_engaged{0};
+        if (s_engaged.fetch_add(1) == 0) std::fprintf(stderr, "[terrround] ENGAGED (chop rounding scoped to the terrain group classifier)\n");
+        const unsigned int saved = _mm_getcsr();
+        _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8040u);
+        if (g_orig2188b8) g_orig2188b8(rdram, ctx, runtime);
+        _mm_setcsr(saved);
+    }
+    void bt3ThunkStackWatch(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // [watchgate] PS2X_THUNKWATCH=1 restores the stack write-watch around this thunk.
+        // Default OFF: the unconditional arm/disarm stole the global watch from every other
+        // probe (palsrc-geo flapped 32x/fight) and flooded ps2WatchReport with 113k lines.
+        static const bool s_tw = [](){ const char *v = std::getenv("PS2X_THUNKWATCH"); return v && v[0] && v[0] != '0'; }();
+        if (s_tw)
+        {
+            const uint32_t sp = getRegU32(ctx, 29) & 0x1FFFFFFFu;
+            const uint32_t lo = (sp - 16u) & 0x1FFFFFFFu;
+            g_ps2WatchHi.store(sp, std::memory_order_relaxed);
+            g_ps2WatchLo.store(lo, std::memory_order_relaxed);
+        }
+        if (g_orig2722c0) g_orig2722c0(rdram, ctx, runtime);
+        if (s_tw) g_ps2WatchLo.store(0u, std::memory_order_relaxed);
+    }
     void bt3DemoWalkGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_002316d0
     {
         // Arm the write-watch on this tree-walk's STACK region (once) to catch the stray write
         // that corrupts FUN_002316d0's saved $ra (at $sp+0x18) with 0x2c9f80. ps2WatchReport
         // is garbage-filtered so only the out-of-code (0x2c9f80) write is reported, with its pc.
-        if (g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
+        // [watchgate] PS2X_DEMOSTACKWATCH=1 arms it; default OFF since 2026-08-28: the armed range stayed
+        // live into fights and every store into it went through ps2WatchReport's mutex (2.4% of the guest thread).
+        static const bool s_dsw = [](){ const char *v = std::getenv("PS2X_DEMOSTACKWATCH"); return v && v[0] && v[0] != '0'; }();
+        if (s_dsw && g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
         {
             const uint32_t sp = getRegU32(ctx, 29) & 0x1FFFFFFFu;
             g_ps2WatchHi.store(sp + 0x800u, std::memory_order_relaxed);
@@ -3040,7 +3662,8 @@ namespace
             const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6);
             // Arm the write-watch on the camera-target range [BASE+0x210, BASE+0x268) once,
             // so we catch whoever writes the target vector (0x220/0x260). BASE = a2 - 0x40.
-            if (g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
+            static const bool s_cw = [](){ const char *v = std::getenv("PS2X_CAMWATCH"); return v && v[0] && v[0] != '0'; }();   // [watchgate]
+            if (s_cw && g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
             {
                 const uint32_t base = (a2 - 0x40u) & 0x1FFFFFFFu;
                 g_bt3CamBase.store(base, std::memory_order_relaxed);
@@ -3083,6 +3706,84 @@ namespace
         // would only advance when the next SE command happened to arrive.
         seServiceVoices(runtime);
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
+        {   // [init114] lifecycle: periodic read of the resident texture table rec0/rec14 ptrs
+            static const bool s_i14 = [](){ const char *v = std::getenv("PS2X_INIT114"); return v && v[0] && v[0] != '0'; }();
+            if (s_i14)
+            {
+                const uint64_t fr_ = g_bt3FrameCount.load(std::memory_order_relaxed);
+                static std::atomic<uint32_t> s_pn{0};
+                if ((fr_ % 300u) == 0u && s_pn.fetch_add(1) < 40u)
+                {
+                    auto r32 = [&](uint32_t a) -> uint32_t { const uint8_t *pp = getMemPtr(rdram, a & 0x1FFFFFFFu); uint32_t v = 0; if (pp) std::memcpy(&v, pp, 4); return v; };
+                    std::fprintf(stderr, "[tbl-life] fr=%llu rec0=0x%x rec14=0x%x rec15=0x%x\n",
+                                 (unsigned long long)fr_, r32(0x135a658u), r32(0x135a658u + 14u*64u), r32(0x135a658u + 15u*64u));
+                }
+            }
+        }
+        // [valscan] PS2X_VALSCAN=<hexval>: one-shot full-RAM scans for a 32-bit value at
+        // fr>=4400 and fr>=4460 -- finds the constants source struct + DL copies without store tracing.
+        {
+            static const uint32_t s_vsv = [](){ const char *v = std::getenv("PS2X_VALSCAN"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 16) : 0u; }();
+            static int s_vsn = 0;
+            const uint64_t vfr_ = g_bt3FrameCount.load(std::memory_order_relaxed);
+            if (s_vsv && ((s_vsn == 0 && vfr_ >= 4400u) || (s_vsn == 1 && vfr_ >= 4460u)))
+            {
+                ++s_vsn;
+                const uint32_t *w = reinterpret_cast<const uint32_t *>(rdram);
+                uint32_t hits = 0;
+                for (uint32_t i = 0; i < (32u * 1024u * 1024u) / 4u; ++i)
+                    if (w[i] == s_vsv)
+                    {
+                        if (hits < 40u) std::fprintf(stderr, "[valscan] fr=%llu addr=0x%08x\n", (unsigned long long)vfr_, i * 4u);
+                        ++hits;
+                    }
+                std::fprintf(stderr, "[valscan] fr=%llu total=%u\n", (unsigned long long)vfr_, hits);
+            }
+        }
+        // [ramdump] PS2X_RAMDUMP=<hexaddr>,<hexbytes>,<frame>: one-shot guest RAM dump to work/ramdump.bin
+        {
+            static const std::string s_rd = [](){ const char *v = std::getenv("PS2X_RAMDUMP"); return std::string(v ? v : ""); }();
+            static uint32_t ra_=0, rb_=0, rf_=0;
+            static const bool s_rok = !s_rd.empty() && std::sscanf(s_rd.c_str(), "%x,%x,%x", &ra_, &rb_, &rf_) == 3;
+            static bool s_rdone = false;
+            { static bool s_said = false;
+              if (!s_said && !s_rd.empty()) { s_said = true;
+                std::fprintf(stderr, "[ramdump] cfg='%s' ok=%d addr=0x%x bytes=0x%x frGate=%u\n",
+                             s_rd.c_str(), (int)s_rok, ra_, rb_, rf_); } }
+            if (s_rok && !s_rdone && g_bt3FrameCount.load(std::memory_order_relaxed) >= rf_)
+            {
+                s_rdone = true;
+                if (const uint8_t *pr = getMemPtr(rdram, ra_))
+                    if (FILE *f = std::fopen("/home/z3/Desktop/bt3/work/ramdump.bin", "wb"))
+                    { std::fwrite(pr, 1, rb_, f); std::fclose(f);
+                      std::fprintf(stderr, "[ramdump] 0x%x +0x%x written at fr=%u\n", ra_, rb_, rf_); }
+            }
+        }
+        // [sheetwatch] PS2X_SHEETWATCH=1: per-frame content watch on the terrain band sheet
+        // buffer (0x53d3a0) — prints the frame whenever the first 64 bytes change.
+        {
+            static const bool s_sw2 = [](){ const char *v = std::getenv("PS2X_SHEETWATCH"); return v && v[0] && v[0] != '0'; }();
+            if (s_sw2)
+            {
+                static uint8_t s_last[64]; static bool s_have = false; static int s_prints = 0;
+                if (const uint8_t *ps = getMemPtr(rdram, 0x53d3a0u))
+                {
+                    if (!s_have || std::memcmp(s_last, ps, 64) != 0)
+                    {
+                        std::memcpy(s_last, ps, 64); 
+                        if (s_prints < 40)
+                        {
+                            ++s_prints;
+                            char hx[40]; for (int i = 0; i < 16; ++i) std::snprintf(hx + i*2, 4, "%02x", ps[i]);
+                            std::fprintf(stderr, "[sheetwatch] fr=%llu changed%s first16=%s\n",
+                                         (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
+                                         s_have ? "" : " (first)", hx);
+                        }
+                        s_have = true;
+                    }
+                }
+            }
+        }
         // ***** PER-FRAME CD FILE-SERVER PUMP (PS2X_CDPUMP, default ON) *****
         // The in-fight STAGE-CHUNK streaming (near-LOD terrain, collision) polls its
         // completion through paths that never tick the CRI CD file server FUN_0028a3b0 —
@@ -3096,15 +3797,22 @@ namespace
             Bt3CdTickGuard tickGuard;
             if (s_pump && tickGuard.engaged && runtime->hasFunction(0x0028a3b0u))
             {
-                R5900Context tctx = *ctx;           // inherit gp/sp
-                tctx.r[31] = _mm_setzero_si128();   // ra = 0 => run until return
-                tctx.pc = 0x0028a3b0u;              // CD file-server tick
-                uint32_t steps = 0u;
-                while (tctx.pc != 0u && steps++ < 2000000u)
+                // PS2X_CDPUMP_N: tick the server N times per frame (default 1). The server is a
+                // state machine advancing ~one stage per tick; 1/frame starves multi-stage chunk
+                // requests (terrain texture slots stay 0xFE fill — the pale-terrain root).
+                static const uint32_t s_pumpN = [](){ const char *v = std::getenv("PS2X_CDPUMP_N"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 1u; }();
+                for (uint32_t pn = 0; pn < s_pumpN; ++pn)
                 {
-                    PS2Runtime::RecompiledFunction step = runtime->lookupFunction(tctx.pc);
-                    if (!step) break;
-                    step(rdram, &tctx, runtime);
+                    R5900Context tctx = *ctx;           // inherit gp/sp
+                    tctx.r[31] = _mm_setzero_si128();   // ra = 0 => run until return
+                    tctx.pc = 0x0028a3b0u;              // CD file-server tick
+                    uint32_t steps = 0u;
+                    while (tctx.pc != 0u && steps++ < 2000000u)
+                    {
+                        PS2Runtime::RecompiledFunction step = runtime->lookupFunction(tctx.pc);
+                        if (!step) break;
+                        step(rdram, &tctx, runtime);
+                    }
                 }
                 s_bt3CdTicking = false;
             }
@@ -3467,6 +4175,45 @@ namespace
         g_orig100ab8 = runtime.lookupFunction(0x00100ab8u);
         if (g_orig100ab8)
             runtime.replaceFunction(0x00100ab8u, &bt3FrameKick);
+        if (const char *v = std::getenv("PS2X_STAGEGATE"); v && v[0] && v[0] != '0')
+            bt3StageGateArm(runtime);
+        if (const char *v = std::getenv("PS2X_FORCE14"); v && v[0] && v[0] != '0')
+        {
+            g_f14Orig = runtime.lookupFunction(0x0010a218u);
+            if (g_f14Orig) runtime.replaceFunction(0x0010a218u, &bt3Force14Probe);
+            std::fprintf(stderr, "[force14] hook %s\n", g_f14Orig ? "ok" : "MISSING");
+        }
+        if (const char *v = std::getenv("PS2X_INIT114"); v && v[0] && v[0] != '0')
+        {
+            g_i114Orig = runtime.lookupFunction(0x00114c60u);
+            if (g_i114Orig) runtime.replaceFunction(0x00114c60u, &bt3Init114Probe);
+            std::fprintf(stderr, "[init114] hook %s\n", g_i114Orig ? "ok" : "MISSING");
+        }
+        if (const char *v = std::getenv("PS2X_INST337"); v && v[0] && v[0] != '0')
+        {
+            const uint32_t idx337 = (0x337090u - 0x334C00u) / 4u;
+            g_i337Orig = g_ps2OverlayFunctionTable[idx337];
+            g_ps2OverlayFunctionTable[idx337] = &bt3Inst337Probe;
+            std::fprintf(stderr, "[inst337] overlay hook %s\n", g_i337Orig ? "ok" : "MISSING");
+        }
+        if (const char *v = std::getenv("PS2X_TBLCEN"); v && v[0] && v[0] != '0')
+        {
+            g_tcOrig = runtime.lookupFunction(0x0010c520u);
+            if (g_tcOrig) runtime.replaceFunction(0x0010c520u, &bt3TblCenProbe);
+            std::fprintf(stderr, "[tblcen] hook %s\n", g_tcOrig ? "ok" : "MISSING");
+        }
+        if (const char *v = std::getenv("PS2X_CAROUSEL"); v && v[0] && v[0] != '0')
+        {
+            g_caOrig = runtime.lookupFunction(0x00100738u);
+            if (g_caOrig) runtime.replaceFunction(0x00100738u, &bt3CarouselProbe);
+            std::fprintf(stderr, "[carousel] hook %s\n", g_caOrig ? "ok" : "MISSING");
+        }
+        if (const char *v = std::getenv("PS2X_ROLLBACK"); v && v[0] && v[0] != '0')
+        {
+            g_rbOrig = runtime.lookupFunction(0x00100890u);
+            if (g_rbOrig) runtime.replaceFunction(0x00100890u, &bt3RollbackProbe);
+            std::fprintf(stderr, "[rollback] hook %s\n", g_rbOrig ? "ok" : "MISSING");
+        }
         // Resource-ready probe hook (only logs under PS2X_LOADPROBE; passthrough otherwise).
         g_orig252d78 = runtime.lookupFunction(0x00252d78u);
         if (g_orig252d78)
@@ -3511,6 +4258,74 @@ namespace
         // Camera view-matrix builder probe (PS2X_CAMPROBE).
         // Demo scene-tree recursion-depth guard: default ON (prevents the cyclic-tree stack
         // overflow crash). Disable with PS2X_NO_DEMO_GUARD. The PS2X_DEMOPROBE dump rides on it.
+        if (std::getenv("PS2X_VSTEP"))
+        {   // [vstep] [logicrate]
+            g_orig102060 = runtime.lookupFunction(0x00102060u);
+            if (g_orig102060) runtime.replaceFunction(0x00102060u, &bt3VStep);
+            g_orig115950 = runtime.lookupFunction(0x00115950u);
+            g_orig264d98 = runtime.lookupFunction(0x00264d98u);
+            if (g_orig264d98) runtime.replaceFunction(0x00264d98u, &bt3WaitProbe);   // [vstepprobe]
+            if (g_orig115950) runtime.replaceFunction(0x00115950u, &bt3LogicRate);
+            std::fprintf(stderr, "[vstep] step override armed (0x102060 %s, 0x115950 %s)\n", g_orig102060 ? "ok" : "MISSING", g_orig115950 ? "ok" : "MISSING");
+        }
+        {   // [shadowprobe]
+            const char *sp = std::getenv("PS2X_SHADOWPROBE");
+            if (sp && sp[0] == '1') bt3ShadowProbeArm(runtime);
+        }
+        {   // [fixupprobe] always on (a few lines per load)
+            g_orig10a028 = runtime.lookupFunction(0x0010a028u);
+            if (g_orig10a028) runtime.replaceFunction(0x0010a028u, &bt3FixupProbe);
+        }
+        {   // [thunkwatch]
+            const char *tw = std::getenv("PS2X_THUNKWATCH");
+            if (!(tw && tw[0] == '0'))
+            {
+                g_orig2722c0 = runtime.lookupFunction(0x002722c0u);
+                if (g_orig2722c0) runtime.replaceFunction(0x002722c0u, &bt3ThunkStackWatch);
+                g_orig2188b8 = runtime.lookupFunction(0x002188b8u);   // [terrround]
+                if (g_orig2188b8) runtime.replaceFunction(0x002188b8u, &bt3TerrRoundScope);
+                if (std::getenv("PS2X_UPB"))
+                {
+                    g_orig13c300 = runtime.lookupFunction(0x0013c300u);
+                    if (g_orig13c300) runtime.replaceFunction(0x0013c300u, &bt3Upb13c300);
+                    g_orig13c638 = runtime.lookupFunction(0x0013c638u);
+                    if (g_orig13c638) runtime.replaceFunction(0x0013c638u, &bt3Upb13c638);
+                    g_orig13ca80 = runtime.lookupFunction(0x0013ca80u);
+                    if (g_orig13ca80) runtime.replaceFunction(0x0013ca80u, &bt3Upb13ca80);
+                }
+                if (std::getenv("PS2X_WLK"))
+                {
+                    const uint32_t slot = (0x399b18u - g_ps2OverlayFunctionTableBase) / 4u;
+                    if (slot < g_ps2OverlayFunctionTableSlotCount && g_ps2OverlayFunctionTable[slot])
+                    {
+                        g_origWalker = g_ps2OverlayFunctionTable[slot];
+                        g_ps2OverlayFunctionTable[slot] = &bt3WalkerProbe;
+                        std::fprintf(stderr, "[wlk] walker hook installed (slot %u)\n", slot);
+                    }
+                    else std::fprintf(stderr, "[wlk] hook FAILED (slot %u base 0x%x)\n", slot, g_ps2OverlayFunctionTableBase);
+                }
+                if (std::getenv("PS2X_SPRQ"))
+                {
+                    g_orig2bb098 = runtime.lookupFunction(0x002bb098u);   // [sprq]
+                    if (g_orig2bb098) runtime.replaceFunction(0x002bb098u, &bt3SprQProbe);
+                }
+                if (std::getenv("PS2X_PAKCPY"))
+                {
+                    g_orig2a9a1c = runtime.lookupFunction(0x002a9a1cu);   // [pakcpy]
+                    if (g_orig2a9a1c) runtime.replaceFunction(0x002a9a1cu, &bt3PakCpyProbe);
+                }
+                if (std::getenv("PS2X_SLOTPROBE"))
+                {
+                    g_orig24f860 = runtime.lookupFunction(0x0024f860u);   // [slotprobe]
+                    if (g_orig24f860) runtime.replaceFunction(0x0024f860u, &bt3SlotProbe);
+                }
+                if (std::getenv("PS2X_VF3PROBE"))
+                {
+                    g_orig111358 = runtime.lookupFunction(0x00111358u);   // [vf3probe]
+                    if (g_orig111358) runtime.replaceFunction(0x00111358u, &bt3Vf3Probe);
+                }
+            }
+        }
         if (!std::getenv("PS2X_NO_DEMO_GUARD"))
         {
             g_orig2316d0 = runtime.lookupFunction(0x002316d0u);
@@ -3554,7 +4369,7 @@ namespace
                 h.orig = runtime.lookupFunction(h.addr);
                 if (h.orig) runtime.replaceFunction(h.addr, &bt3CamSetterProbe);
             }
-            if (std::getenv("PS2X_CAMFORCE"))
+            if (std::getenv("PS2X_CAMFORCE") || std::getenv("PS2X_CAMROUND"))   // [camround] shares the hook
             {
                 g_orig23d510 = runtime.lookupFunction(0x0023d510u);
                 if (g_orig23d510) runtime.replaceFunction(0x0023d510u, &bt3CamForce);
@@ -3821,5 +4636,82 @@ namespace
     PS2_REGISTER_GAME_OVERRIDE("BT3 sound init bypass", "SLUS_216.78", 0u, 0u, &applyBt3SoundInitBypass);
     PS2_REGISTER_GAME_OVERRIDE("BT3 DTX sound URPC compat", "SLUS_216.78", 0u, 0u, &applyBt3DtxCompat);
     PS2_REGISTER_GAME_OVERRIDE("BT3 sceMpeg callback stubs", "SLUS_216.78", 0u, 0u, &applyBt3MpegCallbackStubs);
+    // [nullpkt] The infinite-loading freeze: func_114860 (texture-packet address patcher) is
+    // called with a NULL packet list (a1 = [obj+0x2C] not populated yet) and walks it as a
+    // linked list from address 0 -- on hardware address 0 aliases the kernel's exception-vector
+    // code, so the walk stumbles through non-zero garbage and exits; our RAM there is zeros, so
+    // next-offset 0 loops forever ([stallprobe]: pc 0x1149a0, t6=0, all reads 0). Returning
+    // immediately is the hardware outcome (nothing patched). PS2X_NULLPKT=0 disables.
+    PS2Runtime::RecompiledFunction g_orig114860 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig113478 = nullptr;
+    extern "C" void *ps2xGuestWaitBegin();
+    extern "C" void ps2xGuestWaitEnd(void *);
+    // Wait (yielding the guest execution token so the loader threads can run) until the 32-bit
+    // field at `addr` becomes non-zero. Returns the value (0 after the cap).
+    static uint32_t bt3WaitFieldNonZero(uint8_t *rdram, uint32_t addr, const char *what, uint32_t pc, R5900Context *ctx = nullptr, PS2Runtime *runtime = nullptr)
+    {
+        static const int s_capMs = [](){ const char *v = std::getenv("PS2X_NULLPKT_WAITMS"); return v ? std::atoi(v) : 1000; }();
+        auto rd = [&]() -> uint32_t { uint32_t v = 0; if (const uint8_t *q = getConstMemPtr(rdram, addr)) std::memcpy(&v, q, 4); return v; };
+        uint32_t v = rd();
+        if (v != 0u) return v;
+        static unsigned long n = 0; const unsigned long id = ++n;
+        const auto t0 = std::chrono::steady_clock::now();
+        int waited = 0;
+        while (v == 0u && waited < s_capMs)
+        {
+            // [nullpkt-tick] the list is filled by the loader, whose CD reads only complete when the CD server
+            // is ticked (see [spinpump]); the two 2026-08-28 loading hangs sat in this loop for the full cap with
+            // the loader parked. Tick it every iteration, then yield the scheduler.
+            if (ctx && runtime && runtime->hasFunction(0x0028a3b0u))
+            {
+                Bt3CdTickGuard tickGuard;
+                if (tickGuard.engaged) { bt3RunCdTickInline(rdram, ctx, runtime); s_bt3CdTicking = false; }
+            }
+            void *scope = ps2xGuestWaitBegin();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            ps2xGuestWaitEnd(scope);
+            waited += 2;
+            v = rd();
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (id <= 12) std::cerr << "[nullpkt] " << what << " at pc 0x" << std::hex << pc << " was NULL; waited " << std::dec << (int)ms
+                                << " ms -> " << (v ? "populated, continuing" : "STILL NULL, skipping") << " (x" << id << ")" << std::endl;
+        return v;
+    }
+    void bt3NullPacketGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_NULLPKT"); return !(v && v[0] == '0'); }();
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), ra = getRegU32(ctx, 31);
+        if (s_on && a0 == 0u && a1 == 0u)
+        {
+            // The known caller (0x1133ac) loads a1 from [s0+0x2C]; s0 is still live in the context.
+            uint32_t v = 0u;
+            if (ra == 0x1133b4u) v = bt3WaitFieldNonZero(rdram, getRegU32(ctx, 16) + 0x2Cu, "func_114860 packet list [s0+0x2C]", 0x114860u, ctx, runtime);
+            if (v == 0u) { ctx->pc = ra; return; }
+            ctx->r[5] = _mm_set_epi64x(0, (int64_t)(int32_t)v);   // low 64 bits = sign-extended 32-bit value, upper zero
+        }
+        if (g_orig114860) g_orig114860(rdram, ctx, runtime);
+    }
+    void bt3NullListGuard113478(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_NULLPKT"); return !(v && v[0] == '0'); }();
+        const uint32_t a0 = getRegU32(ctx, 4);
+        if (s_on && a0 != 0u)
+        {
+            const uint32_t v = bt3WaitFieldNonZero(rdram, a0 + 0x44u, "sub_113478 list [a0+0x44]", 0x113478u, ctx, runtime);
+            if (v == 0u) { ctx->pc = getRegU32(ctx, 31); return; }
+        }
+        if (g_orig113478) g_orig113478(rdram, ctx, runtime);
+    }
+    void applyBt3NullPacketGuard(PS2Runtime &runtime)
+    {
+        g_orig114860 = runtime.lookupFunction(0x00114860u);
+        if (g_orig114860 && runtime.replaceFunction(0x00114860u, &bt3NullPacketGuard))
+            std::cerr << "[game_overrides] BT3: NULL packet-list guard on func_114860 (waits for the loader)" << std::endl;
+        g_orig113478 = runtime.lookupFunction(0x00113478u);
+        if (g_orig113478 && runtime.replaceFunction(0x00113478u, &bt3NullListGuard113478))
+            std::cerr << "[game_overrides] BT3: NULL list guard on sub_113478 (waits for the loader)" << std::endl;
+    }
+    PS2_REGISTER_GAME_OVERRIDE("BT3 NULL packet-list guard", "SLUS_216.78", 0u, 0u, &applyBt3NullPacketGuard);
     PS2_REGISTER_GAME_OVERRIDE("BT3 CD read-state edge guard", "SLUS_216.78", 0u, 0u, &applyBt3CdStateEdge);
 }

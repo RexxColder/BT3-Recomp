@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cstdio>
 #include "Common.h"
 #include "GS.h"
 #include "ps2_log.h"
@@ -913,6 +915,14 @@ namespace ps2_stubs
         // then re-uploads that garbage later -> persistent VRAM texture corruption).
         fenceAsyncKickForGsAccess(runtime);
         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
+        ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "storeimg", nullptr);
+        {   // [storeimg] every VRAM->RAM download: the un-hooked guest-RAM writer class (found 2026-09-01)
+            static const bool s_si = [](){ const char *v = std::getenv("PS2X_STOREIMG"); return v && v[0] && v[0] != '0'; }();
+            if (s_si)
+                std::fprintf(stderr, "[storeimg] sbp=%u psm=%u fbw=%u w=%u h=%u dst=0x%08x bytes=%u\n",
+                             sbp, (uint32_t)img.psm, fbw, (uint32_t)img.width, (uint32_t)img.height,
+                             dstAddr, totalImageBytes);
+        }
         runtime->guestFree(pktAddr);
 
         setReturnS32(ctx, 0);
@@ -1457,6 +1467,10 @@ namespace ps2_stubs
 
     void sceGsSyncV(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        {   // [syncvlog] who paces on sceGsSyncV, and how often (per 256 calls)
+            static std::atomic<uint32_t> s_n{0}; const uint32_t n = s_n.fetch_add(1u);
+            if ((n & 255u) == 0u) std::fprintf(stderr, "[syncv] call #%u ra=0x%x mode=%u\n", n, getRegU32(ctx, 31), getRegU32(ctx, 4));
+        }
         const uint64_t tick = ps2_syscalls::WaitForNextVSyncTick(rdram, runtime);
         if (g_gparam.interlace != 0u)
         {

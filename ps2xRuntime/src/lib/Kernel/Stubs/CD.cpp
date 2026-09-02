@@ -1,3 +1,6 @@
+#include <cstring>
+#include <atomic>
+#include <cstdio>
 #include "Common.h"
 #include "CD.h"
 #include "MPEG.h"
@@ -124,12 +127,65 @@ namespace ps2_stubs
             {
                 return true;
             }
-
-            return readCdSectors(args.lbn, args.sectors, rdram + offset, bytes);
+            uint32_t lbn = args.lbn;
+            {   // [afsremap] PS2X_AFSREMAP=<lbn1>:<lbn2>:<nsectors> (hex): pure sector redirect, the AFS index is untouched
+                // (editing the index -- even the size alone -- corrupts the boot). Reads inside [lbn1, lbn1+n) fetch
+                // lbn2 + (lbn - lbn1). Use a target entry no larger than the source so its header table stays inside.
+                static const std::string s_rm = [](){ const char *v = std::getenv("PS2X_AFSREMAP"); return std::string(v ? v : ""); }();
+                static uint32_t r1 = 0, r2 = 0, rn = 0;
+                static const bool s_rok = !s_rm.empty() && std::sscanf(s_rm.c_str(), "%x:%x:%x", &r1, &r2, &rn) == 3;
+                if (s_rok && lbn >= r1 && lbn < r1 + rn)
+                {
+                    static uint32_t s_rlog = 0;
+                    if (s_rlog++ < 12u) std::fprintf(stderr, "[afsremap] read lbn 0x%x -> 0x%x (%u sectors)\n", lbn, r2 + (lbn - r1), args.sectors);
+                    lbn = r2 + (lbn - r1);
+                }
+            }
+            {   // [afsswap] sector remap: reads inside entry 1's (enlarged) range fetch entry 2's sectors instead
+                static const std::string s_sw = [](){ const char *v = std::getenv("PS2X_AFSSWAP"); return std::string(v ? v : ""); }();
+                static uint32_t o1 = 0, z1 = 0, o2 = 0, z2 = 0;
+                static const bool s_ok = !s_sw.empty() && std::sscanf(s_sw.c_str(), "%x:%x:%x:%x", &o1, &z1, &o2, &z2) == 4;
+                if (s_ok)
+                {
+                    const uint32_t l1 = 0x7c6u + (o1 >> 11), l2 = 0x7c6u + (o2 >> 11), n = (z2 + 2047u) >> 11;
+                    if (lbn >= l1 && lbn < l1 + n)
+                    {
+                        lbn = l2 + (lbn - l1);
+                        static uint32_t s_log = 0;
+                        if (s_log++ < 12u) std::fprintf(stderr, "[afsswap] remap read lbn 0x%x -> 0x%x (%u sectors)\n", args.lbn, lbn, args.sectors);
+                    }
+                }
+            }
+            {
+                const bool ok_ = readCdSectors(lbn, args.sectors, rdram + offset, bytes);
+                if (ok_) ps2TraceGuestRangeWrite(rdram, offset, (uint32_t)bytes, "cdread", ctx);
+                return ok_;
+            }
         };
 
         CdReadArgs selected{a0, a1, a2, "a0/a1/a2"};
         bool ok = tryRead(selected);
+        // [cddst] PS2X_CDDST=<lo>:<hi> (hex): UNCAPPED log of reads whose dst intersects the
+        // range — the general [cdread] log's 6000-line budget hides in-fight deliveries.
+        {
+            static const std::string s_cw = [](){ const char *v = std::getenv("PS2X_CDDST"); return std::string(v ? v : ""); }();
+            static uint32_t w_lo = 0, w_hi = 0;
+            static const bool s_wok = !s_cw.empty() && std::sscanf(s_cw.c_str(), "%x:%x", &w_lo, &w_hi) == 2;
+            if (ok && s_wok)
+            {
+                const uint32_t d0 = selected.buf & 0x1FFFFFFFu;
+                const uint32_t d1 = d0 + selected.sectors * 2048u;
+                if (d0 < w_hi && d1 > w_lo)
+                    std::fprintf(stderr, "[cddst] lbn=0x%x sectors=%u dst=0x%x..0x%x ra=0x%x\n",
+                                 selected.lbn, selected.sectors, d0, d1, getRegU32(ctx, 31));
+            }
+        }
+        {   // [cdreadlog] every read that landed: destination range + which argument layout, so a late/misplaced read
+            // can be matched against a corrupted object (loader wild-jump hunt). First 6000 only.
+            static std::atomic<uint32_t> s_cl{0};
+            if (ok && s_cl.fetch_add(1u) < 6000u)
+                std::fprintf(stderr, "[cdread] lbn=0x%x sectors=%u dst=0x%x..0x%x\n", selected.lbn, selected.sectors, selected.buf, selected.buf + selected.sectors * 2048u);
+        }
 
         if (!ok)
         {
@@ -158,6 +214,7 @@ namespace ps2_stubs
 
                     if (tryRead(candidate))
                     {
+                        std::fprintf(stderr, "[cdread] ALT %s lbn=0x%x sectors=%u dst=0x%x..0x%x\n", candidate.tag, candidate.lbn, candidate.sectors, candidate.buf, candidate.buf + candidate.sectors * 2048u);   // [cdreadlog]
                         static uint32_t recoverLogCount = 0;
                         if (recoverLogCount < 16)
                         {
@@ -200,6 +257,39 @@ namespace ps2_stubs
 
         if (ok)
         {
+            // [afsswap] PS2X_AFSSWAP=<off1>:<size1>:<off2>:<size2> (hex): the game reads the PZS3US1.AFS index at boot
+            // (lbn 0x7c6.. one sector at a time into a staging buffer, parsed right after each read). Patch the raw
+            // (off,size) pair in the buffer we just filled, and -- in case the parsed table keeps (lbn,size) -- scan RAM
+            // for that derived form too. Used to load another stage's Map_XX_PS on the scripted fight.
+            static const std::string s_sw = [](){ const char *v = std::getenv("PS2X_AFSSWAP"); return std::string(v ? v : ""); }();
+            static uint32_t s_calls = 0, s_hits = 0;
+            if (!s_sw.empty() && s_calls++ < 3000u)
+            {
+                uint32_t o1 = 0, z1 = 0, o2 = 0, z2 = 0;
+                if (std::sscanf(s_sw.c_str(), "%x:%x:%x:%x", &o1, &z1, &o2, &z2) == 4)
+                {
+                    const uint32_t l1 = 0x7c6u + (o1 >> 11), l2 = 0x7c6u + (o2 >> 11);
+                    auto scan = [&](const uint8_t *base, size_t len, uint32_t k0, uint32_t k1, uint32_t r0, uint32_t r1, const char *what)
+                    {
+                        uint8_t key[8]; std::memcpy(key, &k0, 4); std::memcpy(key + 4, &k1, 4);
+                        const uint8_t *cur = base; size_t left = len;
+                        while (left >= 8)
+                        {
+                            const uint8_t *hit = static_cast<const uint8_t *>(memmem(cur, left, key, 8));
+                            if (!hit) break;
+                            const uint32_t at = static_cast<uint32_t>(hit - rdram);
+                            std::memcpy(rdram + at, &r0, 4); std::memcpy(rdram + at + 4, &r1, 4);
+                            std::fprintf(stderr, "[afsswap] %s (0x%x,0x%x) at guest 0x%x -> (0x%x,0x%x) (cd call %u lbn=0x%x, hit %u)\n", what, k0, k1, at, r0, r1, s_calls, selected.lbn, ++s_hits);
+                            cur = hit + 8; left = len - (cur - base);
+                        }
+                    };
+                    // size only: the index must stay offset-sorted (swapping the offset crashed the boot at 0x26e104);
+                    // the sector remap in tryRead() fetches the other entry's data for the whole (larger) size.
+                    (void)l1; (void)l2; (void)o2;
+                    const uint32_t off = selected.buf & PS2_RAM_MASK; const size_t bytes = clampReadBytes(selected.sectors, off);
+                    scan(rdram + off, bytes, o1, z1, o1, z2, "raw pair in read buffer (size only)");
+                }
+            }
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             noteAdxHeaderIfPresent(rdram, a2, a1);
             setReturnS32(ctx, 1); // command accepted/success
@@ -380,7 +470,9 @@ namespace ps2_stubs
                 bytes = maxBytes;
             }
 
-            if (!readCdSectors(lbn, sectors, rdram + offset, bytes))
+            if (readCdSectors(lbn, sectors, rdram + offset, bytes))
+                ps2TraceGuestRangeWrite(rdram, offset, (uint32_t)bytes, "cdchain", ctx);
+            else if (true)
             {
                 ok = false;
                 break;
@@ -614,6 +706,7 @@ namespace ps2_stubs
         const bool ok = (sectors > 0u) && readCdSectors(readLbn, sectors, rdram + offset, bytes);
         if (ok)
         {
+            ps2TraceGuestRangeWrite(rdram, offset, (uint32_t)bytes, "cdstream", ctx);
             g_cdStreamingLbn += sectors;
             if (requestedBytes > bytes)
             {

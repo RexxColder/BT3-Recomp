@@ -1,4 +1,5 @@
 #include "ps2_runtime.h"
+#include "runtime/ps2_gs_gpu_renderer.h"
 #include "games_database.h"
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "ps2_debug_panel.h"
@@ -8,12 +9,16 @@
 #include "ps2_log.h"
 #endif
 
+#include <cstring>
+#include <cstdio>
+#include <vector>
 #include <iostream>
 #include <string>
 #include <filesystem>
 #include <exception>
 #include <algorithm>
 #include <cstdlib>
+#include <csignal>
 
 namespace
 {
@@ -89,8 +94,334 @@ namespace
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Vsync counter for the replay harness. The dev tree defines this in the renderer (its
+// probes frame-gate on it); this build has no such probes, so the harness owns it here.
+int g_ps2ReplayVsync = 0;
+
+// PS2X_GS_REPLAY: offline GS-dump replay harness. DIAGNOSTIC ONLY -- inert unless the env var
+// is set. Feeds a PCSX2 .gs dump's packet stream through our own GS, so one frame can be
+// reproduced deterministically and diffed against the console screenshot embedded in the
+// dump: no gameplay, no timing. Ported from the dev tree 2026-08-22 so that work on this
+// clean repo build is measurable. Adds no behaviour to a normal run.
+// ---------------------------------------------------------------------------------------
+static void gsReplayDumpBuf(GS &gs, uint32_t fbp, uint32_t fbw, int w, int h, int vsync)
+{
+    char p[160];
+    std::snprintf(p, sizeof p, "/home/z3/Desktop/bt3/work/gsreplay_v%d_f%u.ppm", vsync, fbp);
+    FILE *f = std::fopen(p, "wb");
+    if (!f) return;
+    std::fprintf(f, "P6\n%d %d\n255\n", w, h);
+    std::vector<uint8_t> alpha((size_t)w * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            const uint32_t v = GSMem::ReadCT32(gs.vramData(), fbp * 32u, fbw, (uint32_t)x, (uint32_t)y);
+            std::fputc(v & 0xFF, f); std::fputc((v >> 8) & 0xFF, f); std::fputc((v >> 16) & 0xFF, f);
+            alpha[(size_t)y * w + x] = (uint8_t)((v >> 24) & 0xFF);
+        }
+    std::fclose(f);
+    std::snprintf(p, sizeof p, "/home/z3/Desktop/bt3/work/gsreplay_v%d_f%u_a.pgm", vsync, fbp);
+    if (FILE *fa = std::fopen(p, "wb"))
+    {
+        std::fprintf(fa, "P5\n%d %d\n255\n", w, h);
+        std::fwrite(alpha.data(), 1, alpha.size(), fa);
+        std::fclose(fa);
+    }
+}
+
+static int runGsReplay(PS2Runtime &rt, const char *path)
+{
+    FILE *f = std::fopen(path, "rb");
+    if (!f) { std::fprintf(stderr, "[gsreplay] cannot open %s\n", path); return 1; }
+    std::fseek(f, 0, SEEK_END); const long sz = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> d((size_t)sz);
+    if (std::fread(d.data(), 1, d.size(), f) != d.size()) { std::fclose(f); return 1; }
+    std::fclose(f);
+    uint32_t magic; std::memcpy(&magic, d.data(), 4);
+    GS &gs = rt.gs();
+    size_t off = 0; int sliceBase = 0;
+    if (magic == 0xFFFFFFFFu)
+    {
+        // PCSX2 dump: header + state (leads with 4MB VRAM) + privileged regs + packets.
+        uint32_t stateSize, ssize;
+        std::memcpy(&stateSize, d.data() + 0x0C, 4);
+        std::memcpy(&ssize, d.data() + 0x28, 4);
+        const size_t state = 0x36 + ssize;
+        // PS2X_GS_REPLAY_NOSEED=1: skip the VRAM seed. The seed hands every pass real console
+        // content; without it the replay starts from empty VRAM, closer to how a live run
+        // begins. Used to test whether the seed is what makes the effect column strips visible
+        // in replay when they are invisible live.
+        static const bool s_noSeed = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_NOSEED"); return v && v[0] && v[0] != '0'; }();
+        if (!s_noSeed && gs.vramData() && stateSize >= 4u * 1024 * 1024 && state + stateSize <= (size_t)sz)
+        {
+            // [vramseedfix] 2026-08-31: VRAM is the LAST 4MB of the state blob, not its head
+            // (gsvram.py layout, validated): seeding from `state` copied a 509-byte register
+            // prefix into VRAM and shifted every texel -- the mottled terrain on every
+            // console-dump replay. Live runs never seed; replays of PCSX2 dumps before this
+            // fix carried a corrupted static-texture base.
+            std::memcpy(gs.vramData(), d.data() + state + stateSize - 4u * 1024 * 1024, std::min<size_t>(4u * 1024 * 1024, gs.vramSize()));
+            // Seeding VRAM behind the renderer's back leaves its texture/CLUT caches keyed to
+            // content that no longer exists, so terrain tiles decode through stale palettes --
+            // that is the red vertical striping the first port produced. Stamp the whole of
+            // VRAM as freshly uploaded so every cached decode is re-keyed. 4MB = 16384 blocks
+            // of 256 bytes.
+            ps2GpuRenderer().onVramUpload(0u, 16384u);
+        }
+        off = state + stateSize + 8192;
+    }
+    else if (magic == 0xFFFFFFFEu)
+    {
+        // [slice] PS2X replay slice written by PS2X_GS_REPLAY_SLICE (see the vsync branch below):
+        //   u32 magic 0xFFFFFFFE | u32 baseVsync | u32 nregs | nregs x {u8 addr, u64 value}
+        //   | u32 vramBytes | VRAM | raw records...
+        // Restores the register file through one synthetic A+D GIF packet, seeds VRAM, and
+        // continues the vsync count from baseVsync so FROM/TO keep their full-recording meaning.
+        uint32_t base = 0, nregs = 0; std::memcpy(&base, d.data() + 4, 4); std::memcpy(&nregs, d.data() + 8, 4);
+        size_t p = 12;
+        std::vector<uint8_t> pkt; pkt.reserve(16 + 16 * nregs);
+        auto put64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) pkt.push_back((uint8_t)(v >> (8 * i))); };
+        put64((uint64_t)nregs | (1ull << 15) | (1ull << 60)); put64(0xEull);   // NLOOP, EOP, NREG=1, REGS=A+D
+        for (uint32_t i = 0; i < nregs; ++i)
+        { const uint8_t a = d[p]; uint64_t v; std::memcpy(&v, d.data() + p + 1, 8); p += 9; put64(v); put64(a); }
+        uint32_t vb = 0; std::memcpy(&vb, d.data() + p, 4); p += 4;
+        if (gs.vramData() && vb && p + vb <= (size_t)sz)
+        { std::memcpy(gs.vramData(), d.data() + p, std::min<size_t>(vb, gs.vramSize())); ps2GpuRenderer().onVramUpload(0u, 16384u); }
+        p += vb;
+        gs.processGIFPacket(pkt.data(), (uint32_t)pkt.size());
+        off = p; sliceBase = (int)base;
+        std::fprintf(stderr, "[slice] loaded: base vsync %u, %u registers restored, %u VRAM bytes, records from %zu\n", base, nregs, vb, off);
+    }
+    else if (d[0] == 0u)
+    {
+        // Raw PS2X_GS_RECORD stream: packets from byte 0, no VRAM snapshot (the
+        // recording contains every upload since boot, so VRAM fills as it plays).
+        off = 0;
+    }
+    else { std::fprintf(stderr, "[gsreplay] unrecognized file format\n"); return 1; }
+
+    // (PS2X_GS_REPLAY_VRAMSEED omitted: it needs the dev tree's noup seeding helper.)
+
+    // have no vsync markers).
+    const long dumpEvery = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_DUMPEVERY"); return v ? std::atol(v) : 0L; }();
+    const long dumpFrom = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_FROM"); return v ? std::atol(v) : 0L; }();
+    const long dumpTo = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_TO"); return v ? std::atol(v) : 0L; }();
+    const long fdrawAt = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_FDRAWAT"); return v ? std::atol(v) : 0L; }();
+    // PS2X_GS_REPLAY_LOOP=<n>: replay the whole dump n times. ref_native.gs holds only 4
+    // vsyncs, which is too few for BT3's multi-stage feedback chain (Z -> scene alpha -> fbp224
+    // -> outline composite) to converge -- each stage sees the previous frame's writeback.
+    const long replayLoops = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_LOOP");
+                                   const long n = v ? std::atol(v) : 1L; return n > 0 ? n : 1L; }();
+    const size_t offStart = off;
+    int vsyncs = sliceBase; uint64_t xfers = 0; bool sawVsync = false;
+    // PS2X_GS_REPLAY_SLICE=<out> + PS2X_GS_REPLAY_SLICEAT=<vsync> [+ PS2X_GS_REPLAY_SLICEEND=<vsync>]:
+    // at that vsync, write a slice (registers + VRAM + the records up to SLICEEND) and stop.
+    const char *slicePath = std::getenv("PS2X_GS_REPLAY_SLICE");
+    const long sliceAt = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_SLICEAT"); return v ? std::atol(v) : 0L; }();
+    const long sliceEnd = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_SLICEEND"); return v ? std::atol(v) : 0L; }();
+    std::fprintf(stderr, "[gsreplay] %s: %ld bytes, packets from %zu (loops=%ld)\n", path, sz, off, replayLoops);
+    for (long loopIter = 0; loopIter < replayLoops; ++loopIter)
+    {
+    if (loopIter > 0) { off = offStart; std::fprintf(stderr, "[gsreplay] --- loop %ld (vsyncs so far %d) ---\n", loopIter, vsyncs); }
+    while (off < (size_t)sz)
+    {
+        const uint8_t t = d[off++];
+        if (t == 0)
+        {
+            ++off; // path id (all paths carry GIF-format data)
+            uint32_t n; std::memcpy(&n, d.data() + off, 4); off += 4;
+            if (off + n > (size_t)sz) break;
+            gs.processGIFPacket(d.data() + off, n);
+            off += n; ++xfers;
+            // PS2X_BARRIER: drain read-after-write barriers. A draw that samples a page an
+            // earlier queued draw wrote cannot see it, because textures are decoded while the
+            // command list is BUILT and the list is rendered later. Here (single-threaded
+            // replay, GL owned by this thread) we can publish + render what is built so far and
+            // push that page into VRAM, so the next decode reads fresh bytes. FBOs persist
+            // across render calls, so splitting a frame into segments is safe.
+            if (GsGpuRenderer::enabled())
+            {
+                static const bool s_bar = [](){ const char *v = std::getenv("PS2X_BARRIER");
+                                                return v && v[0] && v[0] != '0'; }();
+                static const bool s_livepath = [](){ const char *v = std::getenv("PS2X_LIVEPATH"); return v && v[0] && v[0] != '0'; }();
+                uint32_t bpage = 0;
+                while (s_bar && !s_livepath && ps2GpuRenderer().takeBarrierRequest(bpage))
+                {
+                    // renderRange, NOT swapFrame + renderAndGetTextureId: publishing mid-frame
+                    // and running the full render made the display pick, the per-frame extent
+                    // census and the present all fire against a PREFIX of the frame, which
+                    // wrecked the picture (MAE 11.9 -> 72.7). renderRange draws only the
+                    // not-yet-drawn commands into the FBOs and returns.
+                    ps2GpuRenderer().renderRange(512, 448);
+                    ps2GpuRenderer().flushPageToVram(bpage);
+                    static int nb = 0;
+                    if (++nb <= 40)
+                        std::fprintf(stderr, "[barrier] #%d rendered pending + flushed page %u\n", nb, bpage);
+                }
+            }
+            if (!sawVsync && dumpEvery > 0 && (xfers % (uint64_t)dumpEvery) == 0)
+            {
+                // Our live game renders 512-wide (fbw 8); the console dump 640 (fbw 10).
+                const int tag = (int)(xfers / (uint64_t)dumpEvery);
+                std::fprintf(stderr, "[gsreplay] periodic dump %d at xfer %llu\n", tag, (unsigned long long)xfers);
+                if (GsGpuRenderer::enabled())
+                {
+                    // GPU-path replay: publish the accumulated DrawCmds, render on this
+                    // (GL-owning) thread, save the present — the GPU-vs-SW diff harness.
+                    ps2GpuRenderer().swapFrame();
+                    ps2GpuRenderer().renderAndGetTextureId(512, 448);
+                    char gp[160];
+                    std::snprintf(gp, sizeof gp, "/home/z3/Desktop/bt3/work/gsreplay_gpu_%02d.png", tag);
+                    ps2GpuRenderer().debugSavePresent(gp);
+                }
+                else
+                {
+                    gsReplayDumpBuf(gs, 0u, 8u, 512, 448, 1000 + tag);
+                    gsReplayDumpBuf(gs, 112u, 8u, 512, 448, 2000 + tag);
+                }
+            }
+        }
+        else if (t == 1)
+        {
+            ++off; ++vsyncs; sawVsync = true;
+            if (magic == 0xFFFFFFFFu && dumpTo <= 0)
+            {
+                // Console dump: one-frame capture — dump every buffer and stop.
+                std::fprintf(stderr, "[gsreplay] vsync %d after %llu transfers\n", vsyncs, (unsigned long long)xfers);
+                gsReplayDumpBuf(gs, 0u, 10u, 640, 448, vsyncs);
+                gsReplayDumpBuf(gs, 112u, 10u, 640, 448, vsyncs);
+                gsReplayDumpBuf(gs, 224u, 8u, 512, 448, vsyncs);
+                gsReplayDumpBuf(gs, 336u, 4u, 256, 256, vsyncs);
+                gsReplayDumpBuf(gs, 368u, 2u, 128, 128, vsyncs);
+                gsReplayDumpBuf(gs, 502u, 1u, 64, 64, vsyncs);
+                if (vsyncs >= 2) break;
+            }
+            else
+            {
+                // Raw recording with frame markers: publish per frame (exact live
+                // cadence); render+save every dumpEvery-th frame in GPU mode.
+                const bool inWin = dumpTo <= 0 || (vsyncs >= dumpFrom && vsyncs <= dumpTo);
+                // Warm-up: RENDER (without saving) the frames just before the window. The
+                // GPU queue drops published lists nobody renders, so a window opened cold
+                // starts from empty FBOs — the effect chain (f336/f368/f502 feedback) needs
+                // a few real frames of history before its content is meaningful.
+                const long kWarm = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_WARM"); return v ? std::atol(v) : 40L; }();
+                const bool inWarm = dumpTo > 0 && vsyncs >= dumpFrom - kWarm && vsyncs < dumpFrom;
+                { extern int g_ps2ReplayVsync; g_ps2ReplayVsync = vsyncs; }
+                if (GsGpuRenderer::enabled())
+                {
+                    if (fdrawAt > 0 && vsyncs == fdrawAt)
+                    if (std::getenv("PS2X_BODYDUMP"))
+                        std::fprintf(stderr, "[bodyfr] %d\n", vsyncs);
+                    ps2GpuRenderer().swapFrame();
+                    { extern bool g_replayInWindow; g_replayInWindow = inWin; }
+                    if ((dumpEvery > 0 && (vsyncs % (int)dumpEvery) == 0 && inWin) || (dumpTo > 0 && inWin))
+                    {
+                        ps2GpuRenderer().renderAndGetTextureId(512, 448);
+                        // PS2X_GS_REPLAY_OUT=<dir>: where the per-frame PNGs land (default
+                        // work/). Per-variant dirs let A/B replays run in parallel.
+                        static const char *outDir = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_OUT");
+                                                          return (v && v[0]) ? v : "/home/z3/Desktop/bt3/work"; }();
+                        char gp[256];
+                        std::snprintf(gp, sizeof gp, "%s/gsreplay_gpu_fr%04d.png", outDir, vsyncs);
+                        ps2GpuRenderer().debugSavePresent(gp);
+                    }
+                    else if (inWarm)
+                        ps2GpuRenderer().renderAndGetTextureId(512, 448);
+                    // PS2X_GS_REPLAY_VDUMP=1: in GPU mode ALSO dump the effect-chain buffers
+                    // from the VRAM MIRROR (what PS2X_SWEFFECT rasterized) — shows whether the
+                    // pyramid content exists in VRAM independently of the GL composite.
+                    static const bool s_vdump = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_VDUMP"); return v && v[0] && v[0] != '0'; }();
+                    if (s_vdump && dumpTo > 0 && vsyncs >= dumpFrom && vsyncs <= dumpTo)
+                    {
+                        gsReplayDumpBuf(gs, 224u, 4u, 256, 256, 30000 + vsyncs);
+                        gsReplayDumpBuf(gs, 336u, 4u, 256, 256, 40000 + vsyncs);
+                        gsReplayDumpBuf(gs, 368u, 2u, 128, 128, 50000 + vsyncs);
+                        gsReplayDumpBuf(gs, 502u, 1u, 64, 64, 60000 + vsyncs);
+                        gsReplayDumpBuf(gs, 112u, 8u, 512, 448, 70000 + vsyncs);
+                    }
+                }
+                else if ((dumpEvery > 0 && (vsyncs % (int)dumpEvery) == 0 && inWin) || (dumpTo > 0 && inWin))
+                {
+                    // BT3 renders the scene at FBW=8 (512px) on console too — the 640 in
+                    // DISPFB is the display window, not the render stride. Dumping at 640
+                    // shears the frame into diagonal staircase bands.
+                    gsReplayDumpBuf(gs, 0u, 8u, 512, 448, 10000 + vsyncs);
+                    gsReplayDumpBuf(gs, 112u, 8u, 512, 448, 20000 + vsyncs);
+                    gsReplayDumpBuf(gs, 224u, 8u, 512, 448, 30000 + vsyncs);
+                    gsReplayDumpBuf(gs, 336u, 4u, 256, 256, 40000 + vsyncs);
+                    gsReplayDumpBuf(gs, 368u, 2u, 128, 128, 50000 + vsyncs);
+                    gsReplayDumpBuf(gs, 502u, 1u, 64, 64, 60000 + vsyncs);
+                }
+            }
+            if (slicePath && slicePath[0] && sliceAt > 0 && vsyncs == sliceAt)
+            {
+                if (GsGpuRenderer::enabled()) ps2GpuRenderer().flushRecentPagesToVram(vsyncs - 3);
+                std::vector<uint8_t> o; auto put32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) o.push_back((uint8_t)(v >> (8 * i))); };
+                auto put64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) o.push_back((uint8_t)(v >> (8 * i))); };
+                put32(0xFFFFFFFEu); put32((uint32_t)vsyncs);
+                const uint64_t *rr = gs.rawRegs(); const bool *rs = gs.rawRegsSet();
+                std::vector<uint8_t> order;
+                for (int a = 1; a < 0x63; ++a)
+                {   // vertex kicks (0x02-0x05, 0x0C-0x0D), TEXFLUSH, TRXDIR, SIGNAL/FINISH/LABEL are not state
+                    if (a == 0x02 || a == 0x03 || a == 0x04 || a == 0x05 || a == 0x0C || a == 0x0D || a == 0x3F || a == 0x53 || a >= 0x60) continue;
+                    if (rs[a]) order.push_back((uint8_t)a);
+                }
+                if (rs[0]) order.push_back(0u);   // PRIM last (after PRMODECONT/PRMODE)
+                put32((uint32_t)order.size());
+                for (uint8_t a : order) { o.push_back(a); put64(rr[a]); }
+                put32(gs.vramSize()); o.insert(o.end(), gs.vramData(), gs.vramData() + gs.vramSize());
+                size_t e = off; int vs2 = vsyncs;   // records up to SLICEEND
+                while (e < (size_t)sz)
+                {
+                    const uint8_t t2 = d[e];
+                    if (t2 == 0) { uint32_t n2; std::memcpy(&n2, d.data() + e + 2, 4); e += 6 + n2; }
+                    else if (t2 == 1) { if (sliceEnd > 0 && vs2 >= sliceEnd) break; e += 2; ++vs2; }
+                    else if (t2 == 2) e += 5; else if (t2 == 3) e += 8193; else break;
+                }
+                if (e > (size_t)sz) e = (size_t)sz;
+                o.insert(o.end(), d.data() + off, d.data() + e);
+                if (FILE *sf = std::fopen(slicePath, "wb")) { std::fwrite(o.data(), 1, o.size(), sf); std::fclose(sf); }
+                std::fprintf(stderr, "[slice] wrote %s: %.1f MB, base vsync %d, %zu registers, records for vsyncs %d..%d\n",
+                             slicePath, o.size() / 1e6, vsyncs, order.size(), vsyncs, vs2);
+                break;
+            }
+            // Window done: the rest of the recording can't change what was already dumped.
+            if (dumpTo > 0 && vsyncs > dumpTo)
+            {
+                // PS2X_GS_REPLAY_VRAMDUMP=<path>: raw 4MB VRAM snapshot at window end. Diffing
+                // a SW-mode dump against a GPU-mode one isolates what GS RENDERING put in VRAM
+                // (GPU mode rasterizes into FBOs, never back into VRAM) — i.e. exactly which
+                // sampled regions are render-target readback rather than uploaded textures.
+                if (const char *vp = std::getenv("PS2X_GS_REPLAY_VRAMDUMP"))
+                    if (gs.vramData())
+                        if (FILE *vf = std::fopen(vp, "wb"))
+                        { std::fwrite(gs.vramData(), 1, gs.vramSize(), vf); std::fclose(vf);
+                          std::fprintf(stderr, "[gsreplay] VRAM dumped to %s\n", vp); }
+                std::fprintf(stderr, "[gsreplay] window end at vsync %d\n", vsyncs);
+                break;
+            }
+        }
+        else if (t == 2) { off += 4; }
+        else if (t == 3) { off += 8192; }
+        else { std::fprintf(stderr, "[gsreplay] unknown packet type %u at %zu\n", t, off - 1); break; }
+    }
+    }
+
+    std::fprintf(stderr, "[gsreplay] done: %d vsyncs, %llu transfers\n", vsyncs, (unsigned long long)xfers);
+    return 0;
+}
+
+extern "C" void ps2xGsRecordFlush();      // PS2X_GS_RECORD ring buffer (ps2_gs_gpu.cpp)
+extern "C" void ps2xGsRecordOnSignal(int);
+
 int main(int argc, char *argv[])
 {
+    // Write the captured tail out however we exit, so a long play session is not lost.
+    // atexit alone was NOT enough -- closing the window skipped it and lost a whole session.
+    std::atexit(ps2xGsRecordFlush);
+    std::signal(SIGINT, ps2xGsRecordOnSignal);
+    std::signal(SIGTERM, ps2xGsRecordOnSignal);
     setupTerminateLogger();
 
     try
@@ -141,6 +472,9 @@ int main(int argc, char *argv[])
             std::cerr << "Failed to initialize PS2 runtime" << std::endl;
             return 1;
         }
+
+        if (const char *rp = std::getenv("PS2X_GS_REPLAY"))
+            return runGsReplay(runtime, rp);
 
         if (!runtime.loadELF(filePathStr))
         {

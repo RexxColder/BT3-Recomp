@@ -1,3 +1,7 @@
+#include <cstdlib>
+#include <cstdio>
+#include <chrono>
+#include <atomic>
 #include "Common.h"
 #include "Interrupt.h"
 #include "ps2_log.h"
@@ -9,7 +13,10 @@ namespace ps2_syscalls
     {
         constexpr uint32_t kIntcVblankStart = 2u;
         constexpr uint32_t kIntcVblankEnd = 3u;
-        constexpr auto kVblankPeriod = std::chrono::microseconds(16667);
+        // [vblankus] PS2X_VBLANK_US overrides the emulated vblank period (default 16667 = 60 Hz). Diagnostic only:
+        // with the guest busy ~20 ms/frame, a 25000 us period gives 40 fps if the game waits for the NEXT vblank
+        // (1 tick) and 20 fps if it always waits two ticks.
+        static const auto kVblankPeriod = [](){ const char *v = std::getenv("PS2X_VBLANK_US"); const long us = (v && v[0]) ? std::atol(v) : 0L; return std::chrono::microseconds(us > 1000 ? us : 16667L); }();
         constexpr int kMaxCatchupTicks = 4;
 
         std::mutex g_irq_handler_mutex;
@@ -400,6 +407,24 @@ namespace ps2_syscalls
         {
             s_gp = anyRegisteredHandlerGp();
         }
+        // [cdgate] PS2X_BT3_CDGATE (default ON, =0 off): the pump used to run 4x per REAL vblank
+        // regardless of guest progress. When the guest runs slower than 60 fps (barrier stack:
+        // ~10 fps) that is ~24 pumps between its device-state polls, the state machine cycles
+        // past the value it waits for, and the load never retires (dma counter creeps, fight
+        // never starts). Allow at most 4 pumps per guest frame, with a 250 ms fallback so a
+        // guest that is not swapping (early boot) still gets ticks.
+        static const bool s_gate = [](){ const char *v = std::getenv("PS2X_BT3_CDGATE"); return !(v && v[0] == '0'); }();
+        extern std::atomic<uint64_t> g_gsGuestSwapCount;
+        static uint64_t s_lastSwap = ~0ull; static int s_pumpsThisFrame = 0;
+        static auto s_lastPumpT = std::chrono::steady_clock::now();
+        if (s_gate)
+        {
+            const uint64_t cur = g_gsGuestSwapCount.load(std::memory_order_relaxed);
+            const auto now = std::chrono::steady_clock::now();
+            if (cur != s_lastSwap) { s_lastSwap = cur; s_pumpsThisFrame = 0; }
+            if (s_pumpsThisFrame >= 4 && now - s_lastPumpT < std::chrono::milliseconds(250)) return;
+            s_lastPumpT = now;
+        }
         if (s_gp != 0u)
         {
             // Pump a few times per vblank: each disc read walks a few tick
@@ -408,6 +433,7 @@ namespace ps2_syscalls
             {
                 pumpGuestFunction(rdram, runtime, 0x0028a3b0u, s_gp);
             }
+            s_pumpsThisFrame += 4;
         }
     }
 
@@ -645,6 +671,7 @@ namespace ps2_syscalls
         info.gp = getRegU32(ctx, 28);
         info.sp = getRegU32(ctx, 29);
         info.enabled = true;
+        std::fprintf(stderr, "[intc] AddIntcHandler cause=%u handler=0x%x arg=0x%x ra=0x%x\n", info.cause, info.handler, info.arg, getRegU32(ctx, 31));   // [intclog]
 
         int handlerId = 0;
         {

@@ -1,3 +1,5 @@
+#include "runtime/ps2_memory.h"
+#include <iomanip>
 #include <cstdlib>
 #if !defined(_WIN32)
 #include <execinfo.h> // glibc backtrace for the bad-jump diagnostic
@@ -104,6 +106,33 @@ std::atomic<uint32_t> g_bt3DrawMethod{0};
 void ps2ValueWatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo,
                          const char *op, const R5900Context *ctx)
 {
+    {   // [vwfr] frame stamp for every value-watch hit (pairs with the [vwatch] line that follows)
+        extern std::atomic<uint64_t> g_bt3FrameCount;
+        std::fprintf(stderr, "[vwfr] fr=%llu\n", (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed));
+    }
+    {   // [vwdump] one-shot hexdump around value-watch hits landing in the frame-DL region
+        const uint32_t a_ = guestAddr & 0x1FFFFFFFu;
+        uint8_t *rd_ = ps2GetRdramHostPtr();
+        if (rd_ && a_ >= 0x600000u && a_ < 0x800000u)
+        {
+            static std::atomic<int> s_vwd{0};
+            if (s_vwd.fetch_add(1) < 2)
+            {
+                const uint32_t b_ = (a_ - 0x80u) & ~0xFu;
+                for (uint32_t o_ = 0; o_ < 0x140u; o_ += 16u)
+                {
+                    uint32_t w_[4]; std::memcpy(w_, rd_ + b_ + o_, 16);
+                    std::fprintf(stderr, "[vwdump] 0x%08x: %08x %08x %08x %08x\n", b_ + o_, w_[0], w_[1], w_[2], w_[3]);
+                }
+                // [clobcatch] arm the store-watch on the REF tag qword: the next writer that
+                // touches it before the kick is the clobberer (prints as [camwrite] with pc/ra).
+                g_ps2WatchLo.store((a_ - 4u) & ~0xFu, std::memory_order_relaxed);
+                g_ps2WatchHi.store(((a_ - 4u) & ~0xFu) + 0x10u, std::memory_order_relaxed);
+                g_ps2WatchAll.store(1u, std::memory_order_relaxed);
+                std::fprintf(stderr, "[clobcatch] armed 0x%08x..+0x10\n", (a_ - 4u) & ~0xFu);
+            }
+        }
+    }
     static std::atomic<uint32_t> s_n{0};
     const uint32_t n = s_n.fetch_add(1);
     if (n < 400u)
@@ -332,6 +361,20 @@ namespace
         ctx->vu0_vpu_stat2 = 0;
 
         ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+                {
+                    // [vf0basis] PS2X_VF0BASIS=1: seed the persistent VU0 identity basis rows the
+                    // game establishes once via FUN_00120088 (MR32 chain) — hardware shares ONE
+                    // physical VU0 across threads; per-thread contexts otherwise start them zero
+                    // and func_121E50's normalize drops z^2 (vf3.x==0) => terrain band tears.
+                    static const bool s_vb = [](){ const char *v = std::getenv("PS2X_VF0BASIS"); return v && v[0] && v[0] != '0'; }();
+                    if (s_vb)
+                    {
+                        ctx->vu0_vf[1] = _mm_set_ps(0.0f, 1.0f, 0.0f, 0.0f); // (0,0,1,0)
+                        ctx->vu0_vf[2] = _mm_set_ps(0.0f, 0.0f, 1.0f, 0.0f); // (0,1,0,0)
+                        ctx->vu0_vf[3] = _mm_set_ps(0.0f, 0.0f, 0.0f, 1.0f); // (1,0,0,0)
+                    }
+                }
+
         ctx->vi[0] = 0;
     }
 
@@ -431,6 +474,14 @@ namespace
         return out;
     }
 }
+
+extern "C" bool ps2xThreadWaitInfo(int tid, int *waitType, int *waitId, int *semaCount, int *semaWaiters, int *wakeupCount);   // [schedwhy2] Thread.cpp
+extern "C" bool ps2xCdTickStale(unsigned ms);   // [dispatchpump]
+extern "C" void ps2xCdTickOnly(uint8_t *, R5900Context *, PS2Runtime *);
+extern "C" void ps2xFixupRingDump();   // [fixupring]
+extern "C" void *ps2xGuestWaitBegin();
+extern "C" void ps2xGuestWaitEnd(void *);
+extern "C" void ps2xSpinPump(uint8_t *, R5900Context *, PS2Runtime *);   // [spinpump] game_overrides.cpp
 
 PS2Runtime::GuestExecutionScope::GuestExecutionScope(PS2Runtime *runtime) noexcept
     : m_runtime(runtime)
@@ -671,6 +722,20 @@ PS2Runtime::PS2Runtime()
     // VU0 vf0 is hardwired read-only to (0,0,0,1); a zero-init context leaves it (0,0,0,0),
     // which poisons every VU0 macro-mode matrix (the identity basis is built by rotating vf0).
     m_cpuContext.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+                {
+                    // [vf0basis] PS2X_VF0BASIS=1: seed the persistent VU0 identity basis rows the
+                    // game establishes once via FUN_00120088 (MR32 chain) — hardware shares ONE
+                    // physical VU0 across threads; per-thread contexts otherwise start them zero
+                    // and func_121E50's normalize drops z^2 (vf3.x==0) => terrain band tears.
+                    static const bool s_vb = [](){ const char *v = std::getenv("PS2X_VF0BASIS"); return v && v[0] && v[0] != '0'; }();
+                    if (s_vb)
+                    {
+                        m_cpuContext.vu0_vf[1] = _mm_set_ps(0.0f, 1.0f, 0.0f, 0.0f); // (0,0,1,0)
+                        m_cpuContext.vu0_vf[2] = _mm_set_ps(0.0f, 0.0f, 1.0f, 0.0f); // (0,1,0,0)
+                        m_cpuContext.vu0_vf[3] = _mm_set_ps(0.0f, 0.0f, 0.0f, 1.0f); // (1,0,0,0)
+                    }
+                }
+
 
     // Stack pointer (SP) and global pointer (GP) will be set by the loaded ELF
 
@@ -685,6 +750,7 @@ PS2Runtime::PS2Runtime()
     m_asyncCallbackStackTop = PS2_RAM_SIZE - kMainThreadStackReserve;
 }
 
+double g_fpPresent = 0, g_fpBar = 0, g_fpPre = 0, g_fpWait = 0, g_fpLoop = 0; int g_fpN = 0;   // [frameprof]
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
                                      DebugUiCallback drawCallback,
                                      DebugUiCallback shutdownCallback,
@@ -829,6 +895,12 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
         SetTargetFPS(60);
+        // [barblock] manual pacing: the present thread must service guest barriers every few
+        // hundred microseconds, which it cannot do while asleep inside EndDrawing's frame cap.
+        // PS2X_BARPACE=0 keeps raylib's frame cap (barrier latency then <= one frame) -- A/B for
+        // whether the manual pacing itself disturbs the guest.
+        static const bool s_barPace = [](){ const char *v = std::getenv("PS2X_BARPACE"); return !(v && v[0] == '0'); }();
+        if (GsGpuRenderer::blockingBarriersEnabled() && s_barPace) SetTargetFPS(0);
         // PS2X_TOPMOST=1: keep the game window above others — unattended (AFK) test runs
         // screenshot the whole desktop, and an occluded window can't be captured on Wayland.
         if (const char *tm = std::getenv("PS2X_TOPMOST"); tm && tm[0] && tm[0] != '0')
@@ -1247,6 +1319,15 @@ namespace
     // Resolve a guest PC against the boot ELF table first, then the overlay table.
     PS2Runtime::RecompiledFunction lookupGeneratedFunction(uint32_t address)
     {
+        // [ksegfn] kseg0/kseg1 aliases of RAM (0x8xxxxxxx / 0xAxxxxxxx) are the same code on a PS2. BT3's loader path
+        // calls through kseg0-form function pointers (JALR target 0x8026cbc8 = 0x26cbc8); unmasked they miss the tables,
+        // fall to the overlay interpreter (which lacked lq/sq) and the load hangs with a garbage return address.
+        if (address >= 0x80000000u && address < 0xC0000000u)
+        {
+            static std::atomic<uint32_t> s_n{0}; const uint32_t n = s_n.fetch_add(1u);
+            if (n < 40u || (n % 5000u) == 0u) std::fprintf(stderr, "[ksegfn] #%u kseg-form function pointer 0x%08x -> 0x%08x\n", n, address, address & 0x1FFFFFFFu);
+            address &= 0x1FFFFFFFu;
+        }
         uint32_t slot = 0u;
         if (generatedFunctionTableSlot(address, slot))
         {
@@ -1313,6 +1394,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
     }
 }
 
+static thread_local R5900Context *t_bjCtx = nullptr; static thread_local uint8_t *t_bjRdram = nullptr;   // [thunkwatch]
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
@@ -1337,6 +1419,15 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
             std::cerr << "[badjump] out-of-code target 0x" << std::hex << address
                       << " ; last valid fn entered = 0x" << s_lastValidDispatch
                       << " ; prev = 0x" << s_prevValidDispatch << std::dec << std::endl;
+            {   // [thunkwatch] the sub_002722C0 case reloads $ra from [sp-16] (after its delay-slot addiu): show the slot
+                if (t_bjCtx && t_bjRdram)
+                {
+                    const uint32_t sp = static_cast<uint32_t>(_mm_extract_epi32(t_bjCtx->r[29], 0));
+                    uint32_t w[4] = {0, 0, 0, 0};
+                    for (int k = 0; k < 4; ++k) { const uint32_t a = (sp - 16u + 4u * k) & 0x1FFFFFFFu; if (a + 4 <= 32u * 1024u * 1024u) std::memcpy(&w[k], t_bjRdram + a, 4); }
+                    std::fprintf(stderr, "[badjump] sp=0x%x  [sp-16..sp)= %08x %08x %08x %08x  tid=%d ra=0x%x\n", sp, w[0], w[1], w[2], w[3], g_schedTid, static_cast<uint32_t>(_mm_extract_epi32(t_bjCtx->r[31], 0)));
+                }
+            }
             // Capture the C++ stack depth at the first bad jump: a huge depth == guest recursion
             // overflowed the (host) stack and clobbered the saved $ra. Small depth == a stray
             // write corrupted it. No gdb needed -> no timing perturbation.
@@ -1470,6 +1561,7 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             << " v0=0x" << v0
             << " v1=0x" << v1
             << " a0Readable=" << (a0Readable ? "yes" : "no")
+            << " s0=0x" << getRegU32(ctx, 16) << " s1=0x" << getRegU32(ctx, 17) << " s2=0x" << getRegU32(ctx, 18) << " tid=" << g_schedTid   // [badjump] object regs
             << " a0[0]=0x" << a0Word0
             << " a0[4]=0x" << a0Word4
             << " a0[8]=0x" << a0Word8
@@ -1488,7 +1580,15 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
         {
             std::lock_guard<std::mutex> lock(s_missingFunctionLogMutex);
             std::cerr << oss.str() << std::endl;
-        }
+
+        {   // [badjump] 64 bytes at s0 (the object whose method/vtable was bad) and 64 bytes at sp
+            auto dump = [&](const char *what, uint32_t base) {
+                std::ostringstream d; d << "[guest-branch:mem] " << what << "=0x" << std::hex << base << ":";
+                for (uint32_t o = 0; o < 64u; o += 4u) { uint32_t w = 0; if (!readGuestU32Offset(base, o, w)) { d << " ??"; break; } d << ' ' << std::setw(8) << std::setfill('0') << w; }
+                std::cerr << d.str() << std::endl;
+            };
+            dump("s0", getRegU32(ctx, 16)); dump("sp", sp);
+        }        }
     }
 
     if (firstReport && policy == MissingFunctionPolicy::BreakOnce)
@@ -1679,6 +1779,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
+    t_bjCtx = ctx; t_bjRdram = rdram;   // [thunkwatch] for the [badjump] slot dump
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
@@ -1802,7 +1903,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             GuestExecutionScope pumpScope(this);
             for (uint32_t tickPc : kTickPcs)
             {
-                if (!hasFunction(tickPc) || (s_noAdxPump && tickPc == 0x0028a530u))
+                if (ctx != &m_cpuContext || !hasFunction(tickPc) || (s_noAdxPump && tickPc == 0x0028a530u))   // [pumpmain]
                 {
                     continue;
                 }
@@ -1896,7 +1997,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                     {
                         for (uint32_t bp : kBurstPcs)
                         {
-                            if (!hasFunction(bp))
+                            if (ctx != &m_cpuContext || !hasFunction(bp))   // [pumpmain]
                             {
                                 continue;
                             }
@@ -2073,7 +2174,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             static thread_local uint64_t s_dispTick = 0u;
             // Only once slot 6 is registered (handler non-zero) and init settled.
             uint32_t slot6 = *reinterpret_cast<uint32_t *>(rdram + (0x321810u & 0x01FFFFFFu));
-            if (slot6 != 0u && ++s_dispTick > 3000u && hasFunction(0x00285fa0u))
+            if (ctx == &m_cpuContext && slot6 != 0u && ++s_dispTick > 3000u && hasFunction(0x00285fa0u))   // [pumpmain]
             {
                 s_pumping = true;
                 GuestExecutionScope dispScope(this);
@@ -2161,7 +2262,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             static const uint64_t s_kickDelaySec = [](){ const char *v = std::getenv("PS2X_KICKDELAY"); return (v && v[0]) ? std::strtoull(v, nullptr, 10) : 150ull; }();
             static const std::chrono::steady_clock::time_point s_startTp = std::chrono::steady_clock::now();
             const uint64_t elapsedSec = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - s_startTp).count();
-            if (!s_kicked && elapsedSec >= s_kickDelaySec && cnt == 1u && s_sawSndWait && hasFunction(kickPc))
+            if (ctx == &m_cpuContext && !s_kicked && elapsedSec >= s_kickDelaySec && cnt == 1u && s_sawSndWait && hasFunction(kickPc))   // [pumpmain]
             {
                 s_kicked = true;
                 s_pumping = true;
@@ -3011,6 +3112,8 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
     return top - 0x10u;
 }
 
+thread_local uint32_t g_schedLastPc = 0, g_schedLastRa = 0;   // [schedwhy] per guest thread, updated per dispatch
+extern std::atomic<uint32_t> g_bt3StateLive; // defined below; [eeround2] gate
 void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
 {
     uint32_t lastPc = std::numeric_limits<uint32_t>::max();
@@ -3040,6 +3143,26 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
     while (!isStopRequested())
     {
         const uint32_t pc = ctx->pc;
+        // [eeround2] PS2X_EEROUND2=1: EE chop+FTZ/DAZ only while in-fight (bt3state 0x2d).
+        // EEROUND (global, at thread start) was falsified on runs now known to be rig flakes;
+        // this variant flips MXCSR at the dispatch boundary from the live state gate.
+        {
+            static const bool s_eer2 = [](){ const char *v = std::getenv("PS2X_EEROUND2"); return v && v[0] && v[0] != '0'; }();
+            if (s_eer2)
+            {
+                const bool want = g_bt3StateLive.load(std::memory_order_relaxed) == 0x2du;
+                static thread_local bool s_eer2Cur = false;
+                if (want != s_eer2Cur)
+                {
+                    s_eer2Cur = want;
+                    if (want) _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
+                    else      _mm_setcsr(_mm_getcsr() & ~0xE040u);
+                    static std::atomic<bool> s_eer2Said{false}; bool e = false;
+                    if (want && s_eer2Said.compare_exchange_strong(e, true))
+                        std::fprintf(stderr, "[eeround2] ACTIVE (state=0x2d): EE chop+FTZ\n");
+                }
+            }
+        }
 
         if (schedMain && (fairnessCounter % kFairnessYieldInterval) == 0u && fairnessCounter != 0u)
         {
@@ -3078,9 +3201,51 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
             }
         }
 
+        g_schedLastPc = pc; g_schedLastRa = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));   // [schedwhy]
+        {   // [dispatchpump] the loading deadlock the spin detector misses: the main thread polls through SEVERAL pcs
+            // (never the same one 2000x), the loader threads sit blocked on CD completions, and nothing ticks the CD
+            // file server or hands the cooperative token over. Every 16k dispatches on the main thread: tick the
+            // server if it has not run for 20 ms (no sleep), and yield once if another guest thread is runnable.
+            static const bool s_dpOn = [](){ const char *v = std::getenv("PS2X_DISPATCHPUMP"); return !(v && v[0] == '0'); }();
+            static thread_local uint32_t s_dp = 0;
+            if (s_dpOn && m_schedEnabled && ctx == &m_cpuContext && ((++s_dp & 0x3FFFu) == 0u))
+            {
+                if (ps2xCdTickStale(20u)) ps2xCdTickOnly(rdram, ctx, this);
+                bool othersPresent = false;
+                {   // any other guest thread at all: a thread whose semaphore was just signalled from the RPC/interrupt
+                    // path still shows blocked=true until it gets the token, and this loop is the only place the main
+                    // thread's syscall-free polling ever gives it up (P17: sound thread tid4 signalled, never scheduled)
+                    std::lock_guard<std::mutex> lk(m_schedMutex);
+                    for (auto &kv : m_schedThreads) { const SchedThread &s = *kv.second; if (kv.first != m_schedCurrent && s.present) { othersPresent = true; break; } }
+                }
+                if (othersPresent)
+                {
+                    static std::atomic<uint32_t> s_dy{0};
+                    const uint32_t k = s_dy.fetch_add(1u);
+                    if (k < 4u || (k % 20000u) == 0u) std::fprintf(stderr, "[dispatchpump] main thread yield (x%u) at pc 0x%x\n", k + 1u, pc);
+                    void *scope = ps2xGuestWaitBegin(); std::this_thread::yield(); ps2xGuestWaitEnd(scope);
+                }
+            }
+        }
         if (pc == lastPc)
         {
             ++samePcCount;
+            if (samePcCount == 2000u || samePcCount == 20000u || samePcCount == 200000u || samePcCount == 2000000u)
+            {   // [stallprobe] the infinite-loading freeze re-dispatches at one pc forever (0x1149a0,
+                // func_114860 spinning on a halfword at [$t6+8]). Name what it spins on.
+                auto R = [&](int i) { return static_cast<uint32_t>(_mm_extract_epi32(ctx->r[i], 0)); };
+                const uint32_t t6 = R(14);
+                const uint8_t *rd = m_memory.getRDRAM();
+                auto rd16 = [&](uint32_t va) -> uint32_t { uint16_t v = 0; std::memcpy(&v, rd + ((va & 0x1FFFFFFFu) & PS2_RAM_MASK), 2); return v; };
+                auto rd32 = [&](uint32_t va) -> uint32_t { uint32_t v = 0; std::memcpy(&v, rd + ((va & 0x1FFFFFFFu) & PS2_RAM_MASK), 4); return v; };
+                std::fprintf(stderr, "[stallprobe] pc=0x%x x%u %s ra=0x%x | t6=0x%x [t6+8]=0x%x [t6+0]=0x%08x [t6+4]=0x%08x [t6+c]=0x%08x | a0=0x%x a1=0x%x a2=0x%x a3=0x%x v0=0x%x s0=0x%x s1=0x%x s2=0x%x t7=0x%x t8=0x%x\n",
+                             pc, samePcCount, (ctx == &m_cpuContext) ? "main" : "thread", R(31), t6, rd16(t6 + 8u), rd32(t6), rd32(t6 + 4u), rd32(t6 + 0xCu),
+                             R(4), R(5), R(6), R(7), R(2), R(16), R(17), R(18), R(15), R(24));
+            }
+            if ((samePcCount % 2000u) == 0u && ctx == &m_cpuContext)   // [pumpmain] never run the tick on a sound thread's 2 KB stack
+            {   // [spinpump] a busy-poll: advance the CD file server and let other guest threads run (see game_overrides)
+                ps2xSpinPump(rdram, ctx, this);
+            }
             if ((samePcCount % kSamePcYieldInterval) == 0u)
             {
                 PS2_IF_AGRESSIVE_LOGS({
@@ -3353,7 +3518,8 @@ void PS2Runtime::schedBeginBlock(int tid)
     if (!m_schedEnabled) return;
     std::lock_guard<std::mutex> lk(m_schedMutex);
     auto it = m_schedThreads.find(tid);
-    if (it != m_schedThreads.end()) it->second->blocked = true;
+    extern thread_local uint32_t g_schedLastPc, g_schedLastRa;
+    if (it != m_schedThreads.end()) { it->second->blocked = true; it->second->blockPc = g_schedLastPc; it->second->blockRa = g_schedLastRa; }   // [schedwhy]
     if (m_schedCurrent == tid)
     {
         int nxt = schedPickNextLocked(tid);
@@ -3544,8 +3710,15 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
+std::atomic<uint32_t> g_bt3StateLive{0xffffffffu};   // [barblock] last bt3state seen by the status probe
+static PS2Runtime *g_waitHookRuntime = nullptr;   // [barblock]
+void *PS2Runtime::guestWaitBegin() { return new GuestExecutionReleaseScope(this); }
+void PS2Runtime::guestWaitEnd(void *handle) { delete static_cast<GuestExecutionReleaseScope *>(handle); }
+extern "C" void *ps2xGuestWaitBegin() { return g_waitHookRuntime ? g_waitHookRuntime->guestWaitBegin() : nullptr; }
+extern "C" void ps2xGuestWaitEnd(void *h) { if (h && g_waitHookRuntime) g_waitHookRuntime->guestWaitEnd(h); }
 void PS2Runtime::run()
 {
+    g_waitHookRuntime = this;   // [barblock]
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
     ps2_syscalls::resetSoundDriverRpcState();
@@ -3574,6 +3747,17 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        // [eeround] PS2X_EEROUND=1: run the guest thread's float math (EE FPU and
+        // VU0-macro ops, both SSE in recompiled code) under RZ+FTZ+DAZ — PCSX2's
+        // default EE/VU "Chop/Zero" rounding. Host default (round-nearest,
+        // denormals) diverges from console in the last bits of every FPU/VU0
+        // chain; the terrain lighting-group matrix path (sub_002188B8 ->
+        // sub_00120308/120C40 vmula/vmadda ACC chains) consumes exactly such
+        // math, and boundary chunks flip groups on those last bits.
+        {
+            static const bool s_eeRound = [](){ const char *v = std::getenv("PS2X_EEROUND"); return v && v[0] && v[0] != '0'; }();
+            if (s_eeRound) _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
+        }
         try
         {
             dispatchLoop(m_memory.getRDRAM(), &m_cpuContext);
@@ -3689,6 +3873,7 @@ void PS2Runtime::run()
                     std::memcpy(&bt3StatePtr, rd + (0x2ff10cu & PS2_RAM_MASK), 4);
                     if (bt3StatePtr)
                         std::memcpy(&bt3State, rd + (((bt3StatePtr & 0x1FFFFFFFu) + 0x18u) & PS2_RAM_MASK), 4);
+                    g_bt3StateLive.store(bt3State, std::memory_order_relaxed);   // [barblock] loading-state gate
                     std::memcpy(&fadeState, rd + (0x301048u & PS2_RAM_MASK), 4);
                     std::memcpy(&fadeLevel, rd + (0x301050u & PS2_RAM_MASK), 4);
                     // TEST (PS2X_FORCE_TRIANGLE): stamp the game's button flag with
@@ -3718,6 +3903,20 @@ void PS2Runtime::run()
                                   << " +0xa8=0x" << fa8 << " +0xbc=0x" << fbc << std::dec << std::endl;
                     }
                 }
+                {   // [sndblk] the sound stream control block 0x2c9350 (+8 / +4 sub-objects): the object the loading
+                    // hangs corrupt (field +0x10 = 0x02xxxxxx tagged handle dereferenced on tid4). Dumped with every
+                    // status line during loading (bt3state 0x2d) so a hung state can be diffed against a healthy one.
+                    const uint8_t *rd2 = m_memory.getRDRAM();
+                    auto r32 = [&](uint32_t a) -> uint32_t { uint32_t v = 0; std::memcpy(&v, rd2 + (a & PS2_RAM_MASK), 4); return v; };
+                    ps2xFixupRingDump();   // [fixupring] last 16 loader fixup calls, only when new ones arrived
+                    std::ostringstream sb; sb << "[sndblk] 0x2c9350:";
+                    for (uint32_t o = 0; o < 0x40u; o += 4u) sb << ' ' << std::hex << std::setw(8) << std::setfill('0') << r32(0x2c9350u + o);
+                    const uint32_t sub8 = r32(0x2c9358u), sub4 = r32(0x2c9354u);
+                    if (sub8 >= 0x100000u && sub8 < 0x2000000u) { sb << " | +8@" << sub8 << ":"; for (uint32_t o = 0; o < 0x20u; o += 4u) sb << ' ' << std::setw(8) << r32(sub8 + o); }
+                    if (sub4 >= 0x100000u && sub4 < 0x2000000u) { sb << " | +4@" << sub4 << ":"; for (uint32_t o = 0; o < 0x10u; o += 4u) sb << ' ' << std::setw(8) << r32(sub4 + o); }
+                    { sb << " | slot3@2deb70:"; for (uint32_t o = 0; o < 0x40u; o += 4u) sb << ' ' << std::setw(8) << r32(0x2deb70u + o); }   // [sndblk] the sub-object slot the healthy init returns
+                    std::cerr << sb.str() << std::dec << std::endl;
+                }
                 std::cerr << "[status] pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
                           << " ra=0x" << m_debugRa.load(std::memory_order_relaxed) << std::dec
                           << " dma=" << m_memory.dmaStartCount()
@@ -3738,7 +3937,19 @@ void PS2Runtime::run()
                     {
                         SchedThread &s = *kv.second;
                         std::cerr << " tid" << kv.first << "(" << (s.present?"P":"-") << (s.blocked?"B":"-")
-                                  << ",ord=" << s.order << ")";
+                                  << ",ord=" << s.order;
+                        if (s.blocked) std::cerr << ",pc=0x" << std::hex << s.blockPc << ",ra=0x" << s.blockRa << std::dec;   // [schedwhy]
+                        if (s.blocked)
+                        {   // [schedwhy2]
+                            int wt = 0, wid = 0, sc = -1, sw = -1, wk = 0;
+                            if (ps2xThreadWaitInfo(kv.first, &wt, &wid, &sc, &sw, &wk))
+                            {
+                                std::cerr << ",wait=" << wt << "/" << wid;
+                                if (sc >= 0) std::cerr << ",sema(cnt=" << sc << ",waiters=" << sw << ")";
+                                std::cerr << ",wk=" << wk;
+                            }
+                        }
+                        std::cerr << ")";
                     }
                     std::cerr << std::endl;
                 }
@@ -3807,7 +4018,21 @@ void PS2Runtime::run()
         // Refresh the native evdev reader for any Linux gamepad that GLFW cannot map.
         ps2_stubs::PadEvdevLinux::instance().update();
 #endif
+        if (gpuMode) ps2GpuRenderer().serviceBlockingBarriers();   // [barblock]
         BeginDrawing();
+        {   // [presentstate] pre-render chunks and barrier services run GL work between presents and
+            // leave the GS emulation state behind (blend off / GS blend factors, scissor, colour mask,
+            // custom shader, texture unit). The frame blit and the ImGui overlay assume raylib's
+            // defaults: the overlay's glyph quads drawn with blending off are solid white rectangles.
+            rlDrawRenderBatchActive();
+            rlDisableScissorTest();
+            rlDisableDepthTest();
+            rlEnableColorBlend();
+            rlSetBlendMode(RL_BLEND_ALPHA);
+            rlColorMask(true, true, true, true);
+            rlActiveTextureSlot(0);
+            rlDisableShader();
+        }
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
@@ -3832,16 +4057,108 @@ void PS2Runtime::run()
         BeginBlendMode(BLEND_CUSTOM_SEPARATE);
         DrawTexturePro(presentTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         EndBlendMode();
+        {   // [presentlog] PS2X_PRESENTLOG=1: print every CHANGE of the present geometry (a 60 Hz alternation shows as a
+            // stream of transitions; a static picture shows two lines total).
+            static const bool s_pl = [](){ const char *v = std::getenv("PS2X_PRESENTLOG"); return v && v[0] && v[0] != '0'; }();
+            if (s_pl)
+            {
+                static unsigned long s_n = 0; ++s_n;
+                static float prev[10] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+                const float cur[10] = {(float)presentTex.id, (float)presentTex.width, (float)presentTex.height, srcX, srcY, srcWidth, srcHeight, screenWidth, screenHeight, dstRect.x};
+                bool ch = false; for (int i = 0; i < 10; ++i) ch |= (cur[i] != prev[i]);
+                if (ch) { std::fprintf(stderr, "[presentlog] #%lu tex=%u %dx%d src=(%.1f,%.1f %gx%g) screen=%gx%g dst=(%.2f,%.2f %.2fx%.2f)\n", s_n, presentTex.id, presentTex.width, presentTex.height, srcX, srcY, srcWidth, srcHeight, screenWidth, screenHeight, dstRect.x, dstRect.y, dstRect.width, dstRect.height); for (int i = 0; i < 10; ++i) prev[i] = cur[i]; }
+            }
+        }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
-        EndDrawing();
+        {   // [frameprof] PS2X_FRAMEPROF=1: where does the main-loop frame go? (display-path dips)
+            static const bool s_fp = [](){ const char *v = std::getenv("PS2X_FRAMEPROF"); return v && v[0] && v[0] != '0'; }();
+            extern double g_fpPresent, g_fpBar, g_fpPre, g_fpWait, g_fpLoop; extern int g_fpN;
+            const auto tP0 = std::chrono::steady_clock::now();
+            EndDrawing();
+            if (s_fp)
+            {
+                const auto t1 = std::chrono::steady_clock::now();
+                g_fpPresent += std::chrono::duration<double, std::milli>(t1 - tP0).count();
+                ++g_fpN;
+                static auto lastPrint = t1;
+                static auto lastLoop = t1;
+                g_fpLoop += std::chrono::duration<double, std::milli>(t1 - lastLoop).count(); lastLoop = t1;
+                if (std::chrono::duration<double>(t1 - lastPrint).count() >= 1.0)
+                {
+                    lastPrint = t1;
+                    const double n = (double)std::max(1, g_fpN);
+                    std::fprintf(stderr, "[frameprof] n=%d loop %.1f ms: present %.2f bar %.2f pre %.2f wait %.2f (other %.2f)\n",
+                                 g_fpN, g_fpLoop / n, g_fpPresent / n, g_fpBar / n, g_fpPre / n, g_fpWait / n,
+                                 (g_fpLoop - g_fpPresent - g_fpBar - g_fpPre - g_fpWait) / n);
+                    g_fpPresent = g_fpBar = g_fpPre = g_fpWait = g_fpLoop = 0; g_fpN = 0;
+                }
+            }
+        }
+        {   // [ftspike] PS2X_FTSPIKE=1: PER-FRAME time spikes. The [fps] line is a ~1s average;
+            // a 29.9 mean can hide 50-80 ms hitch frames that FEEL like dips ("the dips are
+            // noticable" with min-28.8 logs). Tracks inter-present deltas: per second prints
+            // the worst frame, a bucket histogram, and the count of frames over 40/50 ms.
+            static const bool s_fts = [](){ const char *v = std::getenv("PS2X_FTSPIKE"); return v && v[0] && v[0] != '0'; }();
+            if (s_fts)
+            {
+                static auto last = std::chrono::steady_clock::now();
+                static auto lastPr = last;
+                static double mx = 0; static int n = 0, b25 = 0, b33 = 0, b40 = 0, b50 = 0, b80 = 0;
+                const auto now = std::chrono::steady_clock::now();
+                const double dt = std::chrono::duration<double, std::milli>(now - last).count();
+                last = now; ++n;
+                if (dt > mx) mx = dt;
+                if (dt > 80.0) ++b80; else if (dt > 50.0) ++b50; else if (dt > 40.0) ++b40; else if (dt > 34.5) ++b33; else if (dt > 26.0) ++b25;
+                if (std::chrono::duration<double>(now - lastPr).count() >= 1.0)
+                {
+                    lastPr = now;
+                    std::fprintf(stderr, "[ftspike] n=%d max=%.1fms  >26:%d >34.5:%d >40:%d >50:%d >80:%d\n",
+                                 n, mx, b25, b33, b40, b50, b80);
+                    mx = 0; n = 0; b25 = b33 = b40 = b50 = b80 = 0;
+                }
+            }
+        }
 
         // Drain any streaming PCM into the audio device. Must run on the render thread --
         // raylib's AudioStream calls are not safe to make from the guest threads that
         // produce the data (see PS2AudioBackend::onStreamPcm / serviceStreams).
         audioBackend().serviceStreams();
+        static const bool s_barPace2 = [](){ const char *v = std::getenv("PS2X_BARPACE"); return !(v && v[0] == '0'); }();
+        if (gpuMode && GsGpuRenderer::blockingBarriersEnabled() && s_barPace2)
+        {   // [barblock] pace to 60 Hz ourselves, servicing barrier requests while we wait.
+            static auto s_next = std::chrono::steady_clock::now();
+            const auto period = std::chrono::microseconds(16667);
+            auto now = std::chrono::steady_clock::now();
+            if (s_next + std::chrono::milliseconds(50) < now) s_next = now;   // fell behind: resync
+            s_next += period;
+            while ((now = std::chrono::steady_clock::now()) < s_next)
+            {
+                const auto tA = std::chrono::steady_clock::now();
+                const bool svcIdle = !ps2GpuRenderer().serviceBlockingBarriers();
+                { extern double g_fpBar; g_fpBar += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tA).count(); }
+                if (svcIdle)
+                {
+                    // [pubbreak] a published frame is waiting: present it now instead of idling to the deadline.
+                    // prerenderChunk() refuses to run while a list is pending (ordering), so every microsecond spent
+                    // here after a publish is pre-render coverage lost -> a bigger render leg at the next barrier
+                    // (outline SJ3: render leg 366 ms/60 frames vs 127 before the guest got faster).
+                    static const bool s_pb = [](){ const char *v = std::getenv("PS2X_PUBBREAK"); return !(v && v[0] == '0'); }();
+                    if (s_pb && ps2GpuRenderer().hasPendingFrame()) break;
+                    const auto tB = std::chrono::steady_clock::now();
+                    const bool didPre = ps2GpuRenderer().prerenderChunk();
+                    { extern double g_fpPre; g_fpPre += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tB).count(); }
+                    if (didPre) continue;   // [prerender] draw ahead while the guest records
+
+                    const auto left = std::chrono::duration_cast<std::chrono::microseconds>(s_next - now).count();
+                    const auto tC = std::chrono::steady_clock::now();
+                    ps2GpuRenderer().waitForBlockingBarrierRequest((int)std::max<long long>(1, left));   // cv-driven: wakes on a request, else sleeps to the frame deadline
+                    { extern double g_fpWait; g_fpWait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tC).count(); }
+                }
+            }
+        }
 
         // PS2X_TEXWATCH (default ON, =0 disables): find the recompiled-EE writer of the
         // CORRUPTED floor TEX0 (tw=10 where real HW authors tw=8 — the stage-texture root
@@ -4004,7 +4321,16 @@ void PS2Runtime::run()
                 extern std::atomic<uint64_t> g_bt3FrameCount;
                 static uint64_t s_lastGameFrames = 0u;
                 uint64_t gameFrames = g_bt3FrameCount.load(std::memory_order_relaxed);
+                extern std::atomic<uint64_t> g_guestBusyNs, g_guestBusyFrames, g_guestWallNs;
+                static uint64_t s_lastBusyNs = 0, s_lastBusyFrames = 0, s_lastWallNs = 0;
+                const uint64_t bn = g_guestBusyNs.load(std::memory_order_relaxed), bf = g_guestBusyFrames.load(std::memory_order_relaxed);
+                const uint64_t wn = g_guestWallNs.load(std::memory_order_relaxed);
+                const double guestMs = (bf > s_lastBusyFrames) ? (double)(bn - s_lastBusyNs) / 1.0e6 / (double)(bf - s_lastBusyFrames) : 0.0;   // [guestbusy] ms of guest CPU per published frame
+                const double wallMs = (bf > s_lastBusyFrames) ? (double)(wn - s_lastWallNs) / 1.0e6 / (double)(bf - s_lastBusyFrames) : 0.0;   // [guestwall]
+                s_lastBusyNs = bn; s_lastBusyFrames = bf; s_lastWallNs = wn;
                 std::cerr << "[fps] GAME=" << (double)((gameFrames - s_lastGameFrames) / dt)
+                          << " guest_ms=" << guestMs
+                          << " wall_ms=" << wallMs
                           << " host=" << (uint32_t)(s_fpsFrames / dt)
                           << " prims/sec=" << (uint64_t)((prims - s_lastPrims) / dt)
                           << " Mpix/sec=" << (double)((pix - s_lastPix) / dt / 1.0e6)
@@ -4027,6 +4353,7 @@ void PS2Runtime::run()
     }
 
     requestStop();
+    if (GsGpuRenderer::enabled()) ps2GpuRenderer().abortBlockingBarriers();   // [barblock]
 
     const auto joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!gameThreadFinished.load(std::memory_order_acquire) &&

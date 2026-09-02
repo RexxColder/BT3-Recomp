@@ -1,5 +1,8 @@
+#include <xmmintrin.h>
 #include "Common.h"
 #include "Thread.h"
+
+extern std::atomic<uint32_t> g_bt3StateLive; // [eeround2] gate (ps2_runtime.cpp)
 
 namespace ps2_syscalls
 {
@@ -336,6 +339,20 @@ namespace ps2_syscalls
             info->waitId = 0;
             info->wakeupCount = 0;
             info->suspendCount = 0;
+            {   // [minstack] PS2X_MINSTACK=<bytes>: a guest thread created with a smaller stack gets a private larger one.
+                // BT3's sound threads are created with 0x800/0x1000-byte stacks right above the sound stream control block
+                // 0x2c9350; the loading hangs show a 64-bit register spill landing on that block (see bt3-loading-stall).
+                static const uint32_t s_minStack = [](){ const char *v = std::getenv("PS2X_MINSTACK"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
+                if (s_minStack != 0u && !info->ownsStack && info->stackSize != 0u && info->stackSize < s_minStack)
+                {
+                    const uint32_t big = runtime->guestMalloc(s_minStack, 16u);
+                    if (big != 0)
+                    {
+                        std::fprintf(stderr, "[minstack] tid=%d stack 0x%x size 0x%x -> private 0x%x size 0x%x\n", tid, info->stack, info->stackSize, big, s_minStack);
+                        info->stack = big; info->stackSize = s_minStack; info->ownsStack = true;
+                    }
+                }
+            }
             if (info->stack == 0 && info->stackSize != 0)
             {
                 const uint32_t autoStack = runtime->guestMalloc(info->stackSize, 16u);
@@ -365,6 +382,10 @@ namespace ps2_syscalls
             {
                 std::string name = "PS2Thread_" + std::to_string(tid);
                 ThreadNaming::SetCurrentThreadName(name);
+                {   // [eeround] guest threads run recompiled FPU/VU0 math too
+                    static const bool s_eeRound = [](){ const char *v = std::getenv("PS2X_EEROUND"); return v && v[0] && v[0] != '0'; }();
+                    if (s_eeRound) _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
+                }
             }
             R5900Context threadCtxCopy{};
             R5900Context *threadCtx = &threadCtxCopy;
@@ -372,6 +393,20 @@ namespace ps2_syscalls
             // context leaves it (0,0,0,0), which poisons every VU0 macro-mode matrix (the
             // identity basis is built by rotating vf0). Seed the constant for this thread.
             threadCtx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+                {
+                    // [vf0basis] PS2X_VF0BASIS=1: seed the persistent VU0 identity basis rows the
+                    // game establishes once via FUN_00120088 (MR32 chain) — hardware shares ONE
+                    // physical VU0 across threads; per-thread contexts otherwise start them zero
+                    // and func_121E50's normalize drops z^2 (vf3.x==0) => terrain band tears.
+                    static const bool s_vb = [](){ const char *v = std::getenv("PS2X_VF0BASIS"); return v && v[0] && v[0] != '0'; }();
+                    if (s_vb)
+                    {
+                        threadCtx->vu0_vf[1] = _mm_set_ps(0.0f, 1.0f, 0.0f, 0.0f); // (0,0,1,0)
+                        threadCtx->vu0_vf[2] = _mm_set_ps(0.0f, 0.0f, 1.0f, 0.0f); // (0,1,0,0)
+                        threadCtx->vu0_vf[3] = _mm_set_ps(0.0f, 0.0f, 0.0f, 1.0f); // (1,0,0,0)
+                    }
+                }
+
 
             {
                 std::lock_guard<std::mutex> lock(info->m);
@@ -434,6 +469,26 @@ namespace ps2_syscalls
                 while (runtime && !runtime->isStopRequested())
                 {
                     ++stepCount;
+        // [eeround2] PS2X_EEROUND2=1: EE chop+FTZ/DAZ only while in-fight (bt3state 0x2d).
+        // EEROUND (global, at thread start) was falsified on runs now known to be rig flakes;
+        // this variant flips MXCSR at the dispatch boundary from the live state gate.
+        {
+            static const bool s_eer2 = [](){ const char *v = std::getenv("PS2X_EEROUND2"); return v && v[0] && v[0] != '0'; }();
+            if (s_eer2)
+            {
+                const bool want = g_bt3StateLive.load(std::memory_order_relaxed) == 0x2du;
+                static thread_local bool s_eer2Cur = false;
+                if (want != s_eer2Cur)
+                {
+                    s_eer2Cur = want;
+                    if (want) _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
+                    else      _mm_setcsr(_mm_getcsr() & ~0xE040u);
+                    static std::atomic<bool> s_eer2Said{false}; bool e = false;
+                    if (want && s_eer2Said.compare_exchange_strong(e, true))
+                        std::fprintf(stderr, "[eeround2] ACTIVE (state=0x2d): EE chop+FTZ\n");
+                }
+            }
+        }
                     if (schedOn && (stepCount % kSchedQuantum) == 0u)
                     {
                         runtime->schedYield(tid);
@@ -1299,4 +1354,20 @@ namespace ps2_syscalls
         }
         return false;
     }
+}
+
+// [schedwhy2] wait reason of a guest thread for the [sched-state] dump: wait type / id, and for a semaphore wait the
+// semaphore's current count and waiter count. Returns false if the thread is unknown.
+extern "C" bool ps2xThreadWaitInfo(int tid, int *waitType, int *waitId, int *semaCount, int *semaWaiters, int *wakeupCount)
+{
+    auto info = lookupThreadInfo(tid);
+    if (!info) return false;
+    std::lock_guard<std::mutex> lock(info->m);
+    *waitType = info->waitType; *waitId = info->waitId; *wakeupCount = info->wakeupCount; *semaCount = -1; *semaWaiters = -1;
+    if (info->waitType == TSW_SEMA)
+    {
+        auto sema = lookupSemaInfo(info->waitId);
+        if (sema) { *semaCount = sema->count; *semaWaiters = sema->waiters; }
+    }
+    return true;
 }

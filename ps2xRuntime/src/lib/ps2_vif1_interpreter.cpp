@@ -15,6 +15,12 @@ namespace { std::atomic<uint32_t> g_boneScanTarget{0}; }
 extern std::vector<std::array<uint32_t, 3>> g_kickSrcMap; // see ps2_memory.cpp
 extern bool g_kickSrcMapEnabled();
 extern uint32_t g_vif1QwcSrcGuest; // qwc (non-chain) transfer source base
+// [shadowpass] PS2X_SHADOWPASS=1: the game sends the Pass-1 shadow-silhouette GS context every frame
+// (DIRECT A+D FRAME_1=0x40150 = fbp336 fbw4, then SCISSOR_1 (1,1)-(254,254)) but no vertices ever land
+// in fbp336 under our runtime (pcsx2dump draw 1849 = 9348-vertex grey mesh). Count what VIF1/VU1 do
+// while that context is current: MSCALs (entry pc), XGKICKs and their GIF NLOOPs.
+bool g_spInShadow = false; bool g_spFrame336 = false; bool g_spScissor254 = false;
+uint32_t g_spSets = 0, g_spMscal = 0, g_spLastPC = 0, g_spKicks = 0, g_spLoops = 0, g_spUnpackQw = 0;
 extern bool g_vif1QwcActive;
 // PS2X_KICKHIST: rolling history of recent VIF1 unpacks (dest qw, count, EE source, frame),
 // dumped by the XGKICK spike probe to show exactly which writes fed a popup kick's buffer.
@@ -47,6 +53,7 @@ namespace { std::atomic<uint64_t> g_vifUnpackNs{0}; std::atomic<uint64_t> g_vifU
     std::atomic<int> g_mtxSeqN{-1}; // -1 = not armed; >=0 = events logged
 }
 
+thread_local bool g_upsrcArmSheet = false;   // [upsrc2]
 enum VIFCmd : uint8_t
 {
     VIF_NOP = 0x00,
@@ -473,6 +480,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
             uint32_t startPC = (uint32_t)imm * 8u;
+            if (g_spInShadow) { ++g_spMscal; g_spLastPC = startPC; }   // [shadowpass]
             // [mvpdisp]: which microprogram consumes the last 13qw@addr0 unpack (healthy vs
             // degenerate)? Same pc for both = one program, garbage input; different pc =
             // packet families and the degenerate ones are misrouted.
@@ -610,6 +618,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
                 if (pos + copyBytes <= sizeBytes)
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                    { extern std::atomic<uint32_t> g_vu1CodeGen; g_vu1CodeGen.fetch_add(1u, std::memory_order_relaxed); }   // [vucache16] invalidate the decode cache
             }
             pos += mpgBytes;
             if (pos > sizeBytes)
@@ -628,6 +637,83 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             if (qwCount > 0)
             {
+                // [upsrc2] armed by a BITBLTBUF dbp=10752 header DIRECT: sample THIS payload
+                // (the sheet image data) and find its guest RAM home by memmem.
+                if (g_upsrcArmSheet && qwCount >= 1024u)
+                {
+                    g_upsrcArmSheet = false;
+                    static std::atomic<int> s_sc{0};
+                    {   // [upsrc3 2026-09-01] dump the first SIX armed payloads + multi-window RAM base vote
+                        static std::atomic<int> s_dumpN{0};
+                        const int dn = s_dumpN.fetch_add(1);
+                        if (dn < 6)
+                        {
+                            const uint32_t lim3 = std::min(sizeBytes - pos, qwCount * 16u);
+                            char pth3[96];
+                            std::snprintf(pth3, sizeof pth3, "/home/z3/Desktop/bt3/work/upload_payload_%d.bin", dn);
+                            if (FILE *f = std::fopen(pth3,"wb"))
+                            { std::fwrite(data + pos, 1, lim3, f); std::fclose(f);
+                              std::fprintf(stderr, "[upsrc3] payload %d dumped (%u bytes)\n", dn, lim3); }
+                            // vote: 10 entropy-checked windows spread across the payload; base = home - windowOff
+                            int votes = 0; uint32_t base0 = 0; int agree = 0;
+                            for (int wnd = 0; wnd < 10; ++wnd)
+                            {
+                                const uint32_t wo = 256u + (uint32_t)wnd * (lim3 > 4096u ? (lim3 - 512u) / 10u : 64u);
+                                if (wo + 64u > lim3) break;
+                                bool seen[256]={}; int di=0;
+                                for (int i=0;i<64;++i){ const uint8_t b=data[pos+wo+i]; if(!seen[b]){seen[b]=true;++di;} }
+                                if (di < 16) continue;
+                                for (uint32_t a = 0; a + 64u <= PS2_RAM_SIZE; a += 16u)
+                                    if (std::memcmp(m_rdram + a, data + pos + wo, 64) == 0)
+                                    {
+                                        const uint32_t b2 = a - (wo & ~15u);
+                                        std::fprintf(stderr, "[upsrc3] wnd+0x%x home=0x%08x base=0x%08x\n", wo, a, b2);
+                                        ++votes; if (!base0) { base0 = b2; agree = 1; } else if (b2 == base0) ++agree;
+                                        break;
+                                    }
+                            }
+                            std::fprintf(stderr, "[upsrc3] votes=%d agree=%d base0=0x%08x\n", votes, agree, base0);
+                        }
+                    }
+                    if (s_sc.fetch_add(1) < 3 && pos + 80u + 64u <= sizeBytes)
+                    {
+                        // [upsrc2-fix 2026-09-01] STRONG needle: the old fixed payload+80 window could be
+                        // all-zero, matching the first zero block in RAM (0x53d3a0 mirage — 3 runs, byte
+                        // watch showed pure zeros there). Skip forward to a 64B window with >=16 distinct
+                        // byte values before searching; also search SPR (scratchpad DMA sources never
+                        // touch main RAM and their stores take the traceless special path).
+                        const uint8_t *needle = data + pos + 80u;
+                        {
+                            const uint32_t lim2 = std::min(sizeBytes - pos, qwCount * 16u);
+                            for (uint32_t w = 80u; w + 64u <= lim2 && w < 4096u; w += 16u)
+                            {
+                                bool seen[256] = {}; int distinct = 0;
+                                for (int i = 0; i < 64; ++i) { const uint8_t b = data[pos + w + i]; if (!seen[b]) { seen[b] = true; ++distinct; } }
+                                if (distinct >= 16) { needle = data + pos + w; break; }
+                            }
+                        }
+                        {   // scratchpad scan (16KB) — inline accessor from runtime/ps2_memory.h
+                            if (uint8_t *sp = ps2GetScratchpadHostPtr())
+                                for (uint32_t a = 0; a + 64u <= 16384u; a += 16u)
+                                    if (std::memcmp(sp + a, needle, 64) == 0)
+                                    { std::fprintf(stderr, "[upsrc2] SHEET payload found in SPR at 0x%04x (qwc=%u)\n", a, qwCount); break; }
+                        }
+                        int hits = 0;
+                        for (uint32_t a = 0; a + 64u <= PS2_RAM_SIZE && hits < 3; a += 16u)
+                            if (std::memcmp(m_rdram + a, needle, 64) == 0)
+                            {
+                                ++hits;
+                                std::fprintf(stderr, "[upsrc2] SHEET payload found in RAM at 0x%08x (qwc=%u)\n", a, qwCount);
+                                // [sheetwriters] aim the global store-watch at THIS run's staging buffer:
+                                // next frame's rebuild reports its writer pcs as [camwrite].
+                                extern std::atomic<uint32_t> g_ps2WatchLo, g_ps2WatchHi;
+                                g_ps2WatchLo.store(a, std::memory_order_relaxed);
+                                g_ps2WatchHi.store(a + 0x80u, std::memory_order_relaxed);
+                                std::fprintf(stderr, "[upsrc2] store-watch re-aimed to 0x%08x..0x%08x\n", a, a + 0x80u);
+                            }
+                        if (!hits) std::fprintf(stderr, "[upsrc2] SHEET sample not in RAM (qwc=%u; staged/SPR?)\n", qwCount);
+                    }
+                }
                 // PS2X_VIFTEX: the terrain draw DIRECTs (TEX0 tbp0 10816/10880/10944/10992)
                 // exist in EE RAM, the chain walker visits their tags, offline sim parses them
                 // — yet the GS never sees those TEX0s. Log when a DIRECT containing one passes
@@ -680,6 +766,69 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         }
                         else
                             o += nloop * 16u;
+                    }
+                }
+                {   // [upsrc2] PS2X_UPSRC=1: guest source of the band-sheet upload — scan DIRECT
+                    // payloads for A+D BITBLTBUF with DBP==10752 and report the guest src address.
+                    static const bool s_u2 = [](){ const char *v = std::getenv("PS2X_UPSRC"); return v && v[0] && v[0] != '0'; }();
+                    if (s_u2)
+                    {
+                        static std::atomic<int> s_un2{0};
+                        const uint32_t lim = qwCount * 16u;
+                        for (uint32_t o = 0; o + 16u <= lim && s_un2.load(std::memory_order_relaxed) < 24; o += 16u)
+                        {
+                            uint64_t plo, phi;
+                            std::memcpy(&plo, data + pos + o, 8); std::memcpy(&phi, data + pos + o + 8, 8);
+                            const uint32_t u2dbp = (uint32_t)((plo >> 32) & 0x3FFFu);
+                            if ((phi & 0xFFu) == 0x50u && u2dbp == 10752u)
+                            {
+                                uint32_t srcG = 0u;
+                                if (g_vif1QwcActive) srcG = g_vif1QwcSrcGuest + pos + o;
+                                else if (data >= m_rdram && data < m_rdram + PS2_RAM_SIZE) srcG = (uint32_t)(data - m_rdram) + pos + o;
+                                if (s_un2.fetch_add(1) < 24)
+                                    std::fprintf(stderr, "[upsrc2] BITBLTBUF dbp=%u sbp=%u spsm=%u srcG=0x%08x qwc=%u\n",
+                                                 u2dbp, (uint32_t)(plo & 0x3FFFu), (uint32_t)((plo >> 24) & 0x3Fu), srcG, qwCount);
+                                // capture the CLUT payload + its guest address once: the IMAGE data follows
+                                // in the VIF stream — dump the next 2KB of stream bytes with their srcG base.
+                                g_upsrcArmSheet = true;   // payload arrives in the NEXT big DIRECT
+                            }
+                        }
+                    }
+                }
+                {   // [shadowpass] detect the Pass-1 context in DIRECT A+D packets
+                    static const bool s_sp = [](){ const char *v = std::getenv("PS2X_SHADOWPASS"); return v && v[0] && v[0] != '0'; }();
+                    if (s_sp)
+                    {
+                        uint32_t o = 0; const uint32_t lim = qwCount * 16u;
+                        while (o + 16u <= lim && o < 4096u)
+                        {
+                            uint64_t tlo, thi; std::memcpy(&tlo, data + pos + o, 8); std::memcpy(&thi, data + pos + o + 8, 8); o += 16u;
+                            const uint32_t nloop = (uint32_t)(tlo & 0x7FFF); const uint32_t flg = (uint32_t)((tlo >> 58) & 3u);
+                            uint32_t nreg = (uint32_t)((tlo >> 60) & 0xFu); if (!nreg) nreg = 16u;
+                            if (flg == 0u)
+                            {
+                                for (uint32_t l = 0; l < nloop && o + 16u <= lim; ++l)
+                                    for (uint32_t r = 0; r < nreg && o + 16u <= lim; ++r, o += 16u)
+                                    {
+                                        if (((thi >> (r * 4u)) & 0xFu) != 14u) continue;
+                                        uint64_t plo, phi; std::memcpy(&plo, data + pos + o, 8); std::memcpy(&phi, data + pos + o + 8, 8);
+                                        const uint32_t addr = (uint32_t)(phi & 0xFFu);
+                                        if (addr == 0x4Cu) { g_spFrame336 = ((plo & 0xFFFFFFFFu) == 0x40150u); if (!g_spFrame336) g_spInShadow = false; }
+                                        else if (addr == 0x40u && g_spFrame336 && (plo & 0xFFFFFFFFFFFFull) == 0x00fe000100fe0001ull)
+                                        {
+                                            g_spInShadow = true; const uint32_t n = ++g_spSets;
+                                            if (n <= 4u || (n % 240u) == 0u)
+                                            {
+                                                std::fprintf(stderr, "[shadowpass] ctx set #%u (DIRECT qwc=%u) | since previous set: mscal=%u lastPC=0x%x unpackQw=%u kicks=%u nloopSum=%u\n",
+                                                             n, qwCount, g_spMscal, g_spLastPC, g_spUnpackQw, g_spKicks, g_spLoops);
+                                            }
+                                            g_spMscal = 0; g_spKicks = 0; g_spLoops = 0; g_spUnpackQw = 0;
+                                        }
+                                    }
+                            }
+                            else if (flg == 1u) o += ((nloop * nreg + 1u) / 2u) * 16u;
+                            else o += nloop * 16u;
+                        }
                     }
                 }
                 const bool directHl = (opcode == VIF_DIRECTHL);
@@ -1111,6 +1260,83 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 }
             }
 
+            // [cycletrace] PS2X_CYCLETRACE=<minframe>: log S-format and MASKED unpacks with
+            // their full cycle state (cmd/CL/WL/mode/mask) — the terrain per-cell param
+            // streams; decides whether fill-mode (WL>CL) semantics are in play there.
+            {
+                static const long s_ct = [](){ const char *v = std::getenv("PS2X_CYCLETRACE"); return v && v[0] ? std::atol(v) : -1; }();
+                if (s_ct >= 0 && (vn == 0u || maskEnable))
+                {
+                    extern std::atomic<uint64_t> g_bt3FrameCount;
+                    const long fr = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
+                    if (fr >= s_ct)
+                    {
+                        static std::atomic<int> s_cn{0};
+                        if (s_cn.fetch_add(1) < 100)
+                            std::fprintf(stderr, "[cycletrace] fr=%ld cmd=%02x vn=%d vl=%d m=%d vuAddr=%u cnt=%u cl=%u wl=%u mode=%u mask=%08x tops=%u\n",
+                                         fr, (unsigned)((imm >> 24) & 0xFFu) | 0x60u, (int)vn, (int)vl, maskEnable ? 1 : 0,
+                                         vuAddr, (unsigned)writeVectorCount, cl, wl, vif1_regs.mode & 3u, vif1_regs.mask, vif1_regs.tops & 0x3FFu);
+                    }
+                }
+            }
+            // [rowtrace] PS2X_ROWTRACE=<minframe>: log every unpack whose EFFECTIVE target is
+            // VU rows 0-15 (the terrain micro's uniform block; entry 0 latches vf1-8/vf13-16
+            // from there) with its guest SOURCE address -- raw chain-byte scans missed the
+            // carrier, so observe at the only place effective addresses exist.
+            {
+                static const long s_rt = [](){ const char *v = std::getenv("PS2X_ROWTRACE"); return v && v[0] ? std::atol(v) : -1; }();
+                if (s_rt >= 0 && vuAddr < 16u)
+                {
+                    extern std::atomic<uint64_t> g_bt3FrameCount;
+                    const long fr = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
+                    if (fr >= s_rt)
+                    {
+                        uint32_t srcG = 0u;
+                        if (g_vif1QwcActive) srcG = g_vif1QwcSrcGuest + pos;
+                        else
+                            for (size_t mi = g_kickSrcMap.size(); mi > 0; --mi)
+                                if (g_kickSrcMap[mi - 1][0] <= pos)
+                                { srcG = g_kickSrcMap[mi - 1][1] + (pos - g_kickSrcMap[mi - 1][0]); break; }
+                        // map empty on this feed path: when `data` points into guest RAM the
+                        // source is directly recoverable, no map needed.
+                        if (srcG == 0u && data >= m_rdram && data < m_rdram + PS2_RAM_SIZE)
+                            srcG = (uint32_t)(data - m_rdram) + pos;
+                        // PS2X_ROWTRACE_CNT=<n>: log only unpacks of exactly n vectors (12 = the
+                        // per-frame view-matrix upload) — big budget for a per-frame value series.
+                        static const long s_rtCnt = [](){ const char *v = std::getenv("PS2X_ROWTRACE_CNT"); return v && v[0] ? std::atol(v) : -1; }();
+                        if (s_rtCnt >= 0 && (long)writeVectorCount != s_rtCnt) goto rowtrace_done;
+                        static std::atomic<int> s_n{0};
+                        if (s_n.fetch_add(1) < (s_rtCnt >= 0 ? 4000 : 240))
+                        {
+                            float q0[4] = {0, 0, 0, 0};
+                            if (pos + 16u <= sizeBytes) std::memcpy(q0, data + pos, 16);
+                            std::fprintf(stderr, "[rowtrace] fr=%ld vuAddr=%u cnt=%u src=0x%08x q0=(%.3f %.3f %.3f %.3f)\n",
+                                         fr, vuAddr, (unsigned)writeVectorCount, srcG, q0[0], q0[1], q0[2], q0[3]);
+                        }
+                        rowtrace_done:;
+                    }
+                }
+            }
+            {   // [row12w] PS2X_ROW12LOG=1: log every V4-32 unpack whose dest range covers row 12
+                static const bool s_r12w = [](){ const char *v = std::getenv("PS2X_ROW12LOG"); return v && v[0] && v[0] != '0'; }();
+                if (s_r12w && vn == 3u && vl == 0u && vuAddr <= 12u && vuAddr + writeVectorCount > 12u)
+                {
+                    extern std::atomic<uint64_t> g_bt3FrameCount;
+                    const uint64_t fr_ = g_bt3FrameCount.load(std::memory_order_relaxed);
+                    if ((fr_ % 600u) < 2u)
+                    {
+                        static std::atomic<uint32_t> s_n{0};
+                        if (s_n.fetch_add(1) < 4000u)
+                        {
+                            uint32_t r12v = 0;
+                            const size_t off_ = pos + (size_t)(12u - vuAddr) * 16u;
+                            if (off_ + 4u <= sizeBytes) std::memcpy(&r12v, data + off_, 4);
+                            std::fprintf(stderr, "[row12w] fr=%llu dest=%u cnt=%u m=%d row12src=%08x\n",
+                                         (unsigned long long)fr_, vuAddr, (unsigned)writeVectorCount, maskEnable ? 1 : 0, r12v);
+                        }
+                    }
+                }
+            }
             // PS2X_KICKHIST: record this unpack in the rolling ring for spike-kick forensics.
             if (g_unpackRingEnabled() && vn == 3u && vl == 0u)
             {

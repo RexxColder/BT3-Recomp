@@ -1,6 +1,9 @@
 #include "Common.h"
 #include "RPC.h"
 
+extern std::atomic<uint32_t> g_ps2WatchLo;
+extern std::atomic<uint32_t> g_ps2WatchHi;
+
 namespace ps2_syscalls
 {
     namespace
@@ -944,6 +947,13 @@ namespace ps2_syscalls
 
         bool dtxCopyBytes(uint8_t *rdram, uint32_t dstAddr, uint32_t srcAddr, uint32_t len)
         {
+            ps2TraceGuestRangeWrite(rdram, dstAddr, len, "dtxcopy", nullptr);
+            {   // [dtxwatch] provenance when the copy covers the awatch range
+                const uint32_t wl = ::g_ps2WatchLo.load(std::memory_order_relaxed);
+                const uint32_t a0 = dstAddr & 0x1FFFFFFFu;
+                if (wl && a0 < ::g_ps2WatchHi.load(std::memory_order_relaxed) && a0 + len > wl)
+                    std::fprintf(stderr, "[dtxwatch] copy dst=0x%08x src=0x%08x len=%u\n", dstAddr, srcAddr, len);
+            }
             for (uint32_t i = 0; i < len; ++i)
             {
                 const uint8_t *src = getConstMemPtr(rdram, srcAddr + i);

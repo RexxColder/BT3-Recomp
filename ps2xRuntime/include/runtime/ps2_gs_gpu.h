@@ -190,6 +190,32 @@ struct GSContext
     uint64_t fba;
 };
 
+// [deferdec] everything a fast-path texture decode reads, snapshotted at record time so the
+// decode can run on the GL thread right after that thread writes the source page back.
+struct TexDecodeReq
+{
+    GSTex0Reg tex0{};
+    uint64_t clamp = 0;
+    GSTexaReg texa{0u, false, 0u};
+    GSTexClutReg texclut{0u, 0u, 0u};
+    int texW = 0, texH = 0;
+    bool rawAlphaDec = false;
+    uint64_t texKey = 0;
+    uint32_t pageLo = 0, pageHi = 0;
+    int subDxW = 0, subDx0 = 0;
+    uint32_t flushPage = 0xFFFFFFFFu, flushClutPage = 0xFFFFFFFFu;   // pages the GL thread must write back first
+    bool flushAlpha = false;
+    bool served = false;   // set by the GL thread once decoded
+    uint32_t coverLo = 0xFFFFFFFFu, coverLo2 = 0xFFFFFFFFu;   // [pageskip] first page of each flush's FBO cover
+    std::vector<uint32_t> coverSeq, coverSeq2;                 // [pageskip] m_contentSeq of the covered pages at the read: pages the guest wrote after it are not overwritten by the flush
+    uint32_t zwbBp = 0, zwbPsm = 0, zwbBw = 0; double zwbZMax = 0.0;   // [zwbsnap] ZBUF state at the read: the flush must not use the guest's LATER z
+    bool fmtValid = false; uint32_t fmtFbw = 0, fmtPsm = 0; int fmtMaxX = 0, fmtMaxY = 0;   // [fmtsnap] the flushed fbp's FRAME format at the read: a deferred flush must not use the guest's LATER view (stride/psm/extent)buf
+    std::vector<uint8_t> clutSnap; uint32_t clutSnapPage = 0xFFFFFFFFu; uint32_t clutSnapSeq[2] = {0u, 0u};   // [ddmirror] upload seq of the 2 palette pages at the post   // [clutsnap] the CLUT page(s) as they were at the READ: streamed palette slots change 7x per frame
+    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> srcSnap;
+    std::vector<uint32_t> srcSnapSeq;   // [srcsnap2] m_uploadSeq of each srcSnap page at the post
+    std::vector<uint32_t> coverContentSeq;   // [cseqsnap] m_contentSeq[flushPage .. +256) at the post: the flush's shadow/band bookkeeping must see the READ's stamps, not the guest's later ones   // [srcsnap] source pages OUTSIDE the flush cover, as they were at the READ (upload-fed sheets that get re-streamed before the service)
+};
+
 struct GSPrimReg
 {
     GSPrimType type;
@@ -364,7 +390,31 @@ public:
     void refreshDisplaySnapshot();
 
     inline void WriteVram(u32 psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+    void invalidateClutCache() { m_clutCacheKey = ~0ull; }   // [clutwb] (~0 = the "invalid until built" sentinel the decoders test) a VRAM writeback may have changed a rendered palette
     inline u32 ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const;
+
+    uint8_t *vramData() { return m_vram; }
+    // [slice] raw shadow of every general register written via writeRegister (A+D, REGLIST,
+    // PACKED). Lets the replay slicer re-emit the full register state as one A+D packet.
+    const uint64_t *rawRegs() const { return m_rawRegs; }
+    const bool *rawRegsSet() const { return m_rawSet; }
+    uint32_t vramSize() const { return m_vramSize; }
+    GSRasterizer &rasterizer() { return m_rasterizer; }   // [deferdec]
+
+    // Invalidate the decoded-palette cache. A barrier writeback can change a palette that
+    // lives in VRAM (BT3 RENDERS its outline CLUTs), and the cache key folds in this counter.
+    void bumpTexUploadGen() { ++m_texUploadGen; }
+    // [clutpagegen] per-8KB-page upload generation: the CLUT cache keys on the generation of the palette's own
+    // page(s) instead of the global m_texUploadGen (which every texture upload bumps -> a 256-entry palette
+    // rebuild + hash after any upload, 2.5% of the guest thread).
+    uint32_t m_pageUploadGen[512]{};
+    void bumpPageUploadGen(uint32_t dbpBlock, uint32_t sizeBlocks)
+    {
+        uint32_t p0 = dbpBlock / 32u, p1 = (dbpBlock + sizeBlocks) / 32u;
+        if (p0 > 511u) p0 = 511u;
+        if (p1 > 511u) p1 = 511u;
+        for (uint32_t p = p0; p <= p1; ++p) ++m_pageUploadGen[p];
+    }
 
 private:
     void snapshotVRAM();
@@ -402,6 +452,8 @@ private:
 
     GSContext m_ctx[2];
     GSPrimReg m_prim{};
+    uint64_t m_rawRegs[0x63] = {};
+    bool m_rawSet[0x63] = {};
 
     uint8_t m_curR = 0x80, m_curG = 0x80, m_curB = 0x80, m_curA = 0x80;
     float m_curQ = 1.0f;
@@ -424,6 +476,7 @@ private:
     // per pixel. Rebuilt (by GSRasterizer) when the state key or a texture upload
     // generation changes; read-only during parallel scanline rasterization.
     uint32_t m_clutCache[256]{};
+    uint64_t m_clutCacheHash16 = 0, m_clutCacheHash256 = 0;   // [cluthash] FNV of the decoded palette (16 / 256 entries), rebuilt with the cache -- the per-draw texture key mixes these instead of re-hashing 256 entries per draw
     uint64_t m_clutCacheKey = ~0ull;   // invalid until first build
     uint32_t m_texUploadGen = 0u;      // bumped on processImageData (palette/texture upload)
 
@@ -478,6 +531,12 @@ private:
 
     std::array<ReadVramFunc, 0x3F> m_read_vram_funcs{ };
     std::array<WriteVramFunc, 0x3F> m_write_vram_funcs{ };
+public:
+    // [wbhoist] direct access to the per-format VRAM accessors so bulk writers can hoist the
+    // std::function dispatch out of their per-pixel loops.
+    const ReadVramFunc &readVramFn(u32 psm) const { return m_read_vram_funcs[psm & 0x3F]; }
+    const WriteVramFunc &writeVramFn(u32 psm) const { return m_write_vram_funcs[psm & 0x3F]; }
+private:
 };
 
 inline u32 GS::ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const

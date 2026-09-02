@@ -4,6 +4,12 @@
 #include "Kernel/Syscalls/Common.h"
 
 #include <algorithm>
+#include <atomic>
+
+// [clwatch] guest write-watch controls (defined in ps2_runtime.cpp) — file scope: a block-scope
+// extern inside the anonymous/named namespace mangles into it and fails to link (3rd occurrence).
+extern std::atomic<uint32_t> g_ps2WatchLo;
+extern std::atomic<uint32_t> g_ps2WatchHi;
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -267,6 +273,14 @@ namespace ps2_iop_cl
                             {
                                 file.seekg(0, std::ios::beg);
                                 file.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(bytesToCopy));
+                                ps2TraceGuestRangeWrite(rdram, dstAddr, (uint32_t)bytesToCopy, "clfile-load", nullptr);
+                                {   // [clwatch] provenance when the write covers the awatch range
+                                    const uint32_t wl = ::g_ps2WatchLo.load(std::memory_order_relaxed);
+                                    const uint32_t a0 = dstAddr & 0x1FFFFFFFu;
+                                    if (wl && a0 < ::g_ps2WatchHi.load(std::memory_order_relaxed) && a0 + bytesToCopy > wl)
+                                        std::fprintf(stderr, "[clwatch] LOAD file=%s off=0 n=%zu dst=0x%08x\n",
+                                                     hostPath.string().c_str(), bytesToCopy, dstAddr);
+                                }
                                 if (static_cast<size_t>(file.gcount()) != bytesToCopy)
                                 {
                                     status = kClFileLoadStatusFailed;
@@ -412,7 +426,16 @@ namespace ps2_iop_cl
             }
 
             const uint32_t bytesToRead = std::min<uint32_t>(requested, kClFileBufferBytes);
+            const long clOffBefore = std::ftell(file);
             const size_t bytesRead = std::fread(dst, 1u, bytesToRead, file);
+            ps2TraceGuestRangeWrite(rdram, dstAddr, (uint32_t)bytesRead, "clfile-read", nullptr);
+            {
+                const uint32_t wl = ::g_ps2WatchLo.load(std::memory_order_relaxed);
+                const uint32_t a0 = dstAddr & 0x1FFFFFFFu;
+                if (wl && a0 < ::g_ps2WatchHi.load(std::memory_order_relaxed) && a0 + bytesRead > wl)
+                    std::fprintf(stderr, "[clwatch] READ handle off=%ld n=%zu dst=0x%08x\n",
+                                 clOffBefore, bytesRead, dstAddr);
+            }
             if (bytesRead < bytesToRead && std::ferror(file))
             {
                 std::clearerr(file);

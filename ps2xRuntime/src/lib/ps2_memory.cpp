@@ -50,7 +50,9 @@ static inline void ps2xWatchStore(uint32_t address, const void *bytes, uint32_t 
     if (!hit && !s_custom) { const uint32_t *w = reinterpret_cast<const uint32_t *>(bytes);
         for (uint32_t i = 0; i < n / 4u; ++i) if (w[i] == 0x44db523du) { hit = true; break; } }
     if (!hit) return;
-    static int s_n = 0; if (s_n++ >= 60) return;
+    static const uint32_t s_frMin = [](){ const char *v = std::getenv("PS2X_WATCH_FRMIN"); return v ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
+    if (s_frMin) { extern std::atomic<uint64_t> g_bt3FrameCount; if (g_bt3FrameCount.load(std::memory_order_relaxed) < s_frMin) return; }
+    static int s_n = 0; if (s_n++ >= 120) return;
     const uint32_t *w = reinterpret_cast<const uint32_t *>(bytes);
     std::fprintf(stderr, "[watch] store EEva=0x%08x n=%u val0=0x%08x -- backtrace:\n", address, n, w[0]);
 #if !defined(_WIN32)
@@ -354,6 +356,7 @@ bool PS2Memory::initialize(size_t ramSize)
         m_scratchpad = new uint8_t[PS2_SCRATCHPAD_SIZE];
         std::memset(m_scratchpad, 0, PS2_SCRATCHPAD_SIZE);
         ps2SetScratchpadHostPtr(m_scratchpad);
+        ps2SetRdramHostPtr(m_rdram);
 
         // Initialize EE TLB entries (R5900 has 48 entries).
         m_tlbEntries.assign(48, TLBEntry{0, 0, 0, false});
@@ -1341,6 +1344,216 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             maxSz2 = PS2_RAM_SIZE;
                         }
 
+                        {   // [palsrc] PS2X_PALSRC=<dbp>: the CHAIN path (the one live BT3 uses).
+                            // Scan this tag segment for a BITBLTBUF write to the terrain-palette
+                            // block, log its guest address, and (PS2X_PALSRC_ARM=1) arm the guest
+                            // write-watch on the segment so next frame's rebuild backtraces the
+                            // EE builder of the unstable sun-lighting groups.
+                            static const uint32_t s_pd2 = [](){ const char *v = std::getenv("PS2X_PALSRC");
+                                                                return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
+                            static int s_pn2 = 0;   // raised cap: slot-address logging needs many frames
+                            static int s_expectPayload = 0;   // [palsrc] header seen; the NEXT big segment is the palette bytes
+                            // PS2X_PALSRC_GEO=1: skip the palette payload and arm on the NEXT
+                            // BIG segment instead -- the group's GEOMETRY batch, rebuilt per frame
+                            // by the membership builder we want to backtrace.
+                            static const bool s_geo = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
+                                                            return v && v[0] && v[0] != '0'; }();
+                            // PS2X_PALSRC_GEO=2: the RAM batches proved static (PALG3: zero writes,
+                            // full store tracing). The per-frame membership data is suspected SPR-resident
+                            // (chain reads scratchpad directly via SPR-flagged tags; StoreN traces SPR
+                            // writes as 0x10000000+off). Log EVERY segment after a terrain header with
+                            // its scratch flag, and latch+re-assert the watch on the FIRST SPR segment.
+                            static const bool s_geo2 = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
+                                                             return v && (v[0] == '2' || v[0] == '3' || v[0] == '5'); }();
+                            static const bool s_geo3 = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
+                                                             return v && v[0] == '3'; }();
+                            if (s_pd2 && s_geo2 && s_expectPayload > 0)
+                            {
+                                static int s_sn = 0;
+                                if (s_sn < 400)
+                                { std::fprintf(stderr, "[palsrc] SEG scratch=%d addr=0x%08x len %u\n", scratch?1:0, srcAddr, bytes); ++s_sn; }
+                                --s_expectPayload;
+                                static const bool s_armS = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
+                                                                 return v && v[0] && v[0] != '0'; }();
+                                static uint32_t s_sprLo = 0, s_sprHi = 0;
+                                // mode 5: after modes 3/4 proved chunk lists AND DL headers static,
+                                // the last unwatched terrain-chain class = the small 512..1023B
+                                // segments (0x0104f290 len 992, 0x01050ad0 len 704) — the natural
+                                // per-frame UNIFORM blocks for the terrain VU1 micro. Arm there.
+                                static const bool s_geo5 = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
+                                                                 return v && v[0] == '5'; }();
+                                if (s_geo5 && s_armS && !scratch && bytes >= 512u && bytes < 1024u && src < maxSz2)
+                                {
+                                    static uint32_t s_uLo = 0, s_uHi = 0;
+                                    if (s_uLo == 0u)
+                                    {
+                                        s_uLo = src & 0x1FFFFFFFu;
+                                        s_uHi = (src + bytes) & 0x1FFFFFFFu;
+                                        std::fprintf(stderr, "[palsrc] write-watch ARMED on UNIFORM seg 0x%08x..0x%08x len %u\n", s_uLo, s_uHi, bytes);
+                                    }
+                                    g_ps2WatchHi.store(s_uHi, std::memory_order_relaxed);
+                                    g_ps2WatchLo.store(s_uLo, std::memory_order_relaxed);
+                                }
+                                // mode 3: PALG4 census showed ZERO scratch segments; the unwatched
+                                // size class = the ~22 per-group MID-SIZE chunk-list segments
+                                // (1K..24K RAM). Arm the latched watch on the first 2K..32K one.
+                                if (s_geo3 && s_armS && !scratch && bytes >= 2048u && bytes < 32768u && src < maxSz2)
+                                {
+                                    static uint32_t s_midLo = 0, s_midHi = 0;
+                                    if (s_midLo == 0u)
+                                    {
+                                        const uint32_t alen = bytes < 1024u ? bytes : 1024u;
+                                        s_midLo = src & 0x1FFFFFFFu;
+                                        s_midHi = (src + alen) & 0x1FFFFFFFu;
+                                        std::fprintf(stderr, "[palsrc] write-watch ARMED on MIDSEG 0x%08x..0x%08x len %u\n", s_midLo, s_midHi, bytes);
+                                    }
+                                    g_ps2WatchHi.store(s_midHi, std::memory_order_relaxed);
+                                    g_ps2WatchLo.store(s_midLo, std::memory_order_relaxed);
+                                }
+                                if (s_armS && scratch && src < maxSz2)
+                                {
+                                    if (s_sprLo == 0u)
+                                    {
+                                        const uint32_t alen = bytes < 1024u ? bytes : 1024u;
+                                        s_sprLo = 0x10000000u + src;
+                                        s_sprHi = 0x10000000u + src + alen;
+                                        std::fprintf(stderr, "[palsrc] write-watch ARMED on SPR seg 0x%08x..0x%08x (spr off 0x%x)\n", s_sprLo, s_sprHi, src);
+                                    }
+                                    g_ps2WatchHi.store(s_sprHi, std::memory_order_relaxed);
+                                    g_ps2WatchLo.store(s_sprLo, std::memory_order_relaxed);
+                                }
+                            }
+                            // mode 6: the cull test's per-frame UNIFORMS (camera matrix/offset,
+                            // VU mem rows 0..15) arrive via an UNPACK V4-32 in a chain segment
+                            // never covered by modes 2-5. Scan payloads near the terrain section
+                            // for VIF `UNPACK V4-32 addr<16` codes, log them, and latch the watch
+                            // on the first such payload -> the EE uniform builder's pc/ra.
+                            static const bool s_geo6 = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
+                                                             return v && v[0] == '6'; }();
+                            if (s_pd2 && s_geo6 && s_pn2 > 0 && !scratch && src < maxSz2 && bytes >= 8u && bytes <= maxSz2 - src)
+                            {
+                                const uint8_t *pp = base2 + src;
+                                for (uint32_t off = 0; off + 8 <= bytes && off < 4096u; off += 4)
+                                {
+                                    uint32_t w; std::memcpy(&w, pp + off, 4);
+                                    // 6b: num>=4 — the ubiquitous num=3 cell-bbox headers crowded out
+                                    // the log AND stole the arm; the matrix/uniform block is num 4..12.
+                                    // 6d: ANY unpack format (cmd 0x60-0x7F), addr<16, num>=4 — V4-32
+                                    // never carries the uniform rows; the camera block must ride
+                                    // V3-32/V4-16/etc. Log format byte too.
+                                    if ((w & 0xE0000000u) == 0x60000000u && (w & 0x3FFu) < 16u && ((w >> 16) & 0xFFu) >= 4u)
+                                    {
+                                        static int s_un = 0;
+                                        const uint32_t num = (w >> 16) & 0xFFu, ad = w & 0x3FFu;
+                                        if (s_un < 80)
+                                        { std::fprintf(stderr, "[palsrc] UNPACK cmd=%02x num=%u addr=%u flg=%u at guest 0x%08x (payload 0x%08x)\n", (w >> 24) & 0xFFu, num, ad, (w >> 15) & 1u, srcAddr + off, srcAddr + off + 4); ++s_un; }
+                                        static const bool s_armU = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
+                                                                         return v && v[0] && v[0] != '0'; }();
+                                        static uint32_t s_u6Lo = 0, s_u6Hi = 0;
+                                        if (s_armU && ad < 16u && (w & 0xFF000000u) != 0x6C000000u && (w & 0xFF000000u) != 0x7C000000u)
+                                        {
+                                            if (s_u6Lo == 0u)
+                                            {
+                                                s_u6Lo = (src + off + 4u) & 0x1FFFFFFFu;
+                                                s_u6Hi = (src + off + 4u + num * 16u) & 0x1FFFFFFFu;
+                                                std::fprintf(stderr, "[palsrc] write-watch ARMED on UNPACK payload 0x%08x..0x%08x\n", s_u6Lo, s_u6Hi);
+                                            }
+                                            g_ps2WatchHi.store(s_u6Hi, std::memory_order_relaxed);
+                                            g_ps2WatchLo.store(s_u6Lo, std::memory_order_relaxed);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            if (s_pd2 && s_geo && s_expectPayload > 0 && !scratch && bytes >= 32768u && src < maxSz2)
+                            {
+                                s_expectPayload = 0;
+                                static int s_gn = 0;
+                                if (s_gn < 40) { std::fprintf(stderr, "[palsrc] GEOMETRY seg at guest 0x%08x len %u\n", srcAddr, bytes); ++s_gn; }
+                                static const bool s_armG = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
+                                                                 return v && v[0] && v[0] != '0'; }();
+                                // Latch the FIRST batch window and RE-ASSERT it on every terrain header:
+                                // scoped probes (thunk/camera watches) and the AWATCH init junk-arm can
+                                // hold/steal the global watch; unconditional re-assert keeps ours live.
+                                static uint32_t s_geoLo = 0, s_geoHi = 0;
+                                if (s_armG)
+                                {
+                                    if (s_geoLo == 0u)
+                                    {
+                                        const uint32_t alen = bytes < 4096u ? bytes : 4096u;
+                                        s_geoLo = src & 0x1FFFFFFFu;
+                                        s_geoHi = (src + alen) & 0x1FFFFFFFu;
+                                        std::fprintf(stderr, "[palsrc] write-watch ARMED on GEOMETRY 0x%08x..0x%08x\n", src, src + alen);
+                                    }
+                                    g_ps2WatchHi.store(s_geoHi, std::memory_order_relaxed);
+                                    g_ps2WatchLo.store(s_geoLo, std::memory_order_relaxed);
+                                }
+                            }
+                            if (s_pd2 && !s_geo && s_expectPayload > 0 && !scratch && bytes >= 1024u && src < maxSz2)
+                            {
+                                s_expectPayload = 0;
+                                // Slot-indexed payload-address log: if the ADDRESS a slot references
+                                // changes frame-to-frame, the game picks between STATIC light tables
+                                // and the chooser writes the display list, not the palette bytes.
+                                static int s_slot = 0; static uint32_t s_lastFirst = 0; static int s_pl = 0;
+                                if (s_pl < 600)
+                                {
+                                    if (s_lastFirst == 0) s_lastFirst = srcAddr;
+                                    // heuristic frame boundary: slot counter resets when we see the FIRST slot's addr class again
+                                    std::fprintf(stderr, "[palslot] %d 0x%08x len %u\n", s_slot++, srcAddr, bytes);
+                                    ++s_pl;
+                                }
+                                std::fprintf(stderr, "[palsrc] PAYLOAD at guest 0x%08x len %u\n", srcAddr, bytes);
+                                static const bool s_armP = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
+                                                                 return v && v[0] && v[0] != '0'; }();
+                                if (s_armP && g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
+                                {
+                                    const uint32_t alen = bytes < 1024u ? bytes : 1024u;
+                                    g_ps2WatchHi.store((src + alen) & 0x1FFFFFFFu, std::memory_order_relaxed);
+                                    g_ps2WatchLo.store(src & 0x1FFFFFFFu, std::memory_order_relaxed);
+                                    std::fprintf(stderr, "[palsrc] write-watch ARMED on PAYLOAD phys 0x%08x..0x%08x\n", src, src + alen);
+                                }
+                            }
+                            if (s_pd2 && s_pn2 < 700 && !scratch && src < maxSz2 && bytes <= maxSz2 - src)
+                            {
+                                const uint8_t *p2 = base2 + src;
+                                for (uint32_t off = 0; off + 16 <= bytes; off += 16)
+                                {
+                                    uint64_t lo, hi;
+                                    std::memcpy(&lo, p2 + off, 8); std::memcpy(&hi, p2 + off + 8, 8);
+                                    if ((hi & 0xFFull) == 0x50ull && ((lo >> 32) & 0x3FFFull) == s_pd2)
+                                    {
+                                        if (s_pn2 < 40)
+                                            std::fprintf(stderr, "[palsrc] #%d BITBLTBUF dbp=%u at guest 0x%08x (seg 0x%08x+%u len %u ch=%08x)\n",
+                                                         s_pn2, s_pd2, srcAddr + off, srcAddr, off, bytes, channelBase);
+                                        s_expectPayload = 8;   // mode2 logs several following segments; modes 0/1 consume it on the first match
+                                        // mode 4: watch the terrain DL HEADER SLOT REGION itself --
+                                        // every payload layer (palettes/tables/meshes/chunk lists)
+                                        // proved static; if membership lives in the DL ref-tags,
+                                        // their per-frame rewrite hits here. Armed at fight time
+                                        // (first terrain header), 1KB window, latched+re-asserted.
+                                        static const bool s_geo4 = [](){ const char *v = std::getenv("PS2X_PALSRC_GEO");
+                                                                         return v && v[0] == '4'; }();
+                                        static const bool s_armH = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
+                                                                         return v && v[0] && v[0] != '0'; }();
+                                        if (s_geo4 && s_armH)
+                                        {
+                                            static uint32_t s_hdrLo = 0, s_hdrHi = 0;
+                                            if (s_hdrLo == 0u)
+                                            {
+                                                s_hdrLo = srcAddr & 0x1FFFFFFFu;
+                                                s_hdrHi = (srcAddr + 0x400u) & 0x1FFFFFFFu;
+                                                std::fprintf(stderr, "[palsrc] write-watch ARMED on DL HEADER region 0x%08x..0x%08x\n", s_hdrLo, s_hdrHi);
+                                            }
+                                            g_ps2WatchHi.store(s_hdrHi, std::memory_order_relaxed);
+                                            g_ps2WatchLo.store(s_hdrLo, std::memory_order_relaxed);
+                                        }
+                                        if (++s_pn2 >= 40) break;
+                                    }
+                                }
+                            }
+                        }
+
                         // PS2X_ZEROSRC: the collapsed characters' bone data arrives at VU1 as ZEROS.
                         // Find the guest source: log VIF1 ref payloads that are entirely zero (first
                         // 128B) with their EE address. Histogram by 64KB region so one PCSX2 write-bp
@@ -1571,9 +1784,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             if (s_cw2 && channelBase == 0x10009000u)
                             {
                                 static std::atomic<uint32_t> s_st{0}, s_ar{0};
-                                if (tagsProcessed == 1 && s_st.fetch_add(1) < 3000u)
-                                    std::fprintf(stderr, "[chain] START tag@0x%08x id=%u qwc=%u\n",
+                                if (tagsProcessed == 1 && s_st.fetch_add(1) < 200000u)
+                                {
+                                    extern std::atomic<uint64_t> g_bt3FrameCount;
+                                    std::fprintf(stderr, "[chain] START fr=%llu tag@0x%08x id=%u qwc=%u\n",
+                                                 (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
                                                  currentTagAddr, id, (unsigned)tagQwc);
+                                }
                                 if (currentTagAddr >= 0x6e0000u && currentTagAddr < 0x6e6000u && s_ar.fetch_add(1) < 400u)
                                     std::fprintf(stderr, "[chain] ARENA-VISIT tag@0x%08x id=%u qwc=%u (tag #%d)\n",
                                                  currentTagAddr, id, (unsigned)tagQwc, tagsProcessed);
@@ -1648,6 +1865,28 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
+                        {   // [chaintrace] PS2X_CHAINTRACE=<hexframe>: one-shot FULL tag listing of the
+                            // first VIF1 chain walked at/after that frame (find where the walk diverges
+                            // from the built sheet-upload segment).
+                            static const long s_ctFr = [](){ const char *v = std::getenv("PS2X_CHAINTRACE"); return v && v[0] ? std::strtol(v, nullptr, 16) : -1; }();
+                            if (s_ctFr >= 0 && channelBase == 0x10009000u)
+                            {
+                                extern std::atomic<uint64_t> g_bt3FrameCount;
+                                static std::atomic<int> s_ctState{0}; // 0=waiting 1=tracing 2=done
+                                static std::atomic<uint32_t> s_ctLines{0};
+                                int st0 = s_ctState.load(std::memory_order_relaxed);
+                                if (st0 == 0 && (long)g_bt3FrameCount.load(std::memory_order_relaxed) >= s_ctFr && tagsProcessed == 1)
+                                    { s_ctState.store(1); s_ctLines.store(0); std::fprintf(stderr, "[chaintrace] BEGIN fr=%llu\n", (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed)); }
+                                if (s_ctState.load(std::memory_order_relaxed) == 1)
+                                {
+                                    if (s_ctLines.fetch_add(1) < 3000u)
+                                        std::fprintf(stderr, "[chaintrace] #%d tag@0x%08x id=%u qwc=%u next=0x%08x\n",
+                                                     tagsProcessed, currentTagAddr, id, (unsigned)tagQwc, tagAddr);
+                                    if (endChain || id == 7u)
+                                        { s_ctState.store(2); std::fprintf(stderr, "[chaintrace] END after %d tags\n", tagsProcessed); }
+                                }
+                            }
+                        }
                         const bool compactVifLocalTag =
                             (channelBase == 0x10009000u || channelBase == 0x10008000u) &&
                             (id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
@@ -1660,6 +1899,21 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                 appendData(currentTagAddr + 16u, tagQwc);
                             else
                                 appendData(dataAddr, tagQwc);
+                            // [sheettag] PS2X_SHEETTAG=1: log VIF1 chain tags whose data lies in the
+                            // pak band-sheet region or the entry-4 default block — shows whether the
+                            // per-frame upload chain REFs the real sheet (0x139bxxx) or the default.
+                            static const bool s_st = [](){ const char *v = std::getenv("PS2X_SHEETTAG"); return v && v[0] && v[0] != '0'; }();
+                            if (s_st && (channelBase == 0x10009000u || channelBase == 0x1000A000u))
+                            {
+                                const uint32_t da = (compactVifLocalTag ? currentTagAddr + 16u : dataAddr) & 0x1FFFFFFFu;
+                                if (da >= 0x1398000u && da < 0x13a0000u)
+                                {
+                                    static std::atomic<uint32_t> s_stn{0};
+                                    if (s_stn.fetch_add(1) < 200u)
+                                        std::fprintf(stderr, "[sheettag] id=%u data=0x%08x qwc=%u tag@0x%08x\n",
+                                                     id, da, (unsigned)tagQwc, currentTagAddr);
+                                }
+                            }
                         }
                         if (irq && tieEnabled)
                         {
@@ -1988,6 +2242,21 @@ void PS2Memory::processPendingTransfers()
                         break;
                     m_seenGifCopy = true;
                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+                    // [upsrc] PS2X_UPSRC=1: find the guest RAM source of the terrain band-sheet
+                    // upload — scan PATH3 chunks for an A+D BITBLTBUF with DBP==10752, report srcPhys.
+                    if ([](){ static const char *s_env = std::getenv("PS2X_UPSRC"); return s_env; }()) {
+                        static std::atomic<int> s_us{0};
+                        for (uint32_t o = 0; o + 16 <= chunk && s_us.load(std::memory_order_relaxed) < 24; o += 16) {
+                            uint64_t d0, d1;
+                            std::memcpy(&d0, m_rdram + srcPhys + o, 8);
+                            std::memcpy(&d1, m_rdram + srcPhys + o + 8, 8);
+                            if ((d1 & 0xFFu) == 0x50u && ((d0 >> 32) & 0x3FFFu) == 10752u) {
+                                if (s_us.fetch_add(1) < 24)
+                                    fprintf(stderr, "[upsrc] BITBLTBUF dbp=10752 sbp=%u spsm=%u at srcPhys=0x%08x +%u chunk=%u\n",
+                                        (uint32_t)(d0 & 0x3FFFu), (uint32_t)((d0 >> 24) & 0x3Fu), srcPhys, o, chunk);
+                            }
+                        }
+                    }
                     if ([](){ static const char *s_env = std::getenv("PS2X_GIFSRC"); return s_env; }()) {
                         // Scan the packet for a HUD-texture TEX0 (tbp0 in [10752,11264], psm=19)
                         // and report the EE source address the sprite engine built it at.
@@ -2300,6 +2569,32 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
 
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
+    // [upsrc3] PS2X_UPSRC=1: all-paths scan for BITBLTBUF selecting the band sheet (10752)
+    // or band CLUT (12992) — reports the packet's path + guest source when recoverable.
+    {
+        static const bool s_u3 = [](){ const char *v = std::getenv("PS2X_UPSRC"); return v && v[0] && v[0] != '0'; }();
+        if (s_u3 && data && sizeBytes >= 32u)
+        {
+            static std::atomic<int> s_un3{0};
+            for (uint32_t o = 0; o + 16u <= sizeBytes && o < 16384u && s_un3.load(std::memory_order_relaxed) < 30; o += 16u)
+            {
+                uint64_t plo, phi;
+                std::memcpy(&plo, data + o, 8); std::memcpy(&phi, data + o + 8, 8);
+                if ((phi & 0xFFu) == 0x50u)
+                {
+                    const uint32_t dbp3 = (uint32_t)((plo >> 32) & 0x3FFFu);
+                    if (dbp3 == 10752u || dbp3 == 12992u)
+                    {
+                        uint32_t srcG = 0u;
+                        if (data >= m_rdram && data < m_rdram + PS2_RAM_SIZE) srcG = (uint32_t)(data - m_rdram) + o;
+                        if (s_un3.fetch_add(1) < 30)
+                            std::fprintf(stderr, "[upsrc3] path%d BITBLTBUF dbp=%u sbp=%u srcG=0x%08x size=%u off=%u\n",
+                                         (int)pathId, dbp3, (uint32_t)(plo & 0x3FFFu), srcG, sizeBytes, o);
+                    }
+                }
+            }
+        }
+    }
     if (!data || sizeBytes < 16)
         return;
 
@@ -2356,6 +2651,40 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
             
         m_seenGifCopy = true;
         m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+        {   // [palsrc] PS2X_PALSRC=<dbp>: log the GUEST source address of GIF packets that set
+            // BITBLTBUF to this destination block -- the EE-side buffer the game builds its
+            // terrain palettes in. Feed the address to the write-watch to catch the BUILDER
+            // function (the unstable sun-lighting group assignment, 2026-09-01).
+            static const uint32_t s_pd = [](){ const char *v = std::getenv("PS2X_PALSRC");
+                                               return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
+            static int s_pn = 0;
+            if (s_pd && s_pn < 40)
+            {
+                const uint8_t *p = m_rdram + srcPhysAddr;
+                for (uint32_t off = 0; off + 16 <= chunk; off += 16)
+                {
+                    uint64_t lo, hi;
+                    std::memcpy(&lo, p + off, 8); std::memcpy(&hi, p + off + 8, 8);
+                    if ((hi & 0xFFull) == 0x50ull && ((lo >> 32) & 0x3FFFull) == s_pd)
+                    {
+                        std::fprintf(stderr, "[palsrc] #%d BITBLTBUF dbp=%u at guest %#x (packet %#x+%u len %u)\n",
+                                     s_pn, s_pd, srcPhysAddr + off, srcPhysAddr, off, chunk);
+                        // PS2X_PALSRC_ARM=1: arm the guest write-watch on this packet region --
+                        // next frame's rebuild of the palette buffer backtraces its EE writer.
+                        static const bool s_arm = [](){ const char *v = std::getenv("PS2X_PALSRC_ARM");
+                                                        return v && v[0] && v[0] != '0'; }();
+                        if (s_arm && g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
+                        {
+                            g_ps2WatchHi.store((srcPhysAddr + chunk) & 0x1FFFFFFFu, std::memory_order_relaxed);
+                            g_ps2WatchLo.store(srcPhysAddr & 0x1FFFFFFFu, std::memory_order_relaxed);
+                            std::fprintf(stderr, "[palsrc] write-watch ARMED on %#x..%#x\n",
+                                         srcPhysAddr, srcPhysAddr + chunk);
+                        }
+                        if (++s_pn >= 40) break;
+                    }
+                }
+            }
+        }
         submitGifPacket(GifPathId::Path3, m_rdram + srcPhysAddr, chunk);
         
         bytesLeft -= chunk;

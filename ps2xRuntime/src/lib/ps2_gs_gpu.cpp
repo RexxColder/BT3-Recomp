@@ -517,6 +517,23 @@ GS::GS()
 
 static uint8_t *g_vramDumpPtr = nullptr;
 
+// [subpix] PS2X_SUBPIXDBG2=1: do FRACTIONAL vertex positions reach the decode at all? BT3's
+// outline subtract pass is offset by exactly half a pixel, and by the time the sprite builder
+// runs every vertex is integral -- this pins whether the loss is before or after the decode.
+static void ps2xSubpixTally(float x, float y)
+{
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_SUBPIXDBG2");
+                                   return v && v[0] && v[0] != '0'; }();
+    if (!s_on) return;
+    static std::atomic<unsigned long> nAll{0}, nFrac{0}, nHalfY{0};
+    const unsigned long a = nAll.fetch_add(1) + 1ul;
+    if (x != std::floor(x) || y != std::floor(y)) nFrac.fetch_add(1);
+    if (y - std::floor(y) == 0.5f) nHalfY.fetch_add(1);
+    if ((a % 20000ul) == 0ul)
+        std::fprintf(stderr, "[subpix] decode: %lu verts | fractional %lu | y half-pixel %lu\n",
+                     a, nFrac.load(), nHalfY.load());
+}
+
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
     m_vram = vram;
@@ -656,9 +673,22 @@ GSDebugSnapshot GS::getDebugSnapshot() const
 }
 
 
+// [gshist] The GS debug-history ring (one entry per GIF tag, register write, draw, transfer,
+// present) was recorded unconditionally -- ~2% of the guest thread with the F1 panel closed and
+// nobody reading it. Record only while a reader holds a lease: getDebugHistory() (the F1 panel's
+// per-frame call) extends it 5 s. PS2X_GSHIST=1 = always record (old behaviour).
+static std::atomic<uint64_t> g_gsHistLeaseTick{0};
+static inline bool gsHistWanted()
+{
+    static const bool s_force = [](){ const char *v = std::getenv("PS2X_GSHIST"); return v && v[0] && v[0] != '0'; }();
+    if (s_force) return true;
+    return ps2_syscalls::GetCurrentVSyncTick() <= g_gsHistLeaseTick.load(std::memory_order_relaxed);
+}
+
 std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    g_gsHistLeaseTick.store(ps2_syscalls::GetCurrentVSyncTick() + 300u, std::memory_order_relaxed);   // [gshist]
 
     std::vector<GSDebugHistoryEntry> out;
     out.reserve(m_debugHistoryCount);
@@ -744,6 +774,7 @@ void GS::recordDebugEventUnlocked(GSDebugHistoryEntry entry)
 
 void GS::recordGifTagDebugEventUnlocked(uint32_t sizeBytes, uint32_t nloop, uint8_t flg, uint32_t nreg)
 {
+    if (!gsHistWanted()) return;   // [gshist]
     GSDebugHistoryEntry entry = makeDebugEventUnlocked(GSDebugEventKind::GifTag);
     entry.gifSizeBytes = sizeBytes;
     entry.gifNloop = nloop;
@@ -754,6 +785,7 @@ void GS::recordGifTagDebugEventUnlocked(uint32_t sizeBytes, uint32_t nloop, uint
 
 void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
 {
+    if (!gsHistWanted()) return;   // [gshist]
     switch (regAddr)
     {
     case GS_REG_PRIM:
@@ -792,6 +824,7 @@ void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
 
 void GS::recordDrawDebugEventUnlocked(int vertexCount)
 {
+    if (!gsHistWanted()) return;   // [gshist]
     if (vertexCount <= 0)
     {
         return;
@@ -824,6 +857,7 @@ void GS::recordDrawDebugEventUnlocked(int vertexCount)
 
 void GS::recordTransferDebugEventUnlocked()
 {
+    if (!gsHistWanted()) return;   // [gshist]
     GSDebugHistoryEntry entry = makeDebugEventUnlocked(GSDebugEventKind::Transfer);
     entry.transferPixels = m_transferState.total_pixels;
     recordDebugEventUnlocked(entry);
@@ -831,6 +865,7 @@ void GS::recordTransferDebugEventUnlocked()
 
 void GS::recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp, uint32_t width, uint32_t height, bool usedPreferred)
 {
+    if (!gsHistWanted()) return;   // [gshist]
     GSDebugHistoryEntry entry = makeDebugEventUnlocked(GSDebugEventKind::Present);
     entry.displayFbp = displayFbp;
     entry.sourceFbp = sourceFbp;
@@ -1499,14 +1534,814 @@ std::atomic<uint32_t> g_fmvPendingFbp{0xFFFFFFFFu};
 std::atomic<uint32_t> g_fmvPendingBw{0u};
 GS *g_fmvGs = nullptr; // [fmvblit] set on the first image upload; the emitter reads VRAM via it
 
+// ---- FBO -> VRAM writeback -------------------------------------------------------------
+// GPU mode never writes rendered pixels back to VRAM, so a texture whose source region is a
+// render target cannot be decoded again once dropped -- that is the arena-corruption bug.
+// Measured on this build: 120k indexed draws per match sample RENDERED pages, 94% of them
+// fbp224 (a 1024x1024 mask sampled as PSMT8 indices through a CLUT). Handing those bytes back
+// to VRAM makes the whole class ordinary: re-decodable, and therefore safely evictable.
+GS *g_gsWb = nullptr;
+// ZBUF of the current frame, published by the rasterizer for the depth writeback.
+uint32_t g_zwbBp = 0, g_zwbPsm = 0x31u, g_zwbBw = 8u;
+double g_zwbZMax = 4294967295.0;   // zNorm's divisor, published by the rasterizer
+// Write our GL depth buffer back into VRAM as GS Z. Once these bytes are in VRAM, every aliased
+// re-view of them (PSMZ32 reads, the CT16 512x896 column view, PSMT8H index reads) decodes
+// correctly with no per-view special case.
+// [livesync] Present-thread staging: in LIVE mode the FBO can only be read on the GL thread,
+// but VRAM must only change at a defined point in the GUEST command stream (mid-stream writes
+// are what flickered the whole frame). The present thread runs flushPageToVram with
+// g_stageWrites set: these functions then CAPTURE the fully-masked write instead of applying
+// it, and the guest drains the captures at swapFrame (its frame boundary) by calling them
+// again normally. Same masks, same code path, correct thread for each half.
+struct StagedWb
+{
+    uint32_t fbp, fbw, psm; int w, h; uint32_t fbmsk;
+    bool isDepth; double zMax;
+    std::vector<uint32_t> px; std::vector<float> depth;
+};
+std::mutex g_stageWbMx;
+std::vector<StagedWb> g_stagedWb;
+thread_local bool g_stageWrites = false;
+
+void ps2xWritebackDepthToVram(uint32_t zbp, uint32_t zbw, uint32_t zpsm, int w, int h,
+                              const float *depth, double zMax)
+{
+    if (g_stageWrites)
+    {
+        std::lock_guard<std::mutex> lk(g_stageWbMx);
+        for (auto &e : g_stagedWb)
+            if (e.isDepth && e.fbp == zbp)
+            { e.fbw = zbw; e.psm = zpsm; e.w = w; e.h = h; e.zMax = zMax;
+              e.depth.assign(depth, depth + (size_t)w * h); return; }
+        StagedWb e; e.fbp = zbp; e.fbw = zbw; e.psm = zpsm; e.w = w; e.h = h;
+        e.fbmsk = 0u; e.isDepth = true; e.zMax = zMax;
+        e.depth.assign(depth, depth + (size_t)w * h);
+        g_stagedWb.push_back(std::move(e));
+        return;
+    }
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs;
+    if (!gs || !depth || w <= 0 || h <= 0) return;
+    const uint32_t base = GSInternal::framePageBaseToBlock(zbp);
+    const uint32_t bw = zbw ? zbw : 1u;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            double d = depth[(size_t)y * w + x];
+            if (d < 0.0) d = 0.0; else if (d > 1.0) d = 1.0;
+            const uint32_t z = (uint32_t)(d * zMax + 0.5);
+            gs->WriteVram(zpsm, base, bw, (uint32_t)x, (uint32_t)y, z);
+        }
+    // A palette can BE a render target (BT3's outline CLUTs live in pages 499-500, which the
+    // game renders into). The CLUT cache keys on m_texUploadGen, which only processImageData
+    // bumps -- so without this a flushed palette would never be re-read.
+    gs->bumpTexUploadGen();
+    ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u)); gs->bumpPageUploadGen(base, (uint32_t)(((size_t)w * h * 4u) / 256u));   // [clutpagegen]
+}
+// [wbpack16] GPU->VRAM writebacks used to hand WriteVram the raw RGBA8888 word for 16-bit
+// pages, so a CT16 pixel got the low 16 bits (R&31 | G<<8...) instead of R5G5B5A1 -- G landed
+// in B5 (>>2), B and A were dropped, and every CT16 flush wrote garbage colour bits (the reason
+// PS2X_FLUSHCT32 was needed for the scene pages). Pack/unpack like the SW rasterizer does.
+// PS2X_WBPACK16=0 restores the raw behaviour for A/B.
+static inline bool wbIs16(uint32_t psm) { return psm == GS_PSM_CT16 || psm == GS_PSM_CT16S; }
+static inline uint32_t wbPack16(uint32_t c)
+{ return ((c >> 3) & 0x1Fu) | (((c >> 11) & 0x1Fu) << 5) | (((c >> 19) & 0x1Fu) << 10) | (((c >> 31) & 1u) << 15); }
+static inline uint32_t wbUnpack16(uint32_t v)
+{ const uint32_t r = v & 0x1Fu, g = (v >> 5) & 0x1Fu, b = (v >> 10) & 0x1Fu, a = (v >> 15) & 1u;
+  return ((r << 3) | (r >> 2)) | (((g << 3) | (g >> 2)) << 8) | (((b << 3) | (b >> 2)) << 16) | ((a ? 0x80u : 0u) << 24); }
+int g_wbRectX0 = -1, g_wbRectY0 = -1, g_wbRectX1 = -1, g_wbRectY1 = -1;   // [flushrect] -1 = whole buffer
+int g_wbLastWrittenRows = 0;   // [flushdiff] rows written by the last masked writeback
+const uint8_t *g_wbSkipMask = nullptr;   // [flushdiff] per-pixel: 0 = unchanged since the last flush, skip the write
+static const bool s_wbPack16 = [](){ const char *v = std::getenv("PS2X_WBPACK16"); return !(v && v[0] == '0'); }();
+// Masked variant: GS FBMSK protects bits, so a writeback that ignores it destroys data the
+// hardware keeps. BT3's CT16 stripes pass writes fbp0 through FBMSK=0x00003fff -- bits 0..13 are
+// preserved -- so a full-pixel writeback zeroes most of the surface.
+// PS2X_RTTEST=1: round-trip the two address paths that disagree. The barrier WRITES the
+// scene through PSMCT32 (`WriteVram(psm=0, framePageBaseToBlock(fbp), bw=fbw, x, y)`) and the
+// mask build READS the same page through PSMT8H (`ReadVram(PSMT8H, tbp0, tbw, u, v)`).
+// PSMT8H must alias PSMCT32 exactly -- same page/block layout, taking byte 3 -- so writing a
+// known ramp and reading it back at the same (x,y) says which side is wrong. No game data.
+// Read page `fbp` back through the SAME call the decode uses (ReadVram PSMT8H) right after a
+// flush, and report the alpha-byte distribution. If the flush wrote a dense field and this
+// still reads ~0, the disagreement is inside ReadVram's PSMT8H path for this exact state.
+void ps2xVramReadBackT8H(uint32_t fbp, uint32_t tbw)
+{
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs;
+    if (!gs) return;
+    const uint32_t tbp0 = GSInternal::framePageBaseToBlock(fbp);
+    unsigned hist[256] = {0}; long n = 0;
+    for (int y = 0; y < 448; y += 7)
+        for (int x = 0; x < 512; x += 5)
+        { ++hist[gs->ReadVram(GS_PSM_T8H, tbp0, tbw, (uint32_t)x, (uint32_t)y) & 0xFFu]; ++n; }
+    int distinct = 0; unsigned top = 0; int topV = 0; double sum = 0;
+    for (int i = 0; i < 256; ++i) if (hist[i]) { ++distinct; sum += (double)i * hist[i];
+        if (hist[i] > top) { top = hist[i]; topV = i; } }
+    std::fprintf(stderr, "[readback] fbp%u tbp0=%u tbw=%u : index mean %.1f  zero %.1f%%  distinct %d  top %d(%.1f%%)\n",
+                 fbp, tbp0, tbw, sum / (double)n, 100.0 * (double)hist[0] / (double)n, distinct, topV,
+                 100.0 * (double)top / (double)n);
+}
+
+// [livesync] guest-side drain: apply everything the present thread staged, at the caller's
+// (guest) stream position. Runs the SAME writeback functions with staging off.
+unsigned long g_ps2xWbGen = 0;
+unsigned long g_wbPixelsWritten = 0;   // [shstat]
+const std::pair<int,int> *g_wbRowRange = nullptr;   // [flushrows] per-row [x0,x1) to write, or null
+int g_wbFlipY = 0;   // [noflip] 1 = px rows are bottom-up (buffer row for VRAM row y is h-1-y)   // [hashmemo] bumped by every VRAM writeback (WBSTAMP is off by default, so m_contentSeq does not see them)
+
+static void wbHudLog(const char *who, uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h, uint32_t base, uint32_t bw);   // [wbhud]
+void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
+                               const uint32_t *px, uint32_t fbmsk);
+void ps2xApplyStagedWritebacks()
+{
+    ++g_ps2xWbGen;   // [hashmemo] any VRAM writeback invalidates memoised range hashes
+    { GS *gsc = g_gsWb ? g_gsWb : g_fmvGs; if (gsc) gsc->invalidateClutCache(); }   // [clutwb] a flushed page may hold a rendered palette: force the CLUT cache to re-decode
+
+    std::vector<StagedWb> work;
+    {
+        std::lock_guard<std::mutex> lk(g_stageWbMx);
+        if (g_stagedWb.empty()) return;
+        work.swap(g_stagedWb);
+    }
+    for (const auto &e : work)
+    {
+        if (e.isDepth) ps2xWritebackDepthToVram(e.fbp, e.fbw, e.psm, e.w, e.h, e.depth.data(), e.zMax);
+        else           ps2xWritebackToVramMasked(e.fbp, e.fbw, e.psm, e.w, e.h, e.px.data(), e.fbmsk);
+    }
+}
+
+// PS2X_CT16MAP=1: which CT32 bits does a PSMCT16 write actually touch? BT3's alpha rebuild
+// writes the scene RE-VIEWED as CT16 with FBMSK=0x00003fff (CT16 bits 14-15). Our SW pass
+// reproduces the draws but only reaches ~25% of the CT32 alpha bytes at ~2 bits, while
+// console's refill is a smooth full-coverage 256-value field. This probes the real mapping.
+void ps2xCt16MapProbe()
+{
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs;
+    if (!gs) return;
+    const uint32_t base = GSInternal::framePageBaseToBlock(0u);
+    // Clear a small CT32 window, then set ONE CT16 pixel's bits 14-15 and see what moved.
+    for (int y = 0; y < 8; ++y)
+        for (int x = 0; x < 16; ++x)
+            gs->WriteVram(0u, base, 8u, (uint32_t)x, (uint32_t)y, 0u);
+    for (int cy = 0; cy < 2; ++cy)
+    {
+        for (int cx = 0; cx < 16; ++cx)
+        {
+            for (int y = 0; y < 8; ++y)
+                for (int x = 0; x < 16; ++x)
+                    gs->WriteVram(0u, base, 8u, (uint32_t)x, (uint32_t)y, 0u);
+            gs->WriteVram(GS_PSM_CT16, base, 8u, (uint32_t)cx, (uint32_t)cy, 0xC000u); // bits 14,15
+            for (int y = 0; y < 8; ++y)
+                for (int x = 0; x < 16; ++x)
+                {
+                    const uint32_t v = gs->ReadVram(0u, base, 8u, (uint32_t)x, (uint32_t)y);
+                    if (v)
+                        std::fprintf(stderr, "[ct16map] CT16(%d,%d) bits14-15 -> CT32(%d,%d) = %08x%s\n",
+                                     cx, cy, x, y, v, (v & 0xFF000000u) ? "   [ALPHA byte]" : "");
+                }
+        }
+    }
+}
+
+// PS2X_F336PRE=1: what does VRAM page `fbp` hold, read as CT16, at the moment it is called?
+// The edge detect's two SUBTRACTIVE passes (blend 0x62) clamp to zero on a zero destination,
+// and page 336 IS the stage-texture atlas (block 10752), so on console Cd is real texture.
+void ps2xVramCt16Dump(uint32_t fbp, uint32_t fbw, const char *path)
+{   // page `fbp` read as PSMCT16 (512x448) -> RGB png via raylib's ExportImage
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs; if (!gs) return;
+    const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
+    std::vector<uint8_t> px((size_t)512 * 448 * 4);
+    for (int y = 0; y < 448; ++y) for (int x = 0; x < 512; ++x)
+    {   const uint32_t v = gs->ReadVram(GS_PSM_CT16, base, fbw, (uint32_t)x, (uint32_t)y) & 0xFFFFu;
+        uint8_t *o = &px[((size_t)y * 512 + x) * 4];
+        o[0] = (uint8_t)((v & 0x1F) << 3); o[1] = (uint8_t)(((v >> 5) & 0x1F) << 3); o[2] = (uint8_t)(((v >> 10) & 0x1F) << 3); o[3] = 255; }
+    if (FILE *f = std::fopen(path, "wb"))
+    {   std::fprintf(f, "P6\n512 448\n255\n");
+        for (size_t i = 0; i < (size_t)512 * 448; ++i) std::fwrite(&px[i * 4], 1, 3, f);
+        std::fclose(f); std::fprintf(stderr, "[ct16dump] wrote %s\n", path); }
+}
+void ps2xVramT8HDump(uint32_t fbp, uint32_t fbw, const char *path)
+{   // page `fbp` read as PSMT8H (512x448 index bytes) -> P5 pgm
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs; if (!gs) return;
+    const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
+    std::vector<uint8_t> px((size_t)512 * 448);
+    for (int y = 0; y < 448; ++y) for (int x = 0; x < 512; ++x) px[(size_t)y * 512 + x] = (uint8_t)(gs->ReadVram(GS_PSM_T8H, base, fbw, (uint32_t)x, (uint32_t)y) & 0xFFu);
+    if (FILE *f = std::fopen(path, "wb")) { std::fprintf(f, "P5\n512 448\n255\n"); std::fwrite(px.data(), 1, px.size(), f); std::fclose(f); std::fprintf(stderr, "[t8hdump] wrote %s\n", path); }
+}
+void ps2xVramCt16Stats(uint32_t fbp, uint32_t fbw, const char *when)
+{
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs;
+    if (!gs) return;
+    const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
+    long n = 0, nz = 0; double sum = 0;
+    for (int y = 0; y < 448; y += 7)
+        for (int x = 0; x < 512; x += 5)
+        {
+            const uint32_t v = gs->ReadVram(GS_PSM_CT16, base, fbw, (uint32_t)x, (uint32_t)y) & 0xFFFFu;
+            ++n; if (v & 0x7FFFu) ++nz; sum += (double)(v & 0x7FFFu);
+        }
+    std::fprintf(stderr, "[f336pre] %s fbp%u (CT16 fbw=%u): non-black %.1f%%  mean rgb-bits %.1f\n",
+                 when, fbp, fbw, 100.0 * (double)nz / (double)n, sum / (double)n);
+}
+
+void ps2xVramRoundTripTest()
+{
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs;
+    if (!gs) { std::fprintf(stderr, "[rttest] no GS\n"); return; }
+    struct Case { const char *name; uint32_t fbp; uint32_t tbp0; uint32_t bw; };
+    const Case cases[] = {
+        { "fbp0   tbp0=0",    0u,   0u, 8u },
+        { "fbp112 tbp0=3584", 112u, 3584u, 8u },
+    };
+    for (const Case &c : cases)
+    {
+        const uint32_t base = GSInternal::framePageBaseToBlock(c.fbp);
+        int match = 0, total = 0, firstBadX = -1, firstBadY = -1;
+        uint32_t gotFirstBad = 0, wantFirstBad = 0;
+        for (int y = 0; y < 448; y += 37)
+            for (int x = 0; x < 512; x += 41)
+            {
+                const uint8_t a = (uint8_t)(((x * 7 + y * 13) & 0x7F) + 1);
+                gs->WriteVram(0u, base, c.bw, (uint32_t)x, (uint32_t)y, ((uint32_t)a << 24) | 0x00123456u);
+                const uint32_t got = gs->ReadVram(GS_PSM_T8H, c.tbp0, c.bw, (uint32_t)x, (uint32_t)y);
+                ++total;
+                if ((got & 0xFFu) == a) ++match;
+                else if (firstBadX < 0) { firstBadX = x; firstBadY = y; gotFirstBad = got & 0xFFu; wantFirstBad = a; }
+            }
+        std::fprintf(stderr, "[rttest] %s base=%u : CT32 write -> PSMT8H read matches %d/%d",
+                     c.name, base, match, total);
+        if (firstBadX >= 0)
+            std::fprintf(stderr, "   first mismatch at (%d,%d): got %u want %u", firstBadX, firstBadY,
+                         gotFirstBad, wantFirstBad);
+        std::fprintf(stderr, "\n");
+    }
+}
+
+void ps2xVramAlphaStats(const char *tag, uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h)
+{
+    // What does the scene buffer's ALPHA actually look like in VRAM? That byte is the palette
+    // INDEX every outline/shadow composite reads, so its coverage is the single number that
+    // says whether the rebuild pass did anything. Console reaches ~62.75% on this pass.
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs;
+    if (!gs || w <= 0 || h <= 0) return;
+    const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
+    const uint32_t bw = fbw ? fbw : 1u;
+    unsigned hist[256] = {0};
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            ++hist[(gs->ReadVram(psm, base, bw, (uint32_t)x, (uint32_t)y) >> 24) & 0xFFu];
+    const double n = (double)w * h;
+    int distinct = 0; unsigned top = 0; int topV = 0;
+    for (int i = 0; i < 256; ++i) if (hist[i]) { ++distinct; if (hist[i] > top) { top = hist[i]; topV = i; } }
+    {   // Also write the field itself, so it can be put next to console's
+        // itexraw_00000_P_8H dump (which IS this same byte, read as a palette index).
+        static int s_n = 0;
+        const char *dir = std::getenv("PS2X_GS_REPLAY_OUT");
+        if (dir && s_n < 6)
+        {
+            char path[256];
+            std::snprintf(path, sizeof(path), "%s/vramalpha_f%u_%d.raw", dir, fbp, s_n++);
+            if (FILE *f = std::fopen(path, "wb"))
+            {
+                int hdr[2] = { w, h };
+                std::fwrite(hdr, sizeof(hdr), 1, f);
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x)
+                    {
+                        const uint8_t a = (uint8_t)((gs->ReadVram(psm, base, bw, (uint32_t)x, (uint32_t)y) >> 24) & 0xFFu);
+                        std::fwrite(&a, 1, 1, f);
+                    }
+                std::fclose(f);
+            }
+        }
+    }
+    {   // The rebuild pass writes bits 14-15 of each PSMCT16 pixel; half of those land in the
+        // CT32 GREEN byte, which is visible colour. If our VRAM scene RGB shows 8-px bands
+        // aligned to that pass's write pattern, the pass is painting colour it must not.
+        double gW = 0, gO = 0; long nW = 0, nO = 0;
+        for (int y = 0; y < h; ++y)
+            for (int xx = 0; xx < w; ++xx)
+            {
+                const uint32_t px2 = gs->ReadVram(psm, base, bw, (uint32_t)xx, (uint32_t)y);
+                const double g = (double)((px2 >> 8) & 0xFFu);
+                if (((xx / 8) & 1) != 0) { gW += g; ++nW; } else { gO += g; ++nO; }
+            }
+        std::fprintf(stderr, "[vramrgb] %s fbp%u green: written-bands %.2f  other %.2f  delta %+.2f\n",
+                     tag, fbp, nW ? gW / nW : 0.0, nO ? gO / nO : 0.0,
+                     (nW && nO) ? (gW / nW - gO / nO) : 0.0);
+    }
+    std::fprintf(stderr, "[vramalpha] %s fbp%u psm=%02x %dx%d: a!=0 %.2f%%  a>=128 %.2f%%  vals=%d top=%d(%.1f%%)\n",
+                 tag, fbp, psm, w, h,
+                 100.0 * (n - hist[0]) / n,
+                 100.0 * [&]{ double c = 0; for (int i = 128; i < 256; ++i) c += hist[i]; return c; }() / n,
+                 distinct, topV, 100.0 * top / n);
+}
+
+// PS2X_BARMERGEA: fill the scene's VRAM alpha from the FBO only where VRAM alpha is still
+// ZERO. The rebuild pass writes ~25% of the alpha bytes (8-px bands); the geometry's alpha --
+// which console already has in that memory -- lives in our FBO. Protecting alpha entirely
+// (BARKEEPA) keeps only the bands, and writing it wholesale destroys them. Filling the gaps
+// keeps both, with no dependence on when the game's full-screen alpha wipe lands.
+bool g_wbAlphaFillOnly = false;
+
+// Inverse of ps2xWritebackToVramMasked: read a framebuffer page OUT of VRAM into a linear
+// RGBA buffer, top-down. Needed because BT3's cel/outline pass has to run in the SOFTWARE
+// rasterizer (its triangles are sub-pixel slivers that GL's top-left fill rule drops -- see
+// the coverage census: we lose 55.8% of the top-u band), and the software path works in VRAM
+// while the scene it draws into lives in a GPU FBO. The result has to come back.
+void ps2xReadbackFromVram(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h, uint32_t *px)
+{
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs;
+    if (!gs || !px || w <= 0 || h <= 0) return;
+    const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
+    const uint32_t bw = fbw ? fbw : 1u;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            px[(size_t)y * w + x] = gs->ReadVram(psm, base, bw, (uint32_t)x, (uint32_t)y);
+}
+
+// [flushrectchk] count pixels OUTSIDE [x0,x1)x[y0,y1) where the FBO (px) differs from VRAM;
+// returns the count and the bbox of the misses.
+extern "C" unsigned ps2xVramDiffOutside(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h, const uint32_t *px,
+                                        int x0, int y0, int x1, int y1, int *bx0, int *by0, int *bx1, int *by1)
+{
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs; if (!gs) return 0u;
+    const uint32_t base = GSInternal::framePageBaseToBlock(fbp); const uint32_t bw = fbw ? fbw : 1u;
+    const bool p16 = s_wbPack16 && wbIs16(psm); unsigned n = 0; *bx0 = *by0 = 1 << 20; *bx1 = *by1 = -1;
+    for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
+    {
+        if (x >= x0 && x < x1 && y >= y0 && y < y1) continue;
+        const uint32_t nv = px[(size_t)y * w + x]; const uint32_t ov = gs->ReadVram(psm, base, bw, (uint32_t)x, (uint32_t)y);
+        const bool diff = p16 ? ((ov & 0xFFFFu) != wbPack16(nv)) : (psm == 1u ? ((ov ^ nv) & 0xFFFFFFu) != 0u : ov != nv);
+        if (diff) { ++n; *bx0 = std::min(*bx0, x); *by0 = std::min(*by0, y); *bx1 = std::max(*bx1, x); *by1 = std::max(*by1, y); }
+    }
+    return n;
+}
+// [ddmirror] when set, every pixel the masked writeback lands in VRAM is ALSO written into this buffer (same swizzle,
+// no page-skip mask): the deferred decode's private copy = post-time snapshots + the read-time flush, live VRAM untouched.
+uint8_t *g_wbMirror = nullptr;
+// [linvram] when set, every value the writeback stores also lands in this LINEAR image (row-major, stride g_wbLinearStride)
+uint32_t *g_wbLinear = nullptr; int g_wbLinearStride = 0;
+void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
+                               const uint32_t *px, uint32_t fbmsk)
+{
+    wbHudLog("masked", fbp, fbw, psm, w, h, GSInternal::framePageBaseToBlock(fbp), fbw ? fbw : 1u);
+    {   // [pagelog] writebacks whose page range touches PS2X_PAGELOG=lo-hi
+        static const std::pair<int,int> s_pl = [](){ std::pair<int,int> r{-1,-1}; if (const char *v = std::getenv("PS2X_PAGELOG")) std::sscanf(v, "%d-%d", &r.first, &r.second); return r; }();
+        if (s_pl.first >= 0)
+        {
+            const int rowBytes = (int)(fbw ? fbw : 1u) * 64 * ((psm == 2u || psm == 10u) ? 2 : 4);
+            const int lo = (int)fbp, hi = (int)fbp + (int)(((long)h * rowBytes + 8191) / 8192) - 1;
+            if (hi >= s_pl.first && lo <= s_pl.second) { static unsigned long n = 0; if (n++ < 400) std::fprintf(stderr, "[pagelog] WRITEBACK fbp=%u pages %d-%d psm=%u %dx%d fbmsk=%08x\n", fbp, lo, hi, psm, w, h, fbmsk); }
+        }
+    }
+    ++g_ps2xWbGen;   // [hashmemo] any VRAM writeback invalidates memoised range hashes
+    { GS *gsc = g_gsWb ? g_gsWb : g_fmvGs; if (gsc) gsc->invalidateClutCache(); }   // [clutwb] a flushed page may hold a rendered palette: force the CLUT cache to re-decode
+
+    if (g_stageWrites)
+    {
+        std::lock_guard<std::mutex> lk(g_stageWbMx);
+        for (auto &e : g_stagedWb)
+            if (!e.isDepth && e.fbp == fbp)
+            { e.fbw = fbw; e.psm = psm; e.w = w; e.h = h; e.fbmsk = fbmsk;
+              e.px.assign(px, px + (size_t)w * h); return; }
+        StagedWb e; e.fbp = fbp; e.fbw = fbw; e.psm = psm; e.w = w; e.h = h;
+        e.fbmsk = fbmsk; e.isDepth = false; e.zMax = 0.0;
+        e.px.assign(px, px + (size_t)w * h);
+        g_stagedWb.push_back(std::move(e));
+        return;
+    }
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs;
+    {   // Which GS does the writeback land in? The decode reads the `gs` the rasterizer holds.
+        static const bool s_gi = [](){ const char *v = std::getenv("PS2X_GSID");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (s_gi && gs) { static int n = 0; if (n++ < 3)
+            std::fprintf(stderr, "[gsid] writeback gs=%p fbp=%u\n", (void*)gs, fbp); }
+    }
+    if (!gs || !px || w <= 0 || h <= 0) return;
+    {   // Who writes the scene pages, and through what mask? The software alpha rebuild lives
+        // in the alpha byte of page 0/112; any writeback of those pages with fbmsk==0 erases it.
+        static const bool s_wd = [](){ const char *v = std::getenv("PS2X_WBDIAG");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (s_wd && (fbp == 0u || fbp == 112u))
+        {
+            static int n = 0;
+            if (n++ < 20)
+                std::fprintf(stderr, "[wbdiag] writeback fbp%u psm=%02x %dx%d fbmsk=%08x%s\n",
+                             fbp, psm, w, h, fbmsk,
+                             (fbmsk & 0xFF000000u) ? "" : "   <-- OVERWRITES ALPHA");
+        }
+    }
+    const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
+    const uint32_t bw = fbw ? fbw : 1u;
+    // [rawflush] PS2X_RAWFLUSH=1: the FBO holds GL-scale alpha (GS 128 -> 255, needed for GL
+    // blending); VRAM must hold GS-scale bytes -- console reads them back as PALETTE INDICES
+    // (BT3's outline mask chain). Convert at this boundary: a_gs = round(a_gl*128/255), the
+    // inverse of the decoder's floor(a*255/128), exact for all 0..128.
+    static const bool s_rawFlush = [](){ const char *v = std::getenv("PS2X_RAWFLUSH");
+                                         return v && v[0] && v[0] != '0'; }();
+    auto cvA = [&](uint32_t v) -> uint32_t {
+        if (!s_rawFlush || psm != 0u) return v;
+        const uint32_t a = (v >> 24) & 0xFFu;
+        return (v & 0x00FFFFFFu) | (((a * 128u + 127u) / 255u) << 24);
+    };
+    // [flushrect] optional sub-rectangle (set by flushPageToVram): only these rows/cols are
+    // written; px keeps the full w-stride layout.
+    const int ry0 = (g_wbRectY0 >= 0) ? std::max(0, g_wbRectY0) : 0, ry1 = (g_wbRectY0 >= 0) ? std::min(h, g_wbRectY1) : h;
+    const int rx0 = (g_wbRectY0 >= 0) ? std::max(0, g_wbRectX0) : 0, rx1 = (g_wbRectY0 >= 0) ? std::min(w, g_wbRectX1) : w;
+    const auto &wfn = gs->writeVramFn(psm); const auto &rfn = gs->readVramFn(psm);   // [wbhoist]
+    auto PROW = [&](int y) -> size_t { return (size_t)(g_wbFlipY ? (h - 1 - y) : y) * (size_t)w; };   // [noflip]
+    int wrY0 = 1 << 30, wrY1 = -1;   // [flushdiff] rows actually written
+    for (int y = ry0; y < ry1; ++y)
+    {
+        int xs = rx0, xe = rx1;
+        if (g_wbRowRange)
+        {   // [flushrows] per-row changed x-range from the shadow diff: unchanged rows cost one test
+            xs = std::max(xs, g_wbRowRange[(size_t)y].first); xe = std::min(xe, g_wbRowRange[(size_t)y].second);
+            if (xs >= xe) continue;
+        }
+        if (psm == 0u && fbmsk == 0u && !g_wbAlphaFillOnly && !s_rawFlush)
+        {   // [rowct32] unmasked CT32 (the scene / mask page flushes): bulk row write
+            const u32 n = GSMem::WriteRowCT32(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, px + PROW(y) + xs,   // [rowrel] src/mask relative to xs
+                                              g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr);
+            if (g_wbMirror) GSMem::WriteRowCT32(g_wbMirror, base, bw, (u32)xs, (u32)xe, (u32)y, px + PROW(y) + xs, g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr);   // [ddmirror] same skip mask: a page the guest uploaded after the read keeps its post-time snapshot
+            if (g_wbLinear) std::memcpy(g_wbLinear + (size_t)y * g_wbLinearStride + xs, px + PROW(y) + xs, (size_t)(xe - xs) * 4u);   // [linvram]
+            if (n) { if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y; g_wbPixelsWritten += n; }
+            continue;
+        }
+        if ((psm == 0x02u || psm == 0x0Au) && fbmsk == 0u && !g_wbAlphaFillOnly && !s_rawFlush)
+        {   // [rowct16] unmasked CT16/CT16S (the edge page f336): pack the row, then bulk write
+            static std::vector<uint16_t> row16; if (row16.size() < (size_t)w) row16.resize((size_t)w);
+            const uint32_t *srow = px + PROW(y);
+            for (int x = xs; x < xe; ++x) row16[(size_t)x] = (uint16_t)(s_wbPack16 ? wbPack16(srow[x]) : srow[x]);
+            const u32 n = (psm == 0x02u)
+                ? GSMem::WriteRowCT16(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, row16.data() + xs, g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr)
+                : GSMem::WriteRowCT16S(gs->vramData(), base, bw, (u32)xs, (u32)xe, (u32)y, row16.data() + xs, g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr);
+            if (g_wbMirror) { const uint8_t *mk = g_wbSkipMask ? g_wbSkipMask + (size_t)y * w + xs : nullptr;
+                              if (psm == 0x02u) GSMem::WriteRowCT16(g_wbMirror, base, bw, (u32)xs, (u32)xe, (u32)y, row16.data() + xs, mk);
+                              else              GSMem::WriteRowCT16S(g_wbMirror, base, bw, (u32)xs, (u32)xe, (u32)y, row16.data() + xs, mk); }   // [ddmirror]
+            if (g_wbLinear) for (int x = xs; x < xe; ++x) g_wbLinear[(size_t)y * g_wbLinearStride + x] = row16[(size_t)x];   // [linvram]
+            if (n) { if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y; g_wbPixelsWritten += n; }
+            continue;
+        }
+        for (int x = xs; x < xe; ++x)
+        {
+            if (g_wbMirror && !(g_wbSkipMask && !g_wbSkipMask[(size_t)y * w + x]))
+            {   // [ddmirror] the same pixel into the private copy, masked against the COPY's own bytes, same skip mask as live
+                const uint32_t nvm = cvA(px[PROW(y) + x]);
+                const bool p16m = s_wbPack16 && wbIs16(psm);
+                if (g_wbAlphaFillOnly)
+                {
+                    const uint32_t ov = rfn(g_wbMirror, base, bw, (uint32_t)x, (uint32_t)y);
+                    const uint32_t rgbMask = fbmsk & 0x00FFFFFFu;
+                    const uint32_t rgb = (ov & rgbMask) | (nvm & ~rgbMask & 0x00FFFFFFu);
+                    const uint32_t al  = (ov & 0xFF000000u) ? (ov & 0xFF000000u) : (nvm & 0xFF000000u);
+                    wfn(g_wbMirror, base, bw, (uint32_t)x, (uint32_t)y, rgb | al);
+                }
+                else if (fbmsk == 0u) wfn(g_wbMirror, base, bw, (uint32_t)x, (uint32_t)y, p16m ? wbPack16(nvm) : nvm);
+                else
+                {
+                    uint32_t ov = rfn(g_wbMirror, base, bw, (uint32_t)x, (uint32_t)y);
+                    if (p16m) ov = wbUnpack16(ov & 0xFFFFu);
+                    const uint32_t mv = (ov & fbmsk) | (nvm & ~fbmsk);
+                    wfn(g_wbMirror, base, bw, (uint32_t)x, (uint32_t)y, p16m ? wbPack16(mv) : mv);
+                }
+            }
+            if (g_wbSkipMask && !g_wbSkipMask[(size_t)y * w + x]) continue;
+            if (y < wrY0) wrY0 = y; if (y > wrY1) wrY1 = y;
+            ++g_wbPixelsWritten;
+            const uint32_t nv = cvA(px[PROW(y) + x]);
+            if (g_wbAlphaFillOnly)
+            {   // RGB per the caller's mask (the previous version wrote it unconditionally,
+                // which is what regressed the frame); ALPHA only where VRAM has none yet, so
+                // the software rebuild's bands survive and the framebuffer's alpha fills the
+                // gaps. Wholesale alpha writes darken the sky (65 -> 36); protecting alpha
+                // entirely starves the mask (73.3% zero vs console's 24.1%).
+                const uint32_t ov = rfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y);
+                const uint32_t rgbMask = fbmsk & 0x00FFFFFFu;
+                const uint32_t rgb = (ov & rgbMask) | (nv & ~rgbMask & 0x00FFFFFFu);
+                const uint32_t al  = (ov & 0xFF000000u) ? (ov & 0xFF000000u) : (nv & 0xFF000000u);
+                wfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y, rgb | al);
+                if (g_wbLinear) g_wbLinear[(size_t)y * g_wbLinearStride + x] = rgb | al;   // [linvram]
+                continue;
+            }
+            const bool p16 = s_wbPack16 && wbIs16(psm);
+            if (fbmsk == 0u) { const uint32_t sv = p16 ? wbPack16(nv) : nv; wfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y, sv); if (g_wbLinear) g_wbLinear[(size_t)y * g_wbLinearStride + x] = sv; continue; }
+            uint32_t ov = rfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y);
+            if (p16) ov = wbUnpack16(ov & 0xFFFFu);
+            const uint32_t mv = (ov & fbmsk) | (nv & ~fbmsk);
+            { const uint32_t sv = p16 ? wbPack16(mv) : mv; wfn(gs->vramData(), base, bw, (uint32_t)x, (uint32_t)y, sv); if (g_wbLinear) g_wbLinear[(size_t)y * g_wbLinearStride + x] = sv; }
+        }
+    }
+    // A palette can BE a render target (BT3's outline CLUTs live in pages 499-500, which the
+    // game renders into). The CLUT cache keys on m_texUploadGen, which only processImageData
+    // bumps -- so without this a flushed palette would never be re-read.
+    gs->bumpTexUploadGen();
+    g_wbLastWrittenRows = (wrY1 >= wrY0) ? (wrY1 - wrY0 + 1) : 0;
+    // NOTE: invalidating only the rows written (or nothing on a zero-change flush) was tried
+    // 2026-08-27 and is NOT byte-identical (1.4% px) for no measurable gain -- the full-range
+    // bump stays.
+    if (g_wbRectY0 >= 0)
+    {   // rows ry0..ry1-1 only, rounded out to whole page rows (32 rows for 32-bit, 64 for 16/8-bit, 128 for 4-bit)
+        const int y0i = ry0, y1i = ry1;
+        const uint32_t ph = (psm == 0x02u || psm == 0x0Au || psm == 0x32u || psm == 0x3Au || psm == 0x13u || psm == 0x1Bu) ? 64u : (psm == 0x14u || psm == 0x24u || psm == 0x2Cu) ? 128u : 32u;
+        const uint32_t pr0 = (uint32_t)y0i / ph, pr1 = ((uint32_t)std::max(y1i, y0i + 1) + ph - 1u) / ph;
+        ps2GpuRenderer().onVramWriteback(base + pr0 * bw * 32u, (pr1 - pr0) * bw * 32u); gs->bumpPageUploadGen(base + pr0 * bw * 32u, (pr1 - pr0) * bw * 32u);   // [clutpagegen]
+    }
+    else
+    ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u)); gs->bumpPageUploadGen(base, (uint32_t)(((size_t)w * h * 4u) / 256u));   // [clutpagegen]
+}
+
+
+// [wbhud] PS2X_WBHUDLOG=1: BT3's HUD textures live at block 7168 (byte 0x1C0000) = fbp224's base. Log every writeback
+// whose block range overlaps them, so the ordering against the game's HUD re-uploads can be read from the log.
+static void wbHudLog(const char *who, uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h, uint32_t base, uint32_t bw)
+{
+    static const bool s_hl = [](){ const char *v = std::getenv("PS2X_WBHUDLOG"); return v && v[0] && v[0] != '0'; }();
+    if (!s_hl) return;
+    const bool is16 = (psm == GS_PSM_CT16 || psm == GS_PSM_CT16S);
+    const uint32_t end = base + (uint32_t)h * (is16 ? (bw + 1u) / 2u : bw);
+    static unsigned long n = 0, nHit = 0; ++n;
+    const bool hit = (base < 7680u && end > 7168u);
+    if (hit) ++nHit;
+    if ((hit && nHit <= 60) || (n % 2000u) == 0u)
+        std::fprintf(stderr, "[wbhud] #%lu%s %s fbp=%u fbw=%u psm=%u %dx%d blocks [%u,%u) %s HUD pages [7168,7680)\n", n, hit ? " HIT" : "", who, fbp, fbw, psm, w, h, base, end, hit ? "OVERLAPS" : "misses");
+}
+void ps2xWritebackToVram(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h, const uint32_t *px)
+{
+    ++g_ps2xWbGen;   // [hashmemo] any VRAM writeback invalidates memoised range hashes
+    { GS *gsc = g_gsWb ? g_gsWb : g_fmvGs; if (gsc) gsc->invalidateClutCache(); }   // [clutwb] a flushed page may hold a rendered palette: force the CLUT cache to re-decode
+
+    GS *gs = g_gsWb ? g_gsWb : g_fmvGs;
+    if (!gs || !px || w <= 0 || h <= 0) return;
+    const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
+    const uint32_t bw = fbw ? fbw : 1u;
+    wbHudLog("plain", fbp, fbw, psm, w, h, base, bw);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            gs->WriteVram(psm, base, bw, (uint32_t)x, (uint32_t)y, (s_wbPack16 && wbIs16(psm)) ? wbPack16(px[(size_t)y * w + x]) : px[(size_t)y * w + x]);
+    // Tell the renderer these VRAM pages changed, or every cached decode of them stays stale and
+    // the writeback is invisible to reads. onVramWriteback() existed but was NEVER CALLED.
+    // A palette can BE a render target (BT3's outline CLUTs live in pages 499-500, which the
+    // game renders into). The CLUT cache keys on m_texUploadGen, which only processImageData
+    // bumps -- so without this a flushed palette would never be re-read.
+    gs->bumpTexUploadGen();
+    ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u)); gs->bumpPageUploadGen(base, (uint32_t)(((size_t)w * h * 4u) / 256u));   // [clutpagegen]
+    // [wbrt] PS2X_WBDIAG=1: round-trip self-check. If WriteVram(x,y,v) followed by
+    // ReadVram(x,y) does not give back v, the base/stride/format I am passing is wrong and
+    // every byte handed to VRAM is landing in the wrong place -- which would corrupt exactly
+    // like the arena does. Sampled, not exhaustive.
+    {
+        static const bool s_d = [](){ const char *v = std::getenv("PS2X_WBDIAG"); return v && v[0] && v[0] != '0'; }();
+        // Sample PERIODICALLY, not the first N: the first calls all land during boot, so a
+        // 5-minute fight produced only logo-screen readings.
+        static int s_runs = 0;
+        if (s_d && (++s_runs % 600) == 0)
+        {
+            unsigned bad = 0, n = 0;
+            for (int y = 0; y < h; y += 17)
+                for (int x = 0; x < w; x += 13)
+                {
+                    ++n;
+                    if (gs->ReadVram(psm, base, bw, (uint32_t)x, (uint32_t)y) != px[(size_t)y * w + x]) ++bad;
+                }
+            // WHAT are we writing? If the FBO for this page is empty (an earlier diagnostic
+            // reported fbp224 as 0% non-black, alpha 255) then the writeback is faithfully
+            // copying blackness over real data -- correct mechanism, worthless source.
+            unsigned long sr=0,sg=0,sb=0,sa=0; unsigned long nz=0, tot=0;
+            for (int y = 0; y < h; y += 7)
+                for (int x = 0; x < w; x += 5)
+                {
+                    const uint32_t v = px[(size_t)y * w + x];
+                    sr += v & 0xFF; sg += (v >> 8) & 0xFF; sb += (v >> 16) & 0xFF; sa += (v >> 24) & 0xFF;
+                    if (v & 0x00FFFFFFu) ++nz;
+                    ++tot;
+                }
+            // Alpha DISTRIBUTION, not just the mean. The mask reads this alpha as a PSMT8H
+            // palette INDEX, so what matters is spatial VARIATION -- a uniform alpha selects one
+            // CLUT entry everywhere and yields the flat mask we observe. Console's palette has
+            // 150/256 entries with alpha, so a real mask needs a spread of indices.
+            unsigned long ah[8] = {0,0,0,0,0,0,0,0};
+            for (int y = 0; y < h; y += 7)
+                for (int x = 0; x < w; x += 5)
+                    ++ah[(((px[(size_t)y * w + x] >> 24) & 0xFF) * 8u) / 256u];
+            unsigned distinct = 0; for (int i = 0; i < 8; ++i) if (ah[i]) ++distinct;
+            std::fprintf(stderr, "[wbrt] fbp%u psm=%u bw=%u rt %u/%u | RGBA=(%lu,%lu,%lu,%lu) non-black %.1f%%"
+                         " | alpha buckets(32s):", fbp, psm, bw, bad, n, sr/tot, sg/tot, sb/tot, sa/tot, 100.0*nz/tot);
+            for (int i = 0; i < 8; ++i) std::fprintf(stderr, " %lu", ah[i]);
+            std::fprintf(stderr, "  distinct=%u%s\n", distinct,
+                         distinct <= 1 ? "  <== UNIFORM: one CLUT entry everywhere" : "");
+        }
+    }
+    // PS2X_WBSTAMP=1: stamp the written pages so cached decodes of them are re-keyed.
+    // Without this the texture cache keeps serving the decode made BEFORE the writeback --
+    // which is why BT3's shadow Pass 1 (which SAMPLES the scene buffer to build its silhouette)
+    // still reads an empty tbp=0 even with writeback on.
+    // ⚠ Default OFF: srcUploaded is also what the renderer uses to choose between sampling the
+    // live FBO and decoding from VRAM, so stamping flips the blur chain between those paths on
+    // alternate frames and the arena visibly blurs/unblurs.
+    {
+        static const bool s_wbStamp = [](){ const char *v = std::getenv("PS2X_WBSTAMP"); return v && v[0] && v[0] != '0'; }();
+        if (s_wbStamp) ps2GpuRenderer().onVramUpload(base, (uint32_t)(bw * h));
+    }
+}
+
 // PS2X_GRASSHACK shared state (see processImageData tail + GSRasterizer::drawPrimitive):
 // shadow of the 10752 slot captured when the mountains+grass image is resident.
 bool g_ps2xGrassHack = [](){ const char *v = std::getenv("PS2X_GRASSHACK"); return v && v[0] && v[0] != '0'; }();
 uint8_t g_ps2xGrassShadow[131072];
 std::atomic<bool> g_ps2xGrassShadowValid{false};
 
+// ---- PS2X_GS_RECORD: replayable GS stream capture (diagnostic; inert unless the env is set) ----
+// RING BUFFER by default: keeps only the most recent PS2X_GS_RECORD_MB of stream in memory and
+// writes it out at exit. A straight-to-disk recorder fills its cap during boot/menus and never
+// reaches the moment you wanted, which is exactly what happened on the first attempt.
+// PS2X_GS_RECORD_DIRECT=1 restores append-as-you-go.
+#include <deque>
+#include <condition_variable>
+#include <thread>
+#include <csignal>
+namespace {
+struct GsRec {
+    std::mutex mx;
+    std::deque<std::vector<uint8_t>> q;   // each entry is one complete record (header + payload)
+    unsigned long long bytes = 0, cap = 0;
+    FILE *direct = nullptr;
+    const char *path = nullptr;
+    bool init = false, ring = true, done = false;
+    // [recio] direct mode used to fwrite ON THE GIF HOT PATH -- multi-MB synchronous writes
+    // there stall the guest, and BT3's memory-card / loader device polls are timing-gated
+    // (the loading-stall class), so recording DIRECT broke the mc check. A writer thread
+    // drains this queue instead; the hot path only enqueues.
+    std::deque<std::vector<uint8_t>> wq;
+    std::condition_variable wcv;
+    std::thread writer;
+    bool writerStarted = false, writerStop = false;
+    unsigned long long wqBytes = 0;
+};
+GsRec g_rec;
+void gsRecInit()
+{
+    if (g_rec.init) return;
+    g_rec.init = true;
+    const char *p = std::getenv("PS2X_GS_RECORD");
+    if (!p || !p[0]) return;
+    g_rec.path = p;
+    const char *mb = std::getenv("PS2X_GS_RECORD_MB");
+    g_rec.cap = (unsigned long long)((mb && mb[0]) ? std::atoll(mb) : 512LL) * 1024ull * 1024ull;
+    const char *dv = std::getenv("PS2X_GS_RECORD_DIRECT");
+    g_rec.ring = !(dv && dv[0] && dv[0] != '0');
+    if (!g_rec.ring) g_rec.direct = std::fopen(p, "wb");
+    std::fprintf(stderr, "[gsrecord] %s -> %s (cap %llu MB)%s\n",
+                 g_rec.ring ? "RING (keeps the LAST frames, written at exit)" : "direct append",
+                 p, g_rec.cap / (1024ull*1024ull), g_rec.ring ? " -- just quit when you are done" : "");
+}
+void gsRecPush(const uint8_t *hdr, size_t hn, const uint8_t *pay, size_t pn)
+{
+    gsRecInit();
+    if (!g_rec.path) return;
+    std::lock_guard<std::mutex> lk(g_rec.mx);
+    if (g_rec.done) return;
+    if (!g_rec.ring)
+    {
+        if (!g_rec.direct || g_rec.bytes >= g_rec.cap) return;
+        if (!g_rec.writerStarted)
+        {
+            g_rec.writerStarted = true;
+            g_rec.writer = std::thread([](){
+                std::unique_lock<std::mutex> lk(g_rec.mx);
+                for (;;)
+                {
+                    g_rec.wcv.wait(lk, []{ return g_rec.writerStop || !g_rec.wq.empty(); });
+                    while (!g_rec.wq.empty())
+                    {
+                        std::vector<uint8_t> e = std::move(g_rec.wq.front());
+                        g_rec.wq.pop_front(); g_rec.wqBytes -= e.size();
+                        lk.unlock();
+                        std::fwrite(e.data(), 1, e.size(), g_rec.direct);
+                        lk.lock();
+                    }
+                    if (g_rec.writerStop) return;
+                }
+            });
+        }
+        std::vector<uint8_t> e; e.reserve(hn + pn);
+        e.insert(e.end(), hdr, hdr + hn);
+        if (pn) e.insert(e.end(), pay, pay + pn);
+        g_rec.bytes += e.size();
+        // Backpressure guard: if the disk cannot keep up, drop rather than stall the guest
+        // (a gap in the recording beats a broken game).
+        if (g_rec.wqBytes < (512ull << 20))
+        { g_rec.wqBytes += e.size(); g_rec.wq.push_back(std::move(e)); g_rec.wcv.notify_one(); }
+        return;
+    }
+    std::vector<uint8_t> e; e.reserve(hn + pn);
+    e.insert(e.end(), hdr, hdr + hn);
+    if (pn) e.insert(e.end(), pay, pay + pn);
+    g_rec.bytes += e.size();
+    g_rec.q.push_back(std::move(e));
+    while (g_rec.bytes > g_rec.cap && !g_rec.q.empty())
+    { g_rec.bytes -= g_rec.q.front().size(); g_rec.q.pop_front(); }
+}
+} // namespace
+
+// Flush the ring at exit. Drops any leading vsync markers: the replay picks the file format from
+// byte 0 and rejects a stream that does not begin with a packet.
+extern "C" void ps2xGsRecordFlush();
+extern "C" void ps2xGsRecordFlush()
+{
+    std::unique_lock<std::mutex> lk(g_rec.mx);
+    if (g_rec.done || !g_rec.path) return;
+    g_rec.done = true;
+    if (!g_rec.ring)
+    {
+        if (g_rec.writerStarted)
+        {   // Let the writer drain its queue and exit, then join WITHOUT the lock held --
+            // it re-acquires mx between records, so holding mx here would deadlock, and
+            // writing concurrently from two threads would interleave the file.
+            g_rec.writerStop = true;
+            g_rec.wcv.notify_one();
+            lk.unlock();
+            if (g_rec.writer.joinable()) g_rec.writer.join();
+            lk.lock();
+        }
+        if (g_rec.direct)
+        {
+            while (!g_rec.wq.empty())
+            {   // anything enqueued after the stop flag
+                std::vector<uint8_t> &e = g_rec.wq.front();
+                std::fwrite(e.data(), 1, e.size(), g_rec.direct);
+                g_rec.wq.pop_front();
+            }
+            std::fclose(g_rec.direct);
+            g_rec.direct = nullptr;
+        }
+        return;
+    }
+    while (!g_rec.q.empty() && !g_rec.q.front().empty() && g_rec.q.front()[0] != 0u)
+    { g_rec.bytes -= g_rec.q.front().size(); g_rec.q.pop_front(); }
+    FILE *f = std::fopen(g_rec.path, "wb");
+    if (!f) { std::fprintf(stderr, "[gsrecord] could not open %s\n", g_rec.path); return; }
+    unsigned long long w = 0; unsigned long vs = 0;
+    for (auto &e : g_rec.q) { std::fwrite(e.data(), 1, e.size(), f); w += e.size(); if (e[0] == 1u) ++vs; }
+    std::fclose(f);
+    std::fprintf(stderr, "[gsrecord] wrote %s: %.1f MB, %lu frames retained (~%.0f s at 30fps, %.2f MB/frame)"
+                 " -- trigger the effect within this window of quitting\n",
+                 g_rec.path, w / 1e6, vs, vs / 30.0, vs ? (w / 1e6) / vs : 0.0);
+}
+
+extern "C" void ps2xGsRecordVsync()
+{
+    const uint8_t v[2] = {1u, 0u};
+    gsRecPush(v, 2, nullptr, 0);
+    // AUTOFLUSH: do not depend on a clean exit. atexit() did not run when the window was closed
+    // and a whole play session was lost, so write the ring out periodically as well.
+    // PS2X_GS_RECORD_EVERY=0 disables; default every 600 frames (~10 s of play).
+    // Must be well UNDER how many frames the ring holds, or the periodic write can land after
+    // the moment you wanted has already scrolled out. Fight frames are ~1 MB each (~46k kicks),
+    // so a 512 MB ring holds ~500 of them; flushing every 120 keeps the file <=4 s stale.
+    static const long s_every = [](){ const char *v2 = std::getenv("PS2X_GS_RECORD_EVERY");
+                                      return v2 && v2[0] ? std::atol(v2) : 120L; }();
+    if (s_every > 0)
+    {
+        static long n = 0;
+        if (++n % s_every == 0)
+        {
+            bool ring;
+            { std::lock_guard<std::mutex> lk(g_rec.mx); ring = g_rec.ring;
+              if (!ring && g_rec.direct) std::fflush(g_rec.direct); }
+            if (ring)
+            {   // RING MODE ONLY: in direct mode this flush CLOSED the file and every later
+                // record silently no-opped -- direct recordings always ended at exactly 120
+                // vsyncs (~2 s of play). Direct mode streams continuously; its periodic
+                // safety is the fflush above (a hard kill loses at most the OS buffer).
+                ps2xGsRecordFlush();
+                std::lock_guard<std::mutex> lk(g_rec.mx); g_rec.done = false;  // keep recording
+            }
+        }
+    }
+}
+
+// Signal-safe-ish exit paths: closing the window / Ctrl-C did not run atexit.
+extern "C" void ps2xGsRecordOnSignal(int sig)
+{
+    ps2xGsRecordFlush();
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+
+static thread_local int t_gsStateHeld = 0;   // [relock] >0 while this thread holds m_stateMutex in processGIFPacket
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    {   // PS2X_GS_RECORD=<path>: append this packet to a replayable stream so live-only bugs
+        // (explosions, transformations) can be analysed offline with the validated tooling.
+        // Format the replay expects: 0x00, path byte, uint32 length, payload -- and 0x01, pad
+        // for a vsync. PS2X_GS_RECORD_MB caps the file (default 512 MB).
+        if (sizeBytes > 0u)
+        {
+            uint8_t hdr[6] = {0u, 0u, 0u, 0u, 0u, 0u};
+            std::memcpy(hdr + 2, &sizeBytes, 4);
+            gsRecPush(hdr, 6, data, sizeBytes);
+        }
+    }
     if (g_vramDumpPtr)
     {
         static uint32_t s_pktCount = 0;
@@ -1523,6 +2358,11 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         }
     }
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    { extern GS *g_gsWb; if (!g_gsWb) g_gsWb = this; }   // [deferdec] the GL thread's decode needs the GS before any writeback happened (replay had none)
+    // [relock] writeRegister() re-locked this recursive mutex for EVERY register in the packet
+    // (~7% of the guest thread in pthread lock/unlock). Mark it held for this thread so the
+    // nested writeRegister() calls skip the lock (same mutex, same thread: no semantic change).
+    struct GsHeldGuard { GsHeldGuard() { ++t_gsStateHeld; } ~GsHeldGuard() { --t_gsStateHeld; } } _gsHeld;
     if (!data || sizeBytes < 16 || !m_vram)
         return;
     m_curPktData = data;
@@ -1749,7 +2589,24 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(x) / 16.0f;
         vtx.y = static_cast<float>(y) / 16.0f;
+        ps2xSubpixTally(vtx.x, vtx.y);
         vtx.z = static_cast<float>(z);
+        {   // [zraw] PS2X_ZRAW=1: raw z at the ACTIVE decode site (case 0x04/0x05 of
+            // processGIFPacket). The .gs says ~2960 terrain verts/frame carry z>10M.
+            static const bool s_zr = [](){ const char *v = std::getenv("PS2X_ZRAW"); return v && v[0] && v[0] != '0'; }();
+            if (s_zr) { static unsigned long nn=0, ff=0; static uint32_t mx=0;
+                ++nn; if (z > 10000000u) ++ff; if (z > mx) mx = z;
+                static unsigned long byPrim[8]={0,0,0,0,0,0,0,0}, byAdc[2]={0,0}, slot[8]={0,0,0,0,0,0,0,0};
+                if (z > 10000000u) { byPrim[m_prim.type & 7]++; byAdc[adk?1:0]++; slot[(m_vtxCount % 8)]++; }
+                if ((nn % 50000ul) == 0ul) {
+                    std::fprintf(stderr, "[zraw] line %d: verts=%lu  z>10M=%lu (%.2f%%)  maxz=%u\n",
+                                 __LINE__, nn, ff, 100.0*ff/nn, mx);
+                    std::fprintf(stderr, "[zraw]   far by PRIM: ");
+                    for (int i=0;i<8;++i) std::fprintf(stderr, "%d=%lu ", i, byPrim[i]);
+                    std::fprintf(stderr, "| far by ADC: draw=%lu skip=%lu | far by slot(m_vtxCount%%8): ", byAdc[0], byAdc[1]);
+                    for (int i=0;i<8;++i) std::fprintf(stderr, "%d=%lu ", i, slot[i]);
+                    std::fprintf(stderr, "\n"); } }
+        }
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1786,7 +2643,17 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(x) / 16.0f;
         vtx.y = static_cast<float>(y) / 16.0f;
+        ps2xSubpixTally(vtx.x, vtx.y);
         vtx.z = static_cast<float>(z);
+        {   // [zraw] PS2X_ZRAW=1: raw z at the ACTIVE decode site (case 0x04/0x05 of
+            // processGIFPacket). The .gs says ~2960 terrain verts/frame carry z>10M.
+            static const bool s_zr = [](){ const char *v = std::getenv("PS2X_ZRAW"); return v && v[0] && v[0] != '0'; }();
+            if (s_zr) { static unsigned long nn=0, ff=0; static uint32_t mx=0;
+                ++nn; if (z > 10000000u) ++ff; if (z > mx) mx = z;
+                if ((nn % 50000ul) == 0ul)
+                    std::fprintf(stderr, "[zraw] line %d: verts=%lu  z>10M=%lu (%.2f%%)  maxz=%u\n",
+                                 __LINE__, nn, ff, 100.0*ff/nn, mx); }
+        }
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1820,7 +2687,17 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
+        ps2xSubpixTally(vtx.x, vtx.y);
         vtx.z = static_cast<float>((hi >> 4) & 0xFFFFFF);
+        {   // [zraw] PS2X_ZRAW=1: count vertices by raw z at the DECODE, before any cull can
+            // touch them. The .gs says ~2960 terrain vertices/frame carry z>10M; if they never
+            // appear here, the loss is in packet parsing, not in the rasteriser.
+            static const bool s_zr = [](){ const char *v = std::getenv("PS2X_ZRAW"); return v && v[0] && v[0] != '0'; }();
+            if (s_zr) { static unsigned long n=0, far=0; static float mx=0.0f;
+                ++n; if (vtx.z > 10000000.0f) ++far; if (vtx.z > mx) mx = vtx.z;
+                if ((n % 100000ul) == 0ul)
+                    std::fprintf(stderr, "[zraw] XYZF2-packed verts=%lu  z>10M=%lu  maxz=%.0f\n", n, far, mx); }
+        }
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1852,6 +2729,12 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<float>(hi & 0xFFFFFFFF);
+        {   static const bool s_zr = [](){ const char *v = std::getenv("PS2X_ZRAW"); return v && v[0] && v[0] != '0'; }();
+            if (s_zr) { static unsigned long n=0, far=0; static float mx=0.0f;
+                ++n; if (vtx.z > 10000000.0f) ++far; if (vtx.z > mx) mx = vtx.z;
+                if ((n % 20000ul) == 0ul)
+                    std::fprintf(stderr, "[zraw] XYZ2-packed  verts=%lu  z>10M=%lu  maxz=%.0f\n", n, far, mx); }
+        }
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1879,9 +2762,20 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
     }
 }
 
+// [prmode] last raw PRIM / PRMODE values (single GS instance) so PRMODECONT switches can re-apply attributes
+static uint64_t s_primRaw = 0, s_prmodeRaw = 0;
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    auto applyPrimAttrs = [this](uint64_t v)
+    {   // [prmode] attribute bits shared by PRIM and PRMODE
+        m_prim.iip = ((v >> 3) & 1) != 0; m_prim.tme = ((v >> 4) & 1) != 0; m_prim.fge = ((v >> 5) & 1) != 0;
+        m_prim.abe = ((v >> 6) & 1) != 0; m_prim.aa1 = ((v >> 7) & 1) != 0; m_prim.fst = ((v >> 8) & 1) != 0;
+        m_prim.ctxt = ((v >> 9) & 1) != 0; m_prim.fix = ((v >> 10) & 1) != 0;
+    };
+    static const bool s_relock = [](){ const char *v = std::getenv("PS2X_RELOCK"); return !(v && v[0] == '0'); }();   // [relock] =0 -> always lock
+    std::unique_lock<std::recursive_mutex> lock(m_stateMutex, std::defer_lock);
+    if (!s_relock || t_gsStateHeld == 0) lock.lock();
+    if (regAddr < 0x63u) { m_rawRegs[regAddr] = value; m_rawSet[regAddr] = true; }   // [slice] raw shadow
     // [floortex0] (default on, PS2X_SRCDIAG=0 disables): the exact TEX0 the FLOOR draws
     // carry NOW — is the tw=10 corruption still present, or did it heal along the way?
     {
@@ -1919,6 +2813,53 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
                 if (s_gn.fetch_add(1) < 60u)
                     std::fprintf(stderr, "[gstex] TEX0_%c tbp0=%u srcPath=%u\n",
                                  regAddr == GS_REG_TEX0_1 ? '1' : '2', t, m_curSrcPath);
+            }
+        }
+    }
+    // [vucell4] PS2X_VUCELL4=<minframe>: per-strip terrain BAND choice = the CLUT row (CSA)
+    // in TEX0 writes whose CBP is the terrain band palette (12992). Histogram of csa values.
+    {
+        static const long s_v4 = [](){ const char *v = std::getenv("PS2X_VUCELL4"); return v && v[0] ? std::atol(v) : -1; }();
+        if (s_v4 >= 0 && (regAddr == GS_REG_TEX0_1 || regAddr == GS_REG_TEX0_2) &&
+            (uint32_t)((value >> 37) & 0x3FFFu) == 12992u)
+        {
+            extern std::atomic<uint64_t> g_bt3FrameCount;
+            const long fr4 = (long)g_bt3FrameCount.load(std::memory_order_relaxed);
+            if (fr4 >= s_v4)
+            {
+                const uint32_t csa = (uint32_t)((value >> 56) & 0x1Fu);
+                // bind-time palette content: mean RGB of the VRAM palette at cbp 12992 (linear bytes)
+                uint32_t pm = 0, pt = 0;
+                {
+                    const size_t off = (size_t)12992 * 256;
+                    if (off + 1024 <= m_vramSize)
+                    {
+                        uint32_t s0 = 0, s1 = 0;
+                        for (int i = 0; i < 224; ++i) { const uint8_t *e = m_vram + off + i*4; s0 += e[0]+e[1]+e[2]; }
+                        for (int i = 224; i < 256; ++i) { const uint8_t *e = m_vram + off + i*4; s1 += e[0]+e[1]+e[2]; }
+                        pm = s0 / (224*3); pt = s1 / (32*3);
+                    }
+                }
+                static std::mutex s_m4; static std::map<uint32_t,uint32_t> s_h4; static std::atomic<uint32_t> s_n4{0};
+                static std::atomic<uint64_t> s_pmSum{0}, s_ptSum{0};
+                std::lock_guard<std::mutex> lk4(s_m4);
+                ++s_h4[csa];
+                s_pmSum.fetch_add(pm); s_ptSum.fetch_add(pt);
+                const uint32_t n4 = s_n4.fetch_add(1u) + 1u;
+                if (n4 <= 3u || (n4 % 200u) == 0u)
+                {
+                    char raw[64];
+                    std::snprintf(raw, sizeof raw, " tbp0=%u tbw=%u tpsm=%u tw=%u th=%u",
+                                  (uint32_t)(value & 0x3FFFu), (uint32_t)((value >> 14) & 0x3Fu),
+                                  (uint32_t)((value >> 20) & 0x3Fu), (uint32_t)((value >> 26) & 0xFu),
+                                  (uint32_t)((value >> 30) & 0xFu));
+                    std::string ln = "[vucell4] fr=" + std::to_string(fr4) + " n=" + std::to_string(n4)
+                        + " tpsm=" + std::to_string((uint32_t)((value >> 20) & 0x3Fu))
+                        + " palMean=" + std::to_string(pm) + " palTop=" + std::to_string(pt)
+                        + " avgMean=" + std::to_string(s_pmSum.load()/n4) + " avgTop=" + std::to_string(s_ptSum.load()/n4) + raw + " csa-hist:";
+                    for (auto &kv : s_h4) ln += " " + std::to_string(kv.first) + "x" + std::to_string(kv.second);
+                    std::fprintf(stderr, "%s\n", ln.c_str());
+                }
             }
         }
     }
@@ -1996,15 +2937,16 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     {
     case GS_REG_PRIM:
     {
+        // [prmode] PRMODECONT=0 means the attribute bits (IIP/TME/FGE/ABE/AA1/FST/CTXT/FIX) come from PRMODE,
+        // and a PRIM write (register or GIF-tag PRE) only selects the primitive TYPE. We used to copy the
+        // attributes from PRIM regardless, so BT3's shadow-silhouette pass (VU1 packets: PRMODECONT=0,
+        // PRMODE=0x48 = ctx1/TME off, GIF-tag PRIM with CTXT=1) landed in context 2 = the scene buffer
+        // instead of FRAME_1 = fbp336, and the ground-shadow decal sampled an empty silhouette.
+        // PS2X_PRMODE=0 restores the old behaviour (A/B).
+        static const bool s_prmodeFix = [](){ const char *v = std::getenv("PS2X_PRMODE"); return !(v && v[0] == '0'); }();
+        s_primRaw = value;
         m_prim.type = static_cast<GSPrimType>(value & 0x7);
-        m_prim.iip = ((value >> 3) & 1) != 0;
-        m_prim.tme = ((value >> 4) & 1) != 0;
-        m_prim.fge = ((value >> 5) & 1) != 0;
-        m_prim.abe = ((value >> 6) & 1) != 0;
-        m_prim.aa1 = ((value >> 7) & 1) != 0;
-        m_prim.fst = ((value >> 8) & 1) != 0;
-        m_prim.ctxt = ((value >> 9) & 1) != 0;
-        m_prim.fix = ((value >> 10) & 1) != 0;
+        if (m_prmodecont || !s_prmodeFix) applyPrimAttrs(value);
         m_vtxCount = 0;
         m_vtxIndex = 0;
         break;
@@ -2056,6 +2998,12 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         vtx.x = static_cast<float>(value & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((value >> 16) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<double>((value >> 32) & 0xFFFFFF);
+        {   static const bool s_zr = [](){ const char *v = std::getenv("PS2X_ZRAW"); return v && v[0] && v[0] != '0'; }();
+            if (s_zr) { static unsigned long n=0, far=0; static double mx=0.0;
+                ++n; if (vtx.z > 10000000.0) ++far; if (vtx.z > mx) mx = vtx.z;
+                if ((n % 50000ul) == 0ul)
+                    std::fprintf(stderr, "[zraw] REG XYZF2 verts=%lu z>10M=%lu maxz=%.0f\n", n, far, mx); }
+        }
         vtx.fog = static_cast<uint8_t>((value >> 56) & 0xFF);
         vtx.r = m_curR;
         vtx.g = m_curG;
@@ -2076,6 +3024,12 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         vtx.x = static_cast<float>(value & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((value >> 16) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<double>((value >> 32) & 0xFFFFFFFF);
+        {   static const bool s_zr = [](){ const char *v = std::getenv("PS2X_ZRAW"); return v && v[0] && v[0] != '0'; }();
+            if (s_zr) { static unsigned long n=0, far=0; static double mx=0.0;
+                ++n; if (vtx.z > 10000000.0) ++far; if (vtx.z > mx) mx = vtx.z;
+                if ((n % 50000ul) == 0ul)
+                    std::fprintf(stderr, "[zraw] REG XYZ2  verts=%lu z>10M=%lu maxz=%.0f\n", n, far, mx); }
+        }
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -2147,20 +3101,15 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         break;
     }
     case GS_REG_PRMODECONT:
+    {   // [prmode] switching the attribute source re-applies the attributes from the now-active register
+        static const bool s_prmodeFix = [](){ const char *v = std::getenv("PS2X_PRMODE"); return !(v && v[0] == '0'); }();
         m_prmodecont = (value & 1) != 0;
+        if (s_prmodeFix) applyPrimAttrs(m_prmodecont ? s_primRaw : s_prmodeRaw);
         break;
+    }
     case GS_REG_PRMODE:
-        if (!m_prmodecont)
-        {
-            m_prim.iip = ((value >> 3) & 1) != 0;
-            m_prim.tme = ((value >> 4) & 1) != 0;
-            m_prim.fge = ((value >> 5) & 1) != 0;
-            m_prim.abe = ((value >> 6) & 1) != 0;
-            m_prim.aa1 = ((value >> 7) & 1) != 0;
-            m_prim.fst = ((value >> 8) & 1) != 0;
-            m_prim.ctxt = ((value >> 9) & 1) != 0;
-            m_prim.fix = ((value >> 10) & 1) != 0;
-        }
+        s_prmodeRaw = value;
+        if (!m_prmodecont) applyPrimAttrs(value);
         break;
     case GS_REG_TEXCLUT:
         m_texclut.cbw = static_cast<uint8_t>(value & 0x3Fu);
@@ -2168,6 +3117,22 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_texclut.cov = static_cast<uint16_t>((value >> 12) & 0x3FFu);
         break;
     case GS_REG_SCISSOR_1:
+    {   // [shadowpass] the Pass-1 shadow context = FRAME_1 fbp336/fbw4 + SCISSOR (1,1)-(254,254), in either order
+        extern bool g_spInShadow, g_spFrame336, g_spScissor254; extern uint32_t g_spSets, g_spMscal, g_spLastPC, g_spKicks, g_spLoops, g_spUnpackQw;
+        static const bool s_sp = [](){ const char *v = std::getenv("PS2X_SHADOWPASS"); return v && v[0] && v[0] != '0'; }();
+        if (s_sp)
+        {
+            g_spScissor254 = ((value & 0x07FF07FF07FF07FFull) == 0x00fe000100fe0001ull);
+            if (!g_spScissor254) g_spInShadow = false;
+            else if (g_spFrame336 && !g_spInShadow)
+            {
+                g_spInShadow = true; const uint32_t n = ++g_spSets;
+                if (n <= 4u || (n % 240u) == 0u)
+                    std::fprintf(stderr, "[shadowpass] ctx set #%u | since previous set: mscal=%u lastPC=0x%x kicks=%u nloopSum=%u\n", n, g_spMscal, g_spLastPC, g_spKicks, g_spLoops);
+                g_spMscal = 0; g_spKicks = 0; g_spLoops = 0; g_spUnpackQw = 0;
+            }
+        }
+    }
     case GS_REG_SCISSOR_2:
     {
         int ci = (regAddr == GS_REG_SCISSOR_2) ? 1 : 0;
@@ -2214,6 +3179,18 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         break;
     }
     case GS_REG_FRAME_1:
+    {   // [shadowpass]
+        extern bool g_spInShadow, g_spFrame336, g_spScissor254; extern uint32_t g_spSets, g_spMscal, g_spLastPC, g_spKicks, g_spLoops, g_spUnpackQw;
+        g_spFrame336 = ((value & 0xFFFFFFFFull) == 0x40150ull);
+        if (!g_spFrame336) g_spInShadow = false;
+        else if (g_spScissor254 && !g_spInShadow)
+        {
+            g_spInShadow = true; const uint32_t n = ++g_spSets;
+            if (n <= 4u || (n % 240u) == 0u)
+                std::fprintf(stderr, "[shadowpass] ctx set #%u (frame after scissor) | since previous set: mscal=%u lastPC=0x%x kicks=%u nloopSum=%u\n", n, g_spMscal, g_spLastPC, g_spKicks, g_spLoops);
+            g_spMscal = 0; g_spKicks = 0; g_spLoops = 0; g_spUnpackQw = 0;
+        }
+    }
     case GS_REG_FRAME_2:
     {
         int ci = (regAddr == GS_REG_FRAME_2) ? 1 : 0;
@@ -2275,8 +3252,33 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_transferState.x = m_trxpos.dsax;
         m_transferState.y = m_trxpos.dsay;
         m_transferState.total_pixels = m_trxreg.rrw * m_trxreg.rrh;
+        if ((m_trxdir == 0u || m_trxdir == 2u) && m_vram)
+        {   // [uploadwait] the destination pages must not have a deferred flush still queued (see waitPendingFlush)
+            const uint32_t bpp = (m_bitbltbuf.dpsm == GS_PSM_T8 || m_bitbltbuf.dpsm == GS_PSM_T8H) ? 1u
+                               : (m_bitbltbuf.dpsm == GS_PSM_T4 || m_bitbltbuf.dpsm == GS_PSM_T4HL || m_bitbltbuf.dpsm == GS_PSM_T4HH) ? 1u
+                               : (m_bitbltbuf.dpsm == GS_PSM_CT16 || m_bitbltbuf.dpsm == GS_PSM_CT16S || m_bitbltbuf.dpsm == GS_PSM_Z16 || m_bitbltbuf.dpsm == GS_PSM_Z16S) ? 2u : 4u;
+            const uint32_t rowBytes = std::max(1u, (uint32_t)m_bitbltbuf.dbw) * 64u * bpp;
+            const uint32_t pageLo = m_bitbltbuf.dbp / 32u;
+            const uint32_t pageHi = pageLo + ((m_trxpos.dsay + m_trxreg.rrh) * rowBytes) / 8192u + 1u;
+            for (uint32_t p = pageLo; p <= pageHi && p < 512u; ++p) ps2GpuRenderer().waitPendingFlush(p);
+        }
         m_transferState.copied_pixels = 0;
 
+        {   // [up10752] PS2X_UP10752=1: per-frame ORDER of uploads into the band-sheet block —
+            // two tenants (entry-4 slice vs the real sheet) target dbp 10752; last writer wins.
+            static const bool s_u7 = [](){ const char *v = std::getenv("PS2X_UP10752"); return v && v[0] && v[0] != '0'; }();
+            if (s_u7 && m_trxdir == 0u && m_bitbltbuf.dbp == 10752u)
+            {
+                extern std::atomic<uint64_t> g_bt3FrameCount;
+                static std::atomic<uint32_t> s_n7{0};
+                if (s_n7.fetch_add(1) < 400u)
+                    std::fprintf(stderr, "[up10752] fr=%llu dpsm=%u dbw=%u rr=%ux%u dsax=%u dsay=%u\n",
+                                 (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
+                                 (unsigned)m_bitbltbuf.dpsm, (unsigned)m_bitbltbuf.dbw,
+                                 (unsigned)m_trxreg.rrw, (unsigned)m_trxreg.rrh,
+                                 (unsigned)m_trxpos.dsax, (unsigned)m_trxpos.dsay);
+            }
+        }
         if (m_trxdir == 2 && m_vram)
         {
             performLocalToLocalTransfer();
@@ -2487,7 +3489,8 @@ void GS::performLocalToLocalTransfer()
     // them as RT-feedback and SKIPPED them (the flat dark-green terrain in GPU mode).
     // The old reason not to stamp (100% texture re-decode churn) is gone: content-
     // versioned texKeys re-decode only when the copied bytes actually changed.
-    ps2GpuRenderer().onVramUpload(dbp, static_cast<uint32_t>(dbw) * rrh);
+    { extern GS *g_gsWb; g_gsWb = this; }   // writeback needs a GS to reach VRAM
+    ps2GpuRenderer().onVramUpload(dbp, static_cast<uint32_t>(dbw) * rrh); bumpPageUploadGen(dbp, static_cast<uint32_t>(dbw) * rrh);   // [clutpagegen]
 
     {
         static const bool s_l2l = [](){ const char *v = std::getenv("PS2X_TEX_PROBE"); return v && v[0] && v[0] != '0'; }();
@@ -2684,6 +3687,23 @@ void GS::vertexKick(bool drawing)
         goto slideWindow; // ADC kick: no rasterization, but the window still advances
 
     {
+        {   // [zkick] PS2X_ZKICK=1: at the DRAWING kick, before any rasteriser cull, does the
+            // vertex queue carry a far (z>12M) vertex? The .gs says ~8.3% of decoded vertices do,
+            // yet ZERO triangles reach the rasteriser's ZSAT check with one. This says which side
+            // of drawPrimitive() loses them.
+            static const bool s_zk = [](){ const char *v = std::getenv("PS2X_ZKICK"); return v && v[0] && v[0] != '0'; }();
+            if (s_zk && (m_prim.type == GS_PRIM_TRISTRIP || m_prim.type == GS_PRIM_TRIANGLE || m_prim.type == GS_PRIM_TRIFAN))
+            {
+                static unsigned long nn = 0, ff = 0; static float mx = 0.0f;
+                const float z0 = m_vtxQueue[0].z, z1 = m_vtxQueue[1].z, z2 = m_vtxQueue[2].z;
+                ++nn;
+                if (z0 > 12000000.0f || z1 > 12000000.0f || z2 > 12000000.0f) ++ff;
+                mx = std::max(mx, std::max(z0, std::max(z1, z2)));
+                if ((nn % 20000ul) == 0ul)
+                    std::fprintf(stderr, "[zkick] drawing tri-kicks=%lu  queue has far vert=%lu (%.2f%%)  max queue z=%.0f\n",
+                                 nn, ff, 100.0 * ff / nn, mx);
+            }
+        }
         static const bool s_dp = [](){ const char *v = std::getenv("PS2X_DMAPROF"); return v && v[0] && v[0] != '0'; }();
         if (s_dp)
         {
@@ -3103,7 +4123,12 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         if (data && sizeBytes > 0u)
         {
             uint64_t h = 1469598103934665603ull;
-            for (uint32_t i = 0; i < sizeBytes; ++i) h = (h ^ data[i]) * 1099511628211ull;
+            {   // [uphash8] 8 bytes per FNV step instead of 1 (the byte loop was 7% of the guest thread: a serial
+                // multiply chain per byte over every upload). Only equality with the previous hash matters.
+                uint32_t i = 0;
+                for (; i + 8u <= sizeBytes; i += 8u) { uint64_t q; std::memcpy(&q, data + i, 8u); h = (h ^ q) * 1099511628211ull; }
+                for (; i < sizeBytes; ++i) h = (h ^ data[i]) * 1099511628211ull;
+            }
             h ^= (static_cast<uint64_t>(sizeBytes) << 1) ^ (static_cast<uint64_t>(dpsm) << 40);
             std::lock_guard<std::mutex> lk(g_uploadHashMx);
             uint64_t &last = g_uploadHash[dbp];
@@ -3131,6 +4156,35 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         }
         if (changed)
             ps2GpuRenderer().onVramUpload(dbp, static_cast<uint32_t>(dbw) * rrh);
+        {   // [groupviz] PS2X_GROUPVIZ=<dbp>: per-frame ordinal of palette uploads to this block;
+            // the rasterizer tints each palette by it -> replay frames become group maps.
+            static const uint32_t s_gvDbp = [](){ const char *v = std::getenv("PS2X_GROUPVIZ");
+                                                  return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
+            if (s_gvDbp && dbp == s_gvDbp)
+            {
+                extern int g_ps2ReplayVsync;
+                extern uint32_t g_gvGroupOrdinal;
+                static int s_lastVs = -1;
+                if (g_ps2ReplayVsync != s_lastVs) { s_lastVs = g_ps2ReplayVsync; g_gvGroupOrdinal = 0; }
+                ++g_gvGroupOrdinal;
+            }
+        }
+        // [atomicclut] bump the CLUT-page generation only when the TRANSFER COMPLETES, not per
+        // GIF IMAGE packet: a palette upload spanning multiple packets used to bump the gen on
+        // every chunk, so an interleaved draw's ensureClutCache rebuilt from HALF-WRITTEN VRAM.
+        // Measured on the user's hillmove.gs: 16% of terrain draws paired with palette contents
+        // that never existed in the stream (blends of adjacent versions) = the moving dark/light
+        // terrain patches. Consumers of m_pageUploadGen = the CLUT cache key only.
+        // PS2X_ATOMICCLUT=0 restores the per-chunk bump.
+        {
+            // DEFAULT OFF (2026-09-01): shipped default-on it broke LIVE menus (overbright) -- a
+        // palette upload whose transfer never satisfies copied>=total leaves the page
+        // generation stale forever. It also never fixed anything real (the "rogue" pairings
+        // it targeted were authentic 64-byte palette patches). Opt-in for experiments only.
+        static const bool s_atomic = [](){ const char *v = std::getenv("PS2X_ATOMICCLUT"); return v && v[0] && v[0] != '0'; }();
+            if (!s_atomic || m_transferState.copied_pixels >= m_transferState.total_pixels)
+                bumpPageUploadGen(dbp, static_cast<uint32_t>(dbw) * rrh);   // [clutpagegen]
+        }
     }
 
     {
@@ -3200,11 +4254,35 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             return;
     }
 
+    static const bool s_uploadRow = [](){ const char *v = std::getenv("PS2X_UPLOADROW"); return !(v && v[0] == '0'); }();   // [uploadrow]
     // remove the format branching from the loops
     // TODO: fixup copypasta
     switch (dpsm)
     {
     case GS_PSM_CT32:
+        // [uploadrow] whole row segments through the bulk writer (same per-pixel addresses, same wrap and
+        // deactivation points as the per-pixel loop it replaces). PS2X_UPLOADROW=0 = per-pixel.
+        if (s_uploadRow)
+        {
+            while (data_offset + 4u <= sizeBytes)
+            {
+                const uint32_t rowLeft = rrw - (m_transferState.copied_pixels % rrw);
+                const uint32_t dataLeft = (sizeBytes - data_offset) / 4u;
+                const uint32_t totLeft = m_transferState.total_pixels - m_transferState.copied_pixels;
+                uint32_t run = std::min(rowLeft, std::min(dataLeft, totLeft));
+                if (run == 0u) break;
+                if (((uintptr_t)&data[data_offset] & 3u) == 0u)
+                    GSMem::WriteRowCT32(m_vram, dbp, dbw, m_transferState.x, m_transferState.x + run, m_transferState.y, reinterpret_cast<const u32 *>(&data[data_offset]), nullptr);
+                else
+                {   static thread_local std::vector<u32> tmp; if (tmp.size() < run) tmp.resize(run);
+                    std::memcpy(tmp.data(), &data[data_offset], (size_t)run * 4u);
+                    GSMem::WriteRowCT32(m_vram, dbp, dbw, m_transferState.x, m_transferState.x + run, m_transferState.y, tmp.data(), nullptr); }
+                m_transferState.x += run; m_transferState.copied_pixels += run; data_offset += run * 4u;
+                if ((m_transferState.copied_pixels % rrw) == 0) { m_transferState.x = dsax; m_transferState.y++; }
+                if (m_transferState.copied_pixels >= m_transferState.total_pixels) { m_trxdir = 3; m_transferState.total_pixels = 0; break; }
+            }
+            break;
+        }
         while (data_offset < sizeBytes)
         {
             u32 c;
@@ -3429,6 +4507,22 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         break;
 
     case GS_PSM_T8:
+        if (s_uploadRow)
+        {   // [uploadrow]
+            while (data_offset < sizeBytes)
+            {
+                const uint32_t rowLeft = rrw - (m_transferState.copied_pixels % rrw);
+                const uint32_t dataLeft = sizeBytes - data_offset;
+                const uint32_t totLeft = m_transferState.total_pixels - m_transferState.copied_pixels;
+                uint32_t run = std::min(rowLeft, std::min(dataLeft, totLeft));
+                if (run == 0u) break;
+                GSMem::WriteRowP8(m_vram, dbp, dbw, m_transferState.x, m_transferState.x + run, m_transferState.y, &data[data_offset]);
+                m_transferState.x += run; m_transferState.copied_pixels += run; data_offset += run;
+                if ((m_transferState.copied_pixels % rrw) == 0) { m_transferState.x = dsax; m_transferState.y++; }
+                if (m_transferState.copied_pixels >= m_transferState.total_pixels) { m_trxdir = 3; m_transferState.total_pixels = 0; break; }
+            }
+            break;
+        }
         while (data_offset < sizeBytes)
         {
             u8 c = data[data_offset];
