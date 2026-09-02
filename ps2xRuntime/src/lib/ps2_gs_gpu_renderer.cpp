@@ -4710,8 +4710,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
             // fill, mask, flash) is cut at the SAME absolute planes, so between adjacent
             // cuts all layers are linear over the same interval with identical endpoint
             // mapping -- exact alignment by construction, wherever the sliders sit.
-            const float cuts[10] = {168.f * kk, 180.f * kk, 192.f * kk, 204.f * kk, 216.f * kk,
-                                    296.f * kk, 308.f * kk, 320.f * kk, 332.f * kk, 344.f * kk};
+            const float cuts[4] = {124.f * kk, 216.f * kk, 296.f * kk, 388.f * kk};
             float mnx = cmd.tri[0].x, mxx = mnx;
             float mny = cmd.tri[0].y, mxy = mny;
             for (int i = 1; i < 3; ++i)
@@ -7943,7 +7942,15 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         const float k = W / 512.0f;
         auto cen = [&](float s){ return half + (s - half) * inv; };
         if (wsLayout <= 0) return cen(x);
-        const float s1 = 168.f*k, s2 = 216.f*k, s3 = 296.f*k, s4 = 344.f*k;
+        // unit boundaries at the TRUE ART SEAMS (census + reference footage): clusters end
+        // where the bar window begins (124), the plaque spans 216..296, bars end at 444.
+        // Boundaries INSIDE the bar art were the root of the "dark sections": the bar's
+        // authored pale-lead/dark-end shading stretched at different rates on one bar.
+        // With seam-aligned boundaries each bar stretches uniformly end-to-end, like a
+        // 16:9-stretched bar on hardware.
+        // mirror-symmetric: clusters 124 wide each ([0..124] / [388..512]), bars 92 wide
+        // each ([124..216] / [296..388]) -- s4=444 stretched the right pips (x 404..450).
+        const float s1 = 124.f*k, s2 = 216.f*k, s3 = 296.f*k, s4 = 388.f*k;
         // unit target edges; layout 1 = pinned, layout 2 = pinned + custom offsets
         float t0 = 0.f, t1 = s1 * inv;
         float t2 = cen(s2), t3 = cen(s3);
@@ -7957,23 +7964,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (t1 > t2 - 2.f) t1 = t2 - 2.f;
             if (t3 > t4 - 2.f) t4 = t3 + 2.f;
         }
-        // Bridges are cubic Hermite with endpoint slope = inv: the stretch rate ramps
-        // smoothly from the rigid units into the bridge instead of stepping (an abrupt
-        // 0.8 -> 1.9 slope step is what made split bar art look slabby). Monotone for
-        // any tb > ta since inv <= 3 * mean slope.
-        auto bridge = [&](float x, float a, float b, float ta, float tb) -> float
-        {
-            const float span = b - a;
-            const float T = (x - a) / span;
-            const float m = inv * span;
-            const float T2 = T * T, T3 = T2 * T;
-            return (2*T3 - 3*T2 + 1) * ta + (T3 - 2*T2 + T) * m
-                 + (-2*T3 + 3*T2) * tb + (T3 - T2) * m;
-        };
+        // Bridges (= the bars) are plain LINEAR: one uniform stretch across the whole
+        // bar span keeps its authored shading (pale lead, dark end, slash angle) scaling
+        // together. Smoothing the slope here was wrong -- it deliberately made stretch
+        // non-uniform inside the bar, redistributing the shading regions.
         if (x <= s1) return t0 + x * inv;
-        if (x <= s2) return bridge(x, s1, s2, t1, t2);
+        if (x <= s2) return t1 + (x - s1) * (t2 - t1) / (s2 - s1);
         if (x <= s3) return t2 + (x - s2) * inv;
-        if (x <= s4) return bridge(x, s3, s4, t3, t4);
+        if (x <= s4) return t3 + (x - s3) * (t4 - t3) / (s4 - s3);
         return t4 + (x - s4) * inv;
     };
     // [wshud] Aspect-aware HUD: in true-widescreen the 3D scene is pre-squeezed by the
@@ -8029,16 +8027,34 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             static const bool s_wl = [](){ const char *v = std::getenv("PS2X_WSHUDLOG"); return v && v[0] && v[0] != '0'; }();
             static int s_wln = 0;
             static const float s_wlY = [](){ const char *v = std::getenv("PS2X_WSHUDLOGY"); return v ? (float)std::atof(v) : -1000.0f; }();
+            static const bool s_wlDate = [](){ const char *v = std::getenv("PS2X_WSHUDLOGDATE"); return v && v[0] && v[0] != '0'; }();
+            {   // [wshudlog-spr] sprites into the display buffers (any size) -- damage-time
+                // draws may be sprites the tri census never sees
+                static int s_wls = 0;
+                if (s_wl && wsHudInv != 1.0f && s_wls < 120 && !c.isTriangle && !c.isTransfer
+                    && !c.isVramBlit && !c.isDecode && !c.isAliasPass
+                    && (c.destFbp == 0u || c.destFbp == 112u) && c.dy1 < 120.0f)
+                {
+                    ++s_wls;
+                    std::fprintf(stderr, "[wshudlog] S#%d d=%u dpsm=%u dx=(%.0f..%.0f) dy=(%.0f..%.0f) z=%.6g tbp=%u spsm=%u tex=%d fst=%u dt=%d df=%u abe=%d bm=%02x fbmsk=%08x date=%d datm=%u\n",
+                                 s_wls, c.destFbp, (unsigned)c.destPsm, c.dx0, c.dx1, c.dy0, c.dy1, c.z,
+                                 c.srcTbp0, (unsigned)c.srcPsm, c.texKey?1:0, (unsigned)c.fst,
+                                 c.depthTest?1:0, (unsigned)c.depthFunc, c.abe?1:0, (unsigned)c.blendMode,
+                                 c.fbmsk, c.dateEnable?1:0, (unsigned)c.dateMode);
+                }
+            }
             if (s_wl && wsHudInv != 1.0f && s_wln < 400 && c.isTriangle && c.fst == 1u && !c.isTransfer
                 && !c.isVramBlit && !c.isDecode && !c.isAliasPass && (c.destFbp == 0u || c.destFbp == 112u)
-                && c.tri[0].y >= s_wlY)
+                && c.tri[0].y >= s_wlY
+                && (!s_wlDate || c.dateEnable || c.fbmsk != 0u))
             {
                 ++s_wln;
                 float tx0=c.tri[0].x, tx1=tx0, ty0=c.tri[0].y, ty1=ty0;
                 for (int ti=1; ti<3; ++ti) { tx0=std::min(tx0,c.tri[ti].x); tx1=std::max(tx1,c.tri[ti].x);
                                              ty0=std::min(ty0,c.tri[ti].y); ty1=std::max(ty1,c.tri[ti].y); }
-                std::fprintf(stderr, "[wshudlog] T#%d d=%u dpsm=%u x=(%.0f..%.0f) y=(%.0f..%.0f) z=%.4f tbp=%u spsm=%u rend=%d upl=%d idx=%d tex=%d dt=%d df=%u abe=%d bm=%02x fbmsk=%08x date=%d\n",
-                             s_wln, c.destFbp, (unsigned)c.destPsm, tx0, tx1, ty0, ty1, c.tri[0].z,
+                uint32_t zb0, zb1; std::memcpy(&zb0, &c.tri[0].z, 4); std::memcpy(&zb1, &c.tri[1].z, 4);
+                std::fprintf(stderr, "[wshudlog] T#%d zb=%08x/%08x d=%u dpsm=%u x=(%.0f..%.0f) y=(%.0f..%.0f) z=%.4f tbp=%u spsm=%u rend=%d upl=%d idx=%d tex=%d dt=%d df=%u abe=%d bm=%02x fbmsk=%08x date=%d\n",
+                             s_wln, zb0, zb1, c.destFbp, (unsigned)c.destPsm, tx0, tx1, ty0, ty1, c.tri[0].z,
                              c.srcTbp0, (unsigned)c.srcPsm, c.srcRendered?1:0, c.srcUploaded?1:0,
                              c.srcIndexed?1:0, c.texKey?1:0, c.depthTest?1:0,
                              (unsigned)c.depthFunc, c.abe?1:0, (unsigned)c.blendMode, c.fbmsk, c.dateEnable?1:0);
