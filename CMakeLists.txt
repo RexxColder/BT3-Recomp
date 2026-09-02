@@ -11,6 +11,14 @@ endif()
 
 project(PS2RetroX)
 
+# A bare configure (setup.py, or a plain `cmake -S . -B build`) used to build with NO
+# optimization at all (empty CMAKE_BUILD_TYPE = -O0): the from-scratch runner played
+# fights at ~21 fps where the same sources at Release hold the engine's locked 30.
+# Default to Release; -DCMAKE_BUILD_TYPE=... still overrides.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(PS2X_BUILD_RECOMP "Build ps2xRecomp" ON)
