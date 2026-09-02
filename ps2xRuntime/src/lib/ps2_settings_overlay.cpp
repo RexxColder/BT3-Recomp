@@ -868,12 +868,17 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
         // deploy animation.
         ScopedStyleVar animAlpha(ImGuiStyleVar_Alpha, animEase);
 
-        const ImVec2 winSize(1080, 0);
+        // [fitscale] Clamp the panel to the CURRENT viewport: the logical screen can be
+        // anything from the 640x448 classic window to a fullscreen stretch of it, and a
+        // fixed 1080px panel hangs off-screen there (user report).
+        const float vpW = ImGui::GetMainViewport()->Size.x;
+        const float panelW = std::min(1080.0f, std::max(320.0f, vpW * 0.96f));
+        const ImVec2 winSize(panelW, 0);
         ImGui::SetNextWindowSize(winSize, ImGuiCond_Always);
         {
             const ImVec2 vp = ImGui::GetMainViewport()->Size;
             const float maxH = std::max(180.0f, vp.y * 0.92f);
-            ImGui::SetNextWindowSizeConstraints(ImVec2(1080, 180), ImVec2(1080, maxH));
+            ImGui::SetNextWindowSizeConstraints(ImVec2(panelW, 180), ImVec2(panelW, maxH));
         }
 
         // Slide the panel in from just above centre as it deploys (and back up as it
@@ -1454,7 +1459,12 @@ void PS2SettingsOverlay::drawBindingsPopup()
     if (!m_showBindingsPopup)
         return;
 
-    ImGui::SetNextWindowSize(ImVec2(560, 380), ImGuiCond_Always);
+    {   // [fitscale] clamp + centre the modal inside the viewport
+        const ImVec2 vp = ImGui::GetMainViewport()->Size;
+        ImGui::SetNextWindowSize(ImVec2(std::min(560.0f, vp.x * 0.92f),
+                                        std::min(380.0f, vp.y * 0.88f)), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    }
     if (ImGui::BeginPopupModal("Controller Bindings", &m_showBindingsPopup,
                                ImGuiWindowFlags_NoResize))
     {

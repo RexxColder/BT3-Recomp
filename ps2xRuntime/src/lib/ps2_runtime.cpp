@@ -163,8 +163,11 @@ static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x
 static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
 #else
-static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
-static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
+// 2x-ish the PS2 display: gives the settings overlay comfortable logical resolution
+// (its panel is 1080px wide) while the present path scales the game to fit. (PR #1
+// pairing; the overlay also self-clamps to smaller viewports.)
+static constexpr int HOST_WINDOW_WIDTH = 1280;
+static constexpr int HOST_WINDOW_HEIGHT = 720;
 #endif
 struct ElfHeader
 {
