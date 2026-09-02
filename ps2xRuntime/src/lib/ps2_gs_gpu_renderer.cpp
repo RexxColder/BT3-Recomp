@@ -7841,15 +7841,34 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
     for (size_t ci = ciStart; ci < ciEnd; ++ci)
     {
         const DrawCmd &c = DC[ci];
+        {   // [wshudlog] one-run census of widescreen sprite candidates: geometry + source
+            // fields, to pick the HUD-vs-ink discriminator from data instead of guesses.
+            static const bool s_wl = [](){ const char *v = std::getenv("PS2X_WSHUDLOG"); return v && v[0] && v[0] != '0'; }();
+            static int s_wln = 0;
+            if (s_wl && wsHudInv != 1.0f && s_wln < 250 && !c.isTriangle && !c.isTransfer
+                && !c.isVramBlit && !c.isDecode && !c.isAliasPass && (c.destFbp == 0u || c.destFbp == 112u))
+            {
+                ++s_wln;
+                std::fprintf(stderr, "[wshudlog] #%d d=%u dpsm=%u dx=(%.0f..%.0f) dy=(%.0f..%.0f) tbp=%u spsm=%u rend=%d upl=%d idx=%d tex=%d fst=%u dt=%d df=%u abe=%d bm=%02x fbmsk=%08x date=%d\n",
+                             s_wln, c.destFbp, (unsigned)c.destPsm, c.dx0, c.dx1, c.dy0, c.dy1,
+                             c.srcTbp0, (unsigned)c.srcPsm, c.srcRendered?1:0, c.srcUploaded?1:0,
+                             c.srcIndexed?1:0, c.texKey?1:0, (unsigned)c.fst, c.depthTest?1:0,
+                             (unsigned)c.depthFunc, c.abe?1:0, (unsigned)c.blendMode, c.fbmsk, c.dateEnable?1:0);
+            }
+        }
         if (wsHudInv != 1.0f && !c.wsHudApplied && !c.isTriangle && !c.isTransfer && !c.isVramBlit
             && !c.isDecode && !c.isAliasPass && (c.destFbp == 0u || c.destFbp == 112u)
             && (c.destPsm == 0u || c.destPsm == 1u)
-            && !c.srcRendered
             && (!c.depthTest || c.depthFunc == 1u))
         {
             const float W = (c.destFbw >= 320u && c.destFbw <= 1024u) ? (float)c.destFbw : 640.0f;
             const float sprW = c.dx1 - c.dx0;
-            if (sprW > 0.0f && sprW < 0.8f * W)
+            // Height cap: the outline-ink / mask / barrier passes are FULL-HEIGHT column
+            // strips (dy 0..448 in the [wshudlog] census) -- squeezing them paints a
+            // displaced outline ghost. HUD elements are all short. (srcRendered was tried
+            // as the discriminator first, but HUD sprites carry it too and went unsqueezed.)
+            const float sprH = c.dy1 - c.dy0;
+            if (sprW > 0.0f && sprW < 0.8f * W && sprH > 0.0f && sprH < 300.0f)
             {
                 DrawCmd &mc = const_cast<DrawCmd &>(c);
                 const float cx = 0.5f * (c.dx0 + c.dx1);
