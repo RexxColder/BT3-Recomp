@@ -13,6 +13,7 @@
 #include <fstream>
 #include <sstream>
 #include <filesystem>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <ctime>
@@ -244,6 +245,18 @@ namespace
 }
 
 bool PS2SettingsOverlay::s_widescreen = false;
+// [wshudmap] live HUD-layout state, defined in ps2_gs_gpu_renderer.cpp
+extern std::atomic<int> g_wsHudLayout;
+extern std::atomic<int> g_wsHudOffLQ, g_wsHudOffCQ, g_wsHudOffRQ;
+static void pushHudLayout(const PS2SettingsOverlay::Settings &st)
+{
+    // an explicit PS2X_WSHUDLAYOUT env (rig lever) outranks the INI/UI
+    if (std::getenv("PS2X_WSHUDLAYOUT")) return;
+    g_wsHudOffLQ.store(st.hudOffL * 16, std::memory_order_relaxed);
+    g_wsHudOffCQ.store(st.hudOffC * 16, std::memory_order_relaxed);
+    g_wsHudOffRQ.store(st.hudOffR * 16, std::memory_order_relaxed);
+    g_wsHudLayout.store(st.hudLayout, std::memory_order_relaxed);
+}
 std::string PS2SettingsOverlay::s_configDir;
 
 void PS2SettingsOverlay::setConfigDirectory(const std::string &dir)
@@ -449,6 +462,14 @@ void PS2SettingsOverlay::loadSettings()
                     m_settings.windowW = std::atoi(val.c_str());
                 else if (key == "window_h")
                     m_settings.windowH = std::atoi(val.c_str());
+                else if (key == "hud_layout")
+                    m_settings.hudLayout = std::atoi(val.c_str());
+                else if (key == "hud_off_l")
+                    m_settings.hudOffL = std::atoi(val.c_str());
+                else if (key == "hud_off_c")
+                    m_settings.hudOffC = std::atoi(val.c_str());
+                else if (key == "hud_off_r")
+                    m_settings.hudOffR = std::atoi(val.c_str());
             }
             else if (section == "controllers")
             {
@@ -557,6 +578,10 @@ void PS2SettingsOverlay::saveSettings() const
     file << "fullscreen=" << (m_settings.fullscreen ? "1" : "0") << "\n";
     file << "window_w=" << m_settings.windowW << "\n";
     file << "window_h=" << m_settings.windowH << "\n";
+    file << "hud_layout=" << m_settings.hudLayout << "\n";
+    file << "hud_off_l=" << m_settings.hudOffL << "\n";
+    file << "hud_off_c=" << m_settings.hudOffC << "\n";
+    file << "hud_off_r=" << m_settings.hudOffR << "\n";
     file << "widescreen=" << (m_settings.widescreen ? "1" : "0") << "\n\n";
 
     file << "[controllers]\n";
@@ -639,6 +664,7 @@ void PS2SettingsOverlay::applySettings()
     GsGpuRenderer::setShadows(m_settings.shadows);
     GsGpuRenderer::setDofBlur(m_settings.dofBlur);
     GsGpuRenderer::setDofZFar(m_settings.dofZFar);
+    pushHudLayout(m_settings);
     applyDeadzone();
 
     // Apply selected device to PadConfig
@@ -1122,6 +1148,28 @@ void PS2SettingsOverlay::drawVideoTab()
     {
         s_widescreen = m_settings.widescreen;
         m_dirty = true;
+    }
+    if (m_settings.widescreen)
+    {   // widescreen HUD layout: where the corrected-proportion HUD sits on the wide frame
+        static const char *kHudLayouts[] = {"Centered (4:3 block)", "Edge-pinned (wide)", "Custom (sliders)"};
+        ImGui::TextUnformatted("HUD Layout");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        int hl = m_settings.hudLayout;
+        if (ImGui::Combo("##hudlayout", &hl, kHudLayouts, 3))
+        {
+            m_settings.hudLayout = hl;
+            pushHudLayout(m_settings);
+            m_dirty = true;
+        }
+        if (m_settings.hudLayout == 2)
+        {
+            bool ch = false;
+            ch |= ImGui::SliderInt("Left cluster", &m_settings.hudOffL, -120, 120, "%d px");
+            ch |= ImGui::SliderInt("Timer", &m_settings.hudOffC, -120, 120, "%d px");
+            ch |= ImGui::SliderInt("Right cluster", &m_settings.hudOffR, -120, 120, "%d px");
+            if (ch) { pushHudLayout(m_settings); m_dirty = true; }
+            ImGui::TextDisabled("offsets from the edge-pinned layout; bars auto-stretch");
+        }
     }
 
     // Window-size presets. The projection FOV follows the window aspect (see [truews]

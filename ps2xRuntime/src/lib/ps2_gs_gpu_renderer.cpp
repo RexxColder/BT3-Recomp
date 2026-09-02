@@ -83,6 +83,9 @@ uint32_t g_barReqTbp = 0, g_barReqCbp = 0, g_barReqPsm = 0, g_barReqTbw = 0;
 unsigned long g_ddRtSkip = 0;   // [ddrtdirect 2]
 int g_recordAliasKind = 0;   // [gpualias] set around recordSpriteGPU for a CT16-view alias pass
 static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c);   // [gpualias] mode>=4: run the f336 chain GPU-side (defined before recordCmd)
+// [wshudmap] live HUD-layout state (overlay-driven; -1 = fall back to the env config)
+std::atomic<int> g_wsHudLayout{-1};
+std::atomic<int> g_wsHudOffLQ{0}, g_wsHudOffCQ{0}, g_wsHudOffRQ{0};   // custom offsets x16
 static bool gaBuildReviewTex(const Texture2D &src, int srcH, int ta0, int ta1, int aem);   // [gpualias] mode 4: CT16 re-view + decode-exact TEXA alpha, per serving class
 static bool g_gaViewReady = false;   // [gpualias] the view texture holds chain output
 static int g_gaCur = 0;              // [gpualias] ping-pong index
@@ -4683,6 +4686,89 @@ static bool gaDofMaskPass(uint32_t destFbp)
 
 void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
 {
+    {   // [wshudsplit] Subdivide HUD triangles at the layout-map breakpoints. The half-HUD
+        // backdrops are single 256px-wide quads (x -2..254 / 258..514) with the plaque and
+        // pip slots baked into the texture; the execute-time layout map only moves VERTICES,
+        // so an unsplit quad spanning several map segments stretches linearly and drags its
+        // baked-in art out of alignment. Split against the fixed breakpoints and every piece
+        // lands inside one linear segment -- the piecewise map becomes exact for interiors
+        // too. Active only while the widescreen HUD squeeze is live (g_ps2xWsHudInv < 1).
+        extern float g_ps2xWsHudInv;
+        extern std::atomic<int> g_wsHudLayout;
+        static const int s_envLayout = [](){ const char *v = std::getenv("PS2X_WSHUDLAYOUT"); return v ? std::atoi(v) : 0; }();
+        const int liveLayout = g_wsHudLayout.load(std::memory_order_relaxed);
+        const int effLayout = (liveLayout >= 0) ? liveLayout : s_envLayout;
+        if (effLayout >= 1 && g_ps2xWsHudInv < 0.999f && cmd.isTriangle && cmd.fst == 1u && !cmd.isTransfer
+            && !cmd.isVramBlit && !cmd.isDecode
+            && (cmd.destFbp == 0u || cmd.destFbp == 112u) && (cmd.destPsm == 0u || cmd.destPsm == 1u)
+            && cmd.tri[0].z == 0.0f && cmd.tri[1].z == 0.0f && cmd.tri[2].z == 0.0f)
+        {
+            extern float g_ps2xWsSrcW;
+            const float kk = ((g_ps2xWsSrcW >= 320.0f && g_ps2xWsSrcW <= 1024.0f) ? g_ps2xWsSrcW : 512.0f) / 512.0f;
+            const float cuts[4] = {168.f * kk, 216.f * kk, 296.f * kk, 344.f * kk};
+            float mnx = cmd.tri[0].x, mxx = mnx;
+            for (int i = 1; i < 3; ++i) { mnx = std::min(mnx, cmd.tri[i].x); mxx = std::max(mxx, cmd.tri[i].x); }
+            bool crosses = false;
+            for (float cx : cuts) if (cx > mnx + 0.01f && cx < mxx - 0.01f) { crosses = true; break; }
+            if (crosses)
+            {
+                using V = GsGpuRenderer::Vtx;
+                auto lerpV = [](const V &a, const V &b, float t) {
+                    V o = a;
+                    o.x = a.x + (b.x - a.x) * t; o.y = a.y + (b.y - a.y) * t;
+                    o.u = a.u + (b.u - a.u) * t; o.v = a.v + (b.v - a.v) * t;
+                    o.r = (uint8_t)(a.r + (b.r - a.r) * t); o.g = (uint8_t)(a.g + (b.g - a.g) * t);
+                    o.b = (uint8_t)(a.b + (b.b - a.b) * t); o.a = (uint8_t)(a.a + (b.a - a.a) * t);
+                    return o;
+                };
+                // clip a convex polygon against x=cx into left/right parts
+                auto clipAt = [&](const std::vector<V> &poly, float cx, std::vector<V> &lo, std::vector<V> &hi) {
+                    lo.clear(); hi.clear();
+                    const size_t n = poly.size();
+                    for (size_t i = 0; i < n; ++i)
+                    {
+                        const V &a = poly[i], &b = poly[(i + 1) % n];
+                        const bool aL = a.x <= cx, bL = b.x <= cx;
+                        if (aL) lo.push_back(a);
+                        if (!aL) hi.push_back(a);
+                        if (aL != bL && std::fabs(b.x - a.x) > 1e-5f)
+                        {
+                            V m = lerpV(a, b, (cx - a.x) / (b.x - a.x));
+                            m.x = cx;
+                            lo.push_back(m); hi.push_back(m);
+                        }
+                    }
+                };
+                std::vector<std::vector<V>> polys{{cmd.tri[0], cmd.tri[1], cmd.tri[2]}}, next;
+                std::vector<V> lo, hi;
+                for (float cx : cuts)
+                {
+                    next.clear();
+                    for (auto &p : polys)
+                    {
+                        float pmn = p[0].x, pmx = pmn;
+                        for (auto &vv : p) { pmn = std::min(pmn, vv.x); pmx = std::max(pmx, vv.x); }
+                        if (cx <= pmn + 0.01f || cx >= pmx - 0.01f) { next.push_back(p); continue; }
+                        clipAt(p, cx, lo, hi);
+                        if (lo.size() >= 3) next.push_back(lo);
+                        if (hi.size() >= 3) next.push_back(hi);
+                    }
+                    polys.swap(next);
+                }
+                if (polys.size() > 1 || (polys.size() == 1 && polys[0].size() > 3))
+                {
+                    for (auto &p : polys)
+                        for (size_t i = 1; i + 1 < p.size(); ++i)
+                        {
+                            DrawCmd piece = cmd;
+                            piece.tri[0] = p[0]; piece.tri[1] = p[i]; piece.tri[2] = p[i + 1];
+                            recordCmd(piece);
+                        }
+                    return;
+                }
+            }
+        }
+    }
     {   // [gpualias] tag commands recorded for a CT16-view alias pass
         extern int g_recordAliasKind;
         if (g_recordAliasKind) { const_cast<DrawCmd &>(cmd).isAliasPass = true; const_cast<DrawCmd &>(cmd).aliasKind = (uint8_t)g_recordAliasKind; }
@@ -7807,6 +7893,54 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                              (int)!reorderBuf.empty());
         }
     }
+    // [wshudmap] HUD layout map: piecewise-linear, continuous, monotonic. Three movable
+    // units -- left cluster [0..168], center plaque [216..296], right cluster [344..512]
+    // (512-space, scaled by W/512) -- keep exact proportions (slope = inv); the two bar
+    // "bridge" sections stretch linearly to connect wherever the units sit, so nothing
+    // ever tears. Layouts: 0 = centered 4:3 block (uniform), 1 = edge-pinned (portraits
+    // at the screen edges), 2 = custom (per-unit x offsets, INI/env, 512-space px).
+    struct WsHudLayoutCfg { int layout; float offL, offC, offR; };
+    static const auto wsHudCfg = []() -> WsHudLayoutCfg {
+        WsHudLayoutCfg c{0, 0.f, 0.f, 0.f};
+        if (const char *v = std::getenv("PS2X_WSHUDLAYOUT")) c.layout = std::atoi(v);
+        if (const char *v = std::getenv("PS2X_WSHUDOFF")) std::sscanf(v, "%f,%f,%f", &c.offL, &c.offC, &c.offR);
+        return c;
+    }();
+    extern float g_ps2xWsSrcW;
+    const float wsMapW = (g_ps2xWsSrcW >= 320.0f && g_ps2xWsSrcW <= 1024.0f) ? g_ps2xWsSrcW : 512.0f;
+    extern std::atomic<int> g_wsHudLayout;          // live override from the overlay (-1 = use env)
+    extern std::atomic<int> g_wsHudOffLQ, g_wsHudOffCQ, g_wsHudOffRQ;   // custom offsets x16 (quantized)
+    const int wsLayoutLive = g_wsHudLayout.load(std::memory_order_relaxed);
+    const int wsLayout = (wsLayoutLive >= 0) ? wsLayoutLive : wsHudCfg.layout;
+    const float wsOffL = (wsLayoutLive >= 0) ? g_wsHudOffLQ.load(std::memory_order_relaxed) / 16.0f : wsHudCfg.offL;
+    const float wsOffC = (wsLayoutLive >= 0) ? g_wsHudOffCQ.load(std::memory_order_relaxed) / 16.0f : wsHudCfg.offC;
+    const float wsOffR = (wsLayoutLive >= 0) ? g_wsHudOffRQ.load(std::memory_order_relaxed) / 16.0f : wsHudCfg.offR;
+    auto wsMapX = [&](float x, float W, float inv) -> float
+    {
+        const float half = 0.5f * W;
+        const float k = W / 512.0f;
+        auto cen = [&](float s){ return half + (s - half) * inv; };
+        if (wsLayout <= 0) return cen(x);
+        const float s1 = 168.f*k, s2 = 216.f*k, s3 = 296.f*k, s4 = 344.f*k;
+        // unit target edges; layout 1 = pinned, layout 2 = pinned + custom offsets
+        float t0 = 0.f, t1 = s1 * inv;
+        float t2 = cen(s2), t3 = cen(s3);
+        float t4 = W - (W - s4) * inv, t5 = W;
+        if (wsLayout >= 2)
+        {
+            t0 += wsOffL*k; t1 += wsOffL*k;
+            t2 += wsOffC*k; t3 += wsOffC*k;
+            t4 += wsOffR*k; t5 += wsOffR*k;
+            // keep monotonic: clamp unit edges so bridges never invert
+            if (t1 > t2 - 2.f) t1 = t2 - 2.f;
+            if (t3 > t4 - 2.f) t4 = t3 + 2.f;
+        }
+        if (x <= s1) return t0 + x * inv;
+        if (x <= s2) return t1 + (x - s1) * (t2 - t1) / (s2 - s1);
+        if (x <= s3) return t2 + (x - s2) * inv;
+        if (x <= s4) return t3 + (x - s3) * (t4 - t3) / (s4 - s3);
+        return t4 + (x - s4) * inv;
+    };
     // [wshud] Aspect-aware HUD: in true-widescreen the 3D scene is pre-squeezed by the
     // projection patch and un-squeezed at present; screen-space HUD sprites get no such
     // pre-squeeze and come out stretched. Squeeze them here, per sprite, anchored to the
@@ -7884,7 +8018,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             //   sprite path kept for other 2D overlays (subtitles), same short/narrow caps;
             //   full-height passes (outline ink / masks / barriers) and full-width 2D
             //   (fades, FMV) stay untouched.
-            const float W = (c.destFbw >= 320u && c.destFbw <= 1024u) ? (float)c.destFbw : 640.0f;
+            const float W = wsMapW;
             DrawCmd &mc = const_cast<DrawCmd &>(c);
             const float half = 0.5f * W;
             if (!c.isTriangle)
@@ -7893,8 +8027,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (sprW > 0.0f && sprW < 0.8f * W && sprH > 0.0f && sprH < 300.0f
                     && (!c.depthTest || c.depthFunc == 1u))
                 {
-                    mc.dx0 = half + (c.dx0 - half) * wsHudInv;
-                    mc.dx1 = half + (c.dx1 - half) * wsHudInv;
+                    mc.dx0 = wsMapX(c.dx0, W, wsHudInv);
+                    mc.dx1 = wsMapX(c.dx1, W, wsHudInv);
                     mc.wsHudApplied = true;
                 }
             }
@@ -7910,7 +8044,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (tx1 - tx0 < 0.8f * W && ty1 - ty0 < 300.0f)
                 {
                     for (int ti = 0; ti < 3; ++ti)
-                        mc.tri[ti].x = half + (c.tri[ti].x - half) * wsHudInv;
+                        mc.tri[ti].x = wsMapX(c.tri[ti].x, W, wsHudInv);
                     mc.wsHudApplied = true;
                 }
             }

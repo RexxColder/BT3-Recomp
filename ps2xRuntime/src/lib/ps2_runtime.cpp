@@ -43,6 +43,10 @@ float g_ps2xWsScale = 1.0f;
 // [wshud] per-frame squeeze factor for HUD geometry, computed at present time from the
 // ACTUAL present mapping (desired authentic h-scale / widescreen h-scale). 1.0 = off.
 float g_ps2xWsHudInv = 1.0f;
+// [wshudmap] the present crop's source width (game px). The HUD layout map must use the
+// VISIBLE content width (~493 in fights), not FRAME.FBW (640) -- scaling the breakpoints
+// by FBW shoved the center window into a bridge zone and stretched the timer plaque.
+float g_ps2xWsSrcW = 512.0f;
 #include "rlgl.h" // rlSetBlendFactorsSeparate for the blend-free present blit
 namespace ps2_syscalls { bool bt3WakeThreadByEntry(uint32_t entry); }
 
@@ -4137,6 +4141,8 @@ void PS2Runtime::run()
             // under the full-window stretch. inv = desired h-scale / actual h-scale.
             static const float s_pixk2 = [](){ const char *v = std::getenv("PS2X_PIXK"); const float f = v ? (float)std::atof(v) : 1.08f; return (f > 0.5f && f < 2.0f) ? f : 1.08f; }();
             extern float g_ps2xWsHudInv;
+            extern float g_ps2xWsSrcW;
+            g_ps2xWsSrcW = (float)srcWidth;
             const float hEff = dstWidth / (float)srcWidth;
             const float vEff = dstHeight / (float)srcHeight;
             float inv = (vEff * s_pixk2) / hEff;
