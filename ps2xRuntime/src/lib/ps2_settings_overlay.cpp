@@ -429,6 +429,10 @@ void PS2SettingsOverlay::loadSettings()
                     int s = std::atoi(val.c_str());
                     if (!envUserSet("PS2X_RENDER_SCALE")) m_settings.renderScale = (s >= 1 && s <= 4) ? s : 1;
                 }
+                else if (key == "outline")
+                { if (!envUserSet("PS2X_OUTLINE")) m_settings.outline = (val == "1" || val == "true"); }
+                else if (key == "shadows")
+                { if (!envUserSet("PS2X_SHADOWS")) m_settings.shadows = (val == "1" || val == "true"); }
                 else if (key == "fullscreen")
                     m_settings.fullscreen = (val == "1" || val == "true");
                 else if (key == "widescreen")
@@ -534,6 +538,8 @@ void PS2SettingsOverlay::saveSettings() const
     file << "skippost=" << (m_settings.skipPost ? "1" : "0") << "\n";
     file << "skip_stale_vram=" << (m_settings.skipStaleVram ? "1" : "0") << "\n";
     file << "render_scale=" << m_settings.renderScale << "\n";
+    file << "outline=" << (m_settings.outline ? "1" : "0") << "\n";
+    file << "shadows=" << (m_settings.shadows ? "1" : "0") << "\n";
     file << "fullscreen=" << (m_settings.fullscreen ? "1" : "0") << "\n";
     file << "widescreen=" << (m_settings.widescreen ? "1" : "0") << "\n\n";
 
@@ -593,6 +599,8 @@ void PS2SettingsOverlay::syncFromRuntime()
     m_settings.skipPost = GsGpuRenderer::skipPostEnabled();
     m_settings.skipStaleVram = GsGpuRenderer::skipStaleVramEnabled();
     m_settings.renderScale = GsGpuRenderer::renderScale();
+    m_settings.outline = GsGpuRenderer::outlineEnabled();
+    m_settings.shadows = GsGpuRenderer::shadowsEnabled();
 }
 
 void PS2SettingsOverlay::applySettings()
@@ -609,6 +617,8 @@ void PS2SettingsOverlay::applySettings()
     GsGpuRenderer::setSkipPost(m_settings.skipPost);
     GsGpuRenderer::setSkipStaleVram(m_settings.skipStaleVram);
     GsGpuRenderer::setRenderScale(m_settings.renderScale);
+    GsGpuRenderer::setOutline(m_settings.outline);
+    GsGpuRenderer::setShadows(m_settings.shadows);
     applyDeadzone();
 
     // Apply selected device to PadConfig
@@ -1049,6 +1059,10 @@ void PS2SettingsOverlay::drawVideoTab()
     if (toggleSwitch("GPU Renderer (OpenGL)", &m_settings.gpuRenderer))
         m_dirty = true;
     ImGui::TextDisabled("Takes full effect after restart.");
+    if (toggleSwitch("Cel Outline", &m_settings.outline))
+        m_dirty = true;
+    if (toggleSwitch("Character Shadows", &m_settings.shadows))
+        m_dirty = true;
     // (Glow / Skip Post / Half-Texel / Skip Stale VRAM toggles removed: replay A/B
     //  measured them at 0.000 frame diff in fights -- their draw classes are
     //  superseded by the current serving pipeline. Env vars still work for devs.)

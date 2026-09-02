@@ -189,6 +189,11 @@ int  GsGpuRenderer::renderScale()
 }
 void GsGpuRenderer::setRenderScale(int s)  { if (s < 1) s = 1; if (s > 4) s = 4; g_uiRenderScale.store(s); }
 void GsGpuRenderer::setEnabled(bool v)     { g_uiGpu.store(v ? 1 : 0); }
+namespace { std::atomic<int> g_uiOutline{-1}, g_uiShadows{-1}; }
+bool GsGpuRenderer::outlineEnabled()       { return uiFlag(g_uiOutline, "PS2X_OUTLINE", true); }
+void GsGpuRenderer::setOutline(bool v)     { g_uiOutline.store(v ? 1 : 0); }
+bool GsGpuRenderer::shadowsEnabled()       { return uiFlag(g_uiShadows, "PS2X_SHADOWS", true); }
+void GsGpuRenderer::setShadows(bool v)     { g_uiShadows.store(v ? 1 : 0); }
 
 // GS texel-corner vs GL texel-centre addressing. 0.5 texel, or 0 with PS2X_HALFTEXEL=0
 // (or the overlay's Half-Texel toggle).
@@ -4777,7 +4782,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
             // -- attribution test for the mid-field black blob.
             static const int s_nodecal = [](){ const char *v = std::getenv("PS2X_NODECAL");
                                                return v && v[0] ? std::atoi(v) : 0; }();
-            if (s_nodecal == 1 && !c.isTransfer && c.isTriangle && c.srcTbp0 == 10752u && c.srcPsm == 1u
+            if ((s_nodecal == 1 || !GsGpuRenderer::shadowsEnabled()) && !c.isTransfer && c.isTriangle && c.srcTbp0 == 10752u && c.srcPsm == 1u
                 && c.srcTexW == 256 && c.srcTexH == 256 && (c.destFbp == 0u || c.destFbp == 112u))
             { c.abe = false; c.fbmsk = 0xFFFFFFFFu; }
             // PS2X_NODECAL=2: drop the PSMT8 (indexed) reads of page 336 into the scene instead --
@@ -4806,7 +4811,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
         {   // PS2X_NODARK=1: skip the darkener independently, so it can be combined with NODOF.
             static const bool s_nodark = [](){ const char *v = std::getenv("PS2X_NODARK");
                                                return v && v[0] && v[0] != '0'; }();
-            if (s_nodark && !c.isTransfer && c.texKey == 0 && c.blendMode == 0x52
+            if ((s_nodark || !GsGpuRenderer::outlineEnabled()) && !c.isTransfer && c.texKey == 0 && c.blendMode == 0x52
                 && (c.destFbp == 0u || c.destFbp == 112u))
             { c.abe = false; c.fbmsk = 0xFFFFFFFFu; }
         }
@@ -10761,6 +10766,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 }
                 if (!built || g_gaViewTex[g_gaCur].texture.id == 0)
                     goto gaNoFlip;   // could not build: fall back to the normal path
+                if (!GsGpuRenderer::outlineEnabled()) { PS2X_GATE_HIT(); continue; }   // [uitoggles] outline OFF: drop the ink composite
                 tex = g_gaViewTex[g_gaCur].texture; vflip = false; fromFbo = false; gaServed = true;   // decoded-path TEXA (baked); gaServed guards the overrides below
                 { static int n2s = 0; if (++n2s == 300) std::fprintf(stderr, "[gpualias] serve check: tex.id=%u (views %u/%u)\n", tex.id, g_gaViewTex[0].texture.id, g_gaViewTex[1].texture.id); }
                 static unsigned long n = 0;

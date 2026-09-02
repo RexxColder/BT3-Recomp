@@ -28,6 +28,8 @@ public:
         float deadzone = 0.15f;
         bool fullscreen = false;  // [defaults-sync] do not force fullscreen on first launch (rig + user surprise); one toggle away in the overlay
         bool widescreen = false;
+        bool outline = true;
+        bool shadows = true;
         // Overlay launch / close binding. Each is a SET of inputs that must ALL be held
         // together (1+ entries). Captured with a 3s hold during binding.
         std::vector<int> overlayPadBtns = {13, 15};  // default: Select (Back) + Start

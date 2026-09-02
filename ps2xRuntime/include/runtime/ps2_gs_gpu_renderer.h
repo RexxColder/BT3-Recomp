@@ -38,6 +38,9 @@ public:
     // Stored/persisted only for the overlay's config; the scaling machinery itself is
     // NOT ported (its per-draw copy cost regressed the fight loop) -- always renders 1x.
     static int renderScale();       static void setRenderScale(int s);
+    // Cel outline (ink rim + darkener) and character shadow decals, live-toggleable.
+    static bool outlineEnabled();   static void setOutline(bool v);
+    static bool shadowsEnabled();   static void setShadows(bool v);
 
     // A draw command is either an axis-aligned SPRITE quad (rendered with the proven
     // DrawTexturePro path) or a TRIANGLE (rendered with rlgl). One ordered list keeps
