@@ -268,7 +268,25 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     }
     const uint32_t _vw = g_ps2ValueWatch.load(std::memory_order_relaxed);
     if (_vw != 0u && (uint32_t)valueLo == _vw)
+    {
         ps2ValueWatchReport(guestAddr & 0x1FFFFFFFu, size, valueLo, op, ctx);
+        // [vwdump] one-shot context hexdump when the watched value lands in the frame-DL region.
+        const uint32_t a_ = guestAddr & 0x1FFFFFFFu;
+        if (rdram && a_ >= 0x600000u && a_ < 0x800000u)
+        {
+            static std::atomic<int> s_vwd{0};
+            if (s_vwd.fetch_add(1) < 2)
+            {
+                const uint32_t b_ = (a_ - 0x80u) & ~0xFu;
+                for (uint32_t o_ = 0; o_ < 0x140u; o_ += 16u)
+                {
+                    const uint8_t *q_ = rdram + b_ + o_;
+                    uint32_t w_[4]; std::memcpy(w_, q_, 16);
+                    std::fprintf(stderr, "[vwdump] 0x%08x: %08x %08x %08x %08x\n", b_ + o_, w_[0], w_[1], w_[2], w_[3]);
+                }
+            }
+        }
+    }
     (void)size;
     (void)valueLo;
     (void)valueHi;
@@ -282,12 +300,19 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     const char *op,
                                     const R5900Context *ctx)
 {
+    // Range variant of the guest write-watch: stub memcpy/memset/strcpy write guest RAM
+    // host-side, invisible to the per-store macros -- this was a NO-OP, which made every
+    // block-copied buffer (e.g. the terrain-palette payload, 2026-09-01) unwatchable.
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    const uint32_t _wlo = g_ps2WatchLo.load(std::memory_order_relaxed);
+    if (_wlo != 0u && size != 0u)
+    {
+        const uint32_t a0 = guestAddr & 0x1FFFFFFFu;
+        const uint32_t a1 = a0 + size;
+        const uint32_t hi = g_ps2WatchHi.load(std::memory_order_relaxed);
+        if (a0 < hi && a1 > _wlo)
+            ps2WatchReport(a0, size, 0u, 0u, op, ctx);
+    }
 }
 
 struct PS2SoundDriverCompatLayout
@@ -365,6 +390,11 @@ struct PS2DtxCompatLayout
 class PS2Runtime
 {
 public:
+    // [barblock] Host-side wait hooks for the GS barrier: release the scheduler token and the
+    // guest-execution lock while a guest thread waits for the GL thread, re-acquire after.
+    void *guestWaitBegin();
+    void guestWaitEnd(void *handle);
+
     struct IoPaths
     {
         std::filesystem::path elfPath;
@@ -627,6 +657,7 @@ private:
         bool blocked = false;
         bool present = true;
         uint64_t order = 0;
+        uint32_t blockPc = 0, blockRa = 0;   // [schedwhy] guest pc/ra at the last block (which wait parked it)
         std::condition_variable cv;
     };
     int schedPickNextLocked(int afterTid);

@@ -54,6 +54,13 @@ public:
                 uint32_t top = 0, uint32_t itop = 0, uint32_t maxCycles = 65536);
 
     VU1State &state() { return m_state; }
+    // [vu1jit] the static recompiler's fallbacks and the verify-mode reference run
+    void jitSlowUpper(uint32_t instr) { ++m_jitSlowUp; execUpper(instr); }   // [jitstat]
+    void jitSlowLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr) { ++m_jitSlowLo; ++m_jitSlowLoHist[(instr >> 25) & 0x7Fu]; if (((instr >> 25) & 0x7Fu) == 0x40u) ++m_jitSlowLoSpec[((instr & 0x3Fu) | ((instr >> 4) & 0x7C0u)) & 0x7FFu]; execLower(instr, vuData, dataSize, gs, memory, upperInstr); }
+    uint64_t m_jitSlowUp = 0, m_jitSlowLo = 0;
+    void jitStatPrint();   // [jitstat]
+    uint64_t m_jitSlowLoHist[128]{}; uint64_t m_jitSlowLoSpec[2048]{};   // [jitstat] lower fallback histogram: op (bits 25-31) / special-group funct   // [jitstat] interpreter fallbacks taken by the recompiled programs
+    bool m_dryKick = false;   // verify mode: the reference interpreter run must not emit GS packets
     const VU1State &state() const { return m_state; }
 
 private:

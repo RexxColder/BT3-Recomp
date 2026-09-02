@@ -770,6 +770,8 @@ namespace ps2_stubs
         if (hostPtr && fp && size > 0 && count > 0)
         {
             items_read = ::fread(hostPtr, size, count, fp);
+            if (items_read > 0)
+                ps2TraceGuestRangeWrite(rdram, (uint32_t)(hostPtr - rdram), (uint32_t)(items_read * size), "fread", ctx);
         }
         else
         {

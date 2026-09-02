@@ -1,3 +1,4 @@
+#include <vector>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -206,6 +207,44 @@ namespace GSMem
     static P8PageLookupTable   PageTableP8{ };
     static P4PageLookupTable   PageTableP4{ };
 
+    // [ct16pair] PS2X_CT16MAPBUILD=1 (diag, runs once at table init): derive and VERIFY the CT16-view -> CT32 pairing
+    // that the GPU alias passes need. For each CT16 pixel (x16,y16) of a fbw-8 view, find which CT32 pixel (x32,y32)
+    // of the same pages holds its two bytes and which half (0 = bits 0..15 = B,G bytes-ish; 1 = bits 16..31).
+    // Verified by writing a sentinel through WriteVram(psm=CT16) into a zeroed buffer and reading the CT32 word back.
+    static void ct16MapBuild()
+    {
+        const u32 bw = 8u;   // 512-px view, the shape BT3 uses for fbp0/112/336
+        int shape_x_ok = 0, shape_y_ok = 0, n = 0, verified = 0, mismatch = 0;
+        int sampleN = 0;
+        std::vector<u8> scratch(MEMORY_SIZE, 0u);
+        for (u32 y16 = 0; y16 < 96u; ++y16)
+            for (u32 x16 = 0; x16 < 128u; ++x16)
+            {
+                const u32 a16 = PixelStorageTraits<C16>::Address(PageTableC16, 0u, bw, x16, y16) * 2u;   // byte addr
+                // find the CT32 pixel owning these bytes: its word-aligned base
+                const u32 wordByte = a16 & ~3u; const u32 half = (a16 & 2u) >> 1;
+                // search the CT32 pixel with that word address in a local window (same pages)
+                bool found = false; u32 fx = 0, fy = 0;
+                for (u32 y32 = (y16 / 2 > 4u ? y16 / 2 - 4u : 0u); y32 < y16 / 2 + 5u && !found; ++y32)
+                    for (u32 x32 = (x16 > 8u ? x16 - 8u : 0u); x32 < x16 + 9u; ++x32)
+                        if (PixelStorageTraits<C32>::Address(PageTableC32, 0u, bw, x32, y32) * 4u == wordByte) { found = true; fx = x32; fy = y32; break; }
+                if (!found) continue;
+                ++n; shape_x_ok += (fx == x16); shape_y_ok += (fy == y16 / 2 && (y16 & 1u) == half) || (fy == y16 / 2);
+                if (sampleN < 12 && (x16 < 3u || y16 < 3u || (x16 == 64u && y16 < 6u)))
+                { ++sampleN; std::fprintf(stderr, "[ct16pair] (%3u,%3u) -> CT32 (%3u,%3u) half=%u\n", x16, y16, fx, fy, half); }
+                // verify with a real write
+                if ((x16 % 17u) == 0u && (y16 % 13u) == 0u)
+                {
+                    std::fill(scratch.begin(), scratch.begin() + 65536, 0u);
+                    PixelStorageTraits<C16>::Write(PageTableC16, scratch.data(), 0u, bw, x16, y16, 0xABCDu);
+                    u32 w32 = 0; std::memcpy(&w32, &scratch[wordByte], 4u);
+                    const u32 got = half ? (w32 >> 16) : (w32 & 0xFFFFu);
+                    if (got == 0xABCDu) ++verified; else ++mismatch;
+                }
+            }
+        std::fprintf(stderr, "[ct16pair] mapped %d px: x32==x16 %d, y-shape(y/2,half=y&1) %d | write-verified %d, mismatched %d\n",
+                     n, shape_x_ok, shape_y_ok, verified, mismatch);
+    }
     void InitLookupTables()
     {
         // 32 bit
@@ -217,6 +256,7 @@ namespace GSMem
         PixelStorageTraits<C16S>::InitPageLookupTable(PageTableC16S, BlockTableC16S, ColumnTable16);
         PixelStorageTraits<Z16>::InitPageLookupTable(PageTableZ16, BlockTableZ16, ColumnTable16);
         PixelStorageTraits<Z16S>::InitPageLookupTable(PageTableZ16S, BlockTableZ16S, ColumnTable16);
+        { const char *v = std::getenv("PS2X_CT16MAPBUILD"); if (v && v[0] && v[0] != '0') ct16MapBuild(); }   // [ct16pair]
 
         // 8 bit
         PixelStorageTraits<P8>::InitPageLookupTable(PageTableP8, BlockTableP8, ColumnTable8);
@@ -229,6 +269,141 @@ namespace GSMem
     {
         PixelStorageTraits<C32>::Write(PageTableC32, data, bp, bw, x, y, value);
     }
+
+    u32 WriteRowCT32(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u32* src, const u8* mask)
+    {
+        // Same address as PixelStorageTraits<C32>::Address/Write: page * PixelsPerPage + table[block][y%32][x%64],
+        // 4 bytes per pixel, wrapped to MEMORY_SIZE.
+        constexpr u32 kBlocks = C32Traits::BlocksPerPage();          // 32
+        constexpr auto kExt   = C32Traits::PageExtent();             // 64 x 32
+        constexpr u32 kPixels = C32Traits::PixelsPerPage();          // 2048
+        const u32 block = bp % kBlocks;
+        const auto &row = PageTableC32[block][y % kExt.y];
+        u32 n = 0;
+        u32 x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);   // end of this 64-px page column
+            const u32 page = static_cast<u32>(C32Traits::PageId(bp, bw, x, y));
+            const usz pageBase = static_cast<usz>(page) * kPixels;
+            for (; x < colEnd; ++x)
+            {
+                if (mask && !mask[x - x0]) continue;   // [rowrel] src/mask are RELATIVE to x0 (like WriteRowP8/ReadRow*)
+                const usz byte_addr = ((pageBase + row[x % kExt.x]) * 4u) & (MEMORY_SIZE - 4u);
+                std::memcpy(&data[byte_addr], &src[x - x0], 4u);
+                ++n;
+            }
+        }
+        return n;
+    }
+
+    template <typename TraitsT, typename TableT>
+    static u32 writeRow16(const TableT &table, u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask)
+    {   // mirrors PixelStorageTraits<C16*>::Write: byte = (pixel_addr * 2) & (MEMORY_SIZE - 2)
+        constexpr u32 kBlocks = TraitsT::BlocksPerPage();
+        constexpr auto kExt   = TraitsT::PageExtent();             // 64 x 64
+        constexpr u32 kPixels = TraitsT::PixelsPerPage();          // 4096
+        const u32 block = bp % kBlocks;
+        const auto &row = table[block][y % kExt.y];
+        u32 n = 0, x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(TraitsT::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x)
+            {
+                if (mask && !mask[x - x0]) continue;   // [rowrel]
+                const usz byte_addr = ((pageBase + row[x % kExt.x]) * 2u) & (MEMORY_SIZE - 2u);
+                std::memcpy(&data[byte_addr], &src[x - x0], 2u);
+                ++n;
+            }
+        }
+        return n;
+    }
+    u32 WriteRowP8(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u8* src)
+    {   // mirrors PixelStorageTraits<P8>::Write: byte = pixel_addr (8 bpp), page 128x64 texels
+        constexpr u32 kBlocks = P8Traits::BlocksPerPage(); constexpr auto kExt = P8Traits::PageExtent(); constexpr u32 kPixels = P8Traits::PixelsPerPage();
+        const auto &row = PageTableP8[bp % kBlocks][y % kExt.y];
+        u32 n = 0, x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(P8Traits::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x) { data[(pageBase + row[x % kExt.x]) & (MEMORY_SIZE - 1u)] = src[x - x0]; ++n; }
+        }
+        return n;
+    }
+    // [rowdecode] bulk row readers -- mirror the writers: page once per 64-px column, one table lookup per texel.
+    void ReadRowP8(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u8* dst)   // [fastdec] mirrors WriteRowP8
+    {
+        constexpr u32 kBlocks = P8Traits::BlocksPerPage(); constexpr auto kExt = P8Traits::PageExtent(); constexpr u32 kPixels = P8Traits::PixelsPerPage();
+        const auto &row = PageTableP8[bp % kBlocks][y % kExt.y];
+        u32 x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(P8Traits::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x) dst[x - x0] = data[(pageBase + row[x % kExt.x]) & (MEMORY_SIZE - 1u)];
+        }
+    }
+    void ReadRowP4(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u8* dst)   // [fastdec] 4 bpp: table entry = nibble address
+    {
+        constexpr u32 kBlocks = P4Traits::BlocksPerPage(); constexpr auto kExt = P4Traits::PageExtent(); constexpr u32 kPixels = P4Traits::PixelsPerPage();
+        const auto &row = PageTableP4[bp % kBlocks][y % kExt.y];
+        u32 x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(P4Traits::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x) { const usz na = pageBase + row[x % kExt.x]; const u8 b = data[(na >> 1) & (MEMORY_SIZE - 1u)]; dst[x - x0] = (na & 1u) ? (b >> 4) : (b & 0x0Fu); }
+        }
+    }
+    void ReadRowCT32(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u32* dst)
+    {
+        constexpr u32 kBlocks = C32Traits::BlocksPerPage(); constexpr auto kExt = C32Traits::PageExtent(); constexpr u32 kPixels = C32Traits::PixelsPerPage();
+        const auto &row = PageTableC32[bp % kBlocks][y % kExt.y];
+        u32 x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(C32Traits::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x) { const usz a = ((pageBase + row[x % kExt.x]) * 4u) & (MEMORY_SIZE - 4u); std::memcpy(dst + (x - x0), &data[a], 4u); }
+        }
+    }
+    void ReadRowP8H(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u8* dst)
+    {   // P8H = the high byte of the CT32 word at the same pixel address (BitOffset 24)
+        constexpr u32 kBlocks = C32Traits::BlocksPerPage(); constexpr auto kExt = C32Traits::PageExtent(); constexpr u32 kPixels = C32Traits::PixelsPerPage();
+        const auto &row = PageTableC32[bp % kBlocks][y % kExt.y];
+        u32 x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(C32Traits::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x) { const usz a = ((pageBase + row[x % kExt.x]) * 4u + 3u) & (MEMORY_SIZE - 1u); dst[x - x0] = data[a]; }
+        }
+    }
+    template <typename TraitsT, typename TableT>
+    static void readRow16(const TableT &table, const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst)
+    {
+        constexpr u32 kBlocks = TraitsT::BlocksPerPage(); constexpr auto kExt = TraitsT::PageExtent(); constexpr u32 kPixels = TraitsT::PixelsPerPage();
+        const auto &row = table[bp % kBlocks][y % kExt.y];
+        u32 x = x0;
+        while (x < x1)
+        {
+            const u32 colEnd = std::min(x1, (x / kExt.x + 1u) * kExt.x);
+            const usz pageBase = static_cast<usz>(TraitsT::PageId(bp, bw, x, y)) * kPixels;
+            for (; x < colEnd; ++x) { const usz a = ((pageBase + row[x % kExt.x]) * 2u) & (MEMORY_SIZE - 2u); std::memcpy(dst + (x - x0), &data[a], 2u); }
+        }
+    }
+    void ReadRowCT16(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst)  { readRow16<C16Traits>(PageTableC16, data, bp, bw, x0, x1, y, dst); }
+    void ReadRowZ16(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst)   { readRow16<Z16Traits>(PageTableZ16, data, bp, bw, x0, x1, y, dst); }   // [fastdec] the depth->alpha 1024x1024 read
+    void ReadRowZ16S(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst)  { readRow16<Z16STraits>(PageTableZ16S, data, bp, bw, x0, x1, y, dst); }
+    void ReadRowCT16S(const u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, u16* dst) { readRow16<C16STraits>(PageTableC16S, data, bp, bw, x0, x1, y, dst); }
+
+    u32 WriteRowCT16(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask)
+    { return writeRow16<C16Traits>(PageTableC16, data, bp, bw, x0, x1, y, src, mask); }
+    u32 WriteRowCT16S(u8* data, u32 bp, u32 bw, u32 x0, u32 x1, u32 y, const u16* src, const u8* mask)
+    { return writeRow16<C16STraits>(PageTableC16S, data, bp, bw, x0, x1, y, src, mask); }
 
     void WriteCT24(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
     {
