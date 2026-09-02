@@ -4106,6 +4106,20 @@ void PS2Runtime::run()
         const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
         float dstWidth = srcWidth * scale;
         float dstHeight = srcHeight * scale;
+        // [tv43] Authentic 4:3 presentation: the PS2 CRTC displays ANY mode width (512- or
+        // 640-wide buffers) as a full 4:3 TV picture. Square-pixel letterboxing showed the
+        // fight's ~512-wide buffer ~14% too narrow (the HUD's "6" badge measured as a tall
+        // oval; on hardware it is a circle -- the widescreen path, which squeezes to true
+        // 4:3 proportions, drew it round). PS2X_SQPIX=1 restores the old square-pixel
+        // letterbox (the rig's boot screen-matching references were captured that way).
+        {
+            static const bool s_sqpix = [](){ const char *v = std::getenv("PS2X_SQPIX"); return v && v[0] && v[0] != '0'; }();
+            if (!s_sqpix)
+            {
+                dstHeight = std::min((float)screenHeight, (float)screenWidth * 0.75f);
+                dstWidth = dstHeight * (4.0f / 3.0f);
+            }
+        }
         // [overlay] Widescreen: stretch to fill instead of letterboxing.
 #if !defined(PLATFORM_VITA)
         if (PS2SettingsOverlay::isWidescreen() || wsTrigActive())
