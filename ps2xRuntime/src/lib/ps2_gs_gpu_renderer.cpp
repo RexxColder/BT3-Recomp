@@ -206,14 +206,12 @@ int  GsGpuRenderer::renderScale()
     return v;
 }
 void GsGpuRenderer::setRenderScale(int s)
-{   // [rscale] APPLIES AT STARTUP ONLY. Live rebuild of the scene-buffer graph proved
-    // unsafe (mid-frame tears / frame-top black screen -- the buffers, their staging,
-    // snapshots and the present latch cannot be swapped consistently while the pipeline
-    // is mid-flight). The overlay saves the value to the INI; it takes effect on the
-    // next launch. The lazy init in renderScale() reads it then.
+{   // [rscale] Authoritative store. MUST be called from preloadSettings (startup, before
+    // any renderScale() read) -- NOT from the live dropdown/applySettings: live rebuild of
+    // the scene-buffer graph proved unsafe (mid-frame tears / frame-top black). The overlay
+    // persists the value to the INI and preloadSettings applies it on the next launch.
     if (s < 1) s = 1; if (s > 4) s = 4;
-    if (g_uiRenderScale.load(std::memory_order_relaxed) < 0)
-        g_uiRenderScale.store(s);
+    g_uiRenderScale.store(s);
 }
 void GsGpuRenderer::setEnabled(bool v)     { g_uiGpu.store(v ? 1 : 0); }
 namespace { std::atomic<int> g_uiOutline{-1}, g_uiShadows{-1}; }

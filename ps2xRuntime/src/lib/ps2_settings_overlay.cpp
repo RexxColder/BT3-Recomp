@@ -550,6 +550,15 @@ void PS2SettingsOverlay::preloadSettings()
 
         if (section == "video" && key == "widescreen")
             s_widescreen = (val == "1" || val == "true");
+        else if (section == "video" && key == "render_scale")
+        {   // [rscale] authoritative startup application -- runs before anything reads the
+            // live scale, so the INI value wins the lazy-init race.
+            if (!envUserSet("PS2X_RENDER_SCALE") && !envUserSet("PS2X_RENDERSCALE"))
+            {
+                int rs = std::atoi(val.c_str());
+                if (rs >= 1 && rs <= 4) GsGpuRenderer::setRenderScale(rs);
+            }
+        }
     }
 }
 
@@ -662,7 +671,8 @@ void PS2SettingsOverlay::applySettings()
     GsGpuRenderer::setHalfTexel(m_settings.halfTexel);
     GsGpuRenderer::setSkipPost(m_settings.skipPost);
     GsGpuRenderer::setSkipStaleVram(m_settings.skipStaleVram);
-    GsGpuRenderer::setRenderScale(m_settings.renderScale);
+    // [rscale] NOT applied here -- see preloadSettings (startup-only). applySettings runs
+    // on live changes too, and a live scale store would desync the pipeline.
     GsGpuRenderer::setOutline(m_settings.outline);
     GsGpuRenderer::setShadows(m_settings.shadows);
     GsGpuRenderer::setDofBlur(m_settings.dofBlur);
@@ -1146,8 +1156,7 @@ void PS2SettingsOverlay::drawVideoTab()
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
         if (ImGui::Combo("##renderscale", &rsIdx, kScales, 4))
         {
-            m_settings.renderScale = rsIdx + 1;
-            GsGpuRenderer::setRenderScale(m_settings.renderScale);
+            m_settings.renderScale = rsIdx + 1;   // persisted to INI; applied on next launch
             m_dirty = true;
         }
         if (m_settings.renderScale != GsGpuRenderer::renderScale())
