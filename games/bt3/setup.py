@@ -95,8 +95,21 @@ def find_binary(name: str) -> Path:
 # Windows" + "MSBuild support for LLVM (clang-cl) toolset" in the installer): the static VU1
 # recompiler is computed-goto code and the runtime uses GCC/Clang builtins, which MSVC cannot
 # compile. PS2X_SETUP_TOOLSET overrides (e.g. "v143" to try plain MSVC).
-CMAKE_CONFIGURE_EXTRA = (["-T", os.environ.get("PS2X_SETUP_TOOLSET", "ClangCL")]
-                         if IS_WINDOWS else [])
+def cmake_configure_extra() -> list:
+    """-T only makes sense for the Visual Studio generator; a Ninja build directory (clang-cl via
+    -DCMAKE_CXX_COMPILER=clang-cl) must not get it, or the reconfigure fails."""
+    if not IS_WINDOWS:
+        return []
+    cache = BUILD / "CMakeCache.txt"
+    if cache.exists():
+        gen = ""
+        for line in cache.read_text(errors="replace").splitlines():
+            if line.startswith("CMAKE_GENERATOR:"):
+                gen = line.split("=", 1)[1]
+                break
+        if "Visual Studio" not in gen:
+            return []
+    return ["-T", os.environ.get("PS2X_SETUP_TOOLSET", "ClangCL")]
 
 
 def cmake_build(target: str, jobs: str) -> None:
@@ -148,7 +161,7 @@ def main() -> None:
     #    project files, which makes MSBuild rebuild everything from scratch.
     print("== building recompiler")
     if not (BUILD / "CMakeCache.txt").exists():
-        run(["cmake", "-S", ROOT, "-B", BUILD] + CMAKE_CONFIGURE_EXTRA)
+        run(["cmake", "-S", ROOT, "-B", BUILD] + cmake_configure_extra())
     cmake_build("ps2_recomp", str(os.cpu_count() or 4))
     recomp = find_binary("ps2_recomp")
 
@@ -200,7 +213,7 @@ def main() -> None:
                 need_cfg = True
                 break
     if need_cfg:
-        run(["cmake", "-S", ROOT, "-B", BUILD] + CMAKE_CONFIGURE_EXTRA)
+        run(["cmake", "-S", ROOT, "-B", BUILD] + cmake_configure_extra())
     print(f"== building ps2EntryRunner (-j{jobs}, this takes a while)")
     cmake_build("ps2EntryRunner", jobs)
     runner = find_binary("ps2EntryRunner")
