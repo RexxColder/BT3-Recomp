@@ -1,3 +1,4 @@
+#include "runtime/ps2_guestprof.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_common.h"
 #include "runtime/ps2_gs_psmct16.h"
@@ -2331,6 +2332,7 @@ extern "C" void ps2xGsRecordOnSignal(int sig)
 static thread_local int t_gsStateHeld = 0;   // [relock] >0 while this thread holds m_stateMutex in processGIFPacket
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    gprof::Scope gpScope(gprof::GIF);   // [guestprof]
     {   // PS2X_GS_RECORD=<path>: append this packet to a replayable stream so live-only bugs
         // (explosions, transformations) can be analysed offline with the validated tooling.
         // Format the replay expects: 0x00, path byte, uint32 length, payload -- and 0x01, pad
@@ -2468,6 +2470,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (flg == GIF_FMT_IMAGE)
         {
+            gprof::Scope gpScope(gprof::XFER);   // [guestprof] IMAGE-mode host->VRAM transfer
+            ++m_stateGen;   // [rectemplate] VRAM content changes
             uint32_t imageBytes = nloop * 16;
             if (offset + imageBytes > sizeBytes)
                 imageBytes = sizeBytes - offset;
@@ -2782,6 +2786,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 // [prmode] last raw PRIM / PRMODE values (single GS instance) so PRMODECONT switches can re-apply attributes
 static uint64_t s_primRaw = 0, s_prmodeRaw = 0;
+std::atomic<unsigned long> g_regWriteHist[0x63];   // [rectemplate] state-register writes per register (PS2X_GUESTPROF=1)
+
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
     auto applyPrimAttrs = [this](uint64_t v)
@@ -2793,7 +2799,14 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     static const bool s_relock = [](){ const char *v = std::getenv("PS2X_RELOCK"); return !(v && v[0] == '0'); }();   // [relock] =0 -> always lock
     std::unique_lock<std::recursive_mutex> lock(m_stateMutex, std::defer_lock);
     if (!s_relock || t_gsStateHeld == 0) lock.lock();
+    const bool sameVal = (regAddr < 0x63u) && m_rawSet[regAddr] && m_rawRegs[regAddr] == value;   // [rectemplate] a rewrite of the same value changes no state
     if (regAddr < 0x63u) { m_rawRegs[regAddr] = value; m_rawSet[regAddr] = true; }   // [slice] raw shadow
+    switch (regAddr)
+    {   // [rectemplate] per-vertex data registers leave the record template valid; everything else invalidates it
+    case GS_REG_RGBAQ: case GS_REG_ST: case GS_REG_UV: case GS_REG_XYZF2: case GS_REG_XYZ2: case GS_REG_XYZF3: case GS_REG_XYZ3: case GS_REG_FOG: break;
+    case GS_REG_BITBLTBUF: case GS_REG_TRXPOS: case GS_REG_TRXREG: case GS_REG_TRXDIR: ++m_stateGen; break;   // transfers touch VRAM even when re-issued
+    default: if (!sameVal) ++m_stateGen; if (gprof::g_on && regAddr < 0x63u) g_regWriteHist[regAddr].fetch_add(1, std::memory_order_relaxed); break;
+    }
     // [floortex0] (default on, PS2X_SRCDIAG=0 disables): the exact TEX0 the FLOOR draws
     // carry NOW — is the tw=10 corruption still present, or did it heal along the way?
     {

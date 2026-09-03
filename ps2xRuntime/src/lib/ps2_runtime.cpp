@@ -1,3 +1,4 @@
+#include "runtime/ps2_guestprof.h"
 #include <filesystem>
 #include "runtime/ps2_memory.h"
 #include <iomanip>
@@ -3806,8 +3807,8 @@ std::atomic<uint32_t> g_bt3StateLive{0xffffffffu};   // [barblock] last bt3state
 static PS2Runtime *g_waitHookRuntime = nullptr;   // [barblock]
 void *PS2Runtime::guestWaitBegin() { return new GuestExecutionReleaseScope(this); }
 void PS2Runtime::guestWaitEnd(void *handle) { delete static_cast<GuestExecutionReleaseScope *>(handle); }
-extern "C" void *ps2xGuestWaitBegin() { return g_waitHookRuntime ? g_waitHookRuntime->guestWaitBegin() : nullptr; }
-extern "C" void ps2xGuestWaitEnd(void *h) { if (h && g_waitHookRuntime) g_waitHookRuntime->guestWaitEnd(h); }
+extern "C" void *ps2xGuestWaitBegin() { gprof::enter(gprof::WAIT); return g_waitHookRuntime ? g_waitHookRuntime->guestWaitBegin() : nullptr; }   // [guestprof] WAIT
+extern "C" void ps2xGuestWaitEnd(void *h) { gprof::leave(); if (h && g_waitHookRuntime) g_waitHookRuntime->guestWaitEnd(h); }
 void PS2Runtime::run()
 {
     g_waitHookRuntime = this;   // [barblock]
@@ -4527,6 +4528,37 @@ void PS2Runtime::run()
                           << " decodes/sec=" << (uint64_t)((tdc - s_lastTdc) / dt)
                           << " flush_ms/s=" << (g_rlglFlushNs - s_lastFlushNs) / 1.0e6 / dt << std::endl;
                 s_lastGlCalls = glc; s_lastGlFlush = glf; s_lastTdc = tdc; s_lastFlushNs = g_rlglFlushNs;
+                if (gprof::g_on)
+                {   // [guestprof] exclusive phase time on the guest thread(s), ms per second; tsc calibrated over this interval
+                    static uint64_t s_lastTsc = 0, s_lastAcc[gprof::NPHASE] = {0};
+                    const uint64_t tsc = __rdtsc();
+                    if (s_lastTsc)
+                    {
+                        const double nsPerTick = (dt * 1.0e9) / (double)(tsc - s_lastTsc);
+                        std::cerr << "[guestprof]";
+                        for (int i = 0; i < gprof::NPHASE; ++i)
+                        {
+                            const uint64_t a = gprof::g_acc[i].load(std::memory_order_relaxed);
+                            if (i >= 12) { s_lastAcc[i] = a; continue; }
+                            std::cerr << ' ' << gprof::kPhaseName[i] << '=' << (double)(a - s_lastAcc[i]) * nsPerTick / 1.0e6 / dt;
+                            s_lastAcc[i] = a;
+                        }
+                        {   extern std::atomic<unsigned long> g_recTplHit, g_recTplMiss; static unsigned long s_lh = 0, s_lm = 0;
+                            const unsigned long hh = g_recTplHit.load(std::memory_order_relaxed), mm = g_recTplMiss.load(std::memory_order_relaxed);
+                            std::cerr << " ms/s | rectpl hit=" << (unsigned long)((hh - s_lh) / dt) << "/s miss=" << (unsigned long)((mm - s_lm) / dt) << "/s";
+                            s_lh = hh; s_lm = mm; }
+                        {   extern std::atomic<unsigned long> g_recTplWhy[5]; static unsigned long s_lw[5] = {0};
+                            static const char *const kWhy[5] = {"gen", "epoch", "frame", "prim", "draw"};
+                            std::cerr << " why:";
+                            for (int i = 0; i < 5; ++i) { const unsigned long w = g_recTplWhy[i].load(std::memory_order_relaxed); std::cerr << ' ' << kWhy[i] << '=' << (unsigned long)((w - s_lw[i]) / dt); s_lw[i] = w; } }
+                        {   extern std::atomic<unsigned long> g_regWriteHist[0x63]; static unsigned long s_lr[0x63] = {0};
+                            unsigned long d[0x63]; for (int i = 0; i < 0x63; ++i) { const unsigned long w = g_regWriteHist[i].load(std::memory_order_relaxed); d[i] = w - s_lr[i]; s_lr[i] = w; }
+                            std::cerr << " | regwrites/s:";
+                            for (int k = 0; k < 6; ++k) { int best = -1; for (int i = 0; i < 0x63; ++i) if (d[i] && (best < 0 || d[i] > d[best])) best = i; if (best < 0) break; std::cerr << " 0x" << std::hex << best << std::dec << '=' << (unsigned long)(d[best] / dt); d[best] = 0; } }
+                        std::cerr << std::endl;
+                    }
+                    s_lastTsc = tsc;
+                }
                 s_lastGameFrames = gameFrames;
                 s_lastPrims = prims;
                 s_lastPix = pix;
