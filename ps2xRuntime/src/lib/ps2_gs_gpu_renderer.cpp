@@ -205,15 +205,15 @@ int  GsGpuRenderer::renderScale()
     }
     return v;
 }
-namespace { std::atomic<int> g_uiRenderScalePending{-1}; }
 void GsGpuRenderer::setRenderScale(int s)
-{   // [rscale] live changes are DEFERRED to the frame top: applying mid-frame recreated
-    // buffers between draws of one frame (wiped half-drawn content, stale snapshots/latch
-    // -- "switching live breaks everything"). The pending value lands atomically there.
+{   // [rscale] APPLIES AT STARTUP ONLY. Live rebuild of the scene-buffer graph proved
+    // unsafe (mid-frame tears / frame-top black screen -- the buffers, their staging,
+    // snapshots and the present latch cannot be swapped consistently while the pipeline
+    // is mid-flight). The overlay saves the value to the INI; it takes effect on the
+    // next launch. The lazy init in renderScale() reads it then.
     if (s < 1) s = 1; if (s > 4) s = 4;
-    g_uiRenderScalePending.store(s);
     if (g_uiRenderScale.load(std::memory_order_relaxed) < 0)
-        g_uiRenderScale.store(s);   // first-time init (startup INI apply) may take effect at once
+        g_uiRenderScale.store(s);
 }
 void GsGpuRenderer::setEnabled(bool v)     { g_uiGpu.store(v ? 1 : 0); }
 namespace { std::atomic<int> g_uiOutline{-1}, g_uiShadows{-1}; }
@@ -759,8 +759,7 @@ namespace
         // black-cleared) every publish — so the bloom downsample sampled a freshly-wiped fbp0
         // (all-black fbp336 -> black glow overlay over the fight). Keep the largest allocation;
         // only recreate when the request GROWS beyond it (mirrors the atlas monotonic-max fix).
-        if (f.rt.texture.id != 0 && w <= f.w && h <= f.h
-            && f.scale == (rsScaledFbp(fbp) ? rsN() : 1))   // [rscale] live scale change recreates
+        if (f.rt.texture.id != 0 && w <= f.w && h <= f.h)
             return f;
         if (f.rt.texture.id != 0)
         {
@@ -769,14 +768,10 @@ namespace
             if (w < f.w) w = f.w;
             if (h < f.h) h = f.h;
         }
-        const int rsWant = rsScaledFbp(fbp) ? rsN() : 1;
-        if (f.w != w || f.h != h || f.rt.texture.id == 0
-            || f.scale != rsWant)   // [rscale] live scale change must recreate (early-return
-                                    // checked scale, this condition did not -> the dropdown
-                                    // was a no-op until reboot)
+        if (f.w != w || f.h != h || f.rt.texture.id == 0)
         {
             if (f.rt.texture.id != 0) { g_rsTexScale.erase(f.rt.texture.id); ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); }
-            const int rsA = rsWant;
+            const int rsA = rsScaledFbp(fbp) ? rsN() : 1;
             const int wA = w * rsA, hA = h * rsA;
             // PS2X_NODEPTH_RT: create COLOR-ONLY FBOs (no depth renderbuffer). raylib's
             // LoadRenderTexture always attaches a depth renderbuffer; a bad/large depth
@@ -5887,34 +5882,6 @@ void GsGpuRenderer::ensureGl(int w, int h)
 
 unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
 {
-    {   // [rscale] apply a pending Internal Resolution change at the frame boundary:
-        // swap the live value, drop both scene FBOs + their snapshots + the latch in one
-        // step so the whole frame renders into consistent fresh buffers.
-        const int pend = g_uiRenderScalePending.load(std::memory_order_relaxed);
-        if (pend >= 1 && pend != renderScale())
-        {
-            g_uiRenderScale.store(pend, std::memory_order_relaxed);
-            for (uint32_t sfbp : {0u, 112u})
-            {
-                auto it = g_fbos.find(sfbp);
-                if (it != g_fbos.end() && it->second.rt.texture.id != 0)
-                {
-                    g_rsTexScale.erase(it->second.rt.texture.id);
-                    g_rsTexFbo.erase(it->second.rt.texture.id);
-                    ps2xForgetRtTexId(it->second.rt.texture.id);
-                    UnloadRenderTexture(it->second.rt);
-                    if (it->second.stag.texture.id != 0) { ps2xForgetTexId(it->second.stag.texture.id); UnloadRenderTexture(it->second.stag); it->second.stag = RenderTexture2D{}; }
-                    it->second.rt = RenderTexture2D{}; it->second.scale = 1;
-                }
-                auto sit = g_rtSnap.find(sfbp);
-                if (sit != g_rtSnap.end() && sit->second.texture.id != 0)
-                { ps2xForgetTexId(sit->second.texture.id); UnloadRenderTexture(sit->second); sit->second = RenderTexture2D{}; g_rtSnapSeq[sfbp] = 0xFFFFFFFFu; }
-            }
-            if (g_frontLatch.rt.texture.id != 0)
-            { ps2xForgetRtTexId(g_frontLatch.rt.texture.id); UnloadRenderTexture(g_frontLatch.rt); g_frontLatch = Fbo{}; g_frontLatchValid = false; }
-            std::fprintf(stderr, "[rscale] live switch applied at frame top: %d\n", pend);
-        }
-    }
     {   // [deferdec] no render may pass an unserviced decode command: service them first, each one
         // splitting the segment at its position (the barrier path's renderRange used to walk straight
         // through queued decodes -> the draws behind them rendered against an empty placeholder).

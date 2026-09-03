@@ -1150,6 +1150,8 @@ void PS2SettingsOverlay::drawVideoTab()
             GsGpuRenderer::setRenderScale(m_settings.renderScale);
             m_dirty = true;
         }
+        if (m_settings.renderScale != GsGpuRenderer::renderScale())
+            ImGui::TextDisabled("(applies on restart)");
     }
     sectionHeader("FILTERING");
     if (toggleSwitch("Bilinear Filter", &m_settings.bilinear))
