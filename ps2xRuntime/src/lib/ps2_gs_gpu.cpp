@@ -2378,7 +2378,26 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         }
     }
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    { extern GS *g_gsWb; if (!g_gsWb) g_gsWb = this; }   // [deferdec] the GL thread's decode needs the GS before any writeback happened (replay had none)
+    { extern GS *g_gsWb; if (!g_gsWb) g_gsWb = this; }
+    {   // [privlog] PS2X_PRIVLOG=1: the display registers (memory-mapped writes bypass the register handler) every 100 ms
+        static const bool s_pl = [](){ const char *v = std::getenv("PS2X_PRIVLOG"); return v && v[0] && v[0] != '0'; }();
+        if (s_pl && m_privRegs)
+        {
+            static auto s_t = std::chrono::steady_clock::now(); static uint64_t lp = ~0ull, ld = ~0ull;
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t pm = m_privRegs->pmode, d2 = m_privRegs->dispfb2;
+            if (pm != lp || d2 != ld || std::chrono::duration<double>(now - s_t).count() >= 0.25)
+            {
+                s_t = now; lp = pm; ld = d2;
+                const uint64_t d1 = m_privRegs->dispfb1;
+                std::fprintf(stderr, "[privlog] pmode=%016llx en1=%d en2=%d mmod=%d amod=%d slbg=%d alp=%u bgcolor=%06llx | dispfb1 fbp=%u fbw=%u psm=%u dby=%u | dispfb2 fbp=%u fbw=%u psm=%u dby=%u\n",
+                             (unsigned long long)pm, (int)(pm & 1), (int)((pm >> 1) & 1), (int)((pm >> 5) & 1), (int)((pm >> 6) & 1), (int)((pm >> 7) & 1),
+                             (unsigned)((pm >> 8) & 0xFF), (unsigned long long)(m_privRegs->bgcolor & 0xFFFFFF),
+                             (unsigned)(d1 & 0x1FF), (unsigned)((d1 >> 9) & 0x3F), (unsigned)((d1 >> 15) & 0x1F), (unsigned)((d1 >> 43) & 0x7FF),
+                             (unsigned)(d2 & 0x1FF), (unsigned)((d2 >> 9) & 0x3F), (unsigned)((d2 >> 15) & 0x1F), (unsigned)((d2 >> 43) & 0x7FF));
+            }
+        }
+    }   // [deferdec] the GL thread's decode needs the GS before any writeback happened (replay had none)
     // [relock] writeRegister() re-locked this recursive mutex for EVERY register in the packet
     // (~7% of the guest thread in pthread lock/unlock). Mark it held for this thread so the
     // nested writeRegister() calls skip the lock (same mutex, same thread: no semantic change).
@@ -3450,6 +3469,21 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case 0x5b:
         if (m_privRegs)
             m_privRegs->dispfb2 = value;
+        {   // [privlog] PS2X_PRIVLOG=1: PMODE / BGCOLOR as seen at each DISPFB2 write (the game's display flip)
+            static const bool s_pl = [](){ const char *v = std::getenv("PS2X_PRIVLOG"); return v && v[0] && v[0] != '0'; }();
+            if (s_pl && m_privRegs)
+            {
+                static uint64_t lp = ~0ull, lb = ~0ull; static unsigned n = 0; ++n;
+                const uint64_t pm = m_privRegs->pmode, bg = m_privRegs->bgcolor;
+                if (pm != lp || bg != lb || (n % 120u) == 0u)
+                {
+                    lp = pm; lb = bg;
+                    std::fprintf(stderr, "[privlog] flip#%u pmode=%016llx en1=%d en2=%d mmod=%d amod=%d slbg=%d alp=%u bgcolor=%06llx dispfb2.fbp=%u\n",
+                                 n, (unsigned long long)pm, (int)(pm & 1), (int)((pm >> 1) & 1), (int)((pm >> 5) & 1), (int)((pm >> 6) & 1), (int)((pm >> 7) & 1),
+                                 (unsigned)((pm >> 8) & 0xFF), (unsigned long long)(bg & 0xFFFFFF), (unsigned)((value >> 9) & 0x1FF));
+                }
+            }
+        }
         // BT3 (like most games) scans out via output circuit 2: after boot it flips ONLY
         // DISPFB2, never DISPFB1 — so the flip-aligned publish + display hint must live here
         // too (PS2X_DISPFB_PUBLISH on DISPFB1 alone published nothing: frozen black window).
