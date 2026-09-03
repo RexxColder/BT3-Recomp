@@ -14413,7 +14413,12 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
                     && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
-                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))
+                    // [rscale] at internal scale, render-target samples (e.g. the native
+                    // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
+                    // them blocky (pixelated far mountains under DoF). Bilinear smooths the
+                    // upscale. Excludes index-as-data reads (idxRt) and mask writers.
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
                     rlBegin(RL_QUADS);
                     for (int k = 0; k < 4; ++k)
@@ -14770,7 +14775,12 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
                     && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
-                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))
+                    // [rscale] at internal scale, render-target samples (e.g. the native
+                    // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
+                    // them blocky (pixelated far mountains under DoF). Bilinear smooths the
+                    // upscale. Excludes index-as-data reads (idxRt) and mask writers.
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                 rlBegin(RL_QUADS);
                 {   // [emitA] PS2X_CMPWR=1: the vertex alpha actually emitted for the mask composites
                     static const bool s_ea = [](){ const char *v = std::getenv("PS2X_CMPWR"); return v && v[0] && v[0] != '0'; }();
@@ -15217,7 +15227,12 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
                     && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
-                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))
+                    // [rscale] at internal scale, render-target samples (e.g. the native
+                    // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
+                    // them blocky (pixelated far mountains under DoF). Bilinear smooths the
+                    // upscale. Excludes index-as-data reads (idxRt) and mask writers.
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
                     rlBegin(RL_QUADS);
                     rlColor4ub(255, 255, 255, 255);
@@ -15461,7 +15476,12 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
                     && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
-                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))
+                    // [rscale] at internal scale, render-target samples (e.g. the native
+                    // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
+                    // them blocky (pixelated far mountains under DoF). Bilinear smooths the
+                    // upscale. Excludes index-as-data reads (idxRt) and mask writers.
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                         rlCheckRenderBatchLimit(4);
                         rlBegin(RL_QUADS);
                         const int qd[4] = {0, 1, 2, 2};
@@ -15518,7 +15538,12 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
                     && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
-                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))
+                    // [rscale] at internal scale, render-target samples (e.g. the native
+                    // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
+                    // them blocky (pixelated far mountains under DoF). Bilinear smooths the
+                    // upscale. Excludes index-as-data reads (idxRt) and mask writers.
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
             rlCheckRenderBatchLimit(4);
             {   // [region] declared/actual clamp for RT-sourced draws (see uRegion)
                 static int s_locUViz = -2; if (s_locUViz == -2) s_locUViz = GetShaderLocation(g_shader, "uUViz");
@@ -15759,7 +15784,12 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
                     && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
-                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))
+                    // [rscale] at internal scale, render-target samples (e.g. the native
+                    // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
+                    // them blocky (pixelated far mountains under DoF). Bilinear smooths the
+                    // upscale. Excludes index-as-data reads (idxRt) and mask writers.
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -15804,7 +15834,12 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
                     && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
-                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))
+                    // [rscale] at internal scale, render-target samples (e.g. the native
+                    // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
+                    // them blocky (pixelated far mountains under DoF). Bilinear smooths the
+                    // upscale. Excludes index-as-data reads (idxRt) and mask writers.
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -15852,7 +15887,12 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
                     && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
-                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))
+                    // [rscale] at internal scale, render-target samples (e.g. the native
+                    // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
+                    // them blocky (pixelated far mountains under DoF). Bilinear smooths the
+                    // upscale. Excludes index-as-data reads (idxRt) and mask writers.
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(128, 128, 128, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
