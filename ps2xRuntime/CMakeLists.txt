@@ -548,6 +548,13 @@ if(PS2X_IS_VITA)
     endif()
 endif()
 
+if(WIN32)
+    # Guest threads (std::thread, default stack) run recompiled game code with deep call chains and
+    # large frames; Linux gives them 8 MB, Windows 1 MB unless the image says otherwise. The PE
+    # default stack reserve applies to every thread created without an explicit size.
+    target_link_options(ps2EntryRunner PRIVATE "/STACK:134217728")
+endif()
+
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_runtime)
     EnableFastReleaseMode(ps2EntryRunner)
