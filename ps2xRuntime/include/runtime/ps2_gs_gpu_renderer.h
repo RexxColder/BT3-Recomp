@@ -229,6 +229,34 @@ public:
     // This folds the texel-span content hash into the key: each material version gets its
     // own stable entry (decoded once ever, even for per-frame cycling). Returns the
     // versioned key; needDecode=true when the caller must decode+putTexture under it.
+    bool fbpRenderedOnce(uint32_t fbp) const { return fbp < kVramPages && m_fbpRenderSeq[fbp] != 0u; }   // [p8twinskip] has GL ever rendered this fbp
+    // [rtreadskip] PS2X_RTREADSKIP=<mask>: record-time reads of GL-rendered pages whose replay never touches the VRAM
+    // decode -- skip the decode and the barrier request. bit0: PSMT8H mask builds (scene 0/112 -> f224, IDXRT);
+    // bit1: Z-format reads of the Z page (dropped by gaZ16DropRead); bit2: the CT32 blur chain 336->368->502<->504;
+    // bit3: CT16 views of page 336 (mode-4 gaview). Default 0 until each class passes matched-warm parity.
+    static bool rtReadServedClass(uint32_t pg, uint32_t psm, uint32_t destFbp)
+    {
+        static const int s_mask = [](){ const char *v = std::getenv("PS2X_RTREADSKIP"); return v && v[0] ? std::atoi(v) : 2047; }();   // default: every class below (all parity-clean 2026-09-03)
+        if (s_mask == 0) return false;
+        if ((s_mask & 1) && psm == 27u && (pg == 0u || pg == 112u) && destFbp == 224u) return true;
+        if ((s_mask & 2) && pg == 224u && (psm == 0x30u || psm == 0x31u || psm == 0x32u || psm == 0x3Au)) return true;
+        if ((s_mask & 4) && psm == 0u && ((pg == 336u && destFbp == 368u) || (pg == 368u && destFbp == 502u) || (pg == 502u && destFbp == 504u) || (pg == 504u && destFbp == 502u))) return true;
+        if ((s_mask & 8) && psm == 2u && pg == 336u && (destFbp == 0u || destFbp == 112u)) return true;
+        // bit4: the blur chain's UP direction (504 -> 368 -> 336, CT32); bit5: PSMT8H imports of the mask page into the
+        // scene (P8TWIN); bit6: the bloom composite (336 CT32 -> scene); bit7: the scene downsample into the chain
+        // (0/112 CT32 -> f336); bit8: scene CT32 reads into the mask page (0/112 -> f224).
+        if ((s_mask & 16) && psm == 0u && ((pg == 504u && destFbp == 368u) || (pg == 368u && destFbp == 336u))) return true;
+        if ((s_mask & 32) && psm == 27u && pg == 224u && (destFbp == 0u || destFbp == 112u)) return true;
+        if ((s_mask & 64) && psm == 0u && pg == 336u && (destFbp == 0u || destFbp == 112u)) return true;
+        if ((s_mask & 128) && psm == 0u && (pg == 0u || pg == 112u) && destFbp == 336u) return true;
+        if ((s_mask & 256) && psm == 0u && (pg == 0u || pg == 112u) && destFbp == 224u) return true;
+        // bit9: PSMT8H mask reads into the ink page (224 -> f336); bit10: CT24 views of the edge map into the scene (336 -> f0/112)
+        if ((s_mask & 512) && psm == 27u && pg == 224u && destFbp == 336u) return true;
+        if ((s_mask & 1024) && psm == 1u && pg == 336u && (destFbp == 0u || destFbp == 112u)) return true;
+        return false;
+    }
+    // [rtreadskip] page rendered by GL and not re-uploaded by the guest since: the replay samples the FBO, never a VRAM decode
+    bool pageRenderedNotUploaded(uint32_t pg) const { return pg < kVramPages && m_fbpRenderSeq[pg] != 0u && !(m_pageSeq[pg] > m_fbpRenderSeq[pg]); }
     uint64_t resolveTextureVersion(uint64_t baseKey, uint32_t pageLo, uint32_t pageHi,
                                    const uint8_t *vram, uint32_t vramSize, bool &needDecode);
     // PS2X_BARRIER: a draw that SAMPLES a page an earlier queued draw WROTE cannot see that

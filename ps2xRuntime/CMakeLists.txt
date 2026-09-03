@@ -70,6 +70,10 @@ else()
         # Without this, a fresh clone pulls raylib's whole history: 60794 objects, ~350 MiB, for
         # a pinned tag we only ever build one revision of. Depth 1 fetches a fraction of that.
         GIT_SHALLOW TRUE
+        # [ps2x raylib patch] batch multi-buffering (4 buffers), no per-flush texture/VAO/program unbinds,
+        # draw-call/flush counters + flush timer read by the fps line. Applied once at populate time;
+        # the reverse --check makes a re-populate of an already-patched source a no-op.
+        PATCH_COMMAND git apply --reverse --check --quiet "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch" || git apply --ignore-whitespace "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch"
     )
     FetchContent_MakeAvailable(raylib)
 

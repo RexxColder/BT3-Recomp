@@ -1,0 +1,92 @@
+diff --git a/src/config.h b/src/config.h
+index e3749c5..2d00953 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -79,7 +79,7 @@
+ 
+ #define MAX_KEYBOARD_KEYS             512       // Maximum number of keyboard keys supported
+ #define MAX_MOUSE_BUTTONS               8       // Maximum number of mouse buttons supported
+-#define MAX_GAMEPADS                    4       // Maximum number of gamepads supported
++#define MAX_GAMEPADS                   16       // Maximum number of gamepads supported
+ #define MAX_GAMEPAD_AXIS                8       // Maximum number of axis supported (per gamepad)
+ #define MAX_GAMEPAD_BUTTONS            32       // Maximum number of buttons supported (per gamepad)
+ #define MAX_GAMEPAD_VIBRATION_TIME      2.0f    // Maximum vibration time in seconds
+@@ -104,7 +104,7 @@
+ #define RL_SUPPORT_MESH_GPU_SKINNING           1      // GPU skinning, comment if your GPU does not support more than 8 VBOs
+ 
+ //#define RL_DEFAULT_BATCH_BUFFER_ELEMENTS    4096    // Default internal render batch elements limits
+-#define RL_DEFAULT_BATCH_BUFFERS               1      // Default number of batch buffers (multi-buffering)
++#define RL_DEFAULT_BATCH_BUFFERS               4      // Default number of batch buffers (multi-buffering)
+ #define RL_DEFAULT_BATCH_DRAWCALLS           256      // Default number of batch draw calls (by state changes: mode, texture)
+ #define RL_DEFAULT_BATCH_MAX_TEXTURE_UNITS     4      // Maximum number of textures units that can be activated on batch drawing (SetShaderValueTexture())
+ 
+diff --git a/src/rlgl.h b/src/rlgl.h
+index 756656e..aa55649 100644
+--- a/src/rlgl.h
++++ b/src/rlgl.h
+@@ -213,7 +213,7 @@
+     #endif
+ #endif
+ #ifndef RL_DEFAULT_BATCH_BUFFERS
+-    #define RL_DEFAULT_BATCH_BUFFERS                 1      // Default number of batch buffers (multi-buffering)
++    #define RL_DEFAULT_BATCH_BUFFERS                 4      // Default number of batch buffers (multi-buffering)
+ #endif
+ #ifndef RL_DEFAULT_BATCH_DRAWCALLS
+     #define RL_DEFAULT_BATCH_DRAWCALLS             256      // Default number of batch draw calls (by state changes: mode, texture)
+@@ -2901,7 +2901,24 @@ void rlUnloadRenderBatch(rlRenderBatch batch)
+ 
+ // Draw render batch
+ // NOTE: We require a pointer to reset batch and increase current buffer (multi-buffer)
++unsigned long long g_rlglDrawCalls = 0, g_rlglBatchFlushes = 0;   /* [ps2x glcalls] read by the runtime fps line */
++double g_rlglFlushNs = 0.0;   /* [ps2x flushtime] wall ns spent inside non-empty rlDrawRenderBatch calls */
++#include <time.h>
++static inline double ps2xRlglNowNs(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec; }
++static void rlDrawRenderBatchInner(rlRenderBatch *batch);
+ void rlDrawRenderBatch(rlRenderBatch *batch)
++{
++    if (RLGL.State.vertexCounter > 0)
++    {
++        g_rlglBatchFlushes++;
++        const double t0 = ps2xRlglNowNs();
++        rlDrawRenderBatchInner(batch);
++        g_rlglFlushNs += ps2xRlglNowNs() - t0;
++        return;
++    }
++    rlDrawRenderBatchInner(batch);
++}
++static void rlDrawRenderBatchInner(rlRenderBatch *batch)
+ {
+ #if defined(GRAPHICS_API_OPENGL_33) || defined(GRAPHICS_API_OPENGL_ES2)
+     // Update batch vertex buffers
+@@ -3057,6 +3074,7 @@ void rlDrawRenderBatch(rlRenderBatch *batch)
+                 // Bind current draw call texture, activated as GL_TEXTURE0 and Bound to sampler2D texture0 by default
+                 glBindTexture(GL_TEXTURE_2D, batch->draws[i].textureId);
+ 
++                g_rlglDrawCalls++;   /* [ps2x glcalls] one driver draw per batch entry */
+                 if ((batch->draws[i].mode == RL_LINES) || (batch->draws[i].mode == RL_TRIANGLES)) glDrawArrays(batch->draws[i].mode, vertexOffset, batch->draws[i].vertexCount);
+                 else
+                 {
+@@ -3080,12 +3098,20 @@ void rlDrawRenderBatch(rlRenderBatch *batch)
+                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+             }
+ 
+-            glBindTexture(GL_TEXTURE_2D, 0);    // Unbind textures
++            /* [ps2x lean flush] per-flush unbinds (texture, VAO, program) are pure driver overhead: every flush
++
++               re-binds all three at its start. Define RLGL_PS2X_UNBIND to restore them. */
++#if defined(RLGL_PS2X_UNBIND)
++
++            glBindTexture(GL_TEXTURE_2D, 0);
++#endif
+         }
++#if defined(RLGL_PS2X_UNBIND)
+ 
+-        if (RLGL.ExtSupported.vao) glBindVertexArray(0); // Unbind VAO
++        if (RLGL.ExtSupported.vao) glBindVertexArray(0);
+ 
+-        glUseProgram(0);    // Unbind shader program
++        glUseProgram(0);
++#endif
+     }
+ 
+     // Restore viewport to default measures

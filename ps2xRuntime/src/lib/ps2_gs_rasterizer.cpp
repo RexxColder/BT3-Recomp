@@ -15,6 +15,7 @@ static thread_local int g_subDx0 = 0, g_subDxW = 0;   // [subdecode] decode wind
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <unordered_set>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,52 @@ static bool pixCenterDestOk(uint32_t fbp)
 // [deferdec] PS2X_DEFERDEC=1: a texture whose source page is GL-dirty is decoded by the GL thread
 // (in command order, right after it writes the page back) instead of making the guest wait.
 static const bool s_deferDec = [](){ const char *v = std::getenv("PS2X_DEFERDEC"); return v && v[0] && v[0] != '0'; }();
+// [p8twinskip] 2026-09-03: PSMT8H reads of the MASK page (tbp0 7168, not drawn back into f224) are served at
+// replay by the decode-twin (renderer [p8twin], baked default) and never touch the decoded texture -- yet the
+// record path still barrier-requested page 224 (which staged a full-resolution depth readback every frame) and
+// decoded the 512x512 T8H view (~5 per frame, ~20 ms/s). Mirror the renderer's serve condition here and skip
+// both. PS2X_P8TWINSKIPDEC=0 restores the old behaviour.
+// [reqcensus] PS2X_DECCENSUS=1: which draw classes barrier-request a page (tbp0/psm/w/h/dest, site)
+static inline void reqCensus(int site, uint32_t tbp0, uint32_t psm, int w, int h, uint32_t dest)
+{
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_DECCENSUS"); return v && v[0] && v[0] != '0'; }();
+    if (!s_on) return;
+    static std::map<uint64_t, unsigned long> m; static auto t0 = std::chrono::steady_clock::now(); static unsigned long tot = 0;
+    ++tot; m[((uint64_t)site << 60) | ((uint64_t)tbp0 << 40) | ((uint64_t)psm << 32) | ((uint64_t)(w & 0xFFF) << 20) | ((uint64_t)(h & 0xFFF) << 8) | (uint64_t)(dest & 0xFF)]++;
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<double>(now - t0).count() >= 2.0)
+    {
+        std::vector<std::pair<uint64_t, unsigned long>> v(m.begin(), m.end());
+        std::sort(v.begin(), v.end(), [](auto &a, auto &b){ return a.second > b.second; });
+        std::fprintf(stderr, "[reqcensus] %lu barrier requests in 2 s, %zu classes:", tot, v.size());
+        for (size_t i = 0; i < v.size() && i < 10; ++i)
+            std::fprintf(stderr, "  s%llu tbp%llu/psm%llu %llux%llu->f%llu n=%lu", (unsigned long long)(v[i].first >> 60), (unsigned long long)((v[i].first >> 40) & 0xFFFFF),
+                         (unsigned long long)((v[i].first >> 32) & 0xFF), (unsigned long long)((v[i].first >> 20) & 0xFFF), (unsigned long long)((v[i].first >> 8) & 0xFFF), (unsigned long long)(v[i].first & 0xFF), v[i].second);
+        std::fprintf(stderr, "\n");
+        m.clear(); tot = 0; t0 = now;
+    }
+}
+// [rtreadskip] 2026-09-03: a page-aligned texture read of a page GL rendered (and the guest has not re-uploaded
+// since) is served at replay from the FBO / view / twin / depth texture in every branch of the renderer's
+// texture-selection chain (self-reads excluded) -- the record-time VRAM decode and the barrier request that
+// staged the page were pure waste (~230 requests/s = 7 pages staged per frame, ~85 ms/s GL + the guest's
+// staged-write application). PS2X_RTREADSKIP=0 restores the old behaviour.
+static inline bool rtServedRead(uint32_t destFbp, const GSTex0Reg &tex)
+{
+    if ((tex.tbp0 % 32u) != 0u) return false;
+    const uint32_t pg = tex.tbp0 / 32u;
+    if (pg == destFbp) return false;   // feedback read: keep the old path
+    return GsGpuRenderer::rtReadServedClass(pg, tex.psm, destFbp) && ps2GpuRenderer().pageRenderedNotUploaded(pg);
+}
+static inline bool p8twinServedRead(uint32_t destFbp, const GSTex0Reg &tex)
+{
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_P8TWINSKIPDEC"); return !(v && v[0] == '0'); }();
+    static const bool s_tw = [](){ const char *v = std::getenv("PS2X_P8TWIN"); return v && v[0] && v[0] != '0'; }();
+    if (!s_on || !s_tw) return false;
+    if (tex.psm != GS_PSM_T8H || tex.tbp0 != 7168u) return false;
+    if (destFbp == 224u) return false;
+    return ps2GpuRenderer().fbpRenderedOnce(224u);
+}
 
 using namespace GSInternal;
 
@@ -1536,7 +1583,9 @@ void GSRasterizer::drawPrimitive(GS *gs)
                     // interior wireframe). Flush the CLUT page before the decode.
                     // NOTE: needs the page in PS2X_BARONLY to pass the gate (add 499,500).
                     if (celOutline && actx.tex0.cbp != 0u)
-                        ps2GpuRenderer().barrierBeforeRead(actx.tex0.cbp, false, false);
+                        { extern std::atomic<unsigned long> g_barReqPushed; const unsigned long b0 = g_barReqPushed.load(std::memory_order_relaxed);
+                          ps2GpuRenderer().barrierBeforeRead(actx.tex0.cbp, false, false);
+                          if (g_barReqPushed.load(std::memory_order_relaxed) != b0) reqCensus(1, actx.tex0.cbp, actx.tex0.psm, 1 << actx.tex0.tw, 1 << actx.tex0.th, actx.frame.fbp); }
                 }
                 {   // Mark the dirty mask ONLY while a routed cel draw is rasterizing. Arming
                     // it for the whole bracket was wrong: BT3's other software passes (the CT16
@@ -1613,8 +1662,10 @@ void GSRasterizer::drawPrimitive(GS *gs)
                 static const bool s_aliasBar = [](){ const char *v = std::getenv("PS2X_ALIASBAR");
                                                      return v && v[0] && v[0] != '0'; }();
                 if (gs->m_prim.tme)
-                    ps2GpuRenderer().barrierBeforeRead(actx.tex0.tbp0, true,
+                    { extern std::atomic<unsigned long> g_barReqPushed; const unsigned long b0 = g_barReqPushed.load(std::memory_order_relaxed);
+                      ps2GpuRenderer().barrierBeforeRead(actx.tex0.tbp0, true,
                                                        s_aliasBar && spsm == 0x1Bu);
+                      if (g_barReqPushed.load(std::memory_order_relaxed) != b0) reqCensus(2, actx.tex0.tbp0, actx.tex0.psm, 1 << actx.tex0.tw, 1 << actx.tex0.th, actx.frame.fbp); }
                 // The scene-alpha rebuild is about to write VRAM page 0 directly. Hand the
                 // GPU's own scene alpha over first: it carries the characters' FBA-forced
                 // MSB, which is what gives them a silhouette in the mask the outline and
@@ -2842,6 +2893,37 @@ void GSRasterizer::ensureClutCache(GS *gs)
     if (key == gs->m_clutCacheKey)
         return; // cache already valid for this palette state
 
+    // [clutmulti] 2026-09-03: a 64-entry, 2-way cache of built palettes keyed by the same key. Consecutive prims alternate
+    // palettes, so the single-entry cache refilled ~50k times/s from swizzled VRAM. invalidateClutCache() leaves the
+    // ~0 sentinel in m_clutCacheKey -> drop every entry (a writeback also bumps the page gens in the key). PS2X_CLUTMULTI=0 disables.
+    struct ClutMulti { uint64_t key; uint64_t h16, h256; uint32_t tbl[256]; };
+    static ClutMulti s_cm[64] = {};
+    static const bool s_cmOn = [](){ const char *v = std::getenv("PS2X_CLUTMULTI"); return !(v && v[0] == '0'); }();
+    const unsigned cmSlot = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 58) & 62u;   // even slot; +1 = its 2-way partner
+    if (s_cmOn)
+    {
+        if (gs->m_clutCacheKey == ~0ull) for (auto &e : s_cm) e.key = 0ull;
+        for (unsigned w = 0; w < 2; ++w)
+            if (s_cm[cmSlot + w].key == key)
+            {
+                std::memcpy(gs->m_clutCache, s_cm[cmSlot + w].tbl, sizeof(gs->m_clutCache));
+                gs->m_clutCacheKey = key;
+                gs->m_clutCacheHash16 = s_cm[cmSlot + w].h16; gs->m_clutCacheHash256 = s_cm[cmSlot + w].h256;   // [cluthash] as if rebuilt
+                return;
+            }
+    }
+    {   // [clutcensus] PS2X_DECCENSUS=1: how often the single-entry CLUT cache refills, and how many distinct keys
+        // it cycles through -- a refill is 256 swizzled VRAM reads (ReadCT32 + lookupCLUT ~4% of the guest thread)
+        static const bool s_cc = [](){ const char *v = std::getenv("PS2X_DECCENSUS"); return v && v[0] && v[0] != '0'; }();
+        if (s_cc)
+        {
+            static unsigned long s_n = 0; static std::unordered_set<uint64_t> s_keys; static auto s_t = std::chrono::steady_clock::now();
+            ++s_n; s_keys.insert(key);
+            const auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - s_t).count() >= 2.0)
+            { std::fprintf(stderr, "[clutcensus] fills=%lu in 2 s, distinct keys=%zu\n", s_n, s_keys.size()); s_n = 0; s_keys.clear(); s_t = now; }
+        }
+    }
     fillClutFrom(gs->m_clutCache, gs->m_vram, gs->m_texa, gs->m_texclut, tex);   // [deferdec] shared with the GL-thread decode
     {   // [groupviz] PS2X_GROUPVIZ=<cbp>: replace this palette with a solid ID color per
         // upload ordinal -> the rendered frame maps lighting groups to colors.
@@ -2871,6 +2953,15 @@ void GSRasterizer::ensureClutCache(GS *gs)
         gs->m_clutCacheHash16 = hh;
         for (int i = 16; i < 256; ++i) hh = (hh ^ (uint64_t)gs->m_clutCache[i]) * 1099511628211ull;
         gs->m_clutCacheHash256 = hh;
+    }
+    if (s_cmOn)
+    {   // [clutmulti] store the built palette + its hashes (after [groupviz]) in the older of the two ways
+        static uint32_t s_cmTick = 0; static uint32_t s_cmAge[64] = {};
+        unsigned w = (s_cmAge[cmSlot] <= s_cmAge[cmSlot + 1]) ? 0u : 1u;
+        if (s_cm[cmSlot].key == 0ull) w = 0u; else if (s_cm[cmSlot + 1].key == 0ull) w = 1u;
+        ClutMulti &e = s_cm[cmSlot + w];
+        e.key = key; e.h16 = gs->m_clutCacheHash16; e.h256 = gs->m_clutCacheHash256;
+        std::memcpy(e.tbl, gs->m_clutCache, sizeof(gs->m_clutCache)); s_cmAge[cmSlot + w] = ++s_cmTick;
     }
     {   // PS2X_CLUTDUMP=<cbp>: print the whole decoded palette once, to diff against a
         // console-derived palette (index -> colour read straight off a PCSX2 texture dump).
@@ -3823,7 +3914,14 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                             }
                         }
                     }
-                    ps2GpuRenderer().barrierBeforeRead(tex.tbp0, true, wantsAlpha, deferOk ? &deferTex : nullptr);
+                    if (!p8twinServedRead(gs->activeContext().frame.fbp, tex) && !rtServedRead(gs->activeContext().frame.fbp, tex))
+                    {
+                        extern std::atomic<unsigned long> g_barReqPushed;
+                        const unsigned long before = g_barReqPushed.load(std::memory_order_relaxed);
+                        ps2GpuRenderer().barrierBeforeRead(tex.tbp0, true, wantsAlpha, deferOk ? &deferTex : nullptr);
+                        if (g_barReqPushed.load(std::memory_order_relaxed) != before)
+                            reqCensus(3, tex.tbp0, tex.psm, 1 << tex.tw, 1 << tex.th, gs->activeContext().frame.fbp);
+                    }
                 }
             }
             deferAlpha = wantsAlpha;
@@ -4088,7 +4186,12 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                               const char *w = std::getenv("PS2X_ALIASZSW"); return w && w[0] && w[0] != '0'; }();   // [dofmask] see ALIASZSW above
         const bool gaZ16DropRead = s_gaDs4 >= 4 && s_gaDecSkip && !s_gaAliasZ2 && ctx.tex0.tbp0 == 7168u &&
                                    (ctx.tex0.psm == 0x30u || ctx.tex0.psm == 0x31u || ctx.tex0.psm == 0x32u);
-        const bool gaServedRead = gaZ16DropRead || (s_gaDs4 >= 4 && s_gaDecSkip && ctx.tex0.tbp0 == 10752u &&
+        {   // [zwbwant] a Z-format texture read that is NOT dropped is the only consumer of the VRAM depth writeback
+            extern std::atomic<uint64_t> g_zReadWantFrame; extern std::atomic<uint64_t> g_bt3FrameCount;
+            if (!gaZ16DropRead && (ctx.tex0.psm == 0x30u || ctx.tex0.psm == 0x31u || ctx.tex0.psm == 0x32u || ctx.tex0.psm == 0x3Au))
+                g_zReadWantFrame.store(g_bt3FrameCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        const bool gaServedRead = gaZ16DropRead || p8twinServedRead(ctx.frame.fbp, ctx.tex0) || rtServedRead(ctx.frame.fbp, ctx.tex0) || (s_gaDs4 >= 4 && s_gaDecSkip && ctx.tex0.tbp0 == 10752u &&
                                   (ctx.tex0.psm == 0x02u || ctx.tex0.psm == 0x0Au) &&
                                   gs->m_texa.aem && gs->m_texa.ta1 == 0u &&
                                   (gs->m_texa.ta0 == 0x30u ||
@@ -4100,6 +4203,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             const uint32_t pv = ctx.tex0.psm;
             g_resolveAlphaData = (pv == GS_PSM_T8 || pv == GS_PSM_T8H || pv == GS_PSM_T4 || pv == GS_PSM_T4HL || pv == GS_PSM_T4HH)
                                  || ((ctx.frame.fbmsk & 0x00ffffffu) == 0x00ffffffu); }
+        const uint64_t texKeyBase = texKey;   // [dectime] pre-version key (material + CLUT content)
         if (!gaServedRead) texKey = r.resolveTextureVersion(texKey, texPageLo, texPageHi, gs->m_vram, gs->m_vramSize, texNeedDecode);
         if (deferTex || deferClut) texNeedDecode = true;   // [deferdec] GL-dirty source: the record-time hash saw stale VRAM
         // [deferpend] a page whose deferred flush is still queued is stale in VRAM: a read that needs a decode
@@ -4159,8 +4263,38 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             src.clut = gs->m_clutCache; src.clutKey = gs->m_clutCacheKey; src.texa = &gs->m_texa; src.texclut = &gs->m_texclut;
             src.subDxW = g_subDxW; src.subDx0 = g_subDx0;
             int subW = 0; std::vector<uint8_t> rgba;
+            // [dectime] PS2X_DECCENSUS=1: guest-thread wall time spent in inline decodes (incl. the pool wait) and a census by class
+            static const bool s_dcs = [](){ const char *v = std::getenv("PS2X_DECCENSUS"); return v && v[0] && v[0] != '0'; }();
+            const auto _d0 = s_dcs ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             decodeTexRGBA(gs, src, texW, texH, rawAlphaDec, texKey, subW, rgba);   // [decodefn]
             r.putTexture(texKey, std::move(rgba), subW, texH, texPageLo, texPageHi);
+            if (s_dcs)
+            {
+                static double s_ms = 0; static unsigned long s_n = 0; static std::map<uint64_t, std::pair<unsigned long, double>> s_m; static auto s_t = std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
+                const double dms = std::chrono::duration<double, std::milli>(now - _d0).count();
+                s_ms += dms; ++s_n;
+                auto &e = s_m[((uint64_t)ctx.tex0.tbp0 << 40) | ((uint64_t)ctx.tex0.psm << 32) | ((uint64_t)(texW & 0xFFFF) << 16) | (uint64_t)(texH & 0xFFFF)];
+                e.first++; e.second += dms;
+                {   // why: base key never seen (new material/CLUT combination) vs same base re-versioned (span content moved)
+                    static std::unordered_set<uint64_t> s_seenBase; static unsigned long s_newBase = 0, s_reVer = 0;
+                    if (s_seenBase.insert(texKeyBase).second) ++s_newBase; else ++s_reVer;
+                    static auto s_t2 = std::chrono::steady_clock::now();
+                    if (std::chrono::duration<double>(now - s_t2).count() >= 2.0)
+                    { std::fprintf(stderr, "[decwhy] decodes: newBaseKey=%lu sameBaseReversioned=%lu (distinct bases seen %zu)\n", s_newBase, s_reVer, s_seenBase.size()); s_newBase = s_reVer = 0; s_t2 = now; }
+                }
+                if (std::chrono::duration<double>(now - s_t).count() >= 2.0)
+                {
+                    std::vector<std::pair<uint64_t, std::pair<unsigned long, double>>> v(s_m.begin(), s_m.end());
+                    std::sort(v.begin(), v.end(), [](auto &a, auto &b){ return a.second.second > b.second.second; });
+                    std::fprintf(stderr, "[dectime] inline decodes %lu in 2 s = %.1f ms (%.1f ms/s), %zu classes; top by time:", s_n, s_ms, s_ms / 2.0, v.size());
+                    for (size_t i = 0; i < v.size() && i < 8; ++i)
+                        std::fprintf(stderr, "  tbp%llu/psm%llu %llux%llu n=%lu %.1fms", (unsigned long long)(v[i].first >> 40), (unsigned long long)((v[i].first >> 32) & 0xFF),
+                                     (unsigned long long)((v[i].first >> 16) & 0xFFFF), (unsigned long long)(v[i].first & 0xFFFF), v[i].second.first, v[i].second.second);
+                    std::fprintf(stderr, "\n");
+                    s_m.clear(); s_ms = 0; s_n = 0; s_t = now;
+                }
+            }
         }
     }
 

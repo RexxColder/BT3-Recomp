@@ -2337,9 +2337,27 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         // for a vsync. PS2X_GS_RECORD_MB caps the file (default 512 MB).
         if (sizeBytes > 0u)
         {
-            uint8_t hdr[6] = {0u, 0u, 0u, 0u, 0u, 0u};
+            // [recpath] the path byte carries the GIF path (1=XGKICK 2=DIRECT 3=PATH3) so an
+            // offline census can tell VU1-built packets from EE-built ones (was always 0).
+            uint8_t hdr[6] = {0u, (uint8_t)m_curSrcPath, 0u, 0u, 0u, 0u};
             std::memcpy(hdr + 2, &sizeBytes, 4);
             gsRecPush(hdr, 6, data, sizeBytes);
+            {   // [wispsrc] PS2X_WISPSRC=<tbp>: which GIF path delivers the packets binding this
+                // PSMT8 64x64 texture (the aura wisps) -- PATH1 means VU1 built the vertices.
+                static const uint32_t s_wt = [](){ const char *v = std::getenv("PS2X_WISPSRC");
+                                                   return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
+                static int s_wn = 0;
+                if (s_wt && s_wn < 40)
+                    for (uint32_t off = 0; off + 16 <= sizeBytes; off += 16)
+                    {
+                        uint64_t lo, hi; std::memcpy(&lo, data + off, 8); std::memcpy(&hi, data + off + 8, 8);
+                        // REGLIST packets carry one register per 64-bit half: check both.
+                        const bool mLo = (lo & 0x3FFFull) == s_wt && ((lo >> 20) & 0x3Full) == 19ull && ((lo >> 26) & 0xFull) == 6ull;
+                        const bool mHi = (hi & 0x3FFFull) == s_wt && ((hi >> 20) & 0x3Full) == 19ull && ((hi >> 26) & 0xFull) == 6ull;
+                        if (mLo || mHi)
+                        { std::fprintf(stderr, "[wispsrc] GS packet path=%u len=%u tex0@+%u%s\n", (unsigned)m_curSrcPath, sizeBytes, off, mHi ? " (hi half/REGLIST)" : ""); ++s_wn; break; }
+                    }
+            }
         }
     }
     if (g_vramDumpPtr)

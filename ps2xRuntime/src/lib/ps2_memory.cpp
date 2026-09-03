@@ -22,6 +22,7 @@ bool g_kickSrcMapEnabled()
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <cmath>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
@@ -1344,6 +1345,183 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             maxSz2 = PS2_RAM_SIZE;
                         }
 
+                        {   // [raysrc] PS2X_RAYSRC=<tbp> (2026-09-03, Kaioken white): CHAIN-path segments
+                            // carrying the flash-RAY triangles -- REGLIST tag nreg=12 {PRIM,TEX0,3x[RGBAQ,ST,XYZF2],NOP}
+                            // (7 qwords / triangle). Decode the three screen positions (12.4 fixed minus the
+                            // XYOFFSET PS2X_RAYOFX/RAYOFY, default 1792/1824) and report them. Console rays are
+                            // 10s..100s of px; ours contain triangles clipped to the guard-band CORNERS
+                            // (-30,-28)..(542,474) = enormous source triangles -> full-screen additive fills = white.
+                            // PS2X_RAYSRC_ARM=1 arms the guest write-watch on the XYZF2 qword of the first CLAMPED
+                            // vertex so the EE writer of the next packet backtraces ([camwrite] pc/ra/stk).
+                            // PS2X_RAYSRC_SCAN=1 also memmem's RAM for another copy of that vertex block (the
+                            // build buffer, stable across frames) and arms THERE instead of the moving arena slot.
+                            static const uint32_t s_rt = [](){ const char *v = std::getenv("PS2X_RAYSRC");
+                                                               return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
+                            static const bool s_rarm = [](){ const char *v = std::getenv("PS2X_RAYSRC_ARM");
+                                                             return v && v[0] && v[0] != '0'; }();
+                            static const bool s_rscan = [](){ const char *v = std::getenv("PS2X_RAYSRC_SCAN");
+                                                              return v && v[0] && v[0] != '0'; }();
+                            static const float s_ofx = [](){ const char *v = std::getenv("PS2X_RAYOFX"); return v && v[0] ? (float)std::atof(v) : 1792.0f; }();
+                            static const float s_ofy = [](){ const char *v = std::getenv("PS2X_RAYOFY"); return v && v[0] ? (float)std::atof(v) : 1824.0f; }();
+                            static int s_rn = 0, s_rarmed = 0;
+                            if (s_rt && src < maxSz2 && bytes <= maxSz2 - src)
+                            {
+                                const uint8_t *pw = base2 + src;
+                                for (uint32_t off = 0; off + 16 <= bytes; off += 16)
+                                {
+                                    uint64_t h2[2]; std::memcpy(h2, pw + off, 16);
+                                    int hit = -1;
+                                    for (int k = 0; k < 2; ++k)
+                                        if ((h2[k] & 0x3FFFull) == s_rt && ((h2[k] >> 20) & 0x3Full) == 19ull) hit = k;
+                                    if (hit < 0) continue;
+                                    const uint32_t v0 = off + 8u * (uint32_t)(hit + 1);   // first RGBAQ slot
+                                    if (v0 + 72u > bytes) break;
+                                    float xs[3], ys[3]; uint32_t zs[3], as[3], xyzOff[3]; float ss[3], ts[3], qs[3];
+                                    bool clamped = false; int firstClamped = -1;
+                                    for (int v = 0; v < 3; ++v)
+                                    {
+                                        uint64_t rg, st, xyz;
+                                        std::memcpy(&rg, pw + v0 + v * 24u, 8); std::memcpy(&st, pw + v0 + v * 24u + 8u, 8); std::memcpy(&xyz, pw + v0 + v * 24u + 16u, 8);
+                                        xyzOff[v] = v0 + v * 24u + 16u;
+                                        xs[v] = (float)(xyz & 0xFFFFull) / 16.0f - s_ofx; ys[v] = (float)((xyz >> 16) & 0xFFFFull) / 16.0f - s_ofy; zs[v] = (uint32_t)((xyz >> 32) & 0xFFFFFFull);
+                                        as[v] = (uint32_t)((rg >> 24) & 0xFFull);
+                                        uint32_t sb = (uint32_t)(st & 0xFFFFFFFFull), tb = (uint32_t)(st >> 32), qb = (uint32_t)(rg >> 32);
+                                        std::memcpy(&ss[v], &sb, 4); std::memcpy(&ts[v], &tb, 4); std::memcpy(&qs[v], &qb, 4);
+                                        const bool c = xs[v] < -25.0f || xs[v] > 535.0f || ys[v] < -22.0f || ys[v] > 470.0f;
+                                        if (c && firstClamped < 0) firstClamped = v;
+                                        clamped = clamped || c;
+                                    }
+                                    // a REAL ray: all three depths non-trivial, alpha > 0, finite positive Q (stale slots
+                                    // reused by other packet builders show z0/a0/NaN -- KAIO1 spent every arm on those)
+                                    const bool real = zs[0] > 1000u && zs[1] > 1000u && zs[2] > 1000u && (as[0] | as[1] | as[2]) != 0u
+                                                      && std::isfinite(qs[0]) && qs[0] > 0.0f && std::isfinite(ss[0]);
+                                    static int s_rreal = 0;
+                                    if (real) ++s_rreal;
+                                    const bool show = (real && (s_rreal < 120 || (s_rreal % 40) == 0)) || (!real && s_rn < 6);
+                                    if (show)
+                                        std::fprintf(stderr, "[raysrc] #%d%s tri @guest 0x%08x (seg 0x%08x+%u len %u sp=%d)%s v0=(%.1f,%.1f,z%u a%u s%.4f t%.4f q%.4f) v1=(%.1f,%.1f,z%u a%u s%.4f t%.4f) v2=(%.1f,%.1f,z%u a%u s%.4f t%.4f)\n",
+                                                     s_rn, real ? " REAL" : " stale", srcAddr + off, srcAddr, off, bytes, scratch ? 1 : 0, clamped ? " CLAMPED" : "",
+                                                     xs[0], ys[0], zs[0], as[0], ss[0], ts[0], qs[0], xs[1], ys[1], zs[1], as[1], ss[1], ts[1], xs[2], ys[2], zs[2], as[2], ss[2], ts[2]);
+                                    if (real && clamped)
+                                    {   // arm the FUN_00132b60 arg logger ([rayhook]) for the next 400 quad emits
+                                        extern std::atomic<int> g_rayHookArm;
+                                        static bool s_hookArmed = false;
+                                        if (!s_hookArmed) { s_hookArmed = true; g_rayHookArm.store(400, std::memory_order_relaxed); }
+                                    }
+                                    if (s_rarm && clamped && real && !scratch && s_rarmed < 6)
+                                    {
+                                        uint32_t armAt = srcAddr + xyzOff[firstClamped];
+                                        if (s_rscan)
+                                        {   // another copy of this vertex block (RGBAQ..XYZF2 of the clamped vertex = 24 B, plus the next 8 B)
+                                            const uint8_t *needle = pw + v0 + firstClamped * 24u; const size_t nl = 32;
+                                            const uint8_t *cur = m_rdram; const uint8_t *end = m_rdram + PS2_RAM_SIZE; bool found = false;
+                                            while (cur < end)
+                                            {
+                                                const uint8_t *f = (const uint8_t *)memmem(cur, (size_t)(end - cur), needle, nl);
+                                                if (!f) break;
+                                                const uint32_t ga = (uint32_t)(f - m_rdram);
+                                                if (ga < (srcAddr & 0x1FFFFFFFu) || ga >= (srcAddr & 0x1FFFFFFFu) + bytes)
+                                                { std::fprintf(stderr, "[raysrc] SCAN copy of clamped vertex found at guest 0x%08x (arena slot 0x%08x)\n", ga, srcAddr + v0 + firstClamped * 24u); armAt = ga + 16u; found = true; break; }
+                                                cur = f + 1;
+                                            }
+                                            if (!found) std::fprintf(stderr, "[raysrc] SCAN no other copy of the vertex block in RAM\n");
+                                        }
+                                        const uint32_t a0 = (armAt & 0x1FFFFFFFu) & ~0xFu;
+                                        g_ps2WatchAll.store(1u, std::memory_order_relaxed);
+                                        g_ps2WatchHi.store(a0 + 16u, std::memory_order_relaxed);
+                                        g_ps2WatchLo.store(a0, std::memory_order_relaxed);
+                                        ++s_rarmed;
+                                        std::fprintf(stderr, "[raysrc] write-watch ARMED #%d on qword 0x%08x..0x%08x (XYZF2 of v%d at 0x%08x)\n", s_rarmed, a0, a0 + 16u, firstClamped, armAt);
+                                    }
+                                    ++s_rn;
+                                    off += 16u * 5u;   // skip the rest of this triangle's data (6 data qwords total)
+                                }
+                            }
+                        }
+                        {   // [wispsrc] PS2X_WISPSRC=<tbp>: CHAIN-path segments that bind a PSMT8 64x64
+                            // texture at this TBP0 (the aura wisps, REGLIST packets: the TEX0 sits in
+                            // either 64-bit half). Then the first REGLIST RGBAQ slot whose colour bytes
+                            // equal PS2X_WISPRGB (default 0xA95A92) -- its alpha byte (+3) is the value
+                            // that reaches the GS as 0 (2026-09-03). PS2X_WISPSRC_ARM=1 arms the guest
+                            // write-watch on that byte so the EE writer of the next frame backtraces.
+                            static const uint32_t s_wt = [](){ const char *v = std::getenv("PS2X_WISPSRC");
+                                                               return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
+                            static const uint32_t s_wrgb = [](){ const char *v = std::getenv("PS2X_WISPRGB");
+                                                                 return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 0xA95A92u; }();
+                            static const bool s_warm = [](){ const char *v = std::getenv("PS2X_WISPSRC_ARM");
+                                                             return v && v[0] && v[0] != '0'; }();
+                            static int s_wn = 0;
+                            if (s_wt && src < maxSz2 && bytes <= maxSz2 - src)
+                            {
+                                const uint8_t *pw = base2 + src;
+                                // REGLIST RGBAQ slot: R bits 0-7, G 8-15, B 16-23, A 24-31 -- the low 24 bits
+                                // read as an integer are exactly gsparse's rgbaq&0xFFFFFF (0xA95A92 here).
+                                const uint32_t rgbLe = s_wrgb;
+                                for (uint32_t off = 0; off + 16 <= bytes; off += 16)
+                                {
+                                    uint64_t h2[2]; std::memcpy(h2, pw + off, 16);
+                                    int hit = -1;
+                                    for (int k = 0; k < 2; ++k)
+                                        if ((h2[k] & 0x3FFFull) == s_wt && ((h2[k] >> 20) & 0x3Full) == 19ull && ((h2[k] >> 26) & 0xFull) == 6ull) hit = k;
+                                    if (hit < 0) continue;
+                                    uint32_t aAddr = 0u, aVal = 0u;
+                                    for (uint32_t o2 = off; o2 + 16 <= bytes && o2 < off + 16u * 64u && !aAddr; o2 += 16)
+                                    {
+                                        uint64_t v2[2]; std::memcpy(v2, pw + o2, 16);
+                                        for (int k = 0; k < 2; ++k)
+                                            if ((uint32_t)(v2[k] & 0xFFFFFFull) == rgbLe) { aAddr = srcAddr + o2 + (uint32_t)k * 8u + 3u; aVal = (uint32_t)((v2[k] >> 24) & 0xFFull); break; }
+                                    }
+                                    const bool show = s_wn < 20 || (s_wn % 30) == 0;   // unbounded detections, rate-limited prints
+                                    if (show)
+                                        std::fprintf(stderr, "[wispsrc] #%d TEX0 tbp=%u (%s half) at guest 0x%08x (seg 0x%08x+%u len %u scratch=%d) alphaByte@0x%08x=%u\n",
+                                                     s_wn, s_wt, hit ? "hi" : "lo", srcAddr + off, srcAddr, off, bytes, scratch ? 1 : 0, aAddr, aVal);
+                                    // [wispsrc] BUILD-BUFFER SCAN (PS2X_WISPSRC_SCAN=1): the arena copy is
+                                    // memcpy'd from wherever the EE builds the quad, so search all of guest
+                                    // RAM for another copy of this quad's first 64 bytes (tag + PRIM/TEX0 +
+                                    // 2 register pairs, unique per frame) and arm the watch THERE instead --
+                                    // that is where the vertex alpha is written.
+                                    static const bool s_wscan = [](){ const char *v = std::getenv("PS2X_WISPSRC_SCAN");
+                                                                      return v && v[0] && v[0] != '0'; }();
+                                    static int s_scanN = 0;
+                                    uint32_t armAt = aAddr;
+                                    if (s_wscan && s_scanN < 6 && off >= 16u && off + 64u <= bytes && !scratch)
+                                    {
+                                        const uint8_t *needle = pw + off - 16u;
+                                        const uint8_t *hay = base2; const size_t hayN = maxSz2;
+                                        int found = 0;
+                                        for (size_t q = 0; q + 64u <= hayN; q += 16)
+                                        {
+                                            if (hay + q == needle) continue;
+                                            if (std::memcmp(hay + q, needle, 64) != 0) continue;
+                                            ++found;
+                                            const uint32_t addr = (uint32_t)q;
+                                            std::fprintf(stderr, "[wispsrc] SCAN copy of quad @0x%08x found at guest 0x%08x (RGBAQ slot 0x%08x)\n",
+                                                         srcAddr + off - 16u, addr, addr + 48u);
+                                            if (found == 1 && addr + 48u + 3u == (uint32_t)(addr + 51u)) armAt = addr + 48u + 3u;
+                                            if (found >= 4) break;
+                                        }
+                                        if (!found) std::fprintf(stderr, "[wispsrc] SCAN no other copy of the quad in RAM (built in place or in a dead stack frame)\n");
+                                        ++s_scanN;
+                                    }
+                                    // RE-ARM on every detection: the DMA arena is a ring, so the segment
+                                    // moves every frame; the watch must follow the CURRENT slot (or the
+                                    // build buffer found by the scan, which is stable).
+                                    if (s_warm && armAt && !scratch && !(s_wscan && armAt == aAddr && s_scanN > 1 && g_ps2WatchLo.load(std::memory_order_relaxed) != 0u))
+                                    {
+                                        aAddr = armAt;
+                                        // The per-store check keys on the store's START address, so a
+                                        // 64/128-bit store of the whole RGBAQ slot/qword would miss a
+                                        // 1-byte window: watch the containing 16-byte qword instead.
+                                        const uint32_t a0 = (aAddr & 0x1FFFFFFFu) & ~0xFu;
+                                        g_ps2WatchAll.store(1u, std::memory_order_relaxed);   // keep ZERO-valued writes (the alpha IS 0)
+                                        g_ps2WatchHi.store(a0 + 16u, std::memory_order_relaxed);
+                                        g_ps2WatchLo.store(a0, std::memory_order_relaxed);
+                                        if (show) std::fprintf(stderr, "[wispsrc] write-watch ARMED on qword 0x%08x..0x%08x (alpha byte 0x%08x)\n", a0, a0 + 16u, aAddr);
+                                    }
+                                    ++s_wn; break;   // one arm per segment (its first quad)
+                                }
+                            }
+                        }
                         {   // [palsrc] PS2X_PALSRC=<dbp>: the CHAIN path (the one live BT3 uses).
                             // Scan this tag segment for a BITBLTBUF write to the terrain-palette
                             // block, log its guest address, and (PS2X_PALSRC_ARM=1) arm the guest
@@ -2682,6 +2860,50 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
                         }
                         if (++s_pn >= 40) break;
                     }
+                }
+            }
+        }
+        {   // [wispsrc] PS2X_WISPSRC=<tbp>: guest address of PATH3 packets that bind a PSMT8
+            // 64x64 texture at this TBP0 (the aura wisps: tbp 11172/11196), and of the first
+            // vertex RGBAQ after it whose colour bytes equal PS2X_WISPRGB (default 0xA95A92,
+            // our wisp colour) -- the vertex ALPHA byte that arrives as 0 (2026-09-03).
+            // PS2X_WISPSRC_ARM=1 arms the guest write-watch on that alpha byte so the EE
+            // writer of the next frame's packet backtraces.
+            static const uint32_t s_wt = [](){ const char *v = std::getenv("PS2X_WISPSRC");
+                                               return v && v[0] ? (uint32_t)std::atoi(v) : 0u; }();
+            static const uint32_t s_wrgb = [](){ const char *v = std::getenv("PS2X_WISPRGB");
+                                                 return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 0xA95A92u; }();
+            static const bool s_warm = [](){ const char *v = std::getenv("PS2X_WISPSRC_ARM");
+                                             return v && v[0] && v[0] != '0'; }();
+            static int s_wn = 0;
+            if (s_wt && s_wn < 40)
+            {
+                const uint8_t *p = m_rdram + srcPhysAddr;
+                for (uint32_t off = 0; off + 16 <= chunk; off += 16)
+                {
+                    uint64_t lo, hi;
+                    std::memcpy(&lo, p + off, 8); std::memcpy(&hi, p + off + 8, 8);
+                    // TEX0 signature: TBP0 == tbp, PSM == PSMT8 (19), TW == 6 (64 texels)
+                    if ((lo & 0x3FFFull) != s_wt || ((lo >> 20) & 0x3Full) != 19ull || ((lo >> 26) & 0xFull) != 6ull) continue;
+                    uint32_t rgbaOff = 0u, aByte = 0u;
+                    for (uint32_t o2 = off + 16; o2 + 16 <= chunk && o2 < off + 16u * 96u; o2 += 16)
+                    {
+                        uint64_t l2, h2;
+                        std::memcpy(&l2, p + o2, 8); std::memcpy(&h2, p + o2 + 8, 8);
+                        const uint32_t r = (uint32_t)(l2 & 0xFFull), g = (uint32_t)((l2 >> 32) & 0xFFull), b = (uint32_t)(h2 & 0xFFull);
+                        if (((r << 16) | (g << 8) | b) == s_wrgb) { rgbaOff = o2; aByte = (uint32_t)((h2 >> 32) & 0xFFull); break; }
+                    }
+                    std::fprintf(stderr, "[wispsrc] #%d TEX0 tbp=%u reg=%#llx at guest %#x (packet %#x+%u len %u) firstRGBAQ=%#x A=%u\n",
+                                 s_wn, s_wt, (unsigned long long)(hi & 0xFFull), srcPhysAddr + off, srcPhysAddr, off, chunk,
+                                 rgbaOff ? srcPhysAddr + rgbaOff : 0u, aByte);
+                    if (s_warm && rgbaOff && g_ps2WatchLo.load(std::memory_order_relaxed) == 0u)
+                    {
+                        const uint32_t a0 = (srcPhysAddr + rgbaOff + 12u) & 0x1FFFFFFFu;
+                        g_ps2WatchHi.store(a0 + 4u, std::memory_order_relaxed);
+                        g_ps2WatchLo.store(a0, std::memory_order_relaxed);
+                        std::fprintf(stderr, "[wispsrc] write-watch ARMED on alpha byte %#x..%#x\n", a0, a0 + 4u);
+                    }
+                    if (++s_wn >= 40) break;
                 }
             }
         }
