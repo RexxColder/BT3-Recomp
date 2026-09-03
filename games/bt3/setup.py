@@ -91,6 +91,14 @@ def find_binary(name: str) -> Path:
     return hits[0]
 
 
+# Windows builds use the Clang toolset of the Visual Studio Build Tools ("C++ Clang Compiler for
+# Windows" + "MSBuild support for LLVM (clang-cl) toolset" in the installer): the static VU1
+# recompiler is computed-goto code and the runtime uses GCC/Clang builtins, which MSVC cannot
+# compile. PS2X_SETUP_TOOLSET overrides (e.g. "v143" to try plain MSVC).
+CMAKE_CONFIGURE_EXTRA = (["-T", os.environ.get("PS2X_SETUP_TOOLSET", "ClangCL")]
+                         if IS_WINDOWS else [])
+
+
 def cmake_build(target: str, jobs: str) -> None:
     cmd = ["cmake", "--build", BUILD, "--target", target, "-j", jobs]
     if IS_WINDOWS:
@@ -140,7 +148,7 @@ def main() -> None:
     #    project files, which makes MSBuild rebuild everything from scratch.
     print("== building recompiler")
     if not (BUILD / "CMakeCache.txt").exists():
-        run(["cmake", "-S", ROOT, "-B", BUILD])
+        run(["cmake", "-S", ROOT, "-B", BUILD] + CMAKE_CONFIGURE_EXTRA)
     cmake_build("ps2_recomp", str(os.cpu_count() or 4))
     recomp = find_binary("ps2_recomp")
 
@@ -192,7 +200,7 @@ def main() -> None:
                 need_cfg = True
                 break
     if need_cfg:
-        run(["cmake", "-S", ROOT, "-B", BUILD])
+        run(["cmake", "-S", ROOT, "-B", BUILD] + CMAKE_CONFIGURE_EXTRA)
     print(f"== building ps2EntryRunner (-j{jobs}, this takes a while)")
     cmake_build("ps2EntryRunner", jobs)
     runner = find_binary("ps2EntryRunner")

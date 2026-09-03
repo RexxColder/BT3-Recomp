@@ -40,7 +40,9 @@ cd BT3-Recomp
 ```
 
 **Windows (experimental):** install [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
-(the "Desktop development with C++" workload, which includes CMake) and Python 3;
+(the "Desktop development with C++" workload, which includes CMake, plus its optional
+components "C++ Clang Compiler for Windows" and "MSBuild support for LLVM (clang-cl) toolset":
+the build needs Clang, MSVC cannot compile the generated VU1 code) and Python 3;
 `tar` for ISO extraction ships with Windows 10+. Then, from a regular terminal:
 
 ```
