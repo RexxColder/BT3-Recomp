@@ -667,6 +667,22 @@ namespace
     // (fbp0/112) allocate at N x native and draw through an rlScalef(N) modelview, so
     // every command keeps native coordinates. All pixel-as-data machinery (masks, ink,
     // writebacks) stays 1x; boundaries downsample.
+    // [forcebilinear] PCSX2-style filter override: sample every texture bilinear even when
+    // the game requests point (BT3 point-samples far-terrain tiles -- pixelated mountains at
+    // high internal res). Mask writers keep point (gate exactness).
+    std::atomic<int> g_forceBilinear{-1};
+    bool ps2xForceBilinear()
+    {
+        int v = g_forceBilinear.load(std::memory_order_relaxed);
+        if (v < 0)
+        {
+            const char *e = std::getenv("PS2X_FORCE_BILINEAR");
+            v = (e && e[0] && e[0] != '0') ? 1 : 0;
+            g_forceBilinear.store(v, std::memory_order_relaxed);
+        }
+        return v != 0;
+    }
+    void ps2xSetForceBilinear(bool v) { g_forceBilinear.store(v ? 1 : 0, std::memory_order_relaxed); }
     int rsN() { return GsGpuRenderer::renderScale(); }   // live: overlay setter or PS2X_RENDERSCALE
     bool rsScaledFbp(uint32_t fbp) { return rsN() > 1 && (fbp == 0u || fbp == 112u); }
     std::unordered_map<unsigned, int> g_rsTexScale;   // texture id -> scale (scaled FBOs only)
@@ -14394,7 +14410,8 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // [datebin] snap binarizes the gate before every gated draw now, so
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
-                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
                     rlBegin(RL_QUADS);
                     for (int k = 0; k < 4; ++k)
@@ -14750,7 +14767,8 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // [datebin] snap binarizes the gate before every gated draw now, so
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
-                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                 rlBegin(RL_QUADS);
                 {   // [emitA] PS2X_CMPWR=1: the vertex alpha actually emitted for the mask composites
                     static const bool s_ea = [](){ const char *v = std::getenv("PS2X_CMPWR"); return v && v[0] && v[0] != '0'; }();
@@ -15196,7 +15214,8 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // [datebin] snap binarizes the gate before every gated draw now, so
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
-                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
                     rlBegin(RL_QUADS);
                     rlColor4ub(255, 255, 255, 255);
@@ -15439,7 +15458,8 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // [datebin] snap binarizes the gate before every gated draw now, so
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
-                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                         rlCheckRenderBatchLimit(4);
                         rlBegin(RL_QUADS);
                         const int qd[4] = {0, 1, 2, 2};
@@ -15495,7 +15515,8 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // [datebin] snap binarizes the gate before every gated draw now, so
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
-                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
             rlCheckRenderBatchLimit(4);
             {   // [region] declared/actual clamp for RT-sourced draws (see uRegion)
                 static int s_locUViz = -2; if (s_locUViz == -2) s_locUViz = GetShaderLocation(g_shader, "uUViz");
@@ -15735,7 +15756,8 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // [datebin] snap binarizes the gate before every gated draw now, so
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
-                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -15779,7 +15801,8 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // [datebin] snap binarizes the gate before every gated draw now, so
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
-                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -15826,7 +15849,8 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // [datebin] snap binarizes the gate before every gated draw now, so
                     // the other squeezed HUD art can sample bilinear again -- point-forcing
                     // everything aliased the HUD at render scale (2x shimmer).
-                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)); rlSetTexture(tex.id);
+                    && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu)
+                    || (ps2xForceBilinear() && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                         rlBegin(RL_QUADS);
                         rlColor4ub(128, 128, 128, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
