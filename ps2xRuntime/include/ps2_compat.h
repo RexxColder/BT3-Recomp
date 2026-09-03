@@ -11,6 +11,13 @@
 #define F_OK 0
 #endif
 static inline int access(const char *path, int mode) { return _access(path, mode); }
+// setenv(name, value, overwrite): _putenv_s always overwrites, so honour the flag by hand.
+#include <cstdlib>
+static inline int setenv(const char *name, const char *value, int overwrite)
+{
+    if (!overwrite && std::getenv(name)) return 0;
+    return _putenv_s(name, value);
+}
 // memmem is a GNU extension; the MSVC CRT does not have it.
 static inline const void *memmem(const void *hay, size_t hn, const void *needle, size_t nn)
 {

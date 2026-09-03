@@ -1,4 +1,5 @@
 #include "ps2_runtime.h"
+#include "ps2_compat.h"
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "games_database.h"
 #if !defined(PLATFORM_VITA)
