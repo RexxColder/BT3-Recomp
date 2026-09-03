@@ -1082,14 +1082,24 @@ namespace ps2_stubs
         setReturnU32(ctx, 0u);
     }
 
+    // The EE libc rand() (newlib): a 64-bit LCG, seed = seed * 6364136223846793005 + 1,
+    // result = (seed >> 32) & 0x7FFFFFFF -- RAND_MAX is 0x7FFFFFFF, not 0x7FFF. BT3 turns
+    // rand() into fractions by dividing by 2147483520.0 (~2^31), so the old
+    // `std::rand() & 0x7FFF` made every random fraction in the game ~1e-5: particle
+    // lifetimes collapsed to their base value, and the dash/charge aura wisps (whose alpha
+    // fades in only while a particle is older than the fade window) stayed at alpha 0 --
+    // the missing "lingering aura" (2026-09-03). Same recurrence as the guest's own rand.
+    static uint64_t g_ps2Rand64 = 1ull;
+
     void rand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, std::rand() & 0x7FFF);
+        g_ps2Rand64 = g_ps2Rand64 * 6364136223846793005ull + 1ull;
+        setReturnS32(ctx, static_cast<int32_t>((g_ps2Rand64 >> 32) & 0x7FFFFFFFu));
     }
 
     void srand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        std::srand(getRegU32(ctx, 4));
+        g_ps2Rand64 = getRegU32(ctx, 4);
         setReturnS32(ctx, 0);
     }
 
