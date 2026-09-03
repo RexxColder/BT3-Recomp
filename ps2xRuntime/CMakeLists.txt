@@ -94,6 +94,18 @@ else()
         string(REGEX REPLACE "#define[ \t]+MAX_GAMEPADS[ \t]+4"
                              "#define MAX_GAMEPADS                   16" _rl_cfg "${_rl_cfg}")
         file(WRITE "${raylib_SOURCE_DIR}/src/config.h" "${_rl_cfg}")
+    # [ps2x raylib patch] the PATCH_COMMAND above only runs when FetchContent populates the source; a build
+    # directory populated before the patch existed still needs it. Idempotent: apply only if not applied.
+    execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --reverse --check --quiet "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch"
+                    RESULT_VARIABLE _rl_patched OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _rl_patched EQUAL 0)
+        execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --ignore-whitespace "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch"
+                        RESULT_VARIABLE _rl_apply)
+        if(NOT _rl_apply EQUAL 0)
+            message(FATAL_ERROR "raylib ps2x patch failed to apply to ${raylib_SOURCE_DIR}")
+        endif()
+        message(STATUS "raylib ps2x patch applied to ${raylib_SOURCE_DIR}")
+    endif()
     endif()
 
     FetchContent_Declare(
