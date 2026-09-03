@@ -313,7 +313,7 @@ namespace ps2_stubs
             const bool nativeOk = native.isAvailable() && nativeGamepadMatches(pads, native);
 #else
             const bool nativeOk = false;
-            struct { template <class T> bool isButtonDown(T) const { return false; } template <class T> float getAxis(T) const { return 0.0f; } } native;   // no evdev here
+            struct { bool isButtonDown(int) const { return false; } float getAxis(int) const { return 0.0f; } } native;   // no evdev here (a local class cannot hold member templates)
 #endif
             auto mergeAxis = [&](int pad, int axis, float &dst)
             {
