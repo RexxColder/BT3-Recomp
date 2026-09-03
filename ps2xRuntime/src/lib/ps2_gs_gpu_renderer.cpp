@@ -100,6 +100,20 @@ extern "C" void glGetTexParameteriv(unsigned int target, unsigned int pname, int
 extern "C" void glUniform1i(int location, int v0);
 extern "C" void glUniform1f(int location, float v0);
 extern "C" void glViewport(int x, int y, int w, int h);
+// [forcebilinear] PCSX2-style filter override (global linkage: the overlay calls the setter)
+static std::atomic<int> g_forceBilinear{-1};
+bool ps2xForceBilinear()
+{
+    int v = g_forceBilinear.load(std::memory_order_relaxed);
+    if (v < 0)
+    {
+        const char *e = std::getenv("PS2X_FORCE_BILINEAR");
+        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+        g_forceBilinear.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+void ps2xSetForceBilinear(bool v) { g_forceBilinear.store(v ? 1 : 0, std::memory_order_relaxed); }
 static RenderTexture2D g_gaViewTex[2];         // [gpualias] ping-pong CT16 view of the chain output
 uint32_t g_gaClutData[256];                    // [gpualias] SW-chain palette snapshot (guest writes)
 std::atomic<unsigned> g_gaClutSeq{0};
@@ -670,19 +684,7 @@ namespace
     // [forcebilinear] PCSX2-style filter override: sample every texture bilinear even when
     // the game requests point (BT3 point-samples far-terrain tiles -- pixelated mountains at
     // high internal res). Mask writers keep point (gate exactness).
-    std::atomic<int> g_forceBilinear{-1};
-    bool ps2xForceBilinear()
-    {
-        int v = g_forceBilinear.load(std::memory_order_relaxed);
-        if (v < 0)
-        {
-            const char *e = std::getenv("PS2X_FORCE_BILINEAR");
-            v = (e && e[0] && e[0] != '0') ? 1 : 0;
-            g_forceBilinear.store(v, std::memory_order_relaxed);
-        }
-        return v != 0;
-    }
-    void ps2xSetForceBilinear(bool v) { g_forceBilinear.store(v ? 1 : 0, std::memory_order_relaxed); }
+
     int rsN() { return GsGpuRenderer::renderScale(); }   // live: overlay setter or PS2X_RENDERSCALE
     bool rsScaledFbp(uint32_t fbp) { return rsN() > 1 && (fbp == 0u || fbp == 112u); }
     std::unordered_map<unsigned, int> g_rsTexScale;   // texture id -> scale (scaled FBOs only)
