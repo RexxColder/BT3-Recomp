@@ -2,6 +2,7 @@
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+#include "ps2_compat.h"
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_guestprof.h"
 #include <mutex>
