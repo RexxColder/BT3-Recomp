@@ -21,6 +21,12 @@ endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# The runtime reads its knobs with getenv/fopen/sscanf; the MSVC CRT flags every call as "unsafe" and the
+# Windows build log becomes unreadable (dozens of notes per file). Same code, same semantics -- silence it.
+if(WIN32)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+endif()
+
 option(PS2X_BUILD_RECOMP "Build ps2xRecomp" ON)
 option(PS2X_BUILD_RUNTIME "Build ps2xRuntime" ON)
 option(PS2X_BUILD_ANALYZER "Build ps2xAnalyzer" ON)

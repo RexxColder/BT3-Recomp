@@ -292,11 +292,17 @@ extern "C" void glEnable(unsigned cap);
 // put a texture barrier between the two.
 static uint32_t g_lastSampledFboTex = 0;
 static uint32_t g_lastRenderedFboTex = 0;   // [texbarrier] texture of the FBO most recently bound for rendering
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) void *__stdcall wglGetProcAddress(const char *);   // opengl32.dll (raylib links it); no <windows.h>: it collides with raylib's names
+static void *ps2xGlProc(const char *name) { return (void *)wglGetProcAddress(name); }
+#else
 #include <dlfcn.h>
+static void *ps2xGlProc(const char *name) { return dlsym(RTLD_DEFAULT, name); }
+#endif
 static void ps2xTextureBarrier()
 {
     typedef void (*PFN)(void);
-    static PFN p = [](){ void *f = dlsym(RTLD_DEFAULT, "glTextureBarrier"); if (!f) f = dlsym(RTLD_DEFAULT, "glTextureBarrierNV"); return reinterpret_cast<PFN>(f); }();
+    static PFN p = [](){ void *f = ps2xGlProc("glTextureBarrier"); if (!f) f = ps2xGlProc("glTextureBarrierNV"); return reinterpret_cast<PFN>(f); }();
     if (p) p(); else glFinish();
 }
 extern "C" void glTexParameteri(unsigned int target, unsigned int pname, int param);
@@ -5660,14 +5666,22 @@ void GsGpuRenderer::swapFrame()
     g_gsGuestSwapCount.fetch_add(1, std::memory_order_relaxed);
     {   // [guestbusy] the guest thread's CPU time per published frame (the game paces in whole vsyncs, so the fps counter
         // hides everything between 33 and 50 ms; this is the number that says how far the frame is from 30 fps)
+#if defined(_WIN32)
+        const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();   // no per-thread CPU clock without <windows.h>: wall time stands in
+#else
         struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
         const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
         static uint64_t s_last = 0;
         if (s_last) { g_guestBusyNs.fetch_add(now - s_last, std::memory_order_relaxed); g_guestBusyFrames.fetch_add(1, std::memory_order_relaxed); }
         s_last = now;
         {   // [guestwall] wall clock twin: CPU-vs-wall gap = time BLOCKED (barriers, publish waits)
+#if defined(_WIN32)
+            const uint64_t noww = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#else
             struct timespec tw; clock_gettime(CLOCK_MONOTONIC, &tw);
             const uint64_t noww = (uint64_t)tw.tv_sec * 1000000000ull + (uint64_t)tw.tv_nsec;
+#endif
             static uint64_t s_lastW = 0;
             extern std::atomic<uint64_t> g_guestWallNs;
             if (s_lastW) g_guestWallNs.fetch_add(noww - s_lastW, std::memory_order_relaxed);
