@@ -4,6 +4,14 @@ check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
 
 function(EnableFastReleaseMode TargetName)
     message("> Enabling optimization for: ${TargetName}")
+    # clang-cl (the toolset the Windows build uses, see games/bt3/setup.py) reports MSVC=TRUE but does not
+    # accept MSVC's /Qspectre- and /GL (whole-program LTCG), and its LTO objects need lld-link: give it the
+    # plain optimization subset and no LTO, like the GCC/Clang builds on Linux.
+    if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_compile_options(${TargetName} PRIVATE
+            $<$<CONFIG:Release>:/O2 /Ob2 /Oi /Gy /Gw /GF /fp:fast /DNDEBUG /arch:AVX2 /GS->)
+        return()
+    endif()
     if(MSVC)
         target_compile_options(${TargetName} PRIVATE
             $<$<CONFIG:Release>:
