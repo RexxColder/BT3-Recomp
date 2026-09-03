@@ -266,10 +266,10 @@ static void glBlendColor(float red, float green, float blue, float alpha)
 }
 #else
 extern "C" void glBlendColor(float red, float green, float blue, float alpha);
+#endif
 extern "C" unsigned ps2xVramDiffOutside(uint32_t, uint32_t, uint32_t, int, int, const uint32_t *, int, int, int, int, int *, int *, int *, int *);   // [flushrectchk]
 extern "C" void *ps2xGuestWaitBegin();   // [barblock] ps2_runtime.cpp
 extern "C" void ps2xGuestWaitEnd(void *);
-#endif
 extern "C" void glBindTexture(unsigned int target, unsigned int texture);
 extern "C" void glScissor(int x, int y, int width, int height);
 extern "C" void glBindFramebuffer(unsigned target, unsigned framebuffer);   // [decalsync 3]
