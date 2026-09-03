@@ -4,6 +4,15 @@
 #if defined(__linux__)
 #include "runtime/pad_evdev_linux.h"
 #endif
+#if !defined(__linux__)
+struct PadEvdevStub   // stands in for PadEvdevLinux where there is no evdev: never available, reads nothing
+{
+    bool isAvailable() const { return false; }
+    bool matchesName(const char *) const { return false; }
+    float getAxis(int) const { return 0.0f; }
+    bool isButtonDown(int) const { return false; }
+};
+#endif
 
 #include <cstring>
 #include <cstdio>
@@ -313,7 +322,7 @@ namespace ps2_stubs
             const bool nativeOk = native.isAvailable() && nativeGamepadMatches(pads, native);
 #else
             const bool nativeOk = false;
-            struct { bool isButtonDown(int) const { return false; } float getAxis(int) const { return 0.0f; } } native;   // no evdev here (a local class cannot hold member templates)
+            static const PadEvdevStub native;   // no evdev here
 #endif
             auto mergeAxis = [&](int pad, int axis, float &dst)
             {
@@ -925,6 +934,7 @@ namespace ps2_stubs
         const bool nativeOk = native.isAvailable() && nativeGamepadMatches(pads, native);
 #else
         const bool nativeOk = false;
+        static const PadEvdevStub native;   // no evdev here
 #endif
 
         // Buttons.
