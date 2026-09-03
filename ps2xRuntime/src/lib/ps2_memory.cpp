@@ -25,16 +25,7 @@ bool g_kickSrcMapEnabled()
 #include <cmath>
 #include <stdexcept>
 #include <algorithm>
-#if defined(_WIN32)
-static const void *memmem(const void *hay, size_t hn, const void *needle, size_t nn)   // GNU extension, absent from the MSVC CRT
-{
-    if (nn == 0) return hay;
-    if (hn < nn) return nullptr;
-    const unsigned char *h = (const unsigned char *)hay, *n = (const unsigned char *)needle;
-    const unsigned char *r = std::search(h, h + hn, n, n + nn);
-    return r == h + hn ? nullptr : (const void *)r;
-}
-#endif
+#include "ps2_compat.h"
 #include <string>
 #include <vector>
 #include <map>

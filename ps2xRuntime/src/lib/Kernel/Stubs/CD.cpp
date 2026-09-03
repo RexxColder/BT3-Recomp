@@ -1,4 +1,5 @@
 #include <cstring>
+#include "ps2_compat.h"
 #include <atomic>
 #include <cstdio>
 #include "Common.h"
