@@ -5884,6 +5884,50 @@ uint64_t GsGpuRenderer::recordedThisSecond()
     return d;
 }
 
+
+#if defined(_WIN32)
+// [wingl] opengl32.dll exports GL 1.1 only; every newer entry point this file calls directly is resolved from the
+// driver (raylib's GLAD loader is private to rcore). Same names and signatures as the Linux libGL exports, so the
+// rest of the file is unchanged. Resolved eagerly on the GL thread in ensureGl (wglGetProcAddress needs a current
+// context), with a lazy retry at call time as a fallback.
+namespace wingl
+{
+    static void *get(const char *name) { return (void *)wglGetProcAddress(name); }
+}
+#define PS2X_WINGL(name, params, args)                                                                  \
+    static void (*p_##name) params = nullptr;                                                           \
+    extern "C" void name params                                                                          \
+    {                                                                                                    \
+        if (!p_##name) p_##name = reinterpret_cast<void (*) params>(wingl::get(#name));                  \
+        if (p_##name) p_##name args;                                                                     \
+    }
+PS2X_WINGL(glBindFramebuffer, (unsigned target, unsigned framebuffer), (target, framebuffer))
+PS2X_WINGL(glBlitFramebuffer, (int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1, unsigned mask, unsigned filter), (sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter))
+PS2X_WINGL(glActiveTexture, (unsigned int texture), (texture))
+PS2X_WINGL(glGetUniformiv, (unsigned int program, int location, int *params), (program, location, params))
+PS2X_WINGL(glGetUniformfv, (unsigned program, int location, float *params), (program, location, params))
+PS2X_WINGL(glGenQueries, (int n, unsigned int *ids), (n, ids))
+PS2X_WINGL(glBeginQuery, (unsigned int target, unsigned int id), (target, id))
+PS2X_WINGL(glEndQuery, (unsigned int target), (target))
+PS2X_WINGL(glGetQueryObjectuiv, (unsigned int id, unsigned int pname, unsigned int *params), (id, pname, params))
+PS2X_WINGL(glGetFramebufferAttachmentParameteriv, (unsigned target, unsigned attachment, unsigned pname, int *params), (target, attachment, pname, params))
+PS2X_WINGL(glGenVertexArrays, (int n, unsigned int *arrays), (n, arrays))
+PS2X_WINGL(glUseProgram, (unsigned int program), (program))
+PS2X_WINGL(glUniform1i, (int location, int v0), (location, v0))
+PS2X_WINGL(glUniform1f, (int location, float v0), (location, v0))
+PS2X_WINGL(glBindVertexArray, (unsigned int array), (array))
+#undef PS2X_WINGL
+static void ps2xWinGlResolve()
+{
+#define R(name) if (!p_##name) p_##name = reinterpret_cast<decltype(p_##name)>(wingl::get(#name));
+    R(glBindFramebuffer) R(glBlitFramebuffer) R(glActiveTexture) R(glGetUniformiv) R(glGetUniformfv) R(glGenQueries)
+    R(glBeginQuery) R(glEndQuery) R(glGetQueryObjectuiv) R(glGetFramebufferAttachmentParameteriv) R(glGenVertexArrays)
+    R(glUseProgram) R(glUniform1i) R(glUniform1f) R(glBindVertexArray)
+#undef R
+}
+#else
+static void ps2xWinGlResolve() {}
+#endif
 void GsGpuRenderer::ensureGl(int w, int h)
 {
     m_fboW = w;
@@ -5997,6 +6041,7 @@ void GsGpuRenderer::ensureGl(int w, int h)
         std::fprintf(stderr, "[shader] g_shader id=%u uBrightLoc=%d bright=%.3f atstLoc=%d arefLoc=%d | uPal=%d uIdxMode=%d uIdxScale=%d uFba=%d uTexa=%d\n", g_shader.id, loc, bright, g_locAtst, g_locAref, g_locPal, g_locIdxMode, g_locIdxScale, g_locFba, g_locTexa);
         g_shaderInit = true;
     }
+    ps2xWinGlResolve();   // [wingl] on the GL thread, context current
     m_glInit = true;
     g_glTidHash.store(std::hash<std::thread::id>{}(std::this_thread::get_id()),
                       std::memory_order_relaxed);
