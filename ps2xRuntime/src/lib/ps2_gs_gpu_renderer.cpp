@@ -205,7 +205,16 @@ int  GsGpuRenderer::renderScale()
     }
     return v;
 }
-void GsGpuRenderer::setRenderScale(int s)  { if (s < 1) s = 1; if (s > 4) s = 4; g_uiRenderScale.store(s); }
+namespace { std::atomic<int> g_uiRenderScalePending{-1}; }
+void GsGpuRenderer::setRenderScale(int s)
+{   // [rscale] live changes are DEFERRED to the frame top: applying mid-frame recreated
+    // buffers between draws of one frame (wiped half-drawn content, stale snapshots/latch
+    // -- "switching live breaks everything"). The pending value lands atomically there.
+    if (s < 1) s = 1; if (s > 4) s = 4;
+    g_uiRenderScalePending.store(s);
+    if (g_uiRenderScale.load(std::memory_order_relaxed) < 0)
+        g_uiRenderScale.store(s);   // first-time init (startup INI apply) may take effect at once
+}
 void GsGpuRenderer::setEnabled(bool v)     { g_uiGpu.store(v ? 1 : 0); }
 namespace { std::atomic<int> g_uiOutline{-1}, g_uiShadows{-1}; }
 bool GsGpuRenderer::outlineEnabled()       { return uiFlag(g_uiOutline, "PS2X_OUTLINE", true); }
@@ -5878,6 +5887,34 @@ void GsGpuRenderer::ensureGl(int w, int h)
 
 unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
 {
+    {   // [rscale] apply a pending Internal Resolution change at the frame boundary:
+        // swap the live value, drop both scene FBOs + their snapshots + the latch in one
+        // step so the whole frame renders into consistent fresh buffers.
+        const int pend = g_uiRenderScalePending.load(std::memory_order_relaxed);
+        if (pend >= 1 && pend != renderScale())
+        {
+            g_uiRenderScale.store(pend, std::memory_order_relaxed);
+            for (uint32_t sfbp : {0u, 112u})
+            {
+                auto it = g_fbos.find(sfbp);
+                if (it != g_fbos.end() && it->second.rt.texture.id != 0)
+                {
+                    g_rsTexScale.erase(it->second.rt.texture.id);
+                    g_rsTexFbo.erase(it->second.rt.texture.id);
+                    ps2xForgetRtTexId(it->second.rt.texture.id);
+                    UnloadRenderTexture(it->second.rt);
+                    if (it->second.stag.texture.id != 0) { ps2xForgetTexId(it->second.stag.texture.id); UnloadRenderTexture(it->second.stag); it->second.stag = RenderTexture2D{}; }
+                    it->second.rt = RenderTexture2D{}; it->second.scale = 1;
+                }
+                auto sit = g_rtSnap.find(sfbp);
+                if (sit != g_rtSnap.end() && sit->second.texture.id != 0)
+                { ps2xForgetTexId(sit->second.texture.id); UnloadRenderTexture(sit->second); sit->second = RenderTexture2D{}; g_rtSnapSeq[sfbp] = 0xFFFFFFFFu; }
+            }
+            if (g_frontLatch.rt.texture.id != 0)
+            { ps2xForgetRtTexId(g_frontLatch.rt.texture.id); UnloadRenderTexture(g_frontLatch.rt); g_frontLatch = Fbo{}; g_frontLatchValid = false; }
+            std::fprintf(stderr, "[rscale] live switch applied at frame top: %d\n", pend);
+        }
+    }
     {   // [deferdec] no render may pass an unserviced decode command: service them first, each one
         // splitting the segment at its position (the barrier path's renderRange used to walk straight
         // through queued decodes -> the draws behind them rendered against an empty placeholder).
