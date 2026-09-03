@@ -7824,10 +7824,16 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (lit == g_fbos.end() || lit->second.rt.texture.id == 0) return;
         endMode();
         const int cw = lit->second.w, ch = lit->second.h;
-        if (g_frontLatch.w != cw || g_frontLatch.h != ch || g_frontLatch.rt.texture.id == 0)
+        // [latchsync] FIXED-size latch: the two scene buffers differ in height (448 vs 512),
+        // so sizing the latch per-source recreated it EVERY frame with alternating geometry
+        // -- an alternating resample phase = the 2x ground shimmer (user: "merge them in
+        // sync"). One constant 512x512(xscale) latch; both buffers copy into the top rows
+        // identically; the present crops by dispW/H normalized against the fixed dims.
+        const int LW = 512, LH = 512, ls = std::max(1, lit->second.scale);
+        if (g_frontLatch.w != LW || g_frontLatch.h != LH || g_frontLatch.scale != ls || g_frontLatch.rt.texture.id == 0)
         {
             if (g_frontLatch.rt.texture.id != 0) { ps2xForgetRtTexId(g_frontLatch.rt.texture.id); UnloadRenderTexture(g_frontLatch.rt); }
-            g_frontLatch.rt = LoadRenderTexture(cw, ch); g_frontLatch.w = cw; g_frontLatch.h = ch;
+            g_frontLatch.rt = LoadRenderTexture(LW * ls, LH * ls); g_frontLatch.w = LW; g_frontLatch.h = LH; g_frontLatch.scale = ls;
             SetTextureFilter(g_frontLatch.rt.texture, TEXTURE_FILTER_POINT);
         }
         BeginTextureMode(g_frontLatch.rt);
@@ -7836,7 +7842,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         rlDisableColorBlend();
         DrawTexturePro(lit->second.rt.texture,
                        Rectangle{0, 0, (float)(cw * lit->second.scale), -(float)(ch * lit->second.scale)},   // [rscale] physical src
-                       Rectangle{0, 0, (float)cw, (float)ch}, Vector2{0, 0}, 0.0f, WHITE);
+                       Rectangle{0, 0, (float)(cw * ls), (float)(ch * ls)}, Vector2{0, 0}, 0.0f, WHITE);
         rlDrawRenderBatchActive();
         rlEnableColorBlend();
         // Diag: dump the latch content itself (1st + 100th latch) + per-second count. If
@@ -16087,6 +16093,21 @@ if (done.size() < 14 && !done.count(c.texKey))
                                  s_call, a0, a112, s_seen0, s_seen112, dblActive ? 1 : 0, displayFbp);
                     std::fflush(f);
                 }
+            }
+            {   // [pinfbp] live A/B lever for the shimmer hunt: /tmp/ps2x_pinfbp containing
+                // 0 or 112 pins the presented buffer. If the f0/f112 alternation carries a
+                // sub-pixel phase difference, pinning kills the shimmer instantly.
+                static int s_pinCache = -2; static std::chrono::steady_clock::time_point s_pinT{};
+                const auto nowP = std::chrono::steady_clock::now();
+                if (s_pinCache == -2 || std::chrono::duration<double>(nowP - s_pinT).count() > 0.25)
+                {
+                    s_pinT = nowP; s_pinCache = -1;
+                    if (FILE *pf = std::fopen("/tmp/ps2x_pinfbp", "r"))
+                    { int v = -1; if (std::fscanf(pf, "%d", &v) == 1) s_pinCache = v; std::fclose(pf); }
+                }
+                if ((s_pinCache == 0 || s_pinCache == 112) && g_fbos.count((uint32_t)s_pinCache)
+                    && g_fbos[(uint32_t)s_pinCache].rt.texture.id != 0)
+                { displayFbp = (uint32_t)s_pinCache; presentLatch = false; }
             }
         }
     }
