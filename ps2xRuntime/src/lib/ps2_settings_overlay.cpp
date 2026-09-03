@@ -462,6 +462,8 @@ void PS2SettingsOverlay::loadSettings()
                     m_settings.windowW = std::atoi(val.c_str());
                 else if (key == "window_h")
                     m_settings.windowH = std::atoi(val.c_str());
+                else if (key == "force_bilinear")
+                    m_settings.forceBilinear = (val == "1" || val == "true");
                 else if (key == "hud_layout")
                     m_settings.hudLayout = std::atoi(val.c_str());
                 else if (key == "hud_off_l")
@@ -578,6 +580,7 @@ void PS2SettingsOverlay::saveSettings() const
     file << "fullscreen=" << (m_settings.fullscreen ? "1" : "0") << "\n";
     file << "window_w=" << m_settings.windowW << "\n";
     file << "window_h=" << m_settings.windowH << "\n";
+    file << "force_bilinear=" << (m_settings.forceBilinear ? "1" : "0") << "\n";
     file << "hud_layout=" << m_settings.hudLayout << "\n";
     file << "hud_off_l=" << m_settings.hudOffL << "\n";
     file << "hud_off_c=" << m_settings.hudOffC << "\n";
@@ -664,6 +667,7 @@ void PS2SettingsOverlay::applySettings()
     GsGpuRenderer::setShadows(m_settings.shadows);
     GsGpuRenderer::setDofBlur(m_settings.dofBlur);
     GsGpuRenderer::setDofZFar(m_settings.dofZFar);
+    { extern void ps2xSetForceBilinear(bool); ps2xSetForceBilinear(m_settings.forceBilinear); }
     pushHudLayout(m_settings);
     applyDeadzone();
 
@@ -1150,6 +1154,15 @@ void PS2SettingsOverlay::drawVideoTab()
     sectionHeader("FILTERING");
     if (toggleSwitch("Bilinear Filter", &m_settings.bilinear))
         m_dirty = true;
+    {   // PCSX2-style forced filtering: smooth even textures the game point-samples
+        // (far-terrain tiles -- the pixelated mountains at high internal resolution).
+        extern void ps2xSetForceBilinear(bool);
+        if (toggleSwitch("Force Filtering (smooth terrain)", &m_settings.forceBilinear))
+        {
+            ps2xSetForceBilinear(m_settings.forceBilinear);
+            m_dirty = true;
+        }
+    }
 
     // Display
     sectionHeader("DISPLAY");
