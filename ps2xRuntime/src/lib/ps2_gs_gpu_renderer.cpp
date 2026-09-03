@@ -760,10 +760,14 @@ namespace
             if (w < f.w) w = f.w;
             if (h < f.h) h = f.h;
         }
-        if (f.w != w || f.h != h || f.rt.texture.id == 0)
+        const int rsWant = rsScaledFbp(fbp) ? rsN() : 1;
+        if (f.w != w || f.h != h || f.rt.texture.id == 0
+            || f.scale != rsWant)   // [rscale] live scale change must recreate (early-return
+                                    // checked scale, this condition did not -> the dropdown
+                                    // was a no-op until reboot)
         {
             if (f.rt.texture.id != 0) { g_rsTexScale.erase(f.rt.texture.id); ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); }
-            const int rsA = rsScaledFbp(fbp) ? rsN() : 1;
+            const int rsA = rsWant;
             const int wA = w * rsA, hA = h * rsA;
             // PS2X_NODEPTH_RT: create COLOR-ONLY FBOs (no depth renderbuffer). raylib's
             // LoadRenderTexture always attaches a depth renderbuffer; a bad/large depth
