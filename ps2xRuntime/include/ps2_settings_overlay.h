@@ -33,7 +33,7 @@ public:
         bool dofBlur = true;
         int dofZFar = 200000;
         int windowW = 0, windowH = 0; // 0 = keep the default host window size
-        bool forceBilinear = false;   // PCSX2-style forced texture filtering
+        bool forceBilinear = true;    // PCSX2-style forced texture filtering (default ON)
         int hudLayout = 0;            // widescreen HUD: 0=centered 4:3, 1=edge-pinned, 2=custom
         int hudOffL = 0, hudOffC = 0, hudOffR = 0;  // custom layout x-offsets (512-space px)
         // Overlay launch / close binding. Each is a SET of inputs that must ALL be held
