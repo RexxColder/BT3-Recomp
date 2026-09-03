@@ -123,6 +123,8 @@ uint32_t g_gaClutData[256];                    // [gpualias] SW-chain palette sn
 std::atomic<unsigned> g_gaClutSeq{0};
 static unsigned long g_gaExecCount = 0;       // [gpualias] chain passes executed (staleness tracking)
 std::atomic<uint64_t> g_guestBusyNs{0}, g_guestBusyFrames{0};   // [guestbusy] file scope: read by ps2_runtime.cpp
+#include "runtime/ps2_guestprof.h"
+namespace gprof { bool g_on = [](){ const char *v = std::getenv("PS2X_GUESTPROF"); return v && v[0] && v[0] != '0'; }(); std::atomic<uint64_t> g_acc[NPHASE]; thread_local TL t_tl; }   // [guestprof]
 std::atomic<uint64_t> g_guestWallNs{0};   // [guestwall] wall time between publishes (CPU + blocked)
 extern unsigned long g_svcFlushSkip;   // [svcflushseq] defined below
 extern unsigned long g_linFetch, g_linMiss, g_linRefresh;   // [linvram] defined below
@@ -137,8 +139,13 @@ std::unordered_set<uint64_t> g_evictedThisFrame; bool g_evictDrawOn = false; uns
 static std::unordered_set<uint32_t> g_barDirty;  // pages written since their last flush
 struct DirtyRect { float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f; bool full = false; };
 static std::unordered_map<uint32_t, DirtyRect> g_barDirtyRect;   // [flushrect] bbox drawn since the last flush
+static std::atomic<uint32_t> g_barDirtyGen{0};   // [bardedupe] bumped whenever g_barDirty or g_barDirtyRect LOSE entries (recordCmd fast path)
 static void ps2xDirtyAdd(uint32_t fbp, float x0, float y0, float x1, float y1)
-{ DirtyRect &r = g_barDirtyRect[fbp]; r.x0 = std::min(r.x0, x0); r.y0 = std::min(r.y0, y0); r.x1 = std::max(r.x1, x1); r.y1 = std::max(r.y1, y1); }
+{   // [rectcache] caller holds g_barMx; the cached element pointer dies with any erase (g_barDirtyGen bumps under the same lock)
+    static thread_local DirtyRect *s_r = nullptr; static thread_local uint32_t s_fbp = 0xFFFFFFFFu, s_gen = 0;
+    const uint32_t gen = g_barDirtyGen.load(std::memory_order_relaxed);
+    if (!s_r || s_fbp != fbp || s_gen != gen) { s_r = &g_barDirtyRect[fbp]; s_fbp = fbp; s_gen = gen; }
+    DirtyRect &r = *s_r; r.x0 = std::min(r.x0, x0); r.y0 = std::min(r.y0, y0); r.x1 = std::max(r.x1, x1); r.y1 = std::max(r.y1, y1); }
 static void ps2xDirtyFull(uint32_t fbp) { g_barDirtyRect[fbp].full = true; }
 static std::unordered_set<uint32_t> g_barAlphaStale;   // [bargate2] pages whose LAST flush withheld alpha
 unsigned long g_gateSeen = 0;   // commands the gate census looked at (PS2X_GATESRC)
@@ -1773,7 +1780,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
             {
                 any = true; if (rit->second.full) full = true;
                 u.x0 = std::min(u.x0, rit->second.x0); u.y0 = std::min(u.y0, rit->second.y0); u.x1 = std::max(u.x1, rit->second.x1); u.y1 = std::max(u.y1, rit->second.y1);
-                rit = g_barDirtyRect.erase(rit);
+                rit = g_barDirtyRect.erase(rit); g_barDirtyGen.fetch_add(1, std::memory_order_relaxed);
             }
             else ++rit;
         }
@@ -3181,7 +3188,7 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
                     }
                 }
             }
-            g_barDirty.erase(page);
+            g_barDirty.erase(page); g_barDirtyGen.fetch_add(1, std::memory_order_relaxed);
             // [ddrtdirect] PS2X_DDRTDIRECT (default on, =0 off): a NON-INDEXED read (CT32/24/16) of a page that is itself an
             // FBO-backed frame buffer is served by the draw path straight from the FBO texture in the sync build (its
             // decode is a dummy: fbp368's 128x128 timer plate hashes to one empty texture 3736x). Deferring it makes the
@@ -3245,7 +3252,7 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
         static const bool s_alwaysA = [](){ const char *v = std::getenv("PS2X_BARALWAYSA"); return v && v[0] && v[0] != '0'; }();
         const bool dirty = g_barDirty.count(page) != 0 || flushPendingLocked(page);   // [deferpend] [flushcover]
         if (!dirty && !(wantsAlphaAsData && (s_alwaysA || g_barAlphaStale.count(page)))) return;
-        g_barDirty.erase(page);
+        g_barDirty.erase(page); g_barDirtyGen.fetch_add(1, std::memory_order_relaxed);
     }
     {   // [deferdec] PS2X_DEFERDEC_RIG=1: take the deferred path on the replay too (single-threaded: the
         // decode command is serviced when the frame render reaches it) -- the rig parity test for deferral.
@@ -3322,7 +3329,7 @@ void GsGpuRenderer::seedVramAlpha(uint32_t fbp)
     m_seedAlphaOnce = true;
     flushPageToVram(fbp);
     m_seedAlphaOnce = false;
-    { std::lock_guard<std::mutex> bk(g_barMx); g_barDirty.erase(fbp); }
+    { std::lock_guard<std::mutex> bk(g_barMx); g_barDirty.erase(fbp); g_barDirtyGen.fetch_add(1, std::memory_order_relaxed); }
 }
 
 void GsGpuRenderer::swOutlineBegin(uint32_t fbp)
@@ -4830,6 +4837,7 @@ static bool gaDofMaskPass(uint32_t destFbp)
 
 void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
 {
+    gprof::Scope gpScope(gprof::PUSH);   // [guestprof]
     {   // [wshudsplit] Subdivide HUD triangles at the layout-map breakpoints. The half-HUD
         // backdrops are single 256px-wide quads (x -2..254 / 258..514) with the plaque and
         // pip slots baked into the texture; the execute-time layout map only moves VERTICES,
@@ -5170,18 +5178,31 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
         // pick consume) and raises barrier requests -- side effects entirely independent of the
         // pixels it carries, which is why nine changes to its content, masking, blending,
         // shader, placement and state caches all produced byte-identical output.
+        // [bardedupe] consecutive commands with the same (dest page, source page, z page, depth write) leave g_barDirty
+        // exactly as the previous one did -- the read side already erased+requested (or found nothing), the write side's
+        // inserts are idempotent -- unless someone REMOVED entries in between (g_barDirtyGen). Such a command only needs
+        // the dirty-rect union (still under g_barMx: the GL thread reads the rects there). PS2X_BARDEDUPE=0 disables.
+        static const bool s_bdd = [](){ const char *v = std::getenv("PS2X_BARDEDUPE"); return !(v && v[0] == '0'); }();
+        struct BarLast { uint32_t gen = 0, dest = 0, sp = 0, zbp = 0; bool dw = false, valid = false; };
+        static thread_local BarLast s_barLast;
+        extern uint32_t g_zwbBp;
+        const uint32_t barSp = (c.texKey != 0 && (c.srcTbp0 % 32u) == 0u) ? c.srcTbp0 / 32u : 0xFFFFFFFFu;
+        const bool barFast = s_bdd && s_barLast.valid && s_barLast.gen == g_barDirtyGen.load(std::memory_order_relaxed)
+                             && s_barLast.dest == c.destFbp && s_barLast.sp == barSp && s_barLast.zbp == g_zwbBp && s_barLast.dw == c.depthWrite
+                             && barSp != c.destFbp && barSp != g_zwbBp;   // self-feedback re-dirties the page it reads: keep the full path
+        s_barLast.valid = false;
         if (s_bar && !c.isTransfer && !c.isVramBlit)
         {
             // NOT `srcTbp0 != 0`: address 0 is the SCENE buffer, whose alpha is what the whole
             // mask chain reads. Excluding it meant the one page that matters was never flushed.
             // texKey != 0 already proves a texture is bound, so no address test is needed.
-            if (c.texKey != 0 && (c.srcTbp0 % 32u) == 0u && !(c.srcTbp0 / 32u != c.destFbp && rtReadServedClass(c.srcTbp0 / 32u, c.srcPsm, c.destFbp) && pageRenderedNotUploaded(c.srcTbp0 / 32u)))   // [rtreadskip]
+            if (!barFast && c.texKey != 0 && (c.srcTbp0 % 32u) == 0u && !(c.srcTbp0 / 32u != c.destFbp && rtReadServedClass(c.srcTbp0 / 32u, c.srcPsm, c.destFbp) && pageRenderedNotUploaded(c.srcTbp0 / 32u)))   // [rtreadskip]
             {
                 const uint32_t sp = c.srcTbp0 / 32u;
                 std::lock_guard<std::mutex> bk(g_barMx);
                 if (g_barDirty.count(sp))
                 {
-                    g_barDirty.erase(sp);
+                    g_barDirty.erase(sp); g_barDirtyGen.fetch_add(1, std::memory_order_relaxed);
                     if (std::find(g_barPending.begin(), g_barPending.end(), sp) == g_barPending.end())
                     {
                         g_barPending.push_back(sp); ++g_barReqPushed;
@@ -5217,7 +5238,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
                 // changes to the blit's content, masking, blending and shader all produced
                 // byte-identical output; only removing the command itself changed the frame.)
                 std::lock_guard<std::mutex> bk(g_barMx);
-                g_barDirty.insert(c.destFbp);
+                if (!barFast) g_barDirty.insert(c.destFbp);
                 if (c.isTriangle) { float x0 = c.tri[0].x, y0 = c.tri[0].y, x1 = x0, y1 = y0;
                     for (int vi = 1; vi < 3; ++vi) { x0 = std::min(x0, c.tri[vi].x); x1 = std::max(x1, c.tri[vi].x); y0 = std::min(y0, c.tri[vi].y); y1 = std::max(y1, c.tri[vi].y); }
                     ps2xDirtyAdd(c.destFbp, x0, y0, x1, y1); }
@@ -5227,8 +5248,9 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
                 // never flushed our depth before BT3's alpha-rebuild pass sampled it as PSMZ16
                 // -- that pass then read zeros and wrote zeros over the scene alpha, which is
                 // why PS2X_SWALIAS drove fbp0's alpha to 0%.
-                extern uint32_t g_zwbBp;
-                if (c.depthWrite && g_zwbBp != 0u) g_barDirty.insert(g_zwbBp); ps2xDirtyFull(g_zwbBp);
+                if (!barFast) { if (c.depthWrite && g_zwbBp != 0u) g_barDirty.insert(g_zwbBp); ps2xDirtyFull(g_zwbBp); }
+                s_barLast.gen = g_barDirtyGen.load(std::memory_order_relaxed); s_barLast.dest = c.destFbp; s_barLast.sp = barSp;
+                s_barLast.zbp = g_zwbBp; s_barLast.dw = c.depthWrite; s_barLast.valid = true;   // [bardedupe]
             }
         }
     }
@@ -5246,7 +5268,9 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
                                             return (a && a[0] && a[0] != '0') || (b && b[0] && b[0] != '0'); }();
         if (s_fmtSeed && !c.isTransfer && !c.isVramBlit)
         {
-            FbpFmt &f = g_fbpFmt[c.destFbp];
+            static thread_local FbpFmt *s_lastF = nullptr; static thread_local uint32_t s_lastFbp = 0xFFFFFFFFu;   // [fmtcache] element references stay valid (the map is never erased)
+            if (!s_lastF || s_lastFbp != c.destFbp) { s_lastF = &g_fbpFmt[c.destFbp]; s_lastFbp = c.destFbp; }
+            FbpFmt &f = *s_lastF;
             if (c.destFbw) f.fbw = c.destFbw;
             f.psm  = c.destPsm;
             f.maxX = std::max(f.maxX, c.sx + c.sw);
@@ -5525,6 +5549,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     const uint32_t dst = c.isTransfer ? c.xDstFbp : c.destFbp;
     if (dst < kVramPages && !c.isVramBlit)
     {
+        if (m_fbpRenderSeq[dst] == 0) ++m_renderOnceGen;   // [rectemplate]
         m_fbpRenderSeq[dst] = m_writeSeq;
         m_pageDrawSeq[dst] = ++m_drawSeq;   // see m_drawSeq: catches FBO draws, which no
                                             // upload-based counter can see

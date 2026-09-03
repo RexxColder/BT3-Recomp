@@ -1,6 +1,8 @@
 #include <set>
 #include <unistd.h>
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_guestprof.h"
+#include <mutex>
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
@@ -31,7 +33,8 @@ struct Vif1UnpackRec { uint32_t destQw, cnt, srcGuest, spr; uint64_t frame; };
 extern thread_local Vif1UnpackRec g_unpackRing[32];
 extern thread_local uint32_t g_unpackRingPos;
 extern bool g_unpackRingEnabled();
-std::atomic<uint32_t> g_vu1CodeGen{1u};   // [vucache16] external linkage: bumped by the VIF1 MPG writer (ps2_vif1_interpreter.cpp)
+std::atomic<uint32_t> g_vu1CodeGen{1u};
+std::atomic<uint32_t> g_vu1MpgHi{0u};   // [vu1jit-missdump] end of the latest MPG-uploaded program (bytes)   // [vucache16] external linkage: bumped by the VIF1 MPG writer (ps2_vif1_interpreter.cpp)
 namespace { thread_local const uint8_t *g_curVuCode = nullptr; thread_local uint32_t g_curCodeSize = 0;
             thread_local VU1State g_entryStateShadow{}; }
 
@@ -941,6 +944,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
+    gprof::Scope gpScope(gprof::VU1);   // [guestprof]
     // [vumicro] PS2X_VUMICRO=1: microprogram population -- how many distinct microcodes run, from which entry pcs,
     // how far they reach, and how many ops each burns. Dumps each distinct 16 KB image once to
     // /home/z3/Desktop/bt3/work/vumicro_<hash>.bin (the input of a static VU1 recompiler).
@@ -1043,6 +1047,34 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
         ++s_jitMiss;
         if (s_jitMiss <= 4) std::fprintf(stderr, "[vu1jit] no compiled program for this microcode (gen %u) -- interpreting\n", gen);
+        {   // [vu1jit-missdump] always on: dump the uncompiled image once (the gen_vu1.py input) and report how much runs interpreted
+            static thread_local uint32_t s_mdGen = 0xFFFFFFFFu; static thread_local uint64_t s_mdHash = 0; static thread_local unsigned long s_mdRuns = 0, s_mdRunsAll = 0;
+            static thread_local std::chrono::steady_clock::time_point s_mdT = std::chrono::steady_clock::now();
+            static std::set<uint64_t> s_mdSeen; static std::mutex s_mdMtx;
+            if (gen != s_mdGen)
+            {
+                s_mdGen = gen;
+                uint64_t h = 1469598103934665603ull;
+                for (uint32_t i = 0; i < codeSize; ++i) h = (h ^ vuCode[i]) * 1099511628211ull;
+                s_mdHash = h;
+                std::lock_guard<std::mutex> lk(s_mdMtx);
+                if (s_mdSeen.insert(h).second)
+                {
+                    char path[160]; std::snprintf(path, sizeof path, "/home/z3/Desktop/bt3/work/vumicro_%016llx.bin", (unsigned long long)h);
+                    FILE *f = std::fopen(path, "wb"); if (f) { std::fwrite(vuCode, 1, codeSize, f); std::fclose(f); }
+                    std::fprintf(stderr, "[vu1jit] uncompiled microcode %016llx extent 0x%x (gen %u) %s %s\n", (unsigned long long)h,
+                                 g_vu1MpgHi.load(std::memory_order_relaxed), gen, f ? "dumped to" : "could not write", path);
+                }
+            }
+            ++s_mdRuns; ++s_mdRunsAll;
+            const auto now = std::chrono::steady_clock::now();
+            const double dt = std::chrono::duration<double>(now - s_mdT).count();
+            if (dt >= 5.0)
+            {
+                std::fprintf(stderr, "[vu1jit] uncompiled %016llx: %.0f interpreted runs/s (%lu total)\n", (unsigned long long)s_mdHash, s_mdRuns / dt, s_mdRunsAll);
+                s_mdRuns = 0; s_mdT = now;
+            }
+        }
     }
     // PS2X_VUFASTSTATS: fps is useless for grading this change -- hand-played A/B arms differ in
     // stage, camera and character count, and that workload variance (13% in prims/sec between two

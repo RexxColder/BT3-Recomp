@@ -229,6 +229,17 @@ public:
     // This folds the texel-span content hash into the key: each material version gets its
     // own stable entry (decoded once ever, even for per-frame cycling). Returns the
     // versioned key; needDecode=true when the caller must decode+putTexture under it.
+    uint64_t pageDrawStamp(uint32_t lo, uint32_t hi) const   // [rectemplate] max FBO draw seq over a page span (0 for an empty span)
+    {
+        uint64_t m = 0; if (hi >= kVramPages) hi = kVramPages - 1;
+        for (uint32_t p = lo; p <= hi; ++p) { const uint64_t v = __atomic_load_n(&m_pageDrawSeq[p], __ATOMIC_ACQUIRE); if (v > m) m = v; }
+        return m;
+    }
+    uint64_t recTplEpoch() const   // [rectemplate] everything resolveTextureVersion / rtServedRead read besides GS state
+    {
+        uint64_t e = m_writeSeq; e = (e * 0x9E3779B97F4A7C15ull) ^ m_texCacheEpoch.load(std::memory_order_relaxed);
+        e = (e * 0x9E3779B97F4A7C15ull) ^ m_renderOnceGen; return e;
+    }
     bool fbpRenderedOnce(uint32_t fbp) const { return fbp < kVramPages && m_fbpRenderSeq[fbp] != 0u; }   // [p8twinskip] has GL ever rendered this fbp
     // [rtreadskip] PS2X_RTREADSKIP=<mask>: record-time reads of GL-rendered pages whose replay never touches the VRAM
     // decode -- skip the decode and the barrier request. bit0: PSMT8H mask builds (scene 0/112 -> f224, IDXRT);
@@ -433,6 +444,7 @@ private:
     uint64_t m_drawSeq = 0;                  // monotonically bumped per RECORDED draw
     uint64_t m_pageDrawSeq[kVramPages] = {}; // m_drawSeq of the last draw INTO each page
     uint32_t m_writeSeq = 0;                 // monotonically bumped per VRAM upload
+    uint32_t m_renderOnceGen = 0;            // [rectemplate] bumped when a page is rendered for the first time (fbpRenderedOnce flips)
     uint32_t m_pageSeq[kVramPages] = {};     // last GUEST-upload seq per VRAM page (ROUTING)
     // Content version, bumped by guest uploads AND by our own FBO->VRAM writeback. The cache
     // must re-decode when either changes, but only a GUEST upload may influence srcUploaded --

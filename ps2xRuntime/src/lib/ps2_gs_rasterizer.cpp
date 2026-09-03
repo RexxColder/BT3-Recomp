@@ -1,4 +1,5 @@
 static thread_local int g_subDx0 = 0, g_subDxW = 0;   // [subdecode] decode window of the texture being recorded (0 = whole)
+#include "runtime/ps2_guestprof.h"
 #include <map>
 #include <array>
 #include <set>
@@ -3600,8 +3601,11 @@ bool GSRasterizer::decodeIsDeferrable(uint32_t pm)
            pm == GS_PSM_CT16 || pm == GS_PSM_CT16S || pm == GS_PSM_Z16 || pm == GS_PSM_Z16S;
 }
 
+std::atomic<unsigned long> g_recTplHit{0}, g_recTplMiss{0}, g_recTplWhy[5];   // [rectemplate] read by ps2_runtime.cpp
+
 bool GSRasterizer::recordSpriteGPU(GS *gs)
 {
+    gprof::Scope gpScope(gprof::REC_PRE);   // [guestprof] sub-phases via gprof::mark below
     const auto &ctx = gs->activeContext();
     const bool isSprite = (gs->m_prim.type == GS_PRIM_SPRITE);
     const bool tme = gs->m_prim.tme != 0;
@@ -3796,12 +3800,42 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
 
     // --- shared texture setup: key + one-time detexture to linear RGBA ---
     uint64_t texKey = 0;
+    gprof::mark(gprof::REC_TEX);   // [guestprof]
     int texW = 1, texH = 1;
     // [rawmask] PS2X_RAWMASK=1: alpha-as-data draws (RGB fully masked, alpha open) decode texel
     // alpha RAW. The GS alpha byte they deposit is a palette index downstream (BT3's outline
     // mask chain), and the blend-oriented *255/128 expansion corrupts it -- the fbp224 mask held
     // 253 (= expanded CLUT alpha 127) instead of the per-material IDs console shows (1..24).
     // Scoped: these draws write no RGB, so raw alpha cannot change any visible blending.
+    // [rectemplate] the texture-resolve phase below depends only on GS register state (m_stateGen), the renderer's VRAM
+    // upload / writeback / eviction stamps (recTplEpoch) and the frame number ([zwbwant] stamps once per frame), so
+    // consecutive primitives with identical inputs reuse the previous result. PS2X_RECTPL=0 disables; auto-off when a
+    // feature folds VERTEX data into the key (PS2X_SUBDECODE) or FBO draw seqs into the version (PS2X_FBODIRTY).
+    static const bool s_tplOn = [](){ const char *v = std::getenv("PS2X_RECTPL"); if (v && v[0] == '0') return false;
+                                       const char *a = std::getenv("PS2X_SUBDECODE"); return !(a && a[0] && a[0] != '0'); }();
+    // PS2X_FBODIRTY (a main.cpp default) folds the FBO draw seqs of the texture's source pages into the version check;
+    // those move only when a draw lands in a source page (self-feedback), so the template carries their max (drawStamp).
+    struct RecTpl { bool valid = false; uint32_t gen = 0; uint64_t epoch = 0, frame = 0; uint8_t type = 0; bool tme = false, fst = false; uint64_t texKey = 0; int texW = 1, texH = 1;
+                    uint32_t pageLo = 1, pageHi = 0; uint64_t drawStamp = 0; };
+    uint32_t tplPageLo = 1, tplPageHi = 0;   // empty range unless the body computes a texture footprint
+    static thread_local RecTpl s_tpl;
+    extern std::atomic<uint64_t> g_bt3FrameCount;
+    const uint64_t tplFrame = g_bt3FrameCount.load(std::memory_order_relaxed);
+    bool tplHit = false;
+    if (s_tplOn && s_tpl.valid)
+    {   // miss-reason census (g_recTplWhy: 0 gen, 1 epoch, 2 frame, 3 prim/tme/fst, 4 drawStamp) under PS2X_GUESTPROF=1
+        int why = -1;
+        if (s_tpl.gen != gs->m_stateGen + gs->m_texUploadGen * 0x9E3779B1u) why = 0;   // m_texUploadGen: uploads + the grass VRAM swap
+        else if (s_tpl.epoch != ps2GpuRenderer().recTplEpoch()) why = 1;
+        else if (s_tpl.frame != tplFrame) why = 2;
+        else if (s_tpl.type != (uint8_t)gs->m_prim.type || s_tpl.tme != tme || s_tpl.fst != fst) why = 3;
+        else if (s_tpl.drawStamp != ps2GpuRenderer().pageDrawStamp(s_tpl.pageLo, s_tpl.pageHi)) why = 4;
+        tplHit = (why < 0);
+        if (why >= 0 && gprof::g_on) g_recTplWhy[why].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (tplHit) { texKey = s_tpl.texKey; texW = s_tpl.texW; texH = s_tpl.texH; g_recTplHit.fetch_add(1, std::memory_order_relaxed); }
+    else
+    {
     static bool g_rawAlphaDec_s = false;
     {
         static const bool s_rawMask = [](){ const char *v = std::getenv("PS2X_RAWMASK");
@@ -4145,6 +4179,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         const uint32_t footBytes = static_cast<uint32_t>(texW) * static_cast<uint32_t>(texH) * bpp / 8u;
         const uint32_t texPageLo = tex.tbp0 / 32u;
         const uint32_t texPageHi = texPageLo + (footBytes / 8192u);
+        tplPageLo = texPageLo; tplPageHi = texPageHi;   // [rectemplate]
         {
             // Diagnostic (PS2X_GPU_DIAG): how many texture DECODES + texels/sec, and how
             // many textured prims/sec total -> is the cache thrashing (re-decode churn)?
@@ -4266,8 +4301,11 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             // [dectime] PS2X_DECCENSUS=1: guest-thread wall time spent in inline decodes (incl. the pool wait) and a census by class
             static const bool s_dcs = [](){ const char *v = std::getenv("PS2X_DECCENSUS"); return v && v[0] && v[0] != '0'; }();
             const auto _d0 = s_dcs ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            decodeTexRGBA(gs, src, texW, texH, rawAlphaDec, texKey, subW, rgba);   // [decodefn]
-            r.putTexture(texKey, std::move(rgba), subW, texH, texPageLo, texPageHi);
+            {   // [guestprof] DEC = inline texture decode + the upload hand-off
+                gprof::Scope gpScope(gprof::DEC);
+                decodeTexRGBA(gs, src, texW, texH, rawAlphaDec, texKey, subW, rgba);   // [decodefn]
+                r.putTexture(texKey, std::move(rgba), subW, texH, texPageLo, texPageHi);
+            }
             if (s_dcs)
             {
                 static double s_ms = 0; static unsigned long s_n = 0; static std::map<uint64_t, std::pair<unsigned long, double>> s_m; static auto s_t = std::chrono::steady_clock::now();
@@ -4296,6 +4334,11 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 }
             }
         }
+    }
+        s_tpl.valid = s_tplOn; s_tpl.gen = gs->m_stateGen + gs->m_texUploadGen * 0x9E3779B1u; s_tpl.epoch = ps2GpuRenderer().recTplEpoch(); s_tpl.frame = tplFrame;
+        s_tpl.type = (uint8_t)gs->m_prim.type; s_tpl.tme = tme; s_tpl.fst = fst; s_tpl.texKey = texKey; s_tpl.texW = texW; s_tpl.texH = texH;
+        s_tpl.pageLo = tplPageLo; s_tpl.pageHi = tplPageHi; s_tpl.drawStamp = ps2GpuRenderer().pageDrawStamp(tplPageLo, tplPageHi);
+        g_recTplMiss.fetch_add(1, std::memory_order_relaxed);
     }
 
     const uint32_t tfx = tme ? ctx.tex0.tfx : 0u;
@@ -4357,7 +4400,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         g_zwbZMax = zMax;
     }
     GsGpuRenderer &r = ps2GpuRenderer();
+    gprof::mark(gprof::REC_BUILD);   // [guestprof]
     GsGpuRenderer::DrawCmd cmd{};
+    {   // (a state-part snapshot of the command was tried here: a 500-byte copy costs what the field fill costs -- no gain)
     cmd.texKey = texKey;
     // Destination framebuffer + source texture base: route to per-fbp FBOs and enable
     // render-to-texture (sampling a framebuffer that was rendered to).
@@ -4607,6 +4652,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         }
     }
 
+    }
     if (isSprite)
     {
         // Sprite -> DrawTexturePro quad (src rect in TEXELS; single color from v1).
@@ -5583,6 +5629,8 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
 
 void GSRasterizer::drawSprite(GS *gs)
 {
+    gprof::Scope gpScope(gprof::SW);   // [guestprof]
+    ++gs->m_stateGen;   // [rectemplate] software draws change VRAM
     const GSVertex &v0 = gs->m_vtxQueue[0];
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const auto &ctx = gs->activeContext();
@@ -5737,6 +5785,8 @@ void GSRasterizer::drawSprite(GS *gs)
 
 void GSRasterizer::drawTriangle(GS *gs)
 {
+    gprof::Scope gpScope(gprof::SW);   // [guestprof]
+    ++gs->m_stateGen;   // [rectemplate] software draws change VRAM
     const GSVertex &v0 = gs->m_vtxQueue[0];
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const GSVertex &v2 = gs->m_vtxQueue[2];
@@ -6006,6 +6056,8 @@ void GSRasterizer::drawTriangle(GS *gs)
 
 void GSRasterizer::drawLine(GS *gs)
 {
+    gprof::Scope gpScope(gprof::SW);   // [guestprof]
+    ++gs->m_stateGen;   // [rectemplate] software draws change VRAM
     const GSVertex &v0 = gs->m_vtxQueue[0];
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const auto &ctx = gs->activeContext();

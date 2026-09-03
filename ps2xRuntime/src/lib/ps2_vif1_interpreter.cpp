@@ -1,4 +1,5 @@
 // Based on Blackline Interactive implementation
+#include "runtime/ps2_guestprof.h"
 #include <cstdio>
 #include "runtime/ps2_memory.h"
 #include <cstring>
@@ -326,6 +327,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
+    gprof::Scope gpScope(gprof::VIF);   // [guestprof]
 
     if ([](){ static const char *s_env = std::getenv("PS2X_GIFSRC"); return s_env; }()) {
         static int vs_n = 0;
@@ -619,6 +621,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 if (pos + copyBytes <= sizeBytes)
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
                     { extern std::atomic<uint32_t> g_vu1CodeGen; g_vu1CodeGen.fetch_add(1u, std::memory_order_relaxed); }   // [vucache16] invalidate the decode cache
+                {   // [vu1jit-missdump] program extent hi-water: an upload at 0 starts a program, later chunks extend it
+                    extern std::atomic<uint32_t> g_vu1MpgHi;
+                    const uint32_t end = destAddr + copyBytes;
+                    if (destAddr == 0u || end > g_vu1MpgHi.load(std::memory_order_relaxed)) g_vu1MpgHi.store(end, std::memory_order_relaxed);
+                }
             }
             pos += mpgBytes;
             if (pos > sizeBytes)

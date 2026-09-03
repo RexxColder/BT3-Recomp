@@ -462,6 +462,7 @@ private:
     uint8_t m_curFog = 0;
 
     bool m_prmodecont = true;
+    uint32_t m_stateGen = 0;   // [rectemplate] bumped by every non-vertex register write, IMAGE transfer and software draw
     bool m_pabe = false;
     GSTexaReg m_texa{0u, false, 0u};
     GSTexClutReg m_texclut{0u, 0u, 0u};
