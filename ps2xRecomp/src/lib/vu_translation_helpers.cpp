@@ -183,22 +183,25 @@ namespace ps2recomp
             vis_reg_idx);
     }
 
+    // VU0 R register (VRNEXT/VRGET/VRINIT/VRXOR): hardware semantics (PCSX2 VUops.cpp _vuRNEXT etc).
+    // R is a 23-bit LFSR; every read yields 0x3F800000 | mantissa, i.e. a float in [1.0, 2.0). VRNEXT
+    // advances it (taps at bits 4 and 22) and writes the destination fields. The previous invented
+    // 4-lane generator never wrote vft at all (BT3's random-fraction helper returned stale garbage:
+    // Kaioken ray roll angles far outside [-pi, pi] -> exploding billboard quads -> white screen).
     std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)
     {
-        return fmt::format(
-            "{{\n"
-            "    uint32_t r_vals[4];\n"
-            "    _mm_storeu_si128((__m128i*)r_vals, _mm_castps_si128(ctx->vu0_r));\n"
-            "\n"
-            "    // Simple LFSR-based random number generation (PS2-like behavior)\n"
-            "    uint32_t feedback = r_vals[0] ^ (r_vals[0] << 13) ^ (r_vals[1] >> 19) ^ (r_vals[2] << 7);\n"
-            "    r_vals[0] = r_vals[1];\n"
-            "    r_vals[1] = r_vals[2];\n"
-            "    r_vals[2] = r_vals[3];\n"
-            "    r_vals[3] = feedback;\n"
-            "\n"
-            "    ctx->vu0_r = _mm_castsi128_ps(_mm_loadu_si128((__m128i*)r_vals));\n"
-            "}}");
+        uint8_t dest_mask = inst.vectorInfo.vectorField;
+        uint8_t ft_reg = inst.rt;
+        std::string out =
+            "{ uint32_t r; std::memcpy(&r, &ctx->vu0_r, 4); "
+            "const uint32_t x = (r >> 4) & 1u, y = (r >> 22) & 1u; "
+            "r <<= 1; r ^= (x ^ y); r = (r & 0x7FFFFFu) | 0x3F800000u; "
+            "ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32((int)r));";
+        if (ft_reg != 0)
+            out += fmt::format(" __m128i mask = _mm_set_epi32({}, {}, {}, {}); ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], ctx->vu0_r, _mm_castsi128_ps(mask));",
+                               (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+                               (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0, ft_reg, ft_reg);
+        return out + " }";
     }
 
     std::string CodeGenerator::translateVU_VMADD_Field(const Instruction &inst)
@@ -841,29 +844,24 @@ namespace ps2recomp
     {
         uint8_t dest_mask = inst.vectorInfo.vectorField;
         uint8_t ft_reg = inst.rt;
-        return fmt::format("{{ __m128 res = ctx->vu0_r; __m128i mask = _mm_set_epi32({}, {}, {}, {}); ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}", (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0, (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0, ft_reg, ft_reg);
+        std::string out =
+            "{ uint32_t r; std::memcpy(&r, &ctx->vu0_r, 4); r = 0x3F800000u | (r & 0x7FFFFFu); "
+            "ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32((int)r));";
+        if (ft_reg != 0)
+            out += fmt::format(" __m128i mask = _mm_set_epi32({}, {}, {}, {}); ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], ctx->vu0_r, _mm_castsi128_ps(mask));",
+                               (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+                               (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0, ft_reg, ft_reg);
+        return out + " }";
     }
 
     std::string CodeGenerator::translateVU_VRINIT(const Instruction &inst)
     {
         uint8_t fs_reg = inst.rd;
         uint8_t fsf = inst.vectorInfo.fsf;
-
         return fmt::format(
-            "{{\n"
-            "    float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{})));\n"
-            "    uint32_t seed; std::memcpy(&seed, &src, sizeof(seed));\n"
-            "\n"
-            "    // PS2 uses a specific LFSR initialization pattern\n"
-            "    if (seed == 0) seed = 1;\n"
-            "\n"
-            "    uint32_t r0 = seed;\n"
-            "    uint32_t r1 = seed * 0x41C64E6D + 0x3039;\n"
-            "    uint32_t r2 = r1 * 0x41C64E6D + 0x3039;\n"
-            "    uint32_t r3 = r2 * 0x41C64E6D + 0x3039;\n"
-            "\n"
-            "    ctx->vu0_r = _mm_castsi128_ps(_mm_set_epi32(r3, r2, r1, r0));\n"
-            "}}",
+            "{{ float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
+            "uint32_t s; std::memcpy(&s, &src, 4); s = 0x3F800000u | (s & 0x7FFFFFu); "
+            "ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32((int)s)); }}",
             fs_reg, fs_reg, fsf);
     }
 
@@ -871,23 +869,10 @@ namespace ps2recomp
     {
         uint8_t fs_reg = inst.rd;
         uint8_t fsf = inst.vectorInfo.fsf;
-
         return fmt::format(
-            "{{\n"
-            "    float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{})));\n"
-            "    uint32_t src_bits; std::memcpy(&src_bits, &src, sizeof(src_bits));\n"
-            "    __m128i r_current = _mm_castps_si128(ctx->vu0_r);\n"
-            "    __m128i fs_data = _mm_set1_epi32((int)src_bits);\n"
-            "\n"
-            "    // XOR the current random value with the data from the VU vector register\n"
-            "    __m128i xored = _mm_xor_si128(r_current, fs_data);\n"
-            "\n"
-            "    // Apply a simple mixing function similar to PS2's LFSR\n"
-            "    __m128i mixed = _mm_xor_si128(xored, _mm_slli_epi32(xored, 7));\n"
-            "    mixed = _mm_xor_si128(mixed, _mm_srli_epi32(mixed, 9));\n"
-            "\n"
-            "    ctx->vu0_r = _mm_castsi128_ps(mixed);\n"
-            "}}",
+            "{{ float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
+            "uint32_t s, r; std::memcpy(&s, &src, 4); std::memcpy(&r, &ctx->vu0_r, 4); r = 0x3F800000u | ((r ^ s) & 0x7FFFFFu); "
+            "ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32((int)r)); }}",
             fs_reg, fs_reg, fsf);
     }
 

@@ -327,6 +327,7 @@ namespace
 
         ctx->vu0_clip_flags = 0;
         ctx->vu0_clip_flags2 = 0;
+        ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(0x3F800000));   // VU0 R register: 23-bit LFSR, reads as 1.0|mantissa
         ctx->vu0_mac_flags = 0;
         ctx->vu0_status = 0;
         ctx->vu0_q = 1.0f;
