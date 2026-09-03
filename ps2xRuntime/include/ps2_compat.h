@@ -5,6 +5,12 @@
 #include <algorithm>
 
 #if defined(_WIN32)
+// access()/F_OK live in <io.h> as _access on the MSVC CRT.
+#include <io.h>
+#ifndef F_OK
+#define F_OK 0
+#endif
+static inline int access(const char *path, int mode) { return _access(path, mode); }
 // memmem is a GNU extension; the MSVC CRT does not have it.
 static inline const void *memmem(const void *hay, size_t hn, const void *needle, size_t nn)
 {
