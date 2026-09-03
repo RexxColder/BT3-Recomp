@@ -1,5 +1,8 @@
 #include "ps2_runtime.h"
 #include "ps2_compat.h"
+#if defined(_WIN32)
+extern "C" void ps2xWinTimerBegin();   // ps2_win_timer.cpp (a linkage specification must be at namespace scope)
+#endif
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "games_database.h"
 #if !defined(PLATFORM_VITA)
@@ -433,7 +436,7 @@ extern "C" void ps2xGsRecordOnSignal(int);
 int main(int argc, char *argv[])
 {
 #if defined(_WIN32)
-    { extern "C" void ps2xWinTimerBegin(); ps2xWinTimerBegin(); }   // [wintimer] 1 ms tick: timed waits stop rounding to 15.6 ms
+    ps2xWinTimerBegin();   // [wintimer] 1 ms tick: timed waits stop rounding to 15.6 ms
 #endif
     // Write the captured tail out however we exit, so a long play session is not lost.
     // atexit alone was NOT enough -- closing the window skipped it and lost a whole session.
