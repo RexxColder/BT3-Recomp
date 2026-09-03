@@ -1209,6 +1209,7 @@ void bt3NoteSeBankHeader(uint32_t dst, const uint8_t *data, uint32_t size)
                  g_seBankHdrs.size() - 1u, dst, size);
 }
 
+std::atomic<int> g_rayHookArm{0};   // [rayhook] external linkage: set by the [raysrc] probe in ps2_memory.cpp
 namespace
 {
     // Locate the Vagi chunk in a SNAPSHOTTED bank header; offsets are snapshot-relative.
@@ -1775,6 +1776,136 @@ namespace
     // so the ring has to be reset here rather than in the 0x28b428 hook -- otherwise a restart
     // that finds anything still queued hangs the sound thread in that loop.
     // Group layout: [+0x52] channel count, [+0x10 + i*4] the stream objects (sink at [obj+8]).
+    // [wisphook] PS2X_WISPHOOK=1 (2026-09-03 lingering aura): FUN_00131a20 is the generic
+    // billboard-quad emitter (a0 = position vector, a1 = colour floats R,G,B,A, a2 = second
+    // colour floats, t0 = destination packet buffer). Its byte stores at 0x131e74..0x131f3c
+    // turn those floats into the vertex RGBA -- the aura wisps arrive with A = 0.0 here while
+    // console gives 1..55. Log the caller and both colour vectors for wisp-purple calls
+    // (R~146 G~90 B~169) plus the first calls of any colour, then run the original.
+    // [cadence] PS2X_CADENCE=1 (Kaioken-white hunt, 2026-09-03): per-frame call counts of
+    // the per-character fight sampler chain FUN_001c2218 -> 1D2D30 (charge-end sampler) ->
+    // 1D0508 -> 1CF678 (condition LEAVE-edge test). The old dev-tree note measured the
+    // sampler at "every ~6th frame" while the condition roller runs every frame, so 1-frame
+    // edges (cond4 leave = flash stop) were missed. Expected on console: 1c2218/1d2d30 once
+    // per character per frame. Prints once per 60 frames.
+    // [rayhook] PS2X_RAYHOOK=1 (Kaioken white, 2026-09-03): FUN_00132b60 is the generic camera-facing
+    // BILLBOARD QUAD emitter (a0=centre xyzw, a1=colour, a2/a3/t0 packet ctx, f12/f13 = half extents in
+    // world units, f14..f17 = uv rect, f18 = roll angle, f19 = Q scale; corners = centre + camRot*rollRot*
+    // (+-f12,+-f13,0); projected+clipped by FUN_00131478, emitted by FUN_00132e80). Our Kaioken flash
+    // rays (tex 11236) come out clipped to the guard-band corners = enormous quads. Log every call's
+    // args (with the caller's ra) once the [raysrc] probe has seen a REAL clamped ray (g_rayHookArm).
+    // [clipin] second half of PS2X_RAYHOOK: FUN_00131478 (frustum clipper + emit) receives the 3
+    // WORLD-space corner records (48 B each: pos, uv, colour) of one triangle of the quad. For a pure
+    // rotation the edges must be 2h, 2h, 2h*sqrt2 (h = the half extent logged by [rayhook]); if the
+    // corners come out inflated, the roll*camera matrix path (FUN_00120308/001201b8/00121fd0) scales.
+    PS2Runtime::RecompiledFunction g_orig131478 = nullptr;
+    void bt3ClipInHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_rayHookArm.load(std::memory_order_relaxed) > 0)
+        {
+            float v[3][4] = {};
+            if (const uint8_t *vp = getMemPtr(rdram, getRegU32(ctx, 4)))
+                for (int k = 0; k < 3; ++k) std::memcpy(v[k], vp + k * 48, 16);
+            auto d = [&](int a, int b){ const float dx = v[a][0] - v[b][0], dy = v[a][1] - v[b][1], dz = v[a][2] - v[b][2]; return std::sqrt(dx * dx + dy * dy + dz * dz); };
+            uint32_t qbits = getRegU32(ctx, 11); float qf; std::memcpy(&qf, &qbits, 4);
+            std::fprintf(stderr, "[clipin] v0=(%.2f,%.2f,%.2f,%.2f) v1=(%.2f,%.2f,%.2f,%.2f) v2=(%.2f,%.2f,%.2f,%.2f) edges=%.2f/%.2f/%.2f t3=%.4f\n",
+                         v[0][0], v[0][1], v[0][2], v[0][3], v[1][0], v[1][1], v[1][2], v[1][3], v[2][0], v[2][1], v[2][2], v[2][3], d(0, 1), d(1, 2), d(2, 0), qf);
+        }
+        if (g_orig131478) g_orig131478(rdram, ctx, runtime);
+    }
+    PS2Runtime::RecompiledFunction g_orig132b60 = nullptr;
+    void bt3RayHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_rayHookArm.load(std::memory_order_relaxed) > 0)
+        {
+            g_rayHookArm.fetch_sub(1, std::memory_order_relaxed);
+            const uint32_t a0 = getRegU32(ctx, 4);
+            float c[4] = {0, 0, 0, 0};
+            if (const uint8_t *cp = getMemPtr(rdram, a0)) std::memcpy(c, cp, 16);
+            uint8_t col[16] = {0};
+            if (const uint8_t *kp = getMemPtr(rdram, getRegU32(ctx, 5))) std::memcpy(col, kp, 16);
+            // project the centre with the VU0 view-projection (vf16..vf19, as FUN_001210d8 does) and
+            // estimate the on-screen half size: max screen delta of a +half offset along each world axis
+            float M[4][4];
+            for (int r = 0; r < 4; ++r) _mm_storeu_ps(M[r], ctx->vu0_vf[16 + r]);
+            auto proj = [&](float x, float y, float z, float *o){
+                for (int k = 0; k < 4; ++k) o[k] = M[0][k] * x + M[1][k] * y + M[2][k] * z + M[3][k];
+            };
+            float pc[4]; proj(c[0], c[1], c[2], pc);
+            const float w = pc[3] != 0.0f ? pc[3] : 1e-9f;
+            const float sx = pc[0] / w, sy = pc[1] / w;
+            float rad = 0.0f;
+            const float h = ctx->f[12];
+            const float offs[3][3] = {{h, 0, 0}, {0, h, 0}, {0, 0, h}};
+            for (int k = 0; k < 3; ++k)
+            {
+                float q[4]; proj(c[0] + offs[k][0], c[1] + offs[k][1], c[2] + offs[k][2], q);
+                const float qw = q[3] != 0.0f ? q[3] : 1e-9f;
+                const float dx = q[0] / qw - sx, dy = q[1] / qw - sy;
+                rad = std::max(rad, std::sqrt(dx * dx + dy * dy));
+            }
+            {   // camera (billboard) matrix used by FUN_00132b60: [[gp-0x56a0]+0x40], 4x4 floats -- print the first 3 times
+                static int s_cm = 0;
+                if (s_cm < 3)
+                {
+                    const uint32_t gp = getRegU32(ctx, 28);
+                    uint32_t camp = 0; if (const uint8_t *pp = getMemPtr(rdram, gp - 0x56a0u)) std::memcpy(&camp, pp, 4);
+                    float cm[16] = {};
+                    if (const uint8_t *mp = getMemPtr(rdram, camp + 0x40u)) std::memcpy(cm, mp, 64);
+                    std::fprintf(stderr, "[rayhook] cammat@0x%x: [%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f]\n", camp + 0x40u,
+                                 cm[0], cm[1], cm[2], cm[3], cm[4], cm[5], cm[6], cm[7], cm[8], cm[9], cm[10], cm[11], cm[12], cm[13], cm[14], cm[15]);
+                    ++s_cm;
+                }
+            }
+            std::fprintf(stderr, "[rayhook] ra=0x%x centre=(%.2f,%.2f,%.2f) half=%.3f roll=%.3f col=%02x%02x%02x%02x t0=0x%x | proj=(%.1f,%.1f) w=%.2f scrHalf~%.0fpx\n",
+                         getRegU32(ctx, 31), c[0], c[1], c[2], ctx->f[12], ctx->f[18],
+                         col[0], col[1], col[2], col[3], getRegU32(ctx, 8), sx, sy, pc[3], rad);
+        }
+        if (g_orig132b60) g_orig132b60(rdram, ctx, runtime);
+    }
+    PS2Runtime::RecompiledFunction g_orig1c2218 = nullptr, g_orig1d2d30 = nullptr, g_orig1d0508 = nullptr, g_orig1cf678c = nullptr;
+    static std::atomic<uint32_t> s_cad1c2218{0}, s_cad1d2d30{0}, s_cad1d0508{0}, s_cad1cf678{0};
+    static void bt3CadenceTick()
+    {
+        static uint64_t s_lastBucket = 0;
+        const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+        const uint64_t bucket = fr / 60u;
+        if (bucket != s_lastBucket)
+        {
+            std::fprintf(stderr, "[cadence] fr=%llu per-60-frames: 1c2218=%u 1d2d30=%u 1d0508=%u 1cf678=%u\n",
+                         (unsigned long long)fr, s_cad1c2218.exchange(0), s_cad1d2d30.exchange(0), s_cad1d0508.exchange(0), s_cad1cf678.exchange(0));
+            s_lastBucket = bucket;
+        }
+    }
+    void bt3Cad1c2218(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) { ++s_cad1c2218; bt3CadenceTick(); if (g_orig1c2218) g_orig1c2218(rdram, ctx, runtime); }
+    void bt3Cad1d2d30(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) { ++s_cad1d2d30; if (g_orig1d2d30) g_orig1d2d30(rdram, ctx, runtime); }
+    void bt3Cad1d0508(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) { ++s_cad1d0508; if (g_orig1d0508) g_orig1d0508(rdram, ctx, runtime); }
+    void bt3Cad1cf678(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) { ++s_cad1cf678; if (g_orig1cf678c) g_orig1cf678c(rdram, ctx, runtime); }
+
+    PS2Runtime::RecompiledFunction g_orig131a20 = nullptr;
+    void bt3QuadEmitHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00131a20
+    {
+        static int s_n = 0, s_w = 0;
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6);
+        const uint32_t a3 = getRegU32(ctx, 7), t0 = getRegU32(ctx, 8), ra = getRegU32(ctx, 31);
+        auto fl = [&](uint32_t addr) -> const float * {
+            const uint32_t a = addr & 0x1FFFFFFFu;
+            return (a >= 0x100000u && a + 16u <= 0x2000000u) ? reinterpret_cast<const float *>(getMemPtr(rdram, a)) : nullptr;
+        };
+        const float *c1 = fl(a1), *c2 = fl(a2);
+        const bool wisp = c1 && c1[0] > 140.f && c1[0] < 152.f && c1[1] > 85.f && c1[1] < 95.f && c1[2] > 163.f && c1[2] < 175.f;
+        if (s_n < 24 || (wisp && s_w < 80))
+        {
+            std::fprintf(stderr, "[wisphook] #%d%s ra=0x%x a0=0x%x a1=0x%x c1=(%.1f,%.1f,%.1f,%.3f) a2=0x%x c2=(%.1f,%.1f,%.1f,%.3f) a3=0x%x t0=0x%x f12=%.2f f13=%.2f f14=%.2f\n",
+                         s_n, wisp ? " WISP" : "", ra, a0, a1,
+                         c1 ? c1[0] : 0.f, c1 ? c1[1] : 0.f, c1 ? c1[2] : 0.f, c1 ? c1[3] : 0.f, a2,
+                         c2 ? c2[0] : 0.f, c2 ? c2[1] : 0.f, c2 ? c2[2] : 0.f, c2 ? c2[3] : 0.f,
+                         a3, t0, ctx->f[12], ctx->f[13], ctx->f[14]);
+            ++s_n; if (wisp) ++s_w;
+        }
+        if (g_orig131a20) g_orig131a20(rdram, ctx, runtime);
+    }
+
     PS2Runtime::RecompiledFunction g_orig281bb0 = nullptr;
     void bt3StreamGroupStart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // 0x281bb0
     {
@@ -4431,6 +4562,28 @@ namespace
             g_orig281bb0 = runtime.lookupFunction(0x00281bb0u);
             if (g_orig281bb0) runtime.replaceFunction(0x00281bb0u, &bt3StreamGroupStart);
             else std::cerr << "[sndiop] 0x281bb0 (group start) not registered" << std::endl;
+        }
+        if (const char *rh = std::getenv("PS2X_RAYHOOK"); rh && rh[0] && rh[0] != '0')
+        {
+            g_orig132b60 = runtime.lookupFunction(0x00132b60u);
+            if (g_orig132b60) runtime.replaceFunction(0x00132b60u, &bt3RayHook);
+            g_orig131478 = runtime.lookupFunction(0x00131478u);
+            if (g_orig131478) runtime.replaceFunction(0x00131478u, &bt3ClipInHook);
+            std::fprintf(stderr, "[rayhook] installed %d\n", g_orig132b60 ? 1 : 0);
+        }
+        if (const char *cd = std::getenv("PS2X_CADENCE"); cd && cd[0] && cd[0] != '0')
+        {   // [cadence] see bt3CadenceTick
+            g_orig1c2218 = runtime.lookupFunction(0x001c2218u); if (g_orig1c2218) runtime.replaceFunction(0x001c2218u, &bt3Cad1c2218);
+            g_orig1d2d30 = runtime.lookupFunction(0x001d2d30u); if (g_orig1d2d30) runtime.replaceFunction(0x001d2d30u, &bt3Cad1d2d30);
+            g_orig1d0508 = runtime.lookupFunction(0x001d0508u); if (g_orig1d0508) runtime.replaceFunction(0x001d0508u, &bt3Cad1d0508);
+            g_orig1cf678c = runtime.lookupFunction(0x001cf678u); if (g_orig1cf678c) runtime.replaceFunction(0x001cf678u, &bt3Cad1cf678);
+            std::fprintf(stderr, "[cadence] installed %d%d%d%d\n", g_orig1c2218 ? 1 : 0, g_orig1d2d30 ? 1 : 0, g_orig1d0508 ? 1 : 0, g_orig1cf678c ? 1 : 0);
+        }
+        if (const char *wh = std::getenv("PS2X_WISPHOOK"); wh && wh[0] && wh[0] != '0')
+        {   // [wisphook] see bt3QuadEmitHook
+            g_orig131a20 = runtime.lookupFunction(0x00131a20u);
+            if (g_orig131a20) runtime.replaceFunction(0x00131a20u, &bt3QuadEmitHook);
+            std::fprintf(stderr, "[wisphook] installed=%d\n", g_orig131a20 ? 1 : 0);
         }
         // [se] sound effects: service the RPC the IOP would have handled. DEFAULT ON alongside
         // the rest of audio; PS2X_SEPLAY=0 opts out. Gated on sndAudioOn too, so silencing audio

@@ -80,9 +80,11 @@ static inline bool ps2xTraceEnabled()
 
 // PS2X_CAMPROBE write-watch (see ps2_runtime.h). Armed by the camera probe to find the
 // function that writes the battle camera-target vector.
+extern "C" { extern unsigned long long g_rlglDrawCalls, g_rlglBatchFlushes; extern double g_rlglFlushNs; }   // [glcalls] raylib rlgl batch counters (patched rlgl.h)
 std::atomic<uint32_t> g_ps2WatchLo{0};
 std::atomic<uint32_t> g_ps2WatchHi{0};
 std::atomic<uint32_t> g_ps2WatchAll{0};
+uint8_t *g_ps2WatchRdram = nullptr;   // [wispsrc] guest RAM base (set at bind) for ps2WatchReport
 void ps2WatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
                     const char *op, const R5900Context *ctx)
 {
@@ -118,9 +120,68 @@ void ps2WatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_
             if (s_cwSeen.size() >= 400u) return;
         }
     }
-    std::fprintf(stderr, "[camwrite] #%u addr=0x%x sz=%u pc=0x%x ra=0x%x a1src=0x%x val=0x%016llx%016llx op=%s\n",
-                 n, guestAddr, size, ctx ? ctx->pc : 0u, ra, a1,
-                 (unsigned long long)valueHi, (unsigned long long)valueLo, op);
+    // [wispsrc] second-level return address ([sp+8], where the 0x1006e8 append helper saved
+    // $ra before calling memcpy) and the bytes now at the watched qword -- names the BUILDER
+    // of a memcpy'd packet and shows whether the copy carried the wisp colour bytes.
+    uint32_t ra2 = 0u; char qw[48] = "";
+    if (g_ps2WatchRdram)
+    {
+        const uint32_t sp = ctx ? (static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) & 0x1FFFFFFFu) : 0u;
+        if (ctx && sp + 12u <= 0x2000000u) std::memcpy(&ra2, g_ps2WatchRdram + sp + 8u, 4);
+        const uint32_t wl = g_ps2WatchLo.load(std::memory_order_relaxed);
+        if (wl && wl + 16u <= 0x2000000u)
+            for (int i = 0; i < 16; ++i) std::snprintf(qw + i * 2, 3, "%02x", g_ps2WatchRdram[wl + i]);
+    }
+    // [wispalpha] inside FUN_00163980's vertex-write block (0x163f60..0x164080): dump the
+    // factors of the wisp alpha product (alpha_i = shape[i] * [s1+0x6C] * 255 * f23, with
+    // f23 = [s7+0x38] * [s7+0x50] * f12_arg) so the zero factor names itself. Once per 64 hits.
+    if (ctx && g_ps2WatchRdram && ctx->pc >= 0x163f60u && ctx->pc < 0x164080u)
+    {
+        static unsigned s_wa = 0;
+        if ((s_wa++ % 64u) == 0u)
+        {
+            const uint32_t s1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[17], 0)) & 0x1FFFFFFFu;
+            const uint32_t s7 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[23], 0)) & 0x1FFFFFFFu;
+            const uint32_t sp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) & 0x1FFFFFFFu;
+            auto rf = [&](uint32_t a) { float v = 0.f; if (a + 4u <= 0x2000000u) std::memcpy(&v, g_ps2WatchRdram + a, 4); return v; };
+            auto ru = [&](uint32_t a) { uint32_t v = 0u; if (a + 4u <= 0x2000000u) std::memcpy(&v, g_ps2WatchRdram + a, 4); return v; };
+            const uint32_t gp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)) & 0x1FFFFFFFu;
+            const uint32_t g5868 = ru(gp - 0x5868u) & 0x1FFFFFFFu;
+            std::fprintf(stderr, "[wispG] G=0x%x G+0..1c=(%g,%g,%g,%g,%g,%g,%g,%g) G+20/24/28=(%g,%g,%g) reent=0x%x seed=0x%08x%08x p+C=%g p+1C=%g p+0=0x%x p+4..b=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                         g5868, rf(g5868), rf(g5868 + 4u), rf(g5868 + 8u), rf(g5868 + 0xcu), rf(g5868 + 0x10u), rf(g5868 + 0x14u), rf(g5868 + 0x18u), rf(g5868 + 0x1cu), rf(g5868 + 0x20u), rf(g5868 + 0x24u), rf(g5868 + 0x28u), ru(0x2e9808u), ru((ru(0x2e9808u) & 0x1FFFFFFFu) + 0xacu), ru((ru(0x2e9808u) & 0x1FFFFFFFu) + 0xa8u),
+                         rf(s1 + 0xcu), rf(s1 + 0x1cu), ru(s1),
+                         g_ps2WatchRdram[s1 + 4u], g_ps2WatchRdram[s1 + 5u], g_ps2WatchRdram[s1 + 6u], g_ps2WatchRdram[s1 + 7u], g_ps2WatchRdram[s1 + 8u], g_ps2WatchRdram[s1 + 9u], g_ps2WatchRdram[s1 + 0xau], g_ps2WatchRdram[s1 + 0xbu]);
+            std::fprintf(stderr, "[wisptpl] sys+3F0=(%g,%g,%g,%g) sys+400=(%g,%g,%g,%g) sys+410=(%g,%g,%g,%g) p+10/14/28=(%g,%g,%g) pvel+70=(%g,%g,%g,%g) g2c/g30=(%g,%g) sys+0=0x%x sys+8=0x%x sys+10=0x%x\n",
+                         rf(s7 + 0x3f0u), rf(s7 + 0x3f4u), rf(s7 + 0x3f8u), rf(s7 + 0x3fcu),
+                         rf(s7 + 0x400u), rf(s7 + 0x404u), rf(s7 + 0x408u), rf(s7 + 0x40cu),
+                         rf(s7 + 0x410u), rf(s7 + 0x414u), rf(s7 + 0x418u), rf(s7 + 0x41cu),
+                         rf(s1 + 0x10u), rf(s1 + 0x14u), rf(s1 + 0x28u),
+                         rf(s1 + 0x70u), rf(s1 + 0x74u), rf(s1 + 0x78u), rf(s1 + 0x7cu),
+                         rf(g5868 + 0x2cu), rf(g5868 + 0x30u), ru(s7), ru(s7 + 8u), ru(s7 + 0x10u));
+            std::fprintf(stderr, "[wispalpha] pc=0x%x s1=0x%x s7=0x%x f23=%g pa[s1+6c]=%g s1flags=0x%x s1+60/64/68=(%g,%g,%g) sys38=%g sys50=%g sys60=%g shape=(%g,%g,%g,%g) abytes=%02x%02x%02x%02x tail[gp-78f4]=%g callerRA=0x%x\n",
+                         ctx->pc, s1, s7, ctx->f[23], rf(s1 + 0x6cu), ru(s1), rf(s1 + 0x60u), rf(s1 + 0x64u), rf(s1 + 0x68u),
+                         rf(s7 + 0x38u), rf(s7 + 0x50u), rf(s7 + 0x60u),
+                         rf(sp + 0x150u), rf(sp + 0x154u), rf(sp + 0x158u), rf(sp + 0x15cu),
+                         g_ps2WatchRdram[sp + 0x160u], g_ps2WatchRdram[sp + 0x161u], g_ps2WatchRdram[sp + 0x162u], g_ps2WatchRdram[sp + 0x163u],
+                         rf((static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)) & 0x1FFFFFFFu) - 0x78f4u), ru(sp + 0x238u));
+        }
+    }
+    // [wispsrc] mini backtrace: code-range words in the first 0x180 bytes of the guest stack
+    // (saved $ra slots of this frame and its callers, whatever the frame layout).
+    char stk[96] = ""; int sn = 0;
+    if (g_ps2WatchRdram && ctx)
+    {
+        const uint32_t sp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) & 0x1FFFFFFFu;
+        for (uint32_t o = 0; o < 0x280u && sp + o + 4u <= 0x2000000u && sn < 6; o += 4)
+        {
+            uint32_t w; std::memcpy(&w, g_ps2WatchRdram + sp + o, 4);
+            if (w >= 0x100000u && w < 0x2c0000u && (w & 3u) == 0u)
+                sn += std::snprintf(stk + std::strlen(stk), sizeof stk - std::strlen(stk), "%s%x@%x", sn ? "," : "", w, o) > 0 ? 1 : 0;
+        }
+    }
+    std::fprintf(stderr, "[camwrite] #%u addr=0x%x sz=%u pc=0x%x ra=0x%x ra2=0x%x a1src=0x%x val=0x%016llx%016llx op=%s qw=%s stk=%s\n",
+                 n, guestAddr, size, ctx ? ctx->pc : 0u, ra, ra2, a1,
+                 (unsigned long long)valueHi, (unsigned long long)valueLo, op, qw, stk);
 }
 
 std::atomic<uint32_t> g_watchReportN{0};
@@ -885,6 +946,7 @@ bool PS2Runtime::syncCoreSubsystems()
     m_vu1.reset();
 
     m_boundRdram = rdram;
+    g_ps2WatchRdram = rdram;   // [wispsrc] lets ps2WatchReport read the guest stack ([sp+8]) and the watched qword
     m_boundGSVram = gsVram;
     return true;
 }
@@ -4449,13 +4511,22 @@ void PS2Runtime::run()
                 const double guestMs = (bf > s_lastBusyFrames) ? (double)(bn - s_lastBusyNs) / 1.0e6 / (double)(bf - s_lastBusyFrames) : 0.0;   // [guestbusy] ms of guest CPU per published frame
                 const double wallMs = (bf > s_lastBusyFrames) ? (double)(wn - s_lastWallNs) / 1.0e6 / (double)(bf - s_lastBusyFrames) : 0.0;   // [guestwall]
                 s_lastBusyNs = bn; s_lastBusyFrames = bf; s_lastWallNs = wn;
+                static unsigned long long s_lastGlCalls = 0, s_lastGlFlush = 0; static double s_lastFlushNs = 0.0;
+                const unsigned long long glc = g_rlglDrawCalls, glf = g_rlglBatchFlushes;
+                extern std::atomic<unsigned long> g_texDecodeCount; static unsigned long s_lastTdc = 0;
+                const unsigned long tdc = g_texDecodeCount.load(std::memory_order_relaxed);
                 std::cerr << "[fps] GAME=" << (double)((gameFrames - s_lastGameFrames) / dt)
                           << " guest_ms=" << guestMs
                           << " wall_ms=" << wallMs
                           << " host=" << (uint32_t)(s_fpsFrames / dt)
                           << " prims/sec=" << (uint64_t)((prims - s_lastPrims) / dt)
                           << " Mpix/sec=" << (double)((pix - s_lastPix) / dt / 1.0e6)
-                          << " swaps/sec=" << (uint64_t)((swaps - s_lastSwaps) / dt) << std::endl;
+                          << " swaps/sec=" << (uint64_t)((swaps - s_lastSwaps) / dt)
+                          << " glcalls/sec=" << (uint64_t)((glc - s_lastGlCalls) / dt)
+                          << " glflush/sec=" << (uint64_t)((glf - s_lastGlFlush) / dt)
+                          << " decodes/sec=" << (uint64_t)((tdc - s_lastTdc) / dt)
+                          << " flush_ms/s=" << (g_rlglFlushNs - s_lastFlushNs) / 1.0e6 / dt << std::endl;
+                s_lastGlCalls = glc; s_lastGlFlush = glf; s_lastTdc = tdc; s_lastFlushNs = g_rlglFlushNs;
                 s_lastGameFrames = gameFrames;
                 s_lastPrims = prims;
                 s_lastPix = pix;

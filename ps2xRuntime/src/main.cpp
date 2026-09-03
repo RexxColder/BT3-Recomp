@@ -11,6 +11,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <chrono>
 #include <vector>
 #include <iostream>
 #include <string>
@@ -99,6 +100,7 @@ namespace
 // probes frame-gate on it); this build has no such probes, so the harness owns it here.
 int g_ps2ReplayVsync = 0;
 
+static double g_benchGsMs = 0.0, g_benchRenderMs = 0.0; static long g_benchFrames = 0;   // [replaybench] deterministic cost of record (GS parse) vs GL replay
 // PS2X_GS_REPLAY: offline GS-dump replay harness. DIAGNOSTIC ONLY -- inert unless the env var
 // is set. Feeds a PCSX2 .gs dump's packet stream through our own GS, so one frame can be
 // reproduced deterministically and diffed against the console screenshot embedded in the
@@ -231,7 +233,9 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
             ++off; // path id (all paths carry GIF-format data)
             uint32_t n; std::memcpy(&n, d.data() + off, 4); off += 4;
             if (off + n > (size_t)sz) break;
-            gs.processGIFPacket(d.data() + off, n);
+            { const auto _b0 = std::chrono::steady_clock::now();
+              gs.processGIFPacket(d.data() + off, n);
+              g_benchGsMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _b0).count(); }
             off += n; ++xfers;
             // PS2X_BARRIER: drain read-after-write barriers. A draw that samples a page an
             // earlier queued draw wrote cannot see it, because textures are decoded while the
@@ -317,7 +321,9 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
                     { extern bool g_replayInWindow; g_replayInWindow = inWin; }
                     if ((dumpEvery > 0 && (vsyncs % (int)dumpEvery) == 0 && inWin) || (dumpTo > 0 && inWin))
                     {
-                        ps2GpuRenderer().renderAndGetTextureId(512, 448);
+                        { const auto _r0 = std::chrono::steady_clock::now();
+                          ps2GpuRenderer().renderAndGetTextureId(512, 448);
+                          g_benchRenderMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _r0).count(); ++g_benchFrames; }
                         // PS2X_GS_REPLAY_OUT=<dir>: where the per-frame PNGs land (default
                         // work/). Per-variant dirs let A/B replays run in parallel.
                         static const char *outDir = [](){ const char *v = std::getenv("PS2X_GS_REPLAY_OUT");
@@ -327,7 +333,11 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
                         ps2GpuRenderer().debugSavePresent(gp);
                     }
                     else if (inWarm)
+                    {   // [replaybench] warm frames render without a PNG save: the timing window
+                        const auto _r0 = std::chrono::steady_clock::now();
                         ps2GpuRenderer().renderAndGetTextureId(512, 448);
+                        g_benchRenderMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _r0).count(); ++g_benchFrames;
+                    }
                     // PS2X_GS_REPLAY_VDUMP=1: in GPU mode ALSO dump the effect-chain buffers
                     // from the VRAM MIRROR (what PS2X_SWEFFECT rasterized) — shows whether the
                     // pyramid content exists in VRAM independently of the GL composite.
@@ -409,6 +419,10 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
     }
 
     std::fprintf(stderr, "[gsreplay] done: %d vsyncs, %llu transfers\n", vsyncs, (unsigned long long)xfers);
+    { extern std::atomic<unsigned long> g_texDecodeCount;
+      std::fprintf(stderr, "[replaybench] frames=%ld gs_ms=%.1f render_ms=%.1f | per frame: gs(record)=%.2f ms render(GL)=%.2f ms | texdecodes=%lu\n",
+                 g_benchFrames, g_benchGsMs, g_benchRenderMs, g_benchFrames ? g_benchGsMs / g_benchFrames : 0.0, g_benchFrames ? g_benchRenderMs / g_benchFrames : 0.0,
+                 g_texDecodeCount.load()); }
     return 0;
 }
 
