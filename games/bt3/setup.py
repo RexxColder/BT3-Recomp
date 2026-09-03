@@ -98,8 +98,9 @@ def find_binary(name: str) -> Path:
 def cmake_configure_extra() -> list:
     """-T only makes sense for the Visual Studio generator; a Ninja build directory (clang-cl via
     -DCMAKE_CXX_COMPILER=clang-cl) must not get it, or the reconfigure fails."""
+    extra = ["-DCMAKE_BUILD_TYPE=Release"]   # explicit: a Windows Ninja/clang-cl configure came up Debug (/Od /RTC1 -MDd)
     if not IS_WINDOWS:
-        return []
+        return extra
     cache = BUILD / "CMakeCache.txt"
     if cache.exists():
         gen = ""
@@ -108,8 +109,8 @@ def cmake_configure_extra() -> list:
                 gen = line.split("=", 1)[1]
                 break
         if "Visual Studio" not in gen:
-            return []
-    return ["-T", os.environ.get("PS2X_SETUP_TOOLSET", "ClangCL")]
+            return extra
+    return extra + ["-T", os.environ.get("PS2X_SETUP_TOOLSET", "ClangCL")]
 
 
 def cmake_build(target: str, jobs: str) -> None:
