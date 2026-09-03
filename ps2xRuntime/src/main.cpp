@@ -432,6 +432,9 @@ extern "C" void ps2xGsRecordOnSignal(int);
 
 int main(int argc, char *argv[])
 {
+#if defined(_WIN32)
+    { extern "C" void ps2xWinTimerBegin(); ps2xWinTimerBegin(); }   // [wintimer] 1 ms tick: timed waits stop rounding to 15.6 ms
+#endif
     // Write the captured tail out however we exit, so a long play session is not lost.
     // atexit alone was NOT enough -- closing the window skipped it and lost a whole session.
     std::atexit(ps2xGsRecordFlush);
