@@ -32,6 +32,9 @@ public:
     static bool glowEnabled();      static void setGlow(bool v);
     static bool postfxEnabled();    static void setPostfx(bool v);
     static bool glowFixEnabled();   static void setGlowFix(bool v);
+    // [inkstrength] cel-outline darkener strength, in percent of Cs (100 = the old
+    // half-strength line, 199 = the hardware-exact 255/128 -- see PS2X_ADGS).
+    static int  inkStrengthPct();   static void setInkStrengthPct(int pct);
     static bool bilinearEnabled();  static void setBilinear(bool v);
     static bool halfTexelEnabled(); static void setHalfTexel(bool v);
     static bool skipPostEnabled();  static void setSkipPost(bool v);
