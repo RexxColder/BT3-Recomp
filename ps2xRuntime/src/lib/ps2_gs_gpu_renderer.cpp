@@ -4162,7 +4162,7 @@ uint32_t g_darkwLast = 0, g_darkwGen = 0; int g_darkwLogs = 0;
 static const int s_recStage = [](){ const char *v = std::getenv("PS2X_RECSTAGE"); return v ? std::atoi(v) : 64; }();   // default 64 since 2026-08-28: with PRERENDER=16 it is what gets the outline stack to 30 fps (SJ11); no effect on the plain build
 void GsGpuRenderer::flushStage()
 {
-    m_openBatchIdx = (size_t)-1;   // [drawbatch] the staged commands are about to become visible
+    closeOpenBatch();   // [drawbatch] the staged commands are about to become visible: register the run's dirty rect first
     if (m_stage.empty()) return;
     std::lock_guard<std::mutex> lk(m_mtx);
     {   // [segshadow]
@@ -4288,8 +4288,12 @@ bool GsGpuRenderer::sameBatchState(const DrawCmd &a, const DrawCmd &b)
 }
 std::shared_ptr<std::vector<GsGpuRenderer::Vtx>> GsGpuRenderer::takeVtxStore()
 {
+    // The ring only GROWS when the round-robin probe finds no free slot, so it settles at the number
+    // of stores actually in flight (~2.3k batches per frame times the lists queued for replay) rather
+    // than at this cap, which is only a backstop. 4096 was below that working set, so half the batches
+    // fell through to a fresh allocation.
     static const size_t kRing = [](){ const char *v = std::getenv("PS2X_BATCHRING");
-                                      const int n = v && v[0] ? std::atoi(v) : 4096; return (size_t)(n > 0 ? n : 1); }();
+                                      const int n = v && v[0] ? std::atoi(v) : 16384; return (size_t)(n > 0 ? n : 1); }();
     // Round-robin over the ring: a slot whose use_count is 1 is held by nobody but the ring
     // (its frame list has been replayed and freed), so it can be refilled in place -- which is
     // what keeps a run of batches from allocating. Probe a few slots before giving up, so one
@@ -4304,11 +4308,24 @@ std::shared_ptr<std::vector<GsGpuRenderer::Vtx>> GsGpuRenderer::takeVtxStore()
     if (m_vtxRing.size() < kRing) m_vtxRing.push_back(p);
     return p;
 }
+// [drawbatch] End the open run: hand the accumulated dirty rect to the barrier before the staged
+// commands can become visible to the GL thread (flushStage is the only thing that publishes them,
+// and it closes the batch first). Every path that drops m_openBatchIdx goes through here.
+void GsGpuRenderer::closeOpenBatch()
+{
+    if (m_batchRPend)
+    {
+        std::lock_guard<std::mutex> bk(g_barMx);
+        ps2xDirtyAdd(m_batchRFbp, m_batchRX0, m_batchRY0, m_batchRX1, m_batchRY1);
+        m_batchRPend = false;
+    }
+    m_openBatchIdx = (size_t)-1;
+}
 bool GsGpuRenderer::appendBatchTri(const Vtx v[3], bool addDirty)
 {
-    if (m_openBatchIdx >= m_stage.size()) { m_openBatchIdx = (size_t)-1; return false; }
+    if (m_openBatchIdx >= m_stage.size()) { closeOpenBatch(); return false; }
     DrawCmd &h = m_stage[m_openBatchIdx];
-    if ((int)h.triCount >= batchMax()) { m_openBatchIdx = (size_t)-1; return false; }
+    if ((int)h.triCount >= batchMax()) { closeOpenBatch(); return false; }
     // The head already did the PS2X_BARRIER bookkeeping for this (dest, source, zbuf) triple and an
     // appended triangle repeats it exactly -- the same reasoning [bardedupe] uses to skip the set ops
     // for a run of identical commands, and it needs the same guard: if anything REMOVED a g_barDirty /
@@ -4317,7 +4334,7 @@ bool GsGpuRenderer::appendBatchTri(const Vtx v[3], bool addDirty)
     // flush and would decode stale VRAM. g_barDirtyGen counts exactly those removals; on a change,
     // refuse the append so the caller records a full command and redoes the bookkeeping.
     if (m_openBatchDirtyGen != g_barDirtyGen.load(std::memory_order_relaxed))
-    { m_openBatchIdx = (size_t)-1; return false; }
+    { closeOpenBatch(); return false; }
     if (!h.triMore) h.triMore = takeVtxStore();
     h.triMore->push_back(v[0]); h.triMore->push_back(v[1]); h.triMore->push_back(v[2]);
     ++h.triCount;
@@ -4336,8 +4353,21 @@ bool GsGpuRenderer::appendBatchTri(const Vtx v[3], bool addDirty)
                 x0 = std::min(x0, v[i].x); x1 = std::max(x1, v[i].x);
                 y0 = std::min(y0, v[i].y); y1 = std::max(y1, v[i].y);
             }
-            std::lock_guard<std::mutex> bk(g_barMx);
-            ps2xDirtyAdd(h.destFbp, x0, y0, x1, y1);
+            if (!m_batchRPend || m_batchRFbp != h.destFbp)
+            {   // a different page than the pending union: close that one out first
+                if (m_batchRPend)
+                {
+                    std::lock_guard<std::mutex> bk(g_barMx);
+                    ps2xDirtyAdd(m_batchRFbp, m_batchRX0, m_batchRY0, m_batchRX1, m_batchRY1);
+                }
+                m_batchRFbp = h.destFbp; m_batchRX0 = x0; m_batchRY0 = y0; m_batchRX1 = x1; m_batchRY1 = y1;
+                m_batchRPend = true;
+            }
+            else
+            {
+                m_batchRX0 = std::min(m_batchRX0, x0); m_batchRY0 = std::min(m_batchRY0, y0);
+                m_batchRX1 = std::max(m_batchRX1, x1); m_batchRY1 = std::max(m_batchRY1, y1);
+            }
         }
     }
     ++m_recordCount;   // prims/sec counts TRIANGLES, not batches
@@ -5826,11 +5856,12 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
         // one): anything the plain class excludes must not have triangles appended to it.
         if (openable)
         {
+            closeOpenBatch();                       // flush the previous run's rect before re-pointing
             m_openBatchIdx = m_stage.size() - 1;
             m_openBatchDirtyGen = g_barDirtyGen.load(std::memory_order_relaxed);   // see appendBatchTri
             g_batchHead.fetch_add(1, std::memory_order_relaxed);
         }
-        else m_openBatchIdx = (size_t)-1;
+        else closeOpenBatch();
         if (m_stage.size() >= (size_t)s_recStage) flushStage();   // lk is not held on this branch
     }
     ++m_recordCount;

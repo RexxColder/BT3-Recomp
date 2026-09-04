@@ -365,7 +365,7 @@ public:
     // Append one triangle to the open batch. Returns false if there is no open batch, it is
     // full, or the caller's state no longer matches -- the caller then records a full command.
     bool appendBatchTri(const Vtx v[3], bool addDirty = true);
-    void closeBatch() { m_openBatchIdx = (size_t)-1; }
+    void closeBatch() { closeOpenBatch(); }
     // Bumped by every recordCmd and every appended triangle. The recorder keeps the last value it
     // saw next to its retained command; a mismatch means SOMETHING ELSE recorded in between (another
     // thread, an internal blit, an alias pass), so the retained state is no longer the batch head's.
@@ -443,6 +443,14 @@ private:
     // g_barDirtyGen as it stood when the batch head did its barrier bookkeeping; an append is only
     // valid while nothing has REMOVED a dirty entry since (see appendBatchTri).
     uint32_t m_openBatchDirtyGen = 0;
+    // [drawbatch] One dirty-rect union for the whole run instead of one per triangle: the union is
+    // monotone and the staged commands are invisible to the GL thread until flushStage, so nothing
+    // can read the page back between the appends and closeOpenBatch(). Saves a g_barMx lock per
+    // primitive -- ~1M of them per second in a fight.
+    float m_batchRX0 = 0.f, m_batchRY0 = 0.f, m_batchRX1 = 0.f, m_batchRY1 = 0.f;
+    uint32_t m_batchRFbp = 0;
+    bool m_batchRPend = false;
+    void closeOpenBatch();
     // Recycled vertex stores for batched commands. A store is handed to a DrawCmd by shared_ptr and
     // travels with it through m_building -> m_pending -> the replay; use_count()==1 means the last
     // holder is this ring, so it can be refilled without a fresh allocation. Batches of one triangle
