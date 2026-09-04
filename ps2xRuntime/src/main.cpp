@@ -393,7 +393,9 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
                     const uint8_t t2 = d[e];
                     if (t2 == 0) { uint32_t n2; std::memcpy(&n2, d.data() + e + 2, 4); e += 6 + n2; }
                     else if (t2 == 1) { if (sliceEnd > 0 && vs2 >= sliceEnd) break; e += 2; ++vs2; }
-                    else if (t2 == 2) e += 5; else if (t2 == 3) e += 8193; else break;
+                    else if (t2 == 2) e += 5; else if (t2 == 3) e += 8193;
+                    else if (t2 == 4) e += 57;                     // [recpriv] CRTC snapshot
+                    else break;
                 }
                 if (e > (size_t)sz) e = (size_t)sz;
                 o.insert(o.end(), d.data() + off, d.data() + e);
@@ -420,6 +422,24 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
         }
         else if (t == 2) { off += 4; }
         else if (t == 3) { off += 8192; }
+        else if (t == 4)
+        {   // [recpriv] CRTC snapshot: pmode, dispfb1, display1, dispfb2, display2, bgcolor, smode2
+            if (off + 56 > (size_t)sz) break;
+            uint64_t v[7]; std::memcpy(v, d.data() + off, 56); off += 56;
+            gs.setPrivRegsFromRecord(v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+            static int s_pn = 0;
+            if (s_pn < 8) { ++s_pn;
+                std::fprintf(stderr, "[recpriv] CRTC restored: pmode=%016llx EN1=%d EN2=%d | "
+                                     "dispfb1 fbp=%u fbw=%u psm=%u  display1 DX=%u DY=%u DW=%u DH=%u | "
+                                     "dispfb2 fbp=%u fbw=%u psm=%u  display2 DX=%u DY=%u DW=%u DH=%u\n",
+                             (unsigned long long)v[0], (int)(v[0] & 1), (int)((v[0] >> 1) & 1),
+                             (unsigned)(v[1] & 0x1FF), (unsigned)((v[1] >> 9) & 0x3F), (unsigned)((v[1] >> 15) & 0x1F),
+                             (unsigned)(v[2] & 0xFFF), (unsigned)((v[2] >> 12) & 0x7FF),
+                             (unsigned)((v[2] >> 32) & 0xFFF), (unsigned)((v[2] >> 44) & 0x7FF),
+                             (unsigned)(v[3] & 0x1FF), (unsigned)((v[3] >> 9) & 0x3F), (unsigned)((v[3] >> 15) & 0x1F),
+                             (unsigned)(v[4] & 0xFFF), (unsigned)((v[4] >> 12) & 0x7FF),
+                             (unsigned)((v[4] >> 32) & 0xFFF), (unsigned)((v[4] >> 44) & 0x7FF)); }
+        }
         else { std::fprintf(stderr, "[gsreplay] unknown packet type %u at %zu\n", t, off - 1); break; }
     }
     }

@@ -2289,8 +2289,40 @@ extern "C" void ps2xGsRecordFlush()
                  g_rec.path, w / 1e6, vs, vs / 30.0, vs ? (w / 1e6) / vs : 0.0);
 }
 
+// [recpriv] replay side: put a recorded CRTC snapshot back so an offline replay presents the
+// way the live run did. Only the display-affecting registers; everything else is left alone.
+void GS::setPrivRegsFromRecord(uint64_t pmode, uint64_t dispfb1, uint64_t display1,
+                               uint64_t dispfb2, uint64_t display2, uint64_t bgcolor, uint64_t smode2)
+{
+    if (!m_privRegs) return;
+    m_privRegs->pmode = pmode;
+    m_privRegs->dispfb1 = dispfb1; m_privRegs->display1 = display1;
+    m_privRegs->dispfb2 = dispfb2; m_privRegs->display2 = display2;
+    m_privRegs->bgcolor = bgcolor; m_privRegs->smode2 = smode2;
+}
+
 extern "C" void ps2xGsRecordVsync()
 {
+    {   // [recpriv] record type 4: the CRTC state, once per vsync, BEFORE the vsync marker.
+        // The stream used to carry only GIF packets and vsyncs, so a replay presented with
+        // whatever the replayer happened to have in m_privRegs -- which makes every display
+        // bug (DISPFB flips, DISPLAY DX/DY placement, circuit enables) invisible offline.
+        // 2026-09-04: added for the underwater bug, where diving shifts the whole scene.
+        // Old dumps simply have no type 4; the replay skips unknown types it does not know,
+        // and types 2/3 from older recorders are still skipped as before.
+        extern GS *g_gsWb;
+        if (g_gsWb)
+        {
+            const GSRegisters *r = g_gsWb->privRegsForRecord();
+            if (r)
+            {
+                uint64_t v[7] = {r->pmode, r->dispfb1, r->display1, r->dispfb2, r->display2,
+                                 r->bgcolor, r->smode2};
+                const uint8_t hdr[1] = {4u};
+                gsRecPush(hdr, 1, reinterpret_cast<const uint8_t *>(v), sizeof v);
+            }
+        }
+    }
     const uint8_t v[2] = {1u, 0u};
     gsRecPush(v, 2, nullptr, 0);
     // AUTOFLUSH: do not depend on a clean exit. atexit() did not run when the window was closed
@@ -2379,6 +2411,45 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     }
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     { extern GS *g_gsWb; if (!g_gsWb) g_gsWb = this; }
+    {   // [dispwatch] PS2X_DISPWATCH=1: log the FULL CRTC state -- PMODE, both DISPFBs and both
+        // DISPLAYs decoded -- whenever ANY of them changes. The per-register census in the write
+        // handler cannot see these: BT3 writes the privileged regs memory-mapped, bypassing it.
+        // Added 2026-09-04 for the underwater bug (diving shifts the whole scene down-right and
+        // splits the HUD into its own band, which is what an unhandled DISPLAY DX/DY would do).
+        static const bool s_dw = [](){ const char *v = std::getenv("PS2X_DISPWATCH");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (s_dw && m_privRegs)
+        {
+            static uint64_t lpm = ~0ull, ld1 = ~0ull, ld2 = ~0ull, ly1 = ~0ull, ly2 = ~0ull;
+            const uint64_t pm = m_privRegs->pmode, d1 = m_privRegs->dispfb1, d2 = m_privRegs->dispfb2;
+            const uint64_t y1 = m_privRegs->display1, y2 = m_privRegs->display2;
+            if (pm != lpm || d1 != ld1 || d2 != ld2 || y1 != ly1 || y2 != ly2)
+            {
+                lpm = pm; ld1 = d1; ld2 = d2; ly1 = y1; ly2 = y2;
+                static unsigned long n = 0;
+                auto dsp = [](uint64_t v, const char *nm) {
+                    std::fprintf(stderr, "  %s DX=%-5u DY=%-5u MAGH=%u MAGV=%u DW=%-5u DH=%-4u -> visible %ux%u\n",
+                                 nm, (unsigned)(v & 0xFFFu), (unsigned)((v >> 12) & 0x7FFu),
+                                 (unsigned)((v >> 23) & 0xFu), (unsigned)((v >> 27) & 0x3u),
+                                 (unsigned)((v >> 32) & 0xFFFu), (unsigned)((v >> 44) & 0x7FFu),
+                                 (unsigned)(((v >> 32 & 0xFFFu) + 1) / (((v >> 23) & 0xFu) + 1)),
+                                 (unsigned)(((v >> 44 & 0x7FFu) + 1) / (((v >> 27) & 0x3u) + 1)));
+                };
+                auto fb = [](uint64_t v, const char *nm) {
+                    std::fprintf(stderr, "  %s fbp=%-4u fbw=%-3u psm=0x%02x  read origin DBX=%u DBY=%u\n",
+                                 nm, (unsigned)(v & 0x1FFu), (unsigned)((v >> 9) & 0x3Fu),
+                                 (unsigned)((v >> 15) & 0x1Fu),
+                                 (unsigned)((v >> 32) & 0x7FFu), (unsigned)((v >> 43) & 0x7FFu));
+                };
+                std::fprintf(stderr, "[dispwatch] #%lu CRTC CHANGED  pmode=%016llx  EN1=%d EN2=%d MMOD=%d AMOD=%d SLBG=%d ALP=%u\n",
+                             ++n, (unsigned long long)pm, (int)(pm & 1), (int)((pm >> 1) & 1),
+                             (int)((pm >> 5) & 1), (int)((pm >> 6) & 1), (int)((pm >> 7) & 1),
+                             (unsigned)((pm >> 8) & 0xFF));
+                fb(d1, "DISPFB1 "); dsp(y1, "DISPLAY1");
+                fb(d2, "DISPFB2 "); dsp(y2, "DISPLAY2");
+            }
+        }
+    }
     {   // [privlog] PS2X_PRIVLOG=1: the display registers (memory-mapped writes bypass the register handler) every 100 ms
         static const bool s_pl = [](){ const char *v = std::getenv("PS2X_PRIVLOG"); return v && v[0] && v[0] != '0'; }();
         if (s_pl && m_privRegs)
