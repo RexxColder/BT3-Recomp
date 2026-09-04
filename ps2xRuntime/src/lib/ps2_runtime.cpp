@@ -4515,12 +4515,19 @@ void PS2Runtime::run()
                 static unsigned long long s_lastGlCalls = 0, s_lastGlFlush = 0; static double s_lastFlushNs = 0.0;
                 const unsigned long long glc = g_rlglDrawCalls, glf = g_rlglBatchFlushes;
                 extern std::atomic<unsigned long> g_texDecodeCount; static unsigned long s_lastTdc = 0;
+                static unsigned long s_lastHoistTris = 0;   // [glhoist]
                 const unsigned long tdc = g_texDecodeCount.load(std::memory_order_relaxed);
                 std::cerr << "[fps] GAME=" << (double)((gameFrames - s_lastGameFrames) / dt)
                           << " guest_ms=" << guestMs
                           << " wall_ms=" << wallMs
                           << " host=" << (uint32_t)(s_fpsFrames / dt)
                           << " prims/sec=" << (uint64_t)((prims - s_lastPrims) / dt)
+                          << " glhoist/sec=" << [&]{ extern std::atomic<unsigned long> g_glHoistCmds, g_glHoistTris;   // [glhoist]
+                                 static unsigned long s_lc = 0, s_lt = 0;
+                                 const unsigned long cc = g_glHoistCmds.load(std::memory_order_relaxed), tt = g_glHoistTris.load(std::memory_order_relaxed);
+                                 const unsigned long d = (unsigned long)((cc - s_lc) / dt); s_lastHoistTris = (unsigned long)((tt - s_lt) / dt);
+                                 s_lc = cc; s_lt = tt; return d; }()
+                          << " glhoisttris/sec=" << s_lastHoistTris
                           << " vu1pairs/sec=" << [&]{ extern std::atomic<uint64_t> g_vu1PairCount;   // [vupairs]
                                  static uint64_t s_lastVp = 0; const uint64_t vp = g_vu1PairCount.load(std::memory_order_relaxed);
                                  const uint64_t d = (uint64_t)((vp - s_lastVp) / dt); s_lastVp = vp; return d; }()

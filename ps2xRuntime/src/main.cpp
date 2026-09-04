@@ -426,6 +426,11 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
 
     std::fprintf(stderr, "[gsreplay] done: %d vsyncs, %llu transfers\n", vsyncs, (unsigned long long)xfers);
     { extern std::atomic<unsigned long> g_texDecodeCount;
+      {   // [glhoist] the replay prints no [fps] line, and a hoist gate that never holds looks exactly like
+          // a hoist that does nothing -- so the parity gate has to be able to say it actually engaged
+          extern std::atomic<unsigned long> g_glHoistCmds, g_glHoistTris;
+          std::fprintf(stderr, "[replaybench] glhoist: %lu commands, %lu triangles\n",
+                       g_glHoistCmds.load(std::memory_order_relaxed), g_glHoistTris.load(std::memory_order_relaxed)); }
       std::fprintf(stderr, "[replaybench] frames=%ld gs_ms=%.1f render_ms=%.1f | per frame: gs(record)=%.2f ms render(GL)=%.2f ms | texdecodes=%lu\n",
                  g_benchFrames, g_benchGsMs, g_benchRenderMs, g_benchFrames ? g_benchGsMs / g_benchFrames : 0.0, g_benchFrames ? g_benchRenderMs / g_benchFrames : 0.0,
                  g_texDecodeCount.load()); }
