@@ -13443,8 +13443,15 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // destination alpha to TEXA's TA0=48 wherever the fbp336 edge map is non-zero, and
             // this pass darkens there. At GL scale it subtracted 100*48/255 = 19 instead of the
             // hardware's 100*48/128 = 37, roughly half the contrast of console's line.
+            // Default ON since the fbp336 view split (below) restored the ink chain: with the
+            // outline generator sharing one FBO with the glow blur this pass had nothing to
+            // darken, which is why it measured as a no-op and stayed opt-in. On the split it
+            // takes the outline from 516 to 843 edge pixels (console 774, pre-glow build 642)
+            // and moves the character region's darkest 0.5% from 40.6 to 33.8, with the frame
+            // median and every background region unchanged -- it only deepens the ink.
+            // PS2X_ADGS=0 restores the old half-strength line.
             static const bool s_adgs = [](){ const char *v = std::getenv("PS2X_ADGS");
-                                             return v && v[0] && v[0] != '0'; }();
+                                             return !(v && v[0] == '0'); }();
             // Scoped to the outline darkener ONLY: untextured, bm0x52, into a scene buffer.
             // Applying it to every dest-alpha blend wrecks the frame (MAE 14.3 -> 62.4) because
             // most draws store alpha already expanded to the 0..255 convention; this one pass is
