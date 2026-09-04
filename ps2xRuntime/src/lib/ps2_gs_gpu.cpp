@@ -2301,6 +2301,12 @@ void GS::setPrivRegsFromRecord(uint64_t pmode, uint64_t dispfb1, uint64_t displa
     m_privRegs->bgcolor = bgcolor; m_privRegs->smode2 = smode2;
 }
 
+// [recpriv] g_gsWb is a C++ global (defined above); declaring it INSIDE the extern "C"
+// function below gives the declaration C linkage and clang-cl rejects it outright
+// ("declaration of 'g_gsWb' has a different language linkage"), which broke the Windows
+// build. Declare it out here, at C++ linkage, and just use it in the function.
+extern GS *g_gsWb;
+
 extern "C" void ps2xGsRecordVsync()
 {
     {   // [recpriv] record type 4: the CRTC state, once per vsync, BEFORE the vsync marker.
@@ -2310,7 +2316,6 @@ extern "C" void ps2xGsRecordVsync()
         // 2026-09-04: added for the underwater bug, where diving shifts the whole scene.
         // Old dumps simply have no type 4; the replay skips unknown types it does not know,
         // and types 2/3 from older recorders are still skipped as before.
-        extern GS *g_gsWb;
         if (g_gsWb)
         {
             const GSRegisters *r = g_gsWb->privRegsForRecord();
