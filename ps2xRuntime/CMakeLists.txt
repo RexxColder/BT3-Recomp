@@ -415,6 +415,8 @@ endif()
 # runtime type-puns guest memory and relies on integer wraparound.
 if(NOT MSVC)
     target_compile_options(ps2_runtime PRIVATE -O2 -fno-strict-aliasing -fwrapv)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(ps2_runtime PRIVATE /clang:-fno-strict-aliasing /clang:-fwrapv /clang:-ffp-contract=off)   # clang-cl: same contract
 endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
@@ -505,8 +507,10 @@ endif()
 # Optimizing the giant machine-generated TUs pushed a single cl.exe past 34 GB of
 # commit (observed via Resource-Exhaustion event). /bigobj: generated TUs exceed
 # the default COFF section limit.
-if(MSVC)
+if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_compile_options(ps2EntryRunner PRIVATE /Od /bigobj)
+elseif(MSVC)
+    target_compile_options(ps2EntryRunner PRIVATE /bigobj /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-fwrapv)   # clang-cl: optimized like Linux (-O3 there)
 endif()
 
 target_include_directories(ps2_runtime PUBLIC
