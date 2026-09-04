@@ -31,6 +31,7 @@ public:
     static void setEnabled(bool v);
     static bool glowEnabled();      static void setGlow(bool v);
     static bool postfxEnabled();    static void setPostfx(bool v);
+    static bool glowFixEnabled();   static void setGlowFix(bool v);
     static bool bilinearEnabled();  static void setBilinear(bool v);
     static bool halfTexelEnabled(); static void setHalfTexel(bool v);
     static bool skipPostEnabled();  static void setSkipPost(bool v);

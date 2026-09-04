@@ -148,6 +148,9 @@ static void ps2xDirtyAdd(uint32_t fbp, float x0, float y0, float x1, float y1)
     DirtyRect &r = *s_r; r.x0 = std::min(r.x0, x0); r.y0 = std::min(r.y0, y0); r.x1 = std::max(r.x1, x1); r.y1 = std::max(r.y1, y1); }
 static void ps2xDirtyFull(uint32_t fbp) { g_barDirtyRect[fbp].full = true; }
 static std::unordered_set<uint32_t> g_barAlphaStale;   // [bargate2] pages whose LAST flush withheld alpha
+// [glowfix] BT3's bloom/glow chain needs FOUR things at once; any one alone is a REGRESSION
+// (the blend fix on its own washes the whole frame out: ground 146,216,82 vs console 77,115,42).
+static bool ps2xGlowFix() { return GsGpuRenderer::glowFixEnabled(); }
 unsigned long g_gateSeen = 0;   // commands the gate census looked at (PS2X_GATESRC)
 // Pages whose FBO contents have been written back to VRAM this run. A draw sampling one of
 // these can be emitted normally -- the workaround gates that exist because "an FBO cannot be
@@ -176,7 +179,7 @@ std::unordered_map<uint32_t, uint32_t> g_realFbpMap;
 // thread while the guest thread reads.
 #include <atomic>
 namespace {
-    std::atomic<int> g_uiGpu{-1}, g_uiGlow{-1}, g_uiPostfx{-1}, g_uiBilinear{-1},
+    std::atomic<int> g_uiGpu{-1}, g_uiGlow{-1}, g_uiPostfx{-1}, g_uiGlowFix{-1}, g_uiBilinear{-1},
                      g_uiHalfTexel{-1}, g_uiSkipPost{-1}, g_uiSkipStaleVram{-1};
     std::atomic<int> g_uiRenderScale{-1};
     bool uiFlag(std::atomic<int> &a, const char *env, bool defOn)
@@ -194,6 +197,8 @@ namespace {
 bool GsGpuRenderer::glowEnabled()          { return uiFlag(g_uiGlow, "PS2X_GLOW", false); }
 void GsGpuRenderer::setGlow(bool v)        { g_uiGlow.store(v ? 1 : 0); }
 bool GsGpuRenderer::postfxEnabled()        { return uiFlag(g_uiPostfx, "PS2X_POSTFX", false); }
+bool GsGpuRenderer::glowFixEnabled()       { return uiFlag(g_uiGlowFix, "PS2X_GLOWFIX", true); }
+void GsGpuRenderer::setGlowFix(bool v)     { g_uiGlowFix.store(v ? 1 : 0); }
 void GsGpuRenderer::setPostfx(bool v)      { g_uiPostfx.store(v ? 1 : 0); }
 bool GsGpuRenderer::bilinearEnabled()      { return uiFlag(g_uiBilinear, "PS2X_BILINEAR", true); }
 void GsGpuRenderer::setBilinear(bool v)    { g_uiBilinear.store(v ? 1 : 0); }
@@ -683,7 +688,9 @@ namespace
     // since the last snapshot (g_glEnterSeq is bumped by beginFbp's real switch). PS2X_RTSNAP=0 disables.
     std::unordered_map<uint32_t, RenderTexture2D> g_rtSnap; std::unordered_map<uint32_t, uint32_t> g_rtSnapSeq, g_glEnterSeq;
     unsigned long g_rtSnapBlits = 0;
-    static bool rtSnapEnabled() { static const bool s = [](){ const char *v = std::getenv("PS2X_RTSNAP"); return !(v && v[0] == '0'); }(); return s; }
+    static bool rtSnapEnabled() { static const bool s = [](){ const char *v = std::getenv("PS2X_RTSNAP");
+        if (v && v[0]) return v[0] != '0';
+        return !ps2xGlowFix(); }(); return s; }   // [glowfix] default OFF: the snapshot is stale
     static Texture2D rtSnapshotFor(uint32_t fbp, const Fbo &f)
     {
         RenderTexture2D &snap = g_rtSnap[fbp];
@@ -767,11 +774,26 @@ namespace
             // BT3's shadow silhouette buffer (0x2A00 = fbp336) is 256x256 on hardware
             // (FRAME.FBW=4); ours grows to 1024x512 because the same page is also read at other
             // strides, and a silhouette written in 256-space then samples out of the wrong quarter.
-            static const char *s_cap = std::getenv("PS2X_FBOCAP");
+            // [glowfix] default the two caps the bloom chain needs: fbp224 (mask) and fbp336 (glow
+            // buffer) are GROW-ONLY and get pinned far above the size the game addresses, so a read
+            // that uses the DECLARED size lands in the untouched part of the buffer.
+            static const char *s_capEnv = std::getenv("PS2X_FBOCAP");
+            static const char *s_cap = (s_capEnv && s_capEnv[0]) ? s_capEnv
+                                     : (ps2xGlowFix() ? "224:512x448,336:256x256" : nullptr);
             if (s_cap && s_cap[0])
             {
+                // accepts a comma-separated list: "224:512x448,336:256x256"
                 unsigned cf = 0, cw = 0, ch = 0;
-                if (std::sscanf(s_cap, "%u:%ux%u", &cf, &cw, &ch) == 3 && cf == fbp && cw && ch)
+                bool hit = false;
+                for (const char *q = s_cap; q && *q; )
+                {
+                    unsigned f2 = 0, w2 = 0, h2 = 0;
+                    if (std::sscanf(q, "%u:%ux%u", &f2, &w2, &h2) == 3 && f2 == fbp && w2 && h2)
+                    { cf = f2; cw = w2; ch = h2; hit = true; break; }
+                    const char *nx = std::strchr(q, ',');
+                    q = nx ? nx + 1 : nullptr;
+                }
+                if (hit && cf == fbp && cw && ch)
                 { w = (int)cw; h = (int)ch;
                   if (f.rt.texture.id != 0 && (f.w != (int)cw || f.h != (int)ch))
                   { ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); f.rt = RenderTexture2D{}; f.w = f.h = 0; }
@@ -8145,8 +8167,14 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             {
                 // (Cs-Cd)*FIX/128 + Cd = Cs*k + Cd*(1-k), k = FIX/128 -> constant-alpha blend.
                 float k = (float)bc.blendFix / 128.0f; if (k > 1.0f) k = 1.0f;
-                glBlendColor(0.0f, 0.0f, 0.0f, k);
-                srcRGB = 0x8001 /*GL_CONSTANT_ALPHA*/; dstRGB = 0x8002 /*GL_ONE_MINUS_CONSTANT_ALPHA*/;
+                // [blendconst] 0x8001/0x8002 are GL_CONSTANT_COLOR / ONE_MINUS_CONSTANT_COLOR (the
+                // comment said ALPHA; GL_CONSTANT_ALPHA is 0x8003), so the RGB factor came from the
+                // blend colour's RGB -- which was (0,0,0), multiplying Cs by ZERO. Gated separately
+                // from the glow fix: this equation covers far more draws and wants its own pass.
+                static const bool s_bc2 = [](){ const char *v = std::getenv("PS2X_BLENDCONST2");
+                                                return v && v[0] && v[0] != '0'; }();
+                if (s_bc2) glBlendColor(k, k, k, k); else glBlendColor(0.0f, 0.0f, 0.0f, k);
+                srcRGB = 0x8001 /*GL_CONSTANT_COLOR, rgb=k when fixed*/; dstRGB = 0x8002;
             }
             else if (eq == 3)
             {
@@ -8164,8 +8192,11 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             {
                 // Cs*FIX/128 + Cd: additive with constant factor (bm 0x68 postfx bloom strips).
                 float k = (float)bc.blendFix / 128.0f; if (k > 1.0f) k = 1.0f;
-                glBlendColor(0.0f, 0.0f, 0.0f, k);
-                srcRGB = 0x8001; dstRGB = F_ONE;
+                // [blendconst] same wrong enum: GL_CONSTANT_COLOR reads the blend colour's RGB,
+                // which was (0,0,0) -- so this ADDITIVE bloom composite added exactly nothing.
+                // This is the Kaioken/attack glow. Put k in RGB so the factor is k either way.
+                if (ps2xGlowFix()) glBlendColor(k, k, k, k); else glBlendColor(0.0f, 0.0f, 0.0f, k);
+                srcRGB = 0x8001 /*GL_CONSTANT_COLOR, rgb=k when fixed*/; dstRGB = F_ONE;
             }
             else if (eq == 7)
             {
@@ -13375,7 +13406,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             static const bool s_fo32 = [](){ const char *v = std::getenv("PS2X_FBOONE32");
                                              return v && v[0] && v[0] != '0'; }();
             const bool ct32src = (c.srcPsm == 0x00u);
-            const float want = (fromFbo && !idxRt && !(s_fo32 && ct32src)) ? 1.0f : 0.0f;
+            const bool keepCt32Alpha = s_fo32 || ps2xGlowFix();   // [glowfix]
+            const float want = (fromFbo && !idxRt && !(keepCt32Alpha && ct32src)) ? 1.0f : 0.0f;
             if (want != curFO && g_locFboOne >= 0)
             { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locFboOne, &want, SHADER_UNIFORM_FLOAT); curFO = want; }
         }
