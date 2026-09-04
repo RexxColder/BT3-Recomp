@@ -811,9 +811,16 @@ namespace
             // that uses the DECLARED size lands in the untouched part of the buffer.
             static const char *s_capEnv = std::getenv("PS2X_FBOCAP");
             static const char *s_cap = (s_capEnv && s_capEnv[0]) ? s_capEnv
-                                     : (ps2xGlowFix() ? (ps2xGlowView() ? "224:512x448,848:256x256"
+                                     : (ps2xGlowFix() ? (ps2xGlowView() ? "224:512x448,848:256x256,1104:512x448"
                                                                         : "224:512x448,336:256x256")
                                                       : nullptr);
+            // [fbwsplit] 1104 is page 336's FBW=8 CT32 view (see viewKey). fboSizeFor's maps are
+            // keyed by RAW fbp, so a relocated view has no entry and falls through to m_fboW --
+            // which is 640 in the LIVE runtime (FB_WIDTH) but 512 in the replay driver. The
+            // content written into it is 512 wide either way, so live it filled only 512 of a
+            // 640-wide surface and everything downstream showed the right 20% as black: the
+            // underwater picture lost its right fifth, in every aspect mode. That asymmetry is
+            // also why no replay could ever reproduce it. Pin it to the size it is addressed at.
             if (s_cap && s_cap[0])
             {
                 // accepts a comma-separated list: "224:512x448,336:256x256"
@@ -17057,12 +17064,33 @@ if (done.size() < 14 && !done.count(c.texKey))
     // PS2X_PRESENTDUMP: export the PRESENTED texture (what the window shows) every 60 renders,
     // numbered — resolves "FBO dump has content but the screen is black" contradictions.
     {
+        // PS2X_PRESENTDUMP=<n>: n is the render interval (default 60). The cap is 10 at the
+        // default interval and 60 when an interval is given, so a capture can span long enough
+        // to catch a specific moment (e.g. going under water) instead of only the first 20 s.
+        static const int s_pdEvery = [](){ const char *v = std::getenv("PS2X_PRESENTDUMP");
+                                           const int n = v && v[0] ? std::atoi(v) : 0;
+                                           return n > 1 ? n : 60; }();
+        static const int s_pdCap = [](){ const char *v = std::getenv("PS2X_PRESENTDUMP");
+                                         const int n = v && v[0] ? std::atoi(v) : 0;
+                                         return n > 1 ? 60 : 10; }();
         static const bool s_pd = [](){ const char *v = std::getenv("PS2X_PRESENTDUMP"); return v && v[0] && v[0] != '0'; }();
         static int s_pn = 0, s_pf = 0;
-        if (s_pd && outId != 0 && (++s_pf % 60) == 0 && cmds.size() > 4000 && s_pn < 10)
+        if (s_pd && outId != 0 && (++s_pf % s_pdEvery) == 0 && cmds.size() > 4000 && s_pn < s_pdCap)
         {
             Texture2D pt{};
-            pt.id = outId; pt.width = m_presentTexW; pt.height = m_presentTexH;
+            pt.id = outId;
+            {   // [rscale] the SAME trap debugSavePresent documents: at render scale > 1 the
+                // present texture is N x native while m_presentTexW/H still describe the native
+                // size, so LoadImageFromTexture allocates too little and glGetTexImage overruns
+                // it (SIGSEGV). Ask GL for the real level size instead of trusting the fields.
+                int tw = 0, th = 0;
+                glBindTexture(0x0DE1 /*GL_TEXTURE_2D*/, outId);
+                glGetTexLevelParameteriv(0x0DE1, 0, 0x1000 /*GL_TEXTURE_WIDTH*/, &tw);
+                glGetTexLevelParameteriv(0x0DE1, 0, 0x1001 /*GL_TEXTURE_HEIGHT*/, &th);
+                glBindTexture(0x0DE1, 0);
+                pt.width  = tw > 0 ? tw : (m_presentTexW > 0 ? m_presentTexW : 512);
+                pt.height = th > 0 ? th : (m_presentTexH > 0 ? m_presentTexH : 448);
+            }
             pt.mipmaps = 1; pt.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
             Image im = LoadImageFromTexture(pt);
             char p[128]; std::snprintf(p, sizeof(p), "/home/z3/Desktop/bt3/work/present_%02d.png", s_pn++);
