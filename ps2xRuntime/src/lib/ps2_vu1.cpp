@@ -1018,6 +1018,31 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (s_jitProg)
         {
             ++s_jitRuns;
+            {   // [vuentry] PS2X_VUENTRY=1: which PCs does a program actually get ENTERED at? The generated
+                // body gives EVERY pair a label so `goto *jt[st.pc>>3]` can land anywhere, and taking a
+                // label's address forces the compiler to treat that pair as a basic block with unknown
+                // predecessors -- which is why nothing (vf registers above all) can stay live across a pair
+                // boundary. Only 5.2% of pairs are static branch targets, so if the ENTRY set is also small
+                // the rest can become straight-line superblocks. This census is what says whether it is.
+                static const bool s_ve = [](){ const char *v = std::getenv("PS2X_VUENTRY"); return v && v[0] && v[0] != '0'; }();
+                if (s_ve)
+                {
+                    static std::map<uint64_t, std::map<uint32_t, unsigned long>> s_ent;   // prog hash -> entry pc -> count
+                    static auto t0 = std::chrono::steady_clock::now();
+                    ++s_ent[s_jitProg->hash][entryPc];
+                    const auto now = std::chrono::steady_clock::now();
+                    if (std::chrono::duration<double>(now - t0).count() >= 5.0)
+                    {
+                        for (auto &pr : s_ent)
+                        {
+                            std::fprintf(stderr, "[vuentry] prog %016llx entries:", (unsigned long long)pr.first);
+                            for (auto &e : pr.second) std::fprintf(stderr, " 0x%x=%lu", e.first, e.second);
+                            std::fprintf(stderr, "  (%zu distinct)\n", pr.second.size());
+                        }
+                        t0 = now;
+                    }
+                }
+            }
             extern std::atomic<uint64_t> g_bt3FrameCount;   // [vuverifyfrom]
             if (s_jitVerify && g_bt3FrameCount.load(std::memory_order_relaxed) >= s_jitVerifyFrom)
             {
