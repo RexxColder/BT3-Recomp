@@ -7436,7 +7436,20 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     // relocating the scene buffers' CT16 depth re-view as well is a much larger change (that is
     // what PS2X_ALIASSKIP handles instead). PS2X_GLOWVIEW=0 disables.
     const bool s_glowView = ps2xGlowView();
-    auto viewKey = [&](uint32_t fbp, uint8_t psm) -> uint32_t {
+    // [fbwsplit] Page 336's CT32 view has TWO writers at different sizes: the glow silhouette
+    // (FRAME.FBW=4, extent 256x256, ~6100 draws/frame) and a second 512-wide consumer
+    // (FBW=8, extent 512x224, 16 draws) that the underwater view depends on. One surface cannot
+    // be both: pinned to 256x256 the 512-wide writer is clipped in half and the underwater
+    // picture floods; sized 512 the glow's 256-space reads break. Give the FBW=8 writer its own
+    // view as well. sizeHint = FRAME.FBW for a destination, the declared texture width for a
+    // source; 0 = unknown, which keeps the existing (small/glow) view.
+    // Default ON wherever the CT32 view is split at all (PS2X_GLOWVIEW); PS2X_FBWSPLIT=0
+    // disables. Validated on both scenes: the underwater frame becomes pixel-identical to the
+    // uncapped reference (MAE 0.000) while the Kaioken frame, ordinary fight frames and the
+    // menu/memory-card replay are all bit-identical to the build before it (MAE 0.0000).
+    const bool s_fbwSplit = [](){ const char *v = std::getenv("PS2X_FBWSPLIT");
+                                  return v && v[0] ? (v[0] != '0') : true; }() && s_glowView;
+    auto viewKey = [&](uint32_t fbp, uint8_t psm, int sizeHint = 0) -> uint32_t {
         if (fbp >= 512u) return fbp;
         if (!s_fboView && !(s_glowView && fbp == 336u)) return fbp;
         auto pit = primaryPsm.find(fbp);
@@ -7461,7 +7474,10 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 }
             }
         }
-        return moved ? (fbp + 512u) : fbp;
+        if (!moved) return fbp;
+        if (s_fbwSplit && fbp == 336u && sizeHint > 4 && psmBits(psm) == 32)
+            return fbp + 768u;      // the wide (FBW=8 / 512-declared) CT32 writer: its own surface
+        return fbp + 512u;
     };
 
     // Per-VIEW dimensions. fboSizeFor's maps (sourceFbps / rtTexW / rtTexH / destFbwById) are
@@ -9972,7 +9988,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 rlDrawRenderBatchActive();
         }
         {
-            const uint32_t destKey = viewKey(c.destFbp, c.destPsm);
+            const uint32_t destKey = viewKey(c.destFbp, c.destPsm, (int)c.destFbw);
             if (destKey != curFbp) { beginFbp(destKey); curBlendOn = -1; curBlendEq = -1; /* beginFbp re-enabled BLEND_ALPHA */ }
         }
         if (c.isVramBlit)
@@ -12023,8 +12039,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         // sf stays the RAW page for the arithmetic checks below (sf*32 == srcTbp0); sfKey is
         // the FBO-map key, which relocates a secondary bit-depth view (see PS2X_FBOVIEW). A
         // PSMT8/PSMT8H read of a CT32 buffer keeps the base key; only a PSMCT16 re-view moves.
-        const uint32_t sfKey  = viewKey(sf, c.srcPsm);
-        const uint32_t dstKey = viewKey(c.destFbp, c.destPsm);
+        const uint32_t sfKey  = viewKey(sf, c.srcPsm, c.srcTexW > 256 ? 8 : 4);
+        const uint32_t dstKey = viewKey(c.destFbp, c.destPsm, (int)c.destFbw);
         // PS2X_VRAMREAD: an ALIASED read -- one whose source format has a different bit depth
         // from how that page was RENDERED -- must come from VRAM BYTES, not from the colour FBO.
         // The FBO is one fixed interpretation; VRAM is the bytes, and decoding them with the
@@ -16877,6 +16893,163 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if ((s_pinCache == 0 || s_pinCache == 112) && g_fbos.count((uint32_t)s_pinCache)
                     && g_fbos[(uint32_t)s_pinCache].rt.texture.id != 0)
                 { displayFbp = (uint32_t)s_pinCache; presentLatch = false; }
+            }
+        }
+    }
+
+    {   // [uwater] PS2X_UWATER=1: every BIG sprite into a scene buffer, with the source it
+        // samples and the UV rect it uses. The underwater view draws a blurred, zoomed overlay;
+        // if it samples a render target with a declared size different from the FBO we hold,
+        // that is the fbp336 failure mode again (256-space reads out of a grown buffer).
+        static const bool s_uw = [](){ const char *v = std::getenv("PS2X_UWATER");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (s_uw && g_replayInWindow)
+        {
+            static unsigned long s_fr = 0; ++s_fr;
+            {   // [uw336] every use of page 336 (the glow/DoF blur buffer), by declared size.
+                // The 256x256 cap on its CT32 view is what breaks the underwater picture, so the
+                // question is which consumer addresses it LARGER than 256 when under water.
+                struct U { unsigned long n = 0; double maxU = 0, maxV = 0; };
+                std::map<uint64_t, U> rd, wr;
+                for (const DrawCmd &c : cmds)
+                {
+                    if (c.isTransfer) continue;
+                    if (c.srcTbp0 == 336u * 32u)
+                    {
+                        U &e = rd[((uint64_t)c.srcPsm << 40) | ((uint64_t)(c.srcTexW & 0xFFFF) << 24)
+                                  | ((uint64_t)(c.srcTexH & 0xFFFF) << 8) | (uint64_t)c.blendMode];
+                        ++e.n; e.maxU = std::max(e.maxU, (double)std::max(c.su0, c.su1));
+                        e.maxV = std::max(e.maxV, (double)std::max(c.sv0, c.sv1));
+                    }
+                    if (c.destFbp == 336u)
+                    {
+                        const double x1 = c.isTriangle ? std::max(std::max(c.tri[0].x, c.tri[1].x), c.tri[2].x) : c.dx1;
+                        const double y1 = c.isTriangle ? std::max(std::max(c.tri[0].y, c.tri[1].y), c.tri[2].y) : c.dy1;
+                        U &e = wr[((uint64_t)c.destPsm << 40) | ((uint64_t)(c.destFbw & 0xFFFF) << 24)];
+                        ++e.n; e.maxU = std::max(e.maxU, x1); e.maxV = std::max(e.maxV, y1);
+                    }
+                }
+                std::fprintf(stderr, "[uw336] frame %lu  READS of page 336:\n", s_fr);
+                for (auto &kv : rd)
+                    std::fprintf(stderr, "[uw336]   psm=0x%02x declared=%ux%u bm=0x%02x  n=%-5lu maxUV=(%.0f,%.0f)\n",
+                                 (unsigned)((kv.first >> 40) & 0xFF), (unsigned)((kv.first >> 24) & 0xFFFF),
+                                 (unsigned)((kv.first >> 8) & 0xFFFF), (unsigned)(kv.first & 0xFF),
+                                 kv.second.n, kv.second.maxU, kv.second.maxV);
+                std::fprintf(stderr, "[uw336] frame %lu  WRITES into page 336:\n", s_fr);
+                for (auto &kv : wr)
+                    std::fprintf(stderr, "[uw336]   psm=0x%02x FBW=%u  n=%-5lu extent=(%.0f,%.0f)\n",
+                                 (unsigned)((kv.first >> 40) & 0xFF), (unsigned)((kv.first >> 24) & 0xFFFF),
+                                 kv.second.n, kv.second.maxU, kv.second.maxV);
+            }
+            {   // [uwscissor] the underwater scene lands in exactly the LEFT 256 of 512 columns.
+                // Census every draw into a scene buffer by (destFbw, scissor) so the pass that
+                // establishes that half-width region is visible, and separately by destination
+                // page so a half-size offscreen buffer shows up.
+                struct S { unsigned long n = 0; double area = 0; };
+                std::map<uint64_t, S> sc;
+                std::map<uint32_t, S> pages;
+                for (const DrawCmd &c : cmds)
+                {
+                    if (c.isTransfer) continue;
+                    S &pg = pages[c.destFbp]; ++pg.n;
+                    if (c.destFbp != 0u && c.destFbp != 112u) continue;
+                    const uint64_t k = ((uint64_t)c.destFbw << 48) | ((uint64_t)(c.sx & 0xFFFF) << 32)
+                                     | ((uint64_t)(c.sw & 0xFFFF) << 16) | (uint64_t)(c.sh & 0xFFFF);
+                    S &e = sc[k]; ++e.n;
+                }
+                std::fprintf(stderr, "[uwater] --- frame %lu: scene draws by (FBW, scissor) ---\n", s_fr);
+                for (auto &kv : sc)
+                    std::fprintf(stderr, "[uwater]   FBW=%-3u scissor x=%-4u w=%-4u h=%-4u   n=%lu\n",
+                                 (unsigned)(kv.first >> 48), (unsigned)((kv.first >> 32) & 0xFFFF),
+                                 (unsigned)((kv.first >> 16) & 0xFFFF), (unsigned)(kv.first & 0xFFFF), kv.second.n);
+                std::fprintf(stderr, "[uwater]   destination pages this frame:");
+                for (auto &kv : pages) std::fprintf(stderr, " f%u=%lu", kv.first, kv.second.n);
+                std::fprintf(stderr, "\n");
+            }
+            std::map<uint64_t, std::pair<unsigned long, const DrawCmd *>> agg;
+            {   // MAGNIFYING draws, anywhere: a dest rect bigger than the source rect it samples.
+                // The underwater view is uniformly ZOOMED, which is what reading a render target
+                // back at the wrong scale looks like -- so find every draw whose dst/src ratio is
+                // not 1, including VRAM transfers (replayed as FBO->FBO blits) and triangles.
+                for (const DrawCmd &c : cmds)
+                {
+                    float sw2, sh2, dw2, dh2;
+                    if (c.isTransfer) { sw2 = (float)c.xW; sh2 = (float)c.xH; dw2 = (float)c.xW; dh2 = (float)c.xH; }
+                    else if (c.isTriangle) continue;
+                    else { sw2 = std::fabs(c.su1 - c.su0); sh2 = std::fabs(c.sv1 - c.sv0);
+                           dw2 = std::fabs(c.dx1 - c.dx0); dh2 = std::fabs(c.dy1 - c.dy0); }
+                    if (sw2 < 4.0f || sh2 < 4.0f || dw2 < 32.0f || dh2 < 32.0f) continue;
+                    const float kx = dw2 / sw2, ky = dh2 / sh2;
+                    if (std::fabs(kx - 1.0f) < 0.08f && std::fabs(ky - 1.0f) < 0.08f) continue;   // 1:1
+                    static int s_mn = 0;
+                    if (s_mn < 60) { ++s_mn;
+                        std::fprintf(stderr, "[uwater] MAG x%.2f,%.2f  dest=f%-4u src=%-6u psm=0x%02x bm=0x%02x %s"
+                                             " declared=%dx%d  src=(%.0f,%.0f %.0fx%.0f) dst=(%.0f,%.0f %.0fx%.0f)\n",
+                                     kx, ky, c.isTransfer ? c.xDstFbp : c.destFbp,
+                                     c.isTransfer ? c.xSrcFbp * 32u : c.srcTbp0, (unsigned)c.srcPsm,
+                                     (unsigned)c.blendMode, c.isTransfer ? "XFER" : (c.texKey ? "spr" : "UNTEX"),
+                                     c.srcTexW, c.srcTexH,
+                                     c.isTransfer ? (float)c.xSX : c.su0, c.isTransfer ? (float)c.xSY : c.sv0, sw2, sh2,
+                                     c.isTransfer ? (float)c.xDX : c.dx0, c.isTransfer ? (float)c.xDY : c.dy0, dw2, dh2); }
+                }
+            }
+            for (const DrawCmd &c : cmds)
+            {
+                if (c.isTransfer || c.isTriangle) continue;
+                if (c.destFbp != 0u && c.destFbp != 112u) continue;
+                const float w2 = std::fabs(c.dx1 - c.dx0), h2 = std::fabs(c.dy1 - c.dy0);
+                if (w2 * h2 < 512.0f * 448.0f * 0.20f) continue;       // < 20% of the frame
+                const uint64_t k = ((uint64_t)c.srcTbp0 << 24) | ((uint64_t)c.srcPsm << 16)
+                                 | ((uint64_t)c.blendMode << 8) | (unsigned)(c.texKey ? 1 : 0);
+                auto &e = agg[k]; ++e.first; if (!e.second) e.second = &c;
+            }
+            {   // TRIANGLES: the water is geometry, not an overlay. Tally by texture class and
+                // by the screen area covered, so the water mass is the class with the largest area.
+                struct T { double area = 0; unsigned long n = 0; const DrawCmd *ex = nullptr; };
+                std::map<uint64_t, T> tri;
+                for (const DrawCmd &c : cmds)
+                {
+                    if (c.isTransfer || !c.isTriangle) continue;
+                    if (c.destFbp != 0u && c.destFbp != 112u) continue;
+                    const float x0 = std::min(std::min(c.tri[0].x, c.tri[1].x), c.tri[2].x);
+                    const float x1 = std::max(std::max(c.tri[0].x, c.tri[1].x), c.tri[2].x);
+                    const float y0 = std::min(std::min(c.tri[0].y, c.tri[1].y), c.tri[2].y);
+                    const float y1 = std::max(std::max(c.tri[0].y, c.tri[1].y), c.tri[2].y);
+                    const double a = (double)(x1 - x0) * (y1 - y0) * (c.triCount ? c.triCount : 1);
+                    const uint64_t k = ((uint64_t)c.srcTbp0 << 24) | ((uint64_t)c.srcPsm << 16)
+                                     | ((uint64_t)c.blendMode << 8) | (unsigned)(c.texKey ? 1 : 0);
+                    auto &e = tri[k]; e.area += a; e.n += (c.triCount ? c.triCount : 1); if (!e.ex) e.ex = &c;
+                }
+                std::vector<std::pair<double, uint64_t>> ord;
+                for (auto &kv : tri) ord.push_back({kv.second.area, kv.first});
+                std::sort(ord.rbegin(), ord.rend());
+                std::fprintf(stderr, "[uwater] frame %lu: top textured TRIANGLE classes into the scene by area\n", s_fr);
+                for (size_t i = 0; i < ord.size() && i < 8; ++i)
+                {
+                    T &e = tri[ord[i].second]; const DrawCmd &c = *e.ex;
+                    std::fprintf(stderr, "[uwater]   area=%-10.0f tris=%-6lu src=%-6u psm=0x%02x bm=0x%02x clut=%-6u"
+                                         " tex=%dx%d %s abe=%d tfx=%u tcc=%u rgba=(%u,%u,%u,%u)\n",
+                                 e.area, e.n, c.srcTbp0, (unsigned)c.srcPsm, (unsigned)c.blendMode, c.srcClutTbp,
+                                 c.srcTexW, c.srcTexH, c.texKey ? "tex" : "UNTEX", c.abe ? 1 : 0,
+                                 (unsigned)c.tfx, (unsigned)c.tcc,
+                                 (unsigned)c.tri[0].r, (unsigned)c.tri[0].g, (unsigned)c.tri[0].b, (unsigned)c.tri[0].a);
+                }
+            }
+            std::fprintf(stderr, "[uwater] frame %lu: %zu big scene sprites classes\n", s_fr, agg.size());
+            for (auto &kv : agg)
+            {
+                const DrawCmd &c = *kv.second.second;
+                std::fprintf(stderr, "[uwater]   n=%-3lu src=%-6u psm=0x%02x bm=0x%02x tex=%s"
+                                     " declared=%dx%d  uv=(%.0f,%.0f)-(%.0f,%.0f)  dst=(%.0f,%.0f)-(%.0f,%.0f)\n",
+                             kv.second.first, c.srcTbp0, (unsigned)c.srcPsm, (unsigned)c.blendMode,
+                             c.texKey ? "yes" : "UNTEX", c.srcTexW, c.srcTexH,
+                             c.su0, c.sv0, c.su1, c.sv1, c.dx0, c.dy0, c.dx1, c.dy1);
+                const uint32_t sfp = c.srcTbp0 / 32u;
+                auto fit = g_fbos.find(sfp);
+                if (fit != g_fbos.end())
+                    std::fprintf(stderr, "[uwater]       source page %u is an FBO of %dx%d (declared %dx%d)%s\n",
+                                 sfp, fit->second.w, fit->second.h, c.srcTexW, c.srcTexH,
+                                 (fit->second.w != c.srcTexW || fit->second.h != c.srcTexH) ? "   <-- SIZE MISMATCH" : "");
             }
         }
     }
