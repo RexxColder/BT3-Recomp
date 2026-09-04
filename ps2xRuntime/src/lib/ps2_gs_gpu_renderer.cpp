@@ -258,6 +258,7 @@ static float ps2xHalfTexel()
 // first use (x64 has a single calling convention, so the plain signature is fine).
 #if defined(_WIN32)
 extern "C" __declspec(dllimport) void *__stdcall wglGetProcAddress(const char *name);
+extern "C" unsigned long long ps2xWinThreadCpuNs();   // ps2_win_timer.cpp: per-thread CPU time for [guestbusy]
 static void glBlendColor(float red, float green, float blue, float alpha)
 {
     typedef void (*PFN)(float, float, float, float);
@@ -5667,7 +5668,7 @@ void GsGpuRenderer::swapFrame()
     {   // [guestbusy] the guest thread's CPU time per published frame (the game paces in whole vsyncs, so the fps counter
         // hides everything between 33 and 50 ms; this is the number that says how far the frame is from 30 fps)
 #if defined(_WIN32)
-        const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();   // no per-thread CPU clock without <windows.h>: wall time stands in
+        const uint64_t now = ps2xWinThreadCpuNs();   // ps2_win_timer.cpp (GetThreadTimes)
 #else
         struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
         const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
