@@ -2048,7 +2048,13 @@ void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, 
         ps2GpuRenderer().onVramWriteback(base + pr0 * bw * 32u, (pr1 - pr0) * bw * 32u); gs->bumpPageUploadGen(base + pr0 * bw * 32u, (pr1 - pr0) * bw * 32u);   // [clutpagegen]
     }
     else
-    ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u)); gs->bumpPageUploadGen(base, (uint32_t)(((size_t)w * h * 4u) / 256u));   // [clutpagegen]
+    {   // [clutpagegen] braces: without them the else took only the FIRST statement and the
+        // bumpPageUploadGen below ran unconditionally -- so the if-branch bumped twice, once
+        // for its page range and again for the whole buffer. clang's -Wmisleading-indentation
+        // flagged it (it is what a Windows builder hit).
+        ps2GpuRenderer().onVramWriteback(base, (uint32_t)(((size_t)w * h * 4u) / 256u));
+        gs->bumpPageUploadGen(base, (uint32_t)(((size_t)w * h * 4u) / 256u));
+    }
 }
 
 
