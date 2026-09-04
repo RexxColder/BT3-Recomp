@@ -94,7 +94,12 @@ static inline __attribute__((always_inline)) void commitRaw(float *dst, __m128 r
 
 // ---------------------------------------------------------------- upper
 template <uint32_t W>
-static inline bool jitUpper(VU1State &st)
+// [vurestrict] st is the VU1 register file, vuData is VU1 data memory -- two separate allocations that
+// never alias. Saying so matters: vuData is a uint8_t*, which aliases EVERYTHING by the strict-aliasing
+// rules, so without __restrict every SQ/ISW store through it forces the compiler to assume st.vf may have
+// changed and reload it. That reload, not the per-pair labels, is the suspected reason the VU1 body cannot
+// keep vector registers live (see the superblock result in the ledger).
+static inline bool jitUpper(VU1State &__restrict st)
 {
     constexpr uint32_t op = jOP(W);
     constexpr uint8_t dest = jDEST(W), ft = jFT(W), fs = jFS(W), fd = jFD(W);
@@ -236,7 +241,7 @@ static inline bool jitUpper(VU1State &st)
 
 // ---------------------------------------------------------------- lower (non-branch)
 template <uint32_t LO>
-static inline bool jitLower(VU1State &st, uint8_t *vuData, uint32_t dataSize)
+static inline bool jitLower(VU1State &__restrict st, uint8_t *__restrict vuData, uint32_t dataSize)
 {
     if constexpr (LO == 0u || LO == 0x8000033Cu) return true;   // NOP
     constexpr uint32_t opHi = (LO >> 25) & 0x7Fu;
