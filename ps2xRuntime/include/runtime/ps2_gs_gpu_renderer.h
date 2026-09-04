@@ -122,6 +122,16 @@ public:
         float z = 0.0f;             // sprite depth (normalized GL window depth, larger=nearer)
         // triangle (isTriangle == true): normalized UV + per-vertex color
         Vtx tri[3];
+        // [drawbatch] PLAIN-CLASS BATCHING. Ordinary scene triangles arrive in long runs that
+        // share every field above -- one command per triangle then costs a ~330 B fill + copy +
+        // move each (measured ~240 ns/prim of record path at 37k prims/frame). A batched command
+        // carries triangle 0 in tri[] and triangles 1..triCount-1 in triMore (3 Vtx each); every
+        // other field describes all of them. triCount == 1 (and triMore == nullptr) is the
+        // ordinary one-triangle command, so nothing that walks a list of these changes shape.
+        // Only the classes batchEligible() admits are ever batched -- see it for what is excluded
+        // and why (HUD splits, alias passes, decals, self-feedback reads, the outline darkener).
+        uint32_t triCount = 1;
+        std::shared_ptr<std::vector<Vtx>> triMore;
         // GS depth (Z) test state, captured only when PS2X_GPU_DEPTH is on. When off,
         // depthTest stays false and replay behaves exactly as today (no depth test).
         //   depthFunc mirrors GS TEST.ZTST: 0=NEVER, 1=ALWAYS, 2=GEQUAL, 3=GREATER.
@@ -341,6 +351,25 @@ public:
                            const uint8_t *vram, uint32_t vramSize);
     void putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi);
     void recordCmd(const DrawCmd &cmd);
+    // [drawbatch] ---- plain-class triangle batching (guest thread only) ----
+    // Batching lives entirely in the guest-owned staging buffer (PS2X_RECSTAGE > 0, the default):
+    // the open batch is m_stage[m_openBatchIdx], so appending needs no lock at all and the GL
+    // thread can never see a half-built batch. flushStage() closes it before the commands become
+    // visible. With RECSTAGE <= 0 (everything under m_mtx) batching is simply off.
+    static bool batchingEnabled();                       // PS2X_DRAWBATCH (default on) && RECSTAGE > 0
+    static bool batchEligible(const DrawCmd &c);         // is this command a plain scene triangle?
+    static int  batchWhy(const DrawCmd &c);              // 0 = eligible, else which rule rejected it
+    static void batchWhyCensus(const DrawCmd &c);        // [batchwhy] PS2X_BATCHWHY=1 rejection census
+    static bool sameBatchState(const DrawCmd &a, const DrawCmd &b);   // every field except tri[]/triCount/triMore
+    bool batchOpen() const { return m_openBatchIdx != (size_t)-1; }   // guest thread only
+    // Append one triangle to the open batch. Returns false if there is no open batch, it is
+    // full, or the caller's state no longer matches -- the caller then records a full command.
+    bool appendBatchTri(const Vtx v[3], bool addDirty = true);
+    void closeBatch() { m_openBatchIdx = (size_t)-1; }
+    // Bumped by every recordCmd and every appended triangle. The recorder keeps the last value it
+    // saw next to its retained command; a mismatch means SOMETHING ELSE recorded in between (another
+    // thread, an internal blit, an alias pass), so the retained state is no longer the batch head's.
+    uint64_t batchSeq() const { return m_batchSeq; }
     void swapFrame();      // frame boundary (FUN_00100ab8): publish command list
     void onVramUpload(uint32_t dbpBlock, uint32_t sizeBlocks); // stamp the written VRAM pages
     bool hasPendingFrame();   // [pubbreak] a published list is waiting for its present
@@ -409,6 +438,19 @@ private:
     std::vector<DrawCmd> m_building;
     std::vector<DrawCmd> m_stage;   // [recstage] guest-owned staging, moved into m_building under one lock
     void flushStage();
+    // [drawbatch] index into m_stage of the batch currently accepting triangles ((size_t)-1 = none).
+    size_t m_openBatchIdx = (size_t)-1;
+    // g_barDirtyGen as it stood when the batch head did its barrier bookkeeping; an append is only
+    // valid while nothing has REMOVED a dirty entry since (see appendBatchTri).
+    uint32_t m_openBatchDirtyGen = 0;
+    // Recycled vertex stores for batched commands. A store is handed to a DrawCmd by shared_ptr and
+    // travels with it through m_building -> m_pending -> the replay; use_count()==1 means the last
+    // holder is this ring, so it can be refilled without a fresh allocation. Batches of one triangle
+    // never take a store at all (tri[] holds it), so this only churns for runs that really merged.
+    std::vector<std::shared_ptr<std::vector<Vtx>>> m_vtxRing;
+    size_t m_vtxRingPos = 0;
+    uint64_t m_batchSeq = 0;
+    std::shared_ptr<std::vector<Vtx>> takeVtxStore();
     std::vector<DrawCmd> m_ready;
     // Published-but-not-yet-replayed lists, oldest first. FBOs are persistent (content only
     // changes by replaying draws), so every published list MUST be replayed exactly once, in

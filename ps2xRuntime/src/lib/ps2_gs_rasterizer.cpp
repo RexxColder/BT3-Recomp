@@ -4401,7 +4401,34 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     }
     GsGpuRenderer &r = ps2GpuRenderer();
     gprof::mark(gprof::REC_BUILD);   // [guestprof]
-    GsGpuRenderer::DrawCmd cmd{};
+    // [drawbatch] A CONTINUATION of the renderer's open plain-class batch does not fill the state
+    // part at all: it only writes the three vertices and appends them (see GsGpuRenderer::DrawCmd
+    // ::triCount). The retained command is provably still correct because
+    //   - tplHit means gs->m_stateGen is unchanged, and writeRegister bumps it for EVERY register
+    //     except the per-vertex ones (RGBAQ/ST/UV/XYZ*/FOG), plus the GIF IMAGE branch and the SW
+    //     draw path -- so every ctx.* field the fill below reads is byte-identical;
+    //   - it also means recTplEpoch() (VRAM upload/writeback/eviction stamps) and the frame are
+    //     unchanged, which is what srcUploaded/srcRendered/texKey are derived from;
+    //   - batchSeq() unchanged means OUR command is still the batch head -- nothing else recorded
+    //     in between, on this thread or any other;
+    //   - batchEligible() (checked when the head was pushed) excludes the classes whose state
+    //     comes from anywhere else: depth-only companions, alias passes, PSMT8H CLUT publishers,
+    //     self-feedback reads, HUD/FST=1 draws, decals.
+    // A build-phase template that COPIED a saved command was tried before and lost (a ~330 B copy
+    // costs what the field fill costs, ledger item 40); this one copies nothing.
+    static thread_local GsGpuRenderer::DrawCmd s_bcmd;
+    static thread_local uint64_t s_bcmdSeq = ~0ull;
+    extern bool g_recordDepthOnly;
+    extern int g_recordAliasKind;
+    const bool batchCont = s_tplOn && tplHit && !isSprite && GsGpuRenderer::batchingEnabled()
+                           && !g_recordDepthOnly && g_recordAliasKind == 0
+                           && r.batchOpen() && r.batchSeq() == s_bcmdSeq;
+    GsGpuRenderer::DrawCmd &cmd = s_bcmd;
+    // Invalidate FIRST: a fresh fill that is then dropped (the ZSAT/near-plane culls below return
+    // without recording) must not leave the next primitive thinking the retained state is the open
+    // batch head's. Only a completed record re-arms it, at the bottom of the function.
+    if (!batchCont) { s_bcmdSeq = ~0ull;
+    cmd = GsGpuRenderer::DrawCmd{};
     {   // (a state-part snapshot of the command was tried here: a 500-byte copy costs what the field fill costs -- no gain)
     cmd.texKey = texKey;
     // Destination framebuffer + source texture base: route to per-fbp FBOs and enable
@@ -4653,6 +4680,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     }
 
     }
+    }   // [drawbatch] end of the state fill (skipped entirely on a batch continuation)
     if (isSprite)
     {
         // Sprite -> DrawTexturePro quad (src rect in TEXELS; single color from v1).
@@ -5185,6 +5213,14 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     static thread_local int s_gbCount = 0;
                     static thread_local float s_gbScale = 1.0f;
                     static thread_local std::chrono::steady_clock::time_point s_gbT0{};
+                    // [drawbatch] Every piece of a subdivided triangle shares the whole command but its
+                    // three vertices -- the batch's exact shape. The first piece opens the batch through
+                    // recordCmd (which does the barrier/format bookkeeping); the rest append straight
+                    // into it, skipping the ~330 B copy and the whole bookkeeping the head already did.
+                    // pieceSeq goes stale the moment anything else records, which drops us back to the
+                    // full path. This is the hot path at Kame House: the grass subdivision is ~70% of
+                    // every primitive recorded in a fight.
+                    uint64_t pieceSeq = ~0ull;
                     auto emitTri = [&](const SV &a, const SV &b, const SV &c2)
                     {
                         const SV *vv[3] = {&a, &b, &c2};
@@ -5207,7 +5243,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                             cmd.tri[i].q = 1.0f;   // [perspq] sub-vertices carry the quotient: no per-pixel divide
                             cmd.tri[i].r = vv[i]->r; cmd.tri[i].g = vv[i]->g; cmd.tri[i].b = vv[i]->b; cmd.tri[i].a = vv[i]->a;
                         }
-                        r.recordCmd(cmd);
+                        if (pieceSeq != r.batchSeq() || !r.batchOpen() || !r.appendBatchTri(cmd.tri))
+                            r.recordCmd(cmd);   // [drawbatch] first piece (or a batch that closed): full command
+                        pieceSeq = r.batchSeq();
                         if (grassClass) ++s_gbCount;   // [grassbudget]
                     };
                     auto mid = [](const SV &a, const SV &b)
@@ -5325,9 +5363,13 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 }
             }
             if (!subdivided)
-                r.recordCmd(cmd);
+            {   // [drawbatch] three vertex stores into the open batch instead of a whole command
+                if (!batchCont || !r.appendBatchTri(cmd.tri))
+                    r.recordCmd(cmd);
+            }
         }
     }
+    s_bcmdSeq = r.batchSeq();   // [drawbatch] our command is the batch head until someone else records
     return true;
 }
 

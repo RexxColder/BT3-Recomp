@@ -4162,6 +4162,7 @@ uint32_t g_darkwLast = 0, g_darkwGen = 0; int g_darkwLogs = 0;
 static const int s_recStage = [](){ const char *v = std::getenv("PS2X_RECSTAGE"); return v ? std::atoi(v) : 64; }();   // default 64 since 2026-08-28: with PRERENDER=16 it is what gets the outline stack to 30 fps (SJ11); no effect on the plain build
 void GsGpuRenderer::flushStage()
 {
+    m_openBatchIdx = (size_t)-1;   // [drawbatch] the staged commands are about to become visible
     if (m_stage.empty()) return;
     std::lock_guard<std::mutex> lk(m_mtx);
     {   // [segshadow]
@@ -4174,6 +4175,174 @@ void GsGpuRenderer::flushStage()
         if (k > 0 && m_building.size() > m_segFrom && (m_building.size() - m_segFrom) >= (size_t)k && !g_preReady.exchange(true))
             g_bbCv.notify_all();
     }
+}
+// ---------------------------------------------------------------------------
+// [drawbatch] PLAIN-CLASS TRIANGLE BATCHING (guest thread only).
+//
+// Ordinary scene triangles arrive in long runs sharing every DrawCmd field but the three
+// vertices (measured: ~90% of consecutive fight primitives, [rectemplate]'s hit rate). One
+// command per triangle costs a ~330 B fill + copy + move each; a batch pays that once and
+// then three Vtx stores per triangle. The render loop expands a batch back into exactly the
+// per-triangle command sequence it would have seen otherwise (see drawBatchView in
+// renderAndGetTextureId), so the FRAME IS UNCHANGED BY CONSTRUCTION -- what changes is only
+// how the triangles travel from the recorder to the loop.
+//
+// The open batch lives in the guest-owned staging buffer m_stage, so appending needs no lock
+// and the GL thread can never observe a half-built batch: flushStage() closes the batch before
+// the commands become visible. With PS2X_RECSTAGE<=0 (every command under m_mtx) batching is
+// simply off. PS2X_DRAWBATCH=0 disables it; PS2X_BATCHMAX caps a batch's triangles.
+std::atomic<unsigned long> g_batchTri{0}, g_batchHead{0}, g_batchMerge{0};   // [drawbatch] read by ps2_runtime.cpp
+bool GsGpuRenderer::batchingEnabled()
+{
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_DRAWBATCH");
+                                   return !(v && v[0] == '0') && s_recStage > 0; }();
+    return s_on;
+}
+static int batchMax()
+{
+    static const int s_m = [](){ const char *v = std::getenv("PS2X_BATCHMAX");
+                                 return v && v[0] ? std::atoi(v) : 256; }();
+    return s_m;
+}
+// [batchwhy] the reason a command is NOT plain-class, so a "batching never fires" run can be
+// diagnosed from a census instead of guesswork. 0 = eligible. Printed by the block in recordCmd
+// under PS2X_BATCHWHY=1.
+static const char *const kBatchWhy[] = { "ok", "notTri", "special", "depthOnly", "dest", "destPsm",
+                                         "fst", "psm27", "decal", "selfFeed", "darkener" };
+int GsGpuRenderer::batchWhy(const DrawCmd &c)
+{
+    // Only the PLAIN class: an ordinary textured/flat scene triangle. Everything excluded here
+    // is excluded because the render loop treats it per COMMAND rather than per triangle --
+    // pointer identity (g_curDecalCmd), a per-command counter, a split/rewrite of the geometry,
+    // or state that is derived from something m_stateGen does not cover.
+    if (!c.isTriangle) return 1;
+    if (c.isTransfer || c.isVramBlit || c.isDecode || c.isAliasPass || c.wsHudApplied) return 2;
+    if (c.depthOnly) return 3;
+    if (!(c.destFbp == 0u || c.destFbp == 112u)) return 4;   // scene buffers only
+    if (!(c.destPsm == 0u || c.destPsm == 1u)) return 5;
+    if (c.fst != 0u) return 6;              // FST=1 is the 2D/HUD class: [wshudsplit] + the layout map
+    if (c.srcPsm == 27u) return 7;          // PSMT8H: recordSpriteGPU publishes its CLUT once per draw
+    if (c.srcTbp0 == 10752u && c.srcPsm == 1u) return 8;   // shadow-decal tiles: g_curDecalCmd is per-command
+    if (c.texKey != 0 && (c.srcTbp0 / 32u) == c.destFbp) return 9;   // self-feedback: srcRendered flips per draw
+    if (c.texKey == 0 && c.blendMode == 0x52) return 10;   // the outline darkener (a live toggle rewrites it)
+    return 0;
+}
+bool GsGpuRenderer::batchEligible(const DrawCmd &c) { return batchWhy(c) == 0; }
+void GsGpuRenderer::batchWhyCensus(const DrawCmd &c)
+{
+    static const bool s_bw = [](){ const char *v = std::getenv("PS2X_BATCHWHY"); return v && v[0] && v[0] != '0'; }();
+    if (!s_bw) return;
+    static unsigned long s_n[11] = {0}; static unsigned long s_tot = 0;
+    static std::map<uint64_t, unsigned long> s_dest;   // rejected-by-dest census: destFbp/destPsm/fst
+    static auto t0 = std::chrono::steady_clock::now();
+    const int w = batchWhy(c);
+    ++s_n[w]; ++s_tot;
+    if (w == 4 || w == 5 || w == 6)
+        s_dest[((uint64_t)c.destFbp << 24) | ((uint64_t)c.destPsm << 8) | (uint64_t)c.fst]++;
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<double>(now - t0).count() >= 2.0)
+    {
+        std::fprintf(stderr, "[batchwhy] %lu cmds in 2 s:", s_tot);
+        for (int i = 0; i < 11; ++i) if (s_n[i]) std::fprintf(stderr, "  %s=%lu", kBatchWhy[i], s_n[i]);
+        std::fprintf(stderr, " | dest/psm/fst:");
+        std::vector<std::pair<uint64_t, unsigned long>> v(s_dest.begin(), s_dest.end());
+        std::sort(v.begin(), v.end(), [](auto &a, auto &b){ return a.second > b.second; });
+        for (size_t i = 0; i < v.size() && i < 6; ++i)
+            std::fprintf(stderr, " f%llu/psm%llu/fst%llu=%lu", (unsigned long long)(v[i].first >> 24),
+                         (unsigned long long)((v[i].first >> 8) & 0xFFFFu), (unsigned long long)(v[i].first & 0xFFu), v[i].second);
+        std::fprintf(stderr, "\n");
+        for (int i = 0; i < 11; ++i) s_n[i] = 0;
+        s_tot = 0; s_dest.clear(); t0 = now;
+    }
+}
+bool GsGpuRenderer::sameBatchState(const DrawCmd &a, const DrawCmd &b)
+{
+    // EVERY DrawCmd field except tri[], triCount and triMore. A field added to the struct and
+    // forgotten here would render the HEAD's value for every triangle of a run -- a silent
+    // wrong-pixel bug -- so the static_assert below fails the build when the struct grows.
+    static_assert(sizeof(DrawCmd) == 344,   // x86-64; bump only together with a re-read of the field list below
+                  "DrawCmd changed size: re-check sameBatchState() covers every new field, then update this size");
+    return a.texKey == b.texKey && a.isTriangle == b.isTriangle && a.isTransfer == b.isTransfer
+        && a.isVramBlit == b.isVramBlit && a.depthOnly == b.depthOnly && a.wsHudApplied == b.wsHudApplied
+        && a.isAliasPass == b.isAliasPass && a.aliasKind == b.aliasKind && a.isDecode == b.isDecode
+        && a.decode == b.decode && a.vramSnap == b.vramSnap && a.swoDirty == b.swoDirty
+        && a.xSrcFbp == b.xSrcFbp && a.xDstFbp == b.xDstFbp && a.xSX == b.xSX && a.xSY == b.xSY
+        && a.xDX == b.xDX && a.xDY == b.xDY && a.xW == b.xW && a.xH == b.xH
+        && a.destFbp == b.destFbp && a.destFbw == b.destFbw && a.srcTbp0 == b.srcTbp0
+        && a.destPsm == b.destPsm && a.bilinear == b.bilinear
+        && a.srcTexW == b.srcTexW && a.srcTexH == b.srcTexH
+        && a.sx == b.sx && a.sy == b.sy && a.sw == b.sw && a.sh == b.sh
+        && a.dx0 == b.dx0 && a.dy0 == b.dy0 && a.dx1 == b.dx1 && a.dy1 == b.dy1
+        && a.su0 == b.su0 && a.sv0 == b.sv0 && a.su1 == b.su1 && a.sv1 == b.sv1
+        && a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a && a.z == b.z
+        && a.depthTest == b.depthTest && a.depthFunc == b.depthFunc && a.depthWrite == b.depthWrite
+        && a.alphaTest == b.alphaTest && a.alphaFunc == b.alphaFunc && a.alphaRef == b.alphaRef
+        && a.alphaFail == b.alphaFail && a.dateEnable == b.dateEnable && a.dateMode == b.dateMode
+        && a.fst == b.fst && a.abe == b.abe && a.blendMode == b.blendMode && a.blendFix == b.blendFix
+        && a.fbmsk == b.fbmsk && a.wrapU == b.wrapU && a.wrapV == b.wrapV && a.tfx == b.tfx
+        && a.wms == b.wms && a.wmt == b.wmt && a.minu == b.minu && a.maxu == b.maxu
+        && a.minv == b.minv && a.maxv == b.maxv && a.tcc == b.tcc
+        && a.srcIndexed == b.srcIndexed && a.srcUploaded == b.srcUploaded && a.srcRendered == b.srcRendered
+        && a.srcPsm == b.srcPsm && a.texaTa0 == b.texaTa0 && a.texaTa1 == b.texaTa1 && a.texaAem == b.texaAem
+        && a.srcClutTbp == b.srcClutTbp && a.srcClutKey == b.srcClutKey && a.fba == b.fba;
+}
+std::shared_ptr<std::vector<GsGpuRenderer::Vtx>> GsGpuRenderer::takeVtxStore()
+{
+    static const size_t kRing = [](){ const char *v = std::getenv("PS2X_BATCHRING");
+                                      const int n = v && v[0] ? std::atoi(v) : 4096; return (size_t)(n > 0 ? n : 1); }();
+    // Round-robin over the ring: a slot whose use_count is 1 is held by nobody but the ring
+    // (its frame list has been replayed and freed), so it can be refilled in place -- which is
+    // what keeps a run of batches from allocating. Probe a few slots before giving up, so one
+    // long-lived list in flight does not push every batch onto a fresh allocation.
+    for (int probe = 0; probe < 8 && !m_vtxRing.empty(); ++probe)
+    {
+        if (m_vtxRingPos >= m_vtxRing.size()) m_vtxRingPos = 0;
+        std::shared_ptr<std::vector<Vtx>> &slot = m_vtxRing[m_vtxRingPos++];
+        if (slot.use_count() == 1) { slot->clear(); return slot; }
+    }
+    std::shared_ptr<std::vector<Vtx>> p = std::make_shared<std::vector<Vtx>>();
+    if (m_vtxRing.size() < kRing) m_vtxRing.push_back(p);
+    return p;
+}
+bool GsGpuRenderer::appendBatchTri(const Vtx v[3], bool addDirty)
+{
+    if (m_openBatchIdx >= m_stage.size()) { m_openBatchIdx = (size_t)-1; return false; }
+    DrawCmd &h = m_stage[m_openBatchIdx];
+    if ((int)h.triCount >= batchMax()) { m_openBatchIdx = (size_t)-1; return false; }
+    // The head already did the PS2X_BARRIER bookkeeping for this (dest, source, zbuf) triple and an
+    // appended triangle repeats it exactly -- the same reasoning [bardedupe] uses to skip the set ops
+    // for a run of identical commands, and it needs the same guard: if anything REMOVED a g_barDirty /
+    // g_barDirtyRect entry since (a read barrier, a flush), the head's inserts no longer stand and the
+    // page would keep receiving draws while marked clean, so a later read of it would not request a
+    // flush and would decode stale VRAM. g_barDirtyGen counts exactly those removals; on a change,
+    // refuse the append so the caller records a full command and redoes the bookkeeping.
+    if (m_openBatchDirtyGen != g_barDirtyGen.load(std::memory_order_relaxed))
+    { m_openBatchIdx = (size_t)-1; return false; }
+    if (!h.triMore) h.triMore = takeVtxStore();
+    h.triMore->push_back(v[0]); h.triMore->push_back(v[1]); h.triMore->push_back(v[2]);
+    ++h.triCount;
+    ++m_batchSeq;
+    if (addDirty)
+    {   // The barrier's dirty rect is a PIXEL BOX, not a command count: flushPageToVram reads
+        // exactly this box back out of the FBO, so every appended triangle must widen it or a
+        // later flush writes stale VRAM for the pixels the batch's tail covered.
+        static const bool s_bar = [](){ const char *e = std::getenv("PS2X_BARRIER");
+                                        return e && e[0] && e[0] != '0'; }();
+        if (s_bar)
+        {
+            float x0 = v[0].x, y0 = v[0].y, x1 = x0, y1 = y0;
+            for (int i = 1; i < 3; ++i)
+            {
+                x0 = std::min(x0, v[i].x); x1 = std::max(x1, v[i].x);
+                y0 = std::min(y0, v[i].y); y1 = std::max(y1, v[i].y);
+            }
+            std::lock_guard<std::mutex> bk(g_barMx);
+            ps2xDirtyAdd(h.destFbp, x0, y0, x1, y1);
+        }
+    }
+    ++m_recordCount;   // prims/sec counts TRIANGLES, not batches
+    g_batchTri.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 // ---------------------------------------------------------------------------
 // [gpualias] PS2X_GPUALIAS>=4 executor: BT3's fbp336 outline edge chain, run in
@@ -5625,6 +5794,20 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
             }
         }
     }
+    {   // [drawbatch] MERGE: this command differs from the open batch's head only in its three
+        // vertices, so append them instead of pushing a second ~330 B command. Reached by the
+        // callers that build a command per triangle themselves -- the [grassdiv]/[decalq]
+        // subdivision emitters above all -- and by any run the recorder's own fast path
+        // (recordSpriteGPU's batch continuation) did not predict. The bookkeeping above has
+        // already run for this command exactly as it always did, so only the push changes.
+        if (batchingEnabled() && c.triCount == 1 && m_openBatchIdx < m_stage.size()
+            && batchEligible(c) && sameBatchState(m_stage[m_openBatchIdx], c)
+            && appendBatchTri(c.tri, false))   // addDirty=false: the rect union ran above
+        {
+            g_batchMerge.fetch_add(1, std::memory_order_relaxed);
+            return;                            // appendBatchTri counted the primitive
+        }
+    }
     if (s_recStage <= 0)
     {
         (m_segSwapped ? m_buildingShadow : m_building).push_back(std::move(c));   // [cmdmove]; [segshadow]
@@ -5636,10 +5819,22 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     }
     else
     {
+        batchWhyCensus(c);   // [batchwhy] PS2X_BATCHWHY=1
+        const bool openable = batchingEnabled() && c.triCount == 1 && batchEligible(c);   // [drawbatch]
         m_stage.push_back(std::move(c));
+        // [drawbatch] the command just pushed becomes the open batch (or closes the previous
+        // one): anything the plain class excludes must not have triangles appended to it.
+        if (openable)
+        {
+            m_openBatchIdx = m_stage.size() - 1;
+            m_openBatchDirtyGen = g_barDirtyGen.load(std::memory_order_relaxed);   // see appendBatchTri
+            g_batchHead.fetch_add(1, std::memory_order_relaxed);
+        }
+        else m_openBatchIdx = (size_t)-1;
         if (m_stage.size() >= (size_t)s_recStage) flushStage();   // lk is not held on this branch
     }
     ++m_recordCount;
+    ++m_batchSeq;   // [drawbatch] the recorder's retained-state guard
 }
 
 extern "C" void ps2xGsRecordVsync();   // PS2X_GS_RECORD (ps2_gs_gpu.cpp); a function-body
@@ -8360,9 +8555,35 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
     }
     const size_t ciEnd = std::min(DC.size(), m_stopAt);   // [deferdec] split point
     ragStat.markLoop(ciEnd > ciStart ? ciEnd - ciStart : 0);
-    for (size_t ci = ciStart; ci < ciEnd; ++ci)
+    // [drawbatch] A batched command carries triCount triangles that share every other field, so
+    // the loop walks (command, triangle) PAIRS and hands the body exactly the per-triangle DrawCmd
+    // it would have seen without batching -- every gate, census, cache and emit site below is
+    // therefore untouched, and the frame is unchanged by construction. `continue` still means
+    // "done with this triangle": it jumps to the increment expression, which advances the pair.
+    // batchView is the expansion buffer -- the state part is copied once per batch (ti == 0) and
+    // only tri[] is rewritten per triangle, so the copy is amortised over the run.
+    DrawCmd batchView;
+    size_t ti = 0;
+    for (size_t ci = ciStart; ci < ciEnd;
+         (ti + 1u < (size_t)DC[ci].triCount) ? (void)++ti : (void)(ti = 0, ++ci))
     {
-        const DrawCmd &c = DC[ci];
+        const uint32_t nTri = DC[ci].triCount;
+        const bool cmdLastTri = (ti + 1u >= (size_t)nTri);   // [drawbatch] end-of-command hooks fire once
+        if (nTri > 1u)
+        {
+            if (ti == 0)
+            {
+                batchView = DC[ci];
+                batchView.triCount = 1; batchView.triMore.reset();   // the view is a plain one-triangle command
+            }
+            else
+            {
+                const std::vector<Vtx> &vs = *DC[ci].triMore;
+                const size_t b = (ti - 1u) * 3u;
+                batchView.tri[0] = vs[b]; batchView.tri[1] = vs[b + 1]; batchView.tri[2] = vs[b + 2];
+            }
+        }
+        const DrawCmd &c = (nTri > 1u) ? batchView : DC[ci];
         {   // [wshudlog] one-run census of widescreen sprite candidates: geometry + source
             // fields, to pick the HUD-vs-ink discriminator from data instead of guesses.
             static const bool s_wl = [](){ const char *v = std::getenv("PS2X_WSHUDLOG"); return v && v[0] && v[0] != '0'; }();
@@ -9179,7 +9400,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         // New published list (game frame) starts here: depth is per-frame state, so reset the
         // once-per-replay depth-clear tracking and force a full FBO rebind (the beginFbp
         // early-return path skips the depth clear when the FBO didn't change).
-        if (groundShadowOn() && !m_chunkMode && !m_segMode
+        if (groundShadowOn() && !m_chunkMode && !m_segMode && cmdLastTri   // [drawbatch] last triangle of the command
             && (ci + 1 == ciEnd || (listBoundsValid && nextListBoundary < listStarts.size() && ci + 1 == listStarts[nextListBoundary])))
         for (int pass = 0; pass < 1; ++pass)
         {   // only the final (non-chunk, non-segment) drain of the frame: after the DoF/post copies, so nothing repaints over it   // [groundshadow] v6: last command of this list -> draw the blobs into this frame's scene FBO with a depth test at the
@@ -9230,7 +9451,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 curMask = -1; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1; curDepthTest = -1; curDepthFunc = -1; curDepthWrite = -1;
             }
         }
-        if (listBoundsValid && nextListBoundary < listStarts.size() && ci == listStarts[nextListBoundary])
+        if (ti == 0 && listBoundsValid && nextListBoundary < listStarts.size() && ci == listStarts[nextListBoundary])   // [drawbatch] first triangle of the command
         {
             ++nextListBoundary;
             if (groundShadowOn() && !m_chunkMode && !m_segMode && nextListBoundary < listGens.size() + 1 && nextListBoundary - 1 < listGens.size()) g_curGen = listGens[nextListBoundary - 1];   // [groundshadow] v10
@@ -14625,7 +14846,10 @@ if (done.size() < 14 && !done.count(c.texKey))
         }
         if (c.destFbp == 224u && c.texKey != 0) g_f224Mark = 36;
         static const bool s_qm = [](){ const char *v = std::getenv("PS2X_QUADMERGE"); return v && v[0] && v[0] != '0'; }();   // [quadmerge] default OFF 2026-08-30: the merged-quad emit samples the HUD glyphs half a texel off (blur) while the generic path is exact; merge adjacency depends on chunk boundaries -> the HUD wobble. =1 restores.
-        if (s_qm && c.isTriangle && c.texKey != 0 && !fromFbo && ci + 1 < DC.size())
+        // [drawbatch] the merge consumes the NEXT COMMAND (++ci below), which the (command,
+        // triangle) walk cannot express -- so it only runs while neither side is batched.
+        if (s_qm && c.isTriangle && c.texKey != 0 && !fromFbo && ci + 1 < DC.size()
+            && nTri == 1u && DC[ci + 1].triCount == 1u)
         {
             const DrawCmd &c2 = DC[ci + 1];
             if (c2.isTriangle && c2.texKey == c.texKey && c2.destFbp == c.destFbp &&
