@@ -35,3 +35,28 @@ static LONG WINAPI ps2xWinCrashFilter(EXCEPTION_POINTERS *ep)
 }
 extern "C" void ps2xWinCrashHandlerInstall() { SetUnhandledExceptionFilter(ps2xWinCrashFilter); }
 #endif
+
+// [wincpu] per-thread CPU time (the Linux build uses CLOCK_THREAD_CPUTIME_ID) and a one-line host description.
+#if defined(_WIN32)
+extern "C" unsigned long long ps2xWinThreadCpuNs()
+{
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0ull;
+    const unsigned long long kt = ((unsigned long long)k.dwHighDateTime << 32) | k.dwLowDateTime;
+    const unsigned long long ut = ((unsigned long long)u.dwHighDateTime << 32) | u.dwLowDateTime;
+    return (kt + ut) * 100ull;   // 100 ns units -> ns
+}
+extern "C" void ps2xWinHostInfo()
+{
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    char cpu[128] = "?"; DWORD len = sizeof cpu; DWORD mhz = 0; DWORD mlen = sizeof mhz; HKEY k;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_READ, &k) == ERROR_SUCCESS)
+    {
+        RegQueryValueExA(k, "ProcessorNameString", nullptr, nullptr, (LPBYTE)cpu, &len);
+        RegQueryValueExA(k, "~MHz", nullptr, nullptr, (LPBYTE)&mhz, &mlen);
+        RegCloseKey(k);
+    }
+    std::fprintf(stderr, "[host] Windows, %lu logical cpus, %s (~%lu MHz)\n", (unsigned long)si.dwNumberOfProcessors, cpu, (unsigned long)mhz);
+}
+#pragma comment(lib, "advapi32.lib")
+#endif
