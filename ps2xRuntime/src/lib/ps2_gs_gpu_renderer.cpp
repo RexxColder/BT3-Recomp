@@ -4201,6 +4201,11 @@ void GsGpuRenderer::flushStage()
 // the commands become visible. With PS2X_RECSTAGE<=0 (every command under m_mtx) batching is
 // simply off. PS2X_DRAWBATCH=0 disables it; PS2X_BATCHMAX caps a batch's triangles.
 std::atomic<unsigned long> g_batchTri{0}, g_batchHead{0}, g_batchMerge{0};   // [drawbatch] read by ps2_runtime.cpp
+// [glhoist] commands whose draw body was shared across the whole run, and triangles emitted that way.
+// Reported on the [fps] line: a hoist that silently disables itself (a gate condition that never holds in
+// the config being measured) is otherwise indistinguishable from one that does nothing useful -- which is
+// exactly what the first wshud gate did in the user's widescreen=1 config while the rig never noticed.
+std::atomic<unsigned long> g_glHoistCmds{0}, g_glHoistTris{0};
 bool GsGpuRenderer::batchingEnabled()
 {
     static const bool s_on = [](){ const char *v = std::getenv("PS2X_DRAWBATCH");
@@ -8613,8 +8618,12 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
     // broke parity on every frame:
     //   [trihalf]  a half-texel UV bias on bilinear textured triangles, DEFAULT ON -- the emit loop below
     //              repeats it per triangle through the shared triHalfApply();
-    //   [wshud]    the widescreen squeeze rewrites vertex x AND the scissor from each triangle's own
-    //              bbox, so it is per-triangle state -- hoisting is simply off while it is live.
+    //   [wshud]    the widescreen squeeze rewrites vertex x AND derives the scissor from each triangle's
+    //              own bbox, so it is per-triangle state. It can only ever touch a triangle whose three z
+    //              are EXACTLY 0 (its 2D-class test), so instead of disabling hoisting whenever the squeeze
+    //              is live -- which switched the whole feature off in the user's config, where
+    //              widescreen=1, while the rig's private ini has widescreen=0 and never noticed -- a run is
+    //              excluded only when one of ITS triangles is flat in z.
     // Also off for the diagnostics that emit or read back per COMMAND and then `continue`, and for
     // PS2X_GROUNDSHADOW (blobAccumulate takes every fighter VERTEX; the blob draw hangs off a list's last
     // command). The body's one per-VERTEX decision, the inf/NaN guard, moves into the emit loop.
@@ -8625,13 +8634,30 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                               "PS2X_TERRSOFT", "PS2X_TERRFLAT"})
         { const char *e = std::getenv(n); if (e && e[0]) return false; }
         return true; }();
-    const bool hoistOk = s_glHoist && !groundShadowOn() && wsHudInv == 1.0f;
+    const bool hoistOk = s_glHoist && !groundShadowOn();
     bool hoistAll = false;
     for (size_t ci = ciStart; ci < ciEnd;
          (!hoistAll && ti + 1u < (size_t)DC[ci].triCount) ? (void)++ti : (void)(ti = 0, ++ci))
     {
         const uint32_t nTri = DC[ci].triCount;
         hoistAll = hoistOk && nTri > 1u;                                  // [glhoist]
+        if (hoistAll && wsHudInv != 1.0f && !DC[ci].wsHudApplied
+            && (DC[ci].destFbp == 0u || DC[ci].destFbp == 112u)
+            && (DC[ci].destPsm == 0u || DC[ci].destPsm == 1u))
+        {   // [glhoist] the [wshud] squeeze is live and this run's destination passes its state gate --
+            // check the geometry gate too. Only a triangle with all three z == 0 can be squeezed, so a run
+            // with none of those is still safe to share one body. O(triCount) float compares, against
+            // running the whole per-command body triCount times.
+            auto flatZ = [](const Vtx *v) { return v[0].z == 0.0f && v[1].z == 0.0f && v[2].z == 0.0f; };
+            bool couldSqueeze = flatZ(DC[ci].tri);
+            if (!couldSqueeze && DC[ci].triMore)
+            {
+                const std::vector<Vtx> &vs = *DC[ci].triMore;
+                for (uint32_t t = 1; t < nTri && !couldSqueeze; ++t) couldSqueeze = flatZ(&vs[(t - 1u) * 3u]);
+            }
+            if (couldSqueeze) hoistAll = false;
+        }
+        if (hoistAll) { g_glHoistCmds.fetch_add(1, std::memory_order_relaxed); g_glHoistTris.fetch_add(nTri, std::memory_order_relaxed); }
         const bool cmdLastTri = hoistAll || (ti + 1u >= (size_t)nTri);   // [drawbatch] end-of-command hooks fire once
         if (nTri > 1u)
         {
