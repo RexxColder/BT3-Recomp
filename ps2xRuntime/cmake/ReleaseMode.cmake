@@ -8,8 +8,12 @@ function(EnableFastReleaseMode TargetName)
     # accept MSVC's /Qspectre- and /GL (whole-program LTCG), and its LTO objects need lld-link: give it the
     # plain optimization subset and no LTO, like the GCC/Clang builds on Linux.
     if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # Same numeric contract as the Linux build: SSE4.1 only (no FMA contraction -- the VU/clipper
+        # math must round twice), no fast-math (Inf/NaN saturation), guest-memory type punning and
+        # integer wraparound allowed.
         target_compile_options(${TargetName} PRIVATE
-            $<$<CONFIG:Release>:/O2 /Ob2 /Oi /Gy /Gw /GF /fp:fast /DNDEBUG /arch:AVX2 /GS->)
+            $<$<CONFIG:Release>:/O2 /Ob2 /Oi /Gy /Gw /GF /DNDEBUG /GS- /fp:precise>
+            /clang:-msse4.1 /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-fwrapv)
         return()
     endif()
     if(MSVC)
