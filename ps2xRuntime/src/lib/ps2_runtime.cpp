@@ -4551,6 +4551,17 @@ void PS2Runtime::run()
                             static const char *const kWhy[5] = {"gen", "epoch", "frame", "prim", "draw"};
                             std::cerr << " why:";
                             for (int i = 0; i < 5; ++i) { const unsigned long w = g_recTplWhy[i].load(std::memory_order_relaxed); std::cerr << ' ' << kWhy[i] << '=' << (unsigned long)((w - s_lw[i]) / dt); s_lw[i] = w; } }
+                        {   // [drawbatch] tri/s appended into an open batch, batches opened, and how many of
+                            // those appends came from the recordCmd MERGE rather than the recorder's fast path
+                            extern std::atomic<unsigned long> g_batchTri, g_batchHead, g_batchMerge;
+                            static unsigned long s_bt = 0, s_bh = 0, s_bm = 0;
+                            const unsigned long bt = g_batchTri.load(std::memory_order_relaxed);
+                            const unsigned long bh = g_batchHead.load(std::memory_order_relaxed);
+                            const unsigned long bm = g_batchMerge.load(std::memory_order_relaxed);
+                            std::cerr << " | batch tri=" << (unsigned long)((bt - s_bt) / dt)
+                                      << "/s heads=" << (unsigned long)((bh - s_bh) / dt)
+                                      << "/s merged=" << (unsigned long)((bm - s_bm) / dt) << "/s";
+                            s_bt = bt; s_bh = bh; s_bm = bm; }
                         {   extern std::atomic<unsigned long> g_regWriteHist[0x63]; static unsigned long s_lr[0x63] = {0};
                             unsigned long d[0x63]; for (int i = 0; i < 0x63; ++i) { const unsigned long w = g_regWriteHist[i].load(std::memory_order_relaxed); d[i] = w - s_lr[i]; s_lr[i] = w; }
                             std::cerr << " | regwrites/s:";
