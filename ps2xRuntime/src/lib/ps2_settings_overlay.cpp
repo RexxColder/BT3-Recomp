@@ -433,6 +433,9 @@ void PS2SettingsOverlay::loadSettings()
                     { if (!envUserSet("PS2X_GLOW")) m_settings.glow = (val == "1" || val == "true"); }
                 else if (key == "glowfix")
                     { if (!envUserSet("PS2X_GLOWFIX")) m_settings.glowFix = (val == "1" || val == "true"); }
+                else if (key == "ink_strength")
+                    { if (!envUserSet("PS2X_INKSTRENGTH") && !envUserSet("PS2X_ADGS"))
+                          m_settings.inkStrength = std::clamp(std::atoi(val.c_str()), 100, 300); }
                 else if (key == "postfx")
                     { if (!envUserSet("PS2X_POSTFX")) m_settings.postfx = (val == "1" || val == "true"); }
                 else if (key == "bilinear")
@@ -579,6 +582,7 @@ void PS2SettingsOverlay::saveSettings() const
     file << "gpu_renderer=" << (m_settings.gpuRenderer ? "1" : "0") << "\n";
     file << "glow=" << (m_settings.glow ? "1" : "0") << "\n";
     file << "glowfix=" << (m_settings.glowFix ? "1" : "0") << "\n";
+    file << "ink_strength=" << m_settings.inkStrength << "\n";
     file << "postfx=" << (m_settings.postfx ? "1" : "0") << "\n";
     file << "bilinear=" << (m_settings.bilinear ? "1" : "0") << "\n";
     file << "halftexel=" << (m_settings.halfTexel ? "1" : "0") << "\n";
@@ -650,6 +654,7 @@ void PS2SettingsOverlay::syncFromRuntime()
     m_settings.gpuRenderer = GsGpuRenderer::enabled();
     m_settings.glow = GsGpuRenderer::glowEnabled();
     m_settings.glowFix = GsGpuRenderer::glowFixEnabled();
+    m_settings.inkStrength = GsGpuRenderer::inkStrengthPct();
     m_settings.postfx = GsGpuRenderer::postfxEnabled();
     m_settings.bilinear = GsGpuRenderer::bilinearEnabled();
     m_settings.halfTexel = GsGpuRenderer::halfTexelEnabled();
@@ -675,6 +680,7 @@ void PS2SettingsOverlay::applySettings()
     // are decided when the FBO is allocated, so flipping it mid-run would leave a half-applied
     // state -- and a partial glow fix is a REGRESSION (it washes the frame out).
     GsGpuRenderer::setGlowFix(m_settings.glowFix);
+    GsGpuRenderer::setInkStrengthPct(m_settings.inkStrength);   // [inkstrength] live: it is one shader uniform
     GsGpuRenderer::setBilinear(m_settings.bilinear);
     GsGpuRenderer::setHalfTexel(m_settings.halfTexel);
     GsGpuRenderer::setSkipPost(m_settings.skipPost);
@@ -1129,6 +1135,21 @@ void PS2SettingsOverlay::drawVideoTab()
     ImGui::TextDisabled("Takes full effect after restart.");
     if (toggleSwitch("Cel Outline", &m_settings.outline))
         m_dirty = true;
+    if (m_settings.outline)
+    {   // [inkstrength] how hard the outline darkener subtracts. 199% is the exact GS
+        // strength (it divides Ad by 128 where GL divides by 255); 100% is the old,
+        // washed-out line. Applies live -- it is a single shader uniform.
+        ImGui::Text("Ink Strength");
+        ImGui::SameLine(120);
+        ImGui::SetNextItemWidth(220);
+        if (ImGui::SliderInt("##inkstrength", &m_settings.inkStrength, 100, 260, "%d %%",
+                             ImGuiSliderFlags_AlwaysClamp))
+        {
+            GsGpuRenderer::setInkStrengthPct(m_settings.inkStrength);   // live preview
+            m_dirty = true;
+        }
+        ImGui::TextDisabled("199%% matches the console line. Lower = thinner/lighter ink.");
+    }
     if (toggleSwitch("Character Shadows", &m_settings.shadows))
         m_dirty = true;
     if (toggleSwitch("Depth-of-Field Blur", &m_settings.dofBlur))

@@ -256,6 +256,31 @@ int GsGpuRenderer::dofZFar()
     return v;
 }
 void GsGpuRenderer::setDofZFar(int z)      { if (z < 20000) z = 20000; if (z > 800000) z = 800000; g_uiDofZFar.store(z); }
+// [inkstrength] How hard the untextured bm0x52 cel-outline darkener subtracts, as a percent of
+// Cs. 100 = the pre-2026-09-04 line (GL's Ad/255 divisor, half of what hardware does); 199 =
+// 255/128, the exact GS strength (see the PS2X_ADGS block). Exposed because "how heavy is the
+// ink" is a taste call once it is in the right ballpark. PS2X_ADGS=0 pins it to 100.
+namespace { std::atomic<int> g_uiInk{-1}; }
+int GsGpuRenderer::inkStrengthPct()
+{
+    int v = g_uiInk.load(std::memory_order_relaxed);
+    if (v < 0)
+    {
+        const char *adgs = std::getenv("PS2X_ADGS");
+        if (adgs && adgs[0] == '0') v = 100;                 // explicit off wins
+        else
+        {
+            const char *e = std::getenv("PS2X_INKSTRENGTH");
+            // accepts either a multiplier ("1.75") or a percent ("175")
+            const double f = e && e[0] ? std::atof(e) : 0.0;
+            v = (f <= 0.0) ? 199 : (int)((f < 10.0 ? f * 100.0 : f) + 0.5);
+        }
+        if (v < 100) v = 100; if (v > 300) v = 300;
+        g_uiInk.store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
+void GsGpuRenderer::setInkStrengthPct(int p) { if (p < 100) p = 100; if (p > 300) p = 300; g_uiInk.store(p); }
 void GsGpuRenderer::setShadows(bool v)     { g_uiShadows.store(v ? 1 : 0); }
 
 // GS texel-corner vs GL texel-centre addressing. 0.5 texel, or 0 with PS2X_HALFTEXEL=0
@@ -13450,8 +13475,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // and moves the character region's darkest 0.5% from 40.6 to 33.8, with the frame
             // median and every background region unchanged -- it only deepens the ink.
             // PS2X_ADGS=0 restores the old half-strength line.
-            static const bool s_adgs = [](){ const char *v = std::getenv("PS2X_ADGS");
-                                             return !(v && v[0] == '0'); }();
+            // Strength is live-settable (overlay slider / PS2X_INKSTRENGTH); PS2X_ADGS=0 pins
+            // it to 1.0. NOTE: this block also writes uSubScale, so an explicitly-set
+            // PS2X_SUBSCALE (the 0x62 cel pass diagnostic) is overridden once a darkener draw
+            // goes by. Both default to 1.0, so nothing collides unless SUBSCALE is forced.
             // Scoped to the outline darkener ONLY: untextured, bm0x52, into a scene buffer.
             // Applying it to every dest-alpha blend wrecks the frame (MAE 14.3 -> 62.4) because
             // most draws store alpha already expanded to the 0..255 convention; this one pass is
@@ -13459,7 +13486,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             const bool destAlphaCoef = c.abe && c.texKey == 0 && c.blendMode == 0x52 &&
                                        (c.destFbp == 0u || c.destFbp == 112u);
             static float curAdgs = -1.0f;
-            const float wantAdgs = (s_adgs && destAlphaCoef) ? (255.0f / 128.0f) : 1.0f;
+            const float wantAdgs = destAlphaCoef ? (float)GsGpuRenderer::inkStrengthPct() * 0.01f : 1.0f;
             if (wantAdgs != curAdgs && g_locSubScale >= 0)
             {
                 rlDrawRenderBatchActive();

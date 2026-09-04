@@ -30,6 +30,7 @@ public:
         bool fullscreen = false;  // [defaults-sync] do not force fullscreen on first launch (rig + user surprise); one toggle away in the overlay
         bool widescreen = false;
         bool outline = true;
+        int inkStrength = 199;   // [inkstrength] cel-outline darkener, % of Cs (199 = hardware 255/128)
         bool shadows = true;
         bool dofBlur = true;
         int dofZFar = 200000;
