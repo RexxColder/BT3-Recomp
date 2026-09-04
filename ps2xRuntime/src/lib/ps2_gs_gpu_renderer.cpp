@@ -151,6 +151,13 @@ static std::unordered_set<uint32_t> g_barAlphaStale;   // [bargate2] pages whose
 // [glowfix] BT3's bloom/glow chain needs FOUR things at once; any one alone is a REGRESSION
 // (the blend fix on its own washes the whole frame out: ground 146,216,82 vs console 77,115,42).
 static bool ps2xGlowFix() { return GsGpuRenderer::glowFixEnabled(); }
+// [glowview] page 336 carries two views (CT16 outline generator, CT32 glow blur) that want
+// different sizes; split the secondary one onto its own surface. See viewKey().
+static bool ps2xGlowView() {
+    static const int s_v = [](){ const char *v = std::getenv("PS2X_GLOWVIEW");
+                                 return v && v[0] ? ((v[0] != '0') ? 1 : 0) : -1; }();
+    return s_v < 0 ? ps2xGlowFix() : (s_v != 0);
+}
 unsigned long g_gateSeen = 0;   // commands the gate census looked at (PS2X_GATESRC)
 // Pages whose FBO contents have been written back to VRAM this run. A draw sampling one of
 // these can be emitted normally -- the workaround gates that exist because "an FBO cannot be
@@ -779,7 +786,9 @@ namespace
             // that uses the DECLARED size lands in the untouched part of the buffer.
             static const char *s_capEnv = std::getenv("PS2X_FBOCAP");
             static const char *s_cap = (s_capEnv && s_capEnv[0]) ? s_capEnv
-                                     : (ps2xGlowFix() ? "224:512x448,336:256x256" : nullptr);
+                                     : (ps2xGlowFix() ? (ps2xGlowView() ? "224:512x448,848:256x256"
+                                                                        : "224:512x448,336:256x256")
+                                                      : nullptr);
             if (s_cap && s_cap[0])
             {
                 // accepts a comma-separated list: "224:512x448,336:256x256"
@@ -7390,8 +7399,21 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     // 512.. is a free namespace.
     static const bool s_fboView = [](){ const char *v = std::getenv("PS2X_FBOVIEW");
                                         return v && v[0] && v[0] != '0'; }();
+    // [glowview] The bloom chain and the cel-outline chain SHARE page 336 through two views of
+    // different bit depth AND different size: the outline generator renders it as a 512x448
+    // PSMCT16 surface, the glow blur as a 256x256 PSMCT32 one. One GROW-ONLY FBO cannot be both.
+    // Pinning the shared surface to 256x256 (what the glow needs) cost the outline two thirds of
+    // its ink (edges 639 -> 256); leaving it grown to 1024x512 (what the outline needs) put the
+    // glow's 256-space reads in the untouched three quarters of the buffer. So split the views:
+    // page 336's SECONDARY bit-depth view gets its own surface in the reserved fbp>=512
+    // namespace and its own cap, and each chain is sized the way it addresses itself.
+    // This is the same mechanism as PS2X_FBOVIEW, restricted to the one page that needs it --
+    // relocating the scene buffers' CT16 depth re-view as well is a much larger change (that is
+    // what PS2X_ALIASSKIP handles instead). PS2X_GLOWVIEW=0 disables.
+    const bool s_glowView = ps2xGlowView();
     auto viewKey = [&](uint32_t fbp, uint8_t psm) -> uint32_t {
-        if (!s_fboView || fbp >= 512u) return fbp;
+        if (fbp >= 512u) return fbp;
+        if (!s_fboView && !(s_glowView && fbp == 336u)) return fbp;
         auto pit = primaryPsm.find(fbp);
         if (pit == primaryPsm.end()) return fbp;
         const bool moved = (psmBits(psm) != psmBits(pit->second));
