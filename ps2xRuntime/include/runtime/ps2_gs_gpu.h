@@ -447,6 +447,12 @@ private:
 
     uint8_t *m_vram = nullptr;
     uint32_t m_vramSize = 0;
+public:
+    // [recpriv] read-only access for the GS stream recorder (record type 4 = CRTC state).
+    const struct GSRegisters *privRegsForRecord() const { return m_privRegs; }
+    void setPrivRegsFromRecord(uint64_t pmode, uint64_t dispfb1, uint64_t display1,
+                               uint64_t dispfb2, uint64_t display2, uint64_t bgcolor, uint64_t smode2);
+private:
     struct GSRegisters *m_privRegs = nullptr;
     mutable std::recursive_mutex m_stateMutex;
 
