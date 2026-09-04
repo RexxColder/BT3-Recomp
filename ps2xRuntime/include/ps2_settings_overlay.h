@@ -20,6 +20,7 @@ public:
         bool gpuRenderer = false;
         bool glow = true;
         bool postfx = false;
+        bool glowFix = true;   // [glowfix] BT3's bloom/glow chain (Kaioken aura); applies on restart
         bool bilinear = true;
         bool halfTexel = true;
         bool skipPost = true;

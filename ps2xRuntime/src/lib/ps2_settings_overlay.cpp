@@ -431,6 +431,8 @@ void PS2SettingsOverlay::loadSettings()
                     { if (!envUserSet("PS2X_GPU")) m_settings.gpuRenderer = (val == "1" || val == "true"); }
                 else if (key == "glow")
                     { if (!envUserSet("PS2X_GLOW")) m_settings.glow = (val == "1" || val == "true"); }
+                else if (key == "glowfix")
+                    { if (!envUserSet("PS2X_GLOWFIX")) m_settings.glowFix = (val == "1" || val == "true"); }
                 else if (key == "postfx")
                     { if (!envUserSet("PS2X_POSTFX")) m_settings.postfx = (val == "1" || val == "true"); }
                 else if (key == "bilinear")
@@ -576,6 +578,7 @@ void PS2SettingsOverlay::saveSettings() const
     file << "[video]\n";
     file << "gpu_renderer=" << (m_settings.gpuRenderer ? "1" : "0") << "\n";
     file << "glow=" << (m_settings.glow ? "1" : "0") << "\n";
+    file << "glowfix=" << (m_settings.glowFix ? "1" : "0") << "\n";
     file << "postfx=" << (m_settings.postfx ? "1" : "0") << "\n";
     file << "bilinear=" << (m_settings.bilinear ? "1" : "0") << "\n";
     file << "halftexel=" << (m_settings.halfTexel ? "1" : "0") << "\n";
@@ -646,6 +649,7 @@ void PS2SettingsOverlay::syncFromRuntime()
     m_settings.sfxVolume = PS2AudioBackend::sfxVolume();
     m_settings.gpuRenderer = GsGpuRenderer::enabled();
     m_settings.glow = GsGpuRenderer::glowEnabled();
+    m_settings.glowFix = GsGpuRenderer::glowFixEnabled();
     m_settings.postfx = GsGpuRenderer::postfxEnabled();
     m_settings.bilinear = GsGpuRenderer::bilinearEnabled();
     m_settings.halfTexel = GsGpuRenderer::halfTexelEnabled();
@@ -667,6 +671,10 @@ void PS2SettingsOverlay::applySettings()
     GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
     GsGpuRenderer::setGlow(m_settings.glow);
     GsGpuRenderer::setPostfx(m_settings.postfx);
+    // [glowfix] applied at STARTUP only: two of its four parts (the fbp224/fbp336 size caps)
+    // are decided when the FBO is allocated, so flipping it mid-run would leave a half-applied
+    // state -- and a partial glow fix is a REGRESSION (it washes the frame out).
+    GsGpuRenderer::setGlowFix(m_settings.glowFix);
     GsGpuRenderer::setBilinear(m_settings.bilinear);
     GsGpuRenderer::setHalfTexel(m_settings.halfTexel);
     GsGpuRenderer::setSkipPost(m_settings.skipPost);
@@ -1143,6 +1151,14 @@ void PS2SettingsOverlay::drawVideoTab()
     //  superseded by the current serving pipeline. Env vars still work for devs.)
     if (toggleSwitch("Post-FX", &m_settings.postfx))
         m_dirty = true;
+    {   // [glowfix] BT3's bloom/glow chain -- the Kaioken aura and every attack glow.
+        const bool was = m_settings.glowFix;
+        if (toggleSwitch("Glow (Kaioken aura)", &m_settings.glowFix))
+            m_dirty = true;
+        if (m_settings.glowFix != GsGpuRenderer::glowFixEnabled())
+            ImGui::TextDisabled("(applies on restart)");
+        else if (was) ImGui::TextDisabled("Character/attack bloom. Off = the pre-fix look.");
+    }
 
     // (Render Scale UI removed in this integration: the scaling machinery's per-draw
     // cost regressed the fight loop; the setting is still persisted for a future port.)
