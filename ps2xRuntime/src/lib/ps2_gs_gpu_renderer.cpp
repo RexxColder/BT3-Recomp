@@ -1251,6 +1251,15 @@ namespace {
     bool isTerrainDraw(const GsGpuRenderer::DrawCmd &c) { return c.isTriangle && c.srcPsm == 19u && c.srcClutTbp == 12992u && !c.isTransfer; }
     int groundShadowMode() { static const int s = [](){ const char *v = std::getenv("PS2X_GROUNDSHADOW"); return v && v[0] ? std::atoi(v) : 0; }(); return s; }   // default ON since 2026-08-29 (user's fallback for the missing character shadow); =0 off, =2 magenta debug
     bool groundShadowOn() { return groundShadowMode() != 0; }
+    // [trihalf] half-texel UV bias for bilinear textured triangles (see the call site for the magnitude
+    // scan against console). Kept as a shared helper because it is a PER-TRIANGLE edit that the
+    // per-command draw body performs -- [glhoist] has to repeat it for every triangle of a batch.
+    bool triHalfOn() { static const bool v = [](){ const char *e = std::getenv("PS2X_TRIHALF"); return !(e && e[0] == '0'); }(); return v; }
+    void triHalfApply(GsGpuRenderer::Vtx *tri, int srcTexW, int srcTexH)
+    {
+        const float du = 0.5f / (float)srcTexW, dv = 0.5f / (float)srcTexH;
+        for (int i = 0; i < 3; ++i) { tri[i].u -= du; tri[i].v -= dv; }
+    }
     bool isFighterDraw(const GsGpuRenderer::DrawCmd &c) { return c.isTriangle && c.srcPsm == 20u && c.srcClutTbp >= 15360u && c.srcClutTbp < 15400u && !c.isTransfer; }
     void blobAccumulate(const GsGpuRenderer::DrawCmd &c) { BlobAcc &a = accFor(g_curGen); for (int i = 0; i < 3; ++i) { a.X.push_back(c.tri[i].x); a.Y.push_back(c.tri[i].y); a.Z.push_back(c.tri[i].z); } }
     void blobCompute(const BlobAcc &acc)
@@ -8595,11 +8604,35 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
     // only tri[] is rewritten per triangle, so the copy is amortised over the run.
     DrawCmd batchView;
     size_t ti = 0;
+    // [glhoist] A batch's triangles share every field but their vertices, so this per-command body --
+    // texture resolution, FBO bind, blend/depth/scissor/mask/uniform application, the whole gate chain --
+    // reaches the same conclusion for all of them. Run it ONCE per batch and emit every triangle at the
+    // generic emit site: ~55k body executions per frame become ~3k.
+    // ⚠ WHAT MAKES THIS LEGAL is that nothing in the body edits a triangle's VERTICES. Two things do, and
+    // both are handled rather than assumed away -- the first attempt at this change assumed them away and
+    // broke parity on every frame:
+    //   [trihalf]  a half-texel UV bias on bilinear textured triangles, DEFAULT ON -- the emit loop below
+    //              repeats it per triangle through the shared triHalfApply();
+    //   [wshud]    the widescreen squeeze rewrites vertex x AND the scissor from each triangle's own
+    //              bbox, so it is per-triangle state -- hoisting is simply off while it is live.
+    // Also off for the diagnostics that emit or read back per COMMAND and then `continue`, and for
+    // PS2X_GROUNDSHADOW (blobAccumulate takes every fighter VERTEX; the blob draw hangs off a list's last
+    // command). The body's one per-VERTEX decision, the inf/NaN guard, moves into the emit loop.
+    static const bool s_glHoist = [](){
+        const char *v = std::getenv("PS2X_GLHOIST"); if (v && v[0] == '0') return false;
+        for (const char *n : {"PS2X_SKIP_FBTEX_TRI", "PS2X_QUADMERGE", "PS2X_TEXID_COLORS", "PS2X_TRITEST2",
+                              "PS2X_AWRITE", "PS2X_SRCDIAG", "PS2X_DECALDBG", "PS2X_PIXTRACE",
+                              "PS2X_TERRSOFT", "PS2X_TERRFLAT"})
+        { const char *e = std::getenv(n); if (e && e[0]) return false; }
+        return true; }();
+    const bool hoistOk = s_glHoist && !groundShadowOn() && wsHudInv == 1.0f;
+    bool hoistAll = false;
     for (size_t ci = ciStart; ci < ciEnd;
-         (ti + 1u < (size_t)DC[ci].triCount) ? (void)++ti : (void)(ti = 0, ++ci))
+         (!hoistAll && ti + 1u < (size_t)DC[ci].triCount) ? (void)++ti : (void)(ti = 0, ++ci))
     {
         const uint32_t nTri = DC[ci].triCount;
-        const bool cmdLastTri = (ti + 1u >= (size_t)nTri);   // [drawbatch] end-of-command hooks fire once
+        hoistAll = hoistOk && nTri > 1u;                                  // [glhoist]
+        const bool cmdLastTri = hoistAll || (ti + 1u >= (size_t)nTri);   // [drawbatch] end-of-command hooks fire once
         if (nTri > 1u)
         {
             if (ti == 0)
@@ -9613,6 +9646,23 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 for (int i = 0; i < 3 && !bad; ++i)
                     bad = !std::isfinite(c.tri[i].x) || !std::isfinite(c.tri[i].y) ||
                           !std::isfinite(c.tri[i].u) || !std::isfinite(c.tri[i].v);
+                // [glhoist] this iteration is shared with the rest of the batch, so dropping the COMMAND
+                // here is only right when EVERY triangle in it is bad; a single poisoned one is filtered
+                // in the emit loop instead, exactly as the per-triangle walk did.
+                if (bad && hoistAll)
+                {
+                    const std::vector<Vtx> &vs = *DC[ci].triMore;
+                    for (uint32_t t = 1; t < nTri && bad; ++t)
+                    {
+                        bool tb = false;
+                        for (int i = 0; i < 3 && !tb; ++i)
+                        {
+                            const Vtx &v = vs[(t - 1u) * 3u + i];
+                            tb = !std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.u) || !std::isfinite(v.v);
+                        }
+                        if (!tb) bad = false;
+                    }
+                }
             }
             else
             {
@@ -9964,14 +10014,13 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // PS2X_TRIHALF=0 disables.
             // Magnitude scanned against console 2026-08-24: k=1 (this half texel) is the
             // full-frame optimum -- 0 -> 21.08, 1 -> 20.07, 1.5 -> 20.49, 2 -> 21.57, -1 -> 21.86.
-            static const bool s_th = [](){ const char *v = std::getenv("PS2X_TRIHALF"); return !(v && v[0] == '0'); }();
-            static const float s_thK = 1.0f;
-            if (s_th && c.isTriangle && c.bilinear && c.texKey != 0 && c.srcTexW > 0 && c.srcTexH > 0)
-            {
-                DrawCmd &m = const_cast<DrawCmd &>(c);
-                const float du = s_thK * 0.5f / (float)c.srcTexW, dv = s_thK * 0.5f / (float)c.srcTexH;
-                for (int i = 0; i < 3; ++i) { m.tri[i].u -= du; m.tri[i].v -= dv; }
-            }
+            // ⚠ [glhoist] THIS IS A PER-TRIANGLE VERTEX EDIT IN A PER-COMMAND BODY. Any code that shares
+            // one execution of this body across a batch's triangles (see the emit loop) must apply it to
+            // every triangle itself -- triHalfApply() is that single source of truth. Sharing the body
+            // without it shifts only the run's first triangle and leaves the rest sampling half a texel
+            // off: measured as MAE 0.03-1.6 on every parity frame, subtle and everywhere.
+            if (triHalfOn() && c.isTriangle && c.bilinear && c.texKey != 0 && c.srcTexW > 0 && c.srcTexH > 0)
+                triHalfApply(const_cast<DrawCmd &>(c).tri, c.srcTexW, c.srcTexH);
         }
         {   // GS TEX0.TFX per draw (DECAL only; HIGHLIGHT modes left as MODULATE).
             // DEFAULT OFF pending wider testing. With the uBright correction, DECAL is exactly
@@ -16069,6 +16118,33 @@ if (done.size() < 14 && !done.count(c.texKey))
             if (g_locRegion >= 0 && (reg[0] != g_curReg[0] || reg[1] != g_curReg[1] || reg[2] != g_curReg[2] || reg[3] != g_curReg[3]))
             { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locRegion, reg, SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, reg, sizeof reg); }
             }
+            // [glhoist] one pass per triangle of the run (nEmit == 1 for an ordinary command). Everything
+            // above ran ONCE; only the vertices differ, so only this loop repeats -- and it must redo every
+            // PER-TRIANGLE vertex edit the body did to triangle 0, which today is [trihalf].
+            const uint32_t nEmit = hoistAll ? nTri : 1u;
+            Vtx tvBuf[3];
+            for (uint32_t et = 0; et < nEmit; ++et)
+            {
+            const Vtx *TV = c.tri;   // triangle 0 already carries the body's edits
+            if (et > 0u)
+            {
+                const Vtx *const src = &(*DC[ci].triMore)[(et - 1u) * 3u];
+                tvBuf[0] = src[0]; tvBuf[1] = src[1]; tvBuf[2] = src[2];
+                if (triHalfOn() && c.bilinear && c.texKey != 0 && c.srcTexW > 0 && c.srcTexH > 0)
+                    triHalfApply(tvBuf, c.srcTexW, c.srcTexH);
+                TV = tvBuf;
+            }
+            if (hoistAll)
+            {   // the inf/NaN guard is the body's one per-VERTEX decision; it lives here now, so a single
+                // poisoned triangle is dropped instead of the whole run (inf in the GL vertex batch blacks
+                // out every draw after it)
+                bool tbad = false;
+                for (int i = 0; i < 3 && !tbad; ++i)
+                    tbad = !std::isfinite(TV[i].x) || !std::isfinite(TV[i].y) ||
+                           !std::isfinite(TV[i].u) || !std::isfinite(TV[i].v);
+                if (tbad) continue;
+                if (et > 0u) rlCheckRenderBatchLimit(4);   // et == 0 was checked above with the region setup
+            }
             rlBegin(RL_QUADS);
             const int quad[4] = {0, 1, 2, 2};
             // PS2X_TRIWHITE: diagnostic — draw triangles with WHITE vertex color, exposing the raw
@@ -16078,17 +16154,17 @@ if (done.size() < 14 && !done.count(c.texKey))
             {
                 const int i = quad[k];
                 if (s_triWhite) rlColor4ub(255, 255, 255, 255);
-                else rlColor4ub(c.tri[i].r, c.tri[i].g, c.tri[i].b, c.tri[i].a);
+                else rlColor4ub(TV[i].r, TV[i].g, TV[i].b, TV[i].a);
                 // PS2X_TRIUVGRID: force screen-derived UVs. If textures appear smeared across the
                 // scene, GL sampling works and the recorded UV values are the bug; if still flat,
                 // the batch texcoord path itself is broken.
                 static const bool s_uvGrid = [](){ const char *v = std::getenv("PS2X_TRIUVGRID"); return v && v[0] && v[0] != '0'; }();
                 if (s_uvGrid)
                 {
-                    rlTexCoord2f(c.tri[i].x / 512.0f, c.tri[i].y / 448.0f);
+                    rlTexCoord2f(TV[i].x / 512.0f, TV[i].y / 448.0f);
                     rlNormal3f(0.0f, 0.0f, 1.0f);
-                    if (depthOn) rlVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
-                    else rlVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
+                    if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                    else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
                     { PS2X_GATE_HIT(); continue; }
                 }
                 // PS2X_RAMPU=<u>: force a CONSTANT u on the cel/ramp class (tbp 15680), which
@@ -16099,10 +16175,10 @@ if (done.size() < 14 && !done.count(c.texKey))
                                                    return v && v[0] ? (float)std::atof(v) : -1.0f; }();
                 if (s_rampU >= 0.0f && c.srcTbp0 == 15680u)
                 {
-                    rlTexCoord2f(s_rampU, vflip ? 1.0f - c.tri[i].v : c.tri[i].v);
+                    rlTexCoord2f(s_rampU, vflip ? 1.0f - TV[i].v : TV[i].v);
                     rlNormal3f(0.0f, 0.0f, 1.0f);
-                    if (depthOn) rlVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
-                    else rlVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
+                    if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                    else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
                     { PS2X_GATE_HIT(); continue; }
                 }
                 // PS2X_SSUV=<tbp>: force SCREEN-SPACE UVs for one source class. The fbp502
@@ -16114,21 +16190,21 @@ if (done.size() < 14 && !done.count(c.texKey))
                                                 return v && v[0] ? std::atoi(v) : -1; }();
                 if (s_ssuv >= 0 && (int)c.srcTbp0 == (unsigned)s_ssuv)
                 {
-                    const float su = c.tri[i].x / 512.0f, sv = c.tri[i].y / 448.0f;
+                    const float su = TV[i].x / 512.0f, sv = TV[i].y / 448.0f;
                     rlTexCoord2f(su, vflip ? 1.0f - sv : sv);
                     rlNormal3f(0.0f, 0.0f, 1.0f);
-                    if (depthOn) rlVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
-                    else rlVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
+                    if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                    else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
                     { PS2X_GATE_HIT(); continue; }
                 }
                 if (fromFbo && s_atlas && srcSlot) {
                     // remap source-normalized UV into the atlas slot (V flipped for bottom-up GL)
-                    float au = ((float)srcSlot->x + c.tri[i].u * (float)srcSlot->w) / (float)g_atlasW;
-                    float av = 1.0f - ((float)srcSlot->y + c.tri[i].v * (float)srcSlot->h) / (float)g_atlasH;
+                    float au = ((float)srcSlot->x + TV[i].u * (float)srcSlot->w) / (float)g_atlasW;
+                    float av = 1.0f - ((float)srcSlot->y + TV[i].v * (float)srcSlot->h) / (float)g_atlasH;
                     rlTexCoord2f(au, av);
                 } else
                 {
-                    float uu = c.tri[i].u, vv = c.tri[i].v; const float q = c.tri[i].q;
+                    float uu = TV[i].u, vv = TV[i].v; const float q = TV[i].q;
                     // [perspq] q != 1: u/v hold RAW s,t (per-pixel s/q,t/q in the shader). The declared/actual
                     // rescale is linear, so it is valid before the divide; the vertical flip must happen AFTER it,
                     // which in homogeneous form is t' = q - t  ((q - t)/q = 1 - t/q). Also honour PS2X_FBOUV.
@@ -16140,13 +16216,14 @@ if (done.size() < 14 && !done.count(c.texKey))
                     else rlTexCoord2f(uu, vflip ? 1.0f - vv : vv);
                 }
                 if (g_dbgDecalCmd == &c && i == 0) { static int n4 = 0; if (n4++ < 6) { auto fit3 = g_fbos.find(336u); if (fit3 != g_fbos.end()) { int prevFb = 0, att = -1, attType = -1; glGetIntegerv(0x8CA6, &prevFb); glBindFramebuffer(0x8D40, fit3->second.rt.id); glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD1, &att); glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD0, &attType); glBindFramebuffer(0x8D40, (unsigned)prevFb); std::fprintf(stderr, "[decaldbg]   ATTACH fbp336 fbo=%u colour attachment name=%d type=0x%x | decal samples tex.id=%u (rt.texture.id=%u)\n", fit3->second.rt.id, att, attType, tex.id, fit3->second.rt.texture.id); } } }
-                if (g_dbgDecalCmd == &c && i == 0) { static int n2 = 0; float gt[4] = {-9,-9,-9,-9}, gf = -9, gp = -9, gc = -9, gi = -9, gx = -9, ga = -9, gr = -9, gz = -9, gzs = -9; if (g_locZTex >= 0) glGetUniformfv(g_shader.id, g_locZTex, &gz); { int lz = GetShaderLocation(g_shader, "uZScale"); if (lz >= 0) glGetUniformfv(g_shader.id, lz, &gzs); } if (g_locTexa >= 0) glGetUniformfv(g_shader.id, g_locTexa, gt); if (g_locTcc >= 0) glGetUniformfv(g_shader.id, g_locTcc, &gc); if (g_locIdxMode >= 0) glGetUniformfv(g_shader.id, g_locIdxMode, &gi); if (g_locTfx >= 0) glGetUniformfv(g_shader.id, g_locTfx, &gx); if (g_locAtst >= 0) glGetUniformfv(g_shader.id, g_locAtst, &ga); if (g_locAref >= 0) glGetUniformfv(g_shader.id, g_locAref, &gr); if (g_locFboOne >= 0) glGetUniformfv(g_shader.id, g_locFboOne, &gf); if (g_locPerspQ >= 0) glGetUniformfv(g_shader.id, g_locPerspQ, &gp); if (n2++ < 6000) std::fprintf(stderr, "[decaldbg]   EMIT generic tri: chunk=%d curFbp=%u vflip=%d fromFbo=%d tex.id=%u %dx%d src=%dx%d u/v/q v0=(%.3f,%.3f,%.4f) uRegion=(%.4f,%.4f,%.4f,%.0f) | GL uTexa=(%.2f,%.2f,%.2f,%.2f) cache=(%.2f,%.2f,%.2f,%.2f) uFboOne=%.1f uPerspQ=%.1f uTcc=%.1f uIdxMode=%.1f uTfx=%.1f uAtst=%.1f uAref=%.2f uZTex=%.1f uZScale=%.3f\n", (int)m_chunkMode, curFbp, (int)vflip, (int)fromFbo, tex.id, tex.width, tex.height, (int)c.srcTexW, (int)c.srcTexH, c.tri[0].u, c.tri[0].v, c.tri[0].q, g_curReg[0], g_curReg[1], g_curReg[2], g_curReg[3], gt[0], gt[1], gt[2], gt[3], g_curTexa[0], g_curTexa[1], g_curTexa[2], g_curTexa[3], gf, gp, gc, gi, gx, ga, gr, gz, gzs); }
-                rlNormal3f(c.tri[i].q, 0.0f, 1.0f);   // .x carries the GS q (PS2X_PERSPQ)
+                if (g_dbgDecalCmd == &c && i == 0) { static int n2 = 0; float gt[4] = {-9,-9,-9,-9}, gf = -9, gp = -9, gc = -9, gi = -9, gx = -9, ga = -9, gr = -9, gz = -9, gzs = -9; if (g_locZTex >= 0) glGetUniformfv(g_shader.id, g_locZTex, &gz); { int lz = GetShaderLocation(g_shader, "uZScale"); if (lz >= 0) glGetUniformfv(g_shader.id, lz, &gzs); } if (g_locTexa >= 0) glGetUniformfv(g_shader.id, g_locTexa, gt); if (g_locTcc >= 0) glGetUniformfv(g_shader.id, g_locTcc, &gc); if (g_locIdxMode >= 0) glGetUniformfv(g_shader.id, g_locIdxMode, &gi); if (g_locTfx >= 0) glGetUniformfv(g_shader.id, g_locTfx, &gx); if (g_locAtst >= 0) glGetUniformfv(g_shader.id, g_locAtst, &ga); if (g_locAref >= 0) glGetUniformfv(g_shader.id, g_locAref, &gr); if (g_locFboOne >= 0) glGetUniformfv(g_shader.id, g_locFboOne, &gf); if (g_locPerspQ >= 0) glGetUniformfv(g_shader.id, g_locPerspQ, &gp); if (n2++ < 6000) std::fprintf(stderr, "[decaldbg]   EMIT generic tri: chunk=%d curFbp=%u vflip=%d fromFbo=%d tex.id=%u %dx%d src=%dx%d u/v/q v0=(%.3f,%.3f,%.4f) uRegion=(%.4f,%.4f,%.4f,%.0f) | GL uTexa=(%.2f,%.2f,%.2f,%.2f) cache=(%.2f,%.2f,%.2f,%.2f) uFboOne=%.1f uPerspQ=%.1f uTcc=%.1f uIdxMode=%.1f uTfx=%.1f uAtst=%.1f uAref=%.2f uZTex=%.1f uZScale=%.3f\n", (int)m_chunkMode, curFbp, (int)vflip, (int)fromFbo, tex.id, tex.width, tex.height, (int)c.srcTexW, (int)c.srcTexH, TV[0].u, TV[0].v, TV[0].q, g_curReg[0], g_curReg[1], g_curReg[2], g_curReg[3], gt[0], gt[1], gt[2], gt[3], g_curTexa[0], g_curTexa[1], g_curTexa[2], g_curTexa[3], gf, gp, gc, gi, gx, ga, gr, gz, gzs); }
+                rlNormal3f(TV[i].q, 0.0f, 1.0f);   // .x carries the GS q (PS2X_PERSPQ)
                 // ortho maps window_depth = -z, so pass -z to store the intended depth.
-                if (depthOn) rlVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
-                else rlVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
+                if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
             }
             rlEnd();
+            }   // [glhoist] end of the per-triangle emit
             {   // [decalbatch] consecutive shadow-decal pieces share every GL state and the same FBO texture: keep the
                 // texture bound so rlgl accumulates them in ONE draw entry (one glDrawArrays per run of pieces instead of
                 // one per piece -- 2300 pieces/frame at depth cap 7 cost 30 -> 25 fps otherwise).
