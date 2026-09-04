@@ -990,6 +990,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     // and compare state + data memory afterwards -- the correctness gate (the rig cannot see VU1 changes).
     static const bool s_jit = [](){ const char *v = std::getenv("PS2X_VUJIT"); return !(v && v[0] == '0'); }();   // default ON since 2026-08-28 (verify: 7.7M runs, 0 mismatches)
     static const bool s_jitVerify = [](){ const char *v = std::getenv("PS2X_VUJIT_VERIFY"); return v && v[0] && v[0] != '0'; }();
+    // [vuverifyfrom] PS2X_VUJIT_VERIFY_FROM=<game frame>: start verifying only after that frame. Verify runs the
+    // interpreter AND the recompiled body for every VU1 run (~20x the VU1 cost), and the FIGHT LOAD is
+    // timing-sensitive enough that doing it from boot walks straight into the bt3-loading-stall -- measured
+    // 2/2 rig runs on 2026-09-04, against 0/6 for the same rig without verify. Arming it after the load makes
+    // the gate runnable on the rig instead of only in a hand-driven session.
+    static const uint64_t s_jitVerifyFrom = [](){ const char *v = std::getenv("PS2X_VUJIT_VERIFY_FROM");
+                                                  return v && v[0] ? std::strtoull(v, nullptr, 10) : 0ull; }();
     if (s_jit && !t_vuNoJit)
     {
         static thread_local uint32_t s_jitGen = 0xFFFFFFFFu;
@@ -1011,7 +1018,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (s_jitProg)
         {
             ++s_jitRuns;
-            if (s_jitVerify)
+            extern std::atomic<uint64_t> g_bt3FrameCount;   // [vuverifyfrom]
+            if (s_jitVerify && g_bt3FrameCount.load(std::memory_order_relaxed) >= s_jitVerifyFrom)
             {
                 VU1Interpreter ref = *this; ref.m_dryKick = true;
                 std::vector<uint8_t> dataCopy(vuData, vuData + dataSize);
@@ -4007,6 +4015,12 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
 }
 
 // [vu1jit] compile-time specialised helpers + the generated programs (see work/rig/gen_vu1.py)
+
+// [vupairs] VU1 pairs actually executed on the recompiled path, accumulated ONCE PER RUN (the generated
+// code adds its cyc at every return). The [fps] line reports it per second, which is the only honest
+// denominator for VU1 work: ns-per-GS-primitive moves with whatever the record path does that frame,
+// ns-per-pair does not.
+std::atomic<uint64_t> g_vu1PairCount{0};
 
 void VU1Interpreter::jitStatPrint()   // [jitstat]
 {

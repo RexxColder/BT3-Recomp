@@ -4521,6 +4521,9 @@ void PS2Runtime::run()
                           << " wall_ms=" << wallMs
                           << " host=" << (uint32_t)(s_fpsFrames / dt)
                           << " prims/sec=" << (uint64_t)((prims - s_lastPrims) / dt)
+                          << " vu1pairs/sec=" << [&]{ extern std::atomic<uint64_t> g_vu1PairCount;   // [vupairs]
+                                 static uint64_t s_lastVp = 0; const uint64_t vp = g_vu1PairCount.load(std::memory_order_relaxed);
+                                 const uint64_t d = (uint64_t)((vp - s_lastVp) / dt); s_lastVp = vp; return d; }()
                           << " Mpix/sec=" << (double)((pix - s_lastPix) / dt / 1.0e6)
                           << " swaps/sec=" << (uint64_t)((swaps - s_lastSwaps) / dt)
                           << " glcalls/sec=" << (uint64_t)((glc - s_lastGlCalls) / dt)

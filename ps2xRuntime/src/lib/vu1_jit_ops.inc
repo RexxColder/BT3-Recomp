@@ -13,6 +13,23 @@ constexpr uint8_t jDEST(uint32_t w) { return (uint8_t)((w >> 21) & 0xFu); }
 constexpr uint8_t jFT(uint32_t w) { return (uint8_t)((w >> 16) & 0x1Fu); }
 constexpr uint8_t jFS(uint32_t w) { return (uint8_t)((w >> 11) & 0x1Fu); }
 constexpr uint8_t jFD(uint32_t w) { return (uint8_t)((w >> 6) & 0x1Fu); }
+
+// [vuqlazy] The generated code (work/rig/gen_vu1.py) does NOT tick the Q / clip pipelines per pair. It keeps
+// DEADLINES -- qDead / cDead = the value of cyc at which the pending value commits, 0 = idle -- and makes the
+// real state exact only where an op can observe it. These two helpers are that sync, used at the interpreter
+// FALLBACK sites (inside the `if (!jitUpper/jitLower(...))`, so the fast path pays nothing) and at returns.
+// ⚠ IF YOU ADD A READ OF st.q OR st.clip TO A HELPER BELOW, add its opcode to the classifier sets at the top
+// of gen_vu1.py and regenerate -- otherwise that op reads a stale value on the recompiled path only.
+static inline void jitPipeSync(VU1State &st, uint32_t cyc, uint32_t &qDead, uint32_t &cDead)
+{
+    if (qDead) { if (cyc >= qDead) { st.q = st.pendingQ; st.qWait = 0u; qDead = 0u; } else st.qWait = qDead - cyc; }
+    if (cDead) { if (cyc >= cDead) { st.clip = g_pendingClip; g_clipWait = 0u; cDead = 0u; } else g_clipWait = cDead - cyc; }
+}
+static inline void jitPipeArm(VU1State &st, uint32_t cyc, uint32_t &qDead, uint32_t &cDead)
+{
+    qDead = st.qWait ? cyc + st.qWait : 0u;
+    cDead = g_clipWait ? cyc + g_clipWait : 0u;
+}
 constexpr uint8_t jVIT(uint32_t w) { return (uint8_t)((w >> 16) & 0xFu); }
 constexpr uint8_t jVIS(uint32_t w) { return (uint8_t)((w >> 11) & 0xFu); }
 constexpr uint8_t jVID(uint32_t w) { return (uint8_t)((w >> 6) & 0xFu); }
