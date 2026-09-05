@@ -108,17 +108,6 @@ else()
     endif()
     endif()
 
-    # [ps2x batchsize] AFTER the ps2x patch has settled, bump the batch limits: the GS renderer emits
-    # ~85k draw calls/sec and the 8192-element / 256-drawcall caps forced extra flush cycles.
-    # Idempotent: each REGEX is a no-op once its replacement is already in place.
-    if(EXISTS "${raylib_SOURCE_DIR}/src/config.h")
-        file(READ "${raylib_SOURCE_DIR}/src/config.h" _rl_cfg)
-        string(REGEX REPLACE "//#define[ \t]+RL_DEFAULT_BATCH_BUFFER_ELEMENTS[ \t]+4096"
-                             "#define RL_DEFAULT_BATCH_BUFFER_ELEMENTS    16384" _rl_cfg "${_rl_cfg}")
-        string(REGEX REPLACE "#define[ \t]+RL_DEFAULT_BATCH_DRAWCALLS[ \t]+256"
-                             "#define RL_DEFAULT_BATCH_DRAWCALLS           512" _rl_cfg "${_rl_cfg}")
-        file(WRITE "${raylib_SOURCE_DIR}/src/config.h" "${_rl_cfg}")
-    endif()
 
     FetchContent_Declare(
         imgui
