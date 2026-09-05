@@ -1224,7 +1224,7 @@ namespace
         // factor ran at ~half the GS strength (measured: the mountain-shading CLUT's alpha-127
         // darkening applied at 0.498 instead of 0.992 -> "light geometry" on scenery; water
         // tints likewise). uABl128 scales the tcc=1 texture path by 255/128.
-        "  float aBlend = clamp((uABl128 > 0.5 && uTcc > 0.5) ? min(c.a * uABl128, 1.0) : c.a, 0.0, 1.0);\n"
+        "  float aBlend = clamp((uABl128 > 0.5 && uTcc > 0.5) ? min(c.a * 1.9921875, 1.0) : c.a, 0.0, 1.0);\n"
         // PS2X_ASPLIT: uAScale (128/255) must apply ONLY to the VERTEX-derived alpha. Our
         // vertex alpha encodes a GS 128 as 255, so it needs the rescale; but the CLUT decode
         // already yields the GS byte directly (measured: a character texture decodes to a
@@ -4349,7 +4349,7 @@ bool GsGpuRenderer::sameBatchState(const DrawCmd &a, const DrawCmd &b)
     // EVERY DrawCmd field except tri[], triCount and triMore. A field added to the struct and
     // forgotten here would render the HEAD's value for every triangle of a run -- a silent
     // wrong-pixel bug -- so the static_assert below fails the build when the struct grows.
-    static_assert(sizeof(DrawCmd) == 344,   // x86-64; bump only together with a re-read of the field list below
+    static_assert(sizeof(DrawCmd) == 352,   // x86-64; bump only together with a re-read of the field list below
                   "DrawCmd changed size: re-check sameBatchState() covers every new field, then update this size");
     return a.texKey == b.texKey && a.isTriangle == b.isTriangle && a.isTransfer == b.isTransfer
         && a.isVramBlit == b.isVramBlit && a.depthOnly == b.depthOnly && a.wsHudApplied == b.wsHudApplied
@@ -4365,6 +4365,7 @@ bool GsGpuRenderer::sameBatchState(const DrawCmd &a, const DrawCmd &b)
         && a.su0 == b.su0 && a.sv0 == b.sv0 && a.su1 == b.su1 && a.sv1 == b.sv1
         && a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a && a.z == b.z
         && a.depthTest == b.depthTest && a.depthFunc == b.depthFunc && a.depthWrite == b.depthWrite
+        && a.zbufBp == b.zbufBp   // [zbufbp] different Z page = different depth target
         && a.alphaTest == b.alphaTest && a.alphaFunc == b.alphaFunc && a.alphaRef == b.alphaRef
         && a.alphaFail == b.alphaFail && a.dateEnable == b.dateEnable && a.dateMode == b.dateMode
         && a.fst == b.fst && a.abe == b.abe && a.blendMode == b.blendMode && a.blendFix == b.blendFix
@@ -7974,6 +7975,42 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             Fbo &f = g_fbos[curRealFbp]; // dimensions of the ACTUAL bound FBO (merged partner has no own entry)
             const bool full = (sx <= 0 && sy <= 0 && sw >= f.w && sh >= f.h);
             const int rsS = f.scale;   // [rscale] GL scissor is raw physical pixels
+            {   // [splitgap] P1-vs-P2 splitscreen scissors the viewports to x 0..254 and 257..511,
+                // so columns 255..256 are written by NEITHER. Before the split the scene is drawn
+                // full width, so those columns keep whatever was last there -- on a live run the
+                // intro close-up, which is why the divider showed Goku's orange gi. Nothing clears
+                // or writes them during the match (verified in both our stream and a PCSX2 dump:
+                // every full-width-scissor draw is a small HUD element, and geometry reaching the
+                // gap is clipped by the viewport scissors). Console inherits its clear colour
+                // there; we inherit stale pixels. Blank the gap once per frame per buffer.
+                static const bool s_sgap = [](){ const char *v = std::getenv("PS2X_SPLITGAP");
+                                                 return !(v && v[0] == '0'); }();   // default ON
+                static std::unordered_map<uint32_t, int>  s_leftEnd;   // realFbp -> right edge of the left viewport
+                static std::unordered_map<uint32_t, uint32_t> s_gapGen; // realFbp -> frame already blanked
+                if (s_sgap && (curRealFbp == 0u || curRealFbp == 112u) && sw > 0 && sh > 0)
+                {
+                    int &le = s_leftEnd[curRealFbp];
+                    uint32_t &gg = s_gapGen[curRealFbp];
+                    if (gg != frameGen) { gg = frameGen; le = -1; }   // new frame: forget last layout
+                    if (sx <= 0) le = sw;                              // left viewport ends here
+                    else if (le > 0 && sx > le)
+                    {
+                        const int gx = le, gw = sx - le;               // the untouched columns
+                        if (gw > 0 && gw <= 16)                        // a divider, not a real gap in coverage
+                        {
+                            rlDrawRenderBatchActive();
+                            rlEnableScissorTest();
+                            rlScissor(gx * rsS, 0, gw * rsS, f.h * rsS);
+                            rlClearColor(0, 0, 0, 255);
+                            rlClearScreenBuffers();
+                            static int sgn = 0;
+                            if (++sgn <= 3)
+                                std::fprintf(stderr, "[splitgap] blanked x %d..%d on fbp%u\n", gx, gx + gw - 1, curRealFbp);
+                        }
+                        le = -1;   // once per frame
+                    }
+                }
+            }
             if (!full && sw > 0 && sh > 0) { rlEnableScissorTest(); rlScissor(sx * rsS, (f.h - (sy + sh)) * rsS, sw * rsS, sh * rsS); }
             else rlDisableScissorTest();
         }
@@ -12144,6 +12181,73 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         {
             static const bool s_zTexR = [](){ const char *v = std::getenv("PS2X_ZTEX");
                                               return v && v[0] && v[0] != '0'; }();
+            {   // [zpagewb] PS2X_ZPAGEWB=1: the cutscene-skip cross-fade uploads a 512x224
+                // PSMCT24 image into the Z page and reads 512x512 back, every other frame. Only
+                // the top 224 rows are refreshed; the rest of our VRAM mirror is whatever was
+                // last written there -- boot bytes -- because GPU mode renders into FBOs and
+                // never mirrors back. Console's stream (57 upload/read pairs; ours 7, correctly
+                // paired) has live data in those rows. Push the page's colour FBO into VRAM so
+                // the decode reads our own rendering instead of boot leftovers. The decode runs
+                // at command-build time, so this lands one frame later -- stale by a frame
+                // rather than stale by a session.
+                static const bool s_zpwb = [](){ const char *v = std::getenv("PS2X_ZPAGEWB");
+                                                 return !(v && v[0] == '0'); }();   // default ON
+                if (s_zpwb && !c.isTransfer && c.texKey != 0
+                    && (c.srcPsm == 0x00u || c.srcPsm == 0x01u)
+                    && c.zbufBp != 0u && (c.srcTbp0 / 32u) == c.zbufBp)
+                {
+                    const uint32_t wpg = c.zbufBp;
+                    // Once per page per frame: the fade issues ~32 of these draws per vsync, and
+                    // a full-page glReadPixels each time is the synchronous stall class that
+                    // costs little here and a great deal on a weak GPU.
+                    static std::unordered_map<uint32_t, uint32_t> s_wbFrame;
+                    auto &wgen = s_wbFrame[wpg];
+                    const bool wbFirst = (wgen != frameGen);
+                    wgen = frameGen;
+                    auto wit = wbFirst ? g_fbos.find(wpg) : g_fbos.end();
+                    if (wit != g_fbos.end() && wit->second.rt.texture.id != 0)
+                    {
+                        extern void ps2xWritebackToVram(uint32_t, uint32_t, uint32_t, int, int, const uint32_t *);
+                        extern std::unordered_set<uint32_t> g_wbDone;
+                        auto wfit = g_fbpFmt.find(wpg);
+                        const uint32_t wfbw = (wfit != g_fbpFmt.end() && wfit->second.fbw) ? wfit->second.fbw : 8u;
+                        // FBOs are GROW-ONLY, so w/h can far exceed the page's logical extent.
+                        // Writing that many rows at a hardcoded CT32 stride runs off the end of
+                        // the page -- and off VRAM entirely for a grown FBO -- which corrupts
+                        // whatever follows. Clamp to the space before the next allocated fbp and
+                        // to VRAM, exactly as the [wbl] latch writeback does.
+                        int ww = wit->second.w, wh = wit->second.h;
+                        {
+                            const long rowBytes = (long)wfbw * 64L * 4L;   // CT32 bytes per row
+                            uint32_t nextFbp = 512u;
+                            for (const auto &kv : g_fbos)
+                                if (kv.first > wpg && kv.first < nextFbp && kv.second.rt.texture.id != 0)
+                                    nextFbp = kv.first;
+                            if (nextFbp > kVramPages) nextFbp = kVramPages;
+                            if (rowBytes > 0 && nextFbp > wpg)
+                                wh = (int)std::min<long>(wh, (long)(nextFbp - wpg) * 8192L / rowBytes);
+                            ww = std::min(ww, (int)wfbw * 64);
+                            if (wh < 0) wh = 0;
+                        }
+                        if (ww > 0 && wh > 0)
+                        {
+                            static std::vector<uint32_t> wpx;
+                            wpx.resize((size_t)ww * wh);
+                            rlDrawRenderBatchActive();
+                            rlEnableFramebuffer(wit->second.rt.id);
+                            rsBindReadDownsampled(wit->second);
+                            glReadPixels(0, 0, ww, wh, 0x1908, 0x1401, wpx.data());
+                            rlDisableFramebuffer();
+                            ps2xWritebackToVram(wpg, wfbw, 0u /*PSMCT32 bytes*/, ww, wh, wpx.data());
+                            g_wbDone.insert(wpg);
+                            static int wn = 0;
+                            if (++wn <= 3)
+                                std::fprintf(stderr, "[zpagewb] wrote fbp%u (%dx%d fbw=%u) back to VRAM for a CT%u read\n",
+                                             wpg, ww, wh, wfbw, c.srcPsm == 1u ? 24u : 32u);
+                        }
+                    }
+                }
+            }
             if (s_zTexR && !c.isTransfer && c.texKey != 0
                 && (c.srcPsm == 0x30u || c.srcPsm == 0x31u || c.srcPsm == 0x32u))
             {
@@ -14098,35 +14202,19 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         // the As-LERP family (0x44 etc.) gets the GS-correct full factor.
                         static const int s_abm = [](){ const char *v = std::getenv("PS2X_ABLEND128"); return v && v[0] ? std::atoi(v) : 0; }();
                         float want128 = 0.0f;
-                        if (s_abm == 1) want128 = 1.9921875f;
-                        else if (s_abm == 2 && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u))) want128 = 1.9921875f;
+                        if (s_abm == 1) want128 = 1.0f;
+                        else if (s_abm == 2 && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u))) want128 = 1.0f;
                         else if (s_abm == 3 && c.srcClutTbp >= 11390u && c.srcClutTbp <= 11440u && c.srcClutTbp != 11432u
                                  && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u)))
-                            want128 = 1.9921875f;   // mountain/scenery shading family ONLY (the mount.png pale-tops classes); clouds (11432) + additives untouched
+                            want128 = 1.0f;   // mountain/scenery shading family ONLY (the mount.png pale-tops classes); clouds (11432) + additives untouched
                         else if (s_abm == 4 && c.srcClutTbp == 12992u && (c.srcPsm == 0x13u || c.srcPsm == 0x14u)
                                  && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u)))
-                            want128 = 1.9921875f;   // TERRAIN family only: the 0x44 As-lerp at full GS strength = pure texture,
+                            want128 = 1.0f;   // TERRAIN family only: the 0x44 As-lerp at full GS strength = pure texture,
                                               // erasing the half-mix underlayer darkening (predicted: dome 131->148, strip 112->127 = console)
                         else if (s_abm == 5 && c.srcClutTbp != 12992u && c.srcClutTbp != 11472u && c.srcClutTbp != 11476u)
-                            want128 = 1.9921875f;   // DENYLIST scope (same-stream metrics GREF2): full GS factor everywhere EXCEPT
+                            want128 = 1.0f;   // DENYLIST scope (same-stream metrics GREF2): full GS factor everywhere EXCEPT
                                               // terrain (12992: half-mix measured CLOSER to console; full = dark blob + darker hills)
                                               // and the HUD gauge palettes (11472/11476). Sky/clouds land at G0.98 with this.
-                        {   // [mcfade] The boot memory-card prompt "clears" the previous frame
-                            // with a full-screen textured quad (CLUT 12354, MODULATE, blend
-                            // (0,1,0,1), vertex alpha ramping 36->29). Read literally that is a
-                            // ~28% lerp, which leaves every earlier height of the box border on
-                            // screen as the box collapses -- the long-standing close ghosting.
-                            // On hardware it erases COMPLETELY: a PCSX2 dump of the identical
-                            // stream (streams verified draw-for-draw identical, no clear on
-                            // either side) renders ONE clean border on black. Matched here by
-                            // saturating this one CLUT's blend factor. Scope is exactly the
-                            // prompt: fight and underwater replays are bit-identical (MAE
-                            // 0.0000). PS2X_MCFADE=0 restores the old behaviour.
-                            static const bool off = [](){ const char *v = std::getenv("PS2X_MCFADE");
-                                                          return v && v[0] == '0'; }();
-                            if (!off && c.srcTbp0 == 12288u && c.srcClutTbp == 12354u)
-                                want128 = 64.0f;   // saturates to a full erase
-                        }
                         static float cur128 = -1.0f;
                         if (g_locABl128 >= 0 && want128 != cur128)
                         { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locABl128, &want128, SHADER_UNIFORM_FLOAT); cur128 = want128; }
