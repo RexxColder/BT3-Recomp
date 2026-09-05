@@ -8903,8 +8903,25 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (s_dbn < 3) { ++s_dbn; std::fprintf(stderr, "[datebin] snapped HUD band alpha (w=%.0f)\n", bw); }
             }
         }
+        // [wsrtskip] A draw that OPAQUELY samples a live render target is scene
+        // post-processing, never HUD: the fight HUD is uploaded art, always blended.
+        // BT3's underwater pass blits page 336 back over the scene as a GRID of ~57x90
+        // tiles, and its TOP tile row (y 0..90, tbp 10752 = fbp336*32) slipped through
+        // both classifier gates -- each tile is far under 0.8*W wide and ty1=90 < 96 --
+        // so the map squeezed those nine tiles into x 98..542 while the rows below
+        // (ty1 >= 96) stayed put. That is the underwater "segmented box": tile seams,
+        // compressed content, misaligned against the rest of the frame, widescreen only.
+        // Census (ty1<96, squeezed set): underwater 36 draws match rend=1/upl=0/abe=0 and
+        // are all tiles; the grass-arena fight has ZERO, so no HUD art is affected. The
+        // gate deliberately keeps abe=1 RT composites (health / blast-stock dest-alpha bar
+        // fills) squeezed -- unsqueezing those is what tore the HUD in the reverted 6d86fe9.
+        // PS2X_WSRTSKIP=0 restores.
+        static const bool s_wsRtSkip = [](){ const char *v = std::getenv("PS2X_WSRTSKIP");
+                                             return !(v && v[0] == '0'); }();
+        const bool wsScenePost = s_wsRtSkip && c.srcRendered && !c.srcUploaded && !c.abe;
         if (wsHudInv != 1.0f && !c.wsHudApplied && !c.isTransfer && !c.isVramBlit
-            && !c.isDecode && !c.isAliasPass && (c.destFbp == 0u || c.destFbp == 112u)
+            && !c.isDecode && !c.isAliasPass && !wsScenePost
+            && (c.destFbp == 0u || c.destFbp == 112u)
             && (c.destPsm == 0u || c.destPsm == 1u))
         {
             // Center-anchored squeeze (one continuous linear map -- BT3's top bar is a chain
