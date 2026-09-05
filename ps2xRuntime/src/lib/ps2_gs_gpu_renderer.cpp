@@ -758,7 +758,19 @@ namespace
     // high internal res). Mask writers keep point (gate exactness).
 
     int rsN() { return GsGpuRenderer::renderScale(); }   // live: overlay setter or PS2X_RENDERSCALE
-    bool rsScaledFbp(uint32_t fbp) { return rsN() > 1 && (fbp == 0u || fbp == 112u); }
+    // [rsviewscale] the FBW-split CT32 view (1104) scales with the scene. It holds a full
+    // scene-resolution image composited back into the Nx scene buffer, so leaving it 1x sent
+    // the underwater pass through a 1x roundtrip -- and because only ONE of the two alternating
+    // scene buffers takes that path per frame, the top ~80 rows alternated between a correct
+    // and a washed-out state every frame: the user's underwater "HUD box" AND its flicker, one
+    // bug. Measured (dive.bin f106-112, scale 4): band frame-to-frame delta 22.99 -> 1.94, which
+    // is the scale-1 reference exactly; every frame now sits 4.7 from the 1x frame instead of
+    // alternating 4.7/26.0. Scenes that never split the view are bit-identical (glow.bin: 0.000).
+    // Also 1.76 -> 1.42 ms GL/frame: the downsample roundtrip is gone. PS2X_RSVIEWSCALE=0 restores.
+    bool rsViewScale() { static const bool on = [](){ const char *v = std::getenv("PS2X_RSVIEWSCALE");
+                                                      return !(v && v[0] == '0'); }(); return on; }
+    bool rsScaledFbp(uint32_t fbp) { return rsN() > 1 && (fbp == 0u || fbp == 112u
+                                                          || (rsViewScale() && fbp == 1104u)); }
     std::unordered_map<unsigned, int> g_rsTexScale;   // texture id -> scale (scaled FBOs only)
     std::unordered_map<unsigned, uint32_t> g_rsTexFbo;   // texture id -> fbp (scaled FBOs only)
     int rsTexScale(unsigned id) { auto it = g_rsTexScale.find(id); return it == g_rsTexScale.end() ? 1 : it->second; }
