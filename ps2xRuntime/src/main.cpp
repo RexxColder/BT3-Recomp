@@ -113,6 +113,30 @@ static double g_benchGsMs = 0.0, g_benchRenderMs = 0.0; static long g_benchFrame
 // dump: no gameplay, no timing. Ported from the dev tree 2026-08-22 so that work on this
 // clean repo build is measurable. Adds no behaviour to a normal run.
 // ---------------------------------------------------------------------------------------
+// [wshudinv] The replay never runs ps2_runtime.cpp's present, which is where the widescreen
+// squeeze factor g_ps2xWsHudInv is computed -- so it stays 1.0 and EVERY widescreen effect is
+// inert offline. That is why a widescreen-only artifact could not be reproduced from a dump.
+// PS2X_WSHUDINV=<f> forces it (live value for a 1280x720 window over a 512x448 source is
+// (720/448 * 1.08) / (1280/512) = 0.694).
+static void ps2xReplayApplyWsHudInv()
+{
+    static const float f = [](){ const char *v = std::getenv("PS2X_WSHUDINV");
+                                 const float x = v && v[0] ? (float)std::atof(v) : 0.0f;
+                                 return (x > 0.2f && x <= 1.0f) ? x : 0.0f; }();
+    if (f > 0.0f) { extern float g_ps2xWsHudInv; g_ps2xWsHudInv = f; }
+}
+
+// [replayw] the replay has always rendered at a hardcoded 512 while the LIVE path passes
+// FB_WIDTH (640). That asymmetry means the replay cannot reproduce anything that depends on
+// the render width -- e.g. content occupying only 512 of a 640-wide scene FBO. PS2X_REPLAYW
+// lets the replay match live. Default stays 512 so every existing measurement is unchanged.
+static int ps2xReplayRenderW()
+{
+    static const int w = [](){ const char *v = std::getenv("PS2X_REPLAYW");
+                               const int n = v && v[0] ? std::atoi(v) : 512;
+                               return (n >= 256 && n <= 1024) ? n : 512; }();
+    return w;
+}
 static void gsReplayDumpBuf(GS &gs, uint32_t fbp, uint32_t fbw, int w, int h, int vsync)
 {
     char p[160];
@@ -279,7 +303,7 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
                     // GPU-path replay: publish the accumulated DrawCmds, render on this
                     // (GL-owning) thread, save the present — the GPU-vs-SW diff harness.
                     ps2GpuRenderer().swapFrame();
-                    ps2GpuRenderer().renderAndGetTextureId(512, 448);
+                    ps2xReplayApplyWsHudInv(); ps2GpuRenderer().renderAndGetTextureId(ps2xReplayRenderW(), 448);
                     char gp[160];
                     std::snprintf(gp, sizeof gp, "/home/z3/Desktop/bt3/work/gsreplay_gpu_%02d.png", tag);
                     ps2GpuRenderer().debugSavePresent(gp);
@@ -328,7 +352,7 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
                     if ((dumpEvery > 0 && (vsyncs % (int)dumpEvery) == 0 && inWin) || (dumpTo > 0 && inWin))
                     {
                         { const auto _r0 = std::chrono::steady_clock::now();
-                          ps2GpuRenderer().renderAndGetTextureId(512, 448);
+                          ps2xReplayApplyWsHudInv(); ps2GpuRenderer().renderAndGetTextureId(ps2xReplayRenderW(), 448);
                           g_benchRenderMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _r0).count(); ++g_benchFrames; }
                         // PS2X_GS_REPLAY_OUT=<dir>: where the per-frame PNGs land (default
                         // work/). Per-variant dirs let A/B replays run in parallel.
@@ -341,7 +365,7 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
                     else if (inWarm)
                     {   // [replaybench] warm frames render without a PNG save: the timing window
                         const auto _r0 = std::chrono::steady_clock::now();
-                        ps2GpuRenderer().renderAndGetTextureId(512, 448);
+                        ps2xReplayApplyWsHudInv(); ps2GpuRenderer().renderAndGetTextureId(ps2xReplayRenderW(), 448);
                         g_benchRenderMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _r0).count(); ++g_benchFrames;
                     }
                     // PS2X_GS_REPLAY_VDUMP=1: in GPU mode ALSO dump the effect-chain buffers
