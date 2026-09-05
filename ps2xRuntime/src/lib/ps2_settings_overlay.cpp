@@ -258,6 +258,8 @@ static void pushHudLayout(const PS2SettingsOverlay::Settings &st)
     g_wsHudLayout.store(st.hudLayout, std::memory_order_relaxed);
 }
 std::string PS2SettingsOverlay::s_configDir;
+int PS2SettingsOverlay::s_logLevel = 1;        // [loglevel] default: profile+mclog+sched (see header)
+int PS2SettingsOverlay::s_startupLogLevel = 1; // [loglevel] captured by preloadSettings for main()
 
 void PS2SettingsOverlay::setConfigDirectory(const std::string &dir)
 {
@@ -513,6 +515,11 @@ void PS2SettingsOverlay::loadSettings()
                     m_dumpRuntime = (val == "1" || val == "true");
                 else if (key == "dump_gamepad")
                     m_dumpGamepad = (val == "1" || val == "true");
+                else if (key == "log_level")
+                {   // [loglevel] clamp to 0..3 so a bad INI value never disables logging silently
+                    m_settings.logLevel = std::clamp(std::atoi(val.c_str()), 0, 3);
+                    s_logLevel = m_settings.logLevel;
+                }
             }
         }
         catch (const std::exception &)
@@ -563,6 +570,13 @@ void PS2SettingsOverlay::preloadSettings()
                 int rs = std::atoi(val.c_str());
                 if (rs >= 1 && rs <= 4) GsGpuRenderer::setRenderScale(rs);
             }
+        }
+        else if (section == "logging" && key == "log_level")
+        {   // [loglevel] capture for main(): must be visible before runtime init so the
+            // PS2X_* diagnostic env vars (and the stderr redirect to logs/bt3.log) apply.
+            const int lvl = std::clamp(std::atoi(val.c_str()), 0, 3);
+            s_logLevel = lvl;
+            s_startupLogLevel = lvl;
         }
     }
 }
@@ -621,6 +635,7 @@ void PS2SettingsOverlay::saveSettings() const
     file << "dump_controllers=" << (m_dumpControllers ? "1" : "0") << "\n";
     file << "dump_runtime=" << (m_dumpRuntime ? "1" : "0") << "\n";
     file << "dump_gamepad=" << (m_dumpGamepad ? "1" : "0") << "\n";
+    file << "log_level=" << m_settings.logLevel << "\n";
 }
 
 void PS2SettingsOverlay::applyDeadzone()

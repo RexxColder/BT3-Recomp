@@ -42,9 +42,15 @@ public:
         // together (1+ entries). Captured with a 3s hold during binding.
         std::vector<int> overlayPadBtns = {13, 15};  // default: Select (Back) + Start
         std::vector<int> overlayKeys   = {340, 258}; // default: Left Shift + Tab
+        // [loglevel] diagnostic verbosity applied at startup: 0=off, 1=profile+mclog+sched,
+        // 2=+ftspike+fightprobe+reveal, 3=+frameprof+camprobe. Drives which PS2X_* env vars
+        // main() exports; stderr is redirected to <deploy>/logs/bt3.log on any level > 0.
+        int logLevel = 1;
     };
 
     static bool isWidescreen() { return s_widescreen; }
+    static int getLogLevel() { return s_logLevel; }
+    static int getStartupLogLevel() { return s_startupLogLevel; }
 
     static void preloadSettings();
     void syncFromRuntime();   // seed m_settings from live runtime state
@@ -66,6 +72,8 @@ public:
 private:
     static bool s_widescreen;
     static std::string s_configDir;
+    static int s_logLevel;        // [loglevel] effective level for the live overlay UI
+    static int s_startupLogLevel; // [loglevel] captured before init so main() can apply env vars
 
     bool m_visible = false;
     bool m_initialized = false;
