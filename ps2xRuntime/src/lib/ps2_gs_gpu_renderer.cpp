@@ -8947,16 +8947,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 // (census max y=88; there is no bottom HUD strip). The pause menu / combo
                 // counters / any mid-screen 2D share fst/z/tbp with the HUD -- the y band
                 // is the reliable discriminator.
-                // [wswide] PS2X_WSWIDE=<frac>: max width, as a fraction of the buffer, for a
-                // draw to count as HUD. The real HUD pieces are at most ~160 px of 512 (0.31):
-                // the clusters measure x=68..228 and x=284..444. The top-band SCENE composites
-                // that sample page 336 are 256 px (x=-2..254) and were sailing through the old
-                // 0.8 limit -- so the scene got squeezed too, which is the box: the house and
-                // palm appear twice, once squeezed in the band and again unsqueezed below.
-                static const float s_wsWide = [](){ const char *v = std::getenv("PS2X_WSWIDE");
-                                                    const float f = v && v[0] ? (float)std::atof(v) : 0.40f;
-                                                    return (f > 0.05f && f <= 1.0f) ? f : 0.40f; }();
-                if (tx1 - tx0 < s_wsWide * W && ty1 - ty0 < 300.0f && ty1 < 96.0f)
+                if (tx1 - tx0 < 0.8f * W && ty1 - ty0 < 300.0f && ty1 < 96.0f)
                 {
                     for (int ti = 0; ti < 3; ++ti)
                         mc.tri[ti].x = wsMapX(c.tri[ti].x, W, wsHudInv);
