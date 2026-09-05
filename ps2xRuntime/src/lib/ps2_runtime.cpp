@@ -1516,7 +1516,10 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
     {
         paths.hostRoot = paths.elfDirectory;
         paths.cdRoot = paths.elfDirectory;
-        paths.mcRoot = paths.elfDirectory / "mc0";
+        // [deploy] Memory cards live in savedata/ (beside data/), not data/mc0.
+        // elfDirectory = <deploy>/data, so its parent is the deploy root where the
+        // portable savedata/ folder sits (moved saves: icon.sys, dbzsm.ico, save).
+        paths.mcRoot = paths.elfDirectory.parent_path() / "savedata";
     }
 
     // Allow pointing the CDVD backend at a disc image via environment variable.
@@ -4166,6 +4169,20 @@ void PS2Runtime::run()
                         uint32_t tri = 0x1000u;
                         if (rw) { std::memcpy(rw + (0x33398cu & PS2_RAM_MASK), &tri, 4);
                                   std::memcpy(rw + (0x333990u & PS2_RAM_MASK), &tri, 4); }
+                    }
+
+                    // [dragonnet] PS2X_ENABLE_DRAGONNET=1: the main menu's hidden DRAGON_NET
+                    // entry (index 4) is navigable but its State-4 CONFIRM_ACCEPT gate
+                    // checks flags at 0x330000 + 4*448 + 0x398C = 0x33408C for bits 0x600;
+                    // nothing ever writes them (overlay BSS) so the confirm is always
+                    // skipped and X on the entry does nothing. Stamp the bits each
+                    // heartbeat so the gate starts passing.
+                    static const bool s_dragonNet = [](){ const char *v=std::getenv("PS2X_ENABLE_DRAGONNET"); return v&&v[0]&&v[0]!='0'; }();
+                    if (s_dragonNet)
+                    {
+                        uint8_t *rw = m_memory.getRDRAM();
+                        uint32_t flags6 = 0x600u;
+                        if (rw) { std::memcpy(rw + (0x33408cu & PS2_RAM_MASK), &flags6, 4); }
                     }
                     // Intro auto-advance timer: *(*(0x3b0eb8)+0xc4) counts to 0x708.
                     uint32_t p = 0u;
