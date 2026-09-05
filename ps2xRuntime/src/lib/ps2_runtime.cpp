@@ -4211,7 +4211,7 @@ void PS2Runtime::run()
                 // ===================== [hstate] Jerarquía legible de estados =====================
                 // Traduce bt3State (raw) a fase + sub-fase humana. BOOT y MENU están mapeados con
                 // offsets ya documentados en tasks/main_menu_state_machine.md y tasks/ESTATUS.md.
-                // FIGHT_LOAD/IN_FIGHT todavía no tienen los offsets de "tipo de combate" (CPU vs CPU /
+                // FIGHT/IN_FIGHT todavía no tienen los offsets de "tipo de combate"
                 // jugador vs CPU / 2 jugadores) identificados -> ver el bloque [fightprobe] más abajo,
                 // que es el que junta la evidencia para poder completar este switch.
                 if (const uint8_t *rd = m_memory.getRDRAM())
@@ -4292,7 +4292,7 @@ void PS2Runtime::run()
                     case 0x06u: phase = "LOADING"; break;
                     case 0x26u: case 0x28u: case 0x29u:
                         phase = "PREFIGHT_SETUP"; sub = "raw=" + hex32(bt3State); break;
-                    case 0x27u: phase = "FIGHT_LOAD"; sub = "modo=? (ver [fightprobe])"; break;
+                    case 0x27u: phase = "FIGHT";   sub = "modo=? (ver [fightprobe])"; break;
                     case 0x2Du: phase = "IN_FIGHT";   sub = "modo=? (ver [fightprobe])"; break;
                     case 0x38u: phase = "POST_FIGHT"; break;
                     default: break;

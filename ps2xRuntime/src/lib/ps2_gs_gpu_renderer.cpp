@@ -758,7 +758,19 @@ namespace
     // high internal res). Mask writers keep point (gate exactness).
 
     int rsN() { return GsGpuRenderer::renderScale(); }   // live: overlay setter or PS2X_RENDERSCALE
-    bool rsScaledFbp(uint32_t fbp) { return rsN() > 1 && (fbp == 0u || fbp == 112u); }
+    // [rsviewscale] the FBW-split CT32 view (1104) scales with the scene. It holds a full
+    // scene-resolution image composited back into the Nx scene buffer, so leaving it 1x sent
+    // the underwater pass through a 1x roundtrip -- and because only ONE of the two alternating
+    // scene buffers takes that path per frame, the top ~80 rows alternated between a correct
+    // and a washed-out state every frame: the user's underwater "HUD box" AND its flicker, one
+    // bug. Measured (dive.bin f106-112, scale 4): band frame-to-frame delta 22.99 -> 1.94, which
+    // is the scale-1 reference exactly; every frame now sits 4.7 from the 1x frame instead of
+    // alternating 4.7/26.0. Scenes that never split the view are bit-identical (glow.bin: 0.000).
+    // Also 1.76 -> 1.42 ms GL/frame: the downsample roundtrip is gone. PS2X_RSVIEWSCALE=0 restores.
+    bool rsViewScale() { static const bool on = [](){ const char *v = std::getenv("PS2X_RSVIEWSCALE");
+                                                      return !(v && v[0] == '0'); }(); return on; }
+    bool rsScaledFbp(uint32_t fbp) { return rsN() > 1 && (fbp == 0u || fbp == 112u
+                                                          || (rsViewScale() && fbp == 1104u)); }
     std::unordered_map<unsigned, int> g_rsTexScale;   // texture id -> scale (scaled FBOs only)
     std::unordered_map<unsigned, uint32_t> g_rsTexFbo;   // texture id -> fbp (scaled FBOs only)
     int rsTexScale(unsigned id) { auto it = g_rsTexScale.find(id); return it == g_rsTexScale.end() ? 1 : it->second; }
@@ -1212,7 +1224,7 @@ namespace
         // factor ran at ~half the GS strength (measured: the mountain-shading CLUT's alpha-127
         // darkening applied at 0.498 instead of 0.992 -> "light geometry" on scenery; water
         // tints likewise). uABl128 scales the tcc=1 texture path by 255/128.
-        "  float aBlend = clamp((uABl128 > 0.5 && uTcc > 0.5) ? min(c.a * 1.9921875, 1.0) : c.a, 0.0, 1.0);\n"
+        "  float aBlend = clamp((uABl128 > 0.5 && uTcc > 0.5) ? min(c.a * uABl128, 1.0) : c.a, 0.0, 1.0);\n"
         // PS2X_ASPLIT: uAScale (128/255) must apply ONLY to the VERTEX-derived alpha. Our
         // vertex alpha encodes a GS 128 as 255, so it needs the rescale; but the CLUT decode
         // already yields the GS byte directly (measured: a character texture decodes to a
@@ -8891,8 +8903,25 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (s_dbn < 3) { ++s_dbn; std::fprintf(stderr, "[datebin] snapped HUD band alpha (w=%.0f)\n", bw); }
             }
         }
+        // [wsrtskip] A draw that OPAQUELY samples a live render target is scene
+        // post-processing, never HUD: the fight HUD is uploaded art, always blended.
+        // BT3's underwater pass blits page 336 back over the scene as a GRID of ~57x90
+        // tiles, and its TOP tile row (y 0..90, tbp 10752 = fbp336*32) slipped through
+        // both classifier gates -- each tile is far under 0.8*W wide and ty1=90 < 96 --
+        // so the map squeezed those nine tiles into x 98..542 while the rows below
+        // (ty1 >= 96) stayed put. That is the underwater "segmented box": tile seams,
+        // compressed content, misaligned against the rest of the frame, widescreen only.
+        // Census (ty1<96, squeezed set): underwater 36 draws match rend=1/upl=0/abe=0 and
+        // are all tiles; the grass-arena fight has ZERO, so no HUD art is affected. The
+        // gate deliberately keeps abe=1 RT composites (health / blast-stock dest-alpha bar
+        // fills) squeezed -- unsqueezing those is what tore the HUD in the reverted 6d86fe9.
+        // PS2X_WSRTSKIP=0 restores.
+        static const bool s_wsRtSkip = [](){ const char *v = std::getenv("PS2X_WSRTSKIP");
+                                             return !(v && v[0] == '0'); }();
+        const bool wsScenePost = s_wsRtSkip && c.srcRendered && !c.srcUploaded && !c.abe;
         if (wsHudInv != 1.0f && !c.wsHudApplied && !c.isTransfer && !c.isVramBlit
-            && !c.isDecode && !c.isAliasPass && (c.destFbp == 0u || c.destFbp == 112u)
+            && !c.isDecode && !c.isAliasPass && !wsScenePost
+            && (c.destFbp == 0u || c.destFbp == 112u)
             && (c.destPsm == 0u || c.destPsm == 1u))
         {
             // Center-anchored squeeze (one continuous linear map -- BT3's top bar is a chain
@@ -14069,19 +14098,35 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         // the As-LERP family (0x44 etc.) gets the GS-correct full factor.
                         static const int s_abm = [](){ const char *v = std::getenv("PS2X_ABLEND128"); return v && v[0] ? std::atoi(v) : 0; }();
                         float want128 = 0.0f;
-                        if (s_abm == 1) want128 = 1.0f;
-                        else if (s_abm == 2 && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u))) want128 = 1.0f;
+                        if (s_abm == 1) want128 = 1.9921875f;
+                        else if (s_abm == 2 && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u))) want128 = 1.9921875f;
                         else if (s_abm == 3 && c.srcClutTbp >= 11390u && c.srcClutTbp <= 11440u && c.srcClutTbp != 11432u
                                  && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u)))
-                            want128 = 1.0f;   // mountain/scenery shading family ONLY (the mount.png pale-tops classes); clouds (11432) + additives untouched
+                            want128 = 1.9921875f;   // mountain/scenery shading family ONLY (the mount.png pale-tops classes); clouds (11432) + additives untouched
                         else if (s_abm == 4 && c.srcClutTbp == 12992u && (c.srcPsm == 0x13u || c.srcPsm == 0x14u)
                                  && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u)))
-                            want128 = 1.0f;   // TERRAIN family only: the 0x44 As-lerp at full GS strength = pure texture,
+                            want128 = 1.9921875f;   // TERRAIN family only: the 0x44 As-lerp at full GS strength = pure texture,
                                               // erasing the half-mix underlayer darkening (predicted: dome 131->148, strip 112->127 = console)
                         else if (s_abm == 5 && c.srcClutTbp != 12992u && c.srcClutTbp != 11472u && c.srcClutTbp != 11476u)
-                            want128 = 1.0f;   // DENYLIST scope (same-stream metrics GREF2): full GS factor everywhere EXCEPT
+                            want128 = 1.9921875f;   // DENYLIST scope (same-stream metrics GREF2): full GS factor everywhere EXCEPT
                                               // terrain (12992: half-mix measured CLOSER to console; full = dark blob + darker hills)
                                               // and the HUD gauge palettes (11472/11476). Sky/clouds land at G0.98 with this.
+                        {   // [mcfade] The boot memory-card prompt "clears" the previous frame
+                            // with a full-screen textured quad (CLUT 12354, MODULATE, blend
+                            // (0,1,0,1), vertex alpha ramping 36->29). Read literally that is a
+                            // ~28% lerp, which leaves every earlier height of the box border on
+                            // screen as the box collapses -- the long-standing close ghosting.
+                            // On hardware it erases COMPLETELY: a PCSX2 dump of the identical
+                            // stream (streams verified draw-for-draw identical, no clear on
+                            // either side) renders ONE clean border on black. Matched here by
+                            // saturating this one CLUT's blend factor. Scope is exactly the
+                            // prompt: fight and underwater replays are bit-identical (MAE
+                            // 0.0000). PS2X_MCFADE=0 restores the old behaviour.
+                            static const bool off = [](){ const char *v = std::getenv("PS2X_MCFADE");
+                                                          return v && v[0] == '0'; }();
+                            if (!off && c.srcTbp0 == 12288u && c.srcClutTbp == 12354u)
+                                want128 = 64.0f;   // saturates to a full erase
+                        }
                         static float cur128 = -1.0f;
                         if (g_locABl128 >= 0 && want128 != cur128)
                         { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locABl128, &want128, SHADER_UNIFORM_FLOAT); cur128 = want128; }
