@@ -48,6 +48,26 @@ namespace
         return (rb >= 0 && rb < 16) ? kMap[rb] : rb;
     }
 
+    // Does this player have at least one key bind / one pad (button/axis) bind?
+    // Used to keep the default layout in sync with the assigned device: switching
+    // a player from gamepad to keyboard must not leave stale button binds behind,
+    // and vice versa.
+    bool hasKeyBinds(const padconf::Player &p)
+    {
+        for (auto &b : p.binds)
+            if (b.kind == padconf::BindKind::Key)
+                return true;
+        return false;
+    }
+
+    bool hasPadBinds(const padconf::Player &p)
+    {
+        for (auto &b : p.binds)
+            if (b.kind == padconf::BindKind::Button || b.kind == padconf::BindKind::Axis)
+                return true;
+        return false;
+    }
+
     // evdev EV_KEY code -> raylib KEY_* code. The runtime stores raylib codes
     // in pad.conf and polls with IsKeyDown(value), so capture must translate.
     int evKeyToRaylib(int code)
@@ -130,8 +150,6 @@ BindingsTab::BindingsTab(QWidget *parent)
     headLay->addWidget(loadDefaults);
     root->addWidget(head);
 
-    refreshDevices();
-
     m_table = new QTableWidget(24, 3, this);
     m_table->setHorizontalHeaderLabels({QStringLiteral("Action"), QStringLiteral("Current Bind"), QString()});
     m_table->verticalHeader()->setVisible(false);
@@ -168,6 +186,9 @@ BindingsTab::BindingsTab(QWidget *parent)
 
     connect(m_player, &QComboBox::currentIndexChanged, this, &BindingsTab::onPlayerChanged);
     connect(m_device, &QComboBox::currentIndexChanged, this, &BindingsTab::onDeviceChanged);
+    // Refresh after the table and signal wiring exist: onDeviceChanged() ->
+    // refreshRow() touches the table, which must already be built.
+    refreshDevices();
     // Open the initial selection.
     openCaptureDevice();
 
@@ -333,7 +354,24 @@ void BindingsTab::onDeviceChanged(int)
         const int g = idx - kDevGamepadBase;
         dev = {padconf::DevKind::Gamepad, g};
     }
-    m_players[p].device = dev;
+    padconf::Player &player = m_players[p];
+    // When the device kind changes, make sure the player ends up with a usable
+    // layout: bind a keyboard layout on Keyboard and a gamepad layout on pads
+    // (if the new kind has no binds of its own yet).
+    const padconf::DevKind newKind = dev.kind;
+    player.device = dev;
+    if (newKind == padconf::DevKind::Keyboard && !hasKeyBinds(player))
+    {
+        padconf::applyDefaultKeyboardBinds(player);
+        setStatus(QStringLiteral("Keyboard layout applied for Player %1.").arg(p + 1));
+    }
+    else if (newKind == padconf::DevKind::Gamepad && !hasPadBinds(player))
+    {
+        padconf::applyDefaultGamepadBinds(player);
+        setStatus(QStringLiteral("Gamepad layout applied for Player %1.").arg(p + 1));
+    }
+    for (int a = 0; a < 24; ++a)
+        refreshRow(a);
     openCaptureDevice();
 }
 
@@ -342,11 +380,23 @@ void BindingsTab::onLoadDefaults()
     const int p = m_player->currentIndex();
     if (p < 0 || p >= (int)m_players.size())
         return;
-    // Restore the runtime's default gamepad layout for this player.
+    // Load the default layout that matches the current device kind, so
+    // Keyboard players get WASD/arrows (not gamepad buttons).
+    const padconf::DevKind kind = m_players[p].device.kind;
     m_players[p] = padconf::Player{};
-    padconf::applyDefaultGamepadBinds(m_players[p]);
+    if (kind == padconf::DevKind::Keyboard)
+    {
+        m_players[p].device = {padconf::DevKind::Keyboard, -1};
+        padconf::applyDefaultKeyboardBinds(m_players[p]);
+        setStatus(QStringLiteral("Default keyboard layout loaded for Player %1.").arg(p + 1));
+    }
+    else
+    {
+        m_players[p].device = {padconf::DevKind::None, -1};
+        padconf::applyDefaultGamepadBinds(m_players[p]);
+        setStatus(QStringLiteral("Default gamepad layout loaded for Player %1.").arg(p + 1));
+    }
     onPlayerChanged(p);
-    setStatus(QStringLiteral("Default gamepad layout loaded for Player %1.").arg(p + 1));
 }
 
 void BindingsTab::refreshRow(int action)
