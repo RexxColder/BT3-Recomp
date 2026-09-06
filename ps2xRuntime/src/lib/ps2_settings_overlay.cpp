@@ -484,6 +484,8 @@ void PS2SettingsOverlay::loadSettings()
             {
                 if (key == "deadzone")
                     m_settings.deadzone = std::clamp(std::stof(val), 0.0f, 0.5f);
+                else if (key == "overlay_enabled")
+                    m_settings.overlayEnabled = (val == "1" || val == "true");
                 else if (key == "device")
                     m_selectedDevice = std::clamp(std::stoi(val), 0, 100);
                 else if (key == "overlay_pad_btns")
@@ -620,6 +622,7 @@ void PS2SettingsOverlay::saveSettings() const
     file << "[controllers]\n";
     file << "deadzone=" << m_settings.deadzone << "\n";
     file << "device=" << m_selectedDevice << "\n";
+    file << "overlay_enabled=" << (m_settings.overlayEnabled ? "1" : "0") << "\n";
     file << "overlay_pad_btns=";
     for (size_t i = 0; i < m_settings.overlayPadBtns.size(); ++i)
         file << (i ? "," : "") << m_settings.overlayPadBtns[i];
@@ -718,8 +721,16 @@ void PS2SettingsOverlay::applySettings()
         for (size_t p = 0; p < ps2_stubs::PadConfig::kPlayerCount; ++p)
         {
             auto cfg = pcfg.snapshot(p);
-            if (cfg.device.kind != dev.kind || cfg.device.gamepad != dev.glfwSlot)
-                pcfg.setDevice(p, ps2_stubs::PadDevice{dev.kind, dev.glfwSlot});
+            // Persist the launcher's index convention ("Gamepad N"), never the raw
+            // GLFW slot: the slot layout (1 for the Xbox here) != what pad_pN.conf
+            // names, and a bare slot made pad_pN.conf point at a dead controller.
+            int idx = ps2_stubs::padGamepadIndex(dev.glfwSlot);
+            if (dev.kind == ps2_stubs::PadDeviceKind::Gamepad && idx < 0)
+            {
+                continue; // slot not (yet) a controller; leave the player alone
+            }
+            if (cfg.device.kind != dev.kind || cfg.device.gamepad != idx)
+                pcfg.setDevice(p, ps2_stubs::PadDevice{dev.kind, idx});
         }
     }
 
@@ -863,6 +874,12 @@ void PS2SettingsOverlay::readGamepadStateForDevice(
 void PS2SettingsOverlay::draw(PS2Runtime &runtime)
 {
     if (!m_initialized)
+        return;
+
+    // [launcher] In-game overlay master switch: when disabled the panel never
+    // deploys (toggle combos are also skipped below via m_visible staying false),
+    // so a play-session config can keep the HUD out entirely.
+    if (!m_settings.overlayEnabled)
         return;
 
     if (std::getenv("PS2X_COMBO_DIAG") && m_selectedDevice >= 0 &&
@@ -1267,11 +1284,13 @@ void PS2SettingsOverlay::drawVideoTab()
     // Window-size presets. The projection FOV follows the window aspect (see [truews]
     // in ps2_runtime.cpp), so wider windows genuinely show more stage.
     {
-        static const int kRes[][2] = {{1280, 720}, {1600, 900}, {1920, 1080},
-                                      {2560, 1440}, {3440, 1440}, {1024, 768}};
-        static const char *kResNames[] = {"1280 x 720", "1600 x 900", "1920 x 1080",
-                                          "2560 x 1440", "3440 x 1440 (ultrawide)", "1024 x 768 (4:3)"};
-        constexpr int kResCount = 6;
+        static const int kRes[][2] = {{1024, 768}, {1280, 720}, {1360, 768},
+                                      {1366, 768}, {1440, 900}, {1600, 900},
+                                      {1920, 1080}, {2560, 1440}, {3440, 1440}};
+        static const char *kResNames[] = {"1024 x 768 (4:3)", "1280 x 720", "1360 x 768",
+                                          "1366 x 768", "1440 x 900", "1600 x 900",
+                                          "1920 x 1080", "2560 x 1440", "3440 x 1440 (ultrawide)"};
+        constexpr int kResCount = 9;
         int cur = -1;
         const int w = GetScreenWidth(), h = GetScreenHeight();
         for (int i = 0; i < kResCount; ++i)
@@ -1311,8 +1330,8 @@ void PS2SettingsOverlay::drawControllersTab()
         ImGui::Text("Player");
         ImGui::SameLine(90);
         ImGui::SetNextItemWidth(110);
-        const char *playerNames[] = {"P1", "P2", "P3", "P4"};
-        ImGui::Combo("##player", &m_editPlayer, playerNames, 4);
+        const char *playerNames[] = {"P1", "P2"};
+        ImGui::Combo("##player", &m_editPlayer, playerNames, 2);
     }
 
     // Device
@@ -1752,6 +1771,10 @@ void PS2SettingsOverlay::drawBindingsPopup()
         {
             applySettings();
             saveSettings();
+            // [launcher] persist per-action bindings too (pad.conf), not just the
+            // overlay-side cfg: bindings edited here must survive a restart and be
+            // visible to the Qt launcher's Bindings tab.
+            ps2_stubs::PadConfig::instance().save();
         }
         ImGui::PopStyleColor(4);
 

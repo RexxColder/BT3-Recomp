@@ -120,6 +120,23 @@ chmod +x "$DEST_ELF"
 # the runner deployed by setup.py is superseded by the self-extracting ELF
 rm -f "$OUT/ps2EntryRunner"
 
+# ---- Qt launcher (bt3-launcher) ---------------------------------------------------
+echo "== building Qt launcher"
+LAUNCH_DIR="$ROOT/ps2xRuntime/src/launcher"
+LAUNCH_BUILD="$LAUNCH_DIR/build"
+if [[ -f /usr/lib/cmake/Qt6/Qt6Config.cmake ]]; then
+    cmake -S "$LAUNCH_DIR" -B "$LAUNCH_BUILD" -DCMAKE_BUILD_TYPE=Release > "$STAGE/launcher_cmake.log" 2>&1
+    cmake --build "$LAUNCH_BUILD" -j"$JOBS" >> "$STAGE/launcher_cmake.log" 2>&1
+    cp -v "$LAUNCH_BUILD/Launcher" "$OUT/Launcher" | sed 's/^/  /'
+    chmod +x "$OUT/Launcher"
+    cp -rv "$LAUNCH_BUILD/assets" "$OUT/" 2>/dev/null | sed 's/^/  /'
+    if [[ -f "$LAUNCH_DIR/assets/background.png" ]]; then
+        cp -v "$LAUNCH_DIR/assets/background.png" "$OUT/assets/" | sed 's/^/  /'
+    fi
+else
+    echo "  (Qt6 not found -- skipping launcher)"
+fi
+
 mkdir -p "$OUT/logs"
 if [[ ! -d "$OUT/savedata/BASLUS-21678DBZT3" ]]; then
     mkdir -p "$OUT/savedata/BASLUS-21678DBZT3"
@@ -130,3 +147,6 @@ echo "Deploy ready:"
 echo "  $DEST_ELF"
 echo "  $OUT/data   $OUT/savedata   $OUT/assets   $OUT/logs"
 echo "Run:  cd \"$OUT\" && \"./$GAME\""
+if [[ -x "$OUT/Launcher" ]]; then
+    echo "Launcher:  \"$OUT/Launcher\""
+fi
