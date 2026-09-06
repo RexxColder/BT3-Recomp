@@ -97,7 +97,8 @@ namespace ps2_stubs
     class PadConfig
     {
     public:
-        static constexpr size_t kPlayerCount = 4;
+        // [launcher] BT3 is a 1v1 fighter: cap local players at 2.
+        static constexpr size_t kPlayerCount = 2;
 
         static PadConfig &instance();
         // [overlay] Suspend gamepad->guest input while the settings overlay is open, so
@@ -116,7 +117,13 @@ namespace ps2_stubs
         void setDefaultDir(const std::string &elfDir);
         std::string defaultPath() const;
 
-        bool load();  // load from defaultPath(); keeps current values on error
+        // Per-player savedata files: <ELF dir>/savedata/pad_p1.conf (p1) and
+        // pad_p2.conf (p2). defaultPath() is kept for compatibility so the
+        // legacy single pad.conf can be found for migration.
+        std::string playerConfigPath(size_t p) const;
+        std::string legacyConfigPath() const;
+
+        bool load();  // load per-player savedata (legacy pad.conf migration)
         bool save() const;
 
         bool loaded() const { return m_loaded; }
@@ -157,6 +164,12 @@ namespace ps2_stubs
     const char *padBindKindName(PadBindKind kind);
     std::string padBindDisplay(const PadBind &bind);
     std::string padDeviceDisplay(const PadDevice &device);
+
+    // "Gamepad N" (the pad_pN.conf / launcher convention: N-th controller GLFW
+    // reports) <-> the raw GLFW slot. Keeps the config files independent of the
+    // slot numbering GLFW happens to assign (e.g. an Xbox on slot 1 = "Gamepad 0").
+    int padGamepadSlot(int index);   // index -> GLFW slot, or -1
+    int padGamepadIndex(int glfwSlot); // GLFW slot -> index, or -1
 
     // Is gamepad slot `g` an actual controller worth offering to the player?
     //
