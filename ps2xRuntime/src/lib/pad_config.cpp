@@ -1158,7 +1158,20 @@ namespace ps2_stubs
 
 #if defined(__linux__)
         const PadEvdevLinux &native = PadEvdevLinux::instance();
-        const bool nativeOk = native.isAvailable() && nativeGamepadMatches(pads, native);
+        // The native reader is a singleton bound to ONE physical device (the
+        // first pad found in /dev/input) = the launcher's "Gamepad 0". Only
+        // that player may consult it; players on any other gamepad must rely
+        // on their own GLFW slot, otherwise the singleton would feed every
+        // name-matching player the same physical state (P2 mirrors P1).
+        const bool nativeOwner = native.isAvailable() &&
+                                 cfg.device.kind == PadDeviceKind::Gamepad &&
+                                 cfg.device.gamepad == 0;
+        // Several readers (buttons, triggers, axis fallback) pull from the
+        // singleton: allowed for the owner, and only when these pads really
+        // are that device (name match) — unless GLFW exposed no slots at all
+        // (pads empty), where the singleton is the sole source for the owner.
+        const bool nativeOk = nativeOwner &&
+                              (pads.empty() || nativeGamepadMatches(pads, native));
 #else
         const bool nativeOk = false;
         static const PadEvdevStub native;   // no evdev here
@@ -1190,6 +1203,34 @@ namespace ps2_stubs
                     }
                 }
             }
+            else if (bind.kind == PadBindKind::Axis)
+            {
+                // Analog binds on button actions (e.g. L2/R2 saved as
+                // "Axis 4/5" by capture): pressed once the axis passes its
+                // deadzone. GLFW gives triggers 0..1, sticks -1..+1, so use
+                // magnitude for the button state.
+                for (int pad : pads)
+                {
+                    if (std::fabs(GetGamepadAxisMovement(pad, bind.value)) > bind.deadzone)
+                    {
+                        pressed = true;
+                        break;
+                    }
+                }
+                // Trigger axes with no GLFW mapping (only the native evdev
+                // reader knows them): convert axis to the matching trigger
+                // button code and forward the native button state.
+                if (!pressed && nativeOk)
+                {
+                    const int btn = bind.value == GAMEPAD_AXIS_LEFT_TRIGGER ? GAMEPAD_BUTTON_LEFT_TRIGGER_2
+                                   : bind.value == GAMEPAD_AXIS_RIGHT_TRIGGER ? GAMEPAD_BUTTON_RIGHT_TRIGGER_2
+                                                                              : -1;
+                    if (btn >= 0 && native.isButtonDown(btn))
+                    {
+                        pressed = true;
+                    }
+                }
+            }
             if (pressed)
             {
                 pkt.buttons = static_cast<uint16_t>(pkt.buttons & ~buttonMaskForAction(action));
@@ -1204,17 +1245,12 @@ namespace ps2_stubs
                 float best = 0.0f;
                 for (int pad : pads)
                 {
+                    // Only this player's GLFW slot. The native evdev reader is a
+                    // singleton bound to ONE physical device; injecting it here
+                    // would feed every matching player the same physical axes,
+                    // breaking per-player assignment when two controllers are
+                    // used (sticks of P1 appear on P2).
                     float v = GetGamepadAxisMovement(pad, bind.value);
-#if defined(__linux__)
-                    if (nativeOk)
-                    {
-                        const float nv = native.getAxis(bind.value);
-                        if (std::fabs(nv) > std::fabs(v))
-                        {
-                            v = nv;
-                        }
-                    }
-#endif
                     // Direction filter: only keep values in the bind's
                     // direction.  Without this, the opposing Neg/Pos slots
                     // both read the same underlying axis and cancel out
@@ -1261,11 +1297,20 @@ namespace ps2_stubs
             -1.0f, 1.0f);
 
         // Fallback: if GLFW has no mapping for the controller (pads empty)
-        // but the native evdev reader is available, read axes directly.
+        // but the native evdev reader is available, read axes directly. Only
+        // for a player actually assigned a gamepad: elsewhere (e.g. a Keyboard
+        // player) the singleton native device would feed this player the same
+        // physical sticks another player is using (shared-axes leak).
         if (lx == 0.0f && ly == 0.0f && rx == 0.0f && ry == 0.0f)
         {
 #if defined(__linux__)
-            if (pads.empty() && native.isAvailable())
+            // GLFW has no mapping for this gamepad (pads empty) but the native
+            // reader knows the device. Same ownership rule as above: the
+            // singleton is "Gamepad 0" of the launcher, so only that player
+            // inherits its axes. A Keyboard player or any other gamepad player
+            // must not read this physical device (shared-axes leak).
+            if (cfg.device.kind == PadDeviceKind::Gamepad && cfg.device.gamepad == 0 &&
+                pads.empty() && native.isAvailable())
             {
                 lx = native.getAxis(GAMEPAD_AXIS_LEFT_X);
                 ly = native.getAxis(GAMEPAD_AXIS_LEFT_Y);
