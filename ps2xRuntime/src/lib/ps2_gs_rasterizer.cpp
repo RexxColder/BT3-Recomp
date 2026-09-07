@@ -4688,9 +4688,25 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         // happens if this draw's blend factor is the TEXTURE alpha (128 = 1.0) rather than texture x vertex
         // (128*31>>7 = 31 = 24%). Force the full factor for this one class and compare against the console
         // video; it says whether the "A = At for TCC=1" reading is what hardware does.
-        static const bool s_ff = [](){ const char *v = std::getenv("PS2X_FADEFULL"); return !(v && v[0] == '0'); }();   // DEFAULT ON (user-validated 2026-09-07); =0 reverts
+        // 2026-09-07 SCOPED TO THE BOOT PHASE: this cbp/tbp0 class is the full-screen black fade quad EVERY
+        // popup draws. At boot nothing is behind it, but in menus/fights it is the translucent dim behind a
+        // smaller box, and forcing it opaque there painted every in-game popup background black (user report).
+        // Unset = boot only (bt3 overlay state 0x01 via g_bt3StateLive); =1 forces it everywhere (the old
+        // behaviour -- also what a GS replay needs, no guest runs there so the state stays 0xffffffff); =0 off.
+        // 2026-09-07 evening: DEFAULT OFF. The ghosting was never a blend problem -- the frame was
+        // never CLEARED (sceGsSetDefDBuff stub dropped the sceGsClear block, see [dbuffclear] in
+        // Kernel/Stubs/GS.cpp). Kept as an A/B switch only: =1 everywhere, =2 boot-only, unset/0 off.
+        static const int s_ff = [](){ const char *v = std::getenv("PS2X_FADEFULL"); return (v && v[0]) ? ((v[0] == '0') ? 0 : ((v[0] == '2') ? 2 : 1)) : 0; }();
         if (s_ff && tme && ctx.tex0.cbp == 12354u && ctx.tex0.tbp0 == 12288u)
-            for (int k = 0; k < 3; ++k) gs->m_vtxQueue[k].a = 0x80u;
+        {
+            extern std::atomic<uint32_t> g_bt3StateLive;   // status probe, ps2_runtime.cpp (refreshed every tick)
+            const uint32_t st = g_bt3StateLive.load(std::memory_order_relaxed);
+            const bool apply = (s_ff == 1) || (st == 0x01u);
+            static uint32_t s_lastSt = 0xfffffffeu;
+            if (st != s_lastSt) { s_lastSt = st; std::fprintf(stderr, "[fadefull] state=0x%x %s\n", st, apply ? "apply" : "skip"); }
+            if (apply)
+                for (int k = 0; k < 3; ++k) gs->m_vtxQueue[k].a = 0x80u;
+        }
     }
     gprof::mark(gprof::REC_BUILD);   // [guestprof]
     // [drawbatch] A CONTINUATION of the renderer's open plain-class batch does not fill the state

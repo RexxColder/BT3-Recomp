@@ -6626,6 +6626,32 @@ void GsGpuRenderer::ensureGl(int w, int h)
                       std::memory_order_relaxed);
 }
 
+// [clrprobe] column readback of the two display FBOs (x=100, rows 130..330 step 20), PS2X_CLRPROBE=1.
+static void clrProbeCols(const char *tag, uint32_t gen)
+{
+    static const bool s_cp = [](){ const char *v = std::getenv("PS2X_CLRPROBE"); return v && v[0] && v[0] != '0'; }();
+    if (!s_cp) return;
+    static int s_n = 0; if (s_n++ > 300) return;
+    rlDrawRenderBatchActive();
+    for (uint32_t fbp : {0u, 112u})
+    {
+        auto fit = g_fbos.find(fbp);
+        if (fit == g_fbos.end() || fit->second.rt.texture.id == 0) continue;
+        const Texture2D &t = fit->second.rt.texture;
+        const int sc = t.width >= 512 ? t.width / 512 : 1;
+        unsigned char *px = (unsigned char *)rlReadTexturePixels(t.id, t.width, t.height, t.format);
+        if (!px) continue;
+        std::fprintf(stderr, "[clrprobe] %s gen=%u fbp%u tex=%u col:", tag, gen, fbp, t.id);
+        for (int yy = 130; yy <= 330; yy += 20)
+        {
+            const int X = 100 * sc, Y = (t.height - 1) - yy * sc;
+            const unsigned char *q = px + (size_t)(Y * t.width + X) * 4;
+            std::fprintf(stderr, " %d:%u", yy, (unsigned)std::max(q[0], std::max(q[1], q[2])));
+        }
+        std::fprintf(stderr, "\n");
+        RL_FREE(px);
+    }
+}
 unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
 {
     {   // [deferdec] no render may pass an unserviced decode command: service them first, each one
@@ -15613,6 +15639,47 @@ if (done.size() < 14 && !done.count(c.texKey))
                     std::fprintf(stderr, "\n"); s_emit.clear(); }
             }
         }
+        {   // [clrprobe] PS2X_CLRPROBE=1: the libgs double-buffer CLEAR (untextured full-frame sprite
+            // into fbp 0/112) and the FIRST draw into each display-class fbp per render call --
+            // where each one actually lands (FBO id / real fbp / size / scissor / blend / depth).
+            static const bool s_cp = [](){ const char *v = std::getenv("PS2X_CLRPROBE"); return v && v[0] && v[0] != '0'; }();
+            if (s_cp && !c.isTransfer && (c.destFbp == 0u || c.destFbp == 112u))
+            {
+                static uint32_t s_gen = 0xFFFFFFFFu; static std::unordered_set<uint32_t> s_seen; static int s_n = 0;
+                if (frameGen != s_gen) { s_gen = frameGen; s_seen.clear(); }
+                const bool isClear = !c.isTriangle && c.texKey == 0 && (c.dx1 - c.dx0) >= 500.0f && (c.dy1 - c.dy0) >= 440.0f;
+                const bool first = s_seen.insert(c.destFbp).second;
+                if ((isClear || first) && s_n++ < 400)
+                {
+                    auto fit = g_fbos.find(c.destFbp);
+                    if (first && fit != g_fbos.end() && fit->second.rt.texture.id != 0)
+                    {   // what the FBO holds BEFORE this frame's first draw into it: column x=100, rows 130..330 step 20
+                        flushBatch(__LINE__);
+                        const Texture2D &t = fit->second.rt.texture;
+                        const int sc = t.width >= 512 ? t.width / 512 : 1;
+                        unsigned char *px = (unsigned char *)rlReadTexturePixels(t.id, t.width, t.height, t.format);
+                        if (px)
+                        {
+                            std::fprintf(stderr, "[clrprobe]   pre-draw FBO fbp%u tex=%u %dx%d col x=100:", c.destFbp, t.id, t.width, t.height);
+                            for (int yy = 130; yy <= 330; yy += 20)
+                            {
+                                const int X = 100 * sc, Y = (t.height - 1) - yy * sc;   // GL rows are bottom-up
+                                const unsigned char *q = px + (size_t)(Y * t.width + X) * 4;
+                                std::fprintf(stderr, " %d:%u", yy, (unsigned)std::max(q[0], std::max(q[1], q[2])));
+                            }
+                            std::fprintf(stderr, "\n");
+                            RL_FREE(px);
+                        }
+                    }
+                    std::fprintf(stderr, "[clrprobe] gen=%u ci=%zu/%zu %s dest=%u disp=%u real=%u curFbp=%u fbo=%u %dx%d sci=(%d,%d,%d,%d) cur=(%d,%d,%d,%d) off=(%.0f,%.0f) box=(%.0f,%.0f)-(%.0f,%.0f) abe=%d bm=%02x rgba=(%u,%u,%u,%u) fbmsk=%08x zte=%d ztst=%d tex=%llu white=%d\n",
+                                 frameGen, ci, DC.size(), isClear ? "CLEAR" : "first", c.destFbp, displayFbp, realFbpFor(c.destFbp), curFbp,
+                                 fit != g_fbos.end() ? fit->second.rt.id : 0u, fit != g_fbos.end() ? fit->second.w : 0, fit != g_fbos.end() ? fit->second.h : 0,
+                                 c.sx, c.sy, c.sw, c.sh, curSx, curSy, curSw, curSh, offX, offY, c.dx0, c.dy0, c.dx1, c.dy1,
+                                 c.abe ? 1 : 0, (unsigned)c.blendMode, c.r, c.g, c.b, c.a, c.fbmsk,
+                                 (unsigned long long)c.texKey, (tex.id == g_white.id) ? 1 : 0);
+                }
+            }
+        }
 
         // PS2X_DTEXDUMP: export what the fight's DISPLAY textures actually decode to (are they black?).
         {
@@ -17615,6 +17682,18 @@ if (done.size() < 14 && !done.count(c.texKey))
         g_mcFadeReach = g_mcFadeExec = g_mcBodyExec = g_mcBlit = 0; g_mcBodyN = 0; g_mcDestMask = 0; g_mcSeqN = 0;
     }
     ragStat.markEnd();
+    {   // [tailflush] 2026-09-07: the per-command loop leaves its LAST batch pending in rlgl. In
+        // segment mode endMode() flushes it, but on the once-per-frame path nothing did before the
+        // writeback / display pick / present code ran, and that code rebinds framebuffers, so the
+        // pending quads were drawn into whichever FBO was bound by then (or dropped). Every frame's
+        // final draw was therefore lost -- for BT3's boot memory-card box that draw is libgs's
+        // sceGsSwapDBuff CLEAR of the back buffer (memory bt3-mc-prompt-ghosting), so the buffer
+        // kept its history and the closing box left a stack of borders. Proven by a probe whose
+        // rlDrawRenderBatchActive() alone made the replay clean. PS2X_TAILFLUSH=0 reverts.
+        static const bool s_tf = [](){ const char *v = std::getenv("PS2X_TAILFLUSH"); return !(v && v[0] == '0'); }();
+        if (s_tf) flushBatch(__LINE__);
+    }
+    clrProbeCols("post-loop", frameGen);
 
     // ---- segment render ends here (renderRange) -------------------------------------
     // Everything below this point is once-per-FRAME work: the tri-test overlay, the VRAM
@@ -18635,6 +18714,7 @@ if (done.size() < 14 && !done.count(c.texKey))
             }
         }
     }
+    clrProbeCols("post-present", frameGen);
     g_lastOutId = outId;
     return outId;
 }
