@@ -1532,6 +1532,39 @@ std::atomic<bool> g_ps2xMapDrawSeen{false};
 std::atomic<uint32_t> g_ps2FmvActive{0u};
 // [fmvblit] framebuffer currently being filled by movie macroblocks, and its FBW.
 std::atomic<uint32_t> g_fmvPendingFbp{0xFFFFFFFFu};
+std::atomic<uint32_t> g_fmvDisplayFbp{0xFFFFFFFFu};   // [fmvpresent] present the buffer the movie was blitted into
+std::atomic<uint32_t> g_fmvDisplayHold{0u};           // [fmvpresent] publishes this stays valid for
+std::atomic<uint32_t> g_fmvBlitCount{0u};   // [presentdump] arms PS2X_PRESENTDUMP_FMV
+std::atomic<uint32_t> g_fmvPrevDsay{0xFFFFFFFFu};   // [fmvfbp] previous macroblock row: a drop marks a new movie frame
+std::atomic<uint32_t> g_fmvCurBurstFbp{0xFFFFFFFFu};   // [fmvfbp] buffer currently being filled (never blitted: it is incomplete)
+// [fmvcapture] The movie's pixels, captured on the thread that WRITES them, at the instant a frame
+// completes. Reading VRAM from sceMpegGetPicture instead raced the macroblock uploads: the blit
+// caught a buffer part new and part old and the movie flickered -- and the race is timing
+// dependent, which is why anything that slowed a side (a present readback) hid it.
+std::mutex g_fmvCapMtx;
+std::vector<uint8_t> g_fmvCapPix;
+uint32_t g_fmvCapW = 0, g_fmvCapH = 0, g_fmvCapFbp = 0xFFFFFFFFu;
+uint64_t g_fmvCapGen = 0;
+
+// [fmvcapture] Copy a COMPLETED movie buffer out of VRAM. Called from the macroblock upload path,
+// so it runs on whichever thread wrote those pixels and can never observe a half-written frame.
+static void ps2GsCaptureFmvFrame(GS *gs, uint32_t fbp, uint32_t dbw)
+{
+    if (!gs) return;
+    const uint32_t bw = std::max(1u, dbw);
+    const uint32_t w = bw * 64u, h = 448u;
+    std::vector<uint8_t> px(static_cast<size_t>(w) * h * 4u);
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x)
+        {
+            const uint32_t c = gs->ReadVram(0u, fbp * 32u, bw, x, y);
+            uint8_t *o = px.data() + (static_cast<size_t>(y) * w + x) * 4u;
+            o[0] = (uint8_t)(c & 0xFFu); o[1] = (uint8_t)((c >> 8) & 0xFFu);
+            o[2] = (uint8_t)((c >> 16) & 0xFFu); o[3] = 0xFFu;   // scan-out ignores alpha
+        }
+    std::lock_guard<std::mutex> lk(g_fmvCapMtx);
+    g_fmvCapPix.swap(px); g_fmvCapW = w; g_fmvCapH = h; g_fmvCapFbp = fbp; ++g_fmvCapGen;
+}
 std::atomic<uint32_t> g_fmvPendingBw{0u};
 GS *g_fmvGs = nullptr; // [fmvblit] set on the first image upload; the emitter reads VRAM via it
 
@@ -4872,7 +4905,43 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
     if (GsGpuRenderer::enabled() && m_vram && dpsm == 0u && dbw >= 8u)
     {
         g_fmvGs = this;
-        g_fmvPendingFbp.store(dbp / 32u, std::memory_order_relaxed);
+        // [fmvfbp] The movie is DOUBLE BUFFERED and the game addresses its back buffer as
+        // "dbp=0, dsay=448" instead of "dbp=112": with bw=8 a row is 2048 bytes, so row 448 is
+        // exactly where fbp112 begins (112*8192/2048). Using dbp alone recorded EVERY movie frame
+        // as fbp0, so half of them were never published (the previous fbp0 content was re-blitted
+        // instead) and fbp112's FBO only ever received the game's own draws. When the game fades
+        // out over a movie -- which is what skipping does, 32 fullscreen black sprites per frame
+        // with the alpha ramping to 0x80, alternating buffers -- the display then alternated
+        // between a movie frame and a nearly black one: the "flicker to black" on FMV skip.
+        // Fold the row offset into the fbp, keeping the LOWEST of the current burst, since the
+        // macroblocks walk downwards from the frame's origin.
+        // The macroblocks walk left-to-right then DOWN, so dsay rises through a burst and drops
+        // when the next frame starts: that drop is the new frame's origin. (Taking the minimum
+        // instead needed the pending buffer to be consumed on publish, which halved the publish
+        // rate -- and the CD-tick pump allows only 4 pumps per PUBLISH, so the movie's data then
+        // streamed at half rate and playback ran slow. See [fmvconsume].)
+        // Publish the last COMPLETED buffer, never the one being filled. The blit is emitted from
+        // sceMpegGetPicture, which fires more often than a frame arrives, so blitting the current
+        // buffer caught it half written (top rows new, bottom rows old) and the movie flickered.
+        // And we cannot simply publish less often: the CD-tick pump allows 4 pumps per PUBLISH
+        // (Interrupt.cpp [cdgate]), so halving the publishes halved the disc streaming and playback
+        // ran slow. A frame's macroblocks walk left-to-right then DOWN, so dsay rising through the
+        // burst and dropping marks the next frame -- at that moment the burst before it is whole.
+        // PS2X_FMVFBP=0: ignore dsay and record every movie frame as dbp's own fbp -- the
+        // behaviour before the double-buffer fix (half the frames dropped, but a single buffer).
+        static const bool s_fmvFbp = [](){ const char *v = std::getenv("PS2X_FMVFBP"); return !(v && v[0] == '0'); }();
+        const uint32_t fbpHere = s_fmvFbp ? (dbp / 32u + (dsay * dbw) / 32u) : (dbp / 32u);
+        const uint32_t prevDsay = g_fmvPrevDsay.exchange(dsay, std::memory_order_relaxed);
+        if (!s_fmvFbp) { g_fmvPendingFbp.store(fbpHere, std::memory_order_relaxed); }
+        else if (prevDsay == 0xFFFFFFFFu || dsay <= prevDsay)
+        {
+            const uint32_t done = g_fmvCurBurstFbp.exchange(fbpHere, std::memory_order_relaxed);
+            if (done != 0xFFFFFFFFu && done != fbpHere)
+            {
+                g_fmvPendingFbp.store(done, std::memory_order_relaxed);
+                ps2GsCaptureFmvFrame(this, done, dbw);   // whole frame, same thread that wrote it
+            }
+        }
         g_fmvPendingBw.store(dbw, std::memory_order_relaxed);
     }
 }
@@ -4986,44 +5055,64 @@ void ps2GsEmitFmvFrame()
     static const bool s_on = [](){ const char *v = std::getenv("PS2X_FMVBLIT"); return !(v && v[0] == '0'); }();
     if (!s_on)
         return;
-    GS *gs = g_fmvGs;
-    const uint32_t fbp = g_fmvPendingFbp.load(std::memory_order_relaxed);
-    if (!gs || fbp == 0xFFFFFFFFu)
-        return;
 
-    const uint32_t bw = std::max(1u, g_fmvPendingBw.load(std::memory_order_relaxed));
-    const uint32_t w = bw * 64u;
-    const uint32_t h = 448u;
-
-    std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4u);
-    for (uint32_t y = 0; y < h; ++y)
-        for (uint32_t x = 0; x < w; ++x)
-        {
-            const uint32_t px = gs->ReadVram(0u, fbp * 32u, bw, x, y);
-            uint8_t *o = rgba.data() + (static_cast<size_t>(y) * w + x) * 4u;
-            o[0] = (uint8_t)(px & 0xFFu);
-            o[1] = (uint8_t)((px >> 8) & 0xFFu);
-            o[2] = (uint8_t)((px >> 16) & 0xFFu);
-            o[3] = 0xFFu;
-        }
+    // Publish the most recent COMPLETED movie frame ([fmvcapture]). This runs once per
+    // sceMpegGetPicture -- more often than frames arrive -- and that cadence is deliberate: the
+    // CD-tick pump allows 4 disc pumps per PUBLISH (Interrupt.cpp [cdgate]), so publishing only on
+    // new frames halved the streaming rate and playback ran slow. Re-showing the same captured
+    // frame is free: the texture is already cached under its key, so only the draw is repeated.
+    uint32_t fbp, w, h; uint64_t gen; std::vector<uint8_t> pix;
+    {
+        std::lock_guard<std::mutex> lk(g_fmvCapMtx);
+        if (g_fmvCapGen == 0 || g_fmvCapPix.empty())
+            return;
+        fbp = g_fmvCapFbp; w = g_fmvCapW; h = g_fmvCapH; gen = g_fmvCapGen;
+        static uint64_t s_lastGen = 0;
+        if (gen != s_lastGen) { pix = g_fmvCapPix; s_lastGen = gen; }   // upload only on a NEW frame
+    }
 
     const uint64_t key = 0xF00D0000ull | fbp;
-    ps2GpuRenderer().putTexture(key, std::move(rgba), (int)w, (int)h, fbp, fbp + 1u);
+    if (!pix.empty())
+        ps2GpuRenderer().putTexture(key, std::move(pix), (int)w, (int)h, fbp, fbp + 1u);
+
+    // [fmvpresent] the publish carrying a movie frame presents THAT buffer -- the movie is double
+    // buffered ([fmvfbp]) and neither the area pick nor the CRTC hint resolves which of the two is
+    // current, so half the frames were published into an FBO that was never shown.
+    g_fmvDisplayFbp.store(fbp, std::memory_order_relaxed);
+    g_fmvDisplayHold.store(4u, std::memory_order_relaxed);   // survive publishes that carry no movie frame
+    g_fmvBlitCount.fetch_add(1, std::memory_order_relaxed);
 
     GsGpuRenderer::DrawCmd c{};
     c.texKey = key;
     c.isTriangle = false;
     c.destFbp = fbp;
-    c.destFbw = bw;
+    c.destFbw = std::max(1u, w / 64u);
     c.srcTexW = (int)w; c.srcTexH = (int)h;
     c.sx = 0; c.sy = 0; c.sw = (int)w; c.sh = (int)h;
     c.dx0 = 0.0f; c.dy0 = 0.0f; c.dx1 = (float)w; c.dy1 = (float)h;
     c.su0 = 0.0f; c.sv0 = 0.0f; c.su1 = (float)w; c.sv1 = (float)h;
     c.r = 128; c.g = 128; c.b = 128; c.a = 128;
     ps2GpuRenderer().recordCmd(c);
+
+    // [fmvboth] Put the SAME frame in BOTH movie buffers. The movie is double buffered, and every
+    // attempt to steer which of the two gets presented (area pick, CRTC hint, an explicit
+    // override) left some path that could still present the other one -- which holds the PREVIOUS
+    // frame, so the picture alternated new/old and flickered. Whichever buffer anything chooses
+    // now carries the newest frame, so the choice cannot matter. It costs one extra quad per movie
+    // frame and no extra upload: both draws share the texture. PS2X_FMVBOTH=0 disables.
+    static const bool s_both = [](){ const char *v = std::getenv("PS2X_FMVBOTH"); return !(v && v[0] == '0'); }();
+    const uint32_t partner = g_fmvCurBurstFbp.load(std::memory_order_relaxed);
+    if (s_both && partner != 0xFFFFFFFFu && partner != fbp)
+    {
+        GsGpuRenderer::DrawCmd c2 = c;
+        c2.destFbp = partner;
+        ps2GpuRenderer().recordCmd(c2);
+    }
+
     ps2GpuRenderer().swapFrame(); // nothing else publishes during a movie
 
-    static std::atomic<uint32_t> s_n{0};
-    if (s_n.fetch_add(1) < 4u)
-        std::fprintf(stderr, "[fmvblit] frame blit fbp=%u %ux%u published\n", fbp, w, h);
+    static const bool s_lg = [](){ const char *v = std::getenv("PS2X_FMVLOG"); return v && v[0] && v[0] != '0'; }();
+    if (s_lg)
+        std::fprintf(stderr, "[fmvlum] publish fbp=%u %ux%u gen=%llu%s\n", fbp, w, h,
+                     (unsigned long long)gen, pix.empty() ? " (repeat)" : " (new)");
 }

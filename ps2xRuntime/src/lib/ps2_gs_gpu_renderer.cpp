@@ -28,6 +28,7 @@
 #include "raylib.h"
 #include "rlgl.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_memory.h"   // [crtcdisp] GSRegisters (the CRTC registers are memory-mapped)
 extern "C" void glFinish(void);   // [unloadmode] drain experiment
 extern "C" void glFlush(void);    // [preflush]
 
@@ -179,6 +180,17 @@ static bool ps2xGlowView() {
     return s_v < 0 ? ps2xGlowFix() : (s_v != 0);
 }
 unsigned long g_gateSeen = 0;   // commands the gate census looked at (PS2X_GATESRC)
+// [mcfade] PS2X_MCFADE=1: boot memory-card popup close (memory bt3-mc-prompt-ghosting). Console and our GS
+// streams are identical, so the ghost borders come from OUR renderer. Per render call this counts what actually
+// EXECUTES into a display buffer: the full-screen fade quad (tbp 12288 / CLUT 12354), the box body
+// (tbp 12288 / CLUT 12384) with its y extent, and VRAM->FBO blits. More than one body per frame means we are
+// re-executing stale commands; fewer fades than frames means the fade is being dropped.
+static unsigned long g_mcFadeReach = 0, g_mcFadeExec = 0, g_mcBodyExec = 0, g_mcBlit = 0;
+static float g_mcBodyY[12][2] = {}; static int g_mcBodyN = 0; static uint32_t g_mcDestMask = 0;
+static int g_mcSeq[8] = {}; static int g_mcSeqN = 0;   // execution order within the frame: 1 = fade, 2 = body
+static bool ps2xMcFadeOn() { static const bool v = [](){ const char *e = std::getenv("PS2X_MCFADE"); return e && e[0] && e[0] != '0'; }(); return v; }
+static bool mcIsFade(const GsGpuRenderer::DrawCmd &c) { return c.srcTbp0 == 12288u && c.srcClutTbp == 12354u; }
+static bool mcIsBody(const GsGpuRenderer::DrawCmd &c) { return c.srcTbp0 == 12288u && c.srcClutTbp == 12384u; }
 // Pages whose FBO contents have been written back to VRAM this run. A draw sampling one of
 // these can be emitted normally -- the workaround gates that exist because "an FBO cannot be
 // sampled while it is also being written" no longer apply once the bytes are in VRAM.
@@ -1079,14 +1091,44 @@ namespace
             else
                 f.rt = LoadRenderTexture(wA, hA);
             f.w = w; f.h = h; f.scale = rsA;
-            if (rsA > 1)
+            {   // [fboalloc] LoadRenderTexture CAN FAIL -- it returns id 0 and says nothing. At
+                // render scale N a target is N*N times the pixels and our FBOs are grow-only, so a
+                // page that is 1024x512 natively asks for 4096x2048 at 4x; enough of those, or one
+                // past GL_MAX_TEXTURE_SIZE, and the driver refuses.
+                // The result was used unchecked, and the rsA>1 branch below then wrote
+                // g_rsTexScale[0] -- texture id 0 is the DEFAULT/no-texture binding, so every
+                // untextured draw in the frame started being treated as an N-times upscaled texture
+                // and had its UVs divided by N. That is invisible at 1x (the branch cannot run) and
+                // matches a user report of "VFX do not load at 4x, fine at 1x" on the machine whose
+                // GPU is likeliest to refuse the allocation.
+                // Report it LOUDLY: a silent zero here is exactly the class of failure that cost
+                // this project days elsewhere.
+                if (f.rt.texture.id == 0)
+                {
+                    static int s_n = 0;
+                    if (s_n++ < 12)
+                        std::fprintf(stderr, "[fboalloc] FAILED fbp%u %dx%d (scale %d, requested %dx%d) -- "
+                                     "render target not created; effects drawn into this page will be MISSING\n",
+                                     fbp, w, h, rsA, wA, hA);
+                }
+            }
+            if (rsA > 1 && f.rt.texture.id != 0)   // [fboalloc] never key the maps on id 0
             {
                 g_rsTexScale[f.rt.texture.id] = rsA;
                 g_rsTexFbo[f.rt.texture.id] = fbp;
                 if (f.stag.texture.id != 0) { ps2xForgetRtTexId(f.stag.texture.id); UnloadRenderTexture(f.stag); }
                 f.stag = LoadRenderTexture(w, h);
-                SetTextureFilter(f.stag.texture, TEXTURE_FILTER_POINT);
-                ps2xForgetTexId(f.stag.texture.id);
+                if (f.stag.texture.id == 0)
+                {
+                    static int s_ns = 0;
+                    if (s_ns++ < 12)
+                        std::fprintf(stderr, "[fboalloc] FAILED staging fbp%u %dx%d -- 1x readback copy unavailable\n", fbp, w, h);
+                }
+                else
+                {
+                    SetTextureFilter(f.stag.texture, TEXTURE_FILTER_POINT);
+                    ps2xForgetTexId(f.stag.texture.id);
+                }
             }
             SetTextureFilter(f.rt.texture, TEXTURE_FILTER_POINT);
             // Clear ONCE on creation. PS2 framebuffers/render targets persist across
@@ -4425,6 +4467,9 @@ unsigned long g_a44rec = 0, g_a44drawn = 0;
 // [darkw] sentinel: one pixel the darkener darkened, watched across the rest of the frame.
 unsigned g_darkwFboId = 0; int g_darkwX = 0, g_darkwY = 0, g_darkwFboH = 0;
 uint32_t g_darkwLast = 0, g_darkwGen = 0; int g_darkwLogs = 0;
+// [batchstat] who closes the DrawCmd batch? 26.7% of primitives arrive with none open and must
+// refill a 500-byte DrawCmd; the 256-triangle cap was ruled out by A/B (256/1024/8192 identical).
+unsigned long g_closeWhy[6] = {0,0,0,0,0,0};   // 0 publish 1 cap 2 dirtygen 3 renderloopA 4 renderloopB 5 other
 
 // [recstage] recordCmd used to take m_mtx for every command (~100k per fight frame, ~1.3 ms of
 // uncontended lock traffic on the guest thread). Commands are now appended to a guest-owned staging
@@ -4434,7 +4479,7 @@ uint32_t g_darkwLast = 0, g_darkwGen = 0; int g_darkwLogs = 0;
 static const int s_recStage = [](){ const char *v = std::getenv("PS2X_RECSTAGE"); return v ? std::atoi(v) : 64; }();   // default 64 since 2026-08-28: with PRERENDER=16 it is what gets the outline stack to 30 fps (SJ11); no effect on the plain build
 void GsGpuRenderer::flushStage()
 {
-    closeOpenBatch();   // [drawbatch] the staged commands are about to become visible: register the run's dirty rect first
+    (++g_closeWhy[0], closeOpenBatch());   // [drawbatch] the staged commands are about to become visible: register the run's dirty rect first
     if (m_stage.empty()) return;
     std::lock_guard<std::mutex> lk(m_mtx);
     {   // [segshadow]
@@ -4495,7 +4540,16 @@ int GsGpuRenderer::batchWhy(const DrawCmd &c)
     if (!c.isTriangle) return 1;
     if (c.isTransfer || c.isVramBlit || c.isDecode || c.isAliasPass || c.wsHudApplied) return 2;
     if (c.depthOnly) return 3;
-    if (!(c.destFbp == 0u || c.destFbp == 112u)) return 4;   // scene buffers only
+    {   // [batch336] EXPERIMENT (PS2X_BATCH336=1, default OFF): fbp336 -- the post-process /
+        // DoF composite page -- is 53.7% of all recorded commands, and every one of them closes
+        // the open batch, which is why 26.7% of primitives arrive with no batch open and refill
+        // a 500-byte DrawCmd. Nothing here records WHY 336 was excluded beyond "scene buffers
+        // only", so measure it: allow 336 and check the frames are byte-identical.
+        // ⚠ 336 has per-command handling elsewhere (the FBW view split, the tile-grid blit,
+        // [wsrtskip]); if any of that is per-command rather than per-triangle this WILL differ.
+        static const bool s_b336 = [](){ const char *v = std::getenv("PS2X_BATCH336"); return v && v[0] && v[0] != '0'; }();
+        if (!(c.destFbp == 0u || c.destFbp == 112u || (s_b336 && c.destFbp == 336u))) return 4;   // scene buffers only
+    }
     if (!(c.destPsm == 0u || c.destPsm == 1u)) return 5;
     if (c.fst != 0u) return 6;              // FST=1 is the 2D/HUD class: [wshudsplit] + the layout map
     if (c.srcPsm == 27u) return 7;          // PSMT8H: recordSpriteGPU publishes its CLUT once per draw
@@ -4603,7 +4657,7 @@ bool GsGpuRenderer::appendBatchTri(const Vtx v[3], bool addDirty)
 {
     if (m_openBatchIdx >= m_stage.size()) { closeOpenBatch(); return false; }
     DrawCmd &h = m_stage[m_openBatchIdx];
-    if ((int)h.triCount >= batchMax()) { closeOpenBatch(); return false; }
+    if ((int)h.triCount >= batchMax()) { (++g_closeWhy[1], closeOpenBatch()); return false; }
     // The head already did the PS2X_BARRIER bookkeeping for this (dest, source, zbuf) triple and an
     // appended triangle repeats it exactly -- the same reasoning [bardedupe] uses to skip the set ops
     // for a run of identical commands, and it needs the same guard: if anything REMOVED a g_barDirty /
@@ -4612,7 +4666,7 @@ bool GsGpuRenderer::appendBatchTri(const Vtx v[3], bool addDirty)
     // flush and would decode stale VRAM. g_barDirtyGen counts exactly those removals; on a change,
     // refuse the append so the caller records a full command and redoes the bookkeeping.
     if (m_openBatchDirtyGen != g_barDirtyGen.load(std::memory_order_relaxed))
-    { closeOpenBatch(); return false; }
+    { (++g_closeWhy[2], closeOpenBatch()); return false; }
     if (!h.triMore) h.triMore = takeVtxStore();
     h.triMore->push_back(v[0]); h.triMore->push_back(v[1]); h.triMore->push_back(v[2]);
     ++h.triCount;
@@ -6146,12 +6200,12 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
         // one): anything the plain class excludes must not have triangles appended to it.
         if (openable)
         {
-            closeOpenBatch();                       // flush the previous run's rect before re-pointing
+            (++g_closeWhy[3], closeOpenBatch());                       // flush the previous run's rect before re-pointing
             m_openBatchIdx = m_stage.size() - 1;
             m_openBatchDirtyGen = g_barDirtyGen.load(std::memory_order_relaxed);   // see appendBatchTri
             g_batchHead.fetch_add(1, std::memory_order_relaxed);
         }
-        else closeOpenBatch();
+        else (++g_closeWhy[4], closeOpenBatch());
         if (m_stage.size() >= (size_t)s_recStage) flushStage();   // lk is not held on this branch
     }
     ++m_recordCount;
@@ -7804,6 +7858,27 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     // render-on-publish path. With INTERP we clear+draw+present the SAME (draw-target) buffer
     // every host frame, so presenting the front buffer (which the current draws DON'T touch)
     // would show black on the frames we cleared it -> the black/actual flashing. Skip it.
+    const uint32_t areaPickFbp = displayFbp; const bool areaPickOk = found || !destArea.empty();
+    {   // [crtcdisp] PS2X_CRTCDISP=1: take the scanned-out buffer from the CRTC registers, every frame.
+        // setDisplay() -- the only writer of m_hintDisplayFbp -- is called from the DISPFB register-write
+        // handler, but BT3 flips buffers with MEMORY-MAPPED DISPFB writes that bypass it. The hint therefore
+        // never moves, the sticky fallback below keeps presenting fbp0 forever, and what reaches the screen is
+        // one buffer's own history (measured: 428/428 live frames presented f0 while the game flipped 0<->112
+        // every frame). On the boot memory-card popup that history IS the ghost trail; elsewhere a repainted
+        // background hides it. m_privRegs is memory-mapped, so it is always current.
+        static const bool s_crtcDisp = [](){ const char *v = std::getenv("PS2X_CRTCDISP"); return !(v && v[0] == '0'); }();   // DEFAULT ON (user-validated 2026-09-07); =0 reverts
+        if (s_crtcDisp)
+        {
+            extern GS *g_gsWb;
+            if (g_gsWb)
+                if (const GSRegisters *pr = g_gsWb->privRegsForRecord())
+                {
+                    const uint32_t fbp = static_cast<uint32_t>(pr->dispfb1 & 0x1FFu);
+                    const uint32_t fbw = static_cast<uint32_t>((pr->dispfb1 >> 9) & 0x3Fu);
+                    if (fbw) setDisplay(fbp, fbw);
+                }
+        }
+    }
     if (!g_interpOn && m_hintDisplayFbp != 0xFFFFFFFFu && g_fbpEverDrawn.count(m_hintDisplayFbp) &&
         g_fbos.count(m_hintDisplayFbp) && g_fbos[m_hintDisplayFbp].rt.texture.id != 0)
         displayFbp = m_hintDisplayFbp;
@@ -7836,6 +7911,47 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (dispArea > 100000.0 && g_fbos.count(displayFbp)) s_stickyFbp = displayFbp;
         if (s_stickyFbp != 0xFFFFFFFFu && g_fbos.count(s_stickyFbp) && g_fbos[s_stickyFbp].rt.texture.id != 0)
             displayFbp = s_stickyFbp;
+    }
+
+    {   // [crtcdisp] mode 2: present the buffer THIS publish drew into, not the one DISPFB names.
+        // At publish time the game has not flipped yet -- DISPFB still points at the buffer that was on
+        // screen while these draws were being made -- so mode 1 shows every frame one late, and the last
+        // frame of an animation is never shown at all (the game stops publishing, so the stale image
+        // sticks: the boot popup freezes on a 4px box for ~0.5 s where console shows its 1px sliver).
+        static const int s_cdMode = [](){ const char *v = std::getenv("PS2X_CRTCDISP"); return v && v[0] ? std::atoi(v) : 1; }();   // DEFAULT 1
+        (void)areaPickFbp; (void)areaPickOk;
+        if (s_cdMode >= 2 && !g_interpOn && m_hintDisplayFbp != 0xFFFFFFFFu
+            && g_fbpEverDrawn.count(m_hintDisplayFbp) && g_fbos.count(m_hintDisplayFbp)
+            && g_fbos[m_hintDisplayFbp].rt.texture.id != 0)
+            displayFbp = m_hintDisplayFbp;   // the CRTC is the authority; the sticky rule is only a fallback
+    }
+
+    // [fmvpresent] A publish carrying an FMV frame presents the buffer that frame was blitted into.
+    // The movie is double buffered but issues no draws of its own, so the area pick has only the
+    // blit to go on and the CRTC hint is sampled once per movie frame -- both aliased onto ONE
+    // buffer, so every frame written to the other was published into an FBO that was never shown
+    // (half the frames dropped, the rest doubled: a stuttering movie). This is consumed here, so it
+    // can only affect the publish that immediately follows a movie blit. PS2X_FMVPRESENT=0 disables.
+    {
+        extern std::atomic<uint32_t> g_fmvDisplayFbp;
+        extern std::atomic<uint32_t> g_fmvDisplayHold;
+        static const bool s_fp = [](){ const char *v = std::getenv("PS2X_FMVPRESENT"); return !(v && v[0] == '0'); }();
+        const uint32_t fmvFbp = g_fmvDisplayFbp.load(std::memory_order_relaxed);
+        const uint32_t hold = g_fmvDisplayHold.load(std::memory_order_relaxed);
+        if (s_fp && fmvFbp != 0xFFFFFFFFu && hold > 0u)
+        {
+            // Hold across publishes that carry NO movie frame. Consuming it on the first publish
+            // meant any other publisher (an empty or near-empty frame between two movie frames)
+            // fell back to the normal pick, chose the OTHER buffer -- which still holds the
+            // PREVIOUS movie frame -- and the picture alternated new/old: a flicker that only
+            // appears when something else publishes in between, which is why it was config
+            // dependent and why anything that slowed the movie down hid it.
+            // A publish carrying real game draws (cmds > 1) still uses the normal pick, so the
+            // skip fade, which draws 16 fullscreen sprites per frame, composites as before.
+            if (cmds.size() <= 1 && g_fbos.count(fmvFbp) && g_fbos[fmvFbp].rt.texture.id != 0)
+                displayFbp = fmvFbp;
+            g_fmvDisplayHold.store(hold - 1u, std::memory_order_relaxed);
+        }
     }
 
     // DEBUG (PS2X_DISPLAYFBP=<n>): force the presented buffer to fbp <n>. Lets us test
@@ -9082,6 +9198,11 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 && (hc.destFbp == 0u || hc.destFbp == 112u)
                 && hc.tri[0].y <= 90.0f && hc.tri[1].y <= 90.0f && hc.tri[2].y <= 90.0f;
             if (g_hudTraceCur) ++g_hudTrace[0];
+        }
+        if (ps2xMcFadeOn())
+        {   // [mcfade] reached the loop body
+            const DrawCmd &mc = DC[ci];
+            if (mcIsFade(mc)) ++g_mcFadeReach;
         }
         hoistAll = hoistOk && nTri > 1u;                                  // [glhoist]
         if (hoistAll && wsHudInv != 1.0f && !DC[ci].wsHudApplied
@@ -17464,6 +17585,34 @@ if (done.size() < 14 && !done.count(c.texKey))
             static const bool s_fr = [](){ const char *v = std::getenv("PS2X_FLUSH_RT"); return v && v[0] && v[0] != '0'; }();
             if (s_fr && c.destFbp != displayFbp) flushBatch(__LINE__);
         }
+        if (ps2xMcFadeOn() && (c.destFbp == 0u || c.destFbp == 112u))
+        {   // [mcfade] survived every gate: this one really draws
+            if (c.isVramBlit) ++g_mcBlit;
+            else if (mcIsFade(c)) { ++g_mcFadeExec; g_mcDestMask |= (c.destFbp == 0u) ? 1u : 2u;
+                                    if (g_mcSeqN < 8 && (g_mcSeqN == 0 || g_mcSeq[g_mcSeqN - 1] != 1)) g_mcSeq[g_mcSeqN++] = 1; }
+            else if (mcIsBody(c) && c.isTriangle)
+            {
+                ++g_mcBodyExec;
+                float y0 = c.tri[0].y, y1 = y0;
+                for (int k = 1; k < 3; ++k) { y0 = std::min(y0, c.tri[k].y); y1 = std::max(y1, c.tri[k].y); }
+                if (g_mcBodyN < 12) { g_mcBodyY[g_mcBodyN][0] = y0; g_mcBodyY[g_mcBodyN][1] = y1; ++g_mcBodyN; }
+                if (g_mcSeqN < 8 && (g_mcSeqN == 0 || g_mcSeq[g_mcSeqN - 1] != 2)) g_mcSeq[g_mcSeqN++] = 2;
+            }
+        }
+    }
+    if (ps2xMcFadeOn() && (g_mcFadeExec || g_mcBodyExec || g_mcBlit))
+    {
+        extern std::atomic<uint64_t> g_bt3FrameCount;
+        std::fprintf(stderr, "[mcfade] fr=%llu disp=f%u | fade reach=%lu exec=%lu (buffers %s) | body exec=%lu",
+                     (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), displayFbp,
+                     g_mcFadeReach, g_mcFadeExec,
+                     g_mcDestMask == 3u ? "f0+f112" : (g_mcDestMask == 1u ? "f0" : (g_mcDestMask == 2u ? "f112" : "none")),
+                     g_mcBodyExec);
+        for (int k = 0; k < g_mcBodyN; ++k) std::fprintf(stderr, " y%.0f-%.0f", g_mcBodyY[k][0], g_mcBodyY[k][1]);
+        std::fprintf(stderr, " | order=");
+        for (int k = 0; k < g_mcSeqN; ++k) std::fprintf(stderr, "%s", g_mcSeq[k] == 1 ? "fade " : "body ");
+        std::fprintf(stderr, "| vramblits=%lu\n", g_mcBlit);
+        g_mcFadeReach = g_mcFadeExec = g_mcBodyExec = g_mcBlit = 0; g_mcBodyN = 0; g_mcDestMask = 0; g_mcSeqN = 0;
     }
     ragStat.markEnd();
 
@@ -18046,13 +18195,25 @@ if (done.size() < 14 && !done.count(c.texKey))
         // to catch a specific moment (e.g. going under water) instead of only the first 20 s.
         static const int s_pdEvery = [](){ const char *v = std::getenv("PS2X_PRESENTDUMP");
                                            const int n = v && v[0] ? std::atoi(v) : 0;
-                                           return n > 1 ? n : 60; }();
+                                           // n==1 means EVERY publish: the old "1 -> every 60th"
+                                           // made a short capture of a sparse scene impossible
+                                           return n >= 1 ? n : 60; }();
         static const int s_pdCap = [](){ const char *v = std::getenv("PS2X_PRESENTDUMP");
                                          const int n = v && v[0] ? std::atoi(v) : 0;
-                                         return n > 1 ? 60 : 10; }();
+                                         return n >= 1 ? 60 : 10; }();
         static const bool s_pd = [](){ const char *v = std::getenv("PS2X_PRESENTDUMP"); return v && v[0] && v[0] != '0'; }();
+        // PS2X_PRESENTDUMP_MIN=<n>: the cmds floor. It defaults to 4000 (fight frames only), which
+        // makes the dump useless for anything sparse -- a movie publishes ONE command, so no frame
+        // ever qualified and the only way to see what the window showed was a 20 Hz screen grab.
+        static const size_t s_pdMin = [](){ const char *v = std::getenv("PS2X_PRESENTDUMP_MIN");
+                                            return v && v[0] ? (size_t)std::strtoul(v, nullptr, 0) : (size_t)4000; }();
+        // PS2X_PRESENTDUMP_FMV=1: do not start counting until the first movie frame has been
+        // published, so the 60-frame budget lands on the movie instead of being spent during boot.
+        static const bool s_pdFmv = [](){ const char *v = std::getenv("PS2X_PRESENTDUMP_FMV"); return v && v[0] && v[0] != '0'; }();
+        extern std::atomic<uint32_t> g_fmvBlitCount;
         static int s_pn = 0, s_pf = 0;
-        if (s_pd && outId != 0 && (++s_pf % s_pdEvery) == 0 && cmds.size() > 4000 && s_pn < s_pdCap)
+        const bool pdArmed = !s_pdFmv || g_fmvBlitCount.load(std::memory_order_relaxed) > 0u;
+        if (s_pd && pdArmed && outId != 0 && (++s_pf % s_pdEvery) == 0 && cmds.size() > s_pdMin && s_pn < s_pdCap)
         {
             Texture2D pt{};
             pt.id = outId;

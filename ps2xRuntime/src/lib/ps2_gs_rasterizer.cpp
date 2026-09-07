@@ -4683,6 +4683,15 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         g_zwbZMax = zMax;
     }
     GsGpuRenderer &r = ps2GpuRenderer();
+    {   // [fadefull] PS2X_FADEFULL=1: EXPERIMENT for the boot memory-card popup (memory bt3-mc-prompt-ghosting).
+        // PCSX2's software renderer clears the buffer every frame on a byte-identical stream, which only
+        // happens if this draw's blend factor is the TEXTURE alpha (128 = 1.0) rather than texture x vertex
+        // (128*31>>7 = 31 = 24%). Force the full factor for this one class and compare against the console
+        // video; it says whether the "A = At for TCC=1" reading is what hardware does.
+        static const bool s_ff = [](){ const char *v = std::getenv("PS2X_FADEFULL"); return !(v && v[0] == '0'); }();   // DEFAULT ON (user-validated 2026-09-07); =0 reverts
+        if (s_ff && tme && ctx.tex0.cbp == 12354u && ctx.tex0.tbp0 == 12288u)
+            for (int k = 0; k < 3; ++k) gs->m_vtxQueue[k].a = 0x80u;
+    }
     gprof::mark(gprof::REC_BUILD);   // [guestprof]
     // [drawbatch] A CONTINUATION of the renderer's open plain-class batch does not fill the state
     // part at all: it only writes the three vertices and appends them (see GsGpuRenderer::DrawCmd
@@ -4706,6 +4715,33 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     const bool batchCont = s_tplOn && tplHit && !isSprite && GsGpuRenderer::batchingEnabled()
                            && !g_recordDepthOnly && g_recordAliasKind == 0
                            && r.batchOpen() && r.batchSeq() == s_bcmdSeq;
+    {   // [batchstat] PS2X_BATCHSTAT=1: WHY does a primitive have to refill the whole DrawCmd?
+        // REC_BUILD is ~120 ms/s on the low-end target (4.5 ms/frame, ~74 ns/prim) and it is almost
+        // entirely `cmd = DrawCmd{}` + ~100 field stores. The fill itself is irreducible -- a
+        // 500-byte snapshot was tried and cost the same -- so the only lever is SKIPPING it via
+        // batchCont. Sprites can never continue a batch (!isSprite), and a template miss or a
+        // closed batch also force a refill. Count which, so the fix targets the real reason.
+        static const bool s_bs = [](){ const char *v = std::getenv("PS2X_BATCHSTAT"); return v && v[0] && v[0] != '0'; }();
+        if (s_bs)
+        {
+            static unsigned long n = 0, cont = 0, spr = 0, notpl = 0, closed = 0, other = 0;
+            ++n;
+            if (batchCont) ++cont;
+            else if (isSprite) ++spr;
+            else if (!tplHit) ++notpl;
+            else if (!r.batchOpen()) ++closed;          // nothing open: someone called closeOpenBatch
+            else if (r.batchSeq() != s_bcmdSeq) ++other;   // open, but not the batch WE last appended to
+            if ((n % 400000ul) == 0ul)
+                { extern unsigned long g_closeWhy[6];
+                  std::fprintf(stderr, "[batchstat] closes: publish=%lu cap=%lu dirtygen=%lu loopA=%lu loopB=%lu\n",
+                               g_closeWhy[0], g_closeWhy[1], g_closeWhy[2], g_closeWhy[3], g_closeWhy[4]); }
+                std::fprintf(stderr, "[batchstat] prims=%lu  refill=%.1f%%  | continued=%.1f%% "
+                             "sprite=%.1f%% tplmiss=%.1f%% noBatchOpen=%.1f%% seqMismatch=%.1f%%\n",
+                             n, 100.0 * (double)(n - cont) / (double)n, 100.0 * (double)cont / (double)n,
+                             100.0 * (double)spr / (double)n, 100.0 * (double)notpl / (double)n,
+                             100.0 * (double)closed / (double)n, 100.0 * (double)other / (double)n);
+        }
+    }
     GsGpuRenderer::DrawCmd &cmd = s_bcmd;
     // Invalidate FIRST: a fresh fill that is then dropped (the ZSAT/near-plane culls below return
     // without recording) must not leave the next primitive thinking the retained state is the open
