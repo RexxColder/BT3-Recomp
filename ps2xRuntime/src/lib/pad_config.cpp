@@ -212,6 +212,45 @@ namespace ps2_stubs
             return nAxes >= 4 && nButtons >= 8;
         }
 
+        std::vector<int> availableGamepads();
+
+        // Map a "Gamepad N" index (how the Qt launcher names pads: 0 = first
+        // gamepad detected) to a concrete GLFW/raylib slot, or -1 if out of range.
+        // Accepts a raw GLFW slot as a fallback so configs written by the older
+        // in-game overlay (which stored dev.glfwSlot directly) keep working.
+        int gamepadIndexToSlot(int index)
+        {
+            const std::vector<int> avail = availableGamepads();
+            if (index >= 0 && index < static_cast<int>(avail.size()))
+            {
+                return avail[index];
+            }
+            if (IsGamepadAvailable(index))
+            {
+                return index;
+            }
+            return -1;
+        }
+
+        // Reverse map: where does this GLFW slot sit in the "Gamepad N" list
+        // (the position the launcher and pad_pN.conf use), or -1 if not a pad.
+        int gamepadSlotToIndex(int glfwSlot)
+        {
+            if (glfwSlot < 0)
+            {
+                return -1;
+            }
+            const std::vector<int> avail = availableGamepads();
+            for (size_t i = 0; i < avail.size(); ++i)
+            {
+                if (avail[i] == glfwSlot)
+                {
+                    return static_cast<int>(i);
+                }
+            }
+            return IsGamepadAvailable(glfwSlot) ? glfwSlot : -1;
+        }
+
         std::vector<int> availableGamepads()
         {
             logGamepadSlotsOnce();
@@ -312,11 +351,22 @@ namespace ps2_stubs
             return cfg;
         }
 
-        // Legacy "auto" poll: merge every available gamepad (fixed map) + keyboard
-        // (fixed map). Reproduces the pre-configurator behaviour exactly.
-        void pollLegacyAuto(PadPacket &pkt)
+        // Legacy "auto" poll: distribute devices per player instead of merging
+        // every pad+keyboard into one packet (that bug made P1 drive both sides).
+        //   >= 2 gamepads:  player 0 -> gamepad[0], player 1 -> gamepad[1]
+        //   1 gamepad + kb: player 0 -> gamepad[0], player 1 -> keyboard
+        //   no gamepad:     both players -> keyboard
+        void pollLegacyAuto(PadPacket &pkt, size_t player)
         {
-            const std::vector<int> pads = availableGamepads();
+            const std::vector<int> allPads = availableGamepads();
+            // This player's gamepads: dedicate one when enough are present,
+            // otherwise none (falls back to keyboard for that player).
+            std::vector<int> pads;
+            if (!allPads.empty() && (player == 0 || allPads.size() >= 2))
+            {
+                pads.push_back(allPads[player < allPads.size() ? player : 0]);
+            }
+            const bool kbdDrives = pads.empty();   // no pad for this player
 #if defined(__linux__)
             const PadEvdevLinux &native = PadEvdevLinux::instance();
             const bool nativeOk = native.isAvailable() && nativeGamepadMatches(pads, native);
@@ -376,16 +426,17 @@ namespace ps2_stubs
                 btn(PadAction::Start, GAMEPAD_BUTTON_MIDDLE_RIGHT);
             }
             // Read native axes even when GLFW has no mapping for the
-            // controller (pads empty).  The evdev reader provides the
-            // correct analog values independently of GLFW's gamepad DB.
-            if (pads.empty() && nativeOk)
+            // controller (pads empty).  Only the first player inherits the
+            // unmapped native device; player 1 falls back to keyboard instead
+            // of sharing P1's pad.
+            if (pads.empty() && nativeOk && player == 0)
             {
                 lx = native.getAxis(GAMEPAD_AXIS_LEFT_X);
                 ly = native.getAxis(GAMEPAD_AXIS_LEFT_Y);
                 rx = native.getAxis(GAMEPAD_AXIS_RIGHT_X);
                 ry = native.getAxis(GAMEPAD_AXIS_RIGHT_Y);
             }
-            if (!pads.empty() || nativeOk)
+            if (!pads.empty() || (nativeOk && player == 0))
             {
                 pkt.lx = floatToByte(lx);
                 pkt.ly = floatToByte(ly);
@@ -404,33 +455,36 @@ namespace ps2_stubs
                     pkt.buttons = static_cast<uint16_t>(pkt.buttons & ~buttonMaskForAction(a));
                 }
             };
-            key(PadAction::Up, KEY_UP);
-            key(PadAction::Down, KEY_DOWN);
-            key(PadAction::Left, KEY_LEFT);
-            key(PadAction::Right, KEY_RIGHT);
-            key(PadAction::Square, KEY_Z);
-            key(PadAction::Cross, KEY_X);
-            key(PadAction::Circle, KEY_C);
-            key(PadAction::Triangle, KEY_V);
-            key(PadAction::L1, KEY_Q);
-            key(PadAction::R1, KEY_E);
-            key(PadAction::L2, KEY_ONE);
-            key(PadAction::R2, KEY_THREE);
-            key(PadAction::L3, KEY_LEFT_CONTROL);
-            key(PadAction::R3, KEY_RIGHT_CONTROL);
-            key(PadAction::Select, KEY_RIGHT_SHIFT);
-            key(PadAction::Start, KEY_ENTER);
-
-            float ax = 0.0f;
-            float ay = 0.0f;
-            if (IsKeyDown(KEY_D)) ax += 1.0f;
-            if (IsKeyDown(KEY_A)) ax -= 1.0f;
-            if (IsKeyDown(KEY_S)) ay += 1.0f;
-            if (IsKeyDown(KEY_W)) ay -= 1.0f;
-            if (ax != 0.0f || ay != 0.0f)
+            if (!s_noKb && kbdDrives)
             {
-                pkt.lx = floatToByte(ax);
-                pkt.ly = floatToByte(ay);
+                key(PadAction::Up, KEY_UP);
+                key(PadAction::Down, KEY_DOWN);
+                key(PadAction::Left, KEY_LEFT);
+                key(PadAction::Right, KEY_RIGHT);
+                key(PadAction::Square, KEY_Z);
+                key(PadAction::Cross, KEY_X);
+                key(PadAction::Circle, KEY_C);
+                key(PadAction::Triangle, KEY_V);
+                key(PadAction::L1, KEY_Q);
+                key(PadAction::R1, KEY_E);
+                key(PadAction::L2, KEY_ONE);
+                key(PadAction::R2, KEY_THREE);
+                key(PadAction::L3, KEY_LEFT_CONTROL);
+                key(PadAction::R3, KEY_RIGHT_CONTROL);
+                key(PadAction::Select, KEY_RIGHT_SHIFT);
+                key(PadAction::Start, KEY_ENTER);
+
+                float ax = 0.0f;
+                float ay = 0.0f;
+                if (IsKeyDown(KEY_D)) ax += 1.0f;
+                if (IsKeyDown(KEY_A)) ax -= 1.0f;
+                if (IsKeyDown(KEY_S)) ay += 1.0f;
+                if (IsKeyDown(KEY_W)) ay -= 1.0f;
+                if (ax != 0.0f || ay != 0.0f)
+                {
+                    pkt.lx = floatToByte(ax);
+                    pkt.ly = floatToByte(ay);
+                }
             }
         }
     }
@@ -619,6 +673,20 @@ namespace ps2_stubs
         cfg.load();
     }
 
+    // Public wrappers so the in-game overlay persists the *index* naming the
+    // launcher uses ("Gamepad 0/1/..." in pad_pN.conf), never the raw GLFW slot.
+    // The slot layout differs from the evdev enumeration the launcher shows, and
+    // is what made "Gamepad 1" silently point at a dead slot.
+    int padGamepadSlot(int index)
+    {
+        return gamepadIndexToSlot(index);
+    }
+
+    int padGamepadIndex(int glfwSlot)
+    {
+        return gamepadSlotToIndex(glfwSlot);
+    }
+
     PadPacket padPollPlayer(size_t player)
     {
         return PadConfig::instance().poll(player);
@@ -716,112 +784,249 @@ namespace ps2_stubs
         return "./pad.conf";
     }
 
+    // Savedata files live in <ELF dir>/savedata. Each player gets its own file
+    // (pad_p1.conf / pad_p2.conf); the legacy single pad.conf is still read as a
+    // fallback so pre-existing setups keep working (migrated to the new files).
+    static const char *kPlayerFilePrefix = "pad_p";
+    static const char *kLegacyFileName = "pad.conf";
+
+    std::string PadConfig::playerConfigPath(size_t p) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const std::string dir = (m_dir.empty() ? std::string(".") : m_dir) + "/savedata";
+        return dir + "/" + kPlayerFilePrefix + std::to_string(p + 1) + ".conf";
+    }
+
+    std::string PadConfig::legacyConfigPath() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return (m_dir.empty() ? std::string(".") : m_dir) + "/" + kLegacyFileName;
+    }
+
+    namespace
+    {
+        // Parse one player file (/pad_pN.conf): lines use the classic
+        // "player <idx>" framing, but only one player lives in each file.
+        bool parsePlayerFile(const std::string &path, size_t fixedPlayer,
+                             PadPlayerConfig players[PadConfig::kPlayerCount], bool &any)
+        {
+            std::ifstream in(path);
+            if (!in.is_open())
+            {
+                return false;
+            }
+            std::string line;
+            while (std::getline(in, line))
+            {
+                std::istringstream ss(line);
+                std::string tok;
+                if (!(ss >> tok) || tok != "player")
+                {
+                    continue;
+                }
+                int idx = -1;
+                if (!(ss >> idx) || idx < 0 || idx >= static_cast<int>(PadConfig::kPlayerCount))
+                {
+                    continue;
+                }
+                if (!(ss >> tok))
+                {
+                    continue;
+                }
+                PadPlayerConfig &dst = players[fixedPlayer];
+                if (tok == "device")
+                {
+                    std::string kind;
+                    if (!(ss >> kind))
+                    {
+                        continue;
+                    }
+                    PadDevice &dev = dst.device;
+                    if (kind == "Keyboard")
+                    {
+                        dev = PadDevice{PadDeviceKind::Keyboard, -1};
+                        setDefaultKeyboardBinds(dst);
+                    }
+                    else if (kind == "Gamepad")
+                    {
+                        int g = -1;
+                        if (ss >> g)
+                        {
+                            dev = PadDevice{PadDeviceKind::Gamepad, g};
+                        }
+                    }
+                    else
+                    {
+                        dev = PadDevice{PadDeviceKind::None, -1};
+                    }
+                    any = true;
+                }
+                else if (tok == "bind")
+                {
+                    std::string actionName, kindName;
+                    if (!(ss >> actionName >> kindName))
+                    {
+                        continue;
+                    }
+                    int value = -1;
+                    if (!(ss >> value))
+                    {
+                        continue;
+                    }
+                    float sign = 1.0f;
+                    ss >> sign;
+
+                    PadBindKind kind = PadBindKind::None;
+                    if (kindName == "Key") kind = PadBindKind::Key;
+                    else if (kindName == "Button") kind = PadBindKind::Button;
+                    else if (kindName == "Axis") kind = PadBindKind::Axis;
+
+                    PadAction action = PadAction::Count;
+                    for (size_t a = 0; a < static_cast<size_t>(PadAction::Count); ++a)
+                    {
+                        if (actionName == padActionName(static_cast<PadAction>(a)))
+                        {
+                            action = static_cast<PadAction>(a);
+                            break;
+                        }
+                    }
+                    if (action == PadAction::Count || kind == PadBindKind::None)
+                    {
+                        continue;
+                    }
+                    PadBind bind;
+                    bind.kind = kind;
+                    bind.value = value;
+                    bind.sign = (std::fabs(sign) < 0.5f) ? -1.0f : 1.0f;
+                    dst.binds[static_cast<size_t>(action)] = bind;
+                    any = true;
+                }
+            }
+            return true;
+        }
+    } // namespace
+
     bool PadConfig::load()
     {
-        const std::string path = defaultPath();
-        std::ifstream in(path);
-        if (!in.is_open())
-        {
-            return false;
-        }
-
         PadPlayerConfig players[kPlayerCount];
         for (size_t i = 0; i < kPlayerCount; ++i)
         {
             players[i] = makeDefaultPlayer();
         }
 
-        std::string line;
+        // Prefer one savedata file per player (savedata/pad_p1.conf, pad_p2.conf).
         bool any = false;
-        while (std::getline(in, line))
+        bool foundNew = false;
+        for (size_t p = 0; p < kPlayerCount; ++p)
         {
-            std::istringstream ss(line);
-            std::string tok;
-            if (!(ss >> tok) || tok != "player")
+            const std::string path = playerConfigPath(p);
+            const bool openedFile = parsePlayerFile(path, p, players, any);
+            if (openedFile)
             {
-                continue;
-            }
-            int idx = -1;
-            if (!(ss >> idx) || idx < 0 || idx >= static_cast<int>(kPlayerCount))
-            {
-                continue;
-            }
-            if (!(ss >> tok))
-            {
-                continue;
-            }
-            if (tok == "device")
-            {
-                std::string kind;
-                if (!(ss >> kind))
-                {
-                    continue;
-                }
-                PadDevice &dev = players[idx].device;
-                if (kind == "Keyboard")
-                {
-                    dev = PadDevice{PadDeviceKind::Keyboard, -1};
-                    setDefaultKeyboardBinds(players[idx]);
-                }
-                else if (kind == "Gamepad")
-                {
-                    int g = -1;
-                    if (ss >> g)
-                    {
-                        dev = PadDevice{PadDeviceKind::Gamepad, g};
-                    }
-                }
-                else
-                {
-                    dev = PadDevice{PadDeviceKind::None, -1};
-                }
-                any = true;
-            }
-            else if (tok == "bind")
-            {
-                std::string actionName, kindName;
-                if (!(ss >> actionName >> kindName))
-                {
-                    continue;
-                }
-                int value = -1;
-                if (!(ss >> value))
-                {
-                    continue;
-                }
-                float sign = 1.0f;
-                ss >> sign;
-
-                PadBindKind kind = PadBindKind::None;
-                if (kindName == "Key") kind = PadBindKind::Key;
-                else if (kindName == "Button") kind = PadBindKind::Button;
-                else if (kindName == "Axis") kind = PadBindKind::Axis;
-
-                PadAction action = PadAction::Count;
-                for (size_t a = 0; a < static_cast<size_t>(PadAction::Count); ++a)
-                {
-                    if (actionName == padActionName(static_cast<PadAction>(a)))
-                    {
-                        action = static_cast<PadAction>(a);
-                        break;
-                    }
-                }
-                if (action == PadAction::Count || kind == PadBindKind::None)
-                {
-                    continue;
-                }
-                PadBind bind;
-                bind.kind = kind;
-                bind.value = value;
-                bind.sign = (std::fabs(sign) < 0.5f) ? -1.0f : 1.0f;
-                players[idx].binds[static_cast<size_t>(action)] = bind;
-                any = true;
+                foundNew = true;
             }
         }
 
-        if (!any)
+        // Migration: no per-player files yet -> read the old single pad.conf.
+        if (!foundNew)
         {
-            return false;
+            const std::string legacy = legacyConfigPath();
+            {
+                std::ifstream in(legacy);
+                if (in.is_open())
+                {
+                    std::string line;
+                    while (std::getline(in, line))
+                    {
+                        std::istringstream ss(line);
+                        std::string tok;
+                        if (!(ss >> tok) || tok != "player")
+                        {
+                            continue;
+                        }
+                        int idx = -1;
+                        if (!(ss >> idx) || idx < 0 || idx >= static_cast<int>(kPlayerCount))
+                        {
+                            continue;
+                        }
+                        if (!(ss >> tok) || idx >= static_cast<int>(kPlayerCount))
+                        {
+                            continue;
+                        }
+                        if (tok == "device")
+                        {
+                            std::string kind;
+                            if (!(ss >> kind))
+                            {
+                                continue;
+                            }
+                            PadDevice &dev = players[idx].device;
+                            if (kind == "Keyboard")
+                            {
+                                dev = PadDevice{PadDeviceKind::Keyboard, -1};
+                                setDefaultKeyboardBinds(players[idx]);
+                            }
+                            else if (kind == "Gamepad")
+                            {
+                                int g = -1;
+                                if (ss >> g)
+                                {
+                                    dev = PadDevice{PadDeviceKind::Gamepad, g};
+                                }
+                            }
+                            else
+                            {
+                                dev = PadDevice{PadDeviceKind::None, -1};
+                            }
+                            any = true;
+                        }
+                        else if (tok == "bind")
+                        {
+                            std::string actionName, kindName;
+                            if (!(ss >> actionName >> kindName))
+                            {
+                                continue;
+                            }
+                            int value = -1;
+                            if (!(ss >> value))
+                            {
+                                continue;
+                            }
+                            float sign = 1.0f;
+                            ss >> sign;
+
+                            PadBindKind kind = PadBindKind::None;
+                            if (kindName == "Key") kind = PadBindKind::Key;
+                            else if (kindName == "Button") kind = PadBindKind::Button;
+                            else if (kindName == "Axis") kind = PadBindKind::Axis;
+
+                            PadAction action = PadAction::Count;
+                            for (size_t a = 0; a < static_cast<size_t>(PadAction::Count); ++a)
+                            {
+                                if (actionName == padActionName(static_cast<PadAction>(a)))
+                                {
+                                    action = static_cast<PadAction>(a);
+                                    break;
+                                }
+                            }
+                            if (action == PadAction::Count || kind == PadBindKind::None)
+                            {
+                                continue;
+                            }
+                            PadBind bind;
+                            bind.kind = kind;
+                            bind.value = value;
+                            bind.sign = (std::fabs(sign) < 0.5f) ? -1.0f : 1.0f;
+                            players[idx].binds[static_cast<size_t>(action)] = bind;
+                            any = true;
+                        }
+                    }
+                }
+            }
+            if (any)
+            {
+                std::printf("[pad_config] migrating legacy pad.conf -> savedata/pad_pN.conf\n");
+            }
         }
 
         {
@@ -832,26 +1037,38 @@ namespace ps2_stubs
             }
             m_loaded = true;
         }
-        std::printf("[pad_config] loaded %s\n", path.c_str());
-        return true;
+
+        if (any)
+        {
+            // Persist the migrated / freshly-loaded config back into per-player
+            // savedata files so the new layout is the one that sticks.
+            (void)save();
+        }
+        std::printf("[pad_config] loaded (per-player savedata)\n");
+        return any;
     }
 
     bool PadConfig::save() const
     {
-        const std::string path = defaultPath();
-        const std::string tmp = path + ".tmp";
+        bool ok = true;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const std::string dir = (m_dir.empty() ? std::string(".") : m_dir) + "/savedata";
+        std::error_code mdEc;
+        std::filesystem::create_directories(dir, mdEc);
+        for (size_t p = 0; p < kPlayerCount; ++p)
         {
-            std::ofstream out(tmp, std::ios::trunc);
-            if (!out.is_open())
+            const std::string path = dir + "/" + kPlayerFilePrefix + std::to_string(p + 1) + ".conf";
+            const std::string tmp = path + ".tmp";
             {
-                return false;
-            }
-            out << "# BT3-Recomp pad configuration\n";
-            out << "# player <idx> device <None|Keyboard|Gamepad [index]>\n";
-            out << "# player <idx> bind <Action> <Key|Button|Axis> <value> [sign]\n";
-            std::lock_guard<std::mutex> lock(m_mutex);
-            for (size_t p = 0; p < kPlayerCount; ++p)
-            {
+                std::ofstream out(tmp, std::ios::trunc);
+                if (!out.is_open())
+                {
+                    ok = false;
+                    continue;
+                }
+                out << "# BT3-Recomp pad configuration - Player " << (p + 1) << "\n";
+                out << "# player <N> device <None|Keyboard|Gamepad [index]>\n";
+                out << "# player <N> bind <Action> <Key|Button|Axis> <value> [sign]\n";
                 const PadPlayerConfig &cfg = m_players[p];
                 out << "player " << p << " device";
                 switch (cfg.device.kind)
@@ -878,15 +1095,18 @@ namespace ps2_stubs
                         << (bind.sign < 0.0f ? -1 : 1) << "\n";
                 }
             }
+            std::error_code ec;
+            std::filesystem::rename(tmp, path, ec);
+            if (ec)
+            {
+                ok = false;
+            }
+            else
+            {
+                std::printf("[pad_config] saved %s\n", path.c_str());
+            }
         }
-        std::error_code ec;
-        std::filesystem::rename(tmp, path, ec);
-        if (ec)
-        {
-            return false;
-        }
-        std::printf("[pad_config] saved %s\n", path.c_str());
-        return true;
+        return ok;
     }
 
     PadPacket PadConfig::poll(size_t player) const
@@ -917,21 +1137,41 @@ namespace ps2_stubs
         const bool anyPad = cfg.device.kind == PadDeviceKind::None;
         if (anyPad)
         {
-            pollLegacyAuto(pkt);
+            pollLegacyAuto(pkt, player);
             return pkt;
         }
 
         std::vector<int> pads;
-        if (cfg.device.kind == PadDeviceKind::Gamepad && IsGamepadAvailable(cfg.device.gamepad))
+        if (cfg.device.kind == PadDeviceKind::Gamepad)
         {
-            pads.push_back(cfg.device.gamepad);
+            // pad_pN.conf stores the launcher's "Gamepad N" index (N-th pad that
+            // reports as a controller), not the raw GLFW slot. Resolve it so a
+            // single Xbox on GLFW slot 1 still matches "Gamepad 0".
+            const int slot = padGamepadSlot(cfg.device.gamepad);
+            if (slot >= 0 && IsGamepadAvailable(slot))
+            {
+                pads.push_back(slot);
+            }
         }
         static const bool s_noKb2 = [](){ const char *v = std::getenv("PS2X_NOKB"); return v && v[0] == '1'; }();
         const bool keyboardAllowed = !s_noKb2 && cfg.device.kind != PadDeviceKind::Gamepad;
 
 #if defined(__linux__)
         const PadEvdevLinux &native = PadEvdevLinux::instance();
-        const bool nativeOk = native.isAvailable() && nativeGamepadMatches(pads, native);
+        // The native reader is a singleton bound to ONE physical device (the
+        // first pad found in /dev/input) = the launcher's "Gamepad 0". Only
+        // that player may consult it; players on any other gamepad must rely
+        // on their own GLFW slot, otherwise the singleton would feed every
+        // name-matching player the same physical state (P2 mirrors P1).
+        const bool nativeOwner = native.isAvailable() &&
+                                 cfg.device.kind == PadDeviceKind::Gamepad &&
+                                 cfg.device.gamepad == 0;
+        // Several readers (buttons, triggers, axis fallback) pull from the
+        // singleton: allowed for the owner, and only when these pads really
+        // are that device (name match) — unless GLFW exposed no slots at all
+        // (pads empty), where the singleton is the sole source for the owner.
+        const bool nativeOk = nativeOwner &&
+                              (pads.empty() || nativeGamepadMatches(pads, native));
 #else
         const bool nativeOk = false;
         static const PadEvdevStub native;   // no evdev here
@@ -963,6 +1203,34 @@ namespace ps2_stubs
                     }
                 }
             }
+            else if (bind.kind == PadBindKind::Axis)
+            {
+                // Analog binds on button actions (e.g. L2/R2 saved as
+                // "Axis 4/5" by capture): pressed once the axis passes its
+                // deadzone. GLFW gives triggers 0..1, sticks -1..+1, so use
+                // magnitude for the button state.
+                for (int pad : pads)
+                {
+                    if (std::fabs(GetGamepadAxisMovement(pad, bind.value)) > bind.deadzone)
+                    {
+                        pressed = true;
+                        break;
+                    }
+                }
+                // Trigger axes with no GLFW mapping (only the native evdev
+                // reader knows them): convert axis to the matching trigger
+                // button code and forward the native button state.
+                if (!pressed && nativeOk)
+                {
+                    const int btn = bind.value == GAMEPAD_AXIS_LEFT_TRIGGER ? GAMEPAD_BUTTON_LEFT_TRIGGER_2
+                                   : bind.value == GAMEPAD_AXIS_RIGHT_TRIGGER ? GAMEPAD_BUTTON_RIGHT_TRIGGER_2
+                                                                              : -1;
+                    if (btn >= 0 && native.isButtonDown(btn))
+                    {
+                        pressed = true;
+                    }
+                }
+            }
             if (pressed)
             {
                 pkt.buttons = static_cast<uint16_t>(pkt.buttons & ~buttonMaskForAction(action));
@@ -977,17 +1245,12 @@ namespace ps2_stubs
                 float best = 0.0f;
                 for (int pad : pads)
                 {
+                    // Only this player's GLFW slot. The native evdev reader is a
+                    // singleton bound to ONE physical device; injecting it here
+                    // would feed every matching player the same physical axes,
+                    // breaking per-player assignment when two controllers are
+                    // used (sticks of P1 appear on P2).
                     float v = GetGamepadAxisMovement(pad, bind.value);
-#if defined(__linux__)
-                    if (nativeOk)
-                    {
-                        const float nv = native.getAxis(bind.value);
-                        if (std::fabs(nv) > std::fabs(v))
-                        {
-                            v = nv;
-                        }
-                    }
-#endif
                     // Direction filter: only keep values in the bind's
                     // direction.  Without this, the opposing Neg/Pos slots
                     // both read the same underlying axis and cancel out
@@ -1034,11 +1297,20 @@ namespace ps2_stubs
             -1.0f, 1.0f);
 
         // Fallback: if GLFW has no mapping for the controller (pads empty)
-        // but the native evdev reader is available, read axes directly.
+        // but the native evdev reader is available, read axes directly. Only
+        // for a player actually assigned a gamepad: elsewhere (e.g. a Keyboard
+        // player) the singleton native device would feed this player the same
+        // physical sticks another player is using (shared-axes leak).
         if (lx == 0.0f && ly == 0.0f && rx == 0.0f && ry == 0.0f)
         {
 #if defined(__linux__)
-            if (pads.empty() && native.isAvailable())
+            // GLFW has no mapping for this gamepad (pads empty) but the native
+            // reader knows the device. Same ownership rule as above: the
+            // singleton is "Gamepad 0" of the launcher, so only that player
+            // inherits its axes. A Keyboard player or any other gamepad player
+            // must not read this physical device (shared-axes leak).
+            if (cfg.device.kind == PadDeviceKind::Gamepad && cfg.device.gamepad == 0 &&
+                pads.empty() && native.isAvailable())
             {
                 lx = native.getAxis(GAMEPAD_AXIS_LEFT_X);
                 ly = native.getAxis(GAMEPAD_AXIS_LEFT_Y);
