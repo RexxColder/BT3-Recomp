@@ -1,5 +1,6 @@
 #include <atomic>
 #include <cstdio>
+#include <cstddef>
 #include "Common.h"
 #include "GS.h"
 #include "ps2_log.h"
@@ -950,6 +951,24 @@ namespace ps2_stubs
     void sceGsPutDrawEnv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t envAddr = getRegU32(ctx, 4);
+        // [dbuffclear] libgs passes the sceGifTag that precedes the register pairs; its NLOOP is
+        // the pair count (8 = draw env, 14 = draw env + sceGsClear). Detect the A+D tag and apply
+        // every pair after it; anything else keeps the legacy "8 pairs at envAddr" reading.
+        GsRegPairMem tag{};
+        if (readGsRegPairs(rdram, envAddr, &tag, 1u) && (tag.reg & 0xFFu) == 0x0Eu &&
+            ((tag.value >> 60) & 0xFu) == 1u && (tag.value & 0x7FFFu) >= 1u && (tag.value & 0x7FFFu) <= 32u)
+        {
+            const uint32_t nloop = static_cast<uint32_t>(tag.value & 0x7FFFu);
+            GsRegPairMem pairs[32]{};
+            if (!readGsRegPairs(rdram, envAddr + 16u, pairs, nloop))
+            {
+                setReturnS32(ctx, -1);
+                return;
+            }
+            applyGsRegPairs(runtime, pairs, nloop);
+            setReturnS32(ctx, 0);
+            return;
+        }
         GsRegPairMem pairs[8]{};
         if (!readGsRegPairs(rdram, envAddr, pairs, 8u))
         {
@@ -1122,10 +1141,12 @@ namespace ps2_stubs
         uint32_t psm = getRegU32(ctx, 5);
         uint32_t w = getRegU32(ctx, 6);
         uint32_t h = getRegU32(ctx, 7);
-        const uint32_t ztest = readStackU32(rdram, ctx, 16);
-        const uint32_t zpsm = readStackU32(rdram, ctx, 20);
-        const uint32_t clear = readStackU32(rdram, ctx, 24);
-        (void)clear;
+        // [dbuffclear] 2026-09-07: args 5..7 travel in $t0..$t2 on the EE (8 register args), so
+        // the old stack reads saw zeros -- and `clear` was ignored anyway. Decode like the Dc variant.
+        const GsTrailingArgs3 trailing = decodeGsTrailingArgs3(rdram, ctx);
+        const uint32_t ztest = trailing.arg0;
+        const uint32_t zpsm = trailing.arg1;
+        const uint32_t clear = trailing.arg2;
 
         if (w == 0u)
         {
@@ -1162,10 +1183,35 @@ namespace ps2_stubs
         db.disp[0].bgcolor = 0u;
         db.disp[1] = db.disp[0];
 
-        db.giftag0 = {makeGiftagAplusD(14u), 0x0E0E0E0E0E0E0E0EULL};
+        // [dbuffclear] 2026-09-07 ROOT CAUSE of the boot memory-card box ghosting (memory
+        // bt3-mc-prompt-ghosting): libgs sceGsSetDefDBuff(..., clear) seeds an sceGsClear block
+        // (TEST always / PRIM sprite / RGBAQ / XYZ2 x2 / TEST restore) behind each draw env and the
+        // GIF tag covers all 14 registers; the game DMAs giftagN+drawN+clearN itself at the top of
+        // every frame (PCSX2 dump: first packet of each frame, PATH3, 240 bytes, an untextured
+        // unblended black sprite (0,0)-(512,448)). We wrote the 14-register tag but left the six
+        // clear pairs ZERO, so the frame buffer was never cleared and any scene that does not paint
+        // a full background kept its history. The second buffer also had fbp 0: libgs puts it at
+        // fbp1 = one buffer's page count (112 for 512x448 CT32, matching the console's FRAME=0x70).
+        // PS2X_DBUFFCLEAR=0 restores the old seeding (A/B switch).
+        static const bool s_dbClear = [](){ const char *v = std::getenv("PS2X_DBUFFCLEAR"); return !(v && v[0] == '0'); }();
+        const bool seedClear = s_dbClear && clear != 0u;
+        const uint32_t bytesPerPixel = ((psm & 0xFu) == 2u || (psm & 0xFu) == 10u) ? 2u : 4u;   // CT16/CT16S else CT32/CT24
+        const uint32_t fbp1 = s_dbClear ? ((w * h * bytesPerPixel + 8191u) / 8192u) : 0u;
+        db.giftag0 = {makeGiftagAplusD(seedClear ? 14u : (s_dbClear ? 8u : 14u)), 0x0E0E0E0E0E0E0E0EULL};
         seedGsDrawEnv1(db.draw0, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
         db.giftag1 = db.giftag0;
-        seedGsDrawEnv2(db.draw1, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv2(db.draw1, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
+        if (seedClear)
+        {
+            seedGsClearPacket(db.clear0, drawWidth, drawHeight, 0u, ztest, false);
+            seedGsClearPacket(db.clear1, drawWidth, drawHeight, 0u, ztest, true);
+        }
+        {
+            static uint32_t s_log = 0u;
+            if (s_log++ < 4u)
+                std::fprintf(stderr, "[dbuffclear] sceGsSetDefDBuff env=0x%x psm=%u %ux%u ztest=%u zpsm=%u clear=%u -> fbp1=%u zbuf=%u seedClear=%d\n",
+                             envAddr, psm, w, h, ztest, zpsm, clear, fbp1, zbufAddr, seedClear ? 1 : 0);
+        }
 
         if (!writeGsDBuff(rdram, envAddr, db))
         {
@@ -1378,7 +1424,33 @@ namespace ps2_stubs
         }
 
         applyGsDispEnv(runtime, db.disp[which]);
-        if (which == 0u)
+        // [dbuffclear] 2026-09-07: libgs sceGsSwapDBuff DMAs giftagN+drawN+clearN (14 registers) --
+        // the per-frame CLEAR of the buffer about to be drawn. We applied only the 8 draw-env pairs,
+        // so the buffer kept its history (boot memory-card box ghosting). Mirror sceGsSwapDBuffDc:
+        // fast FBO clear + the sceGsClear sprite through the register path. NOTE: these are direct
+        // register writes, so a PS2X_GS_RECORD stream does NOT contain this clear (replay caveat).
+        const GsClearMem &clr = (which == 0u) ? db.clear0 : db.clear1;
+        const bool haveClear = hasSeededGsClearPacket(clr);
+        {
+            static uint32_t s_log = 0u;
+            if (s_log++ < 4u)
+                std::fprintf(stderr, "[dbuffclear] sceGsSwapDBuff env=0x%x which=%u clearSeeded=%d prim=0x%llx rgba=0x%08llx\n",
+                             envAddr, which, haveClear ? 1 : 0,
+                             (unsigned long long)clr.prim.value, (unsigned long long)clr.rgbaq.value);
+        }
+        if (haveClear)
+        {
+            // Submit giftagN + drawN + clearN (15 qwords) from GUEST memory through the GIF DMA
+            // entry point -- byte-for-byte what libgs's sceGsPutDrawEnv DMA does on the console.
+            // The direct register path was tried first and does NOT clear the GPU frame:
+            // clearFramebufferRect only memsets the VRAM shadow and the register-path kicks never
+            // reached the GPU renderer (trail unchanged). This path is ordered with the stream
+            // (async kick) and is captured by PS2X_GS_RECORD, so replays carry the clear too.
+            const uint32_t tagOff = static_cast<uint32_t>((which == 0u) ? offsetof(GsDBuffMem, giftag0)
+                                                                        : offsetof(GsDBuffMem, giftag1));
+            runtime->memory().processGIFPacket((envAddr + tagOff) & 0x1FFFFFFFu, 15u);
+        }
+        else if (which == 0u)
         {
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw0), 8u);
         }
