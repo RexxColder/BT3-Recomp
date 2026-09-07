@@ -1,5 +1,6 @@
 #include <atomic>
 #include <cstdio>
+#include <chrono>
 #include <cstddef>
 #include "Common.h"
 #include "GS.h"
@@ -7,6 +8,7 @@
 #include "runtime/ps2_gs_common.h"
 #include "runtime/ps2_gs_psmct16.h"
 
+extern std::atomic<uint64_t> g_fmvLastEmitNs;   // [fmvwindow] defined in ps2_gs_gpu.cpp (global namespace)
 namespace ps2_stubs
 {
     namespace
@@ -1430,7 +1432,30 @@ namespace ps2_stubs
         // fast FBO clear + the sceGsClear sprite through the register path. NOTE: these are direct
         // register writes, so a PS2X_GS_RECORD stream does NOT contain this clear (replay caveat).
         const GsClearMem &clr = (which == 0u) ? db.clear0 : db.clear1;
-        const bool haveClear = hasSeededGsClearPacket(clr);
+        // [fmvwindow] 2026-09-07: no clear while a movie is playing (or within 1 s of its last frame,
+        // which covers the skip fade-out). On the console the decoder writes the whole frame AFTER
+        // this clear, so it is invisible there; here the movie quad is painted from the capture path
+        // and the clear could land on top of it -- black flashes when skipping, no fade, and a slower
+        // movie (user A/B: PS2X_DBUFFCLEAR=0 cured the skip). PS2X_FMVWINDOW_MS overrides (0 = off).
+        static const uint64_t s_winNs = [](){ const char *v = std::getenv("PS2X_FMVWINDOW_MS");
+                                              return (uint64_t)(v && v[0] ? std::atol(v) : 1000L) * 1000000ull; }();
+        bool fmvRecent = false;
+        if (s_winNs)
+        {
+            const uint64_t last = ::g_fmvLastEmitNs.load(std::memory_order_relaxed);
+            if (last)
+            {
+                const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch()).count();
+                fmvRecent = (now - last) < s_winNs;
+            }
+        }
+        const bool haveClear = hasSeededGsClearPacket(clr) && !fmvRecent;
+        {
+            static bool s_wasRecent = false;
+            if (fmvRecent != s_wasRecent) { s_wasRecent = fmvRecent;
+                std::fprintf(stderr, "[dbuffclear] movie window %s -> clear %s\n", fmvRecent ? "ENTER" : "LEAVE", fmvRecent ? "suppressed" : "active"); }
+        }
         {
             static uint32_t s_log = 0u;
             if (s_log++ < 4u)

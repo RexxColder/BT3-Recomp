@@ -1530,6 +1530,7 @@ std::atomic<bool> g_ps2xMapDrawSeen{false};
 
 // [fmvphase] Set by sceMpegGetPicture; lets the VRAM probes filter to the actual movie.
 std::atomic<uint32_t> g_ps2FmvActive{0u};
+std::atomic<uint64_t> g_fmvLastEmitNs{0u};   // [fmvwindow] set by ps2GsEmitFmvFrame, read by the sceGsSwapDBuff stub
 // [fmvblit] framebuffer currently being filled by movie macroblocks, and its FBW.
 std::atomic<uint32_t> g_fmvPendingFbp{0xFFFFFFFFu};
 std::atomic<uint32_t> g_fmvDisplayFbp{0xFFFFFFFFu};   // [fmvpresent] present the buffer the movie was blitted into
@@ -5071,6 +5072,10 @@ void ps2GsEmitFmvFrame()
         if (gen != s_lastGen) { pix = g_fmvCapPix; s_lastGen = gen; }   // upload only on a NEW frame
     }
 
+    // [fmvwindow] last time a movie frame was published (steady ns); the libgs double-buffer clear
+    // stub (Kernel/Stubs/GS.cpp [dbuffclear]) stays out of the movie while this is recent.
+    g_fmvLastEmitNs.store((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
     const uint64_t key = 0xF00D0000ull | fbp;
     if (!pix.empty())
         ps2GpuRenderer().putTexture(key, std::move(pix), (int)w, (int)h, fbp, fbp + 1u);
