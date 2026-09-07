@@ -4206,6 +4206,16 @@ void PS2Runtime::run()
             }
             // Compact always-on progress line (~every 10s) for long unattended
             // runs, so progress is visible without full PS2X_TRACE.
+            {   // [fadefull] keep g_bt3StateLive fresh EVERY tick (the probe below runs only every 600 ticks
+                // with PS2X_TRACE on): the boot-only fade gate in ps2_gs_rasterizer.cpp reads it per draw.
+                if (const uint8_t *rd = m_memory.getRDRAM())
+                {
+                    uint32_t p = 0u, st = 0xffffffffu;
+                    std::memcpy(&p, rd + (0x2ff10cu & PS2_RAM_MASK), 4);
+                    if (p) std::memcpy(&st, rd + (((p & 0x1FFFFFFFu) + 0x18u) & PS2_RAM_MASK), 4);
+                    g_bt3StateLive.store(st, std::memory_order_relaxed);
+                }
+            }
             if ((s_hbTick % 600u) == 0u)
             {
                 // BT3 overlay game-state: FUN_00336a90 switches on *(*(0x2ff10c)+0x18).
