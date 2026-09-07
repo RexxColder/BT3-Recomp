@@ -85,6 +85,27 @@ COND_PULSE_CLEAR = """\
 
 """
 
+# [sunglare] The game's SUN-GLARE bloom instance (sub_00106188): a full-screen lerp of the
+# fbp224 mask into the scene plus a second downsample/blur/accumulate chain scaled by
+# [0x2FF300+0x4D4], which the game ramps +3/frame while the stage sun projects on screen and
+# decays 1/frame to the stage's floor when it leaves. On this port it washes the arena at
+# every fight start and whenever the camera swings toward the sun (see memory
+# bt3-fight-brightness, 2026-09-08). PS2X_BT3_SUNGLARE=1 keeps the game's instance; the
+# default 0 returns at entry (jr $ra), which skips both draws. The normal bloom instance
+# (FUN_00106ba8) is untouched.
+SUNGLARE_SKIP = """\
+    // [bt3 patch: sunglare] skip the sun-glare bloom instance unless PS2X_BT3_SUNGLARE=1
+    {
+        static const int s_sunglare = [](){ const char *v = std::getenv("PS2X_BT3_SUNGLARE"); return v ? std::atoi(v) : 0; }();
+        if (s_sunglare == 0) {
+            static bool s_said = false;
+            if (!s_said) { s_said = true; std::fprintf(stderr, "[sunglare] sun-glare bloom instance skipped (PS2X_BT3_SUNGLARE=1 restores it)\\n"); }
+            ctx->pc = GPR_U32(ctx, 31);
+            return;
+        }
+    }
+"""
+
 PATCHES = [
     {
         "file": "FUN_002316d0_0x2316d0.cpp",
@@ -116,6 +137,13 @@ PATCHES = [
     // [bt3 patch: truews] aspect-aware widescreen: override the 0.75 projection constant
     // with full-precision 0.75/scale from the live window aspect (0.75 exact = disabled).
     { extern float g_ps2xWsLui; if (g_ps2xWsLui != 0.75f) { uint32_t b_; std::memcpy(&b_, &g_ps2xWsLui, 4); SET_GPR_S32(ctx, 1, (int32_t)b_); } }""",
+    },
+    {
+        "file": "sub_00106188_0x106188.cpp",
+        "marker": "[bt3 patch: sunglare]",
+        "anchor": "    ctx->pc = 0x106188u;\n",
+        "insert_after_anchor": SUNGLARE_SKIP,
+        "extra_include": "#include <cstdio>\n#include <cstdlib>\n",
     },
 ]
 
