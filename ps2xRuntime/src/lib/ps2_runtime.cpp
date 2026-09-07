@@ -4810,7 +4810,18 @@ void PS2Runtime::run()
         // Atlas mode presents a sub-rect of the big atlas texture -> crop from the display slot origin.
         const float srcX = flipY ? static_cast<float>(ps2GpuRenderer().presentSrcX()) : 0.0f;
         const float srcY = flipY ? static_cast<float>(ps2GpuRenderer().presentSrcY()) : 0.0f;
-        const Rectangle srcRect{srcX, srcY, srcWidth, flipY ? -srcHeight : srcHeight};
+        // [presentedge] The present is BILINEAR at render scale > 1 (see below), so the first
+        // destination row/column samples HALF A TEXEL OUTSIDE the source rect and blends in
+        // whatever borders it -- the FBO rows above the display anchor (grow-only buffers that are
+        // never cleared, so they still hold the previous screen) or, in atlas mode, the
+        // neighbouring slot. That is the faint line along the top and left edges, and it is why it
+        // looked like "leaking from the previous page". Inset the rect by half a texel so every
+        // sample stays inside the display region. PS2X_PRESENTEDGE=0 restores the old rect.
+        static const bool s_pEdge = [](){ const char *v = std::getenv("PS2X_PRESENTEDGE"); return !(v && v[0] == '0'); }();
+        const float inset = (s_pEdge && GsGpuRenderer::renderScale() > 1) ? 0.5f : 0.0f;
+        const float srcW2 = srcWidth  - 2.0f * inset;
+        const float srcH2 = srcHeight - 2.0f * inset;
+        const Rectangle srcRect{srcX + inset, srcY + inset, srcW2, flipY ? -srcH2 : srcH2};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
             (screenHeight - dstHeight) * 0.5f,
@@ -4828,6 +4839,8 @@ void PS2Runtime::run()
         // its own per-draw filters, so this only affects the present.
         if (GsGpuRenderer::renderScale() > 1)
             SetTextureFilter(presentTex, TEXTURE_FILTER_BILINEAR);
+        // ...and never let an edge sample wrap to the opposite side of the texture.
+        if (s_pEdge) SetTextureWrap(presentTex, TEXTURE_WRAP_CLAMP);
         DrawTexturePro(presentTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         EndBlendMode();
         { extern double g_fpBlit; g_fpBlit += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tBlit).count(); }
