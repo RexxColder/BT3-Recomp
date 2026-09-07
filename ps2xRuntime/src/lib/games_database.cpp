@@ -4,6 +4,7 @@
 static const std::unordered_map<std::string, std::string> gameDatabase =
 {
     { "SLUS-20267", "hack Part 1 - Infection (USA)" },
+    { "SLUS-21678", "Dragon Ball Z: Budokai Tenkaichi 3 (USA)" },
     { "SLKA-25080", ".hack Vol. 1 - Infection (Korea)" },
     { "SLPS-25143", ".hack Vol. 2 - Mutation (Japan)" },
     { "SLPS-25158", ".hack Vol. 3 - Erosion Pollution (Japan)" },
