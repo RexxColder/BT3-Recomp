@@ -37,15 +37,22 @@ public:
         int dofZFar = 200000;
         int windowW = 0, windowH = 0; // 0 = keep the default host window size
         bool forceBilinear = true;    // PCSX2-style forced texture filtering (default ON)
+        bool overlayEnabled = true;   // [launcher] master switch: false = in-game overlay never opens
         int hudLayout = 0;            // widescreen HUD: 0=centered 4:3, 1=edge-pinned, 2=custom
         int hudOffL = 0, hudOffC = 0, hudOffR = 0;  // custom layout x-offsets (512-space px)
         // Overlay launch / close binding. Each is a SET of inputs that must ALL be held
         // together (1+ entries). Captured with a 3s hold during binding.
         std::vector<int> overlayPadBtns = {13, 15};  // default: Select (Back) + Start
         std::vector<int> overlayKeys   = {340, 258}; // default: Left Shift + Tab
+        // [loglevel] diagnostic verbosity applied at startup: 0=off, 1=profile+mclog+sched,
+        // 2=+ftspike+fightprobe+reveal, 3=+frameprof+camprobe. Drives which PS2X_* env vars
+        // main() exports; stderr is redirected to <deploy>/logs/bt3.log on any level > 0.
+        int logLevel = 1;
     };
 
     static bool isWidescreen() { return s_widescreen; }
+    static int getLogLevel() { return s_logLevel; }
+    static int getStartupLogLevel() { return s_startupLogLevel; }
 
     static void preloadSettings();
     void syncFromRuntime();   // seed m_settings from live runtime state
@@ -67,6 +74,8 @@ public:
 private:
     static bool s_widescreen;
     static std::string s_configDir;
+    static int s_logLevel;        // [loglevel] effective level for the live overlay UI
+    static int s_startupLogLevel; // [loglevel] captured before init so main() can apply env vars
 
     bool m_visible = false;
     bool m_initialized = false;

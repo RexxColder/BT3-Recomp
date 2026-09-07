@@ -1483,8 +1483,8 @@ namespace
         {
             editPlayer = 0;
         }
-        const char *playerNames[] = {"Player 1", "Player 2", "Player 3", "Player 4"};
-        ImGui::Combo("Player", &editPlayer, playerNames, 4);
+        const char *playerNames[] = {"Player 1", "Player 2"};
+        ImGui::Combo("Player", &editPlayer, playerNames, 2);
 
         struct PadInfo
         {
@@ -1794,7 +1794,8 @@ namespace
 
         // Config file controls.
         ImGui::SeparatorText("Config file");
-        ImGui::TextWrapped("path: %s", cfg.defaultPath().c_str());
+        ImGui::TextWrapped("player 1: %s", cfg.playerConfigPath(0).c_str());
+        ImGui::TextWrapped("player 2: %s", cfg.playerConfigPath(1).c_str());
         if (ImGui::Button("Save"))
         {
             if (!cfg.save())

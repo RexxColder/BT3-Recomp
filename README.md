@@ -29,15 +29,21 @@ image** — this repository contains no game code, assets, or media.
   sudo pacman -S --needed base-devel cmake git python rsync libarchive ffmpeg
   ```
 
-## Build — one command
+## Build + deploy — one command
 
-**Linux:**
+**Linux** (build + assemble the self-extracting launcher):
 
 ```sh
 git clone https://github.com/z3xox/BT3-Recomp.git
 cd BT3-Recomp
-./games/bt3/setup.sh /path/to/your/bt3-usa.iso
+./build_and_deploy.sh --iso /path/to/your/bt3-usa.iso --output /path/where/deploy
 ```
+
+The script asks for the ISO and output directory if they are not given, runs the
+full `setup.py` pipeline, then assembles a single self-extracting ELF (runner +
+shared libraries + game data, unpacked to `~/.cache` on first run) into the
+output directory. Pass `--skip-setup` to reuse an existing `games/bt3/work/`
+tree and only rebuild the runner. See `docs/DEPLOY.md` for the full picture.
 
 **Windows (experimental):** install [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
 (the "Desktop development with C++" workload, which includes CMake, plus its optional
@@ -48,17 +54,17 @@ the build needs Clang, MSVC cannot compile the generated VU1 code) and Python 3;
 ```
 git clone https://github.com/z3xox/BT3-Recomp.git
 cd BT3-Recomp
-python games\bt3\setup.py C:\path\to\bt3-usa.iso 6
+python games\bt3\setup.py C:\path\to\bt3-usa.iso --deploy C:\path\where\deploy
 ```
 
 12 GB+ RAM recommended on Windows; the Windows build is young — expect rough
 edges and please report issues.
 
-The script extracts and sha256-verifies the game files from your ISO, builds the
+The pipeline extracts and sha256-verifies the game files from your ISO, builds the
 recompiler, generates ~7,800 C++ sources from the game's executable and overlay,
 applies the committed patches, and builds the final binary. The compile is quick
 on a modern machine (a few minutes at `-j16`); the conservative default is `-j3` —
-pass your core count as the second argument if you have 8 GB+ of free RAM.
+pass your core count with `--jobs N` if you have 8 GB+ of free RAM.
 
 ## Run
 
@@ -98,7 +104,9 @@ Known issues:
 
 | Path | What it is |
 | --- | --- |
-| `games/bt3/setup.sh` | one-command build pipeline |
+| `build_and_deploy.sh` | Linux one-command build + deploy (ISO prompt, self-extracting ELF) |
+| `games/bt3/setup.py` | cross-platform build pipeline (`--deploy`, `--skip-setup`, `--jobs`) |
+| `docs/DEPLOY.md` | the deploy structure and self-extracting launcher documentation |
 | `games/bt3/functions.csv`, `dbzp_*.csv` | function address maps (symbols only) |
 | `games/bt3/gen_overlay.py`, `apply_patches.py` | generators for the game-specific pieces |
 | `ps2xRecomp/` | the static recompiler (with EE FPU/VU semantics fixes) |
