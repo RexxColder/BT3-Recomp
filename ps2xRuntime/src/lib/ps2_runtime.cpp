@@ -1060,6 +1060,10 @@ PS2Runtime::PS2Runtime()
 }
 
 double g_fpPresent = 0, g_fpBar = 0, g_fpPre = 0, g_fpWait = 0, g_fpLoop = 0; int g_fpN = 0;   // [frameprof]
+// [frameprof2] breakdown of the "other" bucket. Splitscreen spends ~456 ms/s there (8.29 ms of an
+// 18.81 ms loop) with bar/pre/wait all 0.00 -- real work nobody has named, larger than every
+// tracked guest phase except VU1. Everything optimised so far lived in already-named buckets.
+double g_fpSbb = 0, g_fpPad = 0, g_fpBegin = 0, g_fpBlit = 0, g_fpUi = 0, g_fpAudio = 0, g_fpRender = 0;   // [frameprof2]
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
                                      DebugUiCallback drawCallback,
                                      DebugUiCallback shutdownCallback,
@@ -4703,8 +4707,10 @@ void PS2Runtime::run()
         {
             // FBO is the full framebuffer (FB_WIDTH x height); present only the DISPLAY
             // region (e.g. 512 wide) so the unrendered right edge isn't a black band.
+            const auto _tRen = std::chrono::steady_clock::now();
             unsigned int texId = ps2GpuRenderer().renderAndGetTextureId(
                 static_cast<int>(FB_WIDTH), static_cast<int>(DEFAULT_DISPLAY_HEIGHT));
+            { extern double g_fpRender; g_fpRender += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tRen).count(); }
             presentTex.id = texId;
             // The presented FBO is sized per-fbp (not necessarily FB_WIDTH x height);
             // normalize the present crop against its real GL texture size.
@@ -4727,9 +4733,14 @@ void PS2Runtime::run()
 
 #if defined(__linux__)
         // Refresh the native evdev reader for any Linux gamepad that GLFW cannot map.
-        ps2_stubs::PadEvdevLinux::instance().update();
+        { const auto _t = std::chrono::steady_clock::now();
+          ps2_stubs::PadEvdevLinux::instance().update();
+          extern double g_fpPad; g_fpPad += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t).count(); }
 #endif
-        if (gpuMode) ps2GpuRenderer().serviceBlockingBarriers();   // [barblock]
+        { const auto _t = std::chrono::steady_clock::now();
+          if (gpuMode) ps2GpuRenderer().serviceBlockingBarriers();   // [barblock]
+          extern double g_fpSbb; g_fpSbb += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t).count(); }
+        const auto _tBegin = std::chrono::steady_clock::now();
         BeginDrawing();
         {   // [presentstate] pre-render chunks and barrier services run GL work between presents and
             // leave the GS emulation state behind (blend off / GS blend factors, scissor, colour mask,
@@ -4745,6 +4756,7 @@ void PS2Runtime::run()
             rlDisableShader();
         }
         ClearBackground(BLACK);
+        { extern double g_fpBegin; g_fpBegin += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tBegin).count(); }
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
@@ -4807,6 +4819,7 @@ void PS2Runtime::run()
         // Blend-free present: the GPU FBO's alpha channel now carries GS dest-alpha (the
         // game's per-pixel masks, legitimately 0 over most of the frame) — alpha-blending
         // the final blit would punch the frame transparent to the clear color.
+        const auto _tBlit = std::chrono::steady_clock::now();
         rlSetBlendFactorsSeparate(0x0001 /*GL_ONE*/, 0x0000 /*GL_ZERO*/, 0x0001, 0x0000, 0x8006 /*GL_FUNC_ADD*/, 0x8006);
         BeginBlendMode(BLEND_CUSTOM_SEPARATE);
         // [rscale] present the scaled scene with LINEAR sampling: at render scale N the
@@ -4817,6 +4830,7 @@ void PS2Runtime::run()
             SetTextureFilter(presentTex, TEXTURE_FILTER_BILINEAR);
         DrawTexturePro(presentTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         EndBlendMode();
+        { extern double g_fpBlit; g_fpBlit += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tBlit).count(); }
         {   // [presentlog] PS2X_PRESENTLOG=1: print every CHANGE of the present geometry (a 60 Hz alternation shows as a
             // stream of transitions; a static picture shows two lines total).
             static const bool s_pl = [](){ const char *v = std::getenv("PS2X_PRESENTLOG"); return v && v[0] && v[0] != '0'; }();
@@ -4831,7 +4845,9 @@ void PS2Runtime::run()
         }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
+            const auto _tUi = std::chrono::steady_clock::now();
             m_debugUiDrawCallback(*this, m_debugUiUserData);
+            { extern double g_fpUi; g_fpUi += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tUi).count(); }
         }
         {   // [frameprof] PS2X_FRAMEPROF=1: where does the main-loop frame go? (display-path dips)
             static const bool s_fp = [](){ const char *v = std::getenv("PS2X_FRAMEPROF"); return v && v[0] && v[0] != '0'; }();
@@ -4853,6 +4869,16 @@ void PS2Runtime::run()
                     std::fprintf(stderr, "[frameprof] n=%d loop %.1f ms: present %.2f bar %.2f pre %.2f wait %.2f (other %.2f)\n",
                                  g_fpN, g_fpLoop / n, g_fpPresent / n, g_fpBar / n, g_fpPre / n, g_fpWait / n,
                                  (g_fpLoop - g_fpPresent - g_fpBar - g_fpPre - g_fpWait) / n);
+                    {   // [frameprof2] split the "other" bucket into the loop's actual segments
+                        extern double g_fpSbb, g_fpPad, g_fpBegin, g_fpBlit, g_fpUi, g_fpAudio, g_fpRender;
+                        const double named = g_fpSbb + g_fpPad + g_fpBegin + g_fpBlit + g_fpUi + g_fpAudio + g_fpRender;
+                        std::fprintf(stderr, "[frameprof2] of that other: sbb %.2f pad %.2f begin %.2f "
+                                             "blit %.2f ui %.2f audio %.2f RENDER %.2f -> named %.2f, still unnamed %.2f\n",
+                                     g_fpSbb / n, g_fpPad / n, g_fpBegin / n, g_fpBlit / n, g_fpUi / n,
+                                     g_fpAudio / n, g_fpRender / n, named / n,
+                                     (g_fpLoop - g_fpPresent - g_fpBar - g_fpPre - g_fpWait - named) / n);
+                        g_fpSbb = g_fpPad = g_fpBegin = g_fpBlit = g_fpUi = g_fpAudio = g_fpRender = 0;
+                    }
                     g_fpPresent = g_fpBar = g_fpPre = g_fpWait = g_fpLoop = 0; g_fpN = 0;
                 }
             }
@@ -4885,7 +4911,9 @@ void PS2Runtime::run()
         // Drain any streaming PCM into the audio device. Must run on the render thread --
         // raylib's AudioStream calls are not safe to make from the guest threads that
         // produce the data (see PS2AudioBackend::onStreamPcm / serviceStreams).
-        audioBackend().serviceStreams();
+        { const auto _t = std::chrono::steady_clock::now();
+          audioBackend().serviceStreams();
+          extern double g_fpAudio; g_fpAudio += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t).count(); }
         static const bool s_barPace2 = [](){ const char *v = std::getenv("PS2X_BARPACE"); return !(v && v[0] == '0'); }();
         if (gpuMode && GsGpuRenderer::blockingBarriersEnabled() && s_barPace2)
         {   // [barblock] pace to 60 Hz ourselves, servicing barrier requests while we wait.

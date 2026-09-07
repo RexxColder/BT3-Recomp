@@ -257,6 +257,28 @@ public:
     uint64_t pageDrawStamp(uint32_t lo, uint32_t hi) const   // [rectemplate] max FBO draw seq over a page span (0 for an empty span)
     {
         uint64_t m = 0; if (hi >= kVramPages) hi = kVramPages - 1;
+        {   // [spansize] PS2X_SPANSIZE=1: how long is the span this scans, and how often?
+            // This loop is the hottest thing inside recordSpriteGPU (16% of it, live splitscreen
+            // profile 2026-09-07) -- the cost is the SCAN, not the atomics (an acquire load is a
+            // plain mov on x86). Whether it is worth replacing with an incrementally-maintained
+            // max depends entirely on the span length, which nobody has measured.
+            static const bool s_on = [](){ const char *v = std::getenv("PS2X_SPANSIZE"); return v && v[0] && v[0] != '0'; }();
+            if (s_on)
+            {
+                static unsigned long s_calls = 0, s_pages = 0;
+                static unsigned long s_hist[8] = {0,0,0,0,0,0,0,0};   // 1,2,4,8,16,32,64,65+
+                const unsigned long n = (hi >= lo) ? (unsigned long)(hi - lo + 1u) : 0ul;
+                ++s_calls; s_pages += n;
+                unsigned b = 0; unsigned long t = 1; while (b < 7 && n > t) { t <<= 1; ++b; }
+                ++s_hist[b];
+                if ((s_calls % 500000ul) == 0ul)
+                    std::fprintf(stderr, "[spansize] calls=%lu pages=%lu mean=%.2f | <=1:%lu <=2:%lu <=4:%lu "
+                                 "<=8:%lu <=16:%lu <=32:%lu <=64:%lu >64:%lu\n",
+                                 s_calls, s_pages, (double)s_pages / (double)s_calls,
+                                 s_hist[0], s_hist[1], s_hist[2], s_hist[3],
+                                 s_hist[4], s_hist[5], s_hist[6], s_hist[7]);
+            }
+        }
         for (uint32_t p = lo; p <= hi; ++p) { const uint64_t v = __atomic_load_n(&m_pageDrawSeq[p], __ATOMIC_ACQUIRE); if (v > m) m = v; }
         return m;
     }
