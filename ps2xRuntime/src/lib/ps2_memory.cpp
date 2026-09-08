@@ -2331,8 +2331,10 @@ std::atomic<uint64_t> g_stage2FrameNs{0};   // [vu1pipe] stage 2's cost per fram
 static thread_local bool t_onKickWorker = false;   // [vu1pipe] the arbiter hand-off applies only on the worker
 bool PS2Memory::vu1PipeEnabled()
 {
-    static const bool s_on = [](){ const char *v = std::getenv("PS2X_VU1PIPE"); const bool on = v && v[0] == '1';
-                                   if (on) std::fprintf(stderr, "[vu1pipe] two-stage kick pipeline ON (worker: VIF+VU1; GsThread: GIF parse + record)\n");
+    // default ON since 2026-09-09: the i5-12400 splitscreen target went 24-27 -> 31 fps mean (hope2/hope3 logs); PS2X_VU1PIPE=0 disables
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_VU1PIPE"); const bool on = !(v && v[0] == '0');
+                                   std::fprintf(stderr, on ? "[vu1pipe] two-stage kick pipeline ON (worker: VIF+VU1; GsThread: GIF parse + record)\n"
+                                                           : "[vu1pipe] two-stage kick pipeline OFF (PS2X_VU1PIPE=0)\n");
                                    return on; }();
     return s_on && asyncKickEnabled();
 }
