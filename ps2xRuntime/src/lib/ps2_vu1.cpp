@@ -59,7 +59,7 @@ thread_local uint32_t g_xgkickEntryStateSize = 0;
 // written = gap)? Plus ADC census of XGKICK output: does any kicked vertex carry ADC=1?
 namespace {
 FILE *vuFlagsLog() { static FILE *f = std::fopen("/home/z3/Desktop/bt3/work/vuflags.txt", "w"); return f; }
-std::atomic<uint64_t> g_fcandN{0}, g_fcandNZ{0}, g_fmandN{0}, g_fmandNZ{0}, g_clipOpN{0};
+uint64_t g_fcandN = 0, g_fcandNZ = 0, g_fmandN = 0, g_fmandNZ = 0, g_clipOpN = 0;   // [vucounters] plain: VU1 runs on one thread; they were std::atomic, a locked RMW per CLIP/FCAND (2026-09-08)
 std::atomic<uint64_t> g_adcSet{0}, g_adcClr{0}, g_xyz3N{0}, g_kickN{0};
 std::atomic<bool> g_vuCodeDumpReq{false}, g_vuCodeDumped{false}; // set by FCAND probe; next run() dumps its microcode
 }
@@ -3097,8 +3097,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                     {
                         std::fprintf(f, "[vuflags] kicks=%llu adcSet=%llu adcClr=%llu xyz3=%llu | clipOps=%llu fcand=%llu (vi1!=0: %llu) fmand=%llu (nz: %llu)\n",
                                      (unsigned long long)k, (unsigned long long)g_adcSet.load(), (unsigned long long)g_adcClr.load(), (unsigned long long)g_xyz3N.load(),
-                                     (unsigned long long)g_clipOpN.load(), (unsigned long long)g_fcandN.load(), (unsigned long long)g_fcandNZ.load(),
-                                     (unsigned long long)g_fmandN.load(), (unsigned long long)g_fmandNZ.load());
+                                     (unsigned long long)g_clipOpN, (unsigned long long)g_fcandN, (unsigned long long)g_fcandNZ,
+                                     (unsigned long long)g_fmandN, (unsigned long long)g_fmandNZ);
                         std::fflush(f);
                     }
                 }

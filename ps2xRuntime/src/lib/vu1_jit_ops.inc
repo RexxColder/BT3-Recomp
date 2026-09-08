@@ -139,15 +139,19 @@ static inline bool jitUpper(VU1State &__restrict st)
         }
         else if constexpr (sop == 0x1Fu)
         {   // CLIP (verbatim from the interpreter, incl. the [clippipe] 4-cycle latency model)
-            const float *vsf = st.vf[fs];
+            // [clipsse] the six scalar compares as two vector compares + a 64-entry flag table. IEEE ordered compares,
+            // so NaN gives false exactly like the scalar form; bit-identical to the interpreter's CLIP.
             const float w = std::fabs(vtp[3]);
-            uint32_t flags = 0;
-            if (vsf[0] > +w) flags |= 0x01;
-            if (vsf[0] < -w) flags |= 0x02;
-            if (vsf[1] > +w) flags |= 0x04;
-            if (vsf[1] < -w) flags |= 0x08;
-            if (vsf[2] > +w) flags |= 0x10;
-            if (vsf[2] < -w) flags |= 0x20;
+            const __m128 vsv = _mm_loadu_ps(st.vf[fs]);
+            const __m128 pw = _mm_set1_ps(w), nw = _mm_set1_ps(-w);
+            const int gt = _mm_movemask_ps(_mm_cmpgt_ps(vsv, pw)) & 7;   // x>w, y>w, z>w
+            const int lt = _mm_movemask_ps(_mm_cmplt_ps(vsv, nw)) & 7;   // x<-w, y<-w, z<-w
+            static const uint8_t kClipFlags[64] = {   // index = gt | (lt << 3) -> PS2 order x+ x- y+ y- z+ z-
+                0x00,0x01,0x04,0x05,0x10,0x11,0x14,0x15, 0x02,0x03,0x06,0x07,0x12,0x13,0x16,0x17,
+                0x08,0x09,0x0C,0x0D,0x18,0x19,0x1C,0x1D, 0x0A,0x0B,0x0E,0x0F,0x1A,0x1B,0x1E,0x1F,
+                0x20,0x21,0x24,0x25,0x30,0x31,0x34,0x35, 0x22,0x23,0x26,0x27,0x32,0x33,0x36,0x37,
+                0x28,0x29,0x2C,0x2D,0x38,0x39,0x3C,0x3D, 0x2A,0x2B,0x2E,0x2F,0x3A,0x3B,0x3E,0x3F };
+            const uint32_t flags = kClipFlags[gt | (lt << 3)];
             const uint32_t base = (g_clipWait > 0u) ? g_pendingClip : st.clip;
             const uint32_t nv = ((base << 6) | flags) & 0xFFFFFFu;
             if (g_clipPipe)
