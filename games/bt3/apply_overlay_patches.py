@@ -16,6 +16,7 @@ Patches are idempotent (marker string checked first) and the script fails loudly
 anchor is missing, since that means DBZP.BIN or the generator changed and the patch
 needs review.
 """
+import re
 import sys
 from pathlib import Path
 
@@ -137,6 +138,17 @@ def apply(runtime_dir: Path) -> int:
             continue
         anchor = patch["anchor"]
         idx = text.find(anchor)
+        if idx < 0:
+            # [pcstores] the generator emits `ctx->pc = <addr>;` before an instruction only where the runtime
+            # can observe it (pc_stores_all = false). Retry the anchor without the per-instruction stores
+            # (4-space indent), then without any pc store, so one patch table serves both generator modes.
+            for pat in (r"^    ctx->pc = 0x[0-9a-fA-F]+u;\n", r"^ *ctx->pc = 0x[0-9a-fA-F]+u;\n"):
+                lean = re.sub(pat, "", anchor, flags=re.M)
+                if lean != anchor:
+                    idx = text.find(lean)
+                    if idx >= 0:
+                        anchor = lean
+                        break
         if idx < 0:
             print(f"ERROR: anchor not found for patch {patch['marker']!r} in {patch['file']}", file=sys.stderr)
             failures += 1
