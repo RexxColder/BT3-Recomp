@@ -5763,18 +5763,43 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
     return true;
 }
 void GSRasterizer::RecInput::refreshClut()
-{   // [recinput] the palette-cache scalars after a (re)build on the worker
+{   // [recinput] the palette-cache scalars after a (re)build on the worker. [recsnap]: when `clut` points at a
+    // snapshot copy, refresh the copy in place rather than re-pointing at the live cache.
     if (!gs) return;
-    clut = gs->m_clutCache; clutKey = gs->m_clutCacheKey; clutHash256 = gs->m_clutCacheHash256; clutHash16 = gs->m_clutCacheHash16;
+    if (clut && clut != gs->m_clutCache) std::memcpy(const_cast<uint32_t *>(clut), gs->m_clutCache, 256u * sizeof(uint32_t));
+    else clut = gs->m_clutCache;
+    clutKey = gs->m_clutCacheKey; clutHash256 = gs->m_clutCacheHash256; clutHash16 = gs->m_clutCacheHash16;
 }
 bool GSRasterizer::recordSpriteGPU(GS *gs)
-{   // [recinput] Stage 1 wrapper: point RecInput at the live GS (no copies) and record exactly as before
+{   // [recinput] Stage 1: point RecInput at the live GS (no copies) and record exactly as before.
+    // [recsnap] Stage 2 (PS2X_RECSNAP=1, default off): record from a COPY of everything the function reads -- the three
+    // vertices, the primitive and context registers, TEXA/TEXCLUT and the built palette -- still on this thread and
+    // in stream order. The copy is what a record thread would consume; this stage prices it on the bench. VRAM and
+    // the palette cache pointer stay live here (the resolve hashes VRAM in stream order on the worker in every stage).
+    static const bool s_snap = [](){ const char *v = std::getenv("PS2X_RECSNAP"); return v && v[0] == '1'; }();   // default OFF until the pool (Stage 3) uses it: +0.4 ms/frame for the copy alone
     RecInput in;
-    in.gs = gs; in.vtx = gs->m_vtxQueue; in.prim = &gs->m_prim; in.ctx = &gs->activeContext();
-    in.texa = &gs->m_texa; in.texclut = &gs->m_texclut;
+    in.gs = gs;
     in.vram = gs->m_vram; in.vramSize = gs->m_vramSize; in.stateGen = gs->m_stateGen; in.texUploadGen = gs->m_texUploadGen;
-    in.refreshClut();
-    return recordSpriteGPU(in);
+    if (!s_snap)
+    {
+        in.vtx = gs->m_vtxQueue; in.prim = &gs->m_prim; in.ctx = &gs->activeContext();
+        in.texa = &gs->m_texa; in.texclut = &gs->m_texclut;
+        in.refreshClut();
+        return recordSpriteGPU(in);
+    }
+    struct Snap { GSVertex vtx[3]; GSPrimReg prim; GSContext ctx; GSTexaReg texa; GSTexClutReg texclut; uint32_t clut[256]; };
+    thread_local Snap snap;
+    snap.vtx[0] = gs->m_vtxQueue[0]; snap.vtx[1] = gs->m_vtxQueue[1]; snap.vtx[2] = gs->m_vtxQueue[2];
+    snap.prim = gs->m_prim; snap.ctx = gs->activeContext(); snap.texa = gs->m_texa; snap.texclut = gs->m_texclut;
+    in.vtx = snap.vtx; in.prim = &snap.prim; in.ctx = &snap.ctx; in.texa = &snap.texa; in.texclut = &snap.texclut;
+    // the palette: build it now (stream order, live VRAM) and copy the 1 KB only for paletted textures
+    const uint32_t psm = gs->activeContext().tex0.psm;
+    const bool pal = gs->m_prim.tme && (psm == GS_PSM_T8 || psm == GS_PSM_T4 || psm == GS_PSM_T8H || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH);
+    if (pal) { ensureClutCache(gs); std::memcpy(snap.clut, gs->m_clutCache, sizeof(snap.clut)); }
+    in.clut = snap.clut; in.clutKey = gs->m_clutCacheKey; in.clutHash256 = gs->m_clutCacheHash256; in.clutHash16 = gs->m_clutCacheHash16;
+    const bool ok = recordSpriteGPU(in);
+    if (s_snap) { gs->m_vtxQueue[0].a = snap.vtx[0].a; gs->m_vtxQueue[1].a = snap.vtx[1].a; gs->m_vtxQueue[2].a = snap.vtx[2].a; }   // [fadefull] writes alpha back
+    return ok;
 }
 
 
