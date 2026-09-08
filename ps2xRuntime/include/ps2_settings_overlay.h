@@ -17,7 +17,7 @@ public:
         float masterVolume = 1.0f;
         float musicVolume = 1.0f;
         float sfxVolume = 1.0f;
-        bool gpuRenderer = false;
+        bool gpuRenderer = true;
         bool glow = true;
         bool postfx = false;
         bool glowFix = true;   // [glowfix] BT3's bloom/glow chain (Kaioken aura); applies on restart
@@ -48,6 +48,8 @@ public:
         // 2=+ftspike+fightprobe+reveal, 3=+frameprof+camprobe. Drives which PS2X_* env vars
         // main() exports; stderr is redirected to <deploy>/logs/bt3.log on any level > 0.
         int logLevel = 1;
+
+        bool operator==(const Settings &o) const;
     };
 
     static bool isWidescreen() { return s_widescreen; }
@@ -81,6 +83,7 @@ private:
     bool m_initialized = false;
     bool m_dirty = false;
     Settings m_settings;
+    Settings m_settingsAtBoot;
     std::string m_configPath;
     int m_activeTab = 0;
 
