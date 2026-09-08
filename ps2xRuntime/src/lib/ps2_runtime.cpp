@@ -125,7 +125,8 @@ namespace ps2_syscalls { bool bt3WakeThreadByEntry(uint32_t entry); }
 #include <unordered_set>
 #include <mutex>
 #include <sstream>
-extern "C" double ps2xGpuMsTake(uint64_t *calls);   // [gputime] ps2_gs_gpu_renderer.cpp
+extern "C" double ps2xGpuMsTake(uint64_t *calls);
+extern "C" void ps2xEeProfAddCurrentThread(const char *name);   // [eeprof]   // [gputime] ps2_gs_gpu_renderer.cpp
 
 // BT3 debug tracing: extremely verbose ([main-pc] etc.). Off unless PS2X_TRACE=1.
 // The per-instruction [main-pc] trace alone emits ~1000+ stderr lines/sec and
@@ -1695,6 +1696,22 @@ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
 bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 {
     return replaceFunction(address, func);
+}
+
+// [eeprof] hand every registered function pointer with its guest address to the sampling profiler
+// (which = 0 main table, 1 overlay table).
+extern "C" void ps2xEeProfCollectTable(void (*cb)(uintptr_t fnptr, uint32_t guestAddr, int which, void *user), void *user)
+{
+    for (uint32_t slot = 0; slot < g_ps2RecompiledFunctionTableSlotCount; ++slot)
+    {
+        PS2Runtime::RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
+        if (fn) cb((uintptr_t)fn, g_ps2RecompiledFunctionTableBase + slot * 4u, 0, user);
+    }
+    for (uint32_t slot = 0; slot < g_ps2OverlayFunctionTableSlotCount; ++slot)
+    {
+        PS2Runtime::RecompiledFunction fn = g_ps2OverlayFunctionTable[slot];
+        if (fn) cb((uintptr_t)fn, g_ps2OverlayFunctionTableBase + slot * 4u, 1, user);
+    }
 }
 
 bool PS2Runtime::hasFunction(uint32_t address) const
@@ -4074,6 +4091,7 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        ps2xEeProfAddCurrentThread("GameThread");   // [eeprof] no-op unless PS2X_EEPROF is set
         // [eeround] PS2X_EEROUND=1: run the guest thread's float math (EE FPU and
         // VU0-macro ops, both SSE in recompiled code) under RZ+FTZ+DAZ — PCSX2's
         // default EE/VU "Chop/Zero" rounding. Host default (round-nearest,
