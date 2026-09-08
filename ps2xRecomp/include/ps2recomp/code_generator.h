@@ -66,6 +66,8 @@ namespace ps2recomp
         BootstrapInfo m_bootstrapInfo;
         bool m_emitInstructionComments = true;
         RecompilerReporter *m_reporter = nullptr;
+        bool m_pcStoresAll = false;   // [pcstores] see RecompilerConfig::pcStoresAll
+        void setPcStoresAll(bool v) { m_pcStoresAll = v; }
         std::string m_currentFunctionName;
 
         std::string translateInstruction(const Instruction &inst);

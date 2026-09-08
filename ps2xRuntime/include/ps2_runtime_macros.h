@@ -145,10 +145,13 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 // Like the FPU, VU floats have NO NaN/Inf — results saturate to +/-Fmax. ps2VuSat()
 // restores that on every vector result so hardware-legal values (e.g. Q=Fmax from a
 // divide-by-zero after a zero cross product) flow through without exploding to Inf/NaN.
+// [vusatguard] the PS2X_VU_SAT switch lives at namespace scope: a function-local static costs a guard-variable
+// load+test on EVERY VU0 macro op (perf annotate 2026-09-08: 16% of a hot vmadd matrix function). Each TU
+// initialises its own copy once at startup; there is no guard at the use sites.
+static const bool g_ps2VuSatOn = [](){ const char *e = ::getenv("PS2X_VU_SAT"); return !(e && e[0] == '0'); }();
 static inline __m128 ps2VuSat(__m128 v)
 {
-    static const bool s_on = [](){ const char *e = ::getenv("PS2X_VU_SAT"); return !(e && e[0] == '0'); }();
-    if (!s_on)
+    if (!g_ps2VuSatOn)
         return v;
     const __m128i iv = _mm_castps_si128(v);
     const __m128i expMask = _mm_set1_epi32(0x7F800000);

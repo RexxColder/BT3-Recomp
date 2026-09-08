@@ -11,6 +11,7 @@ a marker string is checked before inserting — and the script fails loudly if a
 anchor is missing, since that means the generator's output shape changed and the
 patch needs review.
 """
+import re
 import sys
 from pathlib import Path
 
@@ -162,6 +163,15 @@ def apply(output_dir: Path) -> int:
             continue
         anchor = patch["anchor"]
         idx = text.find(anchor)
+        if idx < 0:
+            # [pcstores] the generator emits `ctx->pc = <addr>;` before an instruction only where the runtime
+            # can observe it (pc_stores_all = false); an anchor written against the per-instruction form is
+            # retried without those lines so the same patch table serves both generator modes.
+            lean = re.sub(r"    ctx->pc = 0x[0-9a-fA-F]+u;\n", "", anchor)
+            if lean != anchor:
+                idx = text.find(lean)
+                if idx >= 0:
+                    anchor = lean
         if idx < 0:
             print(f"ERROR: anchor {anchor!r} not found in {patch['file']}", file=sys.stderr)
             failures += 1
