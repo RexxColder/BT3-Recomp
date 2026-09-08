@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
+extern "C" void ps2xGsDisplayFlipHook(unsigned long long dispfb);   // [displatch] ps2_gs_gpu.cpp
 
 namespace
 {
@@ -2016,6 +2017,7 @@ namespace
             regs.dispfb2 = e.dispfb;
             regs.display2 = e.display;
             regs.bgcolor = e.bgcolor;
+            ps2xGsDisplayFlipHook(e.dispfb);   // [displatch] the present's per-frame latch (ps2_gs_gpu.cpp)
         });
     }
 

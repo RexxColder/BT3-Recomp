@@ -3570,6 +3570,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
             // Default: do NOT publish here — publishing on every DISPFB write can emit
             // partial/extra frames and make animation cadence uneven. Publish only on the
             // per-frame render kick (FUN_00100ab8). Just record the scanned-out buffer.
+            { extern std::atomic<unsigned long> g_ps2xDispPrivCalls; g_ps2xDispPrivCalls.fetch_add(1u, std::memory_order_relaxed); }   // [displatch] diag
             ps2GpuRenderer().setDisplay(static_cast<uint32_t>(value & 0x1FFu),
                                         static_cast<uint32_t>((value >> 9) & 0x3Fu));
             // PS2X_DISPFB_PUBLISH: opt-in — publish the just-completed frame HERE (aligned to the
@@ -3631,6 +3632,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         // too (PS2X_DISPFB_PUBLISH on DISPFB1 alone published nothing: frozen black window).
         if (GsGpuRenderer::enabled())
         {
+            { extern std::atomic<unsigned long> g_ps2xDispPrivCalls; g_ps2xDispPrivCalls.fetch_add(1u, std::memory_order_relaxed); }   // [displatch] diag
             ps2GpuRenderer().setDisplay(static_cast<uint32_t>(value & 0x1FFu),
                                         static_cast<uint32_t>((value >> 9) & 0x3Fu));
             {
@@ -5120,4 +5122,15 @@ void ps2GsEmitFmvFrame()
     if (s_lg)
         std::fprintf(stderr, "[fmvlum] publish fbp=%u %ux%u gen=%llu%s\n", fbp, w, h,
                      (unsigned long long)gen, pix.empty() ? " (repeat)" : " (new)");
+}
+
+// [displatch] the sync stubs' display flip (applyGsDispEnv: sceGsSwapDBuff / PutDispEnv) writes the register struct
+// directly and bypassed the DISPFB register path above, so the present's latch never saw the flip (a driven fight
+// reported "0 latched" every window). Same call the register path makes.
+std::atomic<unsigned long> g_ps2xDispFlipHookCalls{0}, g_ps2xDispPrivCalls{0};   // [displatch] diag
+extern "C" void ps2xGsDisplayFlipHook(unsigned long long dispfb)
+{
+    g_ps2xDispFlipHookCalls.fetch_add(1u, std::memory_order_relaxed);
+    if (GsGpuRenderer::enabled())
+        ps2GpuRenderer().setDisplay(static_cast<uint32_t>(dispfb & 0x1FFu), static_cast<uint32_t>((dispfb >> 9) & 0x3Fu));
 }
