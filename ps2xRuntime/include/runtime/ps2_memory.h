@@ -451,9 +451,10 @@ public:
     // Async kick worker state (only used when PS2X_ASYNC_KICK is on -- the default).
     struct KickJob
     {
-        enum Kind : uint8_t { Vif1 = 0, GifPath3 = 1, SwapFrame = 2 };
+        enum Kind : uint8_t { Vif1 = 0, GifPath3 = 1, SwapFrame = 2, GsApply = 3 };
         uint8_t kind = Vif1;
         std::vector<uint8_t> data;
+        std::function<void()> fn;   // [gsqueue] GsApply: a direct GS-state write, run by the worker in stream order
     };
     // [asyncpace] Outstanding async work per DMA channel, indexed [0]=VIF0 [1]=VIF1 [2]=GIF.
     // readIORegister reports CHCR.STR from this so the guest sees the transfer as still RUNNING

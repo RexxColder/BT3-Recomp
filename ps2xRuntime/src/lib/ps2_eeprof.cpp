@@ -194,7 +194,7 @@ namespace
             if (std::chrono::duration<double>(now - last).count() < 10.0) continue;
             last = now;
             {   // [waitprof] blocked time per wait site over the window, ms/s
-                static const char *const kSite[WP_COUNT] = { "framegate", "kickq_frames", "kickq_full", "kick_drain", "sched_yield", "sched_slot", "handoff", "sema", "sync_other", "sleep", "worker_idle" };
+                static const char *const kSite[WP_COUNT] = { "framegate", "kickq_frames", "kickq_full", "kick_drain", "sched_yield", "sched_slot", "handoff", "sema", "sync_other", "sleep", "worker_idle", "fence_syncpath", "fence_storeimg", "barrier_post", "barrier_upload" };
                 static uint64_t lastNs[WP_COUNT] = {0}, lastN[WP_COUNT] = {0};
                 std::string line;
                 for (int k = 0; k < WP_COUNT; ++k)

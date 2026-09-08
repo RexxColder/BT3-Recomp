@@ -2316,6 +2316,9 @@ void PS2Memory::kickWorkerLoop()
         case KickJob::SwapFrame:
             ps2GpuRenderer().swapFrame();
             break;
+        case KickJob::GsApply:   // [gsqueue]
+            if (job.fn) job.fn();
+            break;
         }
         // Sync mode ends every kick with a trailing arbiter drain (processPendingTransfers);
         // replicate that here so deferred PATH3 packets don't sit queued across frames.

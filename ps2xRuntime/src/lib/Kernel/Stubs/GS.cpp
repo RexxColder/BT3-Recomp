@@ -1,3 +1,4 @@
+#include "ps2_waitprof.h"   // [waitprof]
 #include <atomic>
 #include <cstdio>
 #include <chrono>
@@ -127,13 +128,16 @@ namespace ps2_stubs
                 return;
             }
 
-            fenceAsyncKickForGsAccess(runtime);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.testa.reg & 0xFFu), clear.testa.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.prim.reg & 0xFFu), clear.prim.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.rgbaq.reg & 0xFFu), clear.rgbaq.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.xyz2a.reg & 0xFFu), clear.xyz2a.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.xyz2b.reg & 0xFFu), clear.xyz2b.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.testb.reg & 0xFFu), clear.testb.value);
+            const GsClearMem c = clear;
+            applyGsOnStream(runtime, [runtime, c]()   // [gsqueue]
+            {
+                runtime->gs().writeRegister(static_cast<uint8_t>(c.testa.reg & 0xFFu), c.testa.value);
+                runtime->gs().writeRegister(static_cast<uint8_t>(c.prim.reg & 0xFFu), c.prim.value);
+                runtime->gs().writeRegister(static_cast<uint8_t>(c.rgbaq.reg & 0xFFu), c.rgbaq.value);
+                runtime->gs().writeRegister(static_cast<uint8_t>(c.xyz2a.reg & 0xFFu), c.xyz2a.value);
+                runtime->gs().writeRegister(static_cast<uint8_t>(c.xyz2b.reg & 0xFFu), c.xyz2b.value);
+                runtime->gs().writeRegister(static_cast<uint8_t>(c.testb.reg & 0xFFu), c.testb.value);
+            });
         }
 
         void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr);
@@ -916,7 +920,7 @@ namespace ps2_stubs
         // local->host readback buffer is filled by the worker when it reaches the
         // TRXDIR write. Consuming immediately would return stale/empty data (the game
         // then re-uploads that garbage later -> persistent VRAM texture corruption).
-        fenceAsyncKickForGsAccess(runtime);
+        fenceAsyncKickForGsAccess(runtime, WP_FENCE_STOREIMG);
         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
         ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "storeimg", nullptr);
         {   // [storeimg] every VRAM->RAM download: the un-hooked guest-RAM writer class (found 2026-09-01)
@@ -1502,7 +1506,7 @@ namespace ps2_stubs
             // uploads/draws in flight; whatever the game does "after sync" (buffer
             // reuse, direct GS pokes, VRAM management) would race it. Honor the
             // hardware contract and drain the queue.
-            fenceAsyncKickForGsAccess(runtime);
+            fenceAsyncKickForGsAccess(runtime, WP_FENCE_SYNCPATH);
 
             uint32_t count = 0;
             constexpr uint32_t kTimeout = 0x1000000;
