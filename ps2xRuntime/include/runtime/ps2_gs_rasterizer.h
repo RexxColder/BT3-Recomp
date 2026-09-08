@@ -9,6 +9,7 @@
 class GS;
 struct GSTex0Reg; struct GSTexaReg; struct GSTexClutReg; struct TexDecodeReq;   // [deferdec]
 struct DecPoolJob;   // [decpool]
+struct GSVertex; struct GSPrimReg; struct GSContext;   // [recinput]
 // [deferdec] what decodeTexRGBA's fast paths read. In the synchronous case these point into the
 // live GS; in the deferred case into a TexDecodeReq snapshot + a thread-local CLUT.
 struct TexDecodeSrc
@@ -34,6 +35,25 @@ public:
                                     std::vector<uint8_t> &rgba, int &upW, int &upH, int &upFmt, int &upScale, float &upAlpha);
     static bool decodeIsDeferrable(uint32_t psm);   // [deferdec] only the fast paths can run without the GS
     void drawPrimitive(GS *gs);
+    // [recinput] everything recordSpriteGPU reads. Stage 1 of chunked recording: the wrapper below fills it from the
+    // live GS (pointers into it, scalars by value); a later stage copies it into a snapshot a record thread can consume.
+    // `gs` is the worker-only handle for the few callees that must see the live GS (palette-cache build, inline decode);
+    // it is null on a record thread.
+    struct RecInput
+    {
+        GS *gs = nullptr;
+        GSVertex *vtx = nullptr;             // the primitive's vertex queue (mutable: [fadefull] rewrites alpha)
+        const GSPrimReg *prim = nullptr;
+        const GSContext *ctx = nullptr;
+        const GSTexaReg *texa = nullptr;
+        const GSTexClutReg *texclut = nullptr;
+        const uint32_t *clut = nullptr;      // the built palette cache
+        uint64_t clutKey = ~0ull, clutHash256 = 0, clutHash16 = 0;
+        uint8_t *vram = nullptr; size_t vramSize = 0;
+        uint32_t stateGen = 0, texUploadGen = 0;
+        void refreshClut();                  // re-read the palette-cache scalars after ensureClutCache (worker only)
+    };
+    bool recordSpriteGPU(RecInput &in);
     void writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, bool widened = false);
     uint32_t sampleTexture(GS *gs, float s, float t, float q, uint16_t u, uint16_t v);
     uint32_t lookupCLUT(GS *gs, uint8_t index, uint32_t cbp, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
