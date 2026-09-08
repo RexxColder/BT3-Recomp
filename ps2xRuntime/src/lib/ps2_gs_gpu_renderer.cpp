@@ -1,3 +1,4 @@
+#include "ps2_waitprof.h"   // [waitprof]
 #include <time.h>
 #include <tuple>
 #include <deque>
@@ -3265,7 +3266,7 @@ void GsGpuRenderer::waitPendingFlush(uint32_t page)
     extern unsigned long g_deferUploadWait; ++g_deferUploadWait;
     void *sc = ps2xGuestWaitBegin();
     std::unique_lock<std::mutex> lk(g_bbMx);
-    g_bbCv.wait_for(lk, std::chrono::milliseconds(500), [&]{ std::lock_guard<std::mutex> bk(g_barMx); return !flushPendingLocked(page) || g_bbAbort.load(); });
+    { Ps2xWaitScope wup(WP_BARRIER_UPLOAD); g_bbCv.wait_for(lk, std::chrono::milliseconds(500), [&]{ std::lock_guard<std::mutex> bk(g_barMx); return !flushPendingLocked(page) || g_bbAbort.load(); }); }
     lk.unlock();
     ps2xGuestWaitEnd(sc);
 }
@@ -3736,6 +3737,7 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
         const auto tPost = std::chrono::steady_clock::now();
         g_bbQueue.push_back({page, wantsAlphaAsData, tPost});
         g_bbCv.notify_all();
+        Ps2xWaitScope wpost(WP_BARRIER_POST);
         const bool ok = g_bbCv.wait_for(lk, std::chrono::milliseconds(500), [&]{ return g_bbServed >= mine || g_bbAbort.load(); });
         lk.unlock();
         ps2xGuestWaitEnd(waitScope);

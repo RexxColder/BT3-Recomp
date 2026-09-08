@@ -1,4 +1,7 @@
+#include "ps2_waitprof.h"   // [waitprof]
 #include <algorithm>
+#include <vector>
+#include <functional>
 #include <map>
 #include <chrono>
 #include <cstdio>
@@ -1964,27 +1967,53 @@ namespace
     // cutscene-heavy streaming). Drain the queue first so direct access happens at a
     // stream boundary, matching hardware where these calls imply the path is idle.
     // PS2X_ASYNC_GSFENCE=0 disables (A/B kill-switch).
-    static void fenceAsyncKickForGsAccess(PS2Runtime *runtime)
+    static void fenceAsyncKickForGsAccess(PS2Runtime *runtime, int waitSite = WP_KICK_DRAIN)
     {
         static const bool s_off = [](){ const char *v = std::getenv("PS2X_ASYNC_GSFENCE"); return v && v[0] == '0'; }();
         if (s_off || !runtime || !PS2Memory::asyncKickEnabled())
             return;
+        Ps2xWaitScope w(waitSite);   // [waitprof] per-site: the drain itself is bracketed too, this names the caller
         runtime->memory().drainKickQueue();
+    }
+
+    // [gsqueue] A direct GS-state WRITE from a sceGs* stub does not need the worker's queue drained; it needs
+    // to land at the right point in the stream. Under async kick, hand it to the worker as a GsApply job so
+    // it runs after everything the guest kicked before it and before everything kicked after it -- the
+    // hardware order -- without stopping the guest thread. The drain fence cost the i5-12400 three full
+    // worker drains per frame (sceGsSwapDBuff: display env + two draw envs), i.e. the game thread waiting
+    // 83% of a splitscreen frame ([eeprof]/[waitprof], 2026-09-08). Reads (store-image, sceGsSyncPath)
+    // keep the real fence. PS2X_ASYNC_GSQUEUE=0 restores drain-then-apply.
+    static void applyGsOnStream(PS2Runtime *runtime, std::function<void()> apply)
+    {
+        static const bool s_queue = [](){ const char *v = std::getenv("PS2X_ASYNC_GSQUEUE"); return !(v && v[0] == '0'); }();
+        if (s_queue && runtime && PS2Memory::asyncKickEnabled())
+        {
+            PS2Memory::KickJob j;
+            j.kind = PS2Memory::KickJob::GsApply;
+            j.fn = std::move(apply);
+            runtime->memory().enqueueKickJob(std::move(j));
+            return;
+        }
+        fenceAsyncKickForGsAccess(runtime);
+        apply();
     }
 
     static void applyGsDispEnv(PS2Runtime *runtime, const GsDispEnvMem &env)
     {
         if (!runtime || !runtime->syncCoreSubsystems())
             return;
-        fenceAsyncKickForGsAccess(runtime);
-        auto &regs = runtime->memory().gs();
-        regs.pmode = env.pmode;
-        regs.smode2 = env.smode2;
-        regs.dispfb1 = env.dispfb;
-        regs.display1 = env.display;
-        regs.dispfb2 = env.dispfb;
-        regs.display2 = env.display;
-        regs.bgcolor = env.bgcolor;
+        const GsDispEnvMem e = env;
+        applyGsOnStream(runtime, [runtime, e]()
+        {
+            auto &regs = runtime->memory().gs();
+            regs.pmode = e.pmode;
+            regs.smode2 = e.smode2;
+            regs.dispfb1 = e.dispfb;
+            regs.display1 = e.display;
+            regs.dispfb2 = e.dispfb;
+            regs.display2 = e.display;
+            regs.bgcolor = e.bgcolor;
+        });
     }
 
     static void applyGsRegPairs(PS2Runtime *runtime, const GsRegPairMem *pairs, size_t pairCount)
@@ -2000,7 +2029,6 @@ namespace
                              runtime ? (int)runtime->syncCoreSubsystems() : -1);
             return;
         }
-        fenceAsyncKickForGsAccess(runtime);
         {   // [envdiag] PS2X_ENVDIAG=1: which draw environments the guest actually applies.
             // At long camera distance ~50k character draws end up carrying the OUTLINE pass's
             // XYOFFSET (1920,1920) into the SCENE, which scissors them away. Counting the
@@ -2039,10 +2067,12 @@ namespace
                 }
             }
         }
-        for (size_t i = 0; i < pairCount; ++i)
+        std::vector<GsRegPairMem> copy(pairs, pairs + pairCount);
+        applyGsOnStream(runtime, [runtime, copy = std::move(copy)]()
         {
-            runtime->gs().writeRegister(static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);
-        }
+            for (const GsRegPairMem &p : copy)
+                runtime->gs().writeRegister(static_cast<uint8_t>(p.reg & 0xFFu), p.value);
+        });
     }
 
     static void seedGsDrawEnv1(GsDrawEnv1Mem &env,

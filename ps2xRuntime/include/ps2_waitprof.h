@@ -20,6 +20,10 @@ enum Ps2xWaitSite : int
     WP_SYNC_OTHER,      // other kernel sync waits
     WP_THREAD_SLEEP,    // SleepThread / wakeup wait
     WP_WORKER_IDLE,     // kick worker: queue empty
+    WP_FENCE_SYNCPATH,  // sceGsSyncPath: drain the worker (the game asked for an idle path)
+    WP_FENCE_STOREIMG,  // sceGsExecStoreImage: drain before consuming the VRAM readback
+    WP_BARRIER_POST,    // guest side: posted a blocking barrier, waiting for the GL thread to serve it
+    WP_BARRIER_UPLOAD,  // guest side: waiting for a pending page flush before a texture upload
     WP_COUNT
 };
 extern std::atomic<uint64_t> g_ps2xWaitNs[WP_COUNT];
