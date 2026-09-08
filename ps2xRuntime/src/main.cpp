@@ -77,6 +77,26 @@ namespace
         return result;
     }
 
+    // [deploy] Resolve the directory of the running executable (via /proc/self/exe so
+    // argv[0] and CWD cannot steer it). The settings overlay anchors its savedata/,
+    // assets/, fonts and bt3_settings.ini off this directory, so a launcher can be
+    // double-clicked from any CWD and still find its portable files (same convention as
+    // the previous single-binary deploy: <exeDir>/savedata/bt3_settings.ini).
+    std::filesystem::path getExecutableDirectory()
+    {
+        // [deploy] A self-extracting launcher stashes this runner in cache but its
+        // portable files (savedata/, assets/, data/) stay NEXT to the launcher; the
+        // stub passes PS2X_EXEDIR=<launcherDir> so this resolves to the real one.
+        if (const char *exeDir = std::getenv("PS2X_EXEDIR"))
+            if (exeDir[0] != '\0')
+                return std::filesystem::path(exeDir);
+        std::error_code ec;
+        std::filesystem::path self = std::filesystem::canonical("/proc/self/exe", ec);
+        if (ec || self.empty())
+            self = std::filesystem::current_path();
+        return self.parent_path();
+    }
+
     std::filesystem::path getExecutablePath(int argc, char *argv[])
     {
         if (argc >= 2 && argv[1] && argv[1][0] != '\0')
@@ -484,6 +504,19 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
 extern "C" void ps2xGsRecordFlush();      // PS2X_GS_RECORD ring buffer (ps2_gs_gpu.cpp)
 extern "C" void ps2xGsRecordOnSignal(int);
 
+// [mergefix] helpers for the merge repairs
+#ifdef _WIN32
+#include <io.h>
+static bool ps2xStderrIsTerminal() { return _isatty(_fileno(stderr)) != 0; }
+#else
+#include <unistd.h>
+static bool ps2xStderrIsTerminal() { return isatty(fileno(stderr)) != 0; }
+#endif
+extern "C" const char *ps2xExeDirC()
+{   // the resolved executable directory for code that must not depend on the CWD (texture pack index)
+    static const std::string s_dir = getExecutableDirectory().string();
+    return s_dir.c_str();
+}
 int main(int argc, char *argv[])
 {
 #if defined(_WIN32)
@@ -548,25 +581,61 @@ int main(int argc, char *argv[])
         std::string elfName = pathObj.filename().string();
         std::string normalizedId = normalizeGameId(elfName);
 
-        std::string windowTitle = "PS2-Recomp | ";
+        std::string windowTitle;
         const char *gameName = getGameName(normalizedId);
-
-#if !defined(PLATFORM_VITA)
         if (gameName)
         {
-            windowTitle += std::string(gameName) + " | " + elfName;
+            windowTitle = gameName;
         }
         else
-#endif
         {
-            windowTitle += elfName;
+            windowTitle = elfName;
         }
 
         PS2Runtime runtime;
 #if !defined(PLATFORM_VITA)
         // This hook is to prevent leak rlimgui deps to recompiler etc
         PS2SettingsOverlay settingsOverlay;
+        settingsOverlay.setConfigDirectory((getExecutableDirectory() / "savedata").string());
         settingsOverlay.preloadSettings();
+
+        // [loglevel] Boot-time diagnostics from [logging] log_level (0..3, default 1).
+        // Because env vars are read lazily by the runtime, exporting them here -- before
+        // initialize() -- shapes every diagnostic print for the whole session. stderr is
+        // redirected to <deploy>/logs/bt3.log so the deploy stays clean; the file is
+        // overwritten each run (freopen "w"), and the previous run's log is preserved as
+        // bt3.prev.log when it existed. Never clobbers an env var the user exported.
+        {
+            const int lvl = PS2SettingsOverlay::getStartupLogLevel();
+            const auto exeDir = getExecutableDirectory();
+
+            auto enable = [&](const char *name)
+            {
+                if (!std::getenv(name))
+                    setenv(name, "1", 0);
+            };
+
+            if (lvl >= 1) { enable("PS2X_PROFILE"); enable("PS2X_MCLOG"); enable("PS2X_SCHED_DEBUG"); }
+            if (lvl >= 2) { enable("PS2X_FTSPIKE"); enable("PS2X_FIGHTPROBE"); enable("PS2X_REVEAL_HIDDEN_MENU_ENTRY"); }
+            if (lvl >= 3) { enable("PS2X_FRAMEPROF"); enable("PS2X_CAMPROBE"); }
+
+            if (lvl > 0 && ps2xStderrIsTerminal())   // [mergefix] a captured stderr (rig run.log, a user's "> log 2>&1") keeps its lines
+            {
+                std::error_code ec;
+                const auto logsDir = exeDir / "logs";
+                std::filesystem::create_directories(logsDir, ec);
+                if (!ec)
+                {
+                    const auto logPath = logsDir / "bt3.log";
+                    const auto prevPath = logsDir / "bt3.prev.log";
+                    std::error_code pc;
+                    std::filesystem::rename(logPath, prevPath, pc); // best-effort
+                    if (std::freopen(logPath.string().c_str(), "w", stderr))
+                        std::fprintf(stderr, "[loglevel] level=%d stderr -> %s\n",
+                                     lvl, logPath.string().c_str());
+                }
+            }
+        }
         runtime.setDebugUiCallbacks(
             [](PS2Runtime &rt, void *userData)
             {
