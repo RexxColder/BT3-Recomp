@@ -77,35 +77,47 @@ else()
     )
     FetchContent_MakeAvailable(raylib)
 
+    # [ps2x raylib patch] the PATCH_COMMAND above only runs when FetchContent populates the source. A build
+    # directory populated earlier either has no patch or an OLDER version of it, and a newer patch does not
+    # apply on top of an older one (2026-09-08: the vertex-ring patch failed to configure on every existing
+    # Windows build directory). Self-heal: if the current patch is neither applied nor applicable, restore
+    # the pristine 5.5 sources (git checkout -- .) and apply it fresh. Idempotent on every configure.
+    if(EXISTS "${raylib_SOURCE_DIR}/src/rlgl.h")
+        set(_rl_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch")
+        execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --reverse --check --quiet "${_rl_patch}"
+                        RESULT_VARIABLE _rl_patched OUTPUT_QUIET ERROR_QUIET)
+        if(NOT _rl_patched EQUAL 0)
+            execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --check --ignore-whitespace "${_rl_patch}"
+                            RESULT_VARIABLE _rl_applicable OUTPUT_QUIET ERROR_QUIET)
+            if(NOT _rl_applicable EQUAL 0)
+                message(STATUS "raylib ps2x patch: a previous patch version is applied in ${raylib_SOURCE_DIR}; restoring the pristine sources")
+                execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" checkout -- . RESULT_VARIABLE _rl_reset)
+                if(NOT _rl_reset EQUAL 0)
+                    message(FATAL_ERROR "raylib ps2x patch: could not restore ${raylib_SOURCE_DIR} (git checkout -- . failed); delete build/_deps/raylib-* and reconfigure")
+                endif()
+            endif()
+            execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --ignore-whitespace "${_rl_patch}"
+                            RESULT_VARIABLE _rl_apply)
+            if(NOT _rl_apply EQUAL 0)
+                message(FATAL_ERROR "raylib ps2x patch failed to apply to ${raylib_SOURCE_DIR}; delete build/_deps/raylib-* and reconfigure")
+            endif()
+            message(STATUS "raylib ps2x patch applied to ${raylib_SOURCE_DIR}")
+        endif()
+    endif()
+
     # raylib defaults to MAX_GAMEPADS=4, and on Linux those four slots are not necessarily
     # controllers: udev sets ID_INPUT_JOYSTICK=1 on plenty of things that are not, notably
-    # keyboards exposing System Control / Consumer Control HID pages. On a machine with such a
-    # keyboard the four slots fill with junk and a REAL pad plugged in afterwards lands at
-    # index >= 4, where IsGamepadAvailable() can never see it -- the pad simply does not exist
-    # as far as the game is concerned. Raise the ceiling so every connected device is at least
-    # addressable; PadConfig then filters the list down to things that look like gamepads.
+    # keyboards exposing System Control / Consumer Control HID pages. The patch above sets 16;
+    # this rewrite is the belt to that brace for a source tree the patch did not touch.
     # NOTE: a -DMAX_GAMEPADS=16 compile definition does NOT work. rcore.c includes raylib's
     # own config.h (whenever EXTERNAL_CONFIG_FLAGS is undefined, which is our case) and that
     # header redefines MAX_GAMEPADS unconditionally, so it silently wins -- and -w hides the
-    # macro-redefinition warning that would have said so. Patch the fetched header instead;
-    # this re-applies on every configure, so a fresh clone gets it too.
+    # macro-redefinition warning that would have said so. Patch the fetched header instead.
     if(EXISTS "${raylib_SOURCE_DIR}/src/config.h")
         file(READ "${raylib_SOURCE_DIR}/src/config.h" _rl_cfg)
         string(REGEX REPLACE "#define[ \t]+MAX_GAMEPADS[ \t]+4"
                              "#define MAX_GAMEPADS                   16" _rl_cfg "${_rl_cfg}")
         file(WRITE "${raylib_SOURCE_DIR}/src/config.h" "${_rl_cfg}")
-    # [ps2x raylib patch] the PATCH_COMMAND above only runs when FetchContent populates the source; a build
-    # directory populated before the patch existed still needs it. Idempotent: apply only if not applied.
-    execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --reverse --check --quiet "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch"
-                    RESULT_VARIABLE _rl_patched OUTPUT_QUIET ERROR_QUIET)
-    if(NOT _rl_patched EQUAL 0)
-        execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --ignore-whitespace "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch"
-                        RESULT_VARIABLE _rl_apply)
-        if(NOT _rl_apply EQUAL 0)
-            message(FATAL_ERROR "raylib ps2x patch failed to apply to ${raylib_SOURCE_DIR}")
-        endif()
-        message(STATUS "raylib ps2x patch applied to ${raylib_SOURCE_DIR}")
-    endif()
     endif()
 
 
