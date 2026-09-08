@@ -39,6 +39,7 @@ public:
     // live GS (pointers into it, scalars by value); a later stage copies it into a snapshot a record thread can consume.
     // `gs` is the worker-only handle for the few callees that must see the live GS (palette-cache build, inline decode);
     // it is null on a record thread.
+    struct RecOut;   // [recpool] a record thread's output (defined in the .cpp)
     struct RecInput
     {
         GS *gs = nullptr;
@@ -52,8 +53,15 @@ public:
         uint8_t *vram = nullptr; size_t vramSize = 0;
         uint32_t stateGen = 0, texUploadGen = 0;
         void refreshClut();                  // re-read the palette-cache scalars after ensureClutCache (worker only)
+        // [recpool] Stage 3
+        bool resolveOnly = false;            // worker: run pre + the resolve in stream order, fill `resolved`, return before the build
+        bool preResolved = false;            // record thread: skip the resolve and take `resolved`
+        struct Resolved { uint64_t texKey = 0; int texW = 1, texH = 1; bool tplHit = false; int subDxW = 0, subDx0 = 0; } resolved;
+        bool batchOk = true;                 // worker-captured: !g_recordDepthOnly && g_recordAliasKind == 0
+        RecOut *out = nullptr;               // record thread: DrawCmds go here; the worker merges them in order
     };
     bool recordSpriteGPU(RecInput &in);
+    bool recordSpriteGPUSeq(GS *gs);   // [recpool] the stream-ordered path (Stage 1/2 wrapper), also the inline fallback
     void writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, bool widened = false);
     uint32_t sampleTexture(GS *gs, float s, float t, float q, uint16_t u, uint16_t v);
     uint32_t lookupCLUT(GS *gs, uint8_t index, uint32_t cbp, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);

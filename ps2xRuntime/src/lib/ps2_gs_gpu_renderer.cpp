@@ -384,6 +384,7 @@ extern "C" __declspec(dllimport) void *__stdcall wglGetProcAddress(const char *)
 static void *ps2xGlProc(const char *name) { return (void *)wglGetProcAddress(name); }
 #else
 #include <dlfcn.h>
+extern "C" void ps2xRecPoolDrain();   // [recpool] ps2_gs_rasterizer.cpp: merge every posted record job (worker thread)
 static void *ps2xGlProc(const char *name) { return dlsym(RTLD_DEFAULT, name); }
 #endif
 static void ps2xTextureBarrier()
@@ -3752,6 +3753,7 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
         }
         // Hand off the scheduler token + guest-execution lock while we wait, or the loader
         // threads and the CD-tick pump starve (the "stuck loading screen").
+        ps2xRecPoolDrain();   // [recpool] the segment the GL thread renders for this barrier must hold every draw before it
         decPoolDrain();   // [decpool] the GL thread may render the frame so far to serve this barrier
         void *waitScope = ps2xGuestWaitBegin();
         std::unique_lock<std::mutex> lk(g_bbMx);
@@ -4515,6 +4517,13 @@ void GsGpuRenderer::decPoolPost(std::unique_ptr<DecPoolJob> job)
         if (depth > g_decPool.maxDepth.load(std::memory_order_relaxed)) g_decPool.maxDepth.store(depth, std::memory_order_relaxed);
     }
     g_decPool.cv.notify_one();
+}
+bool GsGpuRenderer::pageMayNeedBarrier(uint32_t page)
+{   // [recpool] the gate barrierBeforeRead applies before it decides to post: a page with a dirty FBO or a pending
+    // flush. Conservative: true sends the draw down the inline (stream-ordered) path.
+    if (!m_glInit || page >= kVramPages) return false;
+    std::lock_guard<std::mutex> bk(g_barMx);
+    return g_barDirty.count(page) != 0 || flushPendingLocked(page);
 }
 void GsGpuRenderer::decPoolDrain()
 {   // caller must NOT hold m_mtx: the pool's put takes it
@@ -6737,6 +6746,7 @@ void GsGpuRenderer::swapFrame()
                                  c.vramSnap ? 1 : 0, c.dx0, c.dy0, c.dx1, c.dy1, c.srcTexW, c.srcTexH, c.texKey ? 1 : 0); }
         }
     }
+    ps2xRecPoolDrain();   // [recpool] every posted record job is merged into m_building before the list is published
     decPoolDrain();   // [decpool] every decode this frame posted has landed before the list is published (m_mtx not held here)
     std::unique_lock<std::mutex> lk(m_mtx);
     auto unservicedDecode = [&]() -> bool {   // [deferpub] a decode command published unserviced can only be

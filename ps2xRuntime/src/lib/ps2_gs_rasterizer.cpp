@@ -16,6 +16,7 @@ static thread_local int g_subDx0 = 0, g_subDxW = 0;   // [subdecode] decode wind
 #include "ps2_log.h"
 #include <atomic>
 #include <algorithm>
+#include <deque>
 #include <chrono>
 #include <unordered_set>
 #include <cmath>
@@ -31,6 +32,7 @@ static thread_local int g_subDx0 = 0, g_subDxW = 0;   // [subdecode] decode wind
 #include <functional>
 #include <vector>
 #include <memory>
+extern "C" void ps2xEeProfAddCurrentThread(const char *name);   // [eeprof]
 static const struct AlphaLut { uint8_t v[256]; AlphaLut() { for (int i = 0; i < 256; ++i) v[i] = (uint8_t)std::min(255u, (unsigned)i * 255u / 128u); } uint8_t operator[](uint32_t i) const { return v[i & 0xFFu]; } } kAlpha128To255;   // [fastdec] GS alpha (128 = 1.0) -> texture alpha
 extern "C" uint32_t ps2xDeferCoverFor(uint32_t page);   // [defercover] ps2_gs_gpu_renderer.cpp
 extern "C" uint32_t ps2xDeferCoverFbp(uint32_t page);   // [clutcover] ps2_gs_gpu_renderer.cpp
@@ -3762,6 +3764,11 @@ struct RecSpan { uint32_t lo = 0, hi = 0, clut = 0xFFFFFFFFu; };
 RecSpan g_recSpanRing[256]; uint32_t g_recSpanIdx = 0;
 std::atomic<uint64_t> g_scissorCulled{0};   // [scissorcull] primitives dropped as fully outside SCISSOR
 
+// [recpool] what a record thread hands back per draw: the finished DrawCmd(s) and how the worker may merge them.
+// kind 0 = whole command (recordCmd); 1 = sprite piece (continues the batch its first piece opened);
+// 2 = triangle (may append to the renderer's open batch when `batchable`, exactly as the inline path decides).
+struct RecPiece { GsGpuRenderer::DrawCmd cmd; uint8_t kind; bool batchable; uint16_t draw = 0; };   // draw: index within the chunk (the merge resets the sprite-piece rule per draw)
+struct GSRasterizer::RecOut { std::vector<RecPiece> pieces; };
 bool GSRasterizer::recordSpriteGPU(RecInput &in)
 {
     gprof::Scope gpScope(gprof::REC_PRE);   // [guestprof] sub-phases via gprof::mark below
@@ -4108,10 +4115,11 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
         tplHit = (why < 0);
         if (why >= 0 && gprof::g_on) g_recTplWhy[why].fetch_add(1, std::memory_order_relaxed);
     }
-    if (tplHit) { texKey = s_tpl.texKey; texW = s_tpl.texW; texH = s_tpl.texH; g_recTplHit.store(g_recTplHit.load(std::memory_order_relaxed) + 1ul, std::memory_order_relaxed); /* [statbump] single writer: no locked RMW */ }
+    if (in.preResolved) { texKey = in.resolved.texKey; texW = in.resolved.texW; texH = in.resolved.texH; tplHit = in.resolved.tplHit; g_subDxW = in.resolved.subDxW; g_subDx0 = in.resolved.subDx0; }   // [recpool] the worker resolved this draw
+    else if (tplHit) { texKey = s_tpl.texKey; texW = s_tpl.texW; texH = s_tpl.texH; g_recTplHit.store(g_recTplHit.load(std::memory_order_relaxed) + 1ul, std::memory_order_relaxed); /* [statbump] single writer: no locked RMW */ }
     else
     {
-    static bool g_rawAlphaDec_s = false;
+    static thread_local bool g_rawAlphaDec_s = false;   // [recpool] per thread
     {
         static const bool s_rawMask = [](){ const char *v = std::getenv("PS2X_RAWMASK");
                                             return v && v[0] && v[0] != '0'; }();
@@ -4759,6 +4767,12 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
                 for (int k = 0; k < 3; ++k) in.vtx[k].a = 0x80u;
         }
     }
+    if (in.resolveOnly)
+    {   // [recpool] the worker's stream-ordered half is done: hand the build to a record thread
+        in.resolved.texKey = texKey; in.resolved.texW = texW; in.resolved.texH = texH; in.resolved.tplHit = tplHit;
+        in.resolved.subDxW = g_subDxW; in.resolved.subDx0 = g_subDx0;
+        return true;
+    }
     gprof::mark(gprof::REC_BUILD);   // [guestprof]
     // [drawbatch] A CONTINUATION of the renderer's open plain-class batch does not fill the state
     // part at all: it only writes the three vertices and appends them (see GsGpuRenderer::DrawCmd
@@ -4779,8 +4793,8 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
     static thread_local uint64_t s_bcmdSeq = ~0ull;
     extern bool g_recordDepthOnly;
     extern int g_recordAliasKind;
-    const bool batchCont = s_tplOn && tplHit && !isSprite && GsGpuRenderer::batchingEnabled()
-                           && !g_recordDepthOnly && g_recordAliasKind == 0
+    const bool batchable = s_tplOn && tplHit && !isSprite && GsGpuRenderer::batchingEnabled() && in.batchOk;   // [recpool] the merge may append this
+    const bool batchCont = !in.out && batchable && !g_recordDepthOnly && g_recordAliasKind == 0
                            && r.batchOpen() && r.batchSeq() == s_bcmdSeq;
     {   // [batchstat] PS2X_BATCHSTAT=1: WHY does a primitive have to refill the whole DrawCmd?
         // REC_BUILD is ~120 ms/s on the low-end target (4.5 ms/frame, ~74 ns/prim) and it is almost
@@ -5154,7 +5168,7 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
                 ++s_n;
             }
         }
-        r.recordCmd(cmd);
+        if (in.out) in.out->pieces.push_back(RecPiece{cmd, 0u, false}); else r.recordCmd(cmd);   // [recpool]
     }
     else
     {
@@ -5633,9 +5647,13 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
                             cmd.tri[i].q = 1.0f;   // [perspq] sub-vertices carry the quotient: no per-pixel divide
                             cmd.tri[i].r = vv[i]->r; cmd.tri[i].g = vv[i]->g; cmd.tri[i].b = vv[i]->b; cmd.tri[i].a = vv[i]->a;
                         }
-                        if (pieceSeq != r.batchSeq() || !r.batchOpen() || !r.appendBatchTri(cmd.tri))
-                            r.recordCmd(cmd);   // [drawbatch] first piece (or a batch that closed): full command
-                        pieceSeq = r.batchSeq();
+                        if (in.out) in.out->pieces.push_back(RecPiece{cmd, 1u, batchable});   // [recpool] merged in order by the worker
+                        else
+                        {
+                            if (pieceSeq != r.batchSeq() || !r.batchOpen() || !r.appendBatchTri(cmd.tri))
+                                r.recordCmd(cmd);   // [drawbatch] first piece (or a batch that closed): full command
+                            pieceSeq = r.batchSeq();
+                        }
                         if (grassClass) ++s_gbCount;   // [grassbudget]
                     };
                     auto mid = [](const SV &a, const SV &b)
@@ -5754,12 +5772,13 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
             }
             if (!subdivided)
             {   // [drawbatch] three vertex stores into the open batch instead of a whole command
-                if (!batchCont || !r.appendBatchTri(cmd.tri))
+                if (in.out) in.out->pieces.push_back(RecPiece{cmd, 2u, batchable});   // [recpool]
+                else if (!batchCont || !r.appendBatchTri(cmd.tri))
                     r.recordCmd(cmd);
             }
         }
     }
-    s_bcmdSeq = r.batchSeq();   // [drawbatch] our command is the batch head until someone else records
+    if (!in.out) s_bcmdSeq = r.batchSeq();   // [drawbatch] our command is the batch head until someone else records
     return true;
 }
 void GSRasterizer::RecInput::refreshClut()
@@ -5770,7 +5789,7 @@ void GSRasterizer::RecInput::refreshClut()
     else clut = gs->m_clutCache;
     clutKey = gs->m_clutCacheKey; clutHash256 = gs->m_clutCacheHash256; clutHash16 = gs->m_clutCacheHash16;
 }
-bool GSRasterizer::recordSpriteGPU(GS *gs)
+bool GSRasterizer::recordSpriteGPUSeq(GS *gs)
 {   // [recinput] Stage 1: point RecInput at the live GS (no copies) and record exactly as before.
     // [recsnap] Stage 2 (PS2X_RECSNAP=1, default off): record from a COPY of everything the function reads -- the three
     // vertices, the primitive and context registers, TEXA/TEXCLUT and the built palette -- still on this thread and
@@ -5800,6 +5819,224 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     const bool ok = recordSpriteGPU(in);
     if (s_snap) { gs->m_vtxQueue[0].a = snap.vtx[0].a; gs->m_vtxQueue[1].a = snap.vtx[1].a; gs->m_vtxQueue[2].a = snap.vtx[2].a; }   // [fadefull] writes alpha back
     return ok;
+}
+
+// [recpool] ---------------------------------------------------------------------------------------------------
+// Stage 3 of chunked recording. The kick worker keeps everything that must run in stream order -- parsing, register
+// state, uploads, barrier decisions and the texture resolve (it hashes live VRAM) -- and hands the remaining work of
+// each draw (pre + build, ~2/3 of the record cost) to N record threads as a ~300 B snapshot, in CHUNKS of up to
+// kRecChunk draws (one queue push + notify per chunk: per-draw handoff cost 22 vs 14 ms/frame on the bench).
+// Results are merged back into the building list IN ORDER by the worker, where the sequential batching state
+// machine lives. Fences: the frame publish and every barrier post drain the pool; a draw the pool may not take (a
+// page with a dirty FBO or a pending flush, the depth-only / alias companions) posts the partial chunk, drains, and
+// records inline. No record thread reads VRAM, so uploads need no fence (a fight does ~6400 of them a second).
+//   PS2X_RECPAR=N          record threads (default 0 = off)
+//   PS2X_RECCHUNK=K        draws per chunk (default 128)
+//   PS2X_RECPOOLSTAT=1     a [recpool] line every 10 s (also under PS2X_EEPROF)
+namespace {
+constexpr size_t kRecChunkMax = 256;
+struct RecDraw
+{
+    GSVertex vtx[3]; GSPrimReg prim; GSContext ctx; GSTexaReg texa; GSTexClutReg texclut;
+    std::shared_ptr<const std::array<uint32_t, 256>> pal;
+    uint64_t clutKey = ~0ull, clutHash256 = 0, clutHash16 = 0; uint32_t stateGen = 0, texUploadGen = 0;
+    GSRasterizer::RecInput::Resolved resolved; bool batchOk = true;
+};
+struct RecChunk
+{
+    RecDraw draws[kRecChunkMax]; size_t n = 0;
+    GSRasterizer::RecOut out;
+    GSRasterizer *ras = nullptr;
+    std::atomic<int> state{0};   // 0 free, 1 posted, 2 done
+};
+constexpr size_t kRecRing = 64;   // chunks in flight at most
+struct RecPoolState
+{
+    RecChunk *ring = nullptr;
+    uint64_t head = 0, tail = 0;                   // worker-owned: next to merge / next to post; ring[tail] is being filled
+    std::mutex mx; std::condition_variable cv, done;
+    std::deque<RecChunk *> q;
+    std::once_flag once;
+    std::shared_ptr<const std::array<uint32_t, 256>> lastPal; uint64_t lastPalKey = ~0ull;
+    uint64_t mergeSeq = ~0ull;                     // mirror of the inline path's s_bcmdSeq
+    std::atomic<uint64_t> nPosted{0}, nInline{0}, nInlineBar{0}, nChunks{0}, nPieces{0}, nDrain{0}, nsDrain{0}, nRingWait{0};
+};
+RecPoolState &g_rp = *new RecPoolState;   // leaked on purpose (the [decpool] exit-hang lesson)
+int recPoolThreads() { static const int n = [](){ const char *v = std::getenv("PS2X_RECPAR"); return v && v[0] ? std::atoi(v) : 0; }(); return n; }
+size_t recChunkSize() { static const size_t k = [](){ const char *v = std::getenv("PS2X_RECCHUNK"); long n = v && v[0] ? std::atol(v) : 128; if (n < 1) n = 1; if (n > (long)kRecChunkMax) n = kRecChunkMax; return (size_t)n; }(); return k; }
+void recPoolWorker()
+{
+    ps2xEeProfAddCurrentThread("RecPool");
+    for (;;)
+    {
+        RecChunk *c = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(g_rp.mx);
+            g_rp.cv.wait(lk, []{ return !g_rp.q.empty(); });
+            c = g_rp.q.front(); g_rp.q.pop_front();
+        }
+        c->out.pieces.clear();
+        for (size_t d = 0; d < c->n; ++d)
+        {
+            const RecDraw &j = c->draws[d];
+            GSRasterizer::RecInput in;
+            in.gs = nullptr; in.vtx = const_cast<GSVertex *>(j.vtx); in.prim = &j.prim; in.ctx = &j.ctx; in.texa = &j.texa; in.texclut = &j.texclut;
+            in.clut = j.pal ? j.pal->data() : nullptr; in.clutKey = j.clutKey; in.clutHash256 = j.clutHash256; in.clutHash16 = j.clutHash16;
+            in.vram = nullptr; in.vramSize = 0; in.stateGen = j.stateGen; in.texUploadGen = j.texUploadGen;
+            in.preResolved = true; in.resolved = j.resolved; in.batchOk = j.batchOk; in.out = &c->out;
+            const size_t before = c->out.pieces.size();
+            c->ras->recordSpriteGPU(in);
+            for (size_t p = before; p < c->out.pieces.size(); ++p) c->out.pieces[p].draw = (uint16_t)d;
+        }
+        { std::lock_guard<std::mutex> lk(g_rp.mx); c->state.store(2, std::memory_order_release); }
+        g_rp.done.notify_all();
+    }
+}
+void recPoolStart()
+{
+    g_rp.ring = new RecChunk[kRecRing];
+    const int n = recPoolThreads();
+    for (int i = 0; i < n; ++i) { std::thread t(recPoolWorker); t.detach(); }
+    std::fprintf(stderr, "[recpool] %d record thread(s), chunks of %zu draws, ring %zu\n", n, recChunkSize(), kRecRing);
+}
+void recPoolMergeOne(RecChunk &c)
+{   // worker thread, in stream order: replay exactly what the inline path would have done with each piece
+    GsGpuRenderer &r = ps2GpuRenderer();
+    uint64_t pieceSeq = ~0ull; uint16_t curDraw = 0xFFFFu;
+    for (const RecPiece &pc : c.out.pieces)
+    {
+        if (pc.draw != curDraw) { curDraw = pc.draw; pieceSeq = ~0ull; }
+        switch (pc.kind)
+        {
+        case 0: r.recordCmd(pc.cmd); g_rp.mergeSeq = ~0ull; break;
+        case 1:
+            if (pieceSeq != r.batchSeq() || !r.batchOpen() || !r.appendBatchTri(pc.cmd.tri)) r.recordCmd(pc.cmd);
+            pieceSeq = r.batchSeq(); g_rp.mergeSeq = ~0ull; break;
+        default:
+            if (!(pc.batchable && r.batchOpen() && r.batchSeq() == g_rp.mergeSeq && r.appendBatchTri(pc.cmd.tri))) r.recordCmd(pc.cmd);
+            g_rp.mergeSeq = r.batchSeq(); break;
+        }
+    }
+    g_rp.nPieces.fetch_add(c.out.pieces.size(), std::memory_order_relaxed);
+    g_rp.nChunks.fetch_add(1u, std::memory_order_relaxed);
+    c.n = 0;
+}
+void recPoolMergeReady()
+{   // non-blocking: merge every finished chunk at the head of the ring (never the one being filled)
+    while (g_rp.head != g_rp.tail)
+    {
+        RecChunk &c = g_rp.ring[g_rp.head % kRecRing];
+        if (c.state.load(std::memory_order_acquire) != 2) break;
+        recPoolMergeOne(c); c.state.store(0, std::memory_order_relaxed); ++g_rp.head;
+    }
+}
+void recPoolMergeHeadBlocking()
+{
+    RecChunk &c = g_rp.ring[g_rp.head % kRecRing];
+    if (c.state.load(std::memory_order_acquire) != 2)
+    {
+        std::unique_lock<std::mutex> lk(g_rp.mx);
+        g_rp.done.wait(lk, [&]{ return c.state.load(std::memory_order_acquire) == 2; });
+    }
+    recPoolMergeOne(c); c.state.store(0, std::memory_order_relaxed); ++g_rp.head;
+}
+void recPoolPostCurrent()
+{   // hand the chunk being filled to the threads (no-op when empty)
+    RecChunk &c = g_rp.ring[g_rp.tail % kRecRing];
+    if (c.n == 0) return;
+    c.state.store(1, std::memory_order_relaxed);
+    { std::lock_guard<std::mutex> lk(g_rp.mx); g_rp.q.push_back(&c); }
+    g_rp.cv.notify_one();
+    ++g_rp.tail;
+    g_rp.nPosted.fetch_add(c.n, std::memory_order_relaxed);
+    recPoolMergeReady();
+}
+void recPoolStat()
+{
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_RECPOOLSTAT"); const char *e = std::getenv("PS2X_EEPROF");
+                                   return (v && v[0] && v[0] != '0') || (e && e[0] && e[0] != '0'); }();
+    if (!s_on) return;
+    static auto s_t = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - s_t < std::chrono::seconds(10)) return;
+    const double secs = std::chrono::duration<double>(now - s_t).count(); s_t = now;
+    const uint64_t np = g_rp.nPosted.exchange(0), ni = g_rp.nInline.exchange(0), nb = g_rp.nInlineBar.exchange(0), nc = g_rp.nChunks.exchange(0),
+                   npc = g_rp.nPieces.exchange(0), nd = g_rp.nDrain.exchange(0), nsd = g_rp.nsDrain.exchange(0), nw = g_rp.nRingWait.exchange(0);
+    std::fprintf(stderr, "[recpool] %.0f draws/s pooled in %.0f chunks/s (%.1f draws/chunk, %.2f pieces/draw), %.0f inline/s (%.0f barrier), drains %.1f/s costing %.2f ms/s, ring-full waits %.1f/s\n",
+                 np / secs, nc / secs, nc ? (double)np / (double)nc : 0.0, np ? (double)npc / (double)np : 0.0, ni / secs, nb / secs, nd / secs, nsd / 1e6 / secs, nw / secs);
+}
+}   // namespace
+
+extern "C" void ps2xRecPoolDrain()
+{   // worker thread: post the partial chunk and merge everything (blocking on chunks still in flight)
+    if (!g_rp.ring) { recPoolStat(); return; }
+    recPoolPostCurrent();
+    if (g_rp.head == g_rp.tail) { recPoolStat(); return; }
+    const auto t0 = std::chrono::steady_clock::now();
+    while (g_rp.head != g_rp.tail) recPoolMergeHeadBlocking();
+    g_rp.nDrain.fetch_add(1u, std::memory_order_relaxed);
+    g_rp.nsDrain.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+    recPoolStat();
+}
+
+bool GSRasterizer::recordSpriteGPU(GS *gs)
+{
+    const int par = recPoolThreads();
+    if (par <= 0) return recordSpriteGPUSeq(gs);
+    std::call_once(g_rp.once, recPoolStart);
+    extern bool g_recordDepthOnly; extern int g_recordAliasKind;
+    const GSContext &ctx = gs->activeContext();
+    const bool tme = gs->m_prim.tme != 0;
+    const uint32_t psm = ctx.tex0.psm;
+    const bool pal = tme && (psm == GS_PSM_T8 || psm == GS_PSM_T4 || psm == GS_PSM_T8H || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH);
+    bool poolable = !g_recordDepthOnly && g_recordAliasKind == 0;
+    if (poolable && tme)
+    {
+        GsGpuRenderer &r = ps2GpuRenderer();
+        if (r.pageMayNeedBarrier(ctx.tex0.tbp0 / 32u) || (pal && r.pageMayNeedBarrier(ctx.tex0.cbp / 32u)))
+        { poolable = false; g_rp.nInlineBar.fetch_add(1u, std::memory_order_relaxed); }
+    }
+    if (!poolable)
+    {   // stream order: everything before this draw must be in the list first
+        ps2xRecPoolDrain();
+        g_rp.nInline.fetch_add(1u, std::memory_order_relaxed);
+        return recordSpriteGPUSeq(gs);
+    }
+    // 1. the stream-ordered half on this thread: pre (culls) + the resolve on live VRAM
+    RecInput in;
+    in.gs = gs; in.vtx = gs->m_vtxQueue; in.prim = &gs->m_prim; in.ctx = &ctx; in.texa = &gs->m_texa; in.texclut = &gs->m_texclut;
+    in.vram = gs->m_vram; in.vramSize = gs->m_vramSize; in.stateGen = gs->m_stateGen; in.texUploadGen = gs->m_texUploadGen;
+    in.refreshClut();
+    in.resolveOnly = true;
+    if (!recordSpriteGPU(in)) return false;   // culled or handled entirely on this side: nothing to build
+    // 2. snapshot into the chunk being filled; post it when full (merging finished chunks, waiting only if the ring is full)
+    RecChunk *c = &g_rp.ring[g_rp.tail % kRecRing];
+    if (c->n >= recChunkSize())
+    {
+        recPoolPostCurrent();
+        while (g_rp.tail - g_rp.head >= kRecRing) { g_rp.nRingWait.fetch_add(1u, std::memory_order_relaxed); recPoolMergeHeadBlocking(); }
+        c = &g_rp.ring[g_rp.tail % kRecRing];
+    }
+    RecDraw &j = c->draws[c->n];
+    j.vtx[0] = gs->m_vtxQueue[0]; j.vtx[1] = gs->m_vtxQueue[1]; j.vtx[2] = gs->m_vtxQueue[2];
+    j.prim = gs->m_prim; j.ctx = ctx; j.texa = gs->m_texa; j.texclut = gs->m_texclut;
+    if (pal)
+    {   // an immutable palette block shared by every draw with the same palette key (no 1 KB copy per draw)
+        if (!g_rp.lastPal || g_rp.lastPalKey != gs->m_clutCacheKey)
+        {
+            auto blk = std::make_shared<std::array<uint32_t, 256>>();
+            std::memcpy(blk->data(), gs->m_clutCache, 256u * sizeof(uint32_t));
+            g_rp.lastPal = std::move(blk); g_rp.lastPalKey = gs->m_clutCacheKey;
+        }
+        j.pal = g_rp.lastPal;
+    }
+    else j.pal.reset();
+    j.clutKey = gs->m_clutCacheKey; j.clutHash256 = gs->m_clutCacheHash256; j.clutHash16 = gs->m_clutCacheHash16;
+    j.stateGen = gs->m_stateGen; j.texUploadGen = gs->m_texUploadGen;
+    j.resolved = in.resolved; j.batchOk = true;
+    c->ras = this;
+    ++c->n;
+    return true;
 }
 
 
