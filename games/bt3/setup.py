@@ -99,6 +99,10 @@ def cmake_configure_extra() -> list:
     """-T only makes sense for the Visual Studio generator; a Ninja build directory (clang-cl via
     -DCMAKE_CXX_COMPILER=clang-cl) must not get it, or the reconfigure fails."""
     extra = ["-DCMAKE_BUILD_TYPE=Release"]   # explicit: a Windows Ninja/clang-cl configure came up Debug (/Od /RTC1 -MDd)
+    # ps2xStudio (the editor tool) fetches four git branches at configure time; a network hiccup there
+    # aborted a user's whole game build (imgui_colortextedit populate failed, 2026-09-08). The game does
+    # not need it: off unless PS2X_SETUP_STUDIO=1.
+    extra.append("-DPS2X_BUILD_STUDIO=" + ("ON" if os.environ.get("PS2X_SETUP_STUDIO") == "1" else "OFF"))
     if not IS_WINDOWS:
         return extra
     cache = BUILD / "CMakeCache.txt"
@@ -111,6 +115,17 @@ def cmake_configure_extra() -> list:
         if "Visual Studio" not in gen:
             return extra
     return extra + ["-T", os.environ.get("PS2X_SETUP_TOOLSET", "ClangCL")]
+
+
+def configured() -> bool:
+    """True when the build dir holds a COMPLETED configure: CMakeCache.txt alone is not enough --
+    a configure that failed half-way (a FetchContent download error) leaves the cache behind with no
+    project files, and `cmake --build` then dies with "MSB1009: Project file does not exist"."""
+    if not (BUILD / "CMakeCache.txt").exists():
+        return False
+    if any((BUILD / f).exists() for f in ("build.ninja", "Makefile", "ALL_BUILD.vcxproj")):
+        return True
+    return any(BUILD.glob("*.sln"))
 
 
 def cmake_build(target: str, jobs: str) -> None:
@@ -161,7 +176,7 @@ def main() -> None:
     #    source set changes — and an unnecessary reconfigure rewrites the MSVC
     #    project files, which makes MSBuild rebuild everything from scratch.
     print("== building recompiler")
-    if not (BUILD / "CMakeCache.txt").exists():
+    if not configured():
         run(["cmake", "-S", ROOT, "-B", BUILD] + cmake_configure_extra())
     cmake_build("ps2_recomp", str(os.cpu_count() or 4))
     recomp = find_binary("ps2_recomp")
@@ -207,7 +222,7 @@ def main() -> None:
     #    function tables). Reconfigure explicitly when the runner/overlay file set
     #    changed since the last configure; content-only changes still skip it.
     cache = BUILD / "CMakeCache.txt"
-    need_cfg = not cache.exists()
+    need_cfg = not configured()
     if not need_cfg:
         ct = cache.stat().st_mtime
         for d in (rt / "src" / "runner", rt / "src" / "runner_overlay"):
