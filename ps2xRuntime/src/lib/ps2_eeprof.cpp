@@ -34,6 +34,11 @@
 #include <unistd.h>
 #endif
 
+#include "ps2_waitprof.h"
+std::atomic<uint64_t> g_ps2xWaitNs[WP_COUNT];
+std::atomic<uint64_t> g_ps2xWaitN[WP_COUNT];
+bool g_ps2xWaitProfOn = [](){ const char *e = std::getenv("PS2X_EEPROF"); return e && e[0] && e[0] != '0'; }();
+
 extern "C" void ps2xEeProfCollectTable(void (*cb)(uintptr_t fnptr, uint32_t guestAddr, int which, void *user), void *user);
 
 namespace
@@ -188,6 +193,18 @@ namespace
             const auto now = clock::now();
             if (std::chrono::duration<double>(now - last).count() < 10.0) continue;
             last = now;
+            {   // [waitprof] blocked time per wait site over the window, ms/s
+                static const char *const kSite[WP_COUNT] = { "framegate", "kickq_frames", "kickq_full", "kick_drain", "sched_yield", "sched_slot", "handoff", "sema", "sync_other", "sleep", "worker_idle" };
+                static uint64_t lastNs[WP_COUNT] = {0}, lastN[WP_COUNT] = {0};
+                std::string line;
+                for (int k = 0; k < WP_COUNT; ++k)
+                {
+                    const uint64_t ns = g_ps2xWaitNs[k].load(std::memory_order_relaxed), n = g_ps2xWaitN[k].load(std::memory_order_relaxed);
+                    char b[96]; std::snprintf(b, sizeof(b), " %s=%.1f(%llu)", kSite[k], (double)(ns - lastNs[k]) / 1e7, (unsigned long long)(n - lastN[k]));
+                    line += b; lastNs[k] = ns; lastN[k] = n;
+                }
+                std::fprintf(stderr, "[waitprof] ms/s(waits/10s):%s\n", line.c_str());
+            }
             for (size_t i = 0; i < g_targets.size(); ++i)
             {
                 if (total[i] == 0) continue;

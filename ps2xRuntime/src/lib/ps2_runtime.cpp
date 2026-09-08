@@ -1,3 +1,4 @@
+#include "ps2_waitprof.h"   // [waitprof]
 #include "runtime/ps2_guestprof.h"
 #include "runtime/ps2_texreplace.h"   // [texreplace]
 #include <filesystem>
@@ -3813,6 +3814,7 @@ void PS2Runtime::schedAcquire(int tid, int prio)
     if (schedDbgOn()) std::cerr << "[sched] tid " << tid << " ACQUIRE-wait (cur=" << m_schedCurrent << ")" << std::endl;
     while (!(m_schedCurrent == tid || isStopRequested()))
     {
+        Ps2xWaitScope wslot(WP_SCHED_SLOT);
         if (slot->cv.wait_for(lk, std::chrono::milliseconds(250),
                               [&] { return m_schedCurrent == tid || isStopRequested(); }))
             break;
@@ -3852,7 +3854,7 @@ void PS2Runtime::schedYield(int tid)
         std::unique_lock<std::mutex> lk(m_schedMutex);
         auto it = m_schedThreads.find(tid);
         if (it != m_schedThreads.end())
-            it->second->cv.wait(lk, [&] { return m_schedCurrent == tid || isStopRequested(); });
+        { Ps2xWaitScope w(WP_SCHED_YIELD); it->second->cv.wait(lk, [&] { return m_schedCurrent == tid || isStopRequested(); }); }
     }
     reacquireGuestExecution(depth);
 }
@@ -3886,6 +3888,7 @@ void PS2Runtime::yieldGuestExecutionAfterWake()
     {
         GuestExecutionReleaseScope releaseGuestExecution(this);
         std::unique_lock<std::mutex> lock(m_guestExecutionHandoffMutex);
+        Ps2xWaitScope whand(WP_HANDOFF);
         m_guestExecutionHandoffCv.wait_for(lock, std::chrono::milliseconds(2), [&]()
                                            { return m_guestExecutionHandoffEpoch.load(std::memory_order_acquire) != handoffEpoch; });
     }
