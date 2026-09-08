@@ -35,6 +35,9 @@ bool g_kickSrcMapEnabled()
 #endif
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <condition_variable>
+#include <thread>
 extern "C" void ps2xEeProfAddCurrentThread(const char *name);   // [eeprof]
 extern "C" void ps2xGsDisplayFlipHook(unsigned long long dispfb);   // [displatch] ps2_gs_gpu.cpp
 
@@ -257,11 +260,13 @@ PS2Memory::~PS2Memory()
         if (m_kickThreadStarted)
         {
             m_kickStop = true;
+            m_s2Cv.notify_all();   // [vu1pipe]
             m_kickCv.notify_all();
         }
     }
     if (m_kickThread.joinable())
         m_kickThread.join();
+    if (m_s2Thread.joinable()) { { std::lock_guard<std::mutex> lk(m_s2Mtx); } m_s2Cv.notify_all(); m_s2Thread.join(); }   // [vu1pipe]
 
     if (m_rdram)
     {
@@ -2256,6 +2261,7 @@ void PS2Memory::ensureKickWorker()
         return;
     m_kickThreadStarted = true;
     m_kickThread = std::thread([this]() { kickWorkerLoop(); });
+    if (vu1PipeEnabled()) m_s2Thread = std::thread([this]() { stage2Loop(); });   // [vu1pipe]
 }
 
 void PS2Memory::enqueueKickJob(KickJob &&job)
@@ -2295,7 +2301,7 @@ void PS2Memory::drainKickQueue()
     std::unique_lock<std::mutex> lk(m_kickMtx);
     if (!m_kickThreadStarted)
         return;
-    { Ps2xWaitScope w(WP_KICK_DRAIN); m_kickDoneCv.wait(lk, [this]() { return (m_kickQueue.empty() && !m_kickBusy) || m_kickStop; }); }
+    { Ps2xWaitScope w(WP_KICK_DRAIN); m_kickDoneCv.wait(lk, [this]() { return (m_kickQueue.empty() && !m_kickBusy && m_s2Pending.load(std::memory_order_acquire) == 0u) || m_kickStop; }); }   // [vu1pipe] both stages
 }
 
 // [framegate] The kick worker's BUSY time for the last completed frame, in ns. The frame gate in
@@ -2321,9 +2327,89 @@ static bool ps2xAsyncPaceRelaxed()
     if (s_mode >= 2) return true;
     return ps2xFrameGateHeavy();
 }
+std::atomic<uint64_t> g_stage2FrameNs{0};   // [vu1pipe] stage 2's cost per frame (published at its swap)
+static thread_local bool t_onKickWorker = false;   // [vu1pipe] the arbiter hand-off applies only on the worker
+bool PS2Memory::vu1PipeEnabled()
+{
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_VU1PIPE"); const bool on = v && v[0] == '1';
+                                   if (on) std::fprintf(stderr, "[vu1pipe] two-stage kick pipeline ON (worker: VIF+VU1; GsThread: GIF parse + record)\n");
+                                   return on; }();
+    return s_on && asyncKickEnabled();
+}
+void PS2Memory::stage2Push(Stage2Item &&item)
+{
+    m_s2Pending.fetch_add(1u, std::memory_order_acq_rel);
+    { std::lock_guard<std::mutex> lk(m_s2Mtx); m_s2q.push_back(std::move(item)); }
+    m_s2Cv.notify_one();
+}
+void PS2Memory::stage2FlushArbiter()
+{
+    if (!m_gifArbiter) return;
+    Stage2Item it; it.kind = 0u;
+    m_gifArbiter->takeQueue(it.pkts);
+    if (!it.pkts.empty()) stage2Push(std::move(it));
+}
+void PS2Memory::arbiterDrainOrHandoff()
+{   // the four drain sites: on the worker with the pipeline on, hand the packets to stage 2; otherwise drain in place
+    if (!m_gifArbiter) return;
+    if (vu1PipeEnabled() && t_onKickWorker) stage2FlushArbiter();
+    else m_gifArbiter->drain();
+}
+void PS2Memory::stage2Loop()
+{
+    ps2xEeProfAddCurrentThread("GsThread");   // [eeprof]
+    uint64_t accNs = 0;
+    uint64_t nItems = 0, nPkts = 0, busyNs = 0; size_t maxDepth = 0; auto tStat = std::chrono::steady_clock::now();
+    static const bool s_stat = [](){ const char *v = std::getenv("PS2X_VU1PIPESTAT"); const char *e = std::getenv("PS2X_EEPROF");
+                                     return (v && v[0] && v[0] != '0') || (e && e[0] && e[0] != '0'); }();
+    for (;;)
+    {
+        Stage2Item it;
+        {
+            std::unique_lock<std::mutex> lk(m_s2Mtx);
+            { Ps2xWaitScope w(WP_STAGE2_IDLE); m_s2Cv.wait(lk, [this]() { return !m_s2q.empty() || m_kickStop; }); }
+            if (m_s2q.empty()) return;   // stop
+            if (m_s2q.size() > maxDepth) maxDepth = m_s2q.size();
+            it = std::move(m_s2q.front()); m_s2q.pop_front();
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        switch (it.kind)
+        {
+        case 0u: for (const auto &pkt : it.pkts) m_gifArbiter->process(pkt); nPkts += it.pkts.size(); break;
+        case 1u:
+            ps2GpuRenderer().swapFrame();
+            { std::lock_guard<std::mutex> lk(m_kickMtx); if (m_kickFramesQueued > 0u) --m_kickFramesQueued; m_kickDoneCv.notify_all(); }
+            break;
+        case 2u: if (it.fn) it.fn(); break;
+        default:
+            if (it.chan == 1u)      m_asyncChanBusy[1].fetch_sub(1, std::memory_order_release);
+            else if (it.chan == 2u) m_asyncChanBusy[2].fetch_sub(1, std::memory_order_release);
+            break;
+        }
+        const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        accNs += ns; busyNs += ns; ++nItems;
+        if (it.kind == 1u) { g_stage2FrameNs.store(accNs, std::memory_order_relaxed); accNs = 0; }
+        if (m_s2Pending.fetch_sub(1u, std::memory_order_acq_rel) == 1u)
+        {   // idle: wake a drain
+            std::lock_guard<std::mutex> lk(m_kickMtx);
+            m_kickDoneCv.notify_all();
+        }
+        if (s_stat)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            const double dt = std::chrono::duration<double>(now - tStat).count();
+            if (dt >= 10.0)
+            {
+                std::fprintf(stderr, "[vu1pipe] GsThread: %.0f items/s, %.0f packets/s, busy %.0f ms/s, max queue %zu\n", nItems / dt, nPkts / dt, busyNs / 1e6 / dt, maxDepth);
+                nItems = nPkts = busyNs = 0; maxDepth = 0; tStat = now;
+            }
+        }
+    }
+}
 void PS2Memory::kickWorkerLoop()
 {
     ps2xEeProfAddCurrentThread("KickWorker");   // [eeprof]
+    t_onKickWorker = true;   // [vu1pipe]
     for (;;)
     {
         KickJob job;
@@ -2348,23 +2434,25 @@ void PS2Memory::kickWorkerLoop()
             submitGifPacket(GifPathId::Path3, job.data.data(), static_cast<uint32_t>(job.data.size()), false);
             break;
         case KickJob::SwapFrame:
-            ps2GpuRenderer().swapFrame();
+            if (vu1PipeEnabled()) { Stage2Item it; it.kind = 1u; stage2Push(std::move(it)); }   // [vu1pipe] the publish happens on stage 2, in order
+            else ps2GpuRenderer().swapFrame();
             break;
         case KickJob::GsApply:   // [gsqueue]
-            if (job.fn) job.fn();
+            if (vu1PipeEnabled()) { Stage2Item it; it.kind = 2u; it.fn = std::move(job.fn); stage2Push(std::move(it)); }
+            else if (job.fn) job.fn();
             break;
         }
         // Sync mode ends every kick with a trailing arbiter drain (processPendingTransfers);
         // replicate that here so deferred PATH3 packets don't sit queued across frames.
         if (job.kind != KickJob::SwapFrame && m_gifArbiter)
-            m_gifArbiter->drain();
+            arbiterDrainOrHandoff();
         {   // [framegate] accumulate this frame's worker cost; publish it at the frame boundary
             static uint64_t s_accNs = 0;
             s_accNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                            std::chrono::steady_clock::now() - _jobT0).count();
             if (job.kind == KickJob::SwapFrame)
-            {
-                g_workerFrameNs.store(s_accNs, std::memory_order_relaxed);
+            {   // [vu1pipe] the frame gate wants the pipeline's critical path: the slower of the two stages
+                g_workerFrameNs.store(std::max(s_accNs, g_stage2FrameNs.load(std::memory_order_relaxed)), std::memory_order_relaxed);
                 s_accNs = 0;
             }
         }
@@ -2391,9 +2479,18 @@ void PS2Memory::kickWorkerLoop()
         }
         // [asyncpace] Released AFTER the drain above, so CHCR.STR only reads 0 once this
         // channel's work has actually reached the GS -- the hardware contract the guest relies on.
-        if (job.kind == KickJob::Vif1)          m_asyncChanBusy[1].fetch_sub(1, std::memory_order_release);
-        else if (job.kind == KickJob::GifPath3) m_asyncChanBusy[2].fetch_sub(1, std::memory_order_release);
+        if (vu1PipeEnabled())
+        {   // [vu1pipe] the channel-busy release and the frame count belong to the stage that finishes the job's work
+            Stage2Item it; it.kind = 3u; it.chan = (job.kind == KickJob::Vif1) ? 1u : (job.kind == KickJob::GifPath3) ? 2u : 0u;
+            stage2Push(std::move(it));
+            std::unique_lock<std::mutex> lk(m_kickMtx);
+            m_kickBusy = false;
+            m_kickDoneCv.notify_all();
+        }
+        else
         {
+            if (job.kind == KickJob::Vif1)          m_asyncChanBusy[1].fetch_sub(1, std::memory_order_release);
+            else if (job.kind == KickJob::GifPath3) m_asyncChanBusy[2].fetch_sub(1, std::memory_order_release);
             std::unique_lock<std::mutex> lk(m_kickMtx);
             m_kickBusy = false;
             if (job.kind == KickJob::SwapFrame && m_kickFramesQueued > 0u)
@@ -2751,7 +2848,7 @@ void PS2Memory::processPendingTransfers()
     // the guest thread races the worker's submit/drain and corrupts the packet queue.
     // The worker drains after every job instead.
     if (m_gifArbiter && !asyncKickEnabled())
-        m_gifArbiter->drain();
+        arbiterDrainOrHandoff();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
     static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
@@ -2831,7 +2928,7 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
     m_path3MaskedFifo.clear();
 
     if (m_gifArbiter && drainImmediately)
-        m_gifArbiter->drain();
+        arbiterDrainOrHandoff();
 }
 
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
@@ -2896,7 +2993,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
         m_gifPacketCallback(data, sizeBytes);
 
     if (m_gifArbiter && drainImmediately)
-        m_gifArbiter->drain();
+        arbiterDrainOrHandoff();
 }
 
 void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
