@@ -3762,13 +3762,13 @@ struct RecSpan { uint32_t lo = 0, hi = 0, clut = 0xFFFFFFFFu; };
 RecSpan g_recSpanRing[256]; uint32_t g_recSpanIdx = 0;
 std::atomic<uint64_t> g_scissorCulled{0};   // [scissorcull] primitives dropped as fully outside SCISSOR
 
-bool GSRasterizer::recordSpriteGPU(GS *gs)
+bool GSRasterizer::recordSpriteGPU(RecInput &in)
 {
     gprof::Scope gpScope(gprof::REC_PRE);   // [guestprof] sub-phases via gprof::mark below
-    const auto &ctx = gs->activeContext();
-    const bool isSprite = (gs->m_prim.type == GS_PRIM_SPRITE);
-    const bool tme = gs->m_prim.tme != 0;
-    const bool fst = gs->m_prim.fst != 0;
+    const auto &ctx = (*in.ctx);
+    const bool isSprite = ((*in.prim).type == GS_PRIM_SPRITE);
+    const bool tme = (*in.prim).tme != 0;
+    const bool fst = (*in.prim).fst != 0;
 
     const int ofx = ctx.xyoffset.ofx >> 4;
     const int ofy = ctx.xyoffset.ofy >> 4;
@@ -3802,7 +3802,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             bool allA0 = true;
             for (int i = 0; i < nv; ++i)
             {
-                const GSVertex &v = gs->m_vtxQueue[i];
+                const GSVertex &v = in.vtx[i];
                 const float sx = v.x - ofxF, sy = v.y - ofyF;   // window coords: scissor's space
                 mnx = std::min(mnx, sx); mxx = std::max(mxx, sx);
                 mny = std::min(mny, sy); mxy = std::max(mxy, sy);
@@ -3814,9 +3814,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             else
             {   // same exact 12.4 integer cross product the cull below uses, so the buckets agree.
                 // area is 2x the triangle area in (1/16 px)^2, so 1 px^2 == 512.
-                const long long x0 = std::lround(gs->m_vtxQueue[0].x * 16.0f), y0 = std::lround(gs->m_vtxQueue[0].y * 16.0f);
-                const long long x1 = std::lround(gs->m_vtxQueue[1].x * 16.0f), y1 = std::lround(gs->m_vtxQueue[1].y * 16.0f);
-                const long long x2 = std::lround(gs->m_vtxQueue[2].x * 16.0f), y2 = std::lround(gs->m_vtxQueue[2].y * 16.0f);
+                const long long x0 = std::lround(in.vtx[0].x * 16.0f), y0 = std::lround(in.vtx[0].y * 16.0f);
+                const long long x1 = std::lround(in.vtx[1].x * 16.0f), y1 = std::lround(in.vtx[1].y * 16.0f);
+                const long long x2 = std::lround(in.vtx[2].x * 16.0f), y2 = std::lround(in.vtx[2].y * 16.0f);
                 ar = std::llabs((x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0));
                 if (ar == 0) c_degen.fetch_add(1, std::memory_order_relaxed);
                 else if (ar < 512) c_tiny.fetch_add(1, std::memory_order_relaxed);
@@ -3828,7 +3828,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 c_off.fetch_add(1, std::memory_order_relaxed);
                 if (ar != 0) c_offlive.fetch_add(1, std::memory_order_relaxed);   // the real prize
             }
-            if (allA0 && gs->m_prim.abe) c_a0.fetch_add(1, std::memory_order_relaxed);
+            if (allA0 && (*in.prim).abe) c_a0.fetch_add(1, std::memory_order_relaxed);
             if (!tme) c_notme.fetch_add(1, std::memory_order_relaxed);
 
             static std::atomic<uint64_t> s_lastNs{0};
@@ -3880,7 +3880,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             float mnx = 1e30f, mxx = -1e30f, mny = 1e30f, mxy = -1e30f;
             for (int i = 0; i < nvS; ++i)
             {
-                const GSVertex &v = gs->m_vtxQueue[i];
+                const GSVertex &v = in.vtx[i];
                 const float sx = v.x - ofxF, sy = v.y - ofyF;   // window coords, as SCISSOR is
                 mnx = std::min(mnx, sx); mxx = std::max(mxx, sx);
                 mny = std::min(mny, sy); mxy = std::max(mxy, sy);
@@ -3929,12 +3929,12 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                                 return !(v && v[0] == '0'); }();
             if (s_subCull)
             {
-                const long long x0 = std::lround(gs->m_vtxQueue[0].x * 16.0f);
-                const long long y0 = std::lround(gs->m_vtxQueue[0].y * 16.0f);
-                const long long x1 = std::lround(gs->m_vtxQueue[1].x * 16.0f);
-                const long long y1 = std::lround(gs->m_vtxQueue[1].y * 16.0f);
-                const long long x2 = std::lround(gs->m_vtxQueue[2].x * 16.0f);
-                const long long y2 = std::lround(gs->m_vtxQueue[2].y * 16.0f);
+                const long long x0 = std::lround(in.vtx[0].x * 16.0f);
+                const long long y0 = std::lround(in.vtx[0].y * 16.0f);
+                const long long x1 = std::lround(in.vtx[1].x * 16.0f);
+                const long long y1 = std::lround(in.vtx[1].y * 16.0f);
+                const long long x2 = std::lround(in.vtx[2].x * 16.0f);
+                const long long y2 = std::lround(in.vtx[2].y * 16.0f);
                 const long long area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
                 // SLIVER GUARD (regression fix): a triangle collapses to zero INTEGER area in two
                 // different ways -- (a) it is genuinely tiny, all three vertices inside one pixel,
@@ -3958,9 +3958,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                                      return !(v && v[0] == '0'); }();
                 if (!compact && !(s_keepSliv && g_swDirtyActive))
                 {
-                    const int ix0 = static_cast<int>(gs->m_vtxQueue[0].x), iy0 = static_cast<int>(gs->m_vtxQueue[0].y);
-                    const int ix1 = static_cast<int>(gs->m_vtxQueue[1].x), iy1 = static_cast<int>(gs->m_vtxQueue[1].y);
-                    const int ix2 = static_cast<int>(gs->m_vtxQueue[2].x), iy2 = static_cast<int>(gs->m_vtxQueue[2].y);
+                    const int ix0 = static_cast<int>(in.vtx[0].x), iy0 = static_cast<int>(in.vtx[0].y);
+                    const int ix1 = static_cast<int>(in.vtx[1].x), iy1 = static_cast<int>(in.vtx[1].y);
+                    const int ix2 = static_cast<int>(in.vtx[2].x), iy2 = static_cast<int>(in.vtx[2].y);
                     if (((ix1 - ix0) * (iy2 - iy0) - (iy1 - iy0) * (ix2 - ix0)) == 0)
                         return true;   // non-compact and integer-degenerate: the sliver class
                 }
@@ -3970,9 +3970,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                                return v && v[0] && v[0] != '0'; }();
                 if (s_cs)
                 {
-                    const int ix0 = static_cast<int>(gs->m_vtxQueue[0].x), iy0 = static_cast<int>(gs->m_vtxQueue[0].y);
-                    const int ix1 = static_cast<int>(gs->m_vtxQueue[1].x), iy1 = static_cast<int>(gs->m_vtxQueue[1].y);
-                    const int ix2 = static_cast<int>(gs->m_vtxQueue[2].x), iy2 = static_cast<int>(gs->m_vtxQueue[2].y);
+                    const int ix0 = static_cast<int>(in.vtx[0].x), iy0 = static_cast<int>(in.vtx[0].y);
+                    const int ix1 = static_cast<int>(in.vtx[1].x), iy1 = static_cast<int>(in.vtx[1].y);
+                    const int ix2 = static_cast<int>(in.vtx[2].x), iy2 = static_cast<int>(in.vtx[2].y);
                     const bool oldCull = ((ix1 - ix0) * (iy2 - iy0) - (iy1 - iy0) * (ix2 - ix0)) == 0;
                     static std::atomic<unsigned long> s_tot{0}, s_old{0}, s_new{0}, s_saved{0};
                     const unsigned long n = s_tot.fetch_add(1) + 1;
@@ -4010,9 +4010,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             }
             else
             {
-            const int x0 = static_cast<int>(gs->m_vtxQueue[0].x), y0 = static_cast<int>(gs->m_vtxQueue[0].y);
-            const int x1 = static_cast<int>(gs->m_vtxQueue[1].x), y1 = static_cast<int>(gs->m_vtxQueue[1].y);
-            const int x2 = static_cast<int>(gs->m_vtxQueue[2].x), y2 = static_cast<int>(gs->m_vtxQueue[2].y);
+            const int x0 = static_cast<int>(in.vtx[0].x), y0 = static_cast<int>(in.vtx[0].y);
+            const int x1 = static_cast<int>(in.vtx[1].x), y1 = static_cast<int>(in.vtx[1].y);
+            const int x2 = static_cast<int>(in.vtx[2].x), y2 = static_cast<int>(in.vtx[2].y);
             if ((x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0) == 0)
                 return true; // degenerate: draws no pixels
             }
@@ -4100,10 +4100,10 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     if (s_tplOn && s_tpl.valid)
     {   // miss-reason census (g_recTplWhy: 0 gen, 1 epoch, 2 frame, 3 prim/tme/fst, 4 drawStamp) under PS2X_GUESTPROF=1
         int why = -1;
-        if (s_tpl.gen != gs->m_stateGen + gs->m_texUploadGen * 0x9E3779B1u) why = 0;   // m_texUploadGen: uploads + the grass VRAM swap
+        if (s_tpl.gen != in.stateGen + in.texUploadGen * 0x9E3779B1u) why = 0;   // m_texUploadGen: uploads + the grass VRAM swap
         else if (s_tpl.epoch != ps2GpuRenderer().recTplEpoch()) why = 1;
         else if (s_tpl.frame != tplFrame) why = 2;
-        else if (s_tpl.type != (uint8_t)gs->m_prim.type || s_tpl.tme != tme || s_tpl.fst != fst) why = 3;
+        else if (s_tpl.type != (uint8_t)(*in.prim).type || s_tpl.tme != tme || s_tpl.fst != fst) why = 3;
         else if (s_tpl.drawStamp != ps2GpuRenderer().pageDrawStamp(s_tpl.pageLo, s_tpl.pageHi)) why = 4;
         tplHit = (why < 0);
         if (why >= 0 && gprof::g_on) g_recTplWhy[why].fetch_add(1, std::memory_order_relaxed);
@@ -4133,7 +4133,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                                return v && v[0] && v[0] != '0'; }();
                 if (s_gi && tex.psm == GS_PSM_T8H) { static int n = 0; if (n++ < 3)
                     std::fprintf(stderr, "[gsid] PSMT8H decode gs=%p tbp0=%u tbw=%u tw=%d th=%d\n",
-                                 (void*)gs, tex.tbp0, tex.tbw, 1<<tex.tw, 1<<tex.th); } }
+                                 (void*)in.gs, tex.tbp0, tex.tbw, 1<<tex.tw, 1<<tex.th); } }
             // "Wants this page's ALPHA as data" is not a PSMT8H-only property. BT3 builds its
             // mask TWICE per frame from the same scene page: cycle 1 reads it as PSMT8H (kicks
             // 15051..15082, before any character is drawn) and cycle 2 as PSMCT32 (kicks
@@ -4167,7 +4167,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 const bool gaF336Self = s_f336Skip && tex.tbp0 == 10752u &&
                                         (tex.psm == 0x00u || tex.psm == 0x01u);   // [f336skip] the DoF chain reading back its own downsample buffer (fbw4 CT32/CT24) -- FBO-served RT self-reads; measured as ALL of f336's dirty barriers (bargate336: 250/250 psm 0/1, zero T8)
                 const bool gaAlphaOnlyFbo = s_aoFbo2 &&
-                                            gs->activeContext().frame.fbmsk == 0x00FFFFFFu &&
+                                            (*in.ctx).frame.fbmsk == 0x00FFFFFFu &&
                                             (tex.tbp0 == 0u || tex.tbp0 == 3584u) &&
                                             (tex.psm == 0x00u || tex.psm == 0x01u);   // [alphaonlyfbo] the renderer serves these from the rtsnap FBO copy; the scene flush feeds nothing for them
                 static const bool s_mbSkip = [](){ const char *v = std::getenv("PS2X_MASKBUILDSKIP"); return v && v[0] && v[0] != '0'; }();
@@ -4187,9 +4187,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 const bool gaServed = !s_noskip && s_ga4 >= 4 && ((tex.tbp0 == 10752u && (tex.psm == 0x02u || tex.psm == 0x0Au))
                     // ink-composite signature ONLY (must mirror the renderer flip): other CT16
                     // readers of page 336 (HUD composite, menus) still need the VRAM round-trip.
-                    && gs->m_texa.aem && gs->m_texa.ta1 == 0u
-                    && (gs->m_texa.ta0 == 0x30u ||
-                        (gs->m_texa.ta0 == 0x80u && (gs->activeContext().frame.fbmsk & 0x00FFFFFFu) == 0x00FFFFFFu))
+                    && (*in.texa).aem && (*in.texa).ta1 == 0u
+                    && ((*in.texa).ta0 == 0x30u ||
+                        ((*in.texa).ta0 == 0x80u && ((*in.ctx).frame.fbmsk & 0x00FFFFFFu) == 0x00FFFFFFu))
                     || gaZ16Dropped || gaAlphaOnlyFbo || gaSceneCT32 || gaF336Self || gaMaskBuild || gaShcomp);
                 if (!gaServed)
                 {
@@ -4200,10 +4200,10 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                             static unsigned long n = 0;
                             if (++n <= 12 || (n % 500ul) == 0ul)
                                 std::fprintf(stderr, "[gaunserved] #%lu ta0=%02x ta1=%02x aem=%d dest=f%u dpsm=%u fbmsk=%08x prim=%u tw=%u th=%u\n",
-                                             n, (unsigned)gs->m_texa.ta0, (unsigned)gs->m_texa.ta1, gs->m_texa.aem ? 1 : 0,
-                                             gs->activeContext().frame.fbp, (unsigned)gs->activeContext().frame.psm,
-                                             gs->activeContext().frame.fbmsk, (unsigned)gs->m_prim.type,
-                                             1u << gs->activeContext().tex0.tw, 1u << gs->activeContext().tex0.th);
+                                             n, (unsigned)(*in.texa).ta0, (unsigned)(*in.texa).ta1, (*in.texa).aem ? 1 : 0,
+                                             (*in.ctx).frame.fbp, (unsigned)(*in.ctx).frame.psm,
+                                             (*in.ctx).frame.fbmsk, (unsigned)(*in.prim).type,
+                                             1u << (*in.ctx).tex0.tw, 1u << (*in.ctx).tex0.th);
                         }
                     }
                     {   // [barwho2] PS2X_BARWHO2=1: per-(tbp,cbp) census of the PSMT8H reads that
@@ -4216,20 +4216,20 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                             if (++n <= 16 || (n % 400ul) == 0ul)
                             {
                                 std::fprintf(stderr, "[barwho2] #%lu tbp=%u cbp=%u dest=f%u fbmsk=%08x prim=%u |", n,
-                                             tex.tbp0, tex.cbp, (unsigned)gs->activeContext().frame.fbp,
-                                             gs->activeContext().frame.fbmsk, (unsigned)gs->m_prim.type);
+                                             tex.tbp0, tex.cbp, (unsigned)(*in.ctx).frame.fbp,
+                                             (*in.ctx).frame.fbmsk, (unsigned)(*in.prim).type);
                                 for (auto &kv : h) std::fprintf(stderr, " %u/%u=%lu", (unsigned)(kv.first >> 32), (unsigned)(kv.first & 0xffffffffu), kv.second);
                                 std::fprintf(stderr, "\n");
                             }
                         }
                     }
-                    if (!p8twinServedRead(gs->activeContext().frame.fbp, tex) && !rtServedRead(gs->activeContext().frame.fbp, tex))
+                    if (!p8twinServedRead((*in.ctx).frame.fbp, tex) && !rtServedRead((*in.ctx).frame.fbp, tex))
                     {
                         extern std::atomic<unsigned long> g_barReqPushed;
                         const unsigned long before = g_barReqPushed.load(std::memory_order_relaxed);
                         ps2GpuRenderer().barrierBeforeRead(tex.tbp0, true, wantsAlpha, deferOk ? &deferTex : nullptr);
                         if (g_barReqPushed.load(std::memory_order_relaxed) != before)
-                            reqCensus(3, tex.tbp0, tex.psm, 1 << tex.tw, 1 << tex.th, gs->activeContext().frame.fbp);
+                            reqCensus(3, tex.tbp0, tex.psm, 1 << tex.tw, 1 << tex.th, (*in.ctx).frame.fbp);
                     }
                 }
             }
@@ -4276,12 +4276,12 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             // Would need: apply only to RT-page sources, and a stable identity separate from srcTexW.
             static const bool s_sub = [](){ const char *v = std::getenv("PS2X_SUBDECODE"); return v && v[0] && v[0] != '0'; }();
             const uint32_t wms = (uint32_t)(ctx.clamp & 3u);
-            if (s_sub && gs->m_prim.tme && texW >= 256 && texH >= 64 && wms == 1u)
+            if (s_sub && (*in.prim).tme && texW >= 256 && texH >= 64 && wms == 1u)
             {
                 auto uvOf = [&](const GSVertex &v) -> float {
-                    if (gs->m_prim.fst) return static_cast<float>(v.u >> 4);
+                    if ((*in.prim).fst) return static_cast<float>(v.u >> 4);
                     const float q = (v.q != 0.0f) ? v.q : 1.0f; return (v.s / q) * texW; };
-                const float ua = uvOf(gs->m_vtxQueue[0]), ub = uvOf(gs->m_vtxQueue[1]);
+                const float ua = uvOf(in.vtx[0]), ub = uvOf(in.vtx[1]);
                 int lo = (int)std::floor(std::min(ua, ub)) - 1, hi = (int)std::ceil(std::max(ua, ub)) + 1;
                 lo = std::max(0, lo); hi = std::min(texW, hi);
                 if (hi > lo && (hi - lo) * 4 <= texW) { g_subDx0 = lo; g_subDxW = hi - lo; }
@@ -4291,7 +4291,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         auto mix = [&](uint64_t val) { h = (h ^ val) * 1099511628211ull; };
         mix(tex.tbp0); mix(tex.tbw); mix(tex.psm); mix(tex.tw); mix(tex.th);
         mix(tex.cbp); mix(tex.cpsm); mix(tex.csa); mix(tex.csm);
-        mix(gs->m_texclut.cbw); mix(gs->m_texclut.cou); mix(gs->m_texclut.cov);
+        mix((*in.texclut).cbw); mix((*in.texclut).cou); mix((*in.texclut).cov);
         // Indexed (T4/T8) textures: the palette CONTENT can change under the same cbp
         // (reused CLUT region), and that change may not bump the upload gen — so a cached
         // decode goes stale (wrong colors, e.g. the logo). Fold the decoded palette into
@@ -4305,16 +4305,16 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         static const bool s_noClutKey = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_NOCLUTKEY"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
         if (indexed && !s_noClutKey)
         {
-            ensureClutCache(gs);
+            if (in.gs) { ensureClutCache(in.gs); in.refreshClut(); }
             {   // [clut15972] PS2X_CLUTDUMP=<cbp>: print the decoded palette for one CLUT base
                 static const uint32_t s_cd = [](){ const char *v = std::getenv("PS2X_CLUTDUMP"); return v && v[0] ? (uint32_t)std::atoi(v) : 0xFFFFFFFFu; }();
                 static int cdn = 0;
                 if (s_cd != 0xFFFFFFFFu && tex.cbp == s_cd && cdn < 3)
                 {   ++cdn; unsigned long sr = 0, sg = 0, sb = 0, bright = 0; std::map<unsigned, int> ah;
-                    for (int i = 0; i < 256; ++i) { const uint32_t e = gs->m_clutCache[i]; const unsigned r = e & 0xFF, g = (e >> 8) & 0xFF, b = (e >> 16) & 0xFF, a = (e >> 24) & 0xFF;
+                    for (int i = 0; i < 256; ++i) { const uint32_t e = in.clut[i]; const unsigned r = e & 0xFF, g = (e >> 8) & 0xFF, b = (e >> 16) & 0xFF, a = (e >> 24) & 0xFF;
                         sr += r; sg += g; sb += b; if (std::max({r, g, b}) > 96) ++bright; ++ah[a]; }
                     std::fprintf(stderr, "[clutdump] cbp=%u csa=%u: mean RGB (%lu,%lu,%lu) bright(>96) %lu/256 | alpha distinct %zu | e[0]=%08x e[1]=%08x e[5]=%08x e[128]=%08x e[255]=%08x\n",
-                                 tex.cbp, tex.csa, sr / 256, sg / 256, sb / 256, bright, ah.size(), gs->m_clutCache[0], gs->m_clutCache[1], gs->m_clutCache[5], gs->m_clutCache[128], gs->m_clutCache[255]); }
+                                 tex.cbp, tex.csa, sr / 256, sg / 256, sb / 256, bright, ah.size(), in.clut[0], in.clut[1], in.clut[5], in.clut[128], in.clut[255]); }
             }
             {   // [palpair] PS2X_PALPAIR=1: which palette content does each terrain draw pair with?
                 // Sampled every 200th terrain draw; diff offline vs the gsparse upload-order truth.
@@ -4326,13 +4326,13 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     {
                         unsigned long sum = 0;
                         for (int i2 = 0; i2 < 256; ++i2)
-                        { const uint32_t e = gs->m_clutCache[i2]; sum += (e & 0xFF) + ((e >> 8) & 0xFF) + ((e >> 16) & 0xFF); }
+                        { const uint32_t e = in.clut[i2]; sum += (e & 0xFF) + ((e >> 8) & 0xFF) + ((e >> 16) & 0xFF); }
                         std::fprintf(stderr, "[palpair] %lu %.1f\n", pn, sum / 768.0);
                     }
                 }
             }
             const int nclut = (psmv == GS_PSM_T4 || psmv == GS_PSM_T4HL || psmv == GS_PSM_T4HH) ? 16 : 256;
-            mix(nclut == 16 ? gs->m_clutCacheHash16 : gs->m_clutCacheHash256);   // [cluthash] same dependence, one mix
+            mix(nclut == 16 ? in.clutHash16 : in.clutHash256);   // [cluthash] same dependence, one mix
         }
         {   // [texakey] PS2X_TEXAKEY=1: the CT16/CT24 decode BAKES TEXA (TA0/TA1/AEM) into the texel
             // alpha, but the cache key ignored TEXA -- BT3's two edge-stamp classes read the same
@@ -4341,7 +4341,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             static const bool s_tk = [](){ const char *v = std::getenv("PS2X_TEXAKEY"); return v && v[0] && v[0] != '0'; }();
             const bool texaBaked = (psmv == GS_PSM_CT16 || psmv == GS_PSM_CT16S || psmv == GS_PSM_CT24);
             if (s_tk && texaBaked)
-            {   mix((uint32_t)gs->m_texa.ta0 | ((uint32_t)gs->m_texa.ta1 << 8) | ((uint32_t)(gs->m_texa.aem ? 1u : 0u) << 16) | 0xA5000000u); }
+            {   mix((uint32_t)(*in.texa).ta0 | ((uint32_t)(*in.texa).ta1 << 8) | ((uint32_t)((*in.texa).aem ? 1u : 0u) << 16) | 0xA5000000u); }
         }
         if (g_subDxW) { mix(0x5B000000u | (uint32_t)g_subDx0); mix((uint32_t)g_subDxW); }   // [subdecode]
         texKey = h ? h : 1ull;
@@ -4359,10 +4359,10 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             {
                 ps2tex::TexIdent id;
                 const bool paletted = (ctx.tex0.psm == 19 || ctx.tex0.psm == 20);
-                if (ps2tex::identify(gs->vramData(), ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm,
+                if (ps2tex::identify(in.vram, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm,
                                      ctx.tex0.tw, ctx.tex0.th,
-                                     paletted ? gs->m_clutCache : nullptr,
-                                     gs->m_texa.ta0, gs->m_texa.aem, gs->m_texa.ta1, id))
+                                     paletted ? in.clut : nullptr,
+                                     (*in.texa).ta0, (*in.texa).aem, (*in.texa).ta1, id))
                 {
                     static std::unordered_set<std::string> s_seen;
                     const std::string nm = id.name();
@@ -4406,7 +4406,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 if (n < 6u)
                     std::fprintf(stderr, "[skyrec] #%u entryPc=%u top=%u kickAddr=%u vuData=%p prim=%u\n",
                                  n, g_xgkickEntryPc, g_xgkickTop, g_xgkickKickAddr,
-                                 (const void *)g_xgkickVuData, gs->m_prim.type);
+                                 (const void *)g_xgkickVuData, (*in.prim).type);
                 static std::atomic<bool> s_dumped{false};
                 bool exp0 = false;
                 if (g_xgkickVuData && s_dumped.compare_exchange_strong(exp0, true))
@@ -4430,9 +4430,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             if (s_3d && ctx.tex0.tw >= 5u) {
                 static int n3 = 0;
                 if (n3++ < 40) {
-                    const auto &v0 = gs->m_vtxQueue[0];
+                    const auto &v0 = in.vtx[0];
                     std::fprintf(stderr, "[3d] prim=%u tme=%d abe=%d tbp0=%u psm=%u %ux%u | col=(%u,%u,%u,%u) st=(%.3f,%.3f) uv=(%u,%u) | scr=(%.0f,%.0f)\n",
-                        gs->m_prim.type, gs->m_prim.tme?1:0, gs->m_prim.abe?1:0,
+                        (*in.prim).type, (*in.prim).tme?1:0, (*in.prim).abe?1:0,
                         ctx.tex0.tbp0, ctx.tex0.psm, ctx.tex0.tw, ctx.tex0.th,
                         v0.r, v0.g, v0.b, v0.a, v0.s, v0.t, v0.u, v0.v, v0.x, v0.y);
                 }
@@ -4452,13 +4452,13 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             if (s_hr && hudName) {
                 static int nFrame = 0, nHb = 0, nSurv = 0;
                 int &cnt = (hudName[0]=='F') ? nFrame : (hudName[0]=='H') ? nHb : nSurv;
-                const bool collapsed = ((int)gs->m_vtxQueue[0].x==ofx && (int)gs->m_vtxQueue[0].y==ofy)
-                                    && ((int)gs->m_vtxQueue[1].x==ofx && (int)gs->m_vtxQueue[1].y==ofy);
+                const bool collapsed = ((int)in.vtx[0].x==ofx && (int)in.vtx[0].y==ofy)
+                                    && ((int)in.vtx[1].x==ofx && (int)in.vtx[1].y==ofy);
                 if (cnt++ < 6) std::fprintf(stderr, "[hudraw:%s] method=%08x destFbp=%u fbw=%u %s prim=%u fst=%u | tbp0=%u psm=%u %ux%u | px v0=(%d,%d) v1=(%d,%d) v2=(%d,%d) ofx=%d ofy=%d\n",
                                            hudName, g_bt3DrawMethod.load(std::memory_order_relaxed), ctx.frame.fbp, ctx.frame.fbw, collapsed?"COLLAPSED":"placed",
-                                           gs->m_prim.type, gs->m_prim.fst, ctx.tex0.tbp0, ctx.tex0.psm, ctx.tex0.tw, ctx.tex0.th,
-                                           ((int)gs->m_vtxQueue[0].x)>>4,((int)gs->m_vtxQueue[0].y)>>4,((int)gs->m_vtxQueue[1].x)>>4,((int)gs->m_vtxQueue[1].y)>>4,
-                                           ((int)gs->m_vtxQueue[2].x)>>4,((int)gs->m_vtxQueue[2].y)>>4, ofx>>4, ofy>>4);
+                                           (*in.prim).type, (*in.prim).fst, ctx.tex0.tbp0, ctx.tex0.psm, ctx.tex0.tw, ctx.tex0.th,
+                                           ((int)in.vtx[0].x)>>4,((int)in.vtx[0].y)>>4,((int)in.vtx[1].x)>>4,((int)in.vtx[1].y)>>4,
+                                           ((int)in.vtx[2].x)>>4,((int)in.vtx[2].y)>>4, ofx>>4, ofy>>4);
             }
         }
 
@@ -4532,9 +4532,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         }
         const bool gaServedRead = gaZ16DropRead || p8twinServedRead(ctx.frame.fbp, ctx.tex0) || rtServedRead(ctx.frame.fbp, ctx.tex0) || (s_gaDs4 >= 4 && s_gaDecSkip && ctx.tex0.tbp0 == 10752u &&
                                   (ctx.tex0.psm == 0x02u || ctx.tex0.psm == 0x0Au) &&
-                                  gs->m_texa.aem && gs->m_texa.ta1 == 0u &&
-                                  (gs->m_texa.ta0 == 0x30u ||
-                                   (gs->m_texa.ta0 == 0x80u && (ctx.frame.fbmsk & 0x00FFFFFFu) == 0x00FFFFFFu)));
+                                  (*in.texa).aem && (*in.texa).ta1 == 0u &&
+                                  ((*in.texa).ta0 == 0x30u ||
+                                   ((*in.texa).ta0 == 0x80u && (ctx.frame.fbmsk & 0x00FFFFFFu) == 0x00FFFFFFu)));
         // Resolve the CONTENT-VERSIONED key (see resolveTextureVersion): streamed materials
         // sharing one tbp0 get distinct cache entries instead of overwriting each other.
         bool texNeedDecode = false;
@@ -4543,7 +4543,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             g_resolveAlphaData = (pv == GS_PSM_T8 || pv == GS_PSM_T8H || pv == GS_PSM_T4 || pv == GS_PSM_T4HL || pv == GS_PSM_T4HH)
                                  || ((ctx.frame.fbmsk & 0x00ffffffu) == 0x00ffffffu); }
         const uint64_t texKeyBase = texKey;   // [dectime] pre-version key (material + CLUT content)
-        if (!gaServedRead) texKey = r.resolveTextureVersion(texKey, texPageLo, texPageHi, gs->m_vram, gs->m_vramSize, texNeedDecode);
+        if (!gaServedRead) texKey = r.resolveTextureVersion(texKey, texPageLo, texPageHi, in.vram, in.vramSize, texNeedDecode);
         if (deferTex || deferClut) texNeedDecode = true;   // [deferdec] GL-dirty source: the record-time hash saw stale VRAM
         // [deferpend] a page whose deferred flush is still queued is stale in VRAM: a read that needs a decode
         // (a different view / key of the same page) must queue behind that flush, never decode synchronously.
@@ -4566,7 +4566,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         {   // [deferdec] no guest wait: the GL thread flushes the page(s) and decodes at this point of
             // the command stream, so every draw recorded after this sees the decoded texture.
             auto req = std::make_shared<TexDecodeReq>();
-            req->tex0 = ctx.tex0; req->clamp = ctx.clamp; req->texa = gs->m_texa; req->texclut = gs->m_texclut;
+            req->tex0 = ctx.tex0; req->clamp = ctx.clamp; req->texa = (*in.texa); req->texclut = (*in.texclut);
             req->texW = texW; req->texH = texH; req->rawAlphaDec = rawAlphaDec; req->texKey = texKey;
             req->pageLo = texPageLo; req->pageHi = texPageHi; req->subDxW = g_subDxW; req->subDx0 = g_subDx0;
             // [defercover] a pend-post flushes NOTHING: the sync barrier for a non-fbp page with nothing dirty flushes nothing
@@ -4601,21 +4601,21 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             // with the record-time write sequence makes this frame's later draws of the key hit; the pool's put
             // carries the same stamp, and the frame publish / every barrier post drains the pool first, so the GL
             // thread never renders a draw whose texels are still being decoded.
-            ensureClutCache(gs);
+            if (in.gs) { ensureClutCache(in.gs); in.refreshClut(); }
             auto job = std::make_unique<DecPoolJob>();
-            job->tex0 = ctx.tex0; job->clamp = ctx.clamp; job->texa = gs->m_texa; job->texclut = gs->m_texclut;
+            job->tex0 = ctx.tex0; job->clamp = ctx.clamp; job->texa = (*in.texa); job->texclut = (*in.texclut);
             job->texW = texW; job->texH = texH; job->rawAlphaDec = rawAlphaDec; job->texKey = texKey;
             job->pageLo = texPageLo; job->pageHi = texPageHi; job->subDxW = g_subDxW; job->subDx0 = g_subDx0;
-            std::memcpy(job->clut, gs->m_clutCache, sizeof(job->clut)); job->clutKey = gs->m_clutCacheKey;
+            std::memcpy(job->clut, in.clut, sizeof(job->clut)); job->clutKey = in.clutKey;
             {   // the span: whole swizzle-page rows at the buffer stride (T8 pages are 128x64 texels, T4 128x128),
                 // not just texW*texH bytes -- a narrow texture in a wide buffer reads pages the footprint formula skips
                 const uint32_t pageW = 128u, pageH = (ctx.tex0.psm == GS_PSM_T4) ? 128u : 64u;
                 const uint32_t cols = std::max(1u, (ctx.tex0.tbw * 64u + pageW - 1u) / pageW);
                 const uint32_t rows = std::max(1u, ((uint32_t)texH + pageH - 1u) / pageH);
                 const uint32_t hiPage = std::max(texPageHi, texPageLo + rows * cols);
-                const size_t lo = std::min((size_t)texPageLo * 8192u, (size_t)gs->m_vramSize);
-                const size_t hi = std::min((size_t)(hiPage + 1u) * 8192u, (size_t)gs->m_vramSize);
-                job->spanOff = (uint32_t)lo; job->span.assign(gs->m_vram + lo, gs->m_vram + hi); job->vramSize = gs->m_vramSize;
+                const size_t lo = std::min((size_t)texPageLo * 8192u, (size_t)in.vramSize);
+                const size_t hi = std::min((size_t)(hiPage + 1u) * 8192u, (size_t)in.vramSize);
+                job->spanOff = (uint32_t)lo; job->span.assign(in.vram + lo, in.vram + hi); job->vramSize = in.vramSize;
             }
             job->ras = this; job->rend = &r;
             job->seq = r.putTexturePending(texKey, texW, texH, texPageLo, texPageHi);
@@ -4624,8 +4624,8 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         else if (texNeedDecode && !gaServedRead)
         {
             TexDecodeSrc src;
-            src.tex0 = &ctx.tex0; src.clamp = ctx.clamp; src.vram = gs->m_vram; src.vramSize = gs->m_vramSize;
-            src.clut = gs->m_clutCache; src.clutKey = gs->m_clutCacheKey; src.texa = &gs->m_texa; src.texclut = &gs->m_texclut;
+            src.tex0 = &ctx.tex0; src.clamp = ctx.clamp; src.vram = in.vram; src.vramSize = in.vramSize;
+            src.clut = in.clut; src.clutKey = in.clutKey; src.texa = &(*in.texa); src.texclut = &(*in.texclut);
             src.subDxW = g_subDxW; src.subDx0 = g_subDx0;
             int subW = 0; std::vector<uint8_t> rgba;
             // [dectime] PS2X_DECCENSUS=1: guest-thread wall time spent in inline decodes (incl. the pool wait) and a census by class
@@ -4633,10 +4633,10 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             const auto _d0 = s_dcs ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             {   // [guestprof] DEC = inline texture decode + the upload hand-off
                 gprof::Scope gpScope(gprof::DEC);
-                decodeTexRGBA(gs, src, texW, texH, rawAlphaDec, texKey, subW, rgba);   // [decodefn]
+                decodeTexRGBA(in.gs, src, texW, texH, rawAlphaDec, texKey, subW, rgba);   // [decodefn]
                 int upW = subW, upH = texH, upFmt = 0, upScale = 1;   // [texreplace] upFmt != 0 => compressed DDS
                 float upAlpha = 1.0f;                                 // [texreplace] see PS2X_TEXPACKALPHA
-                applyTexReplacement(gs->vramData(), ctx.tex0, gs->m_clutCache, gs->m_clutCacheKey, gs->m_texa, texKey, subW, texH,
+                applyTexReplacement(in.vram, ctx.tex0, in.clut, in.clutKey, (*in.texa), texKey, subW, texH,
                                     g_subDxW == 0 && !rawAlphaDec, rgba, upW, upH, upFmt, upScale, upAlpha);   // [texreplace] shared with the decode pool
                 r.putTexture(texKey, std::move(rgba), upW, upH, texPageLo, texPageHi, upFmt, upScale, upAlpha);
             }
@@ -4669,8 +4669,8 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             }
         }
     }
-        s_tpl.valid = s_tplOn; s_tpl.gen = gs->m_stateGen + gs->m_texUploadGen * 0x9E3779B1u; s_tpl.epoch = ps2GpuRenderer().recTplEpoch(); s_tpl.frame = tplFrame;
-        s_tpl.type = (uint8_t)gs->m_prim.type; s_tpl.tme = tme; s_tpl.fst = fst; s_tpl.texKey = texKey; s_tpl.texW = texW; s_tpl.texH = texH;
+        s_tpl.valid = s_tplOn; s_tpl.gen = in.stateGen + in.texUploadGen * 0x9E3779B1u; s_tpl.epoch = ps2GpuRenderer().recTplEpoch(); s_tpl.frame = tplFrame;
+        s_tpl.type = (uint8_t)(*in.prim).type; s_tpl.tme = tme; s_tpl.fst = fst; s_tpl.texKey = texKey; s_tpl.texW = texW; s_tpl.texH = texH;
         s_tpl.pageLo = tplPageLo; s_tpl.pageHi = tplPageHi; s_tpl.drawStamp = ps2GpuRenderer().pageDrawStamp(tplPageLo, tplPageHi);
         g_recTplMiss.store(g_recTplMiss.load(std::memory_order_relaxed) + 1ul, std::memory_order_relaxed); /* [statbump] */
     }
@@ -4756,14 +4756,14 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             static uint32_t s_lastSt = 0xfffffffeu;
             if (st != s_lastSt) { s_lastSt = st; std::fprintf(stderr, "[fadefull] state=0x%x %s\n", st, apply ? "apply" : "skip"); }
             if (apply)
-                for (int k = 0; k < 3; ++k) gs->m_vtxQueue[k].a = 0x80u;
+                for (int k = 0; k < 3; ++k) in.vtx[k].a = 0x80u;
         }
     }
     gprof::mark(gprof::REC_BUILD);   // [guestprof]
     // [drawbatch] A CONTINUATION of the renderer's open plain-class batch does not fill the state
     // part at all: it only writes the three vertices and appends them (see GsGpuRenderer::DrawCmd
     // ::triCount). The retained command is provably still correct because
-    //   - tplHit means gs->m_stateGen is unchanged, and writeRegister bumps it for EVERY register
+    //   - tplHit means in.stateGen is unchanged, and writeRegister bumps it for EVERY register
     //     except the per-vertex ones (RGBAQ/ST/UV/XYZ*/FOG), plus the GIF IMAGE branch and the SW
     //     draw path -- so every ctx.* field the fill below reads is byte-identical;
     //   - it also means recTplEpoch() (VRAM upload/writeback/eviction stamps) and the frame are
@@ -4873,12 +4873,12 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             if (n < 40 || (n % 500) == 0)
             {
                 float u0,v0,u1,v1,u2,v2;
-                texelUV(gs->m_vtxQueue[0], u0, v0);
-                texelUV(gs->m_vtxQueue[1], u1, v1);
-                texelUV(gs->m_vtxQueue[2], u2, v2);
-                const auto &a = gs->m_vtxQueue[0];
+                texelUV(in.vtx[0], u0, v0);
+                texelUV(in.vtx[1], u1, v1);
+                texelUV(in.vtx[2], u2, v2);
+                const auto &a = in.vtx[0];
                 std::fprintf(stderr, "[celprobe] #%d prim=%u destFbp=%u tfx=%u tcc=%u abe=%u blend=%02llx fix=%02llx fbmsk=%08x cbp=%u | uvTexel=(%.1f,%.1f)(%.1f,%.1f)(%.1f,%.1f) vc=(%u,%u,%u,%u) scr=(%.0f,%.0f)\n",
-                             n, gs->m_prim.type, ctx.frame.fbp, ctx.tex0.tfx, ctx.tex0.tcc, gs->m_prim.abe ? 1u : 0u,
+                             n, (*in.prim).type, ctx.frame.fbp, ctx.tex0.tfx, ctx.tex0.tcc, (*in.prim).abe ? 1u : 0u,
                              (unsigned long long)(ctx.alpha & 0xFFu), (unsigned long long)((ctx.alpha >> 32) & 0xFFu),
                              ctx.frame.fbmsk, ctx.tex0.cbp,
                              u0, v0, u1, v1, u2, v2, a.r, a.g, a.b, a.a, a.x, a.y);
@@ -4896,20 +4896,20 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             const uint32_t n = s_n.fetch_add(1);
             if (n < 20u || (n % 512u) == 0u)
             {
-                ensureClutCache(gs);
+                if (in.gs) { ensureClutCache(in.gs); in.refreshClut(); }
                 char cl[220] = "";
-                if (gs->m_clutCacheKey != ~0ull)
+                if (in.clutKey != ~0ull)
                 {
                     int o = 0;
                     for (int i = 0; i < 32 && o < 200; i += 2)
-                        o += std::snprintf(cl + o, sizeof(cl) - o, "%02x,", (gs->m_clutCache[i] >> 24) & 0xFF);
+                        o += std::snprintf(cl + o, sizeof(cl) - o, "%02x,", (in.clut[i] >> 24) & 0xFF);
                 }
                 std::fprintf(stderr, "[hpbar] #%u psm=%u tw=%u th=%u cbp=%u cpsm=%u csa=%u csm=%u cld=%u | texa ta0=%u aem=%d ta1=%u | sci=(%d,%d)-(%d,%d) | fst=%u prim=%u | clutA[0..30,2]=%s\n",
                              n, ctx.tex0.psm, ctx.tex0.tw, ctx.tex0.th,
                              ctx.tex0.cbp, ctx.tex0.cpsm, ctx.tex0.csa, ctx.tex0.csm, ctx.tex0.cld,
-                             gs->m_texa.ta0, gs->m_texa.aem ? 1 : 0, gs->m_texa.ta1,
+                             (*in.texa).ta0, (*in.texa).aem ? 1 : 0, (*in.texa).ta1,
                              ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1,
-                             gs->m_prim.fst, gs->m_prim.type, cl);
+                             (*in.prim).fst, (*in.prim).type, cl);
             }
         }
     }
@@ -4939,11 +4939,11 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     // GS TEST.DATE/DATM (destination-alpha test) — the HUD bar partial-fill mechanism.
     cmd.dateEnable = ((ctx.test >> 14) & 1u) != 0u;
     cmd.dateMode = static_cast<uint8_t>((ctx.test >> 15) & 1u);
-    cmd.fst = static_cast<uint8_t>(gs->m_prim.fst & 1u);
+    cmd.fst = static_cast<uint8_t>((*in.prim).fst & 1u);
 
     // GS PRIM.ABE: alpha-blend enable. Opaque prims (abe=0) must be drawn without blending
     // in the GPU renderer, matching the software rasterizer (which gates on m_prim.abe).
-    cmd.abe = gs->m_prim.abe;
+    cmd.abe = (*in.prim).abe;
     // GS ALPHA register: blend equation + FIX, so the replay can map (Cs-Cd)*FIX+Cd (opaque
     // when FIX>=0x80) and Cd-Cs*FIX (subtractive shadows) to correct GL blend modes instead
     // of blanket texture-alpha blending (which erased the low-CLUT-alpha stage to black).
@@ -4981,7 +4981,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                  n, ctx.tex0.tbp0, wms, wmt,
                                  (unsigned)((ctx.clamp >> 4) & 0x3FFu), (unsigned)((ctx.clamp >> 14) & 0x3FFu),
                                  (unsigned)((ctx.clamp >> 24) & 0x3FFu), (unsigned)((ctx.clamp >> 34) & 0x3FFu),
-                                 1u << ctx.tex0.tw, 1u << ctx.tex0.th, gs->m_prim.type);
+                                 1u << ctx.tex0.tw, 1u << ctx.tex0.th, (*in.prim).type);
             }
         }
 
@@ -4998,13 +4998,13 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 static FILE *f = std::fopen("/home/z3/Desktop/bt3/work/clamprec.txt", "w");
                 if (f)
                 {
-                    const auto &v0 = gs->m_vtxQueue[0];
+                    const auto &v0 = in.vtx[0];
                     std::fprintf(f, "[clamprec] tbp0=%u %ux%u psm=%u clamp=%016llx wms=%u wmt=%u minU=%u maxU=%u minV=%u maxV=%u fst=%u | v0 s=%.5f t=%.5f q=%.5f uv=(%u,%u)\n",
                                  ctx.tex0.tbp0, 1 << ctx.tex0.tw, 1 << ctx.tex0.th, ctx.tex0.psm,
                                  (unsigned long long)ctx.clamp, wms, wmt,
                                  (uint32_t)((ctx.clamp >> 4) & 0x3FFu), (uint32_t)((ctx.clamp >> 14) & 0x3FFu),
                                  (uint32_t)((ctx.clamp >> 24) & 0x3FFu), (uint32_t)((ctx.clamp >> 34) & 0x3FFu),
-                                 gs->m_prim.fst, v0.s, v0.t, v0.q, v0.u, v0.v);
+                                 (*in.prim).fst, v0.s, v0.t, v0.q, v0.u, v0.v);
                     std::fflush(f);
                 }
             }
@@ -5025,18 +5025,18 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         // is the only class allowed to sample a live FBO (see PS2X_IDXRT in the renderer).
         if (cmd.srcIndexed && p == 27u)
         {
-            ensureClutCache(gs);
-            const uint64_t h2 = gs->m_clutCacheHash256;   // [cluthash] fresh: ensureClutCache just ran
+            if (in.gs) { ensureClutCache(in.gs); in.refreshClut(); }
+            const uint64_t h2 = in.clutHash256;   // [cluthash] fresh: ensureClutCache just ran
             cmd.srcClutKey = h2 ? h2 : 1ull;
             extern void ps2xPublishClut(uint64_t key, const uint32_t *pal);
-            ps2xPublishClut(cmd.srcClutKey, gs->m_clutCache);
+            ps2xPublishClut(cmd.srcClutKey, in.clut);
         }
         cmd.srcPsm = static_cast<uint8_t>(ctx.tex0.psm);
         cmd.tfx = static_cast<uint8_t>(ctx.tex0.tfx);
         // GS TEXA -> GPU path (the SW/decode path applies it in applyTexa()).
-        cmd.texaTa0 = static_cast<uint8_t>(gs->m_texa.ta0);
-        cmd.texaTa1 = static_cast<uint8_t>(gs->m_texa.ta1);
-        cmd.texaAem = gs->m_texa.aem;
+        cmd.texaTa0 = static_cast<uint8_t>((*in.texa).ta0);
+        cmd.texaTa1 = static_cast<uint8_t>((*in.texa).ta1);
+        cmd.texaAem = (*in.texa).aem;
     }
 
     {
@@ -5050,15 +5050,15 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             uint32_t n = s_lg.fetch_add(1) + 1u;
             if (n <= 40)
             {
-                const GSVertex &q0 = gs->m_vtxQueue[0];
-                const GSVertex &q1 = gs->m_vtxQueue[1];
+                const GSVertex &q0 = in.vtx[0];
+                const GSVertex &q1 = in.vtx[1];
                 auto uvOf = [&](const GSVertex &v, float &u, float &tv) {
-                    if (gs->m_prim.fst) { u = (v.u >> 4) / static_cast<float>(texW); tv = (v.v >> 4) / static_cast<float>(texH); }
+                    if ((*in.prim).fst) { u = (v.u >> 4) / static_cast<float>(texW); tv = (v.v >> 4) / static_cast<float>(texH); }
                     else { float q = (v.q != 0.0f) ? v.q : 1.0f; u = (v.s / q); tv = (v.t / q); }
                 };
                 float u0, tv0, u1, tv1; uvOf(q0, u0, tv0); uvOf(q1, u1, tv1);
                 std::fprintf(stderr, "[logo] #%u key=%llu prim=%u fst=%u tbp0=%u tbw=%u psm=%u | DEST fbp=%u fbw=%u fpsm=%u | xy=(%d,%d)-(%d,%d) uv=(%.3f,%.3f)-(%.3f,%.3f)\n",
-                             n, (unsigned long long)texKey, gs->m_prim.type, gs->m_prim.fst, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm,
+                             n, (unsigned long long)texKey, (*in.prim).type, (*in.prim).fst, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm,
                              ctx.frame.fbp, ctx.frame.fbw, ctx.frame.psm,
                              static_cast<int>(q0.x) - ofx, static_cast<int>(q0.y) - ofy,
                              static_cast<int>(q1.x) - ofx, static_cast<int>(q1.y) - ofy, u0, tv0, u1, tv1);
@@ -5072,8 +5072,8 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     {
         // Sprite -> DrawTexturePro quad (src rect in TEXELS; single color from v1).
         cmd.isTriangle = false;
-        const GSVertex &v0 = gs->m_vtxQueue[0];
-        const GSVertex &v1 = gs->m_vtxQueue[1];
+        const GSVertex &v0 = in.vtx[0];
+        const GSVertex &v1 = in.vtx[1];
         // GSVertex x/y are PIXELS WITH A FRACTION. Truncating to int here throws the fraction
         // away, and BT3's outline composite is built out of exactly such offsets: its three
         // fbp224 -> fbp336 passes are the same image written at y=0.000, then SUBTRACTED at
@@ -5168,14 +5168,14 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 // this drops them or something upstream does.
                 static const bool s_zsc = [](){ const char *v = std::getenv("PS2X_ZSATCOUNT"); return v && v[0] && v[0] != '0'; }();
                 if (s_zsc) { static unsigned long nn=0, dd=0;
-                    const bool farTri = (gs->m_vtxQueue[0].z > 12000000.0 || gs->m_vtxQueue[1].z > 12000000.0 || gs->m_vtxQueue[2].z > 12000000.0);
+                    const bool farTri = (in.vtx[0].z > 12000000.0 || in.vtx[1].z > 12000000.0 || in.vtx[2].z > 12000000.0);
                     ++nn; if (farTri) ++dd;
                     if ((nn % 20000ul) == 0ul)
                         std::fprintf(stderr, "[zsatcount] tris reaching ZSAT=%lu  with a far vertex=%lu (%.2f%%)  zsat_on=%d\n",
                                      nn, dd, 100.0*dd/nn, s_zsat ? 1 : 0); }
             }
             if (s_zsat &&
-                (gs->m_vtxQueue[0].z > 12000000.0 || gs->m_vtxQueue[1].z > 12000000.0 || gs->m_vtxQueue[2].z > 12000000.0))
+                (in.vtx[0].z > 12000000.0 || in.vtx[1].z > 12000000.0 || in.vtx[2].z > 12000000.0))
                 return true; // drop this triangle
         }
         // PS2X_QCULL (experiment): drop textured STQ triangles carrying a NEGATIVE q on any
@@ -5185,7 +5185,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         {
             static const bool s_qcull = [](){ const char *v = std::getenv("PS2X_QCULL"); return v && v[0] && v[0] != '0'; }();
             if (s_qcull && tme && !fst &&
-                (gs->m_vtxQueue[0].q < 0.0f || gs->m_vtxQueue[1].q < 0.0f || gs->m_vtxQueue[2].q < 0.0f))
+                (in.vtx[0].q < 0.0f || in.vtx[1].q < 0.0f || in.vtx[2].q < 0.0f))
                 return true; // drop
         }
         // Triangle -> rlgl (normalized UV, per-vertex color).
@@ -5208,7 +5208,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     static unsigned long n = 0;
                     for (int k2 = 0; k2 < 3; ++k2)
                     {
-                        const float q2 = gs->m_vtxQueue[k2].q;
+                        const float q2 = in.vtx[k2].q;
                         if (!(q2 == q2)) continue;
                         auto &e2 = st[ctx.tex0.tbp0];
                         if (e2[3] == 0) { e2[0] = e2[1] = q2; }
@@ -5230,7 +5230,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     }
                 }
             }
-            const float qa = gs->m_vtxQueue[0].q, qb = gs->m_vtxQueue[1].q, qc = gs->m_vtxQueue[2].q;
+            const float qa = in.vtx[0].q, qb = in.vtx[1].q, qc = in.vtx[2].q;
             const float amin = std::min(std::min(std::fabs(qa), std::fabs(qb)), std::fabs(qc));
             perspSafe = (amin > 1e-4f) && ((qa > 0.0f) == (qb > 0.0f)) && ((qb > 0.0f) == (qc > 0.0f));
         }
@@ -5241,7 +5241,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         const float invTexW = 1.0f / static_cast<float>(texW), invTexH = 1.0f / static_cast<float>(texH);
         for (int i = 0; i < 3; ++i)
         {
-            const GSVertex &v = gs->m_vtxQueue[i];
+            const GSVertex &v = in.vtx[i];
             // PS2X_SUBPIXEL (default ON): keep the GS 12.4 sub-pixel fraction instead of truncating.
             // Console puts 99.5% of BT3's character vertices on a fractional coordinate, so
             // truncating snaps every silhouette edge inwards to a pixel boundary and eats the
@@ -5306,7 +5306,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             const bool perspThis = s_perspQ &&
                 (s_perspMode == 5 ? (shadowDecalClass && [](){ static const bool r = [](){ const char *v = std::getenv("PS2X_DECALRAW"); return v && v[0] == '1'; }(); return r; }())
                  : s_perspMode == 6 ? ((ctx.tex0.psm == 19u || ctx.tex0.psm == 20u) && ctx.tex0.cbp == 12992u
-                                        && std::min(std::min(std::fabs(gs->m_vtxQueue[0].q), std::fabs(gs->m_vtxQueue[1].q)), std::fabs(gs->m_vtxQueue[2].q)) > 0.01f)   // [grassq] NEAR ground only (q>0.01): per-pixel S/Q stops the affine texture swim; far tris (tiny q) keep the per-vertex quotient -- their affine error is invisible and tiny-q division smears
+                                        && std::min(std::min(std::fabs(in.vtx[0].q), std::fabs(in.vtx[1].q)), std::fabs(in.vtx[2].q)) > 0.01f)   // [grassq] NEAR ground only (q>0.01): per-pixel S/Q stops the affine texture swim; far tris (tiny q) keep the per-vertex quotient -- their affine error is invisible and tiny-q division smears
                  : s_perspMode == 4 ? (ctx.tex0.tbp0 != 10752u)
                  : s_perspMode == 3 ? (ctx.tex0.tbp0 == 10752u || ctx.tex0.tbp0 == 15680u)
                  : s_perspMode == 2 ? true
@@ -5353,7 +5353,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             static const bool s_flatTri = [](){ const char *v = std::getenv("PS2X_FLATTRI"); return !(v && v[0] == '0'); }();
             {   static const bool s_ftd = [](){ const char *v = std::getenv("PS2X_FLATTRIDIAG"); return v && v[0] && v[0] != '0'; }();
                 static unsigned long fn2 = 0, neq = 0;
-                if (s_ftd && !gs->m_prim.iip && tme && ctx.tex0.psm == 0x13)
+                if (s_ftd && !(*in.prim).iip && tme && ctx.tex0.psm == 0x13)
                 {
                     ++fn2;
                     if (cmd.tri[0].r != cmd.tri[2].r || cmd.tri[1].r != cmd.tri[2].r) ++neq;
@@ -5362,7 +5362,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                      fn2, cmd.tri[0].r, cmd.tri[1].r, cmd.tri[2].r, neq, fn2);
                 }
             }
-            if (s_flatTri && !gs->m_prim.iip)
+            if (s_flatTri && !(*in.prim).iip)
                 for (int k2 = 0; k2 < 2; ++k2)
                 { cmd.tri[k2].r = cmd.tri[2].r; cmd.tri[k2].g = cmd.tri[2].g;
                   cmd.tri[k2].b = cmd.tri[2].b; cmd.tri[k2].a = cmd.tri[2].a; }
@@ -5447,7 +5447,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                         std::fprintf(stderr, "[spike] #%u ext=%.0fpx tme=%d tex=%dx%d destFbp=%u |", n, ext, tme ? 1 : 0, texW, texH, ctx.frame.fbp);
                         for (int i = 0; i < 3; ++i)
                         {
-                            const GSVertex &v = gs->m_vtxQueue[i];
+                            const GSVertex &v = in.vtx[i];
                             std::fprintf(stderr, " v%d raw=(0x%04x,0x%04x) px=(%d,%d) z=%.0f q=%g stq=(%g,%g)", i,
                                          (unsigned)(uint16_t)v.x, (unsigned)(uint16_t)v.y,
                                          ((int)v.x - ofx) >> 4, ((int)v.y - ofy) >> 4, (double)v.z, v.q, v.s, v.t);
@@ -5469,8 +5469,8 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 static std::atomic<uint32_t> s_bn{0};
                 static int minx=1<<20, miny=1<<20, maxx=-(1<<20), maxy=-(1<<20);
                 for (int i = 0; i < 3; ++i) {
-                    const int px = ((int)gs->m_vtxQueue[i].x - ofx) >> 4;
-                    const int py = ((int)gs->m_vtxQueue[i].y - ofy) >> 4;
+                    const int px = ((int)in.vtx[i].x - ofx) >> 4;
+                    const int py = ((int)in.vtx[i].y - ofy) >> 4;
                     if (px<minx)minx=px; if (px>maxx)maxx=px; if (py<miny)miny=py; if (py>maxy)maxy=py;
                 }
                 const uint32_t n = s_bn.fetch_add(1);
@@ -5490,9 +5490,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 const uint32_t n = s_dn.fetch_add(1);
                 if ((n % 4000u) == 0u)
                 {
-                    const GSVertex &v0 = gs->m_vtxQueue[0];
+                    const GSVertex &v0 = in.vtx[0];
                     std::fprintf(stderr, "[dark] #%u destFbp=%u tme=%u tfx=%u tcc=%u abe=%u | rawVC=(%u,%u,%u,%u) -> cmdVC=(%u,%u,%u,%u) tex=%llu %dx%d\n",
-                                 n, ctx.frame.fbp, tme, tfx, tcc, gs->m_prim.abe,
+                                 n, ctx.frame.fbp, tme, tfx, tcc, (*in.prim).abe,
                                  v0.r, v0.g, v0.b, v0.a, cmd.tri[0].r, cmd.tri[0].g, cmd.tri[0].b, cmd.tri[0].a,
                                  (unsigned long long)texKey, texW, texH);
                 }
@@ -5501,14 +5501,14 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         {
             static const bool s_rv = [](){ const char *v = [](){ static const char *s_env = std::getenv("PS2X_GPU_DIAG"); return s_env; }(); return v && v[0] && v[0] != '0'; }();
             static int s_rn = 0;
-            const int spanX = std::abs(static_cast<int>(gs->m_vtxQueue[0].x) - static_cast<int>(gs->m_vtxQueue[1].x));
+            const int spanX = std::abs(static_cast<int>(in.vtx[0].x) - static_cast<int>(in.vtx[1].x));
             if (s_rv && texKey == 17974423536168675289ull && s_rn < 14 && spanX > 60)
             {
                 ++s_rn;
                 std::fprintf(stderr, "[boxraw] tw=%u th=%u texWH=%dx%d fst=%u tex1=%llu | ",
-                             ctx.tex0.tw, ctx.tex0.th, texW, texH, gs->m_prim.fst, (unsigned long long)ctx.tex1);
+                             ctx.tex0.tw, ctx.tex0.th, texW, texH, (*in.prim).fst, (unsigned long long)ctx.tex1);
                 for (int i = 0; i < 3; ++i) {
-                    const GSVertex &v = gs->m_vtxQueue[i];
+                    const GSVertex &v = in.vtx[i];
                     std::fprintf(stderr, "v%d xy=(%d,%d) uFP=%u vFP=%u s=%.4f t=%.4f q=%.4f -> uv=(%.3f,%.3f)  ",
                                  i, static_cast<int>(v.x) - ofx, static_cast<int>(v.y) - ofy,
                                  v.u, v.v, v.s, v.t, v.q, cmd.tri[i].u, cmd.tri[i].v);
@@ -5534,7 +5534,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 float qMin = 1e30f, qMax = -1e30f;
                 for (int i = 0; i < 3; ++i)
                 {
-                    const GSVertex &v = gs->m_vtxQueue[i];
+                    const GSVertex &v = in.vtx[i];
                     sv[i].x = cmd.tri[i].x; sv[i].y = cmd.tri[i].y; sv[i].zn = cmd.tri[i].z;
                     sv[i].s = v.s; sv[i].t = v.t; sv[i].q = (v.q != 0.0f) ? v.q : 1.0f;
                     sv[i].r = cmd.tri[i].r; sv[i].g = cmd.tri[i].g; sv[i].b = cmd.tri[i].b; sv[i].a = cmd.tri[i].a;
@@ -5762,6 +5762,21 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     s_bcmdSeq = r.batchSeq();   // [drawbatch] our command is the batch head until someone else records
     return true;
 }
+void GSRasterizer::RecInput::refreshClut()
+{   // [recinput] the palette-cache scalars after a (re)build on the worker
+    if (!gs) return;
+    clut = gs->m_clutCache; clutKey = gs->m_clutCacheKey; clutHash256 = gs->m_clutCacheHash256; clutHash16 = gs->m_clutCacheHash16;
+}
+bool GSRasterizer::recordSpriteGPU(GS *gs)
+{   // [recinput] Stage 1 wrapper: point RecInput at the live GS (no copies) and record exactly as before
+    RecInput in;
+    in.gs = gs; in.vtx = gs->m_vtxQueue; in.prim = &gs->m_prim; in.ctx = &gs->activeContext();
+    in.texa = &gs->m_texa; in.texclut = &gs->m_texclut;
+    in.vram = gs->m_vram; in.vramSize = gs->m_vramSize; in.stateGen = gs->m_stateGen; in.texUploadGen = gs->m_texUploadGen;
+    in.refreshClut();
+    return recordSpriteGPU(in);
+}
+
 
 uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t u, uint16_t v)
 {
