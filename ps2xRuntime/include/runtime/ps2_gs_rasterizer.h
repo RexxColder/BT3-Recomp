@@ -8,6 +8,7 @@
 
 class GS;
 struct GSTex0Reg; struct GSTexaReg; struct GSTexClutReg; struct TexDecodeReq;   // [deferdec]
+struct DecPoolJob;   // [decpool]
 // [deferdec] what decodeTexRGBA's fast paths read. In the synchronous case these point into the
 // live GS; in the deferred case into a TexDecodeReq snapshot + a thread-local CLUT.
 struct TexDecodeSrc
@@ -27,6 +28,10 @@ class GSRasterizer
 {
 public:
     void decodeDeferred(const TexDecodeReq &req, uint8_t *vram, size_t vramSize, int &subW, std::vector<uint8_t> &rgba);   // [deferdec] GL thread
+    void decodeSnapshot(const DecPoolJob &job, uint8_t *scratch, size_t vramSize, int &subW, std::vector<uint8_t> &rgba);   // [decpool] pool thread
+    // [texreplace] the pack-replacement swap, shared by the inline decode and the decode pool: on a hit rgba/upW/upH/upFmt/upScale/upAlpha become the replacement's
+    static void applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex0, const uint32_t *clut, uint64_t clutKey, const GSTexaReg &texa, uint64_t texKey, int subW, int texH, bool allowed,
+                                    std::vector<uint8_t> &rgba, int &upW, int &upH, int &upFmt, int &upScale, float &upAlpha);
     static bool decodeIsDeferrable(uint32_t psm);   // [deferdec] only the fast paths can run without the GS
     void drawPrimitive(GS *gs);
     void writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, bool widened = false);

@@ -24,6 +24,7 @@ enum Ps2xWaitSite : int
     WP_FENCE_STOREIMG,  // sceGsExecStoreImage: drain before consuming the VRAM readback
     WP_BARRIER_POST,    // guest side: posted a blocking barrier, waiting for the GL thread to serve it
     WP_BARRIER_UPLOAD,  // guest side: waiting for a pending page flush before a texture upload
+    WP_DECPOOL,         // guest side: draining the decode pool at a publish / barrier post [decpool]
     WP_COUNT
 };
 extern std::atomic<uint64_t> g_ps2xWaitNs[WP_COUNT];
