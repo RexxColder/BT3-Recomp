@@ -33,6 +33,8 @@ public:
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
     void drain();
+    void takeQueue(std::vector<GifArbiterPacket> &out);   // [vu1pipe] hand the queued packets (ordered as drain would) to another thread
+    void process(const GifArbiterPacket &pkt);              // [vu1pipe] run the process function on one packet (the thread that owns the GS)
 
 private:
     ProcessPacketFn m_processFn;

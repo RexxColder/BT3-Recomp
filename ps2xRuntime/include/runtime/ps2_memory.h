@@ -21,6 +21,7 @@
 #else
 #include <immintrin.h> // For SSE/AVX instructions
 #include <smmintrin.h> // For SSE4.1 instructions
+#include "runtime/ps2_gif_arbiter.h"   // [vu1pipe] Stage2Item carries packets
 #endif
 
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
@@ -326,6 +327,15 @@ public:
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
+    // [vu1pipe] second stage of the kick pipeline (PS2X_VU1PIPE=1): the kick worker keeps VIF unpack + VU1 execution
+    // and hands every GIF packet, frame swap, register apply and end-of-job marker to this thread IN STREAM ORDER;
+    // it owns the GS state, VRAM and the draw list exactly as the worker did. Drains cover both stages.
+    struct Stage2Item { uint8_t kind = 0; uint8_t chan = 0; std::vector<GifArbiterPacket> pkts; std::function<void()> fn; };   // kind 0 packets, 1 swap, 2 apply, 3 job end
+    static bool vu1PipeEnabled();
+    void stage2Push(Stage2Item &&item);
+    void stage2FlushArbiter();
+    void arbiterDrainOrHandoff();
+    void stage2Loop();
 
     // Fires (on the guest thread) when the game writes DISPFB1 -- i.e. swaps the
     // display buffer, which marks the just-rendered frame complete. Lets the
@@ -469,6 +479,10 @@ public:
     bool m_kickStop = false;
     bool m_kickBusy = false;              // worker is executing a popped job
     uint32_t m_kickFramesQueued = 0;      // SwapFrame markers currently queued
+    std::deque<Stage2Item> m_s2q;         // [vu1pipe]
+    std::mutex m_s2Mtx; std::condition_variable m_s2Cv;
+    std::thread m_s2Thread;
+    std::atomic<uint32_t> m_s2Pending{0}; // items queued + in flight (0 = stage 2 idle)
     void ensureKickWorker();
     void enqueueKickJob(KickJob &&job);
     void kickWorkerLoop();
