@@ -13,6 +13,10 @@
 // expansion is the fps bottleneck inside processVIF1Data.
 namespace { std::atomic<uint32_t> g_boneScanTarget{0}; }
 #include <array>
+#include <algorithm>       // [vifhist] std::sort -- explicit: clang-cl does not get it transitively
+#include <unordered_map>
+#include <utility>
+#include <vector>
 extern std::vector<std::array<uint32_t, 3>> g_kickSrcMap; // see ps2_memory.cpp
 extern bool g_kickSrcMapEnabled();
 extern uint32_t g_vif1QwcSrcGuest; // qwc (non-chain) transfer source base

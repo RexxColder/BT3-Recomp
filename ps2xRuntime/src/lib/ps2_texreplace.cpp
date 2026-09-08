@@ -14,6 +14,9 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <atomic>
+#include <string>
+#include <vector>
 #include "raylib.h"
 
 namespace ps2tex
