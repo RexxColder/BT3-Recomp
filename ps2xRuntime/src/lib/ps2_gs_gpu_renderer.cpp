@@ -1436,7 +1436,7 @@ namespace
 
 bool GsGpuRenderer::enabled()
 {
-    return uiFlag(g_uiGpu, "PS2X_GPU", false);
+    return uiFlag(g_uiGpu, "PS2X_GPU", true);
 }
 
 GsGpuRenderer &ps2GpuRenderer()
