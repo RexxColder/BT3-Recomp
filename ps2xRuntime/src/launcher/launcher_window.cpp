@@ -1,6 +1,8 @@
 #include "launcher_window.h"
 
 #include "dbz_theme.h"
+#include "install_wizard_dialog.h"
+#include "iso9660.h"
 #include "settings_dialog.h"
 #include "settings_manager.h"
 
@@ -15,7 +17,9 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QScreen>
+#include <QShowEvent>
 #include <QStandardPaths>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <cstdio>
@@ -46,6 +50,7 @@ LauncherWindow::LauncherWindow(QWidget *parent)
 
     // The launcher lives in the deploy root; savedata/ is the shared settings dir.
     m_savedataDir = QDir(QApplication::applicationDirPath()).filePath(QStringLiteral("savedata"));
+    m_dataDir = QDir(QApplication::applicationDirPath()).filePath(QStringLiteral("data"));
 
     // Resolve the game ELF next to the launcher binary.
     const QDir appDir(QApplication::applicationDirPath());
@@ -122,6 +127,8 @@ LauncherWindow::LauncherWindow(QWidget *parent)
         m_hint->setText(QStringLiteral("  %1").arg(QFileInfo(m_gameElf).fileName()));
     barLayout->insertWidget(1, m_hint, 1, Qt::AlignVCenter | Qt::AlignLeft);
 
+    checkGameData();
+
     // Seed settings manager from the shared savedata dir.
     SettingsManager::instance().setConfigDir(m_savedataDir);
     SettingsManager::instance().load();
@@ -153,6 +160,14 @@ void LauncherWindow::onPlayClicked()
             return;
     }
 
+    // Game data must be present and validated before the runner can boot.
+    if (!m_gameDataValid)
+    {
+        // The install wizard restores data on success.
+        if (!openInstallWizard())
+            return;
+    }
+
     // Save any pending settings so the game boots with the launcher's config.
     SettingsManager::instance().save();
 
@@ -164,6 +179,43 @@ void LauncherWindow::onPlayClicked()
 
     // The launcher's job is done: close this window (the game runs on its own).
     close();
+}
+
+void LauncherWindow::checkGameData()
+{
+    m_gameDataValid = (DiscVerify::verifyInstalledData(m_dataDir) == DiscVerify::State::Valid);
+
+    if (m_play)
+        m_play->setEnabled(!m_gameElf.isEmpty() && m_gameDataValid);
+
+    if (!m_gameElf.isEmpty() && !m_gameDataValid)
+    {
+        m_hint->setText(QStringLiteral("  game data missing or corrupted - reinstall required"));
+    }
+}
+
+bool LauncherWindow::openInstallWizard()
+{
+    InstallWizardDialog dlg(this);
+    const bool installed = dlg.exec() == QDialog::Accepted;
+    checkGameData();
+    return installed && m_gameDataValid;
+}
+
+void LauncherWindow::showEvent(QShowEvent *e)
+{
+    QMainWindow::showEvent(e);
+
+    // Pop the install wizard automatically on first launch when the game data
+    // is missing/corrupt. The subsequent runs are user-initiated (PLAY button).
+    if (!m_gameDataValid && !m_wizardShown)
+    {
+        m_wizardShown = true;
+        QTimer::singleShot(0, this, [this] {
+            if (!m_gameDataValid)
+                openInstallWizard();
+        });
+    }
 }
 
 void LauncherWindow::onSettingsClicked()

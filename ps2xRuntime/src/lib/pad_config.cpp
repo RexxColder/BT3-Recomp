@@ -1295,6 +1295,73 @@ namespace ps2_stubs
             slotValue(cfg.binds[static_cast<size_t>(PadAction::RStickYNeg)]) +
                 slotValue(cfg.binds[static_cast<size_t>(PadAction::RStickYPos)]),
             -1.0f, 1.0f);
+#if defined(__linux__)
+        // Native evdev sticks: the singleton is one physical device = the launcher's
+        // "Gamepad 0". When raylib has a GLFW mapping for it the digital side works
+        // but a half-mapped SDL entry can zero the analogue axes (buttons/bumpers and
+        // even triggers still arrive via their own paths), leaving the sticks dead:
+        // slotValue() only reads raylib slots and the old fallback required pads to
+        // be EMPTY. Blend the native deflection into each stick when it is stronger,
+        // but only for the native owner (per-player leak guard, same rule as buttons).
+        if (nativeOwner)
+        {
+            auto mergeStick = [&](float &dst, int axis, const PadBind &neg, const PadBind &pos)
+            {
+                const float nv = native.getAxis(axis);
+                float v = 0.0f;
+                if (neg.kind == PadBindKind::Axis && neg.sign < 0.0f && nv < 0.0f)
+                    v = nv;
+                else if (pos.kind == PadBindKind::Axis && pos.sign > 0.0f && nv > 0.0f)
+                    v = nv;
+                if (std::fabs(v) > std::fabs(dst))
+                {
+                    dst = v;
+                }
+            };
+            mergeStick(lx, GAMEPAD_AXIS_LEFT_X,
+                       cfg.binds[static_cast<size_t>(PadAction::LStickXNeg)],
+                       cfg.binds[static_cast<size_t>(PadAction::LStickXPos)]);
+            mergeStick(ly, GAMEPAD_AXIS_LEFT_Y,
+                       cfg.binds[static_cast<size_t>(PadAction::LStickYNeg)],
+                       cfg.binds[static_cast<size_t>(PadAction::LStickYPos)]);
+            mergeStick(rx, GAMEPAD_AXIS_RIGHT_X,
+                       cfg.binds[static_cast<size_t>(PadAction::RStickXNeg)],
+                       cfg.binds[static_cast<size_t>(PadAction::RStickXPos)]);
+            mergeStick(ry, GAMEPAD_AXIS_RIGHT_Y,
+                       cfg.binds[static_cast<size_t>(PadAction::RStickYNeg)],
+                       cfg.binds[static_cast<size_t>(PadAction::RStickYPos)]);
+        }
+        // [padprobe] PS2X_PADPROBE=1: once (60th frame) dump what each input world
+        // sees for the pad, so a dead path is distinguishable from hardware state.
+        static const bool s_probe = [](){ const char *v = std::getenv("PS2X_PADPROBE"); return v && v[0] == '1'; }();
+        if (s_probe)
+        {
+            static int s_probeFrame = 0;
+            if (++s_probeFrame == 60)
+            {
+                for (int pad : pads)
+                {
+                    std::fprintf(stdout, "[padprobe] slot=%d nativeAvail=%d nativeMatch=%d\n",
+                                 pad, native.isAvailable() ? 1 : 0, nativeOk ? 1 : 0);
+                    std::fprintf(stdout, "[padprobe] raylib axes 0..5: %.3f %.3f %.3f %.3f %.3f %.3f\n",
+                                 GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_X),
+                                 GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_Y),
+                                 GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_X),
+                                 GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_Y),
+                                 GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_TRIGGER),
+                                 GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_TRIGGER));
+                    std::fprintf(stdout, "[padprobe] native  axes 0..5: %.3f %.3f %.3f %.3f %.3f %.3f\n",
+                                 native.getAxis(GAMEPAD_AXIS_LEFT_X), native.getAxis(GAMEPAD_AXIS_LEFT_Y),
+                                 native.getAxis(GAMEPAD_AXIS_RIGHT_X), native.getAxis(GAMEPAD_AXIS_RIGHT_Y),
+                                 native.getAxis(GAMEPAD_AXIS_LEFT_TRIGGER), native.getAxis(GAMEPAD_AXIS_RIGHT_TRIGGER));
+                    std::fprintf(stdout, "[padprobe] buttons raylib(9,10,16,17)=%d%d%d%d native(16,17)=%d%d\n",
+                                 IsGamepadButtonDown(pad, 9), IsGamepadButtonDown(pad, 10),
+                                 IsGamepadButtonDown(pad, 16), IsGamepadButtonDown(pad, 17),
+                                 native.isButtonDown(16), native.isButtonDown(17));
+                }
+            }
+        }
+#endif
 
         // Fallback: if GLFW has no mapping for the controller (pads empty)
         // but the native evdev reader is available, read axes directly. Only

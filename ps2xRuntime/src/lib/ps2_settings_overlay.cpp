@@ -340,15 +340,58 @@ void PS2SettingsOverlay::initialize()
     buildDeviceList();
     // Apply all loaded settings (glow, postfx, volume, etc.) at startup.
     applySettings();
+    // Snapshot the persisted settings so shutdown() only rewrites the ini when the
+    // session actually changed something (keeps launcher-authored values intact).
+    m_settingsAtBoot = m_settings;
 }
 
 void PS2SettingsOverlay::shutdown()
 {
     if (!m_initialized)
         return;
-    saveSettings();
+    // Persist only when something changed this session OR no ini exists yet
+    // (first boot seeds the default file). Otherwise leave the existing
+    // ini untouched so launcher-authored settings survive a play session.
+    if (!(m_settings == m_settingsAtBoot) || !std::filesystem::exists(m_configPath))
+        saveSettings();
     rlImGuiShutdown();
     m_initialized = false;
+}
+
+bool PS2SettingsOverlay::Settings::operator==(const Settings &o) const
+{
+    return masterVolume == o.masterVolume &&
+           musicVolume == o.musicVolume &&
+           sfxVolume == o.sfxVolume &&
+           gpuRenderer == o.gpuRenderer &&
+           glow == o.glow &&
+           postfx == o.postfx &&
+           glowFix == o.glowFix &&
+           bilinear == o.bilinear &&
+           halfTexel == o.halfTexel &&
+           skipPost == o.skipPost &&
+           skipStaleVram == o.skipStaleVram &&
+           renderScale == o.renderScale &&
+           deadzone == o.deadzone &&
+           fullscreen == o.fullscreen &&
+           widescreen == o.widescreen &&
+           outline == o.outline &&
+           texPack == o.texPack &&
+           inkStrength == o.inkStrength &&
+           shadows == o.shadows &&
+           dofBlur == o.dofBlur &&
+           dofZFar == o.dofZFar &&
+           windowW == o.windowW &&
+           windowH == o.windowH &&
+           forceBilinear == o.forceBilinear &&
+           overlayEnabled == o.overlayEnabled &&
+           hudLayout == o.hudLayout &&
+           hudOffL == o.hudOffL &&
+           hudOffC == o.hudOffC &&
+           hudOffR == o.hudOffR &&
+           overlayPadBtns == o.overlayPadBtns &&
+           overlayKeys == o.overlayKeys &&
+           logLevel == o.logLevel;
 }
 
 void PS2SettingsOverlay::resetCaptureState()
