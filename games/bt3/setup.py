@@ -114,6 +114,16 @@ def cmake_configure_extra() -> list:
                 break
         if "Visual Studio" not in gen:
             return extra
+    # Fresh configure. Prefer Ninja + clang-cl when this is a Visual Studio developer prompt (ninja and
+    # clang-cl on PATH, VC environment loaded): Ninja compiles every file in parallel, whereas the default
+    # Visual Studio generator hands the runner project's ~1000 unity units to MSBuild, which without
+    # multi-processor compilation builds them one at a time (a 45-minute scratch build, 2026-09-08).
+    # PS2X_SETUP_GENERATOR=vs forces the Visual Studio generator.
+    import shutil
+    dev_prompt = bool(os.environ.get("VCToolsInstallDir") or os.environ.get("INCLUDE"))
+    if (os.environ.get("PS2X_SETUP_GENERATOR", "ninja").lower() != "vs" and dev_prompt
+            and shutil.which("ninja") and shutil.which("clang-cl")):
+        return extra + ["-G", "Ninja", "-DCMAKE_C_COMPILER=clang-cl", "-DCMAKE_CXX_COMPILER=clang-cl"]
     return extra + ["-T", os.environ.get("PS2X_SETUP_TOOLSET", "ClangCL")]
 
 
