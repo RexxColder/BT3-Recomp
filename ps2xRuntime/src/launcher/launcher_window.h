@@ -24,17 +24,23 @@ private slots:
 
 protected:
     void paintEvent(QPaintEvent *) override;
+    void showEvent(QShowEvent *) override;
 
 private:
     void loadBackground();
+    void checkGameData();
+    bool openInstallWizard();
 
     QLabel *m_hint = nullptr;
     QPushButton *m_play = nullptr;
     QPushButton *m_settings = nullptr;
     QWidget *m_bottomBar = nullptr;
-    QString m_gameElf;
-    QString m_bgPath;
     QProcess *m_gameProc = nullptr;
 
+    QString m_gameElf;
+    QString m_bgPath;
     QString m_savedataDir;
+    QString m_dataDir;
+    bool m_gameDataValid = false;
+    bool m_wizardShown = false;
 };

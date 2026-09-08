@@ -6,6 +6,7 @@
 #include "tab_bindings.h"
 #include "tab_controllers.h"
 #include "tab_logging.h"
+#include "tab_misc.h"
 #include "tab_video.h"
 
 #include <QCloseEvent>
@@ -63,6 +64,7 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     m_tabs->addTab(new ControllersTab(&m_bindings->players()), QStringLiteral("Controllers"));
     m_tabs->addTab(m_bindings, QStringLiteral("Bindings"));
     m_tabs->addTab(new LoggingTab, QStringLiteral("Logging"));
+    m_tabs->addTab(new MiscTab, QStringLiteral("Misc"));
     // Video/Controllers/Logging live-write into SettingsManager; load() the
     // INI once via the singleton constructor call pattern (see main.cpp).
     layout->addWidget(m_tabs, 1);
