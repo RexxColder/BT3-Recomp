@@ -34,6 +34,7 @@ bool g_kickSrcMapEnabled()
 #endif
 #include <cstdio>
 #include <cstdlib>
+extern "C" void ps2xEeProfAddCurrentThread(const char *name);   // [eeprof]
 
 // PS2X_WATCH: when the projection value 0x44db523d (1754.57) is written into a transform packet,
 // print a backtrace to reveal the recompiled EE function that builds the packet (and therefore
@@ -2287,6 +2288,7 @@ std::atomic<uint64_t> g_workerFrameNs{0};
 
 void PS2Memory::kickWorkerLoop()
 {
+    ps2xEeProfAddCurrentThread("KickWorker");   // [eeprof]
     for (;;)
     {
         KickJob job;
