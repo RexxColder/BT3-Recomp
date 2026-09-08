@@ -32,6 +32,8 @@
 #include "runtime/ps2_memory.h"   // [crtcdisp] GSRegisters (the CRTC registers are memory-mapped)
 extern "C" void glFinish(void);   // [unloadmode] drain experiment
 extern "C" void glFlush(void);    // [preflush]
+extern "C" void ps2xRecPoolDrain();   // [recpool] ps2_gs_rasterizer.cpp: merge every posted record job (worker thread). File scope, outside
+                                      // any #if: it used to sit in the non-Windows dlfcn block, so clang-cl never saw it (undeclared identifier)
 
 unsigned long g_texMints = 0, g_texRedecodes = 0;  // [vramdiag] churn accounting
 unsigned long g_uploadBlocks = 0;                 // GS VRAM blocks uploaded (64 words each)
@@ -384,7 +386,6 @@ extern "C" __declspec(dllimport) void *__stdcall wglGetProcAddress(const char *)
 static void *ps2xGlProc(const char *name) { return (void *)wglGetProcAddress(name); }
 #else
 #include <dlfcn.h>
-extern "C" void ps2xRecPoolDrain();   // [recpool] ps2_gs_rasterizer.cpp: merge every posted record job (worker thread)
 static void *ps2xGlProc(const char *name) { return dlsym(RTLD_DEFAULT, name); }
 #endif
 static void ps2xTextureBarrier()
