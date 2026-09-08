@@ -1,3 +1,4 @@
+#include "ps2_waitprof.h"   // [waitprof]
 #include "ps2_runtime_macros.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
@@ -3891,6 +3892,7 @@ namespace
                 const uint64_t want = s_lastTick + 2u;
                 // Bounded: never wait more than ~50 ms, so a stalled vblank worker cannot hang
                 // the guest (the failure mode I wrongly suspected of [asyncpace] earlier tonight).
+                Ps2xWaitScope wgate(WP_FRAMEGATE);   // [waitprof]
                 for (int i = 0; i < 50; ++i)
                 {
                     const uint64_t now = ps2_syscalls::GetCurrentVSyncTick();

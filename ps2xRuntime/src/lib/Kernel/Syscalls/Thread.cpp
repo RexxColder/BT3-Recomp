@@ -1,3 +1,4 @@
+#include "ps2_waitprof.h"   // [waitprof]
 #include <xmmintrin.h>
 #include "Common.h"
 #include "Thread.h"
@@ -743,6 +744,7 @@ namespace ps2_syscalls
                 lock,
                 [&]()
                 {
+                    Ps2xWaitScope wdorm(WP_SYNC_OTHER);
                     info->cv.wait(lock, [&]()
                                   { return !info->started && info->status == THS_DORMANT; });
                 });
@@ -807,6 +809,7 @@ namespace ps2_syscalls
                 lock,
                 [&]()
                 {
+                    Ps2xWaitScope wsusp(WP_SYNC_OTHER);
                     info->cv.wait(lock, [&]()
                                   { return info->suspendCount == 0 || info->terminated.load(); });
                 },
@@ -984,6 +987,7 @@ namespace ps2_syscalls
                 lock,
                 [&]()
                 {
+                    Ps2xWaitScope wsleep(WP_THREAD_SLEEP);
                     info->cv.wait(lock, [&]()
                                   { return info->wakeupCount > 0 || info->forceRelease.load() || info->terminated.load(); });
                 },

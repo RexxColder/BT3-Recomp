@@ -1,3 +1,4 @@
+#include "ps2_waitprof.h"   // [waitprof]
 #include "Common.h"
 #include "Sync.h"
 
@@ -331,6 +332,7 @@ namespace ps2_syscalls
                 lock,
                 [&]()
                 {
+                    Ps2xWaitScope wsema(WP_SEMA);
                     sema->cv.wait(lock, [&]()
                                   {
                                       const bool forced = info ? info->forceRelease.load() : false;
@@ -714,6 +716,7 @@ namespace ps2_syscalls
                 lock,
                 [&]()
                 {
+                    Ps2xWaitScope wsync(WP_SYNC_OTHER);
                     info->cv.wait(lock, satisfied);
                 },
                 [&]()

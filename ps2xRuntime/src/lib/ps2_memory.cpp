@@ -1,3 +1,4 @@
+#include "ps2_waitprof.h"   // [waitprof]
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "ps2_log.h"
@@ -2247,12 +2248,12 @@ void PS2Memory::enqueueKickJob(KickJob &&job)
     // flight) so a slow worker bounds latency/memory instead of queueing frames forever.
     if (job.kind == KickJob::SwapFrame)
     {
-        m_kickDoneCv.wait(lk, [this]() { return m_kickFramesQueued < 2u || m_kickStop; });
+        { Ps2xWaitScope w(WP_KICKQ_FRAMES); m_kickDoneCv.wait(lk, [this]() { return m_kickFramesQueued < 2u || m_kickStop; }); }
         ++m_kickFramesQueued;
     }
     else
     {
-        m_kickDoneCv.wait(lk, [this]() { return m_kickQueue.size() < 8192u || m_kickStop; });
+        { Ps2xWaitScope w(WP_KICKQ_FULL); m_kickDoneCv.wait(lk, [this]() { return m_kickQueue.size() < 8192u || m_kickStop; }); }
     }
     if (m_kickStop)
         return;
@@ -2276,7 +2277,7 @@ void PS2Memory::drainKickQueue()
     std::unique_lock<std::mutex> lk(m_kickMtx);
     if (!m_kickThreadStarted)
         return;
-    m_kickDoneCv.wait(lk, [this]() { return (m_kickQueue.empty() && !m_kickBusy) || m_kickStop; });
+    { Ps2xWaitScope w(WP_KICK_DRAIN); m_kickDoneCv.wait(lk, [this]() { return (m_kickQueue.empty() && !m_kickBusy) || m_kickStop; }); }
 }
 
 // [framegate] The kick worker's BUSY time for the last completed frame, in ns. The frame gate in
@@ -2294,7 +2295,7 @@ void PS2Memory::kickWorkerLoop()
         KickJob job;
         {
             std::unique_lock<std::mutex> lk(m_kickMtx);
-            m_kickCv.wait(lk, [this]() { return !m_kickQueue.empty() || m_kickStop; });
+            { Ps2xWaitScope w(WP_WORKER_IDLE); m_kickCv.wait(lk, [this]() { return !m_kickQueue.empty() || m_kickStop; }); }
             if (m_kickStop)
                 return;
             job = std::move(m_kickQueue.front());
