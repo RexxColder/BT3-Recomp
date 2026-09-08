@@ -123,11 +123,18 @@ namespace ps2recomp
             return;
         }
 
-        m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
-        m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
-        m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
-
         const std::string code = delaySlotCode();
+        // [pcstores] pc / in_delay_slot / branch_pc are read only on the exception path (EPC of a delay-slot
+        // exception, the syscall-in-delay-slot guard) and by diagnostics: store them only when the delay-slot
+        // instruction can reach the runtime.
+        const bool slotStores = m_gen.m_pcStoresAll || code.find("runtime->") != std::string::npos;
+        if (slotStores)
+        {
+            m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
+            m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
+            m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
+        }
+
         std::istringstream lines(code);
         std::string line;
         while (std::getline(lines, line))
@@ -138,7 +145,7 @@ namespace ps2recomp
             }
         }
 
-        m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        if (slotStores) m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);   // [pcstores]
     }
 
     void ControlFlowEmitter::emitResumeFromDelaySlotEntry()

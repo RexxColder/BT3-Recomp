@@ -154,10 +154,18 @@ namespace ps2recomp
                 }
                 else
                 {
-                    ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
-                       << std::dec;
-
-                    ss << "    " << cg.translateInstruction(inst);
+                    // [pcstores] the guest pc is only observable by the runtime (syscalls, breaks, exceptions,
+                    // MMIO loads/stores, preemption checks, the missing-function dispatcher) and by diagnostics.
+                    // Store it before instructions that reach the runtime; plain ALU/FPU/VU0/memory instructions
+                    // skip the store unless pc_stores_all = true (regenerate with it when hunting with the
+                    // write-watch probes, which attribute by pc).
+                    const std::string translated = cg.translateInstruction(inst);
+                    if (cg.m_pcStoresAll || translated.find("runtime->") != std::string::npos)
+                    {
+                        ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
+                           << std::dec;
+                    }
+                    ss << "    " << translated;
                     if (inst.isMmio)
                     {
                         ss << " // MMIO: 0x" << std::hex << inst.mmioAddress << std::dec;

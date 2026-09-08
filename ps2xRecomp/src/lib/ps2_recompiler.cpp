@@ -913,6 +913,7 @@ namespace ps2recomp
             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
             m_codeGenerator->setEmitInstructionComments(true);
+            m_codeGenerator->setPcStoresAll(m_config.pcStoresAll);   // [pcstores]
 
             fs::create_directories(m_config.outputPath);
 

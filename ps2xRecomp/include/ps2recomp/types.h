@@ -178,6 +178,10 @@ namespace ps2recomp
         bool patchSyscalls = false;
         bool patchCop0 = true;
         bool patchCache = true;
+        // [pcstores] emit `ctx->pc = <addr>` before EVERY instruction (true) or only where the runtime can observe
+        // it: function entry, control transfers, and instructions that call into the runtime (false, the default).
+        // The per-instruction store was a memory write per guest instruction and three quarters of a tight loop.
+        bool pcStoresAll = false;
         std::vector<std::string> skipFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;
