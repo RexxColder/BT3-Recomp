@@ -207,7 +207,10 @@ def range_registrar(struct_name: str, csv_path: Path, comment: str) -> str:
 # 0x341358: `addiu $s0, $s1, 0x1`, the head of a loop inside f_3412e8 (which ends at
 # 0x341380) whose `bnez` back-edge sits at 0x341444, inside f_341380. Hit by surrendering
 # a fight.
-MID_FUNCTION_ENTRIES = (0x341358,)
+# 0x34c0b0: inside f_34bf60 (0x34bf60-0x34c0d8); hit live on 2026-09-05 ("No exact recompiled function for
+# guest PC 0x34c0b0", ~24k times in one session) and fixed by hand with fixgap.py in the dev tree only --
+# users regenerate from this file, so it lives here now.
+MID_FUNCTION_ENTRIES = (0x341358, 0x34c0b0)
 
 
 def register_mid_function_entries(lines: list, reg: str, addrs) -> tuple:
