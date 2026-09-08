@@ -4784,14 +4784,13 @@ int GsGpuRenderer::batchWhy(const DrawCmd &c)
     if (!c.isTriangle) return 1;
     if (c.isTransfer || c.isVramBlit || c.isDecode || c.isAliasPass || c.wsHudApplied) return 2;
     if (c.depthOnly) return 3;
-    {   // [batch336] EXPERIMENT (PS2X_BATCH336=1, default OFF): fbp336 -- the post-process /
-        // DoF composite page -- is 53.7% of all recorded commands, and every one of them closes
-        // the open batch, which is why 26.7% of primitives arrive with no batch open and refill
-        // a 500-byte DrawCmd. Nothing here records WHY 336 was excluded beyond "scene buffers
-        // only", so measure it: allow 336 and check the frames are byte-identical.
-        // ⚠ 336 has per-command handling elsewhere (the FBW view split, the tile-grid blit,
-        // [wsrtskip]); if any of that is per-command rather than per-triangle this WILL differ.
-        static const bool s_b336 = [](){ const char *v = std::getenv("PS2X_BATCH336"); return v && v[0] && v[0] != '0'; }();
+    {   // [batch336] DEFAULT ON since 2026-09-08 (PS2X_BATCH336=0 restores the old rule): fbp336 -- the
+        // post-process / DoF composite page -- is 53.7% of all recorded commands, and every one of them
+        // closed the open batch, so 26.7% of primitives arrived with no batch open and refilled a 500-byte
+        // DrawCmd. Allowing it: gs(record) 15.1 -> 14.25 ms/frame on the hit.gs fight window (-5.5%), and
+        // 3+3 replays over 17 frames at 4x are byte-identical (the only differing frame is the renderer's
+        // pre-existing run-to-run bloom race, which hits either side alike).
+        static const bool s_b336 = [](){ const char *v = std::getenv("PS2X_BATCH336"); return !(v && v[0] == '0'); }();
         if (!(c.destFbp == 0u || c.destFbp == 112u || (s_b336 && c.destFbp == 336u))) return 4;   // scene buffers only
     }
     if (!(c.destPsm == 0u || c.destPsm == 1u)) return 5;
