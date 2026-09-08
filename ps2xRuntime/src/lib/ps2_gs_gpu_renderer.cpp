@@ -3731,6 +3731,7 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
         }
         // Hand off the scheduler token + guest-execution lock while we wait, or the loader
         // threads and the CD-tick pump starve (the "stuck loading screen").
+        decPoolDrain();   // [decpool] the GL thread may render the frame so far to serve this barrier
         void *waitScope = ps2xGuestWaitBegin();
         std::unique_lock<std::mutex> lk(g_bbMx);
         const uint64_t mine = ++g_bbPosted;
@@ -4398,7 +4399,132 @@ bool GsGpuRenderer::revalidateTexture(uint64_t key, uint32_t pageLo, uint32_t pa
 }
 
 std::atomic<unsigned long> g_texDecodeCount{0};   // [decodes] real texture decodes (putTexture calls), fps line + replaybench
-void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi, int fmt, int texScale, float alphaScale)
+// [decpool] ----------------------------------------------------------------------------------------
+// Texture decodes off the kick worker. The record path (GSRasterizer, T8/T4 misses) snapshots a decode's
+// inputs into a DecPoolJob, posts it here and moves on; the pool threads decode into a private scratch
+// VRAM and put the result through putTexture with the record-time stamp. decPoolDrain() at the frame
+// publish and at every barrier post keeps the one invariant the GL thread relies on: a draw it renders
+// has its texels in the cache.
+//   PS2X_DECPOOL=N       pool threads (default 2; 0 = off, every decode inline as before)
+//   PS2X_DECPOOLSTAT=1   a [decpool] line every 10 s (also under PS2X_EEPROF)
+extern "C" void ps2xEeProfAddCurrentThread(const char *name);   // [eeprof]
+namespace {
+struct DecPoolState
+{
+    std::mutex mx;
+    std::condition_variable cv, cvDone;
+    std::deque<std::unique_ptr<DecPoolJob>> q;
+    uint64_t posted = 0, done = 0;
+    std::atomic<uint64_t> nsDecode{0}, nJobs{0}, nDrain{0}, nsDrain{0}, maxDepth{0}, bytesSpan{0}, staleDrop{0};
+    std::once_flag once;
+};
+// heap-allocated and never freed on purpose (the [texpackasync] pattern): a static object's destructor would run at
+// process exit while the detached pool threads still wait on its condition variable, which hung the exit
+DecPoolState &g_decPool = *new DecPoolState;
+int decPoolThreads() { static const int n = [](){ const char *v = std::getenv("PS2X_DECPOOL"); return (v && v[0]) ? std::atoi(v) : 2; }(); return n; }
+void decPoolWorker()
+{
+    ps2xEeProfAddCurrentThread("DecPool");
+    std::vector<uint8_t> scratch;
+    for (;;)
+    {
+        std::unique_ptr<DecPoolJob> job;
+        {
+            std::unique_lock<std::mutex> lk(g_decPool.mx);
+            g_decPool.cv.wait(lk, []{ return !g_decPool.q.empty(); });
+            job = std::move(g_decPool.q.front()); g_decPool.q.pop_front();
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        if (scratch.size() < job->vramSize) scratch.resize(job->vramSize);
+        if (!job->span.empty() && (size_t)job->spanOff + job->span.size() <= scratch.size())
+            std::memcpy(scratch.data() + job->spanOff, job->span.data(), job->span.size());
+        int subW = 0; std::vector<uint8_t> rgba;
+        job->ras->decodeSnapshot(*job, scratch.data(), scratch.size(), subW, rgba);
+        int upW = subW, upH = job->texH, upFmt = 0, upScale = 1; float upAlpha = 1.0f;
+        GSRasterizer::applyTexReplacement(scratch.data(), job->tex0, job->clut, job->clutKey, job->texa, job->texKey, subW, job->texH,
+                                          job->subDxW == 0 && !job->rawAlphaDec, rgba, upW, upH, upFmt, upScale, upAlpha);
+        job->rend->putTexture(job->texKey, std::move(rgba), upW, upH, job->pageLo, job->pageHi, upFmt, upScale, upAlpha, (int64_t)job->seq);
+        g_decPool.nsDecode.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+        g_decPool.nJobs.fetch_add(1u, std::memory_order_relaxed);
+        { std::lock_guard<std::mutex> lk(g_decPool.mx); ++g_decPool.done; }
+        g_decPool.cvDone.notify_all();
+    }
+}
+void decPoolStart()
+{
+    const int n = decPoolThreads();
+    for (int i = 0; i < n; ++i) { std::thread t(decPoolWorker); t.detach(); }
+    std::fprintf(stderr, "[decpool] %d decode thread(s)\n", n);
+}
+void decPoolStat()
+{
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_DECPOOLSTAT"); const char *e = std::getenv("PS2X_EEPROF");
+                                   return (v && v[0] && v[0] != '0') || (e && e[0] && e[0] != '0'); }();
+    if (!s_on) return;
+    static auto s_t = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - s_t < std::chrono::seconds(10)) return;
+    const double secs = std::chrono::duration<double>(now - s_t).count(); s_t = now;
+    const uint64_t nj = g_decPool.nJobs.exchange(0), nd = g_decPool.nsDecode.exchange(0), ndr = g_decPool.nDrain.exchange(0),
+                   nsd = g_decPool.nsDrain.exchange(0), md = g_decPool.maxDepth.exchange(0), bs = g_decPool.bytesSpan.exchange(0), sd = g_decPool.staleDrop.exchange(0);
+    std::fprintf(stderr, "[decpool] %.1f jobs/s, %.1f ms/s decoded on the pool, span %.0f KB/s, drain waits %.1f/s costing %.2f ms/s, max queue %llu, stale drops %llu\n",
+                 nj / secs, nd / 1e6 / secs, bs / 1024.0 / secs, ndr / secs, nsd / 1e6 / secs, (unsigned long long)md, (unsigned long long)sd);
+}
+}   // namespace
+
+bool GsGpuRenderer::decPoolWants(uint32_t psm)
+{
+    static const bool s_on = [](){ if (decPoolThreads() <= 0) return false;
+                                   const char *c = std::getenv("PS2X_DECCENSUS"); return !(c && c[0] && c[0] != '0'); }();   // keep the inline census meaningful
+    if (!s_on) return false;
+    // palette formats only: a direct format's live decode may read the flush's LINEAR image ([linvram]), which a
+    // VRAM snapshot cannot reproduce; T8/T4 always read swizzled VRAM through the fast paths
+    if (psm != GS_PSM_T8 && psm != GS_PSM_T4) return false;
+    return GSRasterizer::decodeIsDeferrable(psm);   // the diagnostics that need the live GS force the inline path
+}
+void GsGpuRenderer::decPoolPost(std::unique_ptr<DecPoolJob> job)
+{
+    std::call_once(g_decPool.once, decPoolStart);
+    g_decPool.bytesSpan.fetch_add((uint64_t)job->span.size(), std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(g_decPool.mx);
+        g_decPool.q.push_back(std::move(job));
+        ++g_decPool.posted;
+        const uint64_t depth = g_decPool.posted - g_decPool.done;
+        if (depth > g_decPool.maxDepth.load(std::memory_order_relaxed)) g_decPool.maxDepth.store(depth, std::memory_order_relaxed);
+    }
+    g_decPool.cv.notify_one();
+}
+void GsGpuRenderer::decPoolDrain()
+{   // caller must NOT hold m_mtx: the pool's put takes it
+    std::unique_lock<std::mutex> lk(g_decPool.mx);
+    if (g_decPool.done >= g_decPool.posted) { lk.unlock(); decPoolStat(); return; }
+    const auto t0 = std::chrono::steady_clock::now();
+    bool ok;
+    {
+        Ps2xWaitScope w(WP_DECPOOL);
+        ok = g_decPool.cvDone.wait_for(lk, std::chrono::seconds(2), []{ return g_decPool.done >= g_decPool.posted; });
+    }
+    lk.unlock();
+    g_decPool.nDrain.fetch_add(1u, std::memory_order_relaxed);
+    g_decPool.nsDrain.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+    if (!ok) { static int n = 0; if (n++ < 4) std::fprintf(stderr, "[decpool] drain waited 2 s for the decode pool -- going on without it\n"); }
+    decPoolStat();
+}
+uint32_t GsGpuRenderer::putTexturePending(uint64_t key, int w, int h, uint32_t pageLo, uint32_t pageHi)
+{   // [decpool] record side: the entry exists (w/h set) so this frame's later draws of the key hit instead of
+    // re-posting; an existing entry keeps its texels (an older upload in flight stays right for the frame that
+    // recorded it) and only takes the new stamp. Returns the stamp the pool's put must carry.
+    (void)pageLo; (void)pageHi;
+    std::lock_guard<std::mutex> lk(m_mtx);
+    g_texLastUse[key] = g_texUseGen;   // [evictnew]
+    CachedTex &ct = m_texCache[key];
+    if (ct.w <= 0) { ct.w = w; ct.h = h; ct.needsUpload = false; ct.rgba.clear(); ct.fmt = 0; ct.texScale = 1; ct.alphaScale = 1.0f; }
+    ct.decodeSeq = m_writeSeq;
+    return m_writeSeq;
+}
+
+void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi, int fmt, int texScale, float alphaScale, int64_t seqAt)
 {
     g_texDecodeCount.fetch_add(1u, std::memory_order_relaxed);
     {   // [decodecensus] PS2X_DECCENSUS=1: which textures get re-decoded, by (first page, w, h); top 8 every 2 s
@@ -4462,6 +4588,12 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
         ++g_ptN; std::fprintf(stderr, "[pt] %lu DECODE %dx%d pages %u-%u gl=%d meanA=%lu hash=%llx\n", g_ptN, w, h, pageLo, pageHi, (int)ps2xOnGlThread(), sa / (rgba.size() / 4), (unsigned long long)hh); }
     (void)pageLo; (void)pageHi;
     std::lock_guard<std::mutex> lk(m_mtx);
+    if (seqAt >= 0)
+    {   // [decpool] a pool put carries its record-time stamp; if a newer decode of this key already landed (the
+        // source was rewritten and re-recorded while this one was in flight) this result is stale: drop it
+        auto old = m_texCache.find(key);
+        if (old != m_texCache.end() && old->second.w > 0 && old->second.decodeSeq > (uint32_t)seqAt) { g_decPool.staleDrop.fetch_add(1u, std::memory_order_relaxed); return; }
+    }
     ++g_putTexCount;   // [cachestat]
     g_texLastUse[key] = g_texUseGen;   // [evictnew] a fresh entry must not look like the oldest (last=0) to the budget eviction
     { extern unsigned long g_texMints, g_texRedecodes;   // [vramdiag] churn accounting
@@ -4473,7 +4605,7 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
     ct.fmt = fmt;   // [texreplace] 0 = RGBA8; non-zero = a compressed DDS replacement
     ct.texScale = texScale;
     ct.alphaScale = alphaScale;   // [texreplace]
-    ct.decodeSeq = m_writeSeq;
+    ct.decodeSeq = (seqAt >= 0) ? (uint32_t)seqAt : m_writeSeq;   // [decpool]
     ct.needsUpload = true;
     m_upQueue.push_back(key);   // [upqueue] O(1) here instead of an O(cache) scan per chunk render
     // Flag near-black textures (sampled): a fully stale/empty VRAM region decodes to black.
@@ -6582,6 +6714,7 @@ void GsGpuRenderer::swapFrame()
                                  c.vramSnap ? 1 : 0, c.dx0, c.dy0, c.dx1, c.dy1, c.srcTexW, c.srcTexH, c.texKey ? 1 : 0); }
         }
     }
+    decPoolDrain();   // [decpool] every decode this frame posted has landed before the list is published (m_mtx not held here)
     std::unique_lock<std::mutex> lk(m_mtx);
     auto unservicedDecode = [&]() -> bool {   // [deferpub] a decode command published unserviced can only be
         for (size_t i = m_segFrom; i < m_building.size(); ++i)   // reached in-loop by the frame render -> its draws

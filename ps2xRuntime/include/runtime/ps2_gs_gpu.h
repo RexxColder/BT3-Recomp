@@ -216,6 +216,31 @@ struct TexDecodeReq
     std::vector<uint32_t> coverContentSeq;   // [cseqsnap] m_contentSeq[flushPage .. +256) at the post: the flush's shadow/band bookkeeping must see the READ's stamps, not the guest's later ones   // [srcsnap] source pages OUTSIDE the flush cover, as they were at the READ (upload-fed sheets that get re-streamed before the service)
 };
 
+// [decpool] a texture decode handed to the decode pool: everything the inline decode would have read
+// from the live GS at record time (registers, the built palette, a copy of the source VRAM span), so
+// the pool decodes the same texels while the kick worker moves on. See GsGpuRenderer::decPoolPost.
+class GsGpuRenderer;
+struct DecPoolJob
+{
+    GSTex0Reg tex0{};
+    uint64_t clamp = 0;
+    GSTexaReg texa{0u, false, 0u};
+    GSTexClutReg texclut{0u, 0u, 0u};
+    int texW = 0, texH = 0;
+    bool rawAlphaDec = false;
+    uint64_t texKey = 0;
+    uint32_t pageLo = 0, pageHi = 0;
+    int subDxW = 0, subDx0 = 0;
+    uint32_t clut[256] = {};
+    uint64_t clutKey = ~0ull;
+    std::vector<uint8_t> span;          // VRAM bytes [spanOff, spanOff + span.size()) as they were at the record
+    uint32_t spanOff = 0;
+    size_t vramSize = 0;
+    uint32_t seq = 0;                   // the renderer's write sequence at the record: the entry's freshness stamp
+    GSRasterizer *ras = nullptr;
+    GsGpuRenderer *rend = nullptr;
+};
+
 struct GSPrimReg
 {
     GSPrimType type;

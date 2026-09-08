@@ -20,6 +20,7 @@
 #include <mutex>
 
 struct TexDecodeReq;   // [deferdec]
+struct DecPoolJob;     // [decpool]
 struct LinImg;   // [linvram] ps2_gs_gpu_renderer.cpp
 class GsGpuRenderer
 {
@@ -386,7 +387,11 @@ public:
 
     bool revalidateTexture(uint64_t key, uint32_t pageLo, uint32_t pageHi,
                            const uint8_t *vram, uint32_t vramSize);
-    void putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi, int fmt = 0, int texScale = 1, float alphaScale = 1.0f);
+    void putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi, int fmt = 0, int texScale = 1, float alphaScale = 1.0f, int64_t seqAt = -1);   // [decpool] seqAt >= 0: a pool put, stamped with its record-time sequence
+    uint32_t putTexturePending(uint64_t key, int w, int h, uint32_t pageLo, uint32_t pageHi);   // [decpool] placeholder entry; returns the stamp the pool's put must carry
+    static bool decPoolWants(uint32_t psm);              // [decpool] this format's decode goes to the pool
+    void decPoolPost(std::unique_ptr<DecPoolJob> job);   // [decpool] hand a record-time snapshot to the pool
+    void decPoolDrain();                                  // [decpool] wait until every posted decode has landed in the cache
     void recordCmd(const DrawCmd &cmd);
     // [drawbatch] ---- plain-class triangle batching (guest thread only) ----
     // Batching lives entirely in the guest-owned staging buffer (PS2X_RECSTAGE > 0, the default):
