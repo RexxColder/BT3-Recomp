@@ -1418,8 +1418,8 @@ L_122:
         st.pc = 0x3d0u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -4796,8 +4796,8 @@ L_375:
         st.pc = 0xbb8u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -5042,8 +5042,8 @@ L_395:
         st.pc = 0xc58u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -24360,8 +24360,8 @@ L_96:
         st.pc = 0x300u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -24699,8 +24699,8 @@ L_122:
         st.pc = 0x3d0u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -28077,8 +28077,8 @@ L_375:
         st.pc = 0xbb8u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -28323,8 +28323,8 @@ L_395:
         st.pc = 0xc58u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -47051,8 +47051,8 @@ L_44:
         st.pc = 0x160u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -47344,8 +47344,8 @@ L_66:
         st.pc = 0x210u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -51474,8 +51474,8 @@ L_375:
         st.pc = 0xbb8u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -51720,8 +51720,8 @@ L_395:
         st.pc = 0xc58u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -71137,8 +71137,8 @@ L_101:
         st.pc = 0x328u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -75417,8 +75417,8 @@ L_423:
         st.pc = 0xd38u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -75719,8 +75719,8 @@ L_447:
         st.pc = 0xdf8u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -94388,8 +94388,8 @@ L_89:
         st.pc = 0x2c8u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -98172,8 +98172,8 @@ L_375:
         st.pc = 0xbb8u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -98418,8 +98418,8 @@ L_395:
         st.pc = 0xc58u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -117774,8 +117774,8 @@ L_99:
         st.pc = 0x318u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -121428,8 +121428,8 @@ L_375:
         st.pc = 0xbb8u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -121674,8 +121674,8 @@ L_395:
         st.pc = 0xc58u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -122010,8 +122010,8 @@ L_423:
         st.pc = 0xd38u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -122312,8 +122312,8 @@ L_447:
         st.pc = 0xdf8u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -141212,8 +141212,8 @@ L_108:
         st.pc = 0x360u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -141358,8 +141358,8 @@ L_119:
         st.pc = 0x3b8u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -144782,8 +144782,8 @@ L_375:
         st.pc = 0xbb8u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -145028,8 +145028,8 @@ L_395:
         st.pc = 0xc58u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -145364,8 +145364,8 @@ L_423:
         st.pc = 0xd38u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }
@@ -145666,8 +145666,8 @@ L_447:
         st.pc = 0xdf8u;
         {
             bool fb = false;
-            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; }  }
-            else {  if (!vujit::jitLower<0x800016fcu>(st, vuData, dataSize)) { vujit::jitPipeSync(st, cyc, qDead, cDead); vu.jitSlowLower(0x800016fcu, vuData, dataSize, gs, memory, 0x000002ffu); vujit::jitPipeArm(st, cyc, qDead, cDead); fb = true; } }
+            if constexpr (vuLowerShouldRunBeforeUpper(0x000002ffu, 0x800016fcu)) { vu.xgkickImpl(2u, vuData, dataSize, gs, memory);  }
+            else {  vu.xgkickImpl(2u, vuData, dataSize, gs, memory); }
             if (fb) { _mm_storeu_ps(st.vf[0], _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)); st.vi[0] = 0; }
         }
     }

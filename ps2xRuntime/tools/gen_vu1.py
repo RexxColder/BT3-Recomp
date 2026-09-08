@@ -138,6 +138,10 @@ def emit_pair_body(out, k, lo, up, pairs, inline_mode):
             lo_code.append(f'st.vi[{vit}] = {k + 2};')
         lo_code.append(f'br = {cond};')
         lo_code = ' '.join(lo_code)
+    elif (lo & 0x7FF) == 0x6FC:
+        # [xgkick-native] XGKICK: call the kick service routine directly. It reads only vi[is] and VU memory (no Q/CLIP,
+        # no flags), so no pipeline sync and no post-fallback vf0/vi0 reset.
+        lo_code = f'vu.xgkickImpl({(lo >> 11) & 0x1F}u, vuData, dataSize, gs, memory);'
     else:
         lo_code = f'if (!vujit::jitLower<0x{lo:08x}u>(st, vuData, dataSize)) {{ {slow_pre}vu.jitSlowLower(0x{lo:08x}u, vuData, dataSize, gs, memory, 0x{up:08x}u); {slow_post}fb = true; }}'
     if loi:
