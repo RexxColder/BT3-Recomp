@@ -54,6 +54,7 @@ public:
                 uint32_t top = 0, uint32_t itop = 0, uint32_t maxCycles = 65536);
 
     VU1State &state() { return m_state; }
+    void xgkickImpl(uint32_t viS, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory);   // [xgkick-native] called directly by the recompiled programs
     // [vu1jit] the static recompiler's fallbacks and the verify-mode reference run
     void jitSlowUpper(uint32_t instr) { ++m_jitSlowUp; execUpper(instr); }   // [jitstat]
     void jitSlowLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr) { ++m_jitSlowLo; ++m_jitSlowLoHist[(instr >> 25) & 0x7Fu]; if (((instr >> 25) & 0x7Fu) == 0x40u) ++m_jitSlowLoSpec[((instr & 0x3Fu) | ((instr >> 4) & 0x7C0u)) & 0x7FFu]; execLower(instr, vuData, dataSize, gs, memory, upperInstr); }
