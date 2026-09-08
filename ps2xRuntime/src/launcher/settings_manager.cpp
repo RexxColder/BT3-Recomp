@@ -220,24 +220,24 @@ bool SettingsManager::save()
     upsert("logging", "dump_runtime", m_dumpRuntime ? "1" : "0");
     upsert("logging", "dump_gamepad", m_dumpGamepad ? "1" : "0");
 
-    const QString tmp = path + ".tmp";
+    // Write the ini directly. A tmp+rename round-trip left a stale .tmp file
+    // behind and on some platforms failed to replace the existing ini, so the
+    // "Save" button appeared to do nothing.
+    QFile out(path);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate))
+        return false;
+    QTextStream ts(&out);
+    bool first = true;
+    for (auto it = sections.begin(); it != sections.end(); ++it)
     {
-        QFile out(tmp);
-        if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate))
-            return false;
-        QTextStream ts(&out);
-        bool first = true;
-        for (auto it = sections.begin(); it != sections.end(); ++it)
-        {
-            const Section &s = it.value();
-            if (!first)
-                ts << "\n";
-            first = false;
-            ts << "[" << it.key() << "]\n";
-            for (const QString &k : s.order)
-                ts << k << "=" << s.kv[k] << "\n";
-        }
-        ts.flush();
+        const Section &s = it.value();
+        if (!first)
+            ts << "\n";
+        first = false;
+        ts << "[" << it.key() << "]\n";
+        for (const QString &k : s.order)
+            ts << k << "=" << s.kv[k] << "\n";
     }
-    return QFile::rename(tmp, path);
+    ts.flush();
+    return true;
 }
