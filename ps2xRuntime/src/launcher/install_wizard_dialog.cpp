@@ -1,5 +1,6 @@
 #include "install_wizard_dialog.h"
 
+#include "afs_extract_worker.h"
 #include "extract_worker.h"
 #include "iso9660.h"
 
@@ -88,6 +89,23 @@ QString findImageRecursive(const QString &root, int depth)
             return it.filePath();
     }
     return QString();
+}
+
+// Any PZS3US*.AFS left next to the extracted game data (their parent folder is
+// the deploy dir the runtime reads from).
+QStringList findAfsContainers(const QString &dataDir)
+{
+    QStringList out;
+    QDirIterator it(dataDir, QDir::Files, QDirIterator::Subdirectories);
+    while (it.hasNext())
+    {
+        it.next();
+        const QString n = it.fileName().toUpper();
+        if (n.startsWith(QLatin1String("PZS3US")) && n.endsWith(QLatin1String(".AFS")))
+            out << it.filePath();
+    }
+    out.sort();
+    return out;
 }
 
 } // namespace
@@ -225,7 +243,13 @@ void InstallWizardDialog::buildUi()
             "QProgressBar { background:#1b222b; border:1px solid #2a3542; border-radius:4px; height:14px; }"
             "QProgressBar::chunk { background:#ff9e1a; border-radius:4px; }"));
         l->addWidget(m_bar);
-        l->addSpacing(12);
+        l->addSpacing(6);
+
+        m_activity = new QLabel(QString(), pageC);
+        m_activity->setWordWrap(true);
+        m_activity->setStyleSheet(QStringLiteral("font-size: 12px; color: #8b93a3;"));
+        l->addWidget(m_activity);
+        l->addSpacing(6);
 
         m_doneLabel = new QLabel(QString(), pageC);
         m_doneLabel->setWordWrap(true);
@@ -367,6 +391,11 @@ void InstallWizardDialog::onInstall()
 
 void InstallWizardDialog::onRetryInstall()
 {
+    if (m_inAfsPhase)
+    {
+        startAfsConversion();
+        return;
+    }
     if (m_isoPath.isEmpty())
     {
         setIndex(1);
@@ -380,6 +409,7 @@ void InstallWizardDialog::startExtraction()
     m_bar->setRange(0, 1);
     m_bar->setValue(0);
     m_progressText->setText(QStringLiteral("0 MB / 0 MB"));
+    m_activity->clear();
     m_doneLabel->setText(QStringLiteral("Installation in progress…"));
     m_doneLabel->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
     m_retryInstall->setVisible(false);
@@ -415,8 +445,83 @@ void InstallWizardDialog::onExtractDone(bool ok, const QString &msg)
 {
     if (ok)
     {
+        const QString dataDir = QApplication::applicationDirPath() + QStringLiteral("/data");
+        if (!findAfsContainers(dataDir).isEmpty())
+        {
+            startAfsConversion();
+            return;
+        }
+        applyInstallResult(true, QStringLiteral("Installation complete. Game disc validated."));
+        return;
+    }
+    applyInstallResult(false, msg);
+}
+
+void InstallWizardDialog::startAfsConversion()
+{
+    const QString dataDir = QApplication::applicationDirPath() + QStringLiteral("/data");
+    const QStringList afs = findAfsContainers(dataDir);
+    if (afs.isEmpty())
+    {
+        applyInstallResult(true, QStringLiteral("Installation complete. Game disc validated."));
+        return;
+    }
+
+    m_inAfsPhase = true;
+    m_retryInstall->setVisible(false);
+    m_close->setEnabled(false);
+    m_bar->setRange(0, 1);
+    m_bar->setValue(0);
+    m_progressText->setText(QStringLiteral("0 MB / 0 MB"));
+    m_doneLabel->setText(QStringLiteral("Converting game data to folders…"));
+    m_doneLabel->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
+    m_activity->setText(QStringLiteral("Preparing…"));
+    QCoreApplication::processEvents();
+
+    m_afsThread = new QThread;
+    m_afsWorker = new AfsExtractWorker;
+    m_afsWorker->moveToThread(m_afsThread);
+    connect(m_afsThread, &QThread::finished, m_afsWorker, &QObject::deleteLater);
+    connect(m_afsThread, &QThread::finished, m_afsThread, &QObject::deleteLater);
+    connect(m_afsWorker, &AfsExtractWorker::status, this, &InstallWizardDialog::onAfsStatus);
+    connect(m_afsWorker, &AfsExtractWorker::progress, this, &InstallWizardDialog::onAfsProgress);
+    connect(m_afsWorker, &AfsExtractWorker::done, this, &InstallWizardDialog::onAfsDone);
+    connect(m_afsWorker, &AfsExtractWorker::done, m_afsThread, &QThread::quit);
+    m_afsThread->start();
+
+    QMetaObject::invokeMethod(m_afsWorker, "doWork", Qt::QueuedConnection, Q_ARG(QStringList, afs));
+}
+
+void InstallWizardDialog::onAfsStatus(const QString &text)
+{
+    m_activity->setText(text);
+}
+
+void InstallWizardDialog::onAfsProgress(qint64 done, qint64 total)
+{
+    if (total > 0)
+        m_bar->setRange(0, static_cast<int>(total / (64 * 1024)));
+    m_bar->setValue(static_cast<int>(done / (64 * 1024)));
+    m_progressText->setText(
+        QStringLiteral("%1 MB / %2 MB").arg(fmtMb(done)).arg(fmtMb(total)));
+}
+
+void InstallWizardDialog::onAfsDone(bool ok, const QString &msg)
+{
+    m_inAfsPhase = false;
+    m_activity->clear();
+    if (ok)
+        applyInstallResult(true, QStringLiteral("Installation complete. Game data converted to folders."));
+    else
+        applyInstallResult(false, msg);
+}
+
+void InstallWizardDialog::applyInstallResult(bool ok, const QString &msg)
+{
+    if (ok)
+    {
         m_installed = true;
-        m_doneLabel->setText(QStringLiteral("Installation complete. Game disc validated."));
+        m_doneLabel->setText(msg);
         m_doneLabel->setStyleSheet(QStringLiteral("font-size: 13px; color: #22c55e;"));
         m_bar->setValue(m_bar->maximum());
     }
