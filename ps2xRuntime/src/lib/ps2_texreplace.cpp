@@ -9,7 +9,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include "raylib.h"
 
 namespace ps2tex
@@ -182,29 +186,159 @@ bool replacementsEnabled()
     return g_on;
 }
 
+namespace
+{
+    // Decode one replacement file to an upload-ready blob. raylib's LoadImage is pure CPU
+    // (stb_image) -- safe on any thread, which is what the async worker relies on.
+    bool decodeFile(const std::string &path, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt)
+    {
+        Image img = LoadImage(path.c_str());
+        if (img.data == nullptr || img.width <= 0 || img.height <= 0) { UnloadImage(img); return false; }
+
+        // KEEP a compressed DDS compressed. ImageFormat() silently REFUSES to convert compressed
+        // input (rtextures.c only converts when both formats are < PIXELFORMAT_COMPRESSED_DXT1_RGB),
+        // so calling it on BC data would no-op and we would then copy compressed bytes as if they
+        // were RGBA8 -- garbage textures with no error. Pass the format through instead and let
+        // rlLoadTexture route it to glCompressedTexImage2D.
+        const bool isCompressed = (img.format >= PIXELFORMAT_COMPRESSED_DXT1_RGB);
+        if (!isCompressed) ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+        w = img.width; h = img.height; fmt = img.format;
+        const int bytes = GetPixelDataSize(w, h, img.format);
+        if (bytes <= 0) { UnloadImage(img); return false; }
+        rgba.assign((const uint8_t *)img.data, (const uint8_t *)img.data + (size_t)bytes);
+        UnloadImage(img);
+        return true;
+    }
+
+    // [texpackasync] Background decode. A 5600G+3050 Windows log (2026-09-07) spent a 90-second
+    // stretch at ~20 fps with 73 replacement PNG loads per second decoded INLINE on the record
+    // thread; with the pack indexed the loads are the whole difference between its good and bad
+    // seconds. The record path must never wait on a file: queue it, draw the original, swap the
+    // replacement in when the worker is done.
+    struct Blob { std::vector<uint8_t> rgba; int w = 0, h = 0, fmt = 0; };
+    struct Job { uint64_t key; std::string path; uint64_t texKey; };
+    struct AsyncState
+    {
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::deque<Job> queue;
+        std::unordered_map<uint64_t, Blob> ready;        // pairKey -> decoded, not yet consumed
+        std::deque<uint64_t> readyOrder;                  // FIFO for the byte cap
+        size_t readyBytes = 0;
+        std::unordered_set<uint64_t> pending;             // pairKey queued or decoding
+        std::unordered_set<uint64_t> failed;              // pairKey that would not decode: never retry
+        std::unordered_set<uint64_t> swap;                // texKeys whose replacement is ready
+        std::vector<std::thread> workers;
+        unsigned long decoded = 0, dropped = 0, consumed = 0;
+    };
+    // Heap-allocated and never destroyed on purpose: the workers are detached and may still be
+    // decoding when static destructors run at exit.
+    AsyncState *g_async = nullptr;
+    std::once_flag g_asyncOnce;
+
+    bool asyncEnabled()
+    {
+        static const bool s = [](){ const char *v = std::getenv("PS2X_TEXPACK_ASYNC"); return !(v && v[0] == '0'); }();
+        return s;
+    }
+
+    void workerLoop(AsyncState *st, int idx)
+    {
+        (void)idx;
+        for (;;)
+        {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lk(st->mtx);
+                st->cv.wait(lk, [&]{ return !st->queue.empty(); });
+                job = std::move(st->queue.front()); st->queue.pop_front();
+            }
+            Blob b;
+            const bool ok = decodeFile(job.path, b.rgba, b.w, b.h, b.fmt);
+            std::lock_guard<std::mutex> lk(st->mtx);
+            st->pending.erase(job.key);
+            if (!ok) { st->failed.insert(job.key); continue; }
+            // Byte cap: a texture that is never resolved again would otherwise pin its blob
+            // forever. Oldest-first eviction; 384 MB default, PS2X_TEXPACK_CACHE_MB overrides.
+            static const size_t s_capBytes = [](){ const char *v = std::getenv("PS2X_TEXPACK_CACHE_MB");
+                                                    return (size_t)((v && v[0]) ? std::atol(v) : 384L) * 1024u * 1024u; }();
+            st->readyBytes += b.rgba.size();
+            st->readyOrder.push_back(job.key);
+            st->ready[job.key] = std::move(b);
+            ++st->decoded;
+            while (st->readyBytes > s_capBytes && !st->readyOrder.empty())
+            {
+                const uint64_t k = st->readyOrder.front(); st->readyOrder.pop_front();
+                auto it = st->ready.find(k);
+                if (it == st->ready.end()) continue;
+                st->readyBytes -= it->second.rgba.size();
+                st->ready.erase(it);
+                ++st->dropped;
+            }
+            st->swap.insert(job.texKey);
+        }
+    }
+
+    void startAsync()
+    {
+        g_async = new AsyncState();
+        const char *v = std::getenv("PS2X_TEXPACK_THREADS");
+        int n = (v && v[0]) ? std::atoi(v) : 2;
+        if (n < 1) n = 1;
+        if (n > 8) n = 8;
+        for (int i = 0; i < n; ++i) { std::thread t(workerLoop, g_async, i); t.detach(); }
+        std::fprintf(stderr, "[texpackasync] replacement files decode on %d background thread(s); "
+                             "originals draw until each is ready (PS2X_TEXPACK_ASYNC=0 = inline loads)\n", n);
+    }
+}
+
 bool loadReplacement(const TexIdent &id, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt)
 {
     if (!replacementsEnabled()) return false;
     auto it = g_index.find(pairKey(id.tex0Hash, id.hasClut ? id.clutHash : 0ull));
     if (it == g_index.end()) return false;
+    return decodeFile(it->second, rgba, w, h, fmt);
+}
 
-    // raylib's LoadImage is pure CPU (stb_image) -- safe off the GL thread, which matters because
-    // decoding happens on the guest thread.
-    Image img = LoadImage(it->second.c_str());
-    if (img.data == nullptr || img.width <= 0 || img.height <= 0) { UnloadImage(img); return false; }
+bool loadReplacement(const TexIdent &id, uint64_t texKey, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt)
+{
+    if (!replacementsEnabled()) return false;
+    if (!asyncEnabled()) return loadReplacement(id, rgba, w, h, fmt);
+    const uint64_t key = pairKey(id.tex0Hash, id.hasClut ? id.clutHash : 0ull);
+    auto it = g_index.find(key);
+    if (it == g_index.end()) return false;
+    std::call_once(g_asyncOnce, startAsync);
+    AsyncState *st = g_async;
+    std::lock_guard<std::mutex> lk(st->mtx);
+    auto rd = st->ready.find(key);
+    if (rd != st->ready.end())
+    {
+        Blob &b = rd->second;
+        rgba = std::move(b.rgba); w = b.w; h = b.h; fmt = b.fmt;
+        st->readyBytes -= rgba.size();
+        st->ready.erase(rd);
+        st->swap.erase(texKey);
+        ++st->consumed;
+        {   static unsigned long s_n = 0;
+            if (++s_n <= 3 || (s_n % 500) == 0)
+                std::fprintf(stderr, "[texpackasync] swapped in #%lu (decoded %lu, dropped %lu, pending %zu)\n",
+                             s_n, st->decoded, st->dropped, st->pending.size()); }
+        return true;
+    }
+    if (st->failed.count(key) || st->pending.count(key)) return false;
+    st->pending.insert(key);
+    st->queue.push_back(Job{key, it->second, texKey});
+    st->cv.notify_one();
+    return false;
+}
 
-    // KEEP a compressed DDS compressed. ImageFormat() silently REFUSES to convert compressed
-    // input (rtextures.c only converts when both formats are < PIXELFORMAT_COMPRESSED_DXT1_RGB),
-    // so calling it on BC data would no-op and we would then copy compressed bytes as if they
-    // were RGBA8 -- garbage textures with no error. Pass the format through instead and let
-    // rlLoadTexture route it to glCompressedTexImage2D.
-    const bool isCompressed = (img.format >= PIXELFORMAT_COMPRESSED_DXT1_RGB);
-    if (!isCompressed) ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
-    w = img.width; h = img.height; fmt = img.format;
-    const int bytes = GetPixelDataSize(w, h, img.format);
-    if (bytes <= 0) { UnloadImage(img); return false; }
-    rgba.assign((const uint8_t *)img.data, (const uint8_t *)img.data + (size_t)bytes);
-    UnloadImage(img);
+bool takeReadySwap(uint64_t texKey)
+{
+    if (!g_async) return false;
+    std::lock_guard<std::mutex> lk(g_async->mtx);
+    auto it = g_async->swap.find(texKey);
+    if (it == g_async->swap.end()) return false;
+    g_async->swap.erase(it);
     return true;
 }
 }

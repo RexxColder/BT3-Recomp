@@ -45,5 +45,13 @@ namespace ps2tex
     // glCompressedTexImage2D unchanged. Keeping it compressed is the whole point: a 4x PNG
     // replacement costs 16x the original's VRAM, where BC1 is 4:1 on top of that.
     bool loadReplacement(const TexIdent &id, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt);
+
+    // [texpackasync] Non-blocking variant for the record path. A replacement file is decoded on a
+    // background worker; until it is ready this returns false (the caller uploads the original
+    // texture as usual) and the file is queued once. When the worker finishes, `texKey` is marked
+    // so the texture-cache HIT path can force one re-resolve (takeReadySwap), which then gets the
+    // decoded blob from here. PS2X_TEXPACK_ASYNC=0 restores the synchronous load.
+    bool loadReplacement(const TexIdent &id, uint64_t texKey, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt);
+    bool takeReadySwap(uint64_t texKey);
 }
 #endif

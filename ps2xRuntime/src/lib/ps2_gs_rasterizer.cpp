@@ -4331,7 +4331,10 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             {
                 static std::atomic<uint64_t> s_prims{0}, s_decodes{0}, s_texels{0};
                 s_prims.fetch_add(1, std::memory_order_relaxed);
-                const bool miss = !r.hasTexture(texKey, texPageLo, texPageHi);
+                // [texpackasync] a replacement that finished decoding since this texture was cached forces ONE
+                // re-resolve so the decode path below swaps it in (the cache entry is re-put under the same key).
+                const bool miss = !r.hasTexture(texKey, texPageLo, texPageHi)
+                               || (GsGpuRenderer::texPackEnabled() && ps2tex::takeReadySwap(texKey));
                 if (miss) { s_decodes.fetch_add(1, std::memory_order_relaxed); s_texels.fetch_add(static_cast<uint64_t>(texW) * texH, std::memory_order_relaxed); }
                 static std::mutex s_dm; static std::chrono::steady_clock::time_point s_t = std::chrono::steady_clock::now();
                 // Which textures are churning: sum re-decoded texels per (tbp0,psm,w,h).
@@ -4487,7 +4490,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                              gs->m_texa.ta0, gs->m_texa.aem, gs->m_texa.ta1, id))
                         {
                             std::vector<uint8_t> rep; int rw = 0, rh = 0, rfmt = 0;
-                            const bool found = ps2tex::loadReplacement(id, rep, rw, rh, rfmt);
+                            const bool found = ps2tex::loadReplacement(id, texKey, rep, rw, rh, rfmt);   // [texpackasync]
                             {   // [texrepdiag] PS2X_TEXREPDIAG=1: every lookup, unthrottled, with the
                                 // palette we hashed -- so a draw that resolves to the WRONG CLUT
                                 // variant is visible as a name mismatch rather than guessed at.
