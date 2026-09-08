@@ -8300,6 +8300,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     // every host frame, so presenting the front buffer (which the current draws DON'T touch)
     // would show black on the frames we cleared it -> the black/actual flashing. Skip it.
     const uint32_t areaPickFbp = displayFbp; const bool areaPickOk = found || !destArea.empty();
+    uint32_t hintFbpNow = m_hintDisplayFbp;   // [displatch] snapshot for the pick below
     {   // [crtcdisp] PS2X_CRTCDISP=1: take the scanned-out buffer from the CRTC registers, every frame.
         // setDisplay() -- the only writer of m_hintDisplayFbp -- is called from the DISPFB register-write
         // handler, but BT3 flips buffers with MEMORY-MAPPED DISPFB writes that bypass it. The hint therefore
@@ -8344,6 +8345,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 }
             }
             if (fbp != 0xFFFFFFFFu && fbw) { m_hintDisplayFbp = fbp; m_hintDisplayFbw = fbw; }   // NOT setDisplay(): the present must not latch
+            // [displatch] the pick below must use THIS present's value: m_hintDisplayFbp is also written by the record side at
+            // every flip, and one landing between the line above and the pick would swap the buffer back to the live one
+            hintFbpNow = (fbp != 0xFFFFFFFFu && fbw) ? fbp : m_hintDisplayFbp;
             {   // [displatchdiag] PS2X_DISPLATCHDIAG=1: one line per second with every input of the decision
                 static const bool s_dd = [](){ const char *v = std::getenv("PS2X_DISPLATCHDIAG"); return v && v[0] && v[0] != '0'; }();
                 static auto s_td = std::chrono::steady_clock::now();
@@ -8355,14 +8359,14 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     std::fprintf(stderr, "[displatchdiag] frameGen=%u presentGen=%u lastPub=%u | latch[N-1] gen=%u fbp=%u | atPublish gen=%u hint=%u live=%u | nowLive=%u hint=%u | hook=%lu priv=%lu latched=%d\n",
                                  frameGen, m_presentGen, m_lastPubGen.load(std::memory_order_relaxed), (unsigned)(latch >> 32), (unsigned)(latch & 0xFFFFu),
                                  (unsigned)(pd >> 32), (unsigned)((pd >> 16) & 0xFFFFu), (unsigned)(pd & 0xFFFFu),
-                                 liveFbp, m_hintDisplayFbp, g_ps2xDispFlipHookCalls.load(std::memory_order_relaxed), g_ps2xDispPrivCalls.load(std::memory_order_relaxed), (int)latched);
+                                 liveFbp, hintFbpNow, g_ps2xDispFlipHookCalls.load(std::memory_order_relaxed), g_ps2xDispPrivCalls.load(std::memory_order_relaxed), (int)latched);
                 }
             }
         }
     }
-    if (!g_interpOn && m_hintDisplayFbp != 0xFFFFFFFFu && g_fbpEverDrawn.count(m_hintDisplayFbp) &&
-        g_fbos.count(m_hintDisplayFbp) && g_fbos[m_hintDisplayFbp].rt.texture.id != 0)
-        displayFbp = m_hintDisplayFbp;
+    if (!g_interpOn && hintFbpNow != 0xFFFFFFFFu && g_fbpEverDrawn.count(hintFbpNow) &&
+        g_fbos.count(hintFbpNow) && g_fbos[hintFbpNow].rt.texture.id != 0)
+        displayFbp = hintFbpNow;
     // Atlas mode: STICKY display buffer. The game kicks the renderer with tiny partial publishes
     // between real frames; the area-heuristic (above) correctly identifies which buffer a COMPLETE
     // frame was drawn to, but on tiny publishes it flips to whatever tiny buffer got drawn -> the
@@ -8401,10 +8405,10 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // sticks: the boot popup freezes on a 4px box for ~0.5 s where console shows its 1px sliver).
         static const int s_cdMode = [](){ const char *v = std::getenv("PS2X_CRTCDISP"); return v && v[0] ? std::atoi(v) : 1; }();   // DEFAULT 1
         (void)areaPickFbp; (void)areaPickOk;
-        if (s_cdMode >= 2 && !g_interpOn && m_hintDisplayFbp != 0xFFFFFFFFu
-            && g_fbpEverDrawn.count(m_hintDisplayFbp) && g_fbos.count(m_hintDisplayFbp)
-            && g_fbos[m_hintDisplayFbp].rt.texture.id != 0)
-            displayFbp = m_hintDisplayFbp;   // the CRTC is the authority; the sticky rule is only a fallback
+        if (s_cdMode >= 2 && !g_interpOn && hintFbpNow != 0xFFFFFFFFu
+            && g_fbpEverDrawn.count(hintFbpNow) && g_fbos.count(hintFbpNow)
+            && g_fbos[hintFbpNow].rt.texture.id != 0)
+            displayFbp = hintFbpNow;   // the CRTC is the authority; the sticky rule is only a fallback
     }
 
     // [fmvpresent] A publish carrying an FMV frame presents the buffer that frame was blitted into.
@@ -13964,14 +13968,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 }
                 {   // [texmiss] PS2X_TEXMISS=1: how often are textured draws dropped for a missing GL texture?
                     static const bool s_tm = [](){ const char *v = std::getenv("PS2X_TEXMISS"); return v && v[0] && v[0] != '0'; }();
-                    if (s_tm && !c.isTransfer)
+                    if (!c.isTransfer)   // counters always on (2026-09-09: 'disappearing textures' on the 12400 left no trace); details need PS2X_TEXMISS=1
                     {
                         static unsigned long nMiss = 0, nInCpu = 0, nUpload = 0; static int nDetail = 0;
                         static auto t0 = psxNow();
                         ++nMiss; auto cit = m_texCache.find(c.texKey); if (cit != m_texCache.end()) { ++nInCpu; if (cit->second.needsUpload) ++nUpload; }
-                        if (nDetail < 12) { ++nDetail; std::fprintf(stderr, "[texmiss] draw dropped: dest f%u srcTbp %u psm %u %dx%d tri=%d key %llx | cpu-cache %s%s\n", c.destFbp, c.srcTbp0, c.srcPsm, c.srcTexW, c.srcTexH, (int)c.isTriangle, (unsigned long long)c.texKey, cit != m_texCache.end() ? "HIT" : "miss", (cit != m_texCache.end() && cit->second.needsUpload) ? " (needsUpload)" : ""); }
+                        if (s_tm && nDetail < 12) { ++nDetail; std::fprintf(stderr, "[texmiss] draw dropped: dest f%u srcTbp %u psm %u %dx%d tri=%d key %llx | cpu-cache %s%s\n", c.destFbp, c.srcTbp0, c.srcPsm, c.srcTexW, c.srcTexH, (int)c.isTriangle, (unsigned long long)c.texKey, cit != m_texCache.end() ? "HIT" : "miss", (cit != m_texCache.end() && cit->second.needsUpload) ? " (needsUpload)" : ""); }
                         const auto now = psxNow();
-                        if (now - t0 >= std::chrono::seconds(1)) { std::fprintf(stderr, "[texmiss] last second: %lu dropped (cpu-cache hit %lu, of which needsUpload %lu)\n", nMiss, nInCpu, nUpload); nMiss = nInCpu = nUpload = 0; t0 = now; }
+                        if (now - t0 >= std::chrono::seconds(1)) { if (nMiss) std::fprintf(stderr, "[texmiss] last second: %lu dropped (cpu-cache hit %lu, of which needsUpload %lu)\n", nMiss, nInCpu, nUpload); nMiss = nInCpu = nUpload = 0; t0 = now; }
                     }
                 }
                 if (s_srcDiag) srcDiagTally("missing", c); { PS2X_GATE_HIT(); continue; }
