@@ -14,11 +14,15 @@ set -euo pipefail
 # ---- config ---------------------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ISO_DEFAULT="/home/rexx/Descargas/Roms/PS2/DragonBall Z - Budokai Tenkaichi 3.iso"
-DEPLOY_SRC="${BT3_DEPLOY_SRC:-/tmp/opencode/bt3-deploy}"   # holds stub.c + zstd source
-STUB_SRC="$DEPLOY_SRC/stub.c"
+DEPLOY_SRC="${BT3_DEPLOY_SRC:-/tmp/opencode/bt3-deploy}"   # scratch dir for zstd source + staged payload
 STUB_BIN="$DEPLOY_SRC/stub"
-ZSTD_DIR="$DEPLOY_SRC/zstd-1.5.7"
+ZSTD_VERSION="1.5.7"
+ZSTD_DIR="$DEPLOY_SRC/zstd-$ZSTD_VERSION"
 ZSTD_LIB="$ZSTD_DIR/lib/libzstd.a"
+# The stub source is kept in-repo (tools/selfx/stub.c) so the deploy survives
+# /tmp cleanup; an older BT3_DEPLOY_SRC copy still works as a fallback.
+STUB_SRC="${BT3_STUB_SRC:-$ROOT/tools/selfx/stub.c}"
+[ ! -f "$STUB_SRC" ] && STUB_SRC="$DEPLOY_SRC/stub.c"
 STAGE="$DEPLOY_SRC/stage"
 JOBS="${BT3_JOBS:-$(nproc)}"
 GAME="Dragon Ball - Budokai Tenkaichi 3"
@@ -68,9 +72,16 @@ if [[ ! -x "$STUB_BIN" ]]; then
     echo "== building static stub launcher"
     if [[ ! -f "$ZSTD_LIB" ]]; then
         if [[ ! -f "$ZSTD_DIR/Makefile" ]]; then
-            echo "ERROR: zstd source not found at $ZSTD_DIR (BT3_DEPLOY_SRC)"
-
-            exit 2
+            echo "== fetching zstd $ZSTD_VERSION source"
+            mkdir -p "$DEPLOY_SRC"
+            if ! curl -fsSL --retry 2 \
+                "https://github.com/facebook/zstd/releases/download/v$ZSTD_VERSION/zstd-$ZSTD_VERSION.tar.gz" \
+                -o "$DEPLOY_SRC/zstd.tar.gz"; then
+                echo "ERROR: could not fetch zstd $ZSTD_VERSION (BT3_DEPLOY_SRC=$DEPLOY_SRC)"
+                exit 2
+            fi
+            tar -xzf "$DEPLOY_SRC/zstd.tar.gz" -C "$DEPLOY_SRC"
+            rm -f "$DEPLOY_SRC/zstd.tar.gz"
         fi
         make -C "$ZSTD_DIR" -j"$JOBS" lib-release > /dev/null
     fi
