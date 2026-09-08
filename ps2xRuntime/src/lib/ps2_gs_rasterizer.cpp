@@ -3951,7 +3951,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         tplHit = (why < 0);
         if (why >= 0 && gprof::g_on) g_recTplWhy[why].fetch_add(1, std::memory_order_relaxed);
     }
-    if (tplHit) { texKey = s_tpl.texKey; texW = s_tpl.texW; texH = s_tpl.texH; g_recTplHit.fetch_add(1, std::memory_order_relaxed); }
+    if (tplHit) { texKey = s_tpl.texKey; texW = s_tpl.texW; texH = s_tpl.texH; g_recTplHit.store(g_recTplHit.load(std::memory_order_relaxed) + 1ul, std::memory_order_relaxed); /* [statbump] single writer: no locked RMW */ }
     else
     {
     static bool g_rawAlphaDec_s = false;
@@ -4624,7 +4624,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         s_tpl.valid = s_tplOn; s_tpl.gen = gs->m_stateGen + gs->m_texUploadGen * 0x9E3779B1u; s_tpl.epoch = ps2GpuRenderer().recTplEpoch(); s_tpl.frame = tplFrame;
         s_tpl.type = (uint8_t)gs->m_prim.type; s_tpl.tme = tme; s_tpl.fst = fst; s_tpl.texKey = texKey; s_tpl.texW = texW; s_tpl.texH = texH;
         s_tpl.pageLo = tplPageLo; s_tpl.pageHi = tplPageHi; s_tpl.drawStamp = ps2GpuRenderer().pageDrawStamp(tplPageLo, tplPageHi);
-        g_recTplMiss.fetch_add(1, std::memory_order_relaxed);
+        g_recTplMiss.store(g_recTplMiss.load(std::memory_order_relaxed) + 1ul, std::memory_order_relaxed); /* [statbump] */
     }
 
     const uint32_t tfx = tme ? ctx.tex0.tfx : 0u;

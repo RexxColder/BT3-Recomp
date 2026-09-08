@@ -52,9 +52,15 @@ def upper_is_clip(up):
     return (up & 0x3F) >= 0x3C and jsop(up) == CLIP_SOP
 
 def lower_touches_qwait(lo, loi):
-    # the whole 0x40 group, not just DIV/SQRT/RSQRT/WAITQ: it is a small superset and it also covers
-    # the group's rarer members reaching the interpreter with the counters live
-    return (not loi) and ((lo >> 25) & 0x7F) == 0x40
+    # [qarm-exact] 2026-09-08: exactly the jitted Q writers -- DIV/SQRT/RSQRT/WAITQ (0x40 group, funct 0x3C-0x3F,
+    # sub-op 0x38-0x3B, same derivation as the interpreter's funct2). The old rule was the WHOLE 0x40 group
+    # (IADD/MOVE/LQI/SQI/...), which re-armed qDead after nearly every pair: the re-arm line was the hottest
+    # line of the hottest program (perf annotate). A 0x40-group op that falls back to the interpreter is
+    # covered by PIPE_SLOW/PIPE_REARM around jitSlowLower, so the superset bought nothing.
+    if loi or ((lo >> 25) & 0x7F) != 0x40: return False
+    if (lo & 0x3F) < 0x3C: return False
+    sub = (lo & 3) | ((lo >> 4) & 0x7C)
+    return sub in (0x38, 0x39, 0x3A, 0x3B)
 
 def lower_reads_clip(lo, loi):
     return (not loi) and ((lo >> 25) & 0x7F) in CLIP_READ_LOWER
