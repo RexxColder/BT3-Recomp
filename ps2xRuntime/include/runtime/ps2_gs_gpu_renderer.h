@@ -461,6 +461,7 @@ private:
         bool needsUpload = false;
         unsigned int glId = 0;      // GL texture id (present thread only)
         uint32_t decodeSeq = 0;     // m_writeSeq at decode time
+        uint32_t putGen = 0;        // [texclobber] publish generation of the frame being built when the texels were put
         uint64_t srcHash = 0;       // hash of the VRAM page span at decode/revalidate time
         bool srcHashValid = false;
     };

@@ -721,6 +721,26 @@ namespace
     uint32_t g_lastRenderGen = 0xFFFFFFFFu;       // publish gen last rendered (present thread)
     unsigned int g_lastOutId = 0;                 // last presented texture id
     std::unordered_map<uint64_t, Texture2D> g_glTex;
+    // [texclobber] DETECTOR for the sync-relax corruption hypothesis: the worker running more than a frame ahead of the GL
+    // thread re-uploads a texture a still-pending frame references, and that older frame's draws then sample the newer
+    // texels. Every put stamps the cache entry with the generation of the frame being built; the upload carries it into
+    // g_glTexGen; at the bind the GL thread compares it with the generation of the list it is rendering. One integer
+    // compare per draw. PS2X_TEXCLOBBER=0 turns it off. Prints the first 12 hits and a summary every 10 s (also when 0).
+    std::unordered_map<uint64_t, uint32_t> g_glTexGen;   // GL thread: generation of the texels currently in each GL texture
+    uint32_t g_texClobListGen = 0;                       // GL thread: generation of the list whose draws are being issued
+    bool g_texClobOn = [](){ const char *v = std::getenv("PS2X_TEXCLOBBER"); return !(v && v[0] == '0'); }();
+    struct { unsigned long hits = 0, d1 = 0, d2 = 0, d3 = 0, puts = 0, printed = 0; std::unordered_set<uint64_t> keys;
+             std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now(); } g_texClob;
+    void texClobberTick()
+    {   // GL thread, once per render call: the 10 s summary
+        if (!g_texClobOn) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g_texClob.t0 < std::chrono::seconds(10)) return;
+        g_texClob.t0 = now;
+        std::fprintf(stderr, "[texclobber] 10 s: %lu draws sampled texels newer than their frame (%zu keys; gen delta 1: %lu, 2: %lu, 3+: %lu), %lu texture puts\n",
+                     g_texClob.hits, g_texClob.keys.size(), g_texClob.d1, g_texClob.d2, g_texClob.d3, g_texClob.puts);
+        g_texClob.hits = g_texClob.d1 = g_texClob.d2 = g_texClob.d3 = g_texClob.puts = 0; g_texClob.keys.clear();
+    }
     std::unordered_map<uint64_t, bool> g_texBlack; // texKey -> decoded texture is near-black (stale/empty region in GPU mode)
     std::unordered_map<uint64_t, bool> g_texAlphaBinary; // texKey -> alpha channel is ~binary (0/255): DATE emulation is exact only for these
     // Fade lag: palettes animate under distinct content-keys, so a fade mints a new texKey
@@ -4606,6 +4626,8 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
     ct.texScale = texScale;
     ct.alphaScale = alphaScale;   // [texreplace]
     ct.decodeSeq = (seqAt >= 0) ? (uint32_t)seqAt : m_writeSeq;   // [decpool]
+    ct.putGen = __atomic_load_n(&g_publishGen, __ATOMIC_RELAXED) + 1u;   // [texclobber] the frame being built (swapFrame publishes it as g_publishGen+1)
+    ++g_texClob.puts;
     ct.needsUpload = true;
     m_upQueue.push_back(key);   // [upqueue] O(1) here instead of an O(cache) scan per chunk render
     // Flag near-black textures (sampled): a fully stale/empty VRAM region decodes to black.
@@ -7233,7 +7255,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             }
         }
     } segSwapBack{this, cmds, m_chunkMode ? m_chunk : m_building, m_segMode, m_segMode && !m_chunkMode};
-    struct PendingUp { uint64_t key = 0; std::vector<uint8_t> rgba; int w = 0, h = 0; int fmt = 0; int texScale = 1; float alphaScale = 1.0f; };   // [uploadout]
+    struct PendingUp { uint64_t key = 0; std::vector<uint8_t> rgba; int w = 0, h = 0; int fmt = 0; int texScale = 1; float alphaScale = 1.0f; uint32_t gen = 0; };   // [uploadout] gen: [texclobber]
     static std::vector<PendingUp> s_ups;
     ragStat.phase(1);
     std::vector<DrawCmd> prevCmds;
@@ -7350,7 +7372,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 if (!ct.needsUpload || ct.w <= 0 ||
                     (ct.fmt ? ct.rgba.empty() : ct.rgba.size() < (size_t)ct.w * ct.h * 4))
                     continue;   // duplicate queue entry or invalid: the flag is the truth
-                PendingUp u; u.key = qk; u.w = ct.w; u.h = ct.h; u.fmt = ct.fmt; u.texScale = ct.texScale; u.alphaScale = ct.alphaScale; u.rgba.swap(ct.rgba);
+                PendingUp u; u.key = qk; u.w = ct.w; u.h = ct.h; u.fmt = ct.fmt; u.texScale = ct.texScale; u.alphaScale = ct.alphaScale; u.rgba.swap(ct.rgba); u.gen = ct.putGen;
                 ct.needsUpload = false;
                 spent += u.rgba.size();
                 s_ups.push_back(std::move(u));
@@ -7365,7 +7387,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             if ((!ct.needsUpload && !s_reup) || ct.w <= 0 ||
                 (ct.fmt ? ct.rgba.empty() : ct.rgba.size() < (size_t)ct.w * ct.h * 4))
                 continue;
-            PendingUp u; u.key = kv.first; u.w = ct.w; u.h = ct.h; u.fmt = ct.fmt; u.texScale = ct.texScale; u.alphaScale = ct.alphaScale; u.rgba.swap(ct.rgba);
+            PendingUp u; u.key = kv.first; u.w = ct.w; u.h = ct.h; u.fmt = ct.fmt; u.texScale = ct.texScale; u.alphaScale = ct.alphaScale; u.rgba.swap(ct.rgba); u.gen = ct.putGen;
             ct.needsUpload = false;
             s_ups.push_back(std::move(u));
         }
@@ -7872,7 +7894,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
 
         }
     };
-    for (PendingUp &u : s_ups) glUploadOne(u);
+    for (PendingUp &u : s_ups) { glUploadOne(u); g_glTexGen[u.key] = u.gen; }   // [texclobber]
     if (!s_ups.empty())
     {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -9255,6 +9277,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     // diagnostics scramble indices).
     const bool listBoundsValid = reorderBuf.empty() && !listStarts.empty();
     size_t nextListBoundary = 0;
+    g_texClobListGen = listGens.empty() ? 0u : listGens[0]; texClobberTick();   // [texclobber]
     // ---- Completed-frame latch (PS2X_FRONTLATCH=0 disables) ----
     // Per list: which scene buffer (f0/f112) it predominantly draws. A frame COMPLETES at
     // the boundary where this switches buffers; latch a copy of the finished one there.
@@ -10874,6 +10897,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         if (ti == 0 && listBoundsValid && nextListBoundary < listStarts.size() && ci == listStarts[nextListBoundary])   // [drawbatch] first triangle of the command
         {
             ++nextListBoundary;
+            if (nextListBoundary - 1 < listGens.size()) g_texClobListGen = listGens[nextListBoundary - 1];   // [texclobber]
             if (groundShadowOn() && !m_chunkMode && !m_segMode && nextListBoundary < listGens.size() + 1 && nextListBoundary - 1 < listGens.size()) g_curGen = listGens[nextListBoundary - 1];   // [groundshadow] v10
             if (depthOn && ci != 0)
             {
@@ -13833,6 +13857,23 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 static int n = 0; if (n < 12) { ++n; std::fprintf(stderr, "[evictdraw] DRAW of just-evicted key: dest f%u srcTbp %u psm %u %dx%d tri=%d\n", c.destFbp, c.srcTbp0, c.srcPsm, c.srcTexW, c.srcTexH, (int)c.isTriangle); }
             }
             auto it = gaServed ? g_glTex.end() : g_glTex.find(c.texKey);   // [gpualias] served draws keep the view texture
+            if (g_texClobOn && !gaServed && it != g_glTex.end() && listBoundsValid && g_texClobListGen != 0u)
+            {   // [texclobber] this draw's frame was published at g_texClobListGen; the texels bound now were put in gen gi->second
+                auto gi = g_glTexGen.find(c.texKey);
+                if (gi != g_glTexGen.end() && gi->second > g_texClobListGen)
+                {
+                    const uint32_t d = gi->second - g_texClobListGen;
+                    ++g_texClob.hits; if (d == 1u) ++g_texClob.d1; else if (d == 2u) ++g_texClob.d2; else ++g_texClob.d3;
+                    g_texClob.keys.insert(c.texKey);
+                    if (g_texClob.printed < 12)
+                    {
+                        ++g_texClob.printed;
+                        std::fprintf(stderr, "[texclobber] HIT: draw of frame gen %u samples texels put in gen %u (+%u): key %llx %dx%d dest f%u src tbp %u psm %u tri=%d\n",
+                                     g_texClobListGen, gi->second, d, (unsigned long long)c.texKey, it->second.width, it->second.height,
+                                     c.destFbp, c.srcTbp0, (unsigned)c.srcPsm, (int)c.isTriangle);
+                    }
+                }
+            }
             {   // [hudtrace] stage 1: texture resolved for a HUD-class draw
                 extern unsigned long g_hudTrace[3]; extern bool ps2xHudTraceOn();
                 extern bool g_hudTraceCur;
