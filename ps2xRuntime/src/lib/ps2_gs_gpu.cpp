@@ -1576,6 +1576,9 @@ GS *g_fmvGs = nullptr; // [fmvblit] set on the first image upload; the emitter r
 // fbp224 (a 1024x1024 mask sampled as PSMT8 indices through a CLUT). Handing those bytes back
 // to VRAM makes the whole class ordinary: re-decodable, and therefore safely evictable.
 GS *g_gsWb = nullptr;
+std::atomic<unsigned long> g_gsUploadCount{0}, g_gsVramCopyCount{0};
+std::atomic<unsigned long> g_gsUpConfTex{0}, g_gsUpConfClut{0};   // [upconf] uploads overlapping a recent draw's texture / palette pages
+struct RecSpan { uint32_t lo, hi, clut; }; extern RecSpan g_recSpanRing[256]; extern uint32_t g_recSpanIdx;   // [xferstat] TRXDIR starts: host->local uploads, local->local copies (fps line: uploads/sec, vramcopies/sec)
 // ZBUF of the current frame, published by the rasterizer for the depth writeback.
 uint32_t g_zwbBp = 0, g_zwbPsm = 0x31u, g_zwbBw = 8u;
 double g_zwbZMax = 4294967295.0;   // zNorm's divisor, published by the rasterizer
@@ -3436,6 +3439,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        if (m_trxdir == 0u) g_gsUploadCount.fetch_add(1u, std::memory_order_relaxed); else if (m_trxdir == 2u) g_gsVramCopyCount.fetch_add(1u, std::memory_order_relaxed);   // [xferstat]
 
         // We need the transfer state to survive the call to performLocalTo*Transfer
         // This is because transfers can be broken into multiple IMAGE tags and we
@@ -3450,6 +3454,21 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
                                : (m_bitbltbuf.dpsm == GS_PSM_T4 || m_bitbltbuf.dpsm == GS_PSM_T4HL || m_bitbltbuf.dpsm == GS_PSM_T4HH) ? 1u
                                : (m_bitbltbuf.dpsm == GS_PSM_CT16 || m_bitbltbuf.dpsm == GS_PSM_CT16S || m_bitbltbuf.dpsm == GS_PSM_Z16 || m_bitbltbuf.dpsm == GS_PSM_Z16S) ? 2u : 4u;
             const uint32_t rowBytes = std::max(1u, (uint32_t)m_bitbltbuf.dbw) * 64u * bpp;
+            if (m_trxdir == 0u)
+            {   // [upconf] would this upload conflict with the last 256 recorded draws' read spans?
+                const uint32_t dLo = m_bitbltbuf.dbp / 32u;
+                const uint32_t dHi = dLo + ((uint32_t)(m_trxpos.dsay + m_trxreg.rrh) * rowBytes + 8191u) / 8192u;
+                bool ct = false, cc = false;
+                for (uint32_t i = 0; i < 256u && i < g_recSpanIdx; ++i)
+                {
+                    const RecSpan &rs = g_recSpanRing[i];
+                    if (rs.hi >= dLo && rs.lo <= dHi) ct = true;
+                    if (rs.clut != 0xFFFFFFFFu && rs.clut >= dLo && rs.clut <= dHi) cc = true;
+                    if (ct && cc) break;
+                }
+                if (ct) g_gsUpConfTex.fetch_add(1u, std::memory_order_relaxed);
+                if (cc) g_gsUpConfClut.fetch_add(1u, std::memory_order_relaxed);
+            }
             const uint32_t pageLo = m_bitbltbuf.dbp / 32u;
             const uint32_t pageHi = pageLo + ((m_trxpos.dsay + m_trxreg.rrh) * rowBytes) / 8192u + 1u;
             for (uint32_t p = pageLo; p <= pageHi && p < 512u; ++p) ps2GpuRenderer().waitPendingFlush(p);

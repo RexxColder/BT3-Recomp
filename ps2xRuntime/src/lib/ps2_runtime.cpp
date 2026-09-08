@@ -5165,6 +5165,10 @@ void PS2Runtime::run()
                 static unsigned long long s_lastGlCalls = 0, s_lastGlFlush = 0; static double s_lastFlushNs = 0.0;
                 const unsigned long long glc = g_rlglDrawCalls, glf = g_rlglBatchFlushes;
                 extern std::atomic<unsigned long> g_texDecodeCount; static unsigned long s_lastTdc = 0;
+                extern std::atomic<unsigned long> g_gsUploadCount, g_gsVramCopyCount; static unsigned long s_lastUp = 0, s_lastVc = 0;   // [xferstat]
+                extern std::atomic<unsigned long> g_gsUpConfTex, g_gsUpConfClut; static unsigned long s_lastUct = 0, s_lastUcc = 0;   // [upconf]
+                const unsigned long uct = g_gsUpConfTex.load(std::memory_order_relaxed), ucc = g_gsUpConfClut.load(std::memory_order_relaxed);
+                const unsigned long upc = g_gsUploadCount.load(std::memory_order_relaxed), vcc = g_gsVramCopyCount.load(std::memory_order_relaxed);
                 static unsigned long s_lastHoistTris = 0;   // [glhoist]
                 const unsigned long tdc = g_texDecodeCount.load(std::memory_order_relaxed);
                 std::cerr << "[fps] GAME=" << (double)((gameFrames - s_lastGameFrames) / dt)
@@ -5186,6 +5190,8 @@ void PS2Runtime::run()
                           << " glcalls/sec=" << (uint64_t)((glc - s_lastGlCalls) / dt)
                           << " glflush/sec=" << (uint64_t)((glf - s_lastGlFlush) / dt)
                           << " decodes/sec=" << (uint64_t)((tdc - s_lastTdc) / dt)
+                          << " uploads/sec=" << (uint64_t)((upc - s_lastUp) / dt) << " vramcopies/sec=" << (uint64_t)((vcc - s_lastVc) / dt)   // [xferstat]
+                          << " upconftex/sec=" << (uint64_t)((uct - s_lastUct) / dt) << " upconfclut/sec=" << (uint64_t)((ucc - s_lastUcc) / dt)   // [upconf]
                           << " flush_ms/s=" << (g_rlglFlushNs - s_lastFlushNs) / 1.0e6 / dt
                           << " gpu_ms=" << [&]{   // [gputime] GPU execution ms per GAME frame (ps2xGpuMsTake declared at file scope: block-scope extern "C" is ill-formed on clang-cl)
                                  uint64_t c = 0; const double ms = ps2xGpuMsTake(&c); const double gf = (double)(gameFrames - s_lastGameFrames);
@@ -5196,7 +5202,7 @@ void PS2Runtime::run()
                                  std::ostringstream o; o << " vbr_waits/s=" << (uint64_t)((w - s_w) / dt) << " vbr_wraps/s=" << (uint64_t)((r - s_r) / dt)
                                                          << " mvpskip/s=" << (uint64_t)((m - s_m) / dt);
                                  s_w = w; s_r = r; s_m = m; return o.str(); }() << std::endl;
-                s_lastGlCalls = glc; s_lastGlFlush = glf; s_lastTdc = tdc; s_lastFlushNs = g_rlglFlushNs;
+                s_lastGlCalls = glc; s_lastGlFlush = glf; s_lastTdc = tdc; s_lastUp = upc; s_lastVc = vcc; s_lastUct = uct; s_lastUcc = ucc; s_lastFlushNs = g_rlglFlushNs;
                 if (gprof::g_on)
                 {   // [guestprof] exclusive phase time on the guest thread(s), ms per second; tsc calibrated over this interval
                     static uint64_t s_lastTsc = 0, s_lastAcc[gprof::NPHASE] = {0};

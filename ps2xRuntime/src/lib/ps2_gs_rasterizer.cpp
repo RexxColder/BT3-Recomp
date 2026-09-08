@@ -3755,6 +3755,11 @@ bool GSRasterizer::decodeIsDeferrable(uint32_t pm)
 }
 
 std::atomic<unsigned long> g_recTplHit{0}, g_recTplMiss{0}, g_recTplWhy[5];   // [rectemplate] read by ps2_runtime.cpp
+// [upconf] design datum for chunked recording: the VRAM page spans of the last 256 recorded draws (texture + palette).
+// The transfer handler (ps2_gs_gpu.cpp) tests every host->VRAM upload against them: an upload that overlaps a queued
+// draw's read span would have to fence a parallel record pool. Worker-only, no locking.
+struct RecSpan { uint32_t lo = 0, hi = 0, clut = 0xFFFFFFFFu; };
+RecSpan g_recSpanRing[256]; uint32_t g_recSpanIdx = 0;
 std::atomic<uint64_t> g_scissorCulled{0};   // [scissorcull] primitives dropped as fully outside SCISSOR
 
 bool GSRasterizer::recordSpriteGPU(GS *gs)
@@ -4474,6 +4479,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         const uint32_t footBytes = static_cast<uint32_t>(texW) * static_cast<uint32_t>(texH) * bpp / 8u;
         const uint32_t texPageLo = tex.tbp0 / 32u;
         const uint32_t texPageHi = texPageLo + (footBytes / 8192u);
+        { RecSpan &rs = g_recSpanRing[g_recSpanIdx++ & 255u]; rs.lo = texPageLo; rs.hi = texPageHi; rs.clut = (tex.psm == GS_PSM_T8 || tex.psm == GS_PSM_T4 || tex.psm == GS_PSM_T8H) ? (tex.cbp / 32u) : 0xFFFFFFFFu; }   // [upconf]
         tplPageLo = texPageLo; tplPageHi = texPageHi;   // [rectemplate]
         {
             // Diagnostic (PS2X_GPU_DIAG): how many texture DECODES + texels/sec, and how
