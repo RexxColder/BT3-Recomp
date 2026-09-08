@@ -125,6 +125,7 @@ namespace ps2_syscalls { bool bt3WakeThreadByEntry(uint32_t entry); }
 #include <unordered_set>
 #include <mutex>
 #include <sstream>
+extern "C" double ps2xGpuMsTake(uint64_t *calls);   // [gputime] ps2_gs_gpu_renderer.cpp
 
 // BT3 debug tracing: extremely verbose ([main-pc] etc.). Off unless PS2X_TRACE=1.
 // The per-instruction [main-pc] trace alone emits ~1000+ stderr lines/sec and
@@ -141,6 +142,7 @@ static inline bool ps2xTraceEnabled()
 // PS2X_CAMPROBE write-watch (see ps2_runtime.h). Armed by the camera probe to find the
 // function that writes the battle camera-target vector.
 extern "C" { extern unsigned long long g_rlglDrawCalls, g_rlglBatchFlushes; extern double g_rlglFlushNs; }   // [glcalls] raylib rlgl batch counters (patched rlgl.h)
+extern "C" { extern unsigned long long g_rlglVbRingWaits, g_rlglVbRingWraps, g_rlglVbRingMvpSkips; extern int g_rlglVbRingOn; }   // [vbring]
 std::atomic<uint32_t> g_ps2WatchLo{0};
 std::atomic<uint32_t> g_ps2WatchHi{0};
 std::atomic<uint32_t> g_ps2WatchAll{0};
@@ -5163,7 +5165,16 @@ void PS2Runtime::run()
                           << " glcalls/sec=" << (uint64_t)((glc - s_lastGlCalls) / dt)
                           << " glflush/sec=" << (uint64_t)((glf - s_lastGlFlush) / dt)
                           << " decodes/sec=" << (uint64_t)((tdc - s_lastTdc) / dt)
-                          << " flush_ms/s=" << (g_rlglFlushNs - s_lastFlushNs) / 1.0e6 / dt << std::endl;
+                          << " flush_ms/s=" << (g_rlglFlushNs - s_lastFlushNs) / 1.0e6 / dt
+                          << " gpu_ms=" << [&]{   // [gputime] GPU execution ms per GAME frame (ps2xGpuMsTake declared at file scope: block-scope extern "C" is ill-formed on clang-cl)
+                                 uint64_t c = 0; const double ms = ps2xGpuMsTake(&c); const double gf = (double)(gameFrames - s_lastGameFrames);
+                                 return gf > 0.0 ? ms / gf : 0.0; }()
+                          << " vbring=" << g_rlglVbRingOn << [&]{   // [vbring] fence waits + ring wraps per second, MVP uploads skipped per second
+                                 static unsigned long long s_w = 0, s_r = 0, s_m = 0;
+                                 const unsigned long long w = g_rlglVbRingWaits, r = g_rlglVbRingWraps, m = g_rlglVbRingMvpSkips;
+                                 std::ostringstream o; o << " vbr_waits/s=" << (uint64_t)((w - s_w) / dt) << " vbr_wraps/s=" << (uint64_t)((r - s_r) / dt)
+                                                         << " mvpskip/s=" << (uint64_t)((m - s_m) / dt);
+                                 s_w = w; s_r = r; s_m = m; return o.str(); }() << std::endl;
                 s_lastGlCalls = glc; s_lastGlFlush = glf; s_lastTdc = tdc; s_lastFlushNs = g_rlglFlushNs;
                 if (gprof::g_on)
                 {   // [guestprof] exclusive phase time on the guest thread(s), ms per second; tsc calibrated over this interval

@@ -450,6 +450,12 @@ extern "C"
     unsigned int glGetError(void);
     void glReadPixels(int x, int y, int w, int h, unsigned int format, unsigned int type, void *data);
     void glGetFramebufferAttachmentParameteriv(unsigned int target, unsigned int attachment, unsigned int pname, int *params);
+    // [asyncstage] pixel-pack buffers for the non-blocking staging readback (GL 1.5 core exports).
+    void glGenBuffers(int n, unsigned int *buffers);
+    void glDeleteBuffers(int n, const unsigned int *buffers);
+    void glBindBuffer(unsigned int target, unsigned int buffer);
+    void glBufferData(unsigned int target, ptrdiff_t size, const void *data, unsigned int usage);
+    void glGetBufferSubData(unsigned int target, ptrdiff_t offset, ptrdiff_t size, void *data);
 }
 #ifndef GL_NEVER
 #define GL_NEVER   0x0200
@@ -537,7 +543,27 @@ namespace
     { static const bool v = [](){ const char *e = std::getenv("PS2X_FLUSHCENSUS"); return e && e[0] && e[0] != '0'; }(); return v; }
     static inline void flushBatch(int line)
     {
-        if (flushCensusOn()) ++g_flushHist[line];
+        if (flushCensusOn())
+        {
+            ++g_flushHist[line];
+            // [flushcensus-periodic] a driven run ends by SIGTERM, so the exit-time dump never happens: also print the
+            // top sites every 10 s (in-fight seconds are what matter; the dump resets nothing).
+            static auto s_last = std::chrono::steady_clock::now(); static unsigned long s_n = 0ul;
+            if ((++s_n & 1023ul) == 0ul)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(now - s_last).count() >= 10.0)
+                {
+                    s_last = now;
+                    std::vector<std::pair<int, unsigned long>> v(g_flushHist.begin(), g_flushHist.end());
+                    std::sort(v.begin(), v.end(), [](auto &a, auto &b){ return a.second > b.second; });
+                    unsigned long tot = 0; for (auto &kv : v) tot += kv.second;
+                    std::fprintf(stderr, "[flushcensus-live] %lu flushes so far, top:", tot);
+                    for (size_t i = 0; i < v.size() && i < 12; ++i) std::fprintf(stderr, " L%d=%lu(%.0f%%)", v[i].first, v[i].second, 100.0 * v[i].second / (double)tot);
+                    std::fprintf(stderr, "\n");
+                }
+            }
+        }
         rlDrawRenderBatchActive();
     }
     struct FlushCensusDump
@@ -1779,6 +1805,220 @@ void GsGpuRenderer::flushRecentPagesToVram(int minVsync)
     std::string l; for (uint32_t k : ks) { l += ' '; l += std::to_string(k); }
     std::fprintf(stderr, "[slice] flushed %zu recent FBO pages to VRAM:%s\n", ks.size(), l.c_str());
 }
+// [asyncstage] Non-blocking staging readback. The per-frame [livesync] staging of pages 368/336
+// (and any page a guest reader keeps requesting) used to be blit -> glFinish -> glReadPixels, i.e.
+// a full GPU drain twice per frame on the GL thread. On a fast GPU that wait is ~10 ms/s; on an
+// RTX 4060 laptop at render scale 4 it measured 215-227 ms/s ([ragstat-pro] stage=), a third of
+// the render thread's budget, and presents fell to 5-18/s while the game ran 30. Staging by
+// design hands the guest the LAST COMPLETED frame, so it tolerates one more iteration of latency:
+// issue the read into a pixel-pack buffer and consume it on the next staging pass instead of
+// blocking. HYBRID: a page's FIRST request (or one after a gap) still reads synchronously, so a
+// one-shot capture (pause blur, splitscreen skip cross-fade) keeps this exact frame; only pages
+// requested on consecutive passes go through the buffer. PS2X_ASYNCSTAGE=0 restores the old path.
+// [gpusplit] PS2X_GPUSPLIT=1: GL_TIME_ELAPSED per draw CLASS instead of per call, so a 4x log says
+// whether the GPU time goes to scene geometry, the full-screen composites into the scene, HUD/2D
+// sprites, effect-page (non-scene) draws, or the prologue (staging/uploads). One timer query is
+// active at a time (GL forbids nesting), so while this is on the whole-frame [gputime] query is
+// replaced by the class queries; a query switch happens only when consecutive commands change
+// class (tens to hundreds per frame, not thousands). Results are read one call later.
+namespace
+{
+    enum { GS_PRE = 0, GS_GEOM, GS_COMP, GS_HUD, GS_EFFECT, GS_XFER, GS_N };
+    const char *kGsName[GS_N] = {"pre", "geometry", "composite", "hud2d", "effect", "transfer"};
+    struct GsQ { unsigned int id; int cls; };
+    std::vector<GsQ> g_gsCur, g_gsPrev; std::vector<unsigned int> g_gsPool; int g_gsActive = -1; double g_gsAcc[GS_N] = {0};
+    unsigned long g_gsSwitches = 0ul, g_gsFrames = 0ul;
+    bool gpuSplitOn() { static const bool s = [](){ const char *v = std::getenv("PS2X_GPUSPLIT"); return v && v[0] && v[0] != '0'; }(); return s; }
+    unsigned int gsAlloc()
+    {
+        if (g_gsPool.empty()) { unsigned int ids[64]; glGenQueries(64, ids); for (unsigned int id : ids) g_gsPool.push_back(id); }
+        const unsigned int q = g_gsPool.back(); g_gsPool.pop_back(); return q;
+    }
+    void gsEnd() { if (g_gsActive >= 0) { glEndQuery(0x88BFu); g_gsActive = -1; } }
+    void gsSwitch(int cls)
+    {
+        if (!gpuSplitOn() || g_gsActive == cls) return;
+        gsEnd();
+        const unsigned int q = gsAlloc();
+        glBeginQuery(0x88BFu /*GL_TIME_ELAPSED*/, q);
+        g_gsCur.push_back(GsQ{q, cls}); g_gsActive = cls; ++g_gsSwitches;
+    }
+    unsigned int g_gsSampQ[2] = {0u, 0u}; bool g_gsSampIssued[2] = {false, false}; int g_gsSampSlot = 0; double g_gsSamples = 0;   // [overdraw]
+    void gsFrameBegin()
+    {
+        {   // [overdraw] fragments that PASSED the depth test per call (ZTST=ALWAYS passes everything, so this is shaded fragments)
+            if (!g_gsSampQ[0]) glGenQueries(2, g_gsSampQ);
+            const int o = g_gsSampSlot ^ 1;
+            if (g_gsSampIssued[o]) { unsigned int n = 0u; glGetQueryObjectuiv(g_gsSampQ[o], 0x8866u, &n); g_gsSamples += (double)n; g_gsSampIssued[o] = false; }
+            glBeginQuery(0x8914u /*GL_SAMPLES_PASSED*/, g_gsSampQ[g_gsSampSlot]);
+        }
+        for (const GsQ &e : g_gsPrev)
+        {
+            unsigned int ns = 0u; glGetQueryObjectuiv(e.id, 0x8866u /*GL_QUERY_RESULT*/, &ns);
+            g_gsAcc[e.cls] += (double)ns / 1.0e6; g_gsPool.push_back(e.id);
+        }
+        g_gsPrev.swap(g_gsCur); g_gsCur.clear(); ++g_gsFrames;
+        gsSwitch(GS_PRE);
+    }
+    void gsFrameEnd()
+    {
+        gsEnd();
+        { glEndQuery(0x8914u); g_gsSampIssued[g_gsSampSlot] = true; g_gsSampSlot ^= 1; }   // [overdraw]
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const double dt = std::chrono::duration<double>(now - last).count();
+        if (dt >= 1.0)
+        {
+            last = now;
+            double tot = 0; for (int i = 0; i < GS_N; ++i) tot += g_gsAcc[i];
+            std::fprintf(stderr, "[gpusplit] gpu ms/s total %.1f:", tot / dt);
+            for (int i = 0; i < GS_N; ++i) std::fprintf(stderr, " %s %.1f", kGsName[i], g_gsAcc[i] / dt);
+            std::fprintf(stderr, " | calls/s %.0f switches/call %.1f | shaded Mfrag/s %.1f (%.2f Mfrag/call)\n", g_gsFrames / dt,
+                         g_gsFrames ? (double)g_gsSwitches / g_gsFrames : 0.0, g_gsSamples / dt / 1.0e6, g_gsFrames ? g_gsSamples / g_gsFrames / 1.0e6 : 0.0);
+            g_gsSamples = 0;
+            for (int i = 0; i < GS_N; ++i) g_gsAcc[i] = 0; g_gsSwitches = 0ul; g_gsFrames = 0ul;
+        }
+    }
+    int gsClassOf(const GsGpuRenderer::DrawCmd &c)
+    {
+        if (c.isTransfer || c.isVramBlit || c.isDecode) return GS_XFER;
+        if (c.destFbp != 0u && c.destFbp != 112u) return GS_EFFECT;
+        if (c.isTriangle && c.fst == 0u) return GS_GEOM;
+        // sprites into the scene: BT3's post composites are full-HEIGHT strips (16 x 32 px or 8 x 64 px)
+        if (!c.isTriangle && c.sh >= 400) return GS_COMP;
+        return GS_HUD;
+    }
+}
+// [gputime] GL_TIME_ELAPSED around every renderAndGetTextureId call: the GPU's own execution
+// time for the frame's draw list, independent of how long the CPU took to submit it. A user log
+// then shows directly whether a machine is GPU-bound (gpu_ms per game frame vs the 33 ms
+// budget) instead of inferring it from render-thread stalls. Ring of 4 queries, results read
+// 3 calls later without blocking. PS2X_GPUTIME=0 disables.
+namespace
+{
+    unsigned int g_gpqIds[4] = {0u, 0u, 0u, 0u}; bool g_gpqIssued[4] = {false, false, false, false}; int g_gpqSlot = 0; bool g_gpqInit = false;
+    std::atomic<uint64_t> g_gpuNsAccum{0}; std::atomic<uint64_t> g_gpuCallsAccum{0};
+    bool gpuTimeOn() { static const bool s = [](){ const char *v = std::getenv("PS2X_GPUTIME"); return !(v && v[0] == '0'); }(); return s; }
+    void gpuTimeBegin()
+    {
+        if (gpuSplitOn()) { gsFrameBegin(); return; }   // [gpusplit] class queries instead of the frame query
+        if (!gpuTimeOn()) return;
+        if (!g_gpqInit) { glGenQueries(4, g_gpqIds); g_gpqInit = true; }
+        // harvest the oldest slot before reusing it
+        const int old = g_gpqSlot;
+        if (g_gpqIssued[old])
+        {
+            unsigned int avail = 0u; glGetQueryObjectuiv(g_gpqIds[old], 0x8867u /*GL_QUERY_RESULT_AVAILABLE*/, &avail);
+            unsigned int ns = 0u; glGetQueryObjectuiv(g_gpqIds[old], 0x8866u /*GL_QUERY_RESULT*/, &ns);   // blocks only if the 3-call-old result is still pending
+            g_gpuNsAccum.fetch_add(ns, std::memory_order_relaxed); g_gpuCallsAccum.fetch_add(1u, std::memory_order_relaxed);
+            g_gpqIssued[old] = false;
+        }
+        glBeginQuery(0x88BFu /*GL_TIME_ELAPSED*/, g_gpqIds[old]);
+    }
+    void gpuTimeEnd()
+    {
+        if (gpuSplitOn()) { gsFrameEnd(); return; }
+        if (!gpuTimeOn() || !g_gpqInit) return;
+        glEndQuery(0x88BFu);
+        g_gpqIssued[g_gpqSlot] = true; g_gpqSlot = (g_gpqSlot + 1) & 3;
+    }
+}
+extern "C" double ps2xGpuMsTake(uint64_t *calls)
+{   // [gputime] for the [fps] line: GPU ms accumulated since the last take, and how many calls it covers
+    const uint64_t ns = g_gpuNsAccum.exchange(0u); const uint64_t c = g_gpuCallsAccum.exchange(0u);
+    if (calls) *calls = c;
+    return (double)ns / 1.0e6;
+}
+extern thread_local bool g_stageWrites;   // ps2_gs_gpu.cpp: staging pass captures writes for the guest
+static unsigned long g_stageIter = 0;   // one per [livesync] staging pass (GL thread)
+namespace
+{
+    struct AsyncStage
+    {
+        unsigned int pbo[2] = {0u, 0u}; size_t cap[2] = {0u, 0u};
+        int cur = 0;            // index of the buffer holding the pending read
+        bool pending = false;
+        int pw = 0, ph = 0, prX0 = 0, prY0 = 0, prX1 = 0, prY1 = 0; bool prect = false; unsigned int prt = 0u;
+        unsigned long lastIter = 0ul;
+    };
+    std::unordered_map<uint64_t, AsyncStage> g_asyncStage;
+    unsigned long g_asyncStageHits = 0ul, g_asyncStageSync = 0ul;
+    bool asyncStageOn()
+    {
+        static const bool s = [](){ const char *v = std::getenv("PS2X_ASYNCSTAGE"); return !(v && v[0] == '0'); }();
+        return s;
+    }
+    // Returns true when `px`/rect were filled from the PREVIOUS pass's buffer (and a new read was
+    // issued); false when the caller must do the synchronous read (a new read was still issued so
+    // the next pass can be asynchronous).
+    bool asyncStageReadback(uint32_t fbp, unsigned int rtId, int w, int h, bool &rectUsed, int &rX0, int &rY0, int &rX1, int &rY2,
+                            std::vector<uint32_t> &px, bool noflip, int fboH)
+    {
+        int &rY1 = rY2;
+        // Keyed by (page, window size, target texture): page 336 is staged at alternating window
+        // sizes for its two reader families, and a per-page slot never saw two matching passes in
+        // a row (driven run: async 0-47 vs sync 30-50 per second). A pending read is consumed if it
+        // is at most 3 passes old; a page with no pending read (first request, or after a longer
+        // gap) reads synchronously, which is the one-shot-capture guarantee.
+        const uint64_t key = (uint64_t)fbp ^ ((uint64_t)(w & 0xFFFF) << 16) ^ ((uint64_t)(h & 0xFFFF) << 32) ^ ((uint64_t)rtId << 48);
+        AsyncStage &as = g_asyncStage[key];
+        const bool recent = as.pending && (g_stageIter - as.lastIter) <= 3ul;
+        as.lastIter = g_stageIter;
+        const bool canConsume = recent && as.pw == w && as.ph == h && as.prt == rtId;
+        if (!as.pbo[0]) glGenBuffers(2, as.pbo);
+        // capture this pass's rect before it is overridden by the consumed one
+        const bool cRect = rectUsed; const int cX0 = rX0, cY0 = rY0, cX1 = rX1, cY1 = rY1;
+        bool consumed = false;
+        if (canConsume)
+        {
+            const int b = as.cur;
+            const int rw = as.prect ? (as.prX1 - as.prX0) : w, rh = as.prect ? (as.prY1 - as.prY0) : h;
+            const size_t bytes = (size_t)rw * rh * 4u;
+            glBindBuffer(0x88EBu /*GL_PIXEL_PACK_BUFFER*/, as.pbo[b]);
+            if (as.prect)
+            {
+                static std::vector<uint32_t> tmp; tmp.assign((size_t)rw * rh, 0u);
+                glGetBufferSubData(0x88EBu, 0, (ptrdiff_t)bytes, tmp.data());
+                for (int y = 0; y < rh; ++y)
+                {
+                    if (noflip) std::memcpy(px.data() + (size_t)(h - as.prY1 + y) * w + as.prX0, tmp.data() + (size_t)y * rw, (size_t)rw * 4u);
+                    else        std::memcpy(px.data() + (size_t)(as.prY0 + y) * w + as.prX0, tmp.data() + (size_t)(rh - 1 - y) * rw, (size_t)rw * 4u);
+                }
+            }
+            else
+                glGetBufferSubData(0x88EBu, 0, (ptrdiff_t)bytes, px.data());
+            glBindBuffer(0x88EBu, 0u);
+            rectUsed = as.prect; rX0 = as.prX0; rY0 = as.prY0; rX1 = as.prX1; rY1 = as.prY1;
+            consumed = true; ++g_asyncStageHits;
+        }
+        else ++g_asyncStageSync;
+        // issue this pass's read asynchronously into the other buffer
+        {
+            const int b = consumed ? (as.cur ^ 1) : as.cur;
+            const int rw = cRect ? (cX1 - cX0) : w, rh = cRect ? (cY1 - cY0) : h;
+            const size_t bytes = (size_t)rw * rh * 4u;
+            glBindBuffer(0x88EBu, as.pbo[b]);
+            if (as.cap[b] < bytes) { glBufferData(0x88EBu, (ptrdiff_t)bytes, nullptr, 0x88E1u /*GL_STREAM_READ*/); as.cap[b] = bytes; }
+            if (cRect) glReadPixels(cX0, fboH - cY1, rw, rh, 0x1908, 0x1401, nullptr);
+            else       glReadPixels(0, fboH - h, w, h, 0x1908, 0x1401, nullptr);
+            glBindBuffer(0x88EBu, 0u);
+            as.cur = b; as.pending = true; as.pw = w; as.ph = h; as.prt = rtId;
+            as.prect = cRect; as.prX0 = cX0; as.prY0 = cY0; as.prX1 = cX1; as.prY1 = cY1;
+        }
+        {   // once a second under PS2X_RAGSTAT=1: how many staged pages went async vs synchronous
+            static const bool s_rs = [](){ const char *v = std::getenv("PS2X_RAGSTAT"); return v && v[0] && v[0] != '0'; }();
+            if (s_rs)
+            {
+                static auto last = std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(now - last).count() >= 1.0)
+                { last = now; std::fprintf(stderr, "[asyncstage] async=%lu sync=%lu\n", g_asyncStageHits, g_asyncStageSync); g_asyncStageHits = g_asyncStageSync = 0ul; }
+            }
+        }
+        return consumed;
+    }
+}
+
 void GsGpuRenderer::flushPageToVram(uint32_t fbp)
 {
     {   // [gpualias] flush diagnostics for the edge-map page
@@ -2064,11 +2304,14 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
     flushBatch(__LINE__);
     rlEnableFramebuffer(it->second.rt.id);
     rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
+    const auto tRb0 = std::chrono::steady_clock::now();
+    bool asyncDone = false;   // [asyncstage]
+    if (g_stageWrites && asyncStageOn())
+        asyncDone = asyncStageReadback(fbp, it->second.rt.texture.id, w, h, rectUsed, rX0, rY0, rX1, rY1, px, s_noflip, it->second.h);
+    if (!asyncDone)
     {   // [rbsplit] PS2X_RBSPLIT=1: how much of a readback stall is the GPU finishing the segment (glFinish) vs the transfer
         static const bool s_rbs = [](){ const char *v = std::getenv("PS2X_RBSPLIT"); return !(v && v[0] == '0'); }();   // default ON: the driver's synchronous glReadPixels stalled ~20 ms/frame; glFinish first makes the whole readback ~5.5 ms/frame (rig 20 -> 23 fps)
         if (s_rbs) { extern double g_bsFinish; const auto tf = std::chrono::steady_clock::now(); glFinish(); g_bsFinish += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count(); }
-    }
-    const auto tRb0 = std::chrono::steady_clock::now();
     if (rectUsed)
     {
         const int rw = rX1 - rX0, rh = rY1 - rY0;
@@ -2094,6 +2337,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
     { extern double g_flRead; const auto tr = std::chrono::steady_clock::now();
       glReadPixels(0, it->second.h - h, w, h, 0x1908, 0x1401, px.data());
       g_flRead += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tr).count(); }
+    }   // [asyncstage] end of the synchronous path
     { extern double g_bsReadback; g_bsReadback += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tRb0).count(); }
     if (s_bd)
     {   // Identity of the framebuffer actually being read, to compare against [maskzero].
@@ -6483,6 +6727,11 @@ PS2X_WINGL(glBlitFramebuffer, (int sx0, int sy0, int sx1, int sy1, int dx0, int 
 PS2X_WINGL(glActiveTexture, (unsigned int texture), (texture))
 PS2X_WINGL(glGetUniformiv, (unsigned int program, int location, int *params), (program, location, params))
 PS2X_WINGL(glGetUniformfv, (unsigned program, int location, float *params), (program, location, params))
+PS2X_WINGL(glGenBuffers, (int n, unsigned int *buffers), (n, buffers))
+PS2X_WINGL(glDeleteBuffers, (int n, const unsigned int *buffers), (n, buffers))
+PS2X_WINGL(glBindBuffer, (unsigned int target, unsigned int buffer), (target, buffer))
+PS2X_WINGL(glBufferData, (unsigned int target, ptrdiff_t size, const void *data, unsigned int usage), (target, size, data, usage))
+PS2X_WINGL(glGetBufferSubData, (unsigned int target, ptrdiff_t offset, ptrdiff_t size, void *data), (target, offset, size, data))
 PS2X_WINGL(glGenQueries, (int n, unsigned int *ids), (n, ids))
 PS2X_WINGL(glBeginQuery, (unsigned int target, unsigned int id), (target, id))
 PS2X_WINGL(glEndQuery, (unsigned int target), (target))
@@ -6498,6 +6747,7 @@ static void ps2xWinGlResolve()
 {
 #define R(name) if (!p_##name) p_##name = reinterpret_cast<decltype(p_##name)>(wingl::get(#name));
     R(glBindFramebuffer) R(glBlitFramebuffer) R(glActiveTexture) R(glGetUniformiv) R(glGetUniformfv) R(glGenQueries)
+    R(glGenBuffers) R(glDeleteBuffers) R(glBindBuffer) R(glBufferData) R(glGetBufferSubData)
     R(glBeginQuery) R(glEndQuery) R(glGetQueryObjectuiv) R(glGetFramebufferAttachmentParameteriv) R(glGenVertexArrays)
     R(glUseProgram) R(glUniform1i) R(glUniform1f) R(glBindVertexArray)
 #undef R
@@ -6707,6 +6957,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         }
     } ragStat;
     ensureGl(fbWidth, fbHeight);
+    struct GpuTimeScope { GpuTimeScope() { gpuTimeBegin(); } ~GpuTimeScope() { gpuTimeEnd(); } } _gpuTimeScope;   // [gputime]
     if (g_liveStageArmed)
     {   // [livesync] FBOs hold the last COMPLETED render; read them here (GL thread) with the
         // full flushPageToVram mask logic, but capture the writes for the guest to apply at
@@ -6740,6 +6991,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 if (g_stageGen - it->second > kStageSticky) it = g_stageWant.erase(it);
                 else { stagePages.push_back(it->first); ++it; }
             }
+        ++g_stageIter;   // [asyncstage]
         g_stageWrites = true;
         for (uint32_t pg : stagePages)
         {
@@ -9217,6 +9469,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
          (!hoistAll && ti + 1u < (size_t)DC[ci].triCount) ? (void)++ti : (void)(ti = 0, ++ci))
     {
         const uint32_t nTri = DC[ci].triCount;
+        if (ti == 0u) gsSwitch(gsClassOf(DC[ci]));   // [gpusplit]
         {   // [hudtrace] stage 0: a HUD-class command entered the loop body
             extern unsigned long g_hudTrace[3]; extern bool ps2xHudTraceOn(); extern bool g_hudTraceCur;
             const DrawCmd &hc = DC[ci];
