@@ -12,6 +12,10 @@ extern std::atomic<uint64_t> g_guestThreadCpuNs;
 // [framegate] vsync tick source, declared at file scope for the same reason as the above.
 namespace ps2_syscalls { uint64_t GetCurrentVSyncTick(); }
 extern std::atomic<uint64_t> g_workerFrameNs;   // [framegate] kick worker busy ns, last frame
+// [syncrelax] true while the frame gate is engaged (async kick on, gate on, worker frame > one vblank): the gate
+// then owns the frame rate, so the busy-bit pacing and the sceGsSyncPath drain can let the guest run ahead.
+std::atomic<bool> g_ps2xFrameGateHeavy{false};
+extern "C" bool ps2xFrameGateHeavy() { return g_ps2xFrameGateHeavy.load(std::memory_order_relaxed); }
 
 // [guestbusy-tid] FILE SCOPE, not inside bt3FrameKick. Declaring this extern "C" inside a function
 // body -- which sits in this file's anonymous namespace -- builds silently on Linux clang and
@@ -3885,7 +3889,11 @@ namespace
             static const uint64_t s_vsyncNs = [](){ const char *v = std::getenv("PS2X_VBLANK_US");
                                                     const long us = (v && v[0]) ? std::atol(v) : 0L;
                                                     return (uint64_t)(us > 1000 ? us : 16667L) * 1000ull; }();
-            const bool heavy = g_workerFrameNs.load(std::memory_order_relaxed) > s_vsyncNs;
+            // PS2X_FRAMEGATE_FORCEHEAVY=1 (dev): treat every frame as heavy on a fast box, to exercise the gated +
+            // relaxed-pacing path that slow machines take (the vblank period itself stays real).
+            static const bool s_forceHeavy = [](){ const char *v = std::getenv("PS2X_FRAMEGATE_FORCEHEAVY"); return v && v[0] && v[0] != '0'; }();
+            const bool heavy = s_forceHeavy || g_workerFrameNs.load(std::memory_order_relaxed) > s_vsyncNs;
+            g_ps2xFrameGateHeavy.store(s_gate && heavy && PS2Memory::asyncKickEnabled(), std::memory_order_relaxed);   // [syncrelax]
             if (s_gate && heavy && PS2Memory::asyncKickEnabled())
             {
                 static uint64_t s_lastTick = 0;

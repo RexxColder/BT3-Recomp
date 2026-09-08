@@ -1491,6 +1491,8 @@ namespace ps2_stubs
         setReturnS32(ctx, static_cast<int32_t>(which ^ 1u));
     }
 
+    extern "C" bool ps2xAsyncPaceRelaxedC();   // [syncrelax] ps2_memory.cpp
+    static bool ps2xAsyncPaceRelaxedForStubs() { return ps2xAsyncPaceRelaxedC(); }
     void sceGsSyncPath(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int32_t mode = static_cast<int32_t>(getRegU32(ctx, 4));
@@ -1506,7 +1508,10 @@ namespace ps2_stubs
             // uploads/draws in flight; whatever the game does "after sync" (buffer
             // reuse, direct GS pokes, VRAM management) would race it. Honor the
             // hardware contract and drain the queue.
-            fenceAsyncKickForGsAccess(runtime, WP_FENCE_SYNCPATH);
+            // [syncrelax] ...unless the frame gate is engaged: then the gate paces, the busy bit reads idle
+            // (see readIORegister) and the guest may run ahead of the worker -- see ps2xAsyncPaceRelaxed.
+            if (!ps2xAsyncPaceRelaxedForStubs())
+                fenceAsyncKickForGsAccess(runtime, WP_FENCE_SYNCPATH);
 
             uint32_t count = 0;
             constexpr uint32_t kTimeout = 0x1000000;
