@@ -5188,6 +5188,9 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         }
         // [decalq] the ground-shadow decal class (CT24 read of the Pass-1 silhouette, DATE, blend 0x44)
         const bool shadowDecalClass = tme && ctx.tex0.tbp0 == 10752u && ctx.tex0.psm == 1u && (((ctx.test >> 14) & 1u) != 0u) && ((ctx.alpha & 0xFFu) == 0x44u);
+        // [uvrecip] texW/texH are 1 << TEX0.TW/TH (powers of two), so multiplying by the reciprocal is bit-exact and
+        // replaces two float divides per vertex (9.5% of recordSpriteGPU on the divide line, perf annotate 2026-09-08).
+        const float invTexW = 1.0f / static_cast<float>(texW), invTexH = 1.0f / static_cast<float>(texH);
         for (int i = 0; i < 3; ++i)
         {
             const GSVertex &v = gs->m_vtxQueue[i];
@@ -5229,8 +5232,8 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                 cmd.tri[i].y = static_cast<float>(static_cast<int>(v.y) - ofy);
             }
             float u, tv; texelUV(v, u, tv);
-            cmd.tri[i].u = tme ? (u / static_cast<float>(texW)) : 0.0f;
-            cmd.tri[i].v = tme ? (tv / static_cast<float>(texH)) : 0.0f;
+            cmd.tri[i].u = tme ? (u * invTexW) : 0.0f;
+            cmd.tri[i].v = tme ? (tv * invTexH) : 0.0f;
             // PS2X_PERSPQ=1: hand the shader RAW s,t and q instead of the per-vertex quotient,
             // so the divide happens per pixel the way the GS does it.
             // 2026-08-29 [prmode]: the ground-shadow decal (CT24 read of the Pass-1 silhouette at tbp 10752, DATE,
