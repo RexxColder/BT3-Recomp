@@ -2291,7 +2291,12 @@ extern "C" bool ps2xFrameGateHeavy();   // [syncrelax] game_overrides.cpp
 extern "C" bool ps2xAsyncPaceRelaxedC();
 static bool ps2xAsyncPaceRelaxed()
 {
-    static const int s_mode = [](){ const char *v = std::getenv("PS2X_ASYNC_SYNCRELAX"); return v && v[0] ? std::atoi(v) : 1; }();
+    // DEFAULT OFF since 2026-09-08 evening: =1 let the guest run a frame ahead once the frame gate engaged
+    // (24 -> 28 fps on the i5-12400) but the guest then overwrites a texture VRAM slot before the worker has
+    // drawn the previous frame with it -> flickering arena textures + broken HUD on the real streaming load
+    // (log_new1, user-reported; invisible on a fast box where the gate never engages). Needs a per-slot fence
+    // (only stall when the guest writes VRAM the queued draws still read) before it can default on again.
+    static const int s_mode = [](){ const char *v = std::getenv("PS2X_ASYNC_SYNCRELAX"); return v && v[0] ? std::atoi(v) : 0; }();
     if (s_mode == 0) return false;
     if (s_mode >= 2) return true;
     return ps2xFrameGateHeavy();
