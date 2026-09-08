@@ -11,6 +11,13 @@ endif()
 
 project(PS2RetroX)
 
+# Visual Studio generator: compile a project's files in parallel (MSBuild MultiProcessorCompilation). The
+# generator turns /MP into the project property; it is not passed to clang-cl. Without it the runner's
+# ~1000 unity units build one at a time (45-minute scratch builds, 2026-09-08).
+if(CMAKE_GENERATOR MATCHES "Visual Studio")
+    add_compile_options(/MP)
+endif()
+
 # A bare configure (setup.py, or a plain `cmake -S . -B build`) used to build with NO
 # optimization at all (empty CMAKE_BUILD_TYPE = -O0): the from-scratch runner played
 # fights at ~21 fps where the same sources at Release hold the engine's locked 30.
