@@ -1018,10 +1018,59 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 }
             }
 
+            {   // [vifhist] PS2X_VIFHIST=1: which UNPACK shapes carry the vectors (fast-path design aid), every ~5 s
+                static const bool s_vh = [](){ const char *v = std::getenv("PS2X_VIFHIST"); return v && v[0] && v[0] != '0'; }();
+                if (s_vh)
+                {
+                    static std::unordered_map<uint32_t, uint64_t> hist; static uint64_t total = 0, unpacks = 0;
+                    const uint32_t key = (uint32_t)vn | ((uint32_t)vl << 2) | ((maskEnable ? 1u : 0u) << 4) | ((vif1_regs.mode & 3u) << 5)
+                                       | (((cl >= wl) ? 1u : 0u) << 7) | (((cl == wl) ? 1u : 0u) << 8) | (((vif1_regs.cycle >> 8) & 0xFFu) << 9) | ((vif1_regs.cycle & 0xFFu) << 17)
+                                       | ((writeVectorCount > 1u ? 1u : 0u) << 25);
+                    hist[key] += writeVectorCount; total += writeVectorCount; ++unpacks;
+                    static auto last = std::chrono::steady_clock::now();
+                    const auto now = std::chrono::steady_clock::now();
+                    if (std::chrono::duration<double>(now - last).count() >= 5.0)
+                    {
+                        last = now;
+                        std::vector<std::pair<uint64_t, uint32_t>> v; for (auto &kv : hist) v.push_back({kv.second, kv.first});
+                        std::sort(v.begin(), v.end(), [](auto &x, auto &y){ return x.first > y.first; });
+                        std::fprintf(stderr, "[vifhist] unpacks=%llu vectors=%llu |", (unsigned long long)unpacks, (unsigned long long)total);
+                        for (size_t i = 0; i < v.size() && i < 10; ++i)
+                        {
+                            const uint32_t k = v[i].second;
+                            std::fprintf(stderr, " vn%u vl%u m%u mode%u cl%u wl%u multi%u:%.1f%%", k & 3u, (k >> 2) & 3u, (k >> 4) & 1u, (k >> 5) & 3u,
+                                         (k >> 17) & 0xFFu, (k >> 9) & 0xFFu, (k >> 25) & 1u, 100.0 * (double)v[i].first / (double)total);
+                        }
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+            }
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
+                // [vifbulk] 99.6% of BT3's unpacked vectors are V4-32, unmasked, mode 0, CL==WL (measured with
+                // PS2X_VIFHIST=1 in a driven fight). That shape is a contiguous copy of writeVectorCount quadwords
+                // into VU1 memory, wrapping at 1024 vectors, with no row/col/mask side effects -- so do exactly that
+                // instead of the generic per-vector decode below. PS2X_VIFBULK=0 disables; PS2X_VIFVERIFY=1 runs both
+                // and compares the whole 16 KB after every UNPACK (correctness gate: the GS replay is VIF-blind).
+                static const bool s_bulk = [](){ const char *v = std::getenv("PS2X_VIFBULK"); return !(v && v[0] == '0'); }();
+                static const bool s_verify = [](){ const char *v = std::getenv("PS2X_VIFVERIFY"); return v && v[0] && v[0] != '0'; }();
+                static const bool s_bcOn = [](){ const char *v = std::getenv("PS2X_BONECHK"); return v && v[0] && v[0] != '0'; }();
+                const bool bulkOk = s_bulk && !s_bcOn && !maskEnable && (vif1_regs.mode & 3u) == 0u && vl == 0u && vn == 3u && cl == wl
+                                    && bytesPerVector == 16u && sourceVectorCount == writeVectorCount;
+                auto bulkUnpack = [&]()
+                {
+                    uint32_t dst = vuAddr & 0x3FFu, left = writeVectorCount; const uint8_t *src = srcBase;
+                    while (left)
+                    {
+                        const uint32_t run = (left < 1024u - dst) ? left : (1024u - dst);
+                        std::memcpy(m_vu1Data + (size_t)dst * 16u, src, (size_t)run * 16u);
+                        src += (size_t)run * 16u; dst = (dst + run) & 0x3FFu; left -= run;
+                    }
+                };
+                auto genericUnpack = [&]()
+                {
                 for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
                 {
                     const uint32_t cyclePos = writeIndex % wl;
@@ -1294,6 +1343,33 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         }
                     }
                 }
+                };
+                if (bulkOk && s_verify)
+                {
+                    static std::vector<uint8_t> snap, ref; snap.resize(PS2_VU1_DATA_SIZE); ref.resize(PS2_VU1_DATA_SIZE);
+                    std::memcpy(snap.data(), m_vu1Data, PS2_VU1_DATA_SIZE);
+                    genericUnpack();
+                    std::memcpy(ref.data(), m_vu1Data, PS2_VU1_DATA_SIZE);
+                    std::memcpy(m_vu1Data, snap.data(), PS2_VU1_DATA_SIZE);
+                    srcIndex = 0u;
+                    bulkUnpack();
+                    static uint64_t nOk = 0, nBad = 0;
+                    if (std::memcmp(ref.data(), m_vu1Data, PS2_VU1_DATA_SIZE) != 0)
+                    {
+                        ++nBad;
+                        if (nBad <= 10)
+                        {
+                            size_t first = 0; while (first < PS2_VU1_DATA_SIZE && ref[first] == m_vu1Data[first]) ++first;
+                            std::fprintf(stderr, "[vifverify] MISMATCH #%llu at byte %zu (qw %zu): vuAddr=%u cnt=%u cl=%u wl=%u\n",
+                                         (unsigned long long)nBad, first, first / 16u, vuAddr, writeVectorCount, cl, wl);
+                        }
+                        std::memcpy(m_vu1Data, ref.data(), PS2_VU1_DATA_SIZE);   // keep the reference result
+                    }
+                    else ++nOk;
+                    if (((nOk + nBad) % 100000u) == 0u) std::fprintf(stderr, "[vifverify] ok=%llu bad=%llu\n", (unsigned long long)nOk, (unsigned long long)nBad);
+                }
+                else if (bulkOk) bulkUnpack();
+                else genericUnpack();
             }
 
             // [cycletrace] PS2X_CYCLETRACE=<minframe>: log S-format and MASKED unpacks with
