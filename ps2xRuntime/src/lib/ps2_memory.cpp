@@ -2296,7 +2296,9 @@ static bool ps2xAsyncPaceRelaxed()
     // drawn the previous frame with it -> flickering arena textures + broken HUD on the real streaming load
     // (log_new1, user-reported; invisible on a fast box where the gate never engages). Needs a per-slot fence
     // (only stall when the guest writes VRAM the queued draws still read) before it can default on again.
-    static const int s_mode = [](){ const char *v = std::getenv("PS2X_ASYNC_SYNCRELAX"); return v && v[0] ? std::atoi(v) : 0; }();
+    static const int s_mode = [](){ const char *v = std::getenv("PS2X_ASYNC_SYNCRELAX"); const int m = v && v[0] ? std::atoi(v) : 0;
+                                     std::fprintf(stderr, "[syncrelax] PS2X_ASYNC_SYNCRELAX=%d (0 = off, 1 = when the frame gate is heavy, 2 = always)\n", m);   // a log must prove the setting (2026-09-08: two 12400 runs had it unset)
+                                     return m; }();
     if (s_mode == 0) return false;
     if (s_mode >= 2) return true;
     return ps2xFrameGateHeavy();
