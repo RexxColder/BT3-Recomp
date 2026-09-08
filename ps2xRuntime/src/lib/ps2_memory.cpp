@@ -2287,6 +2287,15 @@ void PS2Memory::drainKickQueue()
 // ~18 ms, so the gate engages and holds 30.
 std::atomic<uint64_t> g_workerFrameNs{0};
 
+extern "C" bool ps2xFrameGateHeavy();   // [syncrelax] game_overrides.cpp
+extern "C" bool ps2xAsyncPaceRelaxedC();
+static bool ps2xAsyncPaceRelaxed()
+{
+    static const int s_mode = [](){ const char *v = std::getenv("PS2X_ASYNC_SYNCRELAX"); return v && v[0] ? std::atoi(v) : 1; }();
+    if (s_mode == 0) return false;
+    if (s_mode >= 2) return true;
+    return ps2xFrameGateHeavy();
+}
 void PS2Memory::kickWorkerLoop()
 {
     ps2xEeProfAddCurrentThread("KickWorker");   // [eeprof]
@@ -3126,8 +3135,15 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
                 // OWN hardware pacing, and still overlaps: the guest runs its logic between the
                 // kick and the next poll, exactly as the EE did while VU1/GIF worked.
                 const uint32_t chan = (address >> 12) & 7u;   // 0x9000 -> 1 (VIF1), 0xA000 -> 2 (GIF)
+                // [syncrelax] PS2X_ASYNC_SYNCRELAX (default 1): once the frame gate is engaged (worker frame
+                // > one vblank, the case on every machine that cannot hold 30) the gate already caps the frame
+                // rate, so the pacing lie is not needed: report the channel idle and let the guest prepare the
+                // next frame while the worker records this one. The kick jobs copy their data at enqueue, so
+                // buffer reuse after "DMA done" is safe; VRAM readbacks keep their own fence (store-image).
+                // On the i5-12400 the drain + this spin were ~600 ms/s of the game thread ([waitprof]).
+                // =0 restores the always-busy report; =2 never reports busy (dev only: fast-forwards fast boxes).
                 if (asyncKickEnabled() && chan < 3u &&
-                    m_asyncChanBusy[chan].load(std::memory_order_acquire) > 0)
+                    m_asyncChanBusy[chan].load(std::memory_order_acquire) > 0 && !ps2xAsyncPaceRelaxed())
                     return m_ioRegisters[address] | 0x100u;   // still RUNNING
 
                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
@@ -3311,3 +3327,4 @@ void PS2Memory::clearModifiedFlag(uint32_t address, uint32_t size)
         }
     }
 }
+extern "C" bool ps2xAsyncPaceRelaxedC() { return ps2xAsyncPaceRelaxed(); }   // [syncrelax] for the GS stubs
