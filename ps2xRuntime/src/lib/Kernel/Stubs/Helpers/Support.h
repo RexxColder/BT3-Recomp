@@ -1985,7 +1985,10 @@ namespace
     // keep the real fence. PS2X_ASYNC_GSQUEUE=0 restores drain-then-apply.
     static void applyGsOnStream(PS2Runtime *runtime, std::function<void()> apply)
     {
-        static const bool s_queue = [](){ const char *v = std::getenv("PS2X_ASYNC_GSQUEUE"); return !(v && v[0] == '0'); }();
+        // DEFAULT OFF since 2026-09-08 evening: queued writes removed one of three worker drains per frame but
+        // gained nothing measurable on the i5-12400 (newest3/5: 23.9/24.7 fps vs 23.9 before) and the 4x
+        // cutscene-skip crash (newest4) appeared with it in. PS2X_ASYNC_GSQUEUE=1 re-enables for testing.
+        static const bool s_queue = [](){ const char *v = std::getenv("PS2X_ASYNC_GSQUEUE"); return v && v[0] == '1'; }();
         if (s_queue && runtime && PS2Memory::asyncKickEnabled())
         {
             PS2Memory::KickJob j;
