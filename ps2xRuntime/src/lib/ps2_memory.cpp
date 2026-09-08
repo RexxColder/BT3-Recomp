@@ -36,6 +36,7 @@ bool g_kickSrcMapEnabled()
 #include <cstdio>
 #include <cstdlib>
 extern "C" void ps2xEeProfAddCurrentThread(const char *name);   // [eeprof]
+extern "C" void ps2xGsDisplayFlipHook(unsigned long long dispfb);   // [displatch] ps2_gs_gpu.cpp
 
 // PS2X_WATCH: when the projection value 0x44db523d (1754.57) is written into a transform packet,
 // print a backtrace to reveal the recompiled EE function that builds the packet (and therefore
@@ -896,6 +897,21 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
     }
 }
 
+// [displatch] the game's own DISPFB1 write (its vblank flip, a memory-bus store that bypasses the sceGs stubs) is the
+// last writer of the display register each frame and the one the present shows. It happens on the game thread outside
+// the kick stream, so a game thread running ahead flips the display before the worker has even published the frame.
+// Carry it through the kick queue: the worker applies the flip latch in stream order.
+static void ps2xDispFlipInStream(PS2Memory *mem, uint64_t dispfb)
+{
+    if (PS2Memory::asyncKickEnabled())
+    {
+        PS2Memory::KickJob j; j.kind = PS2Memory::KickJob::GsApply;
+        j.fn = [dispfb]() { ps2xGsDisplayFlipHook((unsigned long long)dispfb); };
+        mem->enqueueKickJob(std::move(j));
+    }
+    else ps2xGsDisplayFlipHook((unsigned long long)dispfb);
+}
+
 void PS2Memory::write32(uint32_t address, uint32_t value)
 {
     if (address & 3)
@@ -919,6 +935,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
             const bool changed = (newVal != *reg);
             *reg = newVal;
+            if (regOff == 0x70u) ps2xDispFlipInStream(this, newVal);   // [displatch] DISPFB1
             // DISPFB1 (offset 0x0070) changed => the game swapped display buffers,
             // i.e. the just-rendered frame is complete. Snapshot it now.
             if (regOff == 0x0070u && changed && m_displaySwapCallback)
@@ -979,6 +996,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             *reg = value;
+            if (regOff == 0x70u) ps2xDispFlipInStream(this, value);   // [displatch] DISPFB1
         }
         return;
     }

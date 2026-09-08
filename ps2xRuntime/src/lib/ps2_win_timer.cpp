@@ -21,6 +21,9 @@ extern "C" void ps2xWinTimerEnd() { timeEndPeriod(1); }
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
+#include <csignal>
+#include <exception>
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
 // [wincrash] Which thread died? The stack usually says, but the one-line summary is what gets
@@ -110,10 +113,24 @@ static LONG WINAPI ps2xWinCrashFilter(EXCEPTION_POINTERS *ep)
     std::fflush(stderr); std::fflush(stdout);
     return EXCEPTION_CONTINUE_SEARCH;
 }
+static void ps2xWinTerminate()
+{   // [wincrash] std::terminate (an uncaught C++ exception) never reaches the SEH filter: a run that died with no
+    // [wincrash] line at all (new4.txt, 2026-09-08) took this path or abort()
+    std::fprintf(stderr, "[wincrash] std::terminate on thread %lu (%s): uncaught C++ exception or abort\n", GetCurrentThreadId(), ps2xWinThreadRole());
+    std::fflush(stderr); std::fflush(stdout);
+    std::abort();
+}
+static void ps2xWinAbortSignal(int)
+{
+    std::fprintf(stderr, "[wincrash] SIGABRT on thread %lu (%s)\n", GetCurrentThreadId(), ps2xWinThreadRole());
+    std::fflush(stderr); std::fflush(stdout);
+}
 extern "C" void ps2xWinCrashHandlerInstall()
 {
     g_ps2xMainThreadId = GetCurrentThreadId();
     SetUnhandledExceptionFilter(ps2xWinCrashFilter);
+    std::set_terminate(ps2xWinTerminate);
+    std::signal(SIGABRT, ps2xWinAbortSignal);
 }
 #endif
 

@@ -727,6 +727,7 @@ namespace
     // g_glTexGen; at the bind the GL thread compares it with the generation of the list it is rendering. One integer
     // compare per draw. PS2X_TEXCLOBBER=0 turns it off. Prints the first 12 hits and a summary every 10 s (also when 0).
     std::unordered_map<uint64_t, uint32_t> g_glTexGen;   // GL thread: generation of the texels currently in each GL texture
+    std::atomic<uint64_t> g_pubDispDiag{0};   // [displatchdiag] (gen << 32) | (hint fbp << 16) | live fbp at publish
     uint32_t g_texClobListGen = 0;                       // GL thread: generation of the list whose draws are being issued
     bool g_texClobOn = [](){ const char *v = std::getenv("PS2X_TEXCLOBBER"); return !(v && v[0] == '0'); }();
     struct { unsigned long hits = 0, d1 = 0, d2 = 0, d3 = 0, puts = 0, printed = 0; std::unordered_set<uint64_t> keys;
@@ -6801,6 +6802,12 @@ void GsGpuRenderer::swapFrame()
             m_ready.swap(m_building);
         m_building.clear();
         ++g_publishGen; // a genuinely new frame -> present thread should re-render
+        m_lastPubGen.store(g_publishGen, std::memory_order_relaxed);   // [displatch]
+        {   // [displatchdiag] what DISPFB says at publish time: the record-side hint and the live register
+            extern GS *g_gsWb; uint32_t lf = 0xFFFFu;
+            if (g_gsWb) if (const GSRegisters *pr = g_gsWb->privRegsForRecord()) lf = (uint32_t)(pr->dispfb1 & 0x1FFu);
+            g_pubDispDiag.store(((uint64_t)g_publishGen << 32) | ((uint64_t)(m_hintDisplayFbp & 0xFFFFu) << 16) | (uint64_t)(lf & 0xFFFFu), std::memory_order_relaxed);
+        }
         { ++g_ptFrames; if (ptInit() && g_ptFrames >= ptFrom() && g_ptN < ptMax()) { ++g_ptN; std::fprintf(stderr, "[pt] %lu FRAME %lu seq=%u\n", g_ptN, g_ptFrames, m_writeSeq); } }
     }
 }
@@ -8304,13 +8311,53 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (s_crtcDisp)
         {
             extern GS *g_gsWb;
+            uint32_t liveFbp = 0xFFFFFFFFu, liveFbw = 0u;
             if (g_gsWb)
                 if (const GSRegisters *pr = g_gsWb->privRegsForRecord())
                 {
-                    const uint32_t fbp = static_cast<uint32_t>(pr->dispfb1 & 0x1FFu);
-                    const uint32_t fbw = static_cast<uint32_t>((pr->dispfb1 >> 9) & 0x3Fu);
-                    if (fbw) setDisplay(fbp, fbw);
+                    liveFbp = static_cast<uint32_t>(pr->dispfb1 & 0x1FFu);
+                    liveFbw = static_cast<uint32_t>((pr->dispfb1 >> 9) & 0x3Fu);
                 }
+            // [displatch] PS2X_DISPLATCH=1 (default): present the buffer the game flipped to right after THIS frame was
+            // published (setDisplay latched it against the publish generation), not whatever DISPFB says at present time.
+            // Identical to the live read while the record side stays within a frame of the GL thread; when it runs ahead
+            // (sync-relax + queued GS writes) the live register names the NEXT frame's buffer, still being rendered.
+            // The counter below says how often the two disagreed. =0 reverts to the live read.
+            static const bool s_dispLatch = [](){ const char *v = std::getenv("PS2X_DISPLATCH"); return !(v && v[0] == '0'); }();
+            if (!listGens.empty() && listGens.back() != 0u) m_presentGen = listGens.back(); else if (frameGen != 0u) m_presentGen = frameGen;
+            // The flip that puts list N on screen is applied while N-1 is still the newest publish (the game flips in its
+            // vblank handler, THEN kicks the render that publishes; measured: the entry of gen N is never written before
+            // N's present, the register at publish N equals the last flip before it). So: the last flip while gen N-1 was newest.
+            const uint32_t flipGen = m_presentGen - 1u;
+            const uint64_t latch = m_dispLatch[flipGen & 3u].load(std::memory_order_relaxed);
+            const bool latched = s_dispLatch && m_presentGen > 1u && static_cast<uint32_t>(latch >> 32) == flipGen && ((latch >> 16) & 0xFFFFu) != 0u;
+            const uint32_t fbp = latched ? static_cast<uint32_t>(latch & 0xFFFFu) : liveFbp;
+            const uint32_t fbw = latched ? static_cast<uint32_t>((latch >> 16) & 0xFFFFu) : liveFbw;
+            {
+                static unsigned long s_n = 0, s_lat = 0, s_diff = 0; static auto s_t = std::chrono::steady_clock::now();
+                ++s_n; if (latched) { ++s_lat; if (liveFbp != 0xFFFFFFFFu && liveFbp != fbp) ++s_diff; }
+                const auto now = std::chrono::steady_clock::now();
+                if (now - s_t >= std::chrono::seconds(10))
+                {
+                    std::fprintf(stderr, "[displatch] 10 s: %lu presents, %lu latched, %lu differed from the live DISPFB\n", s_n, s_lat, s_diff);
+                    s_n = s_lat = s_diff = 0; s_t = now;
+                }
+            }
+            if (fbp != 0xFFFFFFFFu && fbw) { m_hintDisplayFbp = fbp; m_hintDisplayFbw = fbw; }   // NOT setDisplay(): the present must not latch
+            {   // [displatchdiag] PS2X_DISPLATCHDIAG=1: one line per second with every input of the decision
+                static const bool s_dd = [](){ const char *v = std::getenv("PS2X_DISPLATCHDIAG"); return v && v[0] && v[0] != '0'; }();
+                static auto s_td = std::chrono::steady_clock::now();
+                if (s_dd && std::chrono::steady_clock::now() - s_td >= std::chrono::seconds(1))
+                {
+                    s_td = std::chrono::steady_clock::now();
+                    extern std::atomic<unsigned long> g_ps2xDispFlipHookCalls, g_ps2xDispPrivCalls;
+                    const uint64_t pd = g_pubDispDiag.load(std::memory_order_relaxed);
+                    std::fprintf(stderr, "[displatchdiag] frameGen=%u presentGen=%u lastPub=%u | latch[N-1] gen=%u fbp=%u | atPublish gen=%u hint=%u live=%u | nowLive=%u hint=%u | hook=%lu priv=%lu latched=%d\n",
+                                 frameGen, m_presentGen, m_lastPubGen.load(std::memory_order_relaxed), (unsigned)(latch >> 32), (unsigned)(latch & 0xFFFFu),
+                                 (unsigned)(pd >> 32), (unsigned)((pd >> 16) & 0xFFFFu), (unsigned)(pd & 0xFFFFu),
+                                 liveFbp, m_hintDisplayFbp, g_ps2xDispFlipHookCalls.load(std::memory_order_relaxed), g_ps2xDispPrivCalls.load(std::memory_order_relaxed), (int)latched);
+                }
+            }
         }
     }
     if (!g_interpOn && m_hintDisplayFbp != 0xFFFFFFFFu && g_fbpEverDrawn.count(m_hintDisplayFbp) &&

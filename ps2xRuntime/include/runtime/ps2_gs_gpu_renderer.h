@@ -419,7 +419,18 @@ public:
     static constexpr uint32_t kVramPages = 512; // 4MB / 8KB page
     // DISPFB1 -> the scanned-out buffer's fbp AND its display stride (FBW, in 64px units).
     // If the display FBW differs from the draw FBW, the present must re-stride the buffer.
-    void setDisplay(uint32_t fbp, uint32_t fbw) { m_hintDisplayFbp = fbp; m_hintDisplayFbw = fbw; }
+    void setDisplay(uint32_t fbp, uint32_t fbw)
+    {   // record side, in STREAM order (the game's DISPFB1 write is carried through the kick queue; the sync stubs' flip
+        // runs on the worker under [gsqueue] or on the game thread after a drain)
+        m_hintDisplayFbp = fbp; m_hintDisplayFbw = fbw;
+        // [displatch] remember, per publish generation, the LAST flip applied while that publish was the newest
+        // (last writer wins, like the register itself). The present shows the entry of the list it presents, so a
+        // record side that has run ahead of the GL thread (sync-relax + queued GS writes) cannot make it present
+        // the NEXT frame's buffer while that frame is still being rendered (half-drawn scene, no HUD, flicker).
+        const uint32_t g = m_lastPubGen.load(std::memory_order_relaxed);
+        m_dispLatch[g & 3u].store((static_cast<uint64_t>(g) << 32) | (static_cast<uint64_t>(fbw & 0xFFFFu) << 16) | static_cast<uint64_t>(fbp & 0xFFFFu),
+                                  std::memory_order_relaxed);
+    }
 
     // ---- present thread (owns the GL context) ----
     // Replay the published frame into the FBO; returns the rendered GL texture id
@@ -570,6 +581,9 @@ private:
     int m_presentTexW = 0, m_presentTexH = 0;
     int m_presentSrcX = 0, m_presentSrcY = 0;
     uint32_t m_hintDisplayFbp = 0xFFFFFFFFu; // DISPFB1 fbp (the buffer the CRT scans out)
+    std::atomic<uint32_t> m_lastPubGen{0};   // [displatch] generation of the most recent publish (swapFrame)
+    std::atomic<uint64_t> m_dispLatch[4]{};  // [displatch] ring by gen & 3: (gen << 32) | (fbw << 16) | fbp, last flip while gen was the newest publish
+    uint32_t m_presentGen = 0;               // [displatch] GL thread: generation of the frame being presented (kept across re-presents)
     uint32_t m_hintDisplayFbw = 0u;          // DISPFB1 fbw (display stride, 64px units)
     bool m_glInit = false;
     void ensureGl(int w, int h);
