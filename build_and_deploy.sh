@@ -102,6 +102,16 @@ for lib in "${LIBS[@]}"; do
     if [[ "$base" == ld-linux* ]]; then
         continue  # the kernel maps the interpreter itself; not needed in lib/
     fi
+    # NEVER bundle the C/C++ runtime core. Forcing the build-host glibc onto an
+    # arbitrary target via stub's LD_LIBRARY_PATH=lib causes GLIBC_PRIVATE symbol
+    # clashes at load (e.g. "undefined symbol: __pointer_chk_guard, version
+    # GLIBC_PRIVATE"). The target system provides these; the runner's minimum
+    # glibc floor still applies (build against an older-baseline chroot/container
+    # to widen it).
+    case "$base" in
+        libc.so.*|libm.so.*|libmvec.so.*|libpthread.so.*|libdl.so.*|librt.so.*|libutil.so.*|libresolv.so.*|libnss*.so.*|libanl.so.*|libthread_db.so.*|libBrokenLocale.so.*|libcrypt.so.*|libnsl.so.*|libstdc++.so.*|libgcc_s.so.*)
+            continue ;;
+    esac
     if [[ -f "$lib" && ! -f "$STAGE/lib/$base" ]]; then
         cp "$lib" "$STAGE/lib/$base"
         count=$((count + 1))

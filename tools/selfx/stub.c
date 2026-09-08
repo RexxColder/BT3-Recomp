@@ -1,14 +1,27 @@
 /*
- * Self-extracting stub for the BT3-Recomp Linux launcher.
+ * Self-extracting stub for the BT3-Recomp Linux release.
  *
- * Layout of the final executable (assembled by build_and_deploy.sh):
+ * Layout of the final executable (assembled by the packaging scripts):
  *     [stub ELF][zstd-compressed ustar payload][footer]
  *   footer = "BT3SELFX" + uint64le(len(stub)) + uint64le(len(payload)) + uint64le(seed)
- *   payload = tar("ps2EntryRunner" + "lib/...")
+ *   seed  = first 16 hex chars of the payload sha256 (changes => re-extract)
  *
- * On run: extract the payload to /tmp/bt3-sel-<seed>, then exec the runner with
- * LD_LIBRARY_PATH pointing at the extracted lib/ directory. The seed is used as
- * a deterministic temp-dir suffix so successive runs replace the previous copy.
+ * Two payload layouts:
+ *
+ * 1) game mode  -- payload = "ps2EntryRunner" + "lib/...". Extract to
+ *    /tmp/bt3-sel-<seed>, then exec the runner. savedata/, assets/ and data/
+ *    stay NEXT to this executable (PS2X_EXEDIR), written by the old launcher.
+ *
+ * 2) launcher mode -- payload = "Launcher" + "ps2EntryRunner" + "lib/..." +
+ *    "assets/...". Extract the whole run tree to a persistent, writable
+ *    per-user cache and exec the Qt Launcher from there. The Qt launcher and
+ *    the runner both resolve everything from applicationDirPath()/PS2X_EXEDIR,
+ *    so a read-only mount would break install/settings; the XDG cache is the
+ *    writable run root. data/ and savedata/ are symlinked to a stable
+ *    per-user dir so an update (new seed) keeps the installed game data.
+ *
+ * Usage: ./<self-extract>            (game mode boots the game)
+ *        ./<self-extract> --dir-echo (print the run dir and exit, for tests)
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -19,6 +32,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <errno.h>
+#include <dirent.h>
 
 #include "zstd.h"
 
@@ -157,6 +171,103 @@ static void extract_tar(const Buffer *tar, const char *dir)
     }
 }
 
+static void mkdir_p(const char *path)
+{
+    char tmp[1024];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++)
+    {
+        if (*p == '/')
+        {
+            *p = 0;
+            mkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0755);
+}
+
+/* Recursively remove a directory tree (only used on our own cache dirs). */
+static void rm_rf(const char *path)
+{
+    struct dirent *e;
+    DIR *d = opendir(path);
+    if (!d)
+    {
+        remove(path);
+        return;
+    }
+    while ((e = readdir(d)) != NULL)
+    {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+            continue;
+        char child[1024];
+        snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+        rm_rf(child);
+    }
+    closedir(d);
+    rmdir(path);
+}
+
+static void symlink_or_copy(const char *target, const char *link)
+{
+    struct stat st;
+    if (lstat(link, &st) == 0)
+    {
+        /* The tree copy lands a real savedata/ dir (already has the placeholder
+         * subdir); remove() only handles empty dirs, so wipe any leftover tree. */
+        if (S_ISDIR(st.st_mode))
+            rm_rf(link);
+        else
+            remove(link);
+    }
+    if (symlink(target, link) != 0)
+        die("cannot create stable-data symlink");
+}
+
+static void copy_file(const char *src, const char *dst)
+{
+    FILE *in = fopen(src, "rb");
+    if (!in)
+        return;
+    FILE *out = fopen(dst, "wb");
+    if (!out)
+    {
+        fclose(in);
+        return;
+    }
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+    {
+        if (fwrite(buf, 1, n, out) != n)
+            break;
+    }
+    fclose(out);
+    fclose(in);
+    chmod(dst, 0644);
+}
+
+static const char *seed_dir(char *buf, size_t len, uint64_t seed)
+{
+    /* Persistent, writable, per-user run root: $XDG_DATA_HOME/bt3-recomp/<seed>. */
+    const char *xdg = getenv("XDG_DATA_HOME");
+    const char *home = getenv("HOME");
+    if (xdg && *xdg)
+    {
+        snprintf(buf, len, "%s/bt3-recomp-%08llx", xdg, (unsigned long long)seed);
+    }
+    else if (home && *home)
+    {
+        snprintf(buf, len, "%s/.local/share/bt3-recomp-%08llx", home, (unsigned long long)seed);
+    }
+    else
+    {
+        snprintf(buf, len, "/tmp/bt3-recomp-%08llx", (unsigned long long)seed);
+    }
+    return buf;
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -201,22 +312,98 @@ int main(int argc, char **argv)
     Buffer tar = decompress(payload, ft.payloadLen);
     free(payload);
 
-    char dir[256];
-    snprintf(dir, sizeof(dir), "/tmp/bt3-sel-%08llx", (unsigned long long)ft.seed);
-    /* start clean: remove leftovers from a previous run, then recreate */
-    if (rmdir(dir) == 0)
-        ; /* empty */
-    else
-        system("rm -rf '/tmp/bt3-sel-'*");
-    snprintf(dir, sizeof(dir), "/tmp/bt3-sel-%08llx", (unsigned long long)ft.seed);
-    mkdir(dir, 0755);
+    char dir[1024];
+    seed_dir(dir, sizeof(dir), ft.seed);
+
+    /* Fresh extraction for this seed. */
+    rm_rf(dir);
+    mkdir_p(dir);
 
     extract_tar(&tar, dir);
     free(tar.data);
 
-    /* The runner resolves savedata/, assets/ and data/ from PS2X_EXEDIR (see
-     * getExecutableDirectory) -- those portable files stay NEXT to this
-     * launcher, while the payload is extracted to the temp cache below. */
+    char launcherPath[1024];
+    snprintf(launcherPath, sizeof(launcherPath), "%s/Launcher", dir);
+    int launcherMode = (access(launcherPath, F_OK) == 0);
+
+    if (launcherMode)
+    {
+        /* Stable per-user dirs (NO seed) for installed game data / settings, so
+         * an update keeps them. Base = <XDG_DATA_HOME|~/.local/share>. */
+        char compatBase[1024];
+        snprintf(compatBase, sizeof(compatBase), "%s", dir);
+        char *sep = strstr(compatBase, "/bt3-recomp-");
+        if (sep)
+            *sep = 0;
+        char compat[1024];
+        snprintf(compat, sizeof(compat), "%s/bt3-data", compatBase);
+        mkdir_p(compat);
+        char compatData[1024], compatSave[1024];
+        snprintf(compatData, sizeof(compatData), "%s/data", compat);
+        snprintf(compatSave, sizeof(compatSave), "%s/savedata", compat);
+        mkdir_p(compatData);
+        mkdir_p(compatSave);
+
+        /* The Qt launcher writes savedata/ + data/ next to itself; make it
+         * land in the stable dir so updates (new seed) keep the user data. */
+        char dataLink[1024], saveLink[1024];
+        snprintf(dataLink, sizeof(dataLink), "%s/data", dir);
+        snprintf(saveLink, sizeof(saveLink), "%s/savedata", dir);
+        symlink_or_copy(compatData, dataLink);
+        symlink_or_copy(compatSave, saveLink);
+
+        /* Desktop integration: a stable wrapper + .desktop entry so the game
+         * appears in the app menu with its icon, regardless of the seed dir. */
+        char compatApps[1024], compatIcons[1024];
+        snprintf(compatApps, sizeof(compatApps), "%s/applications", compatBase);
+        snprintf(compatIcons, sizeof(compatIcons), "%s/icons", compatBase);
+        mkdir_p(compatApps);
+        mkdir_p(compatIcons);
+
+        char wrapper[1024];
+        snprintf(wrapper, sizeof(wrapper), "%s/bt3-launcher.sh", compatBase);
+        FILE *w = fopen(wrapper, "w");
+        if (w)
+        {
+            fprintf(w,
+                    "#!/usr/bin/env bash\n"
+                    "set -euo pipefail\n"
+                    "cd '%s'\n"
+                    "export LD_LIBRARY_PATH=\"$PWD/lib\"\n"
+                    "export QT_PLUGIN_PATH=\"$PWD/lib/qt6/plugins\"\n"
+                    "export PS2X_EXEDIR=\"$PWD/data\"\n"
+                    "exec ./Launcher \"$@\"\n",
+                    dir);
+            fclose(w);
+            chmod(wrapper, 0755);
+        }
+
+        char iconFrom[1024], iconTo[1024];
+        snprintf(iconFrom, sizeof(iconFrom), "%s/assets/icon.png", dir);
+        snprintf(iconTo, sizeof(iconTo), "%s/bt3.png", compatIcons);
+        copy_file(iconFrom, iconTo);
+
+        char desk[1024];
+        snprintf(desk, sizeof(desk), "%s/Dragon-Ball-Budokai-Tenkaichi-3.desktop", compatApps);
+        FILE *d = fopen(desk, "w");
+        if (d)
+        {
+            fprintf(d,
+                    "[Desktop Entry]\n"
+                    "Type=Application\n"
+                    "Version=1.0\n"
+                    "Name=Dragon Ball Budokai Tenkaichi 3\n"
+                    "Comment=Play Dragon Ball Budokai Tenkaichi 3 (recompiled)\n"
+                    "Exec=%s\n"
+                    "Icon=%s\n"
+                    "Terminal=false\n"
+                    "Categories=Game;\n",
+                    wrapper, iconTo);
+            fclose(d);
+        }
+    }
+
+    /* Own directory: game mode uses it for the portable savedata/data/assets. */
     char launchDir[4096];
     snprintf(launchDir, sizeof(launchDir), "%s", own);
     char *slash = strrchr(launchDir, '/');
@@ -224,10 +411,24 @@ int main(int argc, char **argv)
         *slash = 0;
     else if (slash == launchDir)
         launchDir[1] = 0;
-    setenv("PS2X_EXEDIR", launchDir, 1);
 
+    setenv("PS2X_EXEDIR", dir, 1);
     chdir(dir);
     setenv("LD_LIBRARY_PATH", "lib", 1);
+
+    if (launcherMode)
+    {
+        setenv("QT_PLUGIN_PATH", "lib/qt6/plugins", 1);
+        if (access("./Launcher", X_OK) != 0)
+        {
+            snprintf(launchDir, sizeof(launchDir), "run dir: %s", dir);
+            die(launchDir);
+        }
+        char *launcherArgv[] = {"./Launcher", NULL};
+        execv("./Launcher", launcherArgv);
+        perror("execv Launcher");
+        return 1;
+    }
 
     /* The runner needs the guest boot ELF as argv[1]. */
     char bootElf[4096];

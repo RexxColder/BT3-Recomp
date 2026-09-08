@@ -12,6 +12,7 @@
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QPainter>
 #include <QProcess>
@@ -69,10 +70,25 @@ LauncherWindow::LauncherWindow(QWidget *parent)
         }
     }
 
+    // Release deploy: no SELFX next to us, but a plain ps2EntryRunner from the
+    // same stage tree. Boot it directly with data/SLUS_216.78 instead of
+    // embedding a duplicate self-extracting runner (saves ~130 MiB payload).
+    if (m_gameElf.isEmpty())
+    {
+        const QString runner = appDir.filePath(QStringLiteral("bt3-runner"));
+        if (QFile::exists(runner) && QFileInfo(runner).isExecutable())
+            m_plainRunner = true;
+    }
+
     // Background: deploy assets/background.png if present, else a DBZ gradient.
     const QString bg = appDir.filePath(QStringLiteral("assets/background.png"));
     if (QFile::exists(bg))
         m_bgPath = bg;
+
+    // Window/taskbar icon from the same asset tree.
+    const QIcon appIcon(appDir.filePath(QStringLiteral("assets/icon.png")));
+    if (!appIcon.isNull())
+        setWindowIcon(appIcon);
 
     // Bottom bar with PLAY (left) + SETTINGS (right).
     auto *bottomBar = new QWidget(this);
@@ -120,11 +136,6 @@ LauncherWindow::LauncherWindow(QWidget *parent)
     connect(m_play, &QPushButton::clicked, this, &LauncherWindow::onPlayClicked);
     connect(m_settings, &QPushButton::clicked, this, &LauncherWindow::onSettingsClicked);
 
-    // Show detected game / missing state in the bar.
-    if (m_gameElf.isEmpty())
-        m_hint->setText(QStringLiteral("  no self-extracting game ELF found in this folder"));
-    else
-        m_hint->setText(QStringLiteral("  %1").arg(QFileInfo(m_gameElf).fileName()));
     barLayout->insertWidget(1, m_hint, 1, Qt::AlignVCenter | Qt::AlignLeft);
 
     checkGameData();
@@ -153,7 +164,7 @@ QString LauncherWindow::findGameElf()
 
 void LauncherWindow::onPlayClicked()
 {
-    if (m_gameElf.isEmpty())
+    if (!m_plainRunner && m_gameElf.isEmpty())
     {
         m_gameElf = findGameElf();
         if (m_gameElf.isEmpty())
@@ -171,10 +182,28 @@ void LauncherWindow::onPlayClicked()
     // Save any pending settings so the game boots with the launcher's config.
     SettingsManager::instance().save();
 
-    // Launch detached: the game extracts + execs its own inner runner.
+    const QDir appDir(QApplication::applicationDirPath());
+
     QProcess *proc = new QProcess(nullptr);
-    proc->setWorkingDirectory(QFileInfo(m_gameElf).absolutePath());
-    proc->setProgram(m_gameElf);
+    proc->setWorkingDirectory(appDir.absolutePath());
+
+    if (m_plainRunner)
+    {
+        // Direct runner mode: point it at the extracted boot ELF and the
+        // bundled library tree; it is already the real ps2EntryRunner.
+        proc->setProgram(appDir.filePath(QStringLiteral("bt3-runner")));
+        const QString dataDir = appDir.filePath(QStringLiteral("data"));
+        proc->setArguments({QDir(dataDir).filePath(QStringLiteral("SLUS_216.78"))});
+        auto env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("PS2X_EXEDIR"), dataDir);
+        env.insert(QStringLiteral("LD_LIBRARY_PATH"), appDir.filePath(QStringLiteral("lib")));
+        proc->setProcessEnvironment(env);
+    }
+    else
+    {
+        // Launch detached: the game extracts + execs its own inner runner.
+        proc->setProgram(m_gameElf);
+    }
     proc->startDetached();
 
     // The launcher's job is done: close this window (the game runs on its own).
@@ -186,12 +215,32 @@ void LauncherWindow::checkGameData()
     m_gameDataValid = (DiscVerify::verifyInstalledData(m_dataDir) == DiscVerify::State::Valid);
 
     if (m_play)
-        m_play->setEnabled(!m_gameElf.isEmpty() && m_gameDataValid);
+        m_play->setEnabled((!m_gameElf.isEmpty() || m_plainRunner) && m_gameDataValid);
 
-    if (!m_gameElf.isEmpty() && !m_gameDataValid)
+    updateHint();
+}
+
+void LauncherWindow::updateHint()
+{
+    QString text;
+    if (!m_gameDataValid)
     {
-        m_hint->setText(QStringLiteral("  game data missing or corrupted - reinstall required"));
+        text = QStringLiteral("  game data missing or corrupted - reinstall required");
     }
+    else if (!m_gameElf.isEmpty())
+    {
+        text = QStringLiteral("  ready to play: %1").arg(QFileInfo(m_gameElf).fileName());
+    }
+    else if (m_plainRunner)
+    {
+        text = QStringLiteral("  ready to play (direct runner)");
+    }
+    else
+    {
+        text = QStringLiteral("  no self-extracting game ELF found in this folder");
+    }
+    if (m_hint)
+        m_hint->setText(text);
 }
 
 bool LauncherWindow::openInstallWizard()
