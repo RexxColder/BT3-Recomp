@@ -392,6 +392,7 @@ public:
     static bool decPoolWants(uint32_t psm);              // [decpool] this format's decode goes to the pool
     void decPoolPost(std::unique_ptr<DecPoolJob> job);   // [decpool] hand a record-time snapshot to the pool
     void decPoolDrain();                                  // [decpool] wait until every posted decode has landed in the cache
+    bool pageMayNeedBarrier(uint32_t page);              // [recpool] would a textured read of this page post a barrier? (dirty or flush pending)
     void recordCmd(const DrawCmd &cmd);
     // [drawbatch] ---- plain-class triangle batching (guest thread only) ----
     // Batching lives entirely in the guest-owned staging buffer (PS2X_RECSTAGE > 0, the default):
