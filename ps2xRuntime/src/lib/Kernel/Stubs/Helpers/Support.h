@@ -7,6 +7,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <vector>
 extern "C" void ps2xGsDisplayFlipHook(unsigned long long dispfb);   // [displatch] ps2_gs_gpu.cpp
 
 namespace
@@ -14,13 +18,41 @@ namespace
     constexpr uint32_t kCdSectorSize = 2048;
     constexpr uint32_t kCdPseudoLbnStart = 0x00100000;
 
+    struct CdAfTable;
+
     struct CdFileEntry
     {
         std::filesystem::path hostPath;
         uint32_t sizeBytes = 0;
         uint32_t baseLbn = 0;
         uint32_t sectors = 0;
+        std::shared_ptr<CdAfTable> afsFolder;   // non-null when served from extracted folders
     };
+
+    // One AFS slot (entry id == index into .slots). slotBytes is the physical disk
+    // slice [offset, offset+slotBytes): the raw entry bytes plus any padding that was
+    // on the disc, preserved verbatim (idx v2).
+    struct CdAfSlot
+    {
+        uint32_t offset = 0;
+        uint32_t size = 0;        // logical (declared) entry size
+        uint32_t slotBytes = 0;   // physical slice size
+    };
+
+    // Folder-backed AFS: the original single .AFS blob is presented as a virtual
+    // file assembled from an extracted folder (PZS3US<N>/%06zu) plus the verbatim
+    // index blob [0, indexBytes). Loaded from the <base>.idx sidecar written by
+    // tools/afs_extract.
+    struct CdAfTable
+    {
+        std::filesystem::path folder;
+        std::vector<CdAfSlot> slots;
+        uint32_t afsBytes = 0;
+        uint32_t indexBytes = 0;
+        std::vector<uint8_t> indexBlob;
+        bool valid = false;
+    };
+
 
     std::unordered_map<std::string, CdFileEntry> g_cdFilesByKey;
     std::unordered_map<std::string, std::filesystem::path> g_cdLeafIndex;
@@ -346,6 +378,199 @@ namespace
         }
     }
 
+    std::shared_ptr<CdAfTable> loadFolderTable(const std::filesystem::path &idxPath,
+                                               const std::filesystem::path &folderPath)
+    {
+        auto table = std::make_shared<CdAfTable>();
+        std::ifstream idx(idxPath, std::ios::binary);
+        if (!idx.is_open())
+        {
+            return nullptr;
+        }
+
+        char magic[8] = {};
+        idx.read(magic, 8);
+        if (std::memcmp(magic, "DBZAFS01", 8) != 0)
+        {
+            return nullptr;
+        }
+
+        uint32_t version = 0, count = 0, afsBytes = 0, indexBytes = 0;
+        auto readU32 = [&idx](uint32_t &v) { idx.read(reinterpret_cast<char *>(&v), 4); return !idx.fail(); };
+        if (!readU32(version) || !readU32(count) || !readU32(afsBytes) || !readU32(indexBytes))
+        {
+            return nullptr;
+        }
+        if (version != 2u || indexBytes > afsBytes)
+        {
+            return nullptr;
+        }
+
+        table->slots.reserve(count);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            uint32_t off = 0, sz = 0, slotBytes = 0, type = 0;
+            if (!readU32(off) || !readU32(sz) || !readU32(slotBytes) || !readU32(type))
+            {
+                return nullptr;
+            }
+            if (off < indexBytes || sz == 0u || slotBytes < sz || off + slotBytes > afsBytes ||
+                off % kCdSectorSize != 0)
+            {
+                return nullptr;
+            }
+            if (!table->slots.empty())
+            {
+                const CdAfSlot &prev = table->slots.back();
+                if (off < prev.offset + prev.slotBytes)   // slots must be strictly contiguous
+                {
+                    return nullptr;
+                }
+            }
+            table->slots.push_back({off, sz, slotBytes});
+        }
+
+        table->indexBlob.resize(indexBytes);
+        if (indexBytes > 0)
+        {
+            idx.read(reinterpret_cast<char *>(table->indexBlob.data()), indexBytes);
+            if (idx.gcount() != static_cast<std::streamsize>(indexBytes))
+            {
+                return nullptr;
+            }
+            if (std::memcmp(table->indexBlob.data(), "AFS\0", 4) != 0)
+            {
+                return nullptr;
+            }
+        }
+
+        table->folder = folderPath;
+        table->afsBytes = afsBytes;
+        table->indexBytes = indexBytes;
+        table->valid = true;
+        return table;
+    }
+
+    bool readFolderRange(const CdFileEntry &entry, uint64_t relOffset, uint8_t *dst, size_t byteCount)
+    {
+        const CdAfTable &table = *entry.afsFolder;
+        if (!dst)
+        {
+            g_lastCdError = -1;
+            return false;
+        }
+        if (byteCount == 0)
+        {
+            g_lastCdError = 0;
+            return true;
+        }
+
+        {
+            const std::vector<CdAfSlot> &slots = table.slots;
+            auto it = std::upper_bound(slots.begin(), slots.end(), relOffset,
+                                       [](uint64_t p, const CdAfSlot &s) { return p < s.offset; });
+            if (it != slots.begin())
+            {
+                const uint64_t id = static_cast<uint64_t>((it - 1) - slots.begin());
+                char nm[32];
+                std::snprintf(nm, sizeof(nm), "%06llu", static_cast<unsigned long long>(id));
+                const CdAfSlot &slot = *(it - 1);
+                std::printf("[slot-read] \"%s\" off=%llu n=%zu\n",
+                            (table.folder / nm).string().c_str(),
+                            static_cast<unsigned long long>(relOffset - slot.offset), byteCount);
+            }
+        }
+
+        std::memset(dst, 0, byteCount);
+        const std::vector<CdAfSlot> &slots = table.slots;
+        size_t done = 0;
+        while (done < byteCount)
+        {
+            const uint64_t pos = relOffset + done;
+            if (pos < table.indexBytes)
+            {
+                const size_t n = static_cast<size_t>(std::min<uint64_t>(table.indexBytes - pos, byteCount - done));
+                std::memcpy(dst + done, table.indexBlob.data() + static_cast<size_t>(pos), n);
+                done += n;
+                continue;
+            }
+            if (pos >= table.afsBytes)
+            {
+                std::memset(dst + done, 0, byteCount - done);   // read past EOF -> zeros
+                done = byteCount;
+                break;
+            }
+
+            auto it = std::upper_bound(slots.begin(), slots.end(), pos,
+                                       [](uint64_t p, const CdAfSlot &s) { return p < s.offset; });
+            if (it == slots.begin())
+            {
+                // Before the first data offset: virtual padding, keep zeros.
+                std::memset(dst + done, 0, byteCount - done);
+                done = byteCount;
+                break;
+            }
+
+            const CdAfSlot &slot = *(it - 1);
+            const uint64_t slotEnd = slot.offset + static_cast<uint64_t>(slot.slotBytes);
+            if (pos >= slotEnd)
+            {
+                // Between physical slots (should not occur for contiguous archives),
+                // zero-fill until the next slot or EOF.
+                uint64_t zeroTo = table.afsBytes;
+                if (it != slots.end())
+                {
+                    zeroTo = slots[static_cast<size_t>(it - slots.begin())].offset;
+                }
+                const size_t n = static_cast<size_t>(std::min<uint64_t>(zeroTo - pos, byteCount - done));
+                std::memset(dst + done, 0, n);
+                done += n;
+                continue;
+            }
+
+            // slot files carry the full physical slice [offset, offset+slotBytes)
+            // verbatim, padding included, so every byte is read straight from disk.
+            const uint64_t inFile = pos - slot.offset;
+            const size_t room = static_cast<size_t>(std::min<uint64_t>(slotEnd - pos, byteCount - done));
+            const size_t fromFile = room;
+
+            bool ok = true;
+            if (fromFile > 0)
+            {
+                char name[32];
+                const uint64_t id = static_cast<uint64_t>(it - 1 - slots.begin());
+                std::snprintf(name, sizeof(name), "%06llu", static_cast<unsigned long long>(id));
+                const std::string filePath = (table.folder / name).string();
+                std::cerr << "\"" << filePath << "\"" << std::endl;
+                std::ifstream file(table.folder / name, std::ios::binary);
+                if (file.is_open())
+                {
+                    file.seekg(static_cast<std::streamoff>(inFile), std::ios::beg);
+                    file.read(reinterpret_cast<char *>(dst + done), static_cast<std::streamsize>(fromFile));
+                    const std::streamsize got = file.gcount();
+                    if (got < static_cast<std::streamsize>(fromFile))
+                    {
+                        std::memset(dst + done + static_cast<size_t>(got), 0,
+                                    fromFile - static_cast<size_t>(got));
+                    }
+                    file.close();
+                }
+                else
+                {
+                    ok = false;
+                }
+            }
+            done += room;   // 'room' covers the copied physical slice bytes
+            if (!ok)
+            {
+                g_lastCdError = -1;
+                return false;
+            }
+        }
+
+        g_lastCdError = 0;
+        return true;
+    }
     bool registerCdFile(const std::string &ps2Path, CdFileEntry &entryOut)
     {
         const std::string key = cdPathKey(ps2Path);
@@ -365,8 +590,31 @@ namespace
 
         const std::filesystem::path root = getCdRootPath();
         std::filesystem::path path = cdHostPath(ps2Path);
+
+        // Serve PZS3US*.AFS as a virtual byte-identical blob assembled from the
+        // extracted folder (PZS3US1/ + PZS3US1.idx sidecar). Detected next to the
+        // host path: <stem>.idx + directory <stem>/. Runs BEFORE the host-file
+        // existence gate so it also keeps working when the .AFS itself has been
+        // deleted (the whole point of folder-backing).
+        std::shared_ptr<CdAfTable> afTable;
+        if (key.size() > 4 && key.compare(key.size() - 4, 4, ".afs") == 0)
+        {
+            const std::filesystem::path stem = path.stem();
+            const std::filesystem::path idxCandidate = path.parent_path() / (stem.string() + ".idx");
+            const std::filesystem::path folderCandidate = path.parent_path() / stem;
+            std::error_code e1, e2;
+            if (std::filesystem::exists(idxCandidate, e1) &&
+                std::filesystem::is_directory(folderCandidate, e2))
+            {
+                afTable = loadFolderTable(idxCandidate, folderCandidate);
+            }
+        }
+
         std::error_code ec;
-        if (!std::filesystem::exists(path, ec) || ec || !std::filesystem::is_regular_file(path, ec))
+        uint64_t sizeBytes = 0;
+        if (!afTable)
+        {
+            if (!std::filesystem::exists(path, ec) || ec || !std::filesystem::is_regular_file(path, ec))
         {
             const std::filesystem::path relative(normalizeCdPathNoPrefix(ps2Path));
             std::filesystem::path resolvedCasePath;
@@ -403,18 +651,24 @@ namespace
             }
         }
 
-        const uint64_t sizeBytes = std::filesystem::file_size(path, ec);
-        if (ec)
-        {
-            g_lastCdError = -1;
-            return false;
+        sizeBytes = std::filesystem::file_size(path, ec);
+            if (ec)
+            {
+                g_lastCdError = -1;
+                return false;
+            }
         }
+
+        const uint32_t effectiveSize = afTable
+            ? std::min<uint64_t>(afTable->afsBytes, 0xFFFFFFFFu)
+            : static_cast<uint32_t>(std::min<uint64_t>(sizeBytes, 0xFFFFFFFFu));
 
         CdFileEntry entry;
         entry.hostPath = path;
-        entry.sizeBytes = static_cast<uint32_t>(std::min<uint64_t>(sizeBytes, 0xFFFFFFFFu));
+        entry.sizeBytes = effectiveSize;
         entry.baseLbn = g_nextPseudoLbn;
-        entry.sectors = sectorsForBytes(sizeBytes);
+        entry.sectors = sectorsForBytes(effectiveSize);
+        entry.afsFolder = afTable;
 
         g_nextPseudoLbn += entry.sectors + 1;
         g_cdFilesByKey.emplace(key, entry);
@@ -517,6 +771,10 @@ namespace
 
             const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
             const uint64_t offset = relativeLbn * kCdSectorSize;
+            if (entry.afsFolder)
+            {
+                return readFolderRange(entry, offset, dst, byteCount);
+            }
             return readHostRange(entry.hostPath, offset, dst, byteCount);
         }
 

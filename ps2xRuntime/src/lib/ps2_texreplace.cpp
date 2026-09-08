@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 #include "raylib.h"
+extern "C" const char *ps2xExeDirC();   // [mergefix] main.cpp
 
 namespace ps2tex
 {
@@ -145,7 +146,16 @@ namespace
         // (bt3_settings.ini) already resolve CWD-relative, so this sits beside them.
         // PS2X_TEXREPLACE overrides for anyone keeping packs elsewhere.
         const char *env = std::getenv("PS2X_TEXREPLACE");
-        const std::string root = (env && env[0]) ? std::string(env) : std::string("textures");
+        std::string root = (env && env[0]) ? std::string(env) : std::string("textures");
+        {   // [mergefix] the launcher/deploy runs with a CWD that has no textures/: fall back to the exe's folder so the
+            // Texture Replacement switch is not greyed out for a deploy install
+            std::error_code ec0;
+            if (!(env && env[0]) && !fs::is_directory(root, ec0))
+            {
+                const char *xd = ps2xExeDirC();
+                if (xd && xd[0]) { const std::string alt = (fs::path(xd) / "textures").string(); if (fs::is_directory(alt, ec0)) root = alt; }
+            }
+        }
         if (!(env && env[0]))
         {
             fs::create_directories(root, ec);   // harmless if it already exists

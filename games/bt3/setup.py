@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
-"""Build Dragon Ball Z: Budokai Tenkaichi 3 (SLUS_216.78, USA) from your own disc image.
+"""Build (+ optional deploy) Dragon Ball Z: Budokai Tenkaichi 3 (SLUS_216.78, USA).
 
-    python3 games/bt3/setup.py <path-to-BT3-USA.iso | path-to-SLUS_216.78> [jobs]
+    python3 games/bt3/setup.py <iso|elf> [--jobs N] [--deploy OUT] [--skip-setup]
 
-Cross-platform (Linux tested; Windows experimental). The game's code is generated
+Cross-platform (Linux primary; Windows experimental). The game's code is generated
 locally from YOUR copy of the game — this repository ships no game code or assets.
 Steps: extract/verify the game files, build the recompiler, generate the runner
 sources, generate the overlay module, apply patches, build the runner.
+
+  --deploy OUT   after a successful build, copy the playable tree (game data,
+                 settings, assets, fonts, and the runner) into OUT. On Windows the
+                 runtime DLLs are copied too. The Linux self-extracting launcher is
+                 created by build_and_deploy.sh, which calls this script with
+                 --deploy so the built runner ends up in place.
+  --skip-setup   skip steps 1-6 (ISO/ELF extraction, recompile, patches). Rebuild the
+                 runner from the already-generated sources and then deploy. Speeds up
+                 re-deploys when nothing in the pipeline changed.
 """
+import argparse
 import hashlib
 import os
 import shutil
@@ -145,20 +155,100 @@ def cmake_build(target: str, jobs: str) -> None:
     run(cmd)
 
 
+def copytree_overlay(src: Path, dst: Path) -> None:
+    """copy_tree-like that overwrites instead of failing on existing dirs."""
+    if src.is_dir():
+        dst.mkdir(parents=True, exist_ok=True)
+        for child in src.iterdir():
+            copytree_overlay(child, dst / child.name)
+    elif src.is_file():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def deploy_tree(runner: Path, out: Path) -> None:
+    """Assemble the portable playable tree in OUT.
+
+    layout: OUT/data/ (game data extracted from the ISO), OUT/savedata/
+    (bt3_settings.ini; existing user saves are preserved), OUT/assets/ (fonts).
+
+    Windows additionally copies the runtime DLLs next to the runner. The Linux
+    build_and_deploy.sh replaces `runner` with the self-extracting payload ELF.
+    """
+    print(f"== assembling deploy tree in {out}")
+    work = HERE / "work"
+    out.mkdir(parents=True, exist_ok=True)
+
+    # game data: BIN/ DATA/ IRX/ SYSTEM.CNF + the boot ELF
+    data_dst = out / "data"
+    for name in ("BIN", "DATA", "IRX", "SYSTEM.CNF"):
+        src = work / name
+        if src.exists():
+            copytree_overlay(src, data_dst / name)
+    boot = data_dst / "SLUS_216.78"
+    if work.joinpath("SLUS_216.78").exists():
+        boot.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(work / "SLUS_216.78", boot)
+
+    # settings: default bt3_settings.ini only if none deployed yet (user keeps their saves)
+    save_dst = out / "savedata"
+    save_dst.mkdir(parents=True, exist_ok=True)
+    cfg_src = runner.parent / "bt3_settings.ini"
+    cfg_dst = save_dst / "bt3_settings.ini"
+    if cfg_src.exists() and not cfg_dst.exists():
+        shutil.copy2(cfg_src, cfg_dst)
+        print(f"  copied default settings -> {cfg_dst}")
+
+    # fonts + overlay assets
+    for a in ("assets",):
+        src = runner.parent / a
+        if src.exists():
+            copytree_overlay(src, out / a)
+
+    # runtime DLLs (Windows). The runner itself gets copied by build_and_deploy.sh
+    # on Linux; here we place it next to the data so the tree is self-contained.
+    if IS_WINDOWS:
+        for p in runner.parent.glob("*.dll"):
+            shutil.copy2(p, out / p.name)
+    else:
+        shutil.copy2(runner, out / runner.name)
+    shutil.copymode(runner, out / runner.name)
+    print(f"  runner -> {out / runner.name}")
+    print(f"Deploy tree ready: {out}")
+
+
 def main() -> None:
-    if len(sys.argv) < 2:
-        print(__doc__, file=sys.stderr)
-        sys.exit(2)
-    src = Path(sys.argv[1]).resolve()
-    jobs = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_JOBS
-    if not src.exists():
-        die(f"{src} does not exist")
-    WORK.mkdir(parents=True, exist_ok=True)
-    elf = WORK / "SLUS_216.78"
+    ap = argparse.ArgumentParser(
+        description="Build (and optionally deploy) Dragon Ball Z: Budokai Tenkaichi 3.")
+    ap.add_argument("src", nargs="?", metavar="<iso|elf>",
+                    help="BT3 USA ISO or bare SLUS_216.78 ELF (not needed with --skip-setup)")
+    ap.add_argument("--jobs", default=DEFAULT_JOBS, metavar="N",
+                    help=f"parallel jobs for the ps2EntryRunner build (default {DEFAULT_JOBS})")
+    ap.add_argument("--deploy", metavar="OUT",
+                    help="after the build, copy the playable tree into OUT")
+    ap.add_argument("--skip-setup", action="store_true",
+                    help="skip ISO/recompile/patches; only rebuild the runner (+deploy)")
+    args = ap.parse_args()
+
+    jobs = str(args.jobs)
+    if args.skip_setup:
+        if not (WORK / "SLUS_216.78").is_file():
+            die("--skip-setup requires an existing games/bt3/work/ (no SLUS_216.78 found)")
+        src = None
+        elf = WORK / "SLUS_216.78"
+    else:
+        if not args.src:
+            ap.print_usage(sys.stderr)
+            die("missing the BT3 ISO or SLUS_216.78 ELF path")
+        src = Path(args.src).resolve()
+        if not src.exists():
+            die(f"{src} does not exist")
+        WORK.mkdir(parents=True, exist_ok=True)
+        elf = WORK / "SLUS_216.78"
 
     # 1. Obtain the game files. The runtime reads loose files (BIN/DBZP.BIN, IRX/,
     #    DATA/) from the directory the ELF lives in, so extract the WHOLE ISO tree.
-    if src.suffix.lower() == ".iso":
+    if not args.skip_setup and src.suffix.lower() == ".iso":
         kind, exe = find_extractor()
         print(f"== extracting ISO contents (~4 GB) with {exe}")
         if kind == "tar":
@@ -168,69 +258,74 @@ def main() -> None:
         if not elf.is_file():
             die("SLUS_216.78 not found in ISO (is this the USA release?)")
         make_writable(WORK)
-    else:
+    elif not args.skip_setup:
         shutil.copyfile(src, elf)
         print("NOTE: you passed a bare ELF. The game also needs the ISO's BIN/, IRX/")
         print(f"      and DATA/ directories next to it in {WORK}.")
 
-    # 2. Verify it is the expected USA ELF.
-    got = sha256_of(elf)
-    if got != ELF_SHA256:
-        print(f"ERROR: ELF sha256 mismatch.\n  expected: {ELF_SHA256}\n  got:      {got}")
-        print("Only the USA release (SLUS-21678) is supported. Set PS2X_SETUP_FORCE=1 to continue anyway.")
-        if os.environ.get("PS2X_SETUP_FORCE") != "1":
-            sys.exit(1)
+    if args.skip_setup:
+        print("--skip-setup: reusing existing games/bt3/work/ and generated sources")
+    else:
+        # 2. Verify it is the expected USA ELF.
+        got = sha256_of(elf)
+        if got != ELF_SHA256:
+            print(f"ERROR: ELF sha256 mismatch.\n  expected: {ELF_SHA256}\n  got:      {got}")
+            print("Only the USA release (SLUS-21678) is supported. Set PS2X_SETUP_FORCE=1 to continue anyway.")
+            if os.environ.get("PS2X_SETUP_FORCE") != "1":
+                sys.exit(1)
 
     # 3. Configure + build the recompiler. Configure only once: the globs use
     #    CONFIGURE_DEPENDS, so later builds re-run cmake by themselves when the
     #    source set changes — and an unnecessary reconfigure rewrites the MSVC
     #    project files, which makes MSBuild rebuild everything from scratch.
-    print("== building recompiler")
-    if not configured():
-        run(["cmake", "-S", ROOT, "-B", BUILD] + cmake_configure_extra())
-    cmake_build("ps2_recomp", str(os.cpu_count() or 4))
-    recomp = find_binary("ps2_recomp")
+    if not args.skip_setup:
+        print("== building recompiler")
+        if not configured():
+            run(["cmake", "-S", ROOT, "-B", BUILD] + cmake_configure_extra())
+        cmake_build("ps2_recomp", str(os.cpu_count() or 4))
+        recomp = find_binary("ps2_recomp")
 
-    # 4. Generate the runner sources. The function map first gets its oversized
-    #    Ghidra-truncation rows deduplicated and split into compiler-friendly
-    #    chunks (see split_functions.py) — without this, single generated
-    #    functions reach ~100K lines and exhaust MSVC's heap.
-    print("== generating runner sources")
-    sys.path.insert(0, str(HERE))
-    from split_functions import split_csv
-    split = WORK / "functions_split.csv"
-    split_csv(elf, HERE / "functions.csv", split)
-    out = WORK / "output"
-    if out.exists():
-        shutil.rmtree(out)
-    cfg_text = (HERE / "config.toml.in").read_text()
-    cfg_text = (cfg_text.replace("@ELF@", elf.as_posix())
-                        .replace("@CSV@", split.as_posix())
-                        .replace("@OUT@", out.as_posix() + "/"))
-    (WORK / "config.toml").write_text(cfg_text)
-    run([recomp, WORK / "config.toml"])
+        # 4. Generate the runner sources. The function map first gets its oversized
+        #    Ghidra-truncation rows deduplicated and split into compiler-friendly
+        #    chunks (see split_functions.py) — without this, single generated
+        #    functions reach ~100K lines and exhaust MSVC's heap.
+        print("== generating runner sources")
+        sys.path.insert(0, str(HERE))
+        from split_functions import split_csv
+        split = WORK / "functions_split.csv"
+        split_csv(elf, HERE / "functions.csv", split)
+        out = WORK / "output"
+        if out.exists():
+            shutil.rmtree(out)
+        cfg_text = (HERE / "config.toml.in").read_text()
+        cfg_text = (cfg_text.replace("@ELF@", elf.as_posix())
+                            .replace("@CSV@", split.as_posix())
+                            .replace("@OUT@", out.as_posix() + "/"))
+        (WORK / "config.toml").write_text(cfg_text)
+        run([recomp, WORK / "config.toml"])
 
-    # 5. Post-generation patches + the overlay module from DBZP.BIN.
-    run([sys.executable, HERE / "apply_patches.py", out])
-    print("== generating overlay sources from BIN/DBZP.BIN")
-    run([sys.executable, HERE / "gen_overlay.py",
-         "--recomp", recomp, "--dbzp", WORK / "BIN" / "DBZP.BIN",
-         "--work", WORK / "overlay", "--runtime", ROOT / "ps2xRuntime"])
-    run([sys.executable, HERE / "apply_overlay_patches.py", ROOT / "ps2xRuntime"])
+        # 5. Post-generation patches + the overlay module from DBZP.BIN.
+        run([sys.executable, HERE / "apply_patches.py", out])
+        print("== generating overlay sources from BIN/DBZP.BIN")
+        run([sys.executable, HERE / "gen_overlay.py",
+             "--recomp", recomp, "--dbzp", WORK / "BIN" / "DBZP.BIN",
+             "--work", WORK / "overlay", "--runtime", ROOT / "ps2xRuntime"])
+        run([sys.executable, HERE / "apply_overlay_patches.py", ROOT / "ps2xRuntime"])
 
-    # 6. Install into the runtime tree.
-    print("== installing runner sources")
-    rt = ROOT / "ps2xRuntime"
-    sync_tree(out, rt / "src" / "runner",
-              exclude=("ps2_recompiled_functions.h", "ps2_recompiled_stubs.h"))
-    for h in ("ps2_recompiled_functions.h", "ps2_recompiled_stubs.h"):
-        shutil.copyfile(out / h, rt / "include" / h)
+        # 6. Install into the runtime tree.
+        print("== installing runner sources")
+        rt = ROOT / "ps2xRuntime"
+        sync_tree(out, rt / "src" / "runner",
+                  exclude=("ps2_recompiled_functions.h", "ps2_recompiled_stubs.h"))
+        for h in ("ps2_recompiled_functions.h", "ps2_recompiled_stubs.h"):
+            shutil.copyfile(out / h, rt / "include" / h)
 
     # 7. Build the game. CONFIGURE_DEPENDS re-globs on Makefile generators, but the
     #    Visual Studio generator does not reliably pick up a changed source SET within
     #    the same build invocation (fresh Windows builds linked without main/the
     #    function tables). Reconfigure explicitly when the runner/overlay file set
     #    changed since the last configure; content-only changes still skip it.
+    rt = ROOT / "ps2xRuntime"
     cache = BUILD / "CMakeCache.txt"
     need_cfg = not configured()
     if not need_cfg:
@@ -244,6 +339,10 @@ def main() -> None:
     print(f"== building ps2EntryRunner (-j{jobs}, this takes a while)")
     cmake_build("ps2EntryRunner", jobs)
     runner = find_binary("ps2EntryRunner")
+
+    if args.deploy:
+        deploy_tree(runner, OUT := Path(args.deploy).resolve())
+        return
 
     env_line = ("set PS2X_CD_IMAGE=<path to your BT3 ISO>& " if IS_WINDOWS else
                 'env PS2X_CD_IMAGE="<path to your BT3 ISO>" ')

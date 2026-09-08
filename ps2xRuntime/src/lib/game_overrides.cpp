@@ -4787,7 +4787,11 @@ namespace
         // (boundary fixed) 0x0026CBC8
         // Virtual controller: connected + ready + per-player input, consistently
         // across all sceDbc pad accessors (see notes above).
-        ps2_stubs::padConfigInit(runtime.getIoPaths().elfDirectory.string());
+        // [deploy] Pads live in <deploy>/savedata/pad_pN.conf while the ELF sits
+        // in <deploy>/data, so anchor to the deploy root (same convention as
+        // mcRoot below in configureIoPathsFromElf) or the launcher's saves
+        // would never be found.
+        ps2_stubs::padConfigInit(runtime.getIoPaths().elfDirectory.parent_path().string());
         runtime.replaceFunction(0x00295160u, &bt3PadConnect);
         runtime.replaceFunction(0x00296160u, &bt3PadStatus);
         runtime.replaceFunction(0x00296090u, &bt3PadRead);
