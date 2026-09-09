@@ -284,7 +284,7 @@ struct State
     // rewriting the X of HUD vertices inside the GIF packets before they reach the backend.
     struct WsHud
     {
-        struct Ctx { uint32_t fbp = 0, fbw = 0, fpsm = 0, zte = 0, ztst = 0; float ofx = 0.f, ofy = 0.f; uint64_t test = 0, frame = 0, alpha = 0, tex0 = 0, scissor = 0; size_t tex0Off = ~size_t(0); };
+        struct Ctx { uint32_t fbp = 0, fbw = 0, fpsm = 0, zte = 0, ztst = 0; float ofx = 0.f, ofy = 0.f; uint64_t test = 0, frame = 0, alpha = 0, tex0 = 0, scissor = 0; size_t tex0Off = ~size_t(0), alphaOff = ~size_t(0); };
         Ctx ctx[2];
         uint64_t primRaw = 0, prmode = 0; bool prmodeCont = true;
         struct V { size_t off = 0; bool packed = false, mapped = false; uint16_t x = 0, y = 0; uint32_t z = 0; };
@@ -294,7 +294,8 @@ struct State
         // [pgsink] RGBAQ writes since the last kick (packet offsets; packed = 16-byte qword, else 8-byte reg), for the darkener
         struct RgbaW { size_t off; bool packed; }; RgbaW rgba[8]; int rgbaN = 0;
         RgbaW uv[8]; int uvN = 0;   // [pgsink] UV writes since the last kick (the edge-detect shift rewrite)
-        uint64_t inkDropped = 0, inkScaled = 0, inkShifted = 0, shadowDropped = 0, dofDropped = 0, maskNeutralized = 0;
+        uint64_t lastRgbaq = 0x3f80000080808080ull;   // last RGBAQ value seen (A+D / REGLIST form), for register restores
+        uint64_t inkDropped = 0, inkScaled = 0, inkShifted = 0, shadowDropped = 0, dofDropped = 0, maskNeutralized = 0, bloomEdits = 0, bloomRestores = 0;
     } wshud;
     std::vector<uint8_t> wsBuf;   // [pgswshud] rebuilt packet when quads are subdivided at layout breakpoints
     uint32_t ssaa = 1;                     // super-sampling factor the backend was created with (1/2/4/8/16)
@@ -531,6 +532,45 @@ static void wsHudKickLocked(State &s, uint8_t *data, float inv)
         }
     }
     h.uvN = 0;
+    {   // [pgsfx] DoF off, mode 3 (BLOOM): rebuild the blur buffer from bright pixels only, so the composite has nothing
+        // blurred to drag along with an aura or a dash trail. (a) the buffer's clear sprites paint the threshold grey,
+        // (b) the downsample sprites subtract the destination ((Cs - Cd) * FIX/128, FIX = 0x80 -> scene - grey, clamped),
+        // (c) the composite becomes additive ((Cs - 0) * As + Cd), (d) the depth-mask sprites write "far" everywhere
+        // (TCC := 0, vertex alpha 0) so the composite passes everywhere. PS2X_PGS_BLOOMTHR = the grey (default 0x90).
+        static const int s_dofMode4 = [](){ const char *e = std::getenv("PS2X_PGS_DOFMODE"); return e && e[0] ? std::atoi(e) : 2; }();
+        static const uint8_t s_thr = [](){ const char *e = std::getenv("PS2X_PGS_BLOOMTHR"); const int v = e && e[0] ? int(std::strtol(e, nullptr, 0)) : 0x90; return uint8_t(v < 0 ? 0 : v > 255 ? 255 : v); }();
+        if (s_dofMode4 == 3 && !GsGpuRenderer::dofBlurEnabled() && isSprite && h.qn >= 2)
+        {
+            const bool tmeB = ((attr >> 4) & 1u) != 0, abeB = ((attr >> 6) & 1u) != 0;
+            const uint32_t tpsmB = uint32_t((c.tex0 >> 20) & 0x3Fu), ttbp0 = uint32_t(c.tex0 & 0x3FFFu), ttw = uint32_t((c.tex0 >> 26) & 0xFu), tth = uint32_t((c.tex0 >> 30) & 0xFu), ttbw = uint32_t((c.tex0 >> 14) & 0x3Fu);
+            const bool blurBuf = c.fbp == 336u && c.fbw == 4u && c.fpsm == 0u;
+            // (a) clear of the 256x256 buffer: untextured, no blend, into fbp 336 fbw 4
+            if (blurBuf && !tmeB && !abeB)
+            {
+                for (int i = 0; i < h.rgbaN; i++) { uint8_t *q = data + h.rgba[i].off; if (h.rgba[i].packed) { q[0] = s_thr; q[4] = s_thr; q[8] = s_thr; } else { q[0] = s_thr; q[1] = s_thr; q[2] = s_thr; } }
+                h.bloomEdits++;
+            }
+            // (b) downsample of the scene: textured from a scene buffer as CT32 512x512, blended, into the blur buffer
+            else if (blurBuf && tmeB && abeB && tpsmB == 0u && ttw == 9u && tth == 9u && (ttbp0 == 0u || ttbp0 == 3584u))
+            {
+                if (c.alphaOff != ~size_t(0) && c.alpha != 0x80000000A4ull) { const uint64_t a = 0x80000000A4ull; std::memcpy(data + c.alphaOff, &a, 8); h.ctx[ci].alpha = a; }
+                h.bloomEdits++;
+            }
+            // (c) the composite: CT24 256x256 read of block 10752 with a destination-alpha test into a scene buffer
+            else if ((c.fbp == 0u || c.fbp == 112u) && (c.fpsm == 0u || c.fpsm == 1u) && tmeB && abeB && tpsmB == 1u && ttbp0 == 10752u && ttbw == 4u && ttw == 8u && tth == 8u && ((c.test >> 14) & 1u))
+            {
+                if (c.alphaOff != ~size_t(0) && (c.alpha & 0xFFu) != 0x48u) { const uint64_t a = (c.alpha & ~0xFFull) | 0x48ull; std::memcpy(data + c.alphaOff, &a, 8); h.ctx[ci].alpha = a; }
+                h.bloomEdits++;
+            }
+            // (d) the depth-mask sprites: write "far" everywhere
+            else if (tmeB && (c.fpsm == 2u || c.fpsm == 10u) && (c.fbp == 0u || c.fbp == 112u) && uint32_t(c.frame >> 32) == 0x3fffu && (tpsmB == 50u || tpsmB == 58u))
+            {
+                if (c.tex0Off != ~size_t(0) && (c.tex0 & (1ull << 34))) { uint64_t t0 = c.tex0 & ~(1ull << 34); std::memcpy(data + c.tex0Off, &t0, 8); h.ctx[ci].tex0 = t0; }
+                for (int i = 0; i < h.rgbaN; i++) { uint8_t *q = data + h.rgba[i].off; if (h.rgba[i].packed) q[12] = 0x00; else q[3] = 0x00; }
+                h.maskNeutralized++;
+            }
+        }
+    }
     {   // [pgsfx] DoF off, mode 2: the depth-mask sprites (16-bit view of a scene buffer, FBMSK 0x3fff, reading the Z
         // buffer as PSMZ16) get their texture alpha turned off (TEX0.TCC := 0) and a vertex alpha of 0x80, so they write
         // "near" (alpha bit 7 = 1) everywhere: no far blur, while draws after them (the aura) still open the mask.
@@ -703,7 +743,7 @@ static void wsHudRegLocked(State &s, uint32_t reg, uint64_t v, uint8_t *data, si
     switch (reg)
     {
     case 0x00: h.primRaw = v; h.qn = 0; break;
-    case 0x01: if (rewrite && data && h.rgbaN < 8) { h.rgba[h.rgbaN].off = off; h.rgba[h.rgbaN].packed = false; h.rgbaN++; } break;   // A+D RGBAQ: 64-bit value in the low half (R,G,B,A bytes 0..3)
+    case 0x01: h.lastRgbaq = v; if (rewrite && data && h.rgbaN < 8) { h.rgba[h.rgbaN].off = off; h.rgba[h.rgbaN].packed = false; h.rgbaN++; } break;   // A+D RGBAQ: 64-bit value in the low half (R,G,B,A bytes 0..3)
     case 0x40: case 0x41:
     {
         h.ctx[reg - 0x40].scissor = v;
@@ -735,7 +775,7 @@ static void wsHudRegLocked(State &s, uint32_t reg, uint64_t v, uint8_t *data, si
     case 0x1A: h.prmodeCont = (v & 1u) != 0; break;
     case 0x1B: h.prmode = (h.prmode & 7u) | (v & ~7ull); break;
     case 0x06: case 0x07: h.ctx[reg - 0x06].tex0 = v; h.ctx[reg - 0x06].tex0Off = (rewrite && data) ? off : ~size_t(0); break;
-    case 0x42: case 0x43: h.ctx[reg - 0x42].alpha = v; break;
+    case 0x42: case 0x43: h.ctx[reg - 0x42].alpha = v; h.ctx[reg - 0x42].alphaOff = (rewrite && data) ? off : ~size_t(0); break;
     case 0x47: case 0x48: h.ctx[reg - 0x47].test = v; h.ctx[reg - 0x47].zte = uint32_t((v >> 16) & 1u); h.ctx[reg - 0x47].ztst = uint32_t((v >> 17) & 3u); break;
     case 0x4C: case 0x4D:
     {   // [pgsfx] DoF off, mode 1: the depth-mask pass (FRAME = 16-bit view of a scene buffer, FBMSK 0x3fff) is made to
@@ -838,11 +878,31 @@ static void wsVertLerpRL(const WsVertRL &a, const WsVertRL &b, float t, WsVertRL
         o.r[o.rgbaIdx] = co | (uint64_t(qi) << 32);
     }
 }
+// [pgsfx] bloom mode: does the tracked state + this tag's primitive describe one of the draws whose shared registers
+// the mapper rewrites (blur-buffer clear / scene downsample / composite / depth-mask sprites)?
+static int wsBloomTargetState(const State::WsHud &h, uint64_t primRaw)
+{
+    const uint64_t attr = h.prmodeCont ? primRaw : h.prmode;
+    const uint32_t primType = uint32_t(primRaw & 7u), ci = uint32_t((attr >> 9) & 1u);
+    const bool tme = ((attr >> 4) & 1u) != 0, abe = ((attr >> 6) & 1u) != 0;
+    const State::WsHud::Ctx &c = h.ctx[ci];
+    const uint32_t tpsm = uint32_t((c.tex0 >> 20) & 0x3Fu), ttbp0 = uint32_t(c.tex0 & 0x3FFFu), ttw = uint32_t((c.tex0 >> 26) & 0xFu), tth = uint32_t((c.tex0 >> 30) & 0xFu), ttbw = uint32_t((c.tex0 >> 14) & 0x3Fu);
+    const bool sprite = primType == 6u, tri = primType >= 3u && primType <= 5u;
+    const bool blurBuf = c.fbp == 336u && c.fbw == 4u && c.fpsm == 0u;
+    if (blurBuf && sprite && !tme && !abe) return 1;                                                                    // clear
+    if (blurBuf && sprite && tme && abe && tpsm == 0u && ttw == 9u && tth == 9u && (ttbp0 == 0u || ttbp0 == 3584u)) return 2;   // downsample
+    if ((c.fbp == 0u || c.fbp == 112u) && (c.fpsm == 0u || c.fpsm == 1u) && (sprite || tri) && tme && abe && tpsm == 1u && ttbp0 == 10752u && ttbw == 4u && ttw == 8u && tth == 8u && ((c.test >> 14) & 1u)) return 3;   // composite
+    if (sprite && tme && (c.fpsm == 2u || c.fpsm == 10u) && (c.fbp == 0u || c.fbp == 112u) && uint32_t(c.frame >> 32) == 0x3fffu && (tpsm == 50u || tpsm == 58u)) return 4;   // depth mask
+    return 0;
+}
 static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, float inv)
 {
     State::WsHud &h = s.wshud;
     const int layout = g_wsHudLayout.load(std::memory_order_relaxed);
-    if (layout <= 0 || !h.active || inv >= 0.999f) return false;
+    static const int s_dofModeP = [](){ const char *e = std::getenv("PS2X_PGS_DOFMODE"); return e && e[0] ? std::atoi(e) : 2; }();
+    const bool bloom = s_dofModeP == 3 && !GsGpuRenderer::dofBlurEnabled();
+    const bool splitting = layout > 0 && h.active && inv < 0.999f;
+    if (!splitting && !bloom) return false;
     const State::WsHud saved = h;   // the pre-pass tracks state like the mapper; restore afterwards so the mapper sees the same start
     std::vector<uint8_t> &out = s.wsBuf; out.clear(); out.reserve(size + 4096);
     bool changed = false;
@@ -854,6 +914,7 @@ static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, flo
         uint32_t nreg = uint32_t((lo >> 60) & 0xFu); if (nreg == 0) nreg = 16;
         if ((lo >> 46) & 1u) h.primRaw = (lo >> 47) & 0x7FFu;
         const size_t tagOff = off; off += 16;
+        size_t lastHdr = out.size();   // header position of the last tag emitted for this input tag (splits emit two)
         size_t bytes = 0;
         if (flg == 0u) bytes = size_t(nloop) * nreg * 16u;
         else if (flg == 1u) bytes = (size_t(nloop) * nreg + 1u) / 2u * 16u;
@@ -922,7 +983,7 @@ static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, flo
                         const float x0 = std::min(a.x, b.x), x1 = std::max(a.x, b.x), y0 = std::min(a.y, b.y), y1 = std::max(a.y, b.y);
                         const bool hud = sceneBuf && (x1 - x0) > 0.f && (x1 - x0) < 0.8f * W && (y1 - y0) > 0.f && (y1 - y0) < 300.f && y1 < 96.f && (!c.zte || c.ztst == 1u);
                         std::vector<float> ts;
-                        if (hud) for (float cx : cuts) if (cx > x0 + 1.f && cx < x1 - 1.f) ts.push_back((cx - a.x) / (b.x - a.x));
+                        if (hud && splitting) for (float cx : cuts) if (cx > x0 + 1.f && cx < x1 - 1.f) ts.push_back((cx - a.x) / (b.x - a.x));
                         if (ts.empty()) { emit(a); emit(b); continue; }
                         std::sort(ts.begin(), ts.end());
                         float tPrev = 0.f; WsVert p0, p1;
@@ -951,7 +1012,7 @@ static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, flo
                     bool zAllZero = true; for (const WsVert &v : vs) { uint32_t z; std::memcpy(&z, v.loop + size_t(xyzIdx) * 16u + 8, 4); if (xyzf) z = (z >> 4) & 0xFFFFFFu; if (z) zAllZero = false; }
                     const bool hud = sceneBuf && fst && zAllZero && (y1 - y0) < 300.f && y1 < 96.f && ((x1 - x0) < 0.8f * W || x0 > 8.f);
                     std::vector<float> ts;
-                    if (hud && axisQuad) for (float cx : cuts) if (cx > x0 + 1.f && cx < x1 - 1.f) ts.push_back((cx - t0.x) / (t1.x - t0.x));
+                    if (hud && axisQuad && splitting) for (float cx : cuts) if (cx > x0 + 1.f && cx < x1 - 1.f) ts.push_back((cx - t0.x) / (t1.x - t0.x));
                     if (!ts.empty())
                     {
                         std::sort(ts.begin(), ts.end());
@@ -972,6 +1033,7 @@ static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, flo
                 {
                     uint64_t nlo = (lo & ~0x7FFFull) | uint64_t(newLoops & 0x7FFFu);
                     uint8_t hdr[16]; std::memcpy(hdr, &nlo, 8); std::memcpy(hdr + 8, &hi, 8);
+                    lastHdr = out.size();
                     out.insert(out.end(), hdr, hdr + 16);
                     out.insert(out.end(), tagOut.begin(), tagOut.end());
                     if (tagChanged) changed = true;
@@ -984,6 +1046,8 @@ static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, flo
                     const uint32_t r = uint32_t((hi >> (4 * i)) & 0xFu);
                     const size_t q = off + (size_t(l) * nreg + i) * 16u;
                     if (r == 0x0) { uint64_t v; std::memcpy(&v, data + q, 8); h.primRaw = v & 0x7FFu; }
+                    else if (r == 0x1) { const uint8_t *pq = data + q; h.lastRgbaq = uint64_t(pq[0]) | (uint64_t(pq[4]) << 8) | (uint64_t(pq[8]) << 16) | (uint64_t(pq[12]) << 24) | (0x3f800000ull << 32); }
+                    else if (r == 0x6 || r == 0x7) { uint64_t v; std::memcpy(&v, data + q, 8); h.ctx[r - 0x6].tex0 = v; }
                     else if (r == 0xE) { uint64_t v, a; std::memcpy(&v, data + q, 8); std::memcpy(&a, data + q + 8, 8); wsHudRegLocked(s, uint32_t(a & 0xFFu), v, nullptr, 0, inv, false); }
                 }
         }
@@ -1040,7 +1104,7 @@ static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, flo
                             const float x0 = std::min(a.x, b.x), x1 = std::max(a.x, b.x), y0 = std::min(a.y, b.y), y1 = std::max(a.y, b.y);
                             const bool hud = sceneBuf && (x1 - x0) > 0.f && (x1 - x0) < 0.8f * W && (y1 - y0) > 0.f && (y1 - y0) < 300.f && y1 < 96.f && (!c.zte || c.ztst == 1u);
                             std::vector<float> ts;
-                            if (hud) for (float cx : cuts) if (cx > x0 + 1.f && cx < x1 - 1.f) ts.push_back((cx - a.x) / (b.x - a.x));
+                            if (hud && splitting) for (float cx : cuts) if (cx > x0 + 1.f && cx < x1 - 1.f) ts.push_back((cx - a.x) / (b.x - a.x));
                             if (ts.empty()) { emit(a); emit(b); continue; }
                             std::sort(ts.begin(), ts.end());
                             float tPrev = 0.f; WsVertRL p0, p1;
@@ -1067,7 +1131,7 @@ static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, flo
                         bool zAllZero = true; for (const WsVertRL &v : vs) if (zOf(v)) zAllZero = false;
                         const bool hud = sceneBuf && fst && zAllZero && (y1 - y0) < 300.f && y1 < 96.f && ((x1 - x0) < 0.8f * W || x0 > 8.f);
                         std::vector<float> ts;
-                        if (hud && axisQuad) for (float cx : cuts) if (cx > x0 + 1.f && cx < x1 - 1.f) ts.push_back((cx - t0.x) / (t1.x - t0.x));
+                        if (hud && axisQuad && splitting) for (float cx : cuts) if (cx > x0 + 1.f && cx < x1 - 1.f) ts.push_back((cx - t0.x) / (t1.x - t0.x));
                         if (!ts.empty())
                         {
                             std::sort(ts.begin(), ts.end());
@@ -1103,6 +1167,7 @@ static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, flo
                             uint64_t blo = (lo & ~(0x7FFFull | (1ull << 46) | (0x7FFull << 47) | (0xFull << 60))) | uint64_t(newV & 0x7FFFu) | (uint64_t(g & 15) << 60);
                             uint64_t bhi = 0; for (int i = 0; i < g; i++) bhi |= ((hi >> (4 * (prefixN + i))) & 0xFull) << (4 * i);
                             uint8_t hdr[16]; std::memcpy(hdr, &blo, 8); std::memcpy(hdr + 8, &bhi, 8);
+                            lastHdr = out.size();
                             out.insert(out.end(), hdr, hdr + 16);
                             if (regsOut.size() & 1u) regsOut.push_back(0);
                             const uint8_t *rb = reinterpret_cast<const uint8_t *>(regsOut.data()); out.insert(out.end(), rb, rb + regsOut.size() * 8u);
@@ -1111,9 +1176,12 @@ static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, flo
                     }
                 }
             }
-            // state: PRIM inside the loop
+            // state: PRIM / RGBAQ / TEX0 inside the loop
             for (uint32_t i = 0; i < nreg; i++)
-                if (uint32_t((hi >> (4 * i)) & 0xFu) == 0x0) { uint64_t v; std::memcpy(&v, data + off + size_t(i) * 8u, 8); h.primRaw = v & 0x7FFu; }
+            {
+                const uint32_t r = uint32_t((hi >> (4 * i)) & 0xFu); uint64_t v; std::memcpy(&v, data + off + size_t(i) * 8u, 8);
+                if (r == 0x0) h.primRaw = v & 0x7FFu; else if (r == 0x1) h.lastRgbaq = v; else if (r == 0x6 || r == 0x7) h.ctx[r - 0x6].tex0 = v;
+            }
         }
         if (!handled && flg == 1u && nloop > 0 && nreg <= 16)
         {
@@ -1172,7 +1240,7 @@ static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, flo
                         const float x0 = std::min(a.x, b.x), x1 = std::max(a.x, b.x), y0 = std::min(a.y, b.y), y1 = std::max(a.y, b.y);
                         const bool hud = sceneBuf && (x1 - x0) > 0.f && (x1 - x0) < 0.8f * W && (y1 - y0) > 0.f && (y1 - y0) < 300.f && y1 < 96.f && (!c.zte || c.ztst == 1u);
                         std::vector<float> ts;
-                        if (hud) for (float cx : cuts) if (cx > x0 + 1.f && cx < x1 - 1.f) ts.push_back((cx - a.x) / (b.x - a.x));
+                        if (hud && splitting) for (float cx : cuts) if (cx > x0 + 1.f && cx < x1 - 1.f) ts.push_back((cx - a.x) / (b.x - a.x));
                         if (ts.empty()) { emit(a); emit(b); continue; }
                         std::sort(ts.begin(), ts.end());
                         float tPrev = 0.f; WsVertRL p0, p1;
@@ -1200,7 +1268,7 @@ static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, flo
                     bool zAllZero = true; for (const WsVertRL &v : vs) if (zOf(v)) zAllZero = false;
                     const bool hud = sceneBuf && fst && zAllZero && (y1 - y0) < 300.f && y1 < 96.f && ((x1 - x0) < 0.8f * W || x0 > 8.f);
                     std::vector<float> ts;
-                    if (hud && axisQuad) for (float cx : cuts) if (cx > x0 + 1.f && cx < x1 - 1.f) ts.push_back((cx - t0.x) / (t1.x - t0.x));
+                    if (hud && axisQuad && splitting) for (float cx : cuts) if (cx > x0 + 1.f && cx < x1 - 1.f) ts.push_back((cx - t0.x) / (t1.x - t0.x));
                     if (!ts.empty())
                     {
                         std::sort(ts.begin(), ts.end());
@@ -1221,6 +1289,7 @@ static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, flo
                 {
                     uint64_t nlo = (lo & ~0x7FFFull) | uint64_t(newLoops & 0x7FFFu);
                     uint8_t hdr[16]; std::memcpy(hdr, &nlo, 8); std::memcpy(hdr + 8, &hi, 8);
+                    lastHdr = out.size();
                     out.insert(out.end(), hdr, hdr + 16);
                     if (regsOut.size() & 1u) regsOut.push_back(0);   // odd register count: the last half-qword is padding
                     const uint8_t *rb = reinterpret_cast<const uint8_t *>(regsOut.data());
@@ -1228,12 +1297,44 @@ static bool wsHudSubdivideLocked(State &s, const uint8_t *data, size_t size, flo
                     if (tagChanged) changed = true;
                 }
             }
-            // state: PRIM via REGLIST reg 0
+            // state: PRIM / RGBAQ / TEX0 via REGLIST regs
             for (uint32_t l = 0; l < nloop; l++)
                 for (uint32_t i = 0; i < nreg; i++)
-                    if (uint32_t((hi >> (4 * i)) & 0xFu) == 0x0) { uint64_t v; std::memcpy(&v, data + off + (size_t(l) * nreg + i) * 8u, 8); h.primRaw = v & 0x7FFu; }
+                {
+                    const uint32_t r = uint32_t((hi >> (4 * i)) & 0xFu); uint64_t v; std::memcpy(&v, data + off + (size_t(l) * nreg + i) * 8u, 8);
+                    if (r == 0x0) h.primRaw = v & 0x7FFu; else if (r == 0x1) h.lastRgbaq = v; else if (r == 0x6 || r == 0x7) h.ctx[r - 0x6].tex0 = v;
+                }
         }
         if (!handled) out.insert(out.end(), data + tagOff, data + off + bytes);
+        if (bloom && flg <= 1u && nloop > 0)
+        {   // vertex tag of a bloom target: append an A+D tag restoring ALPHA / RGBAQ / TEX0 (originals) so the mapper's
+            // per-draw rewrites of those shared registers cannot leak into the draws that follow
+            bool hasXyz = false;
+            for (uint32_t i = 0; i < nreg; i++) { const uint32_t r = uint32_t((hi >> (4 * i)) & 0xFu); if (r == 0x4 || r == 0x5) hasXyz = true; }
+            const int cls = hasXyz ? wsBloomTargetState(h, h.primRaw) : 0;
+            if (cls != 0)
+            {
+                const uint64_t attr = h.prmodeCont ? h.primRaw : h.prmode;
+                const uint32_t ci = uint32_t((attr >> 9) & 1u);
+                // only what the mapper changes for this class: clear -> RGBAQ; downsample / composite -> ALPHA;
+                // depth mask -> TEX0 (CLD cleared: a TEX0 write with its load bits set reloads the palette from memory
+                // that may no longer hold it) + RGBAQ
+                std::vector<std::pair<uint64_t, uint64_t>> regs;
+                if (cls == 1 || cls == 4) regs.emplace_back(h.lastRgbaq, 0x01ull);
+                if (cls == 2 || cls == 3) regs.emplace_back(h.ctx[ci].alpha, 0x42ull + ci);
+                if (cls == 4) regs.emplace_back(h.ctx[ci].tex0 & ~(7ull << 61), 0x06ull + ci);
+                // move the tag's EOP (if any) onto the restore tag
+                uint64_t tlo; std::memcpy(&tlo, out.data() + lastHdr, 8);
+                const bool eop = ((tlo >> 15) & 1u) != 0;
+                if (eop) { tlo &= ~(1ull << 15); std::memcpy(out.data() + lastHdr, &tlo, 8); }
+                uint64_t rlo = uint64_t(regs.size()) | (eop ? (1ull << 15) : 0ull) | (1ull << 60);   // NLOOP n, PACKED, NREG 1
+                uint64_t rhi = 0xEull;                                                                 // A+D
+                uint8_t hdr[16]; std::memcpy(hdr, &rlo, 8); std::memcpy(hdr + 8, &rhi, 8);
+                out.insert(out.end(), hdr, hdr + 16);
+                for (const auto &r : regs) { uint8_t q[16]; std::memcpy(q, &r.first, 8); std::memcpy(q + 8, &r.second, 8); out.insert(out.end(), q, q + 16); }
+                changed = true; h.bloomRestores++;
+            }
+        }
         off += bytes;
     }
     if (off < size) out.insert(out.end(), data + off, data + size);
@@ -1287,7 +1388,7 @@ void wsHudRewriteLocked(State &s, uint8_t *data, size_t size)
                     {
                     case 0x0: { uint64_t v; std::memcpy(&v, data + q, 8); h.primRaw = v & 0x7FFu; h.qn = 0; break; }
                     case 0x6: case 0x7: { uint64_t v; std::memcpy(&v, data + q, 8); h.ctx[r - 0x6].tex0 = v; h.ctx[r - 0x6].tex0Off = q; break; }
-                    case 0x1: if (h.rgbaN < 8) { h.rgba[h.rgbaN].off = q; h.rgba[h.rgbaN].packed = true; h.rgbaN++; } break;
+                    case 0x1: { const uint8_t *pq = data + q; h.lastRgbaq = uint64_t(pq[0]) | (uint64_t(pq[4]) << 8) | (uint64_t(pq[8]) << 16) | (uint64_t(pq[12]) << 24) | (0x3f800000ull << 32); if (h.rgbaN < 8) { h.rgba[h.rgbaN].off = q; h.rgba[h.rgbaN].packed = true; h.rgbaN++; } break; }
                     case 0x3: if (h.uvN < 8) { h.uv[h.uvN].off = q; h.uv[h.uvN].packed = true; h.uvN++; } break;
                     case 0x4: case 0x5: case 0xC: case 0xD:
                     {
@@ -1315,7 +1416,7 @@ void wsHudRewriteLocked(State &s, uint8_t *data, size_t size)
                 case 0x0: { uint64_t v; std::memcpy(&v, data + q, 8); h.primRaw = v & 0x7FFu; h.qn = 0; break; }
                 case 0x4: case 0x5: case 0xC: case 0xD: wsHudVertexLocked(s, data, q, false, (r == 0x4 || r == 0xC), (r == 0x4 || r == 0x5), inv); break;
                 case 0x6: case 0x7: { uint64_t v; std::memcpy(&v, data + q, 8); h.ctx[r - 0x6].tex0 = v; h.ctx[r - 0x6].tex0Off = q; break; }
-                case 0x1: if (h.rgbaN < 8) { h.rgba[h.rgbaN].off = q; h.rgba[h.rgbaN].packed = false; h.rgbaN++; } break;
+                case 0x1: { uint64_t v; std::memcpy(&v, data + q, 8); h.lastRgbaq = v; if (h.rgbaN < 8) { h.rgba[h.rgbaN].off = q; h.rgba[h.rgbaN].packed = false; h.rgbaN++; } break; }
                 case 0x3: if (h.uvN < 8) { h.uv[h.uvN].off = q; h.uv[h.uvN].packed = false; h.uvN++; } break;
                 default: break;   // A+D is not valid in REGLIST
                 }
@@ -1549,7 +1650,7 @@ void onSwap()
         std::fprintf(stderr, "[pgs] cpu gif_transfer %.1f ms/s (%.2f ms/swap) | priv writes/s:", s.xferMs / dt, s.swaps ? s.xferMs / s.swaps : 0.0);
         for (int k = 0; k < 0x20; k++) if (s.privHist[k]) { std::fprintf(stderr, " %02x=%.0f", k << 4, s.privHist[k] / dt); s.privHist[k] = 0; }
         std::fprintf(stderr, " pseudo=%.0f", s.pseudoSeen / dt); s.pseudoSeen = 0;
-        std::fprintf(stderr, " | wshud: inv %.3f (present %.3f) active %d prims/s %.0f verts/s %.0f", s.wshud.lastInv, g_ps2xWsHudInv, s.wshud.active ? 1 : 0, s.wshud.hudPrims / dt, s.wshud.mappedVerts / dt); std::fprintf(stderr, " scissors/s %.0f splits/s %.0f | ink: outline %d strength %d%% width %d%% dropped/s %.0f scaled/s %.0f shifted/s %.0f | fx: shadows %d dof %d dropped/s %.0f/%.0f masks/s %.0f", s.wshud.scissorsMapped / dt, s.wshud.splitPrims / dt, GsGpuRenderer::outlineEnabled() ? 1 : 0, GsGpuRenderer::inkStrengthPct(), g_inkWidthPct.load(), s.wshud.inkDropped / dt, s.wshud.inkScaled / dt, s.wshud.inkShifted / dt, GsGpuRenderer::shadowsEnabled() ? 1 : 0, GsGpuRenderer::dofBlurEnabled() ? 1 : 0, s.wshud.shadowDropped / dt, s.wshud.dofDropped / dt, s.wshud.maskNeutralized / dt); s.wshud.hudPrims = s.wshud.mappedVerts = s.wshud.scissorsMapped = s.wshud.splitPrims = s.wshud.inkDropped = s.wshud.inkScaled = s.wshud.inkShifted = s.wshud.shadowDropped = s.wshud.dofDropped = s.wshud.maskNeutralized = 0;
+        std::fprintf(stderr, " | wshud: inv %.3f (present %.3f) active %d prims/s %.0f verts/s %.0f", s.wshud.lastInv, g_ps2xWsHudInv, s.wshud.active ? 1 : 0, s.wshud.hudPrims / dt, s.wshud.mappedVerts / dt); std::fprintf(stderr, " scissors/s %.0f splits/s %.0f | ink: outline %d strength %d%% width %d%% dropped/s %.0f scaled/s %.0f shifted/s %.0f | fx: shadows %d dof %d dropped/s %.0f/%.0f masks/s %.0f bloom/s %.0f restores/s %.0f", s.wshud.scissorsMapped / dt, s.wshud.splitPrims / dt, GsGpuRenderer::outlineEnabled() ? 1 : 0, GsGpuRenderer::inkStrengthPct(), g_inkWidthPct.load(), s.wshud.inkDropped / dt, s.wshud.inkScaled / dt, s.wshud.inkShifted / dt, GsGpuRenderer::shadowsEnabled() ? 1 : 0, GsGpuRenderer::dofBlurEnabled() ? 1 : 0, s.wshud.shadowDropped / dt, s.wshud.dofDropped / dt, s.wshud.maskNeutralized / dt, s.wshud.bloomEdits / dt, s.wshud.bloomRestores / dt); s.wshud.bloomEdits = s.wshud.bloomRestores = 0; s.wshud.hudPrims = s.wshud.mappedVerts = s.wshud.scissorsMapped = s.wshud.splitPrims = s.wshud.inkDropped = s.wshud.inkScaled = s.wshud.inkShifted = s.wshud.shadowDropped = s.wshud.dofDropped = s.wshud.maskNeutralized = 0;
         if (packMode()) { std::fprintf(stderr, " | pack: hits %llu misses %llu skipped %llu rtstale %llu gate %llu cached %zu", (unsigned long long)s.replacer.hits, (unsigned long long)s.replacer.misses, (unsigned long long)s.replacer.skipped, (unsigned long long)s.replacer.rtstale, (unsigned long long)s.replacer.gateSkips, s.replacer.cache.size()); s.replacer.hits = s.replacer.misses = s.replacer.skipped = s.replacer.rtstale = s.replacer.gateSkips = 0; }
         {   // per swap: paraLLEl-GS render passes / copies / palette updates / primitives (consume_flush_stats)
             const double sw = s.swaps ? double(s.swaps) : 1.0;
