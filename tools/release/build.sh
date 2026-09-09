@@ -50,8 +50,14 @@ case "$ISO" in
     none|NONE|None) ISO="" ;;
 esac
 if [[ "$ISO" == "" ]]; then
+    echo
+    echo "== BT3-Recomp release build"
+    echo "== ----------------------------"
+    echo "== This builds the full runner, launcher and stage from the"
+    echo "== game ISO (extract, recompile and assemble the data)."
+    echo
     if [[ -t 0 ]]; then
-        read -r -p "BT3 ISO path (Enter = ${ISO_DEFAULT}, 'none' = build from generated sources): " ISO
+        read -r -p "Game ISO path (Enter = ${ISO_DEFAULT}, 'none' = use already generated sources): " ISO
         case "$ISO" in
             "") ISO="$ISO_DEFAULT" ;;
             none|NONE|None) ISO="" ;;
@@ -92,5 +98,12 @@ else
 fi
 
 echo
-echo "Stage: $OUT/stage"
-echo "Report: $OUT/floor-report.txt"
+echo "============================================================="
+echo "  DONE: build completed successfully"
+echo "-------------------------------------------------------------"
+echo "  Game stage     : $OUT/stage"
+echo "  Floor gate     : $OUT/floor-report.txt"
+echo ""
+echo "  Next step      : tools/release/package.sh"
+echo "  (generates the self-contained ELF + portable tarball + sha256)"
+echo "============================================================="

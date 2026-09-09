@@ -99,5 +99,15 @@ rm -rf "$TMP_TREE" "$PAYLOAD"
     { sha256sum "BT3-$GAME-Launcher-x86_64"; sha256sum "BT3-Recomp-x86_64.tar.gz"; } > "BT3-Recomp-x86_64.sha256"
 )
 echo
-echo "Release artifacts:"
-ls -lh "$ELF" "$TARBALL" "$OUT_DIR/BT3-Recomp-x86_64.sha256"
+echo "============================================================="
+echo "  DONE: packaging completed successfully"
+echo "-------------------------------------------------------------"
+echo "  Output files:"
+ls -lh "$ELF" "$TARBALL" "$OUT_DIR/BT3-Recomp-x86_64.sha256" | sed 's/^/    /'
+echo "  Output dir:"
+echo "    $OUT_DIR"
+echo ""
+echo "  Usage:"
+echo "    BT3-Dragon Ball - Budokai Tenkaichi 3-Launcher-x86_64  (self-contained ELF, run directly)"
+echo "    BT3-Recomp-x86_64.tar.gz                                (portable: extract and run start-game.sh)"
+echo "============================================================="
