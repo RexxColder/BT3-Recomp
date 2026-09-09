@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "runtime/ps2_gs_gpu_renderer.h"
+#include "runtime/ps2_gs_pgs.h"   // [pgs]
 
 #include <cstdlib>
 #include <cstdio>
@@ -121,7 +122,7 @@ bool ps2xForceBilinear()
     }
     return v != 0;
 }
-void ps2xSetForceBilinear(bool v) { g_forceBilinear.store(v ? 1 : 0, std::memory_order_relaxed); }
+void ps2xSetForceBilinear(bool v) { g_forceBilinear.store(v ? 1 : 0, std::memory_order_relaxed); ps2x_pgs::setForceBilinear(v); /* [pgs] same knob on the backend */ }
 static RenderTexture2D g_gaViewTex[2];         // [gpualias] ping-pong CT16 view of the chain output
 uint32_t g_gaClutData[256];                    // [gpualias] SW-chain palette snapshot (guest writes)
 std::atomic<unsigned> g_gaClutSeq{0};
@@ -326,12 +327,12 @@ int GsGpuRenderer::inkStrengthPct()
             const double f = e && e[0] ? std::atof(e) : 0.0;
             v = (f <= 0.0) ? 199 : (int)((f < 10.0 ? f * 100.0 : f) + 0.5);
         }
-        if (v < 100) v = 100; if (v > 300) v = 300;
+        if (v < 100) v = 100; if (v > 400) v = 400;
         g_uiInk.store(v, std::memory_order_relaxed);
     }
     return v;
 }
-void GsGpuRenderer::setInkStrengthPct(int p) { if (p < 100) p = 100; if (p > 300) p = 300; g_uiInk.store(p); }
+void GsGpuRenderer::setInkStrengthPct(int p) { if (p < 100) p = 100; if (p > 400) p = 400; g_uiInk.store(p); }
 void GsGpuRenderer::setShadows(bool v)     { g_uiShadows.store(v ? 1 : 0); }
 
 // GS texel-corner vs GL texel-centre addressing. 0.5 texel, or 0 with PS2X_HALFTEXEL=0
@@ -6643,6 +6644,7 @@ std::map<uint32_t, int> g_bsPages; long g_bsCmds = 0; std::map<int, int> g_bsSeg
 std::atomic<uint64_t> g_gsGuestSwapCount{0};   // [cdgate] guest frames published (read by the CD-tick pump)
 void GsGpuRenderer::swapFrame()
 {
+    ps2x_pgs::onSwap();   // [pgs] flush + scanout + readback of the paraLLEl-GS frame (no-op when off)
     flushStage();   // [recstage]
     g_gsGuestSwapCount.fetch_add(1, std::memory_order_relaxed);
     {   // [guestbusy] the guest thread's CPU time per published frame (the game paces in whole vsyncs, so the fps counter

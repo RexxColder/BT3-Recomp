@@ -537,6 +537,21 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg)
+
+# [pgs] optional paraLLEl-GS backend (Vulkan compute GS, LGPLv3+): built in when the checkout is present.
+# ps2xRuntime/third_party/parallel-gs is a git-ignored symlink/checkout of https://github.com/Arntzen-Software/parallel-gs
+set(PS2X_PGS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/parallel-gs" CACHE PATH "paraLLEl-GS checkout (with its Granite submodule)")
+option(PS2X_DISABLE_PGS "Do not build the paraLLEl-GS backend even if the checkout is present" OFF)
+if (EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND NOT PS2X_DISABLE_PGS)
+    set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
+    add_subdirectory("${PS2X_PGS_DIR}" "${CMAKE_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_gs_pgs.cpp)
+    target_link_libraries(ps2_runtime PUBLIC parallel-gs)
+    target_compile_definitions(ps2_runtime PUBLIC PS2X_HAVE_PGS=1)
+    message(STATUS "[pgs] paraLLEl-GS backend enabled from ${PS2X_PGS_DIR}")
+else()
+    message(STATUS "[pgs] paraLLEl-GS backend not built (no checkout at ${PS2X_PGS_DIR})")
+endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime

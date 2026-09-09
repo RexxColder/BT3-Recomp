@@ -1,5 +1,9 @@
 #include "ps2_waitprof.h"   // [waitprof]
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_gs_pgs.h"   // [pgs]
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "ps2_log.h"
 #include <array>
@@ -389,6 +393,15 @@ bool PS2Memory::initialize(size_t ramSize)
         gs_regs.display1 = (0ULL << 0) | (0ULL << 12) | (0ULL << 23) | (0ULL << 27) | (639ULL << 32) | (447ULL << 44);
         gs_regs.dispfb2 = gs_regs.dispfb1;
         gs_regs.display2 = gs_regs.display1;
+        // [crtcdefaults] the BIOS's SetGsCrt programs the CRTC sync registers; our syscall stub never did, and
+        // nothing of ours read them -- but a CRTC-exact scanout (the paraLLEl-GS backend) decodes the video
+        // mode from SMODE1. Values as PCSX2 records them for this NTSC title (2026-09-06 splitscreen dump).
+        gs_regs.smode1 = 0x0000000740814504ULL;
+        gs_regs.srfsh  = 0x0000000000000008ULL;
+        gs_regs.synch1 = 0x0007f5b61f06f040ULL;
+        gs_regs.synch2 = 0x000000000033a4d8ULL;
+        gs_regs.syncv  = 0x00c7800601a01801ULL;
+        ps2x_pgs::setRegs(&gs_regs);   // [pgs] the backend reads this block at every swap
 
         // Allocate GS VRAM (4MB)
         m_gsVRAM = new uint8_t[PS2_GS_VRAM_SIZE];
@@ -940,6 +953,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
             const bool changed = (newVal != *reg);
             *reg = newVal;
+            ps2x_pgs::privWrite(regOff, newVal, &gs_regs);   // [pgs]
             if (regOff == 0x70u) ps2xDispFlipInStream(this, newVal);   // [displatch] DISPFB1
             // DISPFB1 (offset 0x0070) changed => the game swapped display buffers,
             // i.e. the just-rendered frame is complete. Snapshot it now.
@@ -1001,6 +1015,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             *reg = value;
+            ps2x_pgs::privWrite(regOff, value, &gs_regs);   // [pgs]
             if (regOff == 0x70u) ps2xDispFlipInStream(this, value);   // [displatch] DISPFB1
         }
         return;
@@ -2360,24 +2375,55 @@ void PS2Memory::arbiterDrainOrHandoff()
 void PS2Memory::stage2Loop()
 {
     ps2xEeProfAddCurrentThread("GsThread");   // [eeprof]
+#if !defined(_WIN32)
+    pthread_setname_np(pthread_self(), "GsThread");   // visible to perf/top
+#endif
     uint64_t accNs = 0;
     uint64_t nItems = 0, nPkts = 0, busyNs = 0; size_t maxDepth = 0; auto tStat = std::chrono::steady_clock::now();
     static const bool s_stat = [](){ const char *v = std::getenv("PS2X_VU1PIPESTAT"); const char *e = std::getenv("PS2X_EEPROF");
                                      return (v && v[0] && v[0] != '0') || (e && e[0] && e[0] != '0'); }();
     for (;;)
     {
-        Stage2Item it;
+        Stage2Item it; uint32_t merged = 1u;
         {
             std::unique_lock<std::mutex> lk(m_s2Mtx);
             { Ps2xWaitScope w(WP_STAGE2_IDLE); m_s2Cv.wait(lk, [this]() { return !m_s2q.empty() || m_kickStop; }); }
             if (m_s2q.empty()) return;   // stop
             if (m_s2q.size() > maxDepth) maxDepth = m_s2q.size();
             it = std::move(m_s2q.front()); m_s2q.pop_front();
+            static const bool s_coal = ps2x_pgs::enabled() && ps2x_pgs::coalesce();
+            if (s_coal && it.kind == 0u)
+            {   // [pgs] every item holds one arbiter flush (usually ONE packet); merge the run of queued packet items so
+                // the backend gets one gif_transfer per path run instead of one per packet
+                while (!m_s2q.empty() && m_s2q.front().kind == 0u && it.pkts.size() < 4096u)
+                {
+                    auto &nx = m_s2q.front();
+                    it.pkts.insert(it.pkts.end(), std::make_move_iterator(nx.pkts.begin()), std::make_move_iterator(nx.pkts.end()));
+                    m_s2q.pop_front(); ++merged;
+                }
+            }
         }
         const auto t0 = std::chrono::steady_clock::now();
         switch (it.kind)
         {
-        case 0u: for (const auto &pkt : it.pkts) m_gifArbiter->process(pkt); nPkts += it.pkts.size(); break;
+        case 0u:
+            if (ps2x_pgs::enabled() && ps2x_pgs::coalesce())
+            {   // [pgs] one gif_transfer per run of same-path packets, then our own parse with the per-packet hook quiet
+                static std::vector<uint8_t> s_run; uint8_t runPath = 0;
+                auto flush = [&]() { if (!s_run.empty()) { ps2x_pgs::gifTransfer(runPath, s_run.data(), s_run.size()); s_run.clear(); } };
+                for (const auto &pkt : it.pkts)
+                {
+                    const uint8_t pth = static_cast<uint8_t>(pkt.pathId);
+                    if (pth != runPath) { flush(); runPath = pth; }
+                    s_run.insert(s_run.end(), pkt.data.begin(), pkt.data.end());
+                }
+                flush();
+                ps2x_pgs::setSuppressed(true);
+                for (const auto &pkt : it.pkts) m_gifArbiter->process(pkt);
+                ps2x_pgs::setSuppressed(false);
+            }
+            else for (const auto &pkt : it.pkts) m_gifArbiter->process(pkt);
+            nPkts += it.pkts.size(); break;
         case 1u:
             ps2GpuRenderer().swapFrame();
             { std::lock_guard<std::mutex> lk(m_kickMtx); if (m_kickFramesQueued > 0u) --m_kickFramesQueued; m_kickDoneCv.notify_all(); }
@@ -2389,9 +2435,9 @@ void PS2Memory::stage2Loop()
             break;
         }
         const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
-        accNs += ns; busyNs += ns; ++nItems;
+        accNs += ns; busyNs += ns; nItems += merged;
         if (it.kind == 1u) { g_stage2FrameNs.store(accNs, std::memory_order_relaxed); accNs = 0; }
-        if (m_s2Pending.fetch_sub(1u, std::memory_order_acq_rel) == 1u)
+        if (m_s2Pending.fetch_sub(merged, std::memory_order_acq_rel) == merged)
         {   // idle: wake a drain
             std::lock_guard<std::mutex> lk(m_kickMtx);
             m_kickDoneCv.notify_all();

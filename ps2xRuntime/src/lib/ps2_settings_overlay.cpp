@@ -1,5 +1,6 @@
 #include "runtime/ps2_texreplace.h"
 #include "ps2_settings_overlay.h"
+#include "runtime/ps2_gs_pgs.h"   // [pgsink] backend ink width
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/pad_config.h"
@@ -246,6 +247,30 @@ namespace
 }
 
 bool PS2SettingsOverlay::s_widescreen = false;
+
+// [fsnative] Fullscreen at the MONITOR's resolution. raylib's ToggleFullscreen() keeps the window's current size as
+// the video mode (1024x768 from the INI); on Wayland the compositor then stretches that 4:3 surface across the 16:9
+// panel while the game still sees a 4:3 screen -- neither the true-widescreen FOV patch nor the HUD squeeze engage
+// and the whole picture is stretched. Size the window to the monitor first; restore the saved size on the way out.
+// PS2X_FSNATIVE=0 restores the old toggle.
+static void ps2xSetFullscreen(bool on, int windowW, int windowH)
+{
+    static const bool s_native = [](){ const char *v = std::getenv("PS2X_FSNATIVE"); return !(v && v[0] == '0'); }();
+    if (!s_native) { ToggleFullscreen(); return; }
+    if (on)
+    {
+        if (IsWindowFullscreen()) return;
+        const int m = GetCurrentMonitor();
+        const int mw = GetMonitorWidth(m), mh = GetMonitorHeight(m);
+        if (mw >= 320 && mh >= 240) SetWindowSize(mw, mh);
+        ToggleFullscreen();
+    }
+    else
+    {
+        if (IsWindowFullscreen()) ToggleFullscreen();
+        if (windowW >= 320 && windowH >= 240) SetWindowSize(windowW, windowH);
+    }
+}
 // [wshudmap] live HUD-layout state, defined in ps2_gs_gpu_renderer.cpp
 extern std::atomic<int> g_wsHudLayout;
 extern std::atomic<int> g_wsHudOffLQ, g_wsHudOffCQ, g_wsHudOffRQ;
@@ -333,7 +358,7 @@ void PS2SettingsOverlay::initialize()
         SetWindowSize(m_settings.windowW, m_settings.windowH);
     // Apply fullscreen on startup if the INI says so (or the default is true).
     if (m_settings.fullscreen)
-        ToggleFullscreen();
+        ps2xSetFullscreen(true, m_settings.windowW, m_settings.windowH);
     // Build the device list up front so the gamepad toggle combo works before the
     // overlay is opened for the first time (m_deviceList is otherwise only populated
     // when the overlay opens via resetCaptureState/buildDeviceList).
@@ -364,6 +389,7 @@ bool PS2SettingsOverlay::Settings::operator==(const Settings &o) const
            musicVolume == o.musicVolume &&
            sfxVolume == o.sfxVolume &&
            gpuRenderer == o.gpuRenderer &&
+           renderer == o.renderer &&
            glow == o.glow &&
            postfx == o.postfx &&
            glowFix == o.glowFix &&
@@ -417,6 +443,7 @@ void PS2SettingsOverlay::toggleVisible()
 // [envwins] An env var the USER set explicitly (present, and not one main() defaulted --
 // PS2X_DEFAULTED lists those) outranks the saved INI: play.sh-style launches and A/B runs
 // must behave as commanded regardless of what the overlay saved last session.
+static bool m_sawRendererKey = false;   // [renderer] set while parsing the ini
 static bool envUserSet(const char *name)
 {
     if (!std::getenv(name)) return false;
@@ -428,6 +455,7 @@ static bool envUserSet(const char *name)
 
 void PS2SettingsOverlay::loadSettings()
 {
+    m_sawRendererKey = false;
     // [defaults-sync] Seed from LIVE runtime state (env + main()'s baked defaults) so a
     // missing INI -- or a key the INI doesn't mention -- never pushes this struct's
     // hardcoded values over the validated configuration.
@@ -475,13 +503,25 @@ void PS2SettingsOverlay::loadSettings()
             {
                 if (key == "gpu_renderer")
                     { if (!envUserSet("PS2X_GPU")) m_settings.gpuRenderer = (val == "1" || val == "true"); }
+                else if (key == "renderer")
+                {   // [renderer] 0 OpenGL / 1 software / 2 paraLLEl-GS
+                    int r = std::atoi(val.c_str());
+#if !defined(PS2X_HAVE_PGS)
+                    if (r == Settings::kRendererParallelGS) r = Settings::kRendererOpenGL;
+#endif
+                    if (r >= 0 && r <= 2) { m_settings.renderer = r; m_sawRendererKey = true; }
+                }
                 else if (key == "glow")
                     { if (!envUserSet("PS2X_GLOW")) m_settings.glow = (val == "1" || val == "true"); }
                 else if (key == "glowfix")
                     { if (!envUserSet("PS2X_GLOWFIX")) m_settings.glowFix = (val == "1" || val == "true"); }
                 else if (key == "ink_strength")
                     { if (!envUserSet("PS2X_INKSTRENGTH") && !envUserSet("PS2X_ADGS"))
-                          m_settings.inkStrength = std::clamp(std::atoi(val.c_str()), 100, 300); }
+                          m_settings.inkStrength = std::clamp(std::atoi(val.c_str()), 100, 400); }
+                else if (key == "ink_width")
+                    m_settings.inkWidth = std::clamp(std::atoi(val.c_str()), 25, 100);
+                else if (key == "ink_color")
+                    m_settings.inkColor = static_cast<unsigned>(std::strtoul(val.c_str(), nullptr, 16)) & 0xFFFFFFu;
                 else if (key == "postfx")
                     { if (!envUserSet("PS2X_POSTFX")) m_settings.postfx = (val == "1" || val == "true"); }
                 else if (key == "bilinear")
@@ -574,6 +614,43 @@ void PS2SettingsOverlay::loadSettings()
         {
         }
     }
+    // [renderer] legacy ini (no `renderer` key): gpu_renderer=0 meant the software rasterizer; otherwise the default
+    // backend, which is paraLLEl-GS when built in. Either way keep gpuRenderer coherent for the older readers.
+    if (!m_sawRendererKey)
+        m_settings.renderer = m_settings.gpuRenderer ? Settings::kRendererDefault : Settings::kRendererSoftware;
+    m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);
+}
+
+// [renderer] The paraLLEl-GS backend reads PS2X_PGS* lazily at its first packet, so the ini choice is exported as
+// environment DEFAULTS here (setenv(...,0): an explicit user override still wins). renderer 2 = backend on, exclusive
+// (our GS parse skipped) unless a texture pack is on, where the backend needs our state-only parse for the hashes.
+static void setEnvDefault(const char *name, const char *value)
+{   // never overwrites: an explicit user env override wins
+    if (std::getenv(name)) return;
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 0);
+#endif
+}
+static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
+{
+#if defined(PS2X_HAVE_PGS)
+    if (renderer == 2)
+    {
+        setEnvDefault("PS2X_PGS", "1");
+        // [pgslive] pack mode whenever a pack is INDEXED (PS2X_TEXREPLACE or ./textures), so the Texture Replacement
+        // switch can flip live in either direction (pack mode keeps our state-only parse's VRAM mirror alive).
+        // PS2X_PGS_PACK=0 in the env forces the exclusive path.
+        setEnvDefault("PS2X_PGS_PACK", (texPack || ps2tex::replacementsEnabled()) ? "1" : "0");
+        { const char *pk = std::getenv("PS2X_PGS_PACK"); if (!(pk && pk[0] == '1')) setEnvDefault("PS2X_PGS_EXCLUSIVE", "1"); }
+        if (forceBilinear) setEnvDefault("PS2X_PGS_FORCE_BILINEAR", "1");
+    }
+    else
+        setEnvDefault("PS2X_PGS", "0");
+#else
+    (void)renderer; (void)texPack; (void)forceBilinear;
+#endif
 }
 
 void PS2SettingsOverlay::preloadSettings()
@@ -582,8 +659,14 @@ void PS2SettingsOverlay::preloadSettings()
         ? (std::filesystem::current_path() / kConfigFileName).string()
         : (std::filesystem::path(s_configDir) / kConfigFileName).string();
     std::ifstream file(iniPath);
+    int rendererPre = Settings::kRendererDefault;   // [renderer] exported below even when no ini exists yet
+    bool texPackPre = true;
+    bool forceBilinearPre = true;
     if (!file.is_open())
+    {
+        exportRendererEnv(rendererPre, texPackPre, forceBilinearPre);
         return;
+    }
 
     std::string section;
     std::string line;
@@ -610,6 +693,19 @@ void PS2SettingsOverlay::preloadSettings()
 
         if (section == "video" && key == "widescreen")
             s_widescreen = (val == "1" || val == "true");
+        else if (section == "video" && key == "renderer")
+        {
+            const int r = std::atoi(val.c_str());
+            if (r >= 0 && r <= 2) rendererPre = r;
+        }
+        else if (section == "video" && key == "gpu_renderer")
+        {   // legacy: 0 = software (only honoured when no `renderer` key follows)
+            if (!(val == "1" || val == "true") && rendererPre == Settings::kRendererDefault) rendererPre = Settings::kRendererSoftware;
+        }
+        else if (section == "video" && key == "texture_pack")
+            texPackPre = (val == "1" || val == "true");
+        else if (section == "video" && key == "force_bilinear")
+            forceBilinearPre = (val == "1" || val == "true");
         else if (section == "video" && key == "render_scale")
         {   // [rscale] authoritative startup application -- runs before anything reads the
             // live scale, so the INI value wins the lazy-init race.
@@ -617,6 +713,7 @@ void PS2SettingsOverlay::preloadSettings()
             {
                 int rs = std::atoi(val.c_str());
                 if (rs >= 1 && rs <= 4) GsGpuRenderer::setRenderScale(rs);
+                if (rs >= 1 && rs <= 4 && !envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(rs);   // [pgslive] backend starts at the INI scale
             }
         }
         else if (section == "logging" && key == "log_level")
@@ -627,6 +724,7 @@ void PS2SettingsOverlay::preloadSettings()
             s_startupLogLevel = lvl;
         }
     }
+    exportRendererEnv(rendererPre, texPackPre, forceBilinearPre);
 }
 
 void PS2SettingsOverlay::saveSettings() const
@@ -642,9 +740,12 @@ void PS2SettingsOverlay::saveSettings() const
 
     file << "[video]\n";
     file << "gpu_renderer=" << (m_settings.gpuRenderer ? "1" : "0") << "\n";
+    file << "renderer=" << m_settings.renderer << "\n";
     file << "glow=" << (m_settings.glow ? "1" : "0") << "\n";
     file << "glowfix=" << (m_settings.glowFix ? "1" : "0") << "\n";
     file << "ink_strength=" << m_settings.inkStrength << "\n";
+    file << "ink_width=" << m_settings.inkWidth << "\n";
+    { char hex[16]; std::snprintf(hex, sizeof hex, "%06x", m_settings.inkColor); file << "ink_color=" << hex << "\n"; }
     file << "postfx=" << (m_settings.postfx ? "1" : "0") << "\n";
     file << "bilinear=" << (m_settings.bilinear ? "1" : "0") << "\n";
     file << "halftexel=" << (m_settings.halfTexel ? "1" : "0") << "\n";
@@ -739,6 +840,7 @@ void PS2SettingsOverlay::applySettings()
     PS2AudioBackend::setMasterVolume(m_settings.masterVolume);
     PS2AudioBackend::setMusicVolume(m_settings.musicVolume);
     PS2AudioBackend::setSfxVolume(m_settings.sfxVolume);
+    m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);   // [renderer]
     GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
     GsGpuRenderer::setGlow(m_settings.glow);
     GsGpuRenderer::setPostfx(m_settings.postfx);
@@ -747,6 +849,8 @@ void PS2SettingsOverlay::applySettings()
     // state -- and a partial glow fix is a REGRESSION (it washes the frame out).
     GsGpuRenderer::setGlowFix(m_settings.glowFix);
     GsGpuRenderer::setInkStrengthPct(m_settings.inkStrength);   // [inkstrength] live: it is one shader uniform
+    ps2x_pgs::setInkWidthPct(m_settings.inkWidth);   // [pgsink] backend stroke width
+    ps2x_pgs::setInkColor(m_settings.inkColor);       // [pgsink] backend stroke colour
     GsGpuRenderer::setBilinear(m_settings.bilinear);
     GsGpuRenderer::setHalfTexel(m_settings.halfTexel);
     GsGpuRenderer::setSkipPost(m_settings.skipPost);
@@ -755,6 +859,8 @@ void PS2SettingsOverlay::applySettings()
     // on live changes too, and a live scale store would desync the pipeline.
     GsGpuRenderer::setOutline(m_settings.outline);
     GsGpuRenderer::setTexPack(m_settings.texPack);
+    ps2x_pgs::setPackEnabled(m_settings.texPack);    // [pgslive]
+    if (!envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(m_settings.renderScale); // [pgslive] (an explicit launcher SSAA wins until the combo is touched)
     GsGpuRenderer::setShadows(m_settings.shadows);
     GsGpuRenderer::setDofBlur(m_settings.dofBlur);
     GsGpuRenderer::setDofZFar(m_settings.dofZFar);
@@ -961,7 +1067,7 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
     if (IsKeyPressed(KEY_F11))
     {
         m_settings.fullscreen = !m_settings.fullscreen;
-        ToggleFullscreen();
+        ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
         m_dirty = true;
     }
 
@@ -991,7 +1097,8 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
         PS2AudioBackend::setMasterVolume(m_settings.masterVolume);
         PS2AudioBackend::setMusicVolume(m_settings.musicVolume);
         PS2AudioBackend::setSfxVolume(m_settings.sfxVolume);
-        GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
+        m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);   // [renderer]
+    GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
         GsGpuRenderer::setGlow(m_settings.glow);
         GsGpuRenderer::setPostfx(m_settings.postfx);
         m_dirty = false;
@@ -1211,8 +1318,25 @@ void PS2SettingsOverlay::drawVideoTab()
 
     // Renderer + Effects (flat, compact — no card borders)
     sectionHeader("RENDERER");
-    if (toggleSwitch("GPU Renderer (OpenGL)", &m_settings.gpuRenderer))
-        m_dirty = true;
+    {   // [renderer] backend dropdown
+#if defined(PS2X_HAVE_PGS)
+        static const char *const kRenderers[] = { "OpenGL", "Software rasterizer", "paraLLEl-GS (Vulkan compute)" };
+        const int nRenderers = 3;
+#else
+        static const char *const kRenderers[] = { "OpenGL", "Software rasterizer" };
+        const int nRenderers = 2;
+#endif
+        int r = std::clamp(m_settings.renderer, 0, nRenderers - 1);
+        ImGui::TextUnformatted("Renderer");
+        ImGui::SameLine(180.0f);
+        ImGui::SetNextItemWidth(260.0f);
+        if (ImGui::Combo("##renderer", &r, kRenderers, nRenderers))
+        {
+            m_settings.renderer = r;
+            m_settings.gpuRenderer = (r != Settings::kRendererSoftware);
+            m_dirty = true;
+        }
+    }
     ImGui::TextDisabled("Takes full effect after restart.");
     if (toggleSwitch("Cel Outline", &m_settings.outline))
         m_dirty = true;
@@ -1223,6 +1347,7 @@ void PS2SettingsOverlay::drawVideoTab()
         if (toggleSwitch("Texture Replacement", &m_settings.texPack))
         {   // Applies LIVE: setTexPack flushes the texture cache so everything re-decodes.
             GsGpuRenderer::setTexPack(m_settings.texPack);
+            ps2x_pgs::setPackEnabled(m_settings.texPack);   // [pgslive] backend: hook gated + cached textures dropped
             m_dirty = true;
         }
         if (!havePack)
@@ -1238,13 +1363,41 @@ void PS2SettingsOverlay::drawVideoTab()
         ImGui::Text("Ink Strength");
         ImGui::SameLine(120);
         ImGui::SetNextItemWidth(220);
-        if (ImGui::SliderInt("##inkstrength", &m_settings.inkStrength, 100, 260, "%d %%",
+        if (ImGui::SliderInt("##inkstrength", &m_settings.inkStrength, 100, 400, "%d %%",
                              ImGuiSliderFlags_AlwaysClamp))
         {
             GsGpuRenderer::setInkStrengthPct(m_settings.inkStrength);   // live preview
             m_dirty = true;
         }
-        ImGui::TextDisabled("199%% matches the console line. Lower = thinner/lighter ink.");
+        ImGui::TextDisabled("199%% matches the console line. Higher = darker ink.");
+        if (m_settings.renderer == 2)
+        {   // [pgsink] paraLLEl-GS: the stroke width is the outline chain's edge-detect shift, rewritten in the stream
+            ImGui::Text("Ink Width");
+            ImGui::SameLine(120);
+            ImGui::SetNextItemWidth(220);
+            if (ImGui::SliderInt("##inkwidth", &m_settings.inkWidth, 25, 100, "%d %%", ImGuiSliderFlags_AlwaysClamp))
+            {
+                ps2x_pgs::setInkWidthPct(m_settings.inkWidth);   // live
+                m_dirty = true;
+            }
+            ImGui::TextDisabled("100%% = the console's one-pixel stroke; lower = thinner (paraLLEl-GS only).");
+            {   // [pgsink] the darkener subtracts its colour from the scene, so the picker sets the complement it keeps
+                float rgb[3] = { ((m_settings.inkColor >> 16) & 0xFFu) / 255.0f, ((m_settings.inkColor >> 8) & 0xFFu) / 255.0f, (m_settings.inkColor & 0xFFu) / 255.0f };
+                ImGui::Text("Ink Color");
+                ImGui::SameLine(120);
+                ImGui::SetNextItemWidth(220);
+                if (ImGui::ColorEdit3("##inkcolor", rgb, ImGuiColorEditFlags_NoPicker | ImGuiColorEditFlags_NoAlpha | ImGuiColorEditFlags_DisplayRGB | ImGuiColorEditFlags_Uint8))
+                {
+                    auto b = [](float f) { return static_cast<unsigned>(std::clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f); };
+                    m_settings.inkColor = (b(rgb[0]) << 16) | (b(rgb[1]) << 8) | b(rgb[2]);
+                    ps2x_pgs::setInkColor(m_settings.inkColor);   // live
+                    m_dirty = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Black")) { m_settings.inkColor = 0; ps2x_pgs::setInkColor(0); m_dirty = true; }
+                ImGui::TextDisabled("Exact on light backgrounds; darker scenes tint toward it (paraLLEl-GS only).");
+            }
+        }
     }
     if (toggleSwitch("Character Shadows", &m_settings.shadows))
         m_dirty = true;
@@ -1261,6 +1414,7 @@ void PS2SettingsOverlay::drawVideoTab()
             m_settings.dofZFar = reach * 1000;
             m_dirty = true;
         }
+        if (m_settings.renderer == 2) ImGui::TextDisabled("paraLLEl-GS: off keeps the aura glow (the game blurs through the same pass,\nso a soft halo stays around a charging aura); reach is OpenGL-only.");
         ImGui::TextDisabled("Lower = blur reaches nearer to the camera. 200k matches the console look.");
     }
     // (Glow / Skip Post / Half-Texel / Skip Stale VRAM toggles removed: replay A/B
@@ -1289,10 +1443,13 @@ void PS2SettingsOverlay::drawVideoTab()
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
         if (ImGui::Combo("##renderscale", &rsIdx, kScales, 4))
         {
-            m_settings.renderScale = rsIdx + 1;   // persisted to INI; applied on next launch
+            m_settings.renderScale = rsIdx + 1;   // persisted to INI; OpenGL applies on next launch, paraLLEl-GS live
+            ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive]
             m_dirty = true;
         }
-        if (m_settings.renderScale != GsGpuRenderer::renderScale())
+        if (m_settings.renderer == 2)
+            ImGui::TextDisabled("paraLLEl-GS: 1x / 2x / 3x / 4x = 1 / 4 / 8 / 16 samples per pixel, applies live.");
+        else if (m_settings.renderScale != GsGpuRenderer::renderScale())
             ImGui::TextDisabled("(applies on restart)");
     }
     sectionHeader("FILTERING");
@@ -1312,7 +1469,7 @@ void PS2SettingsOverlay::drawVideoTab()
     sectionHeader("DISPLAY");
     if (toggleSwitch("Fullscreen", &m_settings.fullscreen))
     {
-        ToggleFullscreen();
+        ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
         m_dirty = true;
     }
     if (toggleSwitch("Widescreen (true FOV)", &m_settings.widescreen))

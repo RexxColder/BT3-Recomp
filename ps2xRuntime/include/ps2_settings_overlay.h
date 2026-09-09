@@ -18,6 +18,15 @@ public:
         float musicVolume = 1.0f;
         float sfxVolume = 1.0f;
         bool gpuRenderer = true;
+        // [renderer] 0 = OpenGL (our GS renderer), 1 = software rasterizer, 2 = paraLLEl-GS (Vulkan compute; only when
+        // the backend is built in). gpuRenderer stays in sync (renderer != 1) for the code that still reads it.
+        static constexpr int kRendererOpenGL = 0, kRendererSoftware = 1, kRendererParallelGS = 2;
+#if defined(PS2X_HAVE_PGS)
+        static constexpr int kRendererDefault = 2;
+#else
+        static constexpr int kRendererDefault = 0;
+#endif
+        int renderer = kRendererDefault;
         bool glow = true;
         bool postfx = false;
         bool glowFix = true;   // [glowfix] BT3's bloom/glow chain (Kaioken aura); applies on restart
@@ -32,6 +41,8 @@ public:
         bool outline = true;
         bool texPack = true;   // [texreplace] use the PCSX2 replacement pack when one is indexed
         int inkStrength = 199;   // [inkstrength] cel-outline darkener, % of Cs (199 = hardware 255/128)
+        int inkWidth = 100;      // [pgsink] paraLLEl-GS: outline stroke width, % of a PS2 texel (100 = native, 25 = thinnest)
+        unsigned inkColor = 0;   // [pgsink] paraLLEl-GS: outline colour 0xRRGGBB (0 = the game's black)
         bool shadows = true;
         bool dofBlur = true;
         int dofZFar = 200000;

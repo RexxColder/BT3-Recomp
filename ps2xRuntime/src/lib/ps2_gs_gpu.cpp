@@ -1,5 +1,6 @@
 #include "runtime/ps2_guestprof.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_gs_pgs.h"   // [pgs]
 #include "runtime/ps2_gs_common.h"
 #include "runtime/ps2_gs_psmct16.h"
 #include "runtime/ps2_gs_psmct32.h"
@@ -16,6 +17,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <unordered_map>
+#include "runtime/ps2_texreplace.h"   // [pgscensus] identify
 #include <cstdlib>
 #include <iostream>
 #include <vector>
@@ -3696,6 +3699,104 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     recordRegisterDebugEventUnlocked(regAddr, value);
 }
 
+namespace ps2x_pgs { extern std::atomic<int> g_pgsProbeReq; extern std::atomic<unsigned> g_pgsProbeFbp, g_pgsProbeZbp; }   // [vramprobe]
+// [rtstale] page footprint of a VRAM region: bp in blocks, bw in 64-pixel units, an inclusive pixel box in `psm`
+// pixels. Pages per row follow the format's page width; a base that is not page aligned makes every block-table
+// index >= 32 land in the NEXT LINEAR page (page + 1), which is how addrPSMT4/8/CT32 resolve it -- not the next
+// page row (the first guard assumed that and refused the popup font on page 341, which it never touched).
+static inline void rtPageDims(uint8_t psm, uint32_t &pw, uint32_t &ph)
+{
+    switch (psm)
+    {
+    case GS_PSM_CT16: case GS_PSM_CT16S: case GS_PSM_Z16: case GS_PSM_Z16S: pw = 64u; ph = 64u; break;
+    case GS_PSM_T8: pw = 128u; ph = 64u; break;
+    case GS_PSM_T4: pw = 128u; ph = 128u; break;
+    default: pw = 64u; ph = 32u; break;   // CT32 / CT24 / Z32 / Z24 / T8H / T4HL / T4HH share the 32-bit page
+    }
+}
+template <typename F>
+static inline void rtForEachPage(uint32_t bp, uint32_t bw, uint8_t psm, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1, F &&fn)
+{
+    uint32_t pw, ph; rtPageDims(psm, pw, ph);
+    const uint32_t ppr = std::max<uint32_t>(1u, (bw * 64u) / pw);
+    const uint32_t pg0 = bp / 32u;
+    const bool spill = (bp % 32u) != 0u;
+    for (uint32_t r = y0 / ph; r <= y1 / ph; ++r)
+        for (uint32_t c = x0 / pw; c <= x1 / pw; ++c)
+        {
+            const uint32_t pg = pg0 + r * ppr + c;
+            if (pg < 512u) fn(pg);
+            if (spill && pg + 1u < 512u) fn(pg + 1u);
+        }
+}
+static void rtStampWritten(GS &gs, uint32_t bp, uint32_t bw, uint8_t psm, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (!w || !h) return;
+    const uint32_t seq = ++gs.m_pageSeqCounter;
+    rtForEachPage(bp, bw, psm, x, y, x + w - 1u, y + h - 1u, [&](uint32_t pg) { gs.m_pageWriteSeq[pg] = seq; });
+}
+static bool rtRegionDrawn(const GS &gs, uint32_t bp, uint32_t bw, uint8_t psm, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1, uint32_t *stalePg)
+{
+    bool stale = false;
+    rtForEachPage(bp, bw, psm, x0, y0, x1, y1, [&](uint32_t pg) { if (!stale && gs.pageDrawnSinceWrite(pg)) { stale = true; if (stalePg) *stalePg = pg; } });
+    return stale;
+}
+static void rtMarkDrawn(GS &gs, uint32_t bp, uint32_t bw, uint8_t psm, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t seq)
+{
+    if (!w || !h) return;
+    rtForEachPage(bp, bw, psm, x, y, x + w - 1u, y + h - 1u, [&](uint32_t pg) { gs.m_pageDrawSeq[pg] = seq; });
+}
+// for the paraLLEl-GS pack hook: was any page of a w x h texture at (bp, bw, psm) drawn since it was last written?
+bool ps2xGsRegionDrawnSinceWrite(const GS *gs, uint32_t bp, uint32_t bw, uint8_t psm, uint32_t w, uint32_t h, uint32_t *stalePg)
+{
+    if (!gs || !w || !h) return false;
+    return rtRegionDrawn(*gs, bp, bw, psm, 0u, 0u, w - 1u, h - 1u, stalePg);
+}
+// [rtstale] debug: the last kick that stamped each page (PS2X_PGS_PACKLOG=1 prints it for refused textures)
+struct RtStalePageInfo { uint32_t fbp, fbw, x0, y0, x1, y1, seq; uint8_t psm; bool z; int prim; };
+static RtStalePageInfo s_rtStaleInfo[512];
+const char *ps2xRtStalePageInfo(const GS *gs, uint32_t pg)
+{
+    static char buf[256];
+    if (pg >= 512u) return "pg out of range";
+    const RtStalePageInfo &i = s_rtStaleInfo[pg];
+    std::snprintf(buf, sizeof(buf), "pg %u drawSeq %u writeSeq %u <- kick prim %d %s fbp %u fbw %u psm %u box (%u,%u)-(%u,%u) seq %u",
+                  pg, gs->m_pageDrawSeq[pg], gs->m_pageWriteSeq[pg], i.prim, i.z ? "ZBUF" : "FRAME", i.fbp, i.fbw, unsigned(i.psm), i.x0, i.y0, i.x1, i.y1, i.seq);
+    return buf;
+}
+void GS::noteDrawTargetPages()
+{   // [rtstale] the pages this kick can write: the primitive's bounding box (frame space = vertex - XYOFFSET, clipped to
+    // the scissor) over the FRAME pages, and the ZBUF pages when Z writes are on. Page width is 64 for every frame/Z
+    // format, page height 32 (32/24-bit) or 64 (16-bit); FBW counts pages per row.
+    if (m_vtxCount <= 0) return;
+    const GSContext &ctx = activeContext();
+    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+    const int n = m_vtxCount < kMaxVerts ? m_vtxCount : kMaxVerts;
+    for (int i = 0; i < n; ++i)
+    {
+        const GSVertex &v = m_vtxQueue[i];
+        minX = std::min(minX, v.x); maxX = std::max(maxX, v.x); minY = std::min(minY, v.y); maxY = std::max(maxY, v.y);
+    }
+    const float ofx = ctx.xyoffset.ofx / 16.0f, ofy = ctx.xyoffset.ofy / 16.0f;
+    const int x0 = std::max<int>(static_cast<int>(std::floor(minX - ofx)), ctx.scissor.x0);
+    const int x1 = std::min<int>(static_cast<int>(std::ceil(maxX - ofx)), ctx.scissor.x1);
+    const int y0 = std::max<int>(static_cast<int>(std::floor(minY - ofy)), ctx.scissor.y0);
+    const int y1 = std::min<int>(static_cast<int>(std::ceil(maxY - ofy)), ctx.scissor.y1);
+    if (x0 > x1 || y0 > y1 || x1 < 0 || y1 < 0) return;
+    const uint32_t seq = ++m_pageSeqCounter;
+    auto mark = [&](uint32_t bp, uint32_t bw, uint8_t psm, bool z)
+    {   // FRAME.FBP / ZBUF.ZBP are page indices: block address = page * 32
+        const uint32_t bx0 = uint32_t(std::max(0, x0)), by0 = uint32_t(std::max(0, y0)), bx1 = uint32_t(x1), by1 = uint32_t(y1);
+        rtForEachPage(bp * 32u, bw, psm, bx0, by0, bx1, by1, [&](uint32_t pg)
+        {
+            m_pageDrawSeq[pg] = seq;
+            s_rtStaleInfo[pg] = RtStalePageInfo{bp, bw, bx0, by0, bx1, by1, seq, psm, z, int(m_prim.type)};
+        });
+    };
+    mark(ctx.frame.fbp, ctx.frame.fbw, ctx.frame.psm, false);
+    if (!ctx.zbuf.zmask) mark(ctx.zbuf.zbp, ctx.frame.fbw, ctx.zbuf.psm, true);
+}
+
 void GS::performLocalToLocalTransfer()
 {
     if (!m_vram)
@@ -3733,6 +3834,12 @@ void GS::performLocalToLocalTransfer()
     // versioned texKeys re-decode only when the copied bytes actually changed.
     { extern GS *g_gsWb; g_gsWb = this; }   // writeback needs a GS to reach VRAM
     ps2GpuRenderer().onVramUpload(dbp, static_cast<uint32_t>(dbw) * rrh); bumpPageUploadGen(dbp, static_cast<uint32_t>(dbw) * rrh);   // [clutpagegen]
+    {   // [rtstale] the destination region is now written (our mirror holds it); a copy out of a region the game drew
+        // into carries stale bytes, so the destination inherits "drawn" in that case
+        rtStampWritten(*this, dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        if (rrw && rrh && rtRegionDrawn(*this, sbp, sbw, spsm, ssax, ssay, ssax + rrw - 1u, ssay + rrh - 1u, nullptr))
+            rtMarkDrawn(*this, dbp, dbw, dpsm, dsax, dsay, rrw, rrh, ++m_pageSeqCounter);
+    }
 
     {
         static const bool s_l2l = [](){ const char *v = std::getenv("PS2X_TEX_PROBE"); return v && v[0] && v[0] != '0'; }();
@@ -3946,8 +4053,104 @@ void GS::vertexKick(bool drawing)
                                  nn, ff, 100.0 * ff / nn, mx);
             }
         }
+        // [nodraw] PS2X_GS_NODRAW=1 (or the paraLLEl-GS pack mode): keep the GS state machine, VRAM and palettes current but
+        // record no draws -- the cheap parse that feeds texture identification while another backend renders.
+        static const bool s_noDraw = [](){ const char *v = std::getenv("PS2X_GS_NODRAW"); return (v && v[0] && v[0] != '0') || ps2x_pgs::packMode(); }();
         static const bool s_dp = [](){ const char *v = std::getenv("PS2X_DMAPROF"); return v && v[0] && v[0] != '0'; }();
-        if (s_dp)
+        if (s_noDraw)
+        {   // state only + [rtstale] page stamps
+            noteDrawTargetPages();
+            // [pgscensus] PS2X_PGS_CENSUS=1: the large textured kicks (>= 20% of 640x448), with the texture registers and
+            // what our identification returns for them -- which draws carry pack images onto the middle of the screen?
+            static const bool s_census = [](){ const char *v = std::getenv("PS2X_PGS_CENSUS"); return v && v[0] && v[0] != '0'; }();
+            static unsigned s_cn = 0;
+            static const int s_censusMode = [](){ const char *v = std::getenv("PS2X_PGS_CENSUS"); return v && v[0] ? std::atoi(v) : 0; }();
+            static unsigned s_skyN = 0;
+            static unsigned s_c16N = 0;
+            static unsigned s_c336N = 0;
+            static std::unordered_map<uint64_t, uint32_t> s_c336Seen;
+            if (s_censusMode == 4 && s_c336N < 60 && m_vtxCount >= 2 && activeContext().frame.fbp == 336u)
+            {   // the outline chain into page 336: one line per distinct (fbmsk, alpha, tex, U-X, V-Y) class
+                const GSContext &ctx = activeContext();
+                const float ofx = ctx.xyoffset.ofx / 16.0f, ofy = ctx.xyoffset.ofy / 16.0f;
+                const GSVertex &a = m_vtxQueue[0], &b = m_vtxQueue[1];
+                const int dux = int(std::lround((a.u / 16.0f) - (a.x - ofx))), dvy = int(std::lround((a.v / 16.0f) - (a.y - ofy)));
+                const uint64_t key = (uint64_t(ctx.frame.fbmsk) << 32) ^ (uint64_t(ctx.alpha & 0xFFu) << 24) ^ (uint64_t(ctx.tex0.tbp0) << 8) ^ uint64_t(ctx.tex0.psm) ^ (uint64_t(uint32_t(dux + 64)) << 48) ^ (uint64_t(uint32_t(dvy + 64)) << 56);
+                if (s_c336Seen[key]++ == 0u)
+                {
+                    s_c336N++;
+                    std::fprintf(stderr, "[pgsc336] #%u prim %d tme %d abe %d fbw %u psm %u fbmsk %08x alpha %02llx test %llx tex tbp0 %u psm %u %ux%u cbp %u | U-X %d V-Y %d | v0 (%.2f,%.2f uv %.2f,%.2f) v1 (%.2f,%.2f uv %.2f,%.2f)\n",
+                                 s_c336N, int(m_prim.type), m_prim.tme ? 1 : 0, m_prim.abe ? 1 : 0, ctx.frame.fbw, unsigned(ctx.frame.psm), ctx.frame.fbmsk, (unsigned long long)(ctx.alpha & 0xFFu), (unsigned long long)ctx.test,
+                                 ctx.tex0.tbp0, unsigned(ctx.tex0.psm), 1u << ctx.tex0.tw, 1u << ctx.tex0.th, ctx.tex0.cbp, dux, dvy,
+                                 a.x - ofx, a.y - ofy, a.u / 16.0f, a.v / 16.0f, b.x - ofx, b.y - ofy, b.u / 16.0f, b.v / 16.0f);
+                }
+            }
+            {   // [vramprobe] the 32-sprite depth-mask pass just finished -> ask the pgs module to dump the frame alpha
+                static unsigned s_c16run = 0;
+                if (activeContext().frame.psm == GS_PSM_CT16) { if (++s_c16run == 32u) { ps2x_pgs::g_pgsProbeFbp.store(activeContext().frame.fbp); ps2x_pgs::g_pgsProbeZbp.store(activeContext().zbuf.zbp); ps2x_pgs::g_pgsProbeReq.store(1); } }
+                else s_c16run = 0;
+            }
+            if (s_censusMode == 3 && s_c16N < 48 && m_vtxCount > 0 && activeContext().frame.psm == GS_PSM_CT16)
+            {   // [pgscensus] every kick into a 16-bit FRAME view: BT3's depth-mask columns (must sit on x = 8..15 mod 16 of
+                // the 16-bit view to land in the alpha halves of the 32-bit scene; anywhere else they paint columns)
+                s_c16N++;
+                const GSContext &ctx = activeContext();
+                const float ofx = ctx.xyoffset.ofx / 16.0f, ofy = ctx.xyoffset.ofy / 16.0f;
+                std::fprintf(stderr, "[pgsc16] #%u prim %d tme %d abe %d fbp %u fbw %u fbmsk %08x zbp %u zmsk %d tex tbp0 %u psm %u %ux%u test %llx scissor (%u,%u)-(%u,%u) xyoff (%.2f,%.2f) verts:",
+                             s_c16N, int(m_prim.type), m_prim.tme ? 1 : 0, m_prim.abe ? 1 : 0, ctx.frame.fbp, ctx.frame.fbw, ctx.frame.fbmsk, unsigned(ctx.zbuf.zbp), ctx.zbuf.zmask ? 1 : 0,
+                             ctx.tex0.tbp0, unsigned(ctx.tex0.psm), 1u << ctx.tex0.tw, 1u << ctx.tex0.th, (unsigned long long)ctx.test,
+                             unsigned(ctx.scissor.x0), unsigned(ctx.scissor.y0), unsigned(ctx.scissor.x1), unsigned(ctx.scissor.y1), ofx, ofy);
+                const int nv = m_vtxCount < kMaxVerts ? m_vtxCount : kMaxVerts;
+                for (int i = 0; i < nv; ++i) { const GSVertex &v = m_vtxQueue[i]; std::fprintf(stderr, " [%.3f,%.3f uv %.2f,%.2f]", v.x - ofx, v.y - ofy, v.u / 16.0f, v.v / 16.0f); }
+                std::fprintf(stderr, "\n");
+            }
+            if (s_censusMode == 2 && s_skyN < 24 && m_prim.tme && m_vtxCount > 0 && activeContext().tex0.tw == 10 && activeContext().tex0.th == 8)
+            {   // every draw with a 1024x256 texture (the sky), with its vertices: frame-space x/y, u/v (texels), s/t/q
+                s_skyN++;
+                const GSContext &ctx = activeContext();
+                const float ofx = ctx.xyoffset.ofx / 16.0f, ofy = ctx.xyoffset.ofy / 16.0f;
+                std::fprintf(stderr, "[pgssky] #%u prim %d fst %d tbp0 %u psm %u clamp %llx tex1 %llx fbp %u scissor (%u,%u)-(%u,%u) verts:", s_skyN, int(m_prim.type), m_prim.fst ? 1 : 0, ctx.tex0.tbp0, unsigned(ctx.tex0.psm), (unsigned long long)ctx.clamp, (unsigned long long)ctx.tex1, ctx.frame.fbp, unsigned(ctx.scissor.x0), unsigned(ctx.scissor.y0), unsigned(ctx.scissor.x1), unsigned(ctx.scissor.y1));
+                const int nv = m_vtxCount < kMaxVerts ? m_vtxCount : kMaxVerts;
+                for (int i = 0; i < nv; ++i)
+                {
+                    const GSVertex &v = m_vtxQueue[i];
+                    std::fprintf(stderr, " [%.3f,%.3f uv %.3f,%.3f stq %.4f,%.4f,%.4f]", v.x - ofx, v.y - ofy, v.u / 16.0f, v.v / 16.0f, v.s, v.t, v.q);
+                }
+                std::fprintf(stderr, "\n");
+            }
+            static std::unordered_map<uint64_t, uint32_t> s_seen;   // distinct (tbp0, psm, tw, th, prim, fbp) -> count
+            if (s_census && s_cn < 200 && m_prim.tme && m_vtxCount > 0)
+            {
+                const GSContext &ctx = activeContext();
+                float mnX = 1e9f, mxX = -1e9f, mnY = 1e9f, mxY = -1e9f;
+                const int nv = m_vtxCount < kMaxVerts ? m_vtxCount : kMaxVerts;
+                for (int i = 0; i < nv; ++i) { mnX = std::min(mnX, m_vtxQueue[i].x); mxX = std::max(mxX, m_vtxQueue[i].x); mnY = std::min(mnY, m_vtxQueue[i].y); mxY = std::max(mxY, m_vtxQueue[i].y); }
+                const float ofx = ctx.xyoffset.ofx / 16.0f, ofy = ctx.xyoffset.ofy / 16.0f;
+                const float area = (mxX - mnX) * (mxY - mnY);
+                const uint64_t key = (uint64_t(ctx.tex0.tbp0) << 40) | (uint64_t(ctx.tex0.psm) << 32) | (uint64_t(ctx.tex0.tw) << 28) | (uint64_t(ctx.tex0.th) << 24) | (uint64_t(m_prim.type) << 20) | uint64_t(ctx.frame.fbp);
+                if (area >= 0.2f * 640.0f * 448.0f && s_seen[key]++ == 0u)
+                {
+                    s_cn++;
+                    const GSTex0Reg &t = ctx.tex0;
+                    std::string name = "-";
+                    if (t.psm == GS_PSM_T8 || t.psm == GS_PSM_T4)
+                    {
+                        uint32_t clut[256] = {};
+                        const int n = GSRasterizer::fillClutForBackend(clut, m_vram, m_texa, m_texclut, t);
+                        ps2tex::TexIdent id;
+                        if (n > 0 && ps2tex::identify(m_vram, t.tbp0, t.tbw, t.psm, t.tw, t.th, clut, m_texa.ta0, m_texa.aem, m_texa.ta1, id)) name = id.name();
+                    }
+                    uint32_t stalePg = ~0u;
+                    const bool drawn = rtRegionDrawn(*this, t.tbp0, t.tbw, t.psm, 0u, 0u, (1u << t.tw) - 1u, (1u << t.th) - 1u, &stalePg);
+                    std::fprintf(stderr, "[pgscensus] #%u prim %d box (%.0f,%.0f)-(%.0f,%.0f) frame fbp %u fbw %u psm %u | zbp %u zmsk %d | tex tbp0 %u tbw %u psm %u %ux%u cbp %u cpsm %u csa %u | abe %d alpha %llx test %llx clamp %llx tex1 %llx | drawn %d (pg %u) ident %s\n",
+                                 s_cn, int(m_prim.type), mnX - ofx, mnY - ofy, mxX - ofx, mxY - ofy, ctx.frame.fbp, ctx.frame.fbw, unsigned(ctx.frame.psm),
+                                 unsigned(ctx.zbuf.zbp), ctx.zbuf.zmask ? 1 : 0, t.tbp0, unsigned(t.tbw), unsigned(t.psm), 1u << t.tw, 1u << t.th, t.cbp, unsigned(t.cpsm), unsigned(t.csa),
+                                 m_prim.abe ? 1 : 0, (unsigned long long)ctx.alpha, (unsigned long long)ctx.test, (unsigned long long)ctx.clamp, (unsigned long long)ctx.tex1,
+                                 drawn ? 1 : 0, stalePg, name.c_str());
+                }
+            }
+        }
+        else if (s_dp)
         {
             static std::atomic<uint64_t> s_ns{0}, s_n{0}, s_texN{0};
             auto t0 = std::chrono::steady_clock::now();
@@ -4425,7 +4628,10 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         // it targeted were authentic 64-byte palette patches). Opt-in for experiments only.
         static const bool s_atomic = [](){ const char *v = std::getenv("PS2X_ATOMICCLUT"); return v && v[0] && v[0] != '0'; }();
             if (!s_atomic || m_transferState.copied_pixels >= m_transferState.total_pixels)
+            {
                 bumpPageUploadGen(dbp, static_cast<uint32_t>(dbw) * rrh);   // [clutpagegen]
+                rtStampWritten(*this, dbp, dbw, m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh);   // [rtstale]
+            }
         }
     }
 
@@ -5078,6 +5284,13 @@ void ps2GsEmitFmvFrame()
     if (!s_on)
         return;
 
+    // [fmvwindow] "a movie frame is being shown" is decided HERE, by the movie player's cadence, not by whether our
+    // GS parse captured the pixels: with the paraLLEl-GS backend in exclusive mode the parse is off, the capture
+    // below never fills, and the early return kept the sceGsSwapDBuff clear active through the whole movie -- the
+    // old "slow movie, black flashes, X does not skip" symptom (see [dbuffclear] in Kernel/Stubs/GS.cpp).
+    g_fmvLastEmitNs.store((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
+
     // Publish the most recent COMPLETED movie frame ([fmvcapture]). This runs once per
     // sceMpegGetPicture -- more often than frames arrive -- and that cadence is deliberate: the
     // CD-tick pump allows 4 disc pumps per PUBLISH (Interrupt.cpp [cdgate]), so publishing only on
@@ -5149,6 +5362,7 @@ void ps2GsEmitFmvFrame()
 std::atomic<unsigned long> g_ps2xDispFlipHookCalls{0}, g_ps2xDispPrivCalls{0};   // [displatch] diag
 extern "C" void ps2xGsDisplayFlipHook(unsigned long long dispfb)
 {
+    ps2x_pgs::streamFlip((uint64_t)dispfb);   // [pgs] stream-ordered flip for the backend's scanout
     g_ps2xDispFlipHookCalls.fetch_add(1u, std::memory_order_relaxed);
     if (GsGpuRenderer::enabled())
         ps2GpuRenderer().setDisplay(static_cast<uint32_t>(dispfb & 0x1FFu), static_cast<uint32_t>((dispfb >> 9) & 0x3Fu));

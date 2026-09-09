@@ -40,3 +40,7 @@ games/bt3/work
 log.txt
 log_*.txt
 __pycache__/
+
+
+# local build trees (build_pre, build_pgs, ...)
+build_*/

@@ -1,0 +1,3 @@
+[submodule "ps2xRuntime/third_party/parallel-gs"]
+	path = ps2xRuntime/third_party/parallel-gs
+	url = https://github.com/z3xox/parallel-gs

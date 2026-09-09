@@ -1,4 +1,5 @@
 #include "runtime/ps2_gif_arbiter.h"
+#include "runtime/ps2_gs_pgs.h"   // [pgs]
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -59,6 +60,20 @@ void GifArbiter::takeQueue(std::vector<GifArbiterPacket> &out)
 void GifArbiter::process(const GifArbiterPacket &pkt)
 {
     if (!m_processFn || pkt.data.empty()) return;
+    if (ps2x_pgs::enabled())
+    {   // [pgs] the paraLLEl-GS backend consumes the same packet, on its own path index. Pack mode: OUR parse first, so the
+        // VRAM and palettes its replacement hook hashes already include this packet's uploads.
+        if (ps2x_pgs::packMode())
+        {
+            g_gifArbCurPath = static_cast<uint8_t>(pkt.pathId);
+            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            g_gifArbCurPath = 0;
+            ps2x_pgs::gifTransfer(static_cast<uint8_t>(pkt.pathId), pkt.data.data(), pkt.data.size());
+            return;
+        }
+        const bool consumed = ps2x_pgs::gifTransfer(static_cast<uint8_t>(pkt.pathId), pkt.data.data(), pkt.data.size());
+        if (consumed && ps2x_pgs::exclusive()) return;   // not consumed (backend unavailable): our parse takes it
+    }
     g_gifArbCurPath = static_cast<uint8_t>(pkt.pathId);
     m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
     g_gifArbCurPath = 0;

@@ -419,6 +419,8 @@ public:
     inline u32 ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const;
 
     uint8_t *vramData() { return m_vram; }
+    const GSTexClutReg &texclutReg() const { return m_texclut; }   // [pgs-texreplace]
+    const GSTexaReg &texaReg() const { return m_texa; }
     // [slice] raw shadow of every general register written via writeRegister (A+D, REGLIST,
     // PACKED). Lets the replay slicer re-emit the full register state as one A+D packet.
     const uint64_t *rawRegs() const { return m_rawRegs; }
@@ -440,6 +442,17 @@ public:
         if (p1 > 511u) p1 = 511u;
         for (uint32_t p = p0; p <= p1; ++p) ++m_pageUploadGen[p];
     }
+    // [rtstale] pack mode (state-only parse, another backend renders): which pages the GAME drew into vs. wrote by
+    // upload/local copy, as one global sequence. Our VRAM mirror never receives rendered pixels, so a texture
+    // identification over a page drawn since its last write hashes stale bytes (the previous texture at that
+    // address) and the pack hook would hand the backend the wrong image -- portraits and energy bars on the
+    // post-process quads. The hook refuses such pages instead.
+    uint32_t m_pageWriteSeq[512]{}, m_pageDrawSeq[512]{};
+    uint32_t m_pageSeqCounter = 0;
+    bool pageDrawnSinceWrite(uint32_t pg) const { return pg < 512u && m_pageDrawSeq[pg] > m_pageWriteSeq[pg]; }
+    // Stamps use the exact page footprint of a region in its pixel format (page 64x32 / 64x64 / 128x64 / 128x128,
+    // FBW/TBW pages per row, plus the linear spill into page+1 of a block-offset base) -- helpers in ps2_gs_gpu.cpp.
+    void noteDrawTargetPages();   // [rtstale] per kick in state-only mode: stamp the frame/Z pages the primitive covers
 
 private:
     void snapshotVRAM();

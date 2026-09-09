@@ -123,3 +123,37 @@ Known issues:
 - *Dragon Ball Z: Budokai Tenkaichi 3* © Spike / Bandai Namco. This project is
   not affiliated with or endorsed by them; it exists for preservation and
   interoperability, and distributes no game content.
+
+## Experimental: paraLLEl-GS backend (branch `parallel-gs`)
+
+This branch carries a second graphics backend: the PS2 GS emulated in Vulkan compute by
+[paraLLEl-GS](https://github.com/Arntzen-Software/parallel-gs) (Arntzen Software, LGPL-3.0-or-later), fed with the
+same GIF packet stream our OpenGL renderer consumes. It is VRAM-exact, so the whole family of render-target aliasing
+workarounds in the GL renderer is unnecessary on this path.
+
+Status (2026-09-10): logos, movies, menus and fights (1P and splitscreen) render correctly in exclusive mode (our own
+GS parse off). Measured on a 9800X3D + RTX 5080 at 1x, per game frame at 30 fps: 1P fight 2.8 ms CPU + 2.9 ms GPU
+(GL path: 5.5 ms + 7.5 ms); splitscreen 5.0 ms CPU + 4.4 ms GPU; splitscreen at 16x supersampling 5.9 ms CPU +
+8.9 ms GPU. Presentation still crosses Vulkan -> CPU -> OpenGL through a fenced readback ring (0.06 ms, one frame of
+latency); texture packs and the Windows build are not wired up on this path yet.
+
+Build (Linux; the checkout is a git submodule with its own Granite submodule):
+
+```
+git submodule update --init --recursive
+cmake -S . -B build_pgs -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja -C build_pgs ps2EntryRunner
+```
+
+CMake picks the backend up automatically when `ps2xRuntime/third_party/parallel-gs/CMakeLists.txt` exists
+(`-DPS2X_DISABLE_PGS=ON` to leave it out). The backend is the DEFAULT renderer when built in: the overlay's
+Renderer dropdown (`[video] renderer=` 0 OpenGL, 1 software, 2 paraLLEl-GS, takes effect on restart) selects it, and the
+runtime falls back to OpenGL by itself if Vulkan is unavailable. Environment overrides still work (`PS2X_PGS=0/1`,
+`PS2X_PGS_EXCLUSIVE=1`). Knobs: `PS2X_PGS_SSAA=1|2|4|8|16`
+(4 = render-scale-2 geometry, 16 = render-scale-4), `PS2X_PGS_HIRES=0|1|2` (scanout 1x/2x/4x; unset = fit the window; 2x needs SSAA 4, 4x needs 16), `PS2X_PGS_PRESENTMIP=0` (no mipmapped downscale at the present), `PS2X_PGS_COALESCE=1`,
+`PS2X_PGS_TIMESTAMPS=1` (per-stage GPU times in the `[pgs]` log line), `PS2X_PGS_DUMP=<dir>` (presented frames as PNG),
+`PS2X_PGS_LIVEFLIP=1`, `PS2X_PGS_SYNCREADBACK=1` / `PS2X_PGS_NOREADBACK=1` (A/B switches). Keyboard input: set the
+controller device to Keyboard in the overlay if a gamepad-like device is present (Auto prefers it).
+
+Licence note: paraLLEl-GS is LGPL-3.0-or-later and this repository is GPL-3.0; the combination is distributed under
+GPL-3.0. Its licence text is `ps2xRuntime/third_party/parallel-gs/COPYING.LGPLv3`.
