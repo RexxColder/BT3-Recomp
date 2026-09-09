@@ -24,6 +24,18 @@ log() { echo "== $*"; }
 
 mkdir -p "$OUT/stage/lib" "$OUT/stage/savedata/BASLUS-21678DBZT3" "$OUT/stage/logs"
 
+# ---- 0. generate the player tables from the ISO (optional) ------------------
+# A fresh clone has no game code: games/bt3/setup.py --gen-only extracts the
+# ISO, builds the recompiler, and installs runner + overlay sources into the
+# (rw-mounted) source tree. PS2X_BUILD_DIR keeps recompiler objects inside the
+# build workspace instead of the host's build/. Steps 1-6 only; the actual
+# runner/launcher build below reuses those generated sources.
+if [[ -n "${PS2X_ISO:-}" ]]; then
+    log "generating runner + overlay sources from ISO"
+    export PS2X_BUILD_DIR="$RUNNER_BUILD/gen"
+    python3 "$SRC/games/bt3/setup.py" "$PS2X_ISO" --gen-only --jobs "$JOBS"
+fi
+
 # ---- 1. runner (bt3-runner), mirrors setup.py's configure ---------------
 if [[ ! -f "$RUNNER_BUILD/CMakeCache.txt" ]]; then
     log "configuring runner (Release)"

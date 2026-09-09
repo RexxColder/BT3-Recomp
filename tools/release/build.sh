@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Host driver for the baseline Ubuntu 22.04 (glibc 2.35) build.
 #
-#   tools/release/build.sh [--reuse-deps] [--jobs N]
+#   tools/release/build.sh [--iso PATH] [--reuse-deps] [--jobs N]
+#
+# If --iso is given, the container runs games/bt3/setup.py --gen-only against it
+# (extract + recompile + overlay), so a fresh clone produces the player tables
+# without any host-side generation step. Without --iso it prompts for one; pass
+# an empty answer to build from already-generated sources.
 #
 # Produces build/release/out/stage/  (runner + launcher + bundled libs, all
 # with the container glibc floor) and build/release/out/floor-report.txt.
@@ -14,13 +19,17 @@ OUT="$RELEASE/out"
 RUNNER_BUILD="$RELEASE/runner"
 LAUNCH_BUILD="$RELEASE/launcher"
 IMG="bt3-release:jammy"
+ISO_DEFAULT="/home/rexx/Descargas/Roms/PS2/DragonBall Z - Budokai Tenkaichi 3.iso"
 
 JOBS="${BT3_RELEASE_JOBS:-$(nproc)}"
 REUSE_DEPS=0
+ISO=""
 for a in "$@"; do
     case "$a" in
         --reuse-deps) REUSE_DEPS=1 ;;
         --jobs=*) JOBS="${a#--jobs=}" ;;
+        --iso) ISO="$2"; shift ;;
+        --iso=*) ISO="${a#--iso=}" ;;
     esac
 done
 
@@ -36,6 +45,25 @@ fi
 
 mkdir -p "$OUT" "$RUNNER_BUILD" "$LAUNCH_BUILD"
 
+# ---- ISO selection (prompt before exec) ---------------------------------------
+if [[ "$ISO" == "" ]]; then
+    read -r -p "BT3 ISO path (Enter = ${ISO_DEFAULT}, 'none' = build from generated sources): " ISO
+    case "$ISO" in
+        "") ISO="$ISO_DEFAULT" ;;
+        none|NONE|None) ISO="" ;;
+    esac
+fi
+ISO_ARG=""
+if [[ "$ISO" != "" ]]; then
+    if [[ ! -f "$ISO" ]]; then
+        echo "ERROR: ISO not found: $ISO" >&2; exit 2
+    fi
+    echo "== ISO: $ISO"
+    ISO_ARG=(-e PS2X_ISO=/srv/bt3.iso -v "$ISO:/srv/bt3.iso:ro")
+else
+    echo "== no ISO: building from already-generated sources"
+fi
+
 echo "== building image $IMG"
 $D docker build -t "$IMG" "$ROOT/tools/release"
 
@@ -50,7 +78,8 @@ $D docker run --rm \
     --user "$(id -u):$(id -g)" \
     -e HOME=/w/runner \
     -e BT3_RELEASE_JOBS="$JOBS" \
-    -v "$ROOT:/src:ro" \
+    "${ISO_ARG[@]}" \
+    -v "$ROOT:/src" \
     -v "$RUNNER_BUILD:/w/runner" \
     -v "$LAUNCH_BUILD:/w/launcher" \
     -v "$OUT:/out" \

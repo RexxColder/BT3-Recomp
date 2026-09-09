@@ -21,6 +21,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         file \
         ccache \
         mold \
+        # games/bt3/setup.py --gen-only: python3 + ISO extraction (bsdtar reads
+        # ISO9660 directly; 7z as fallback; make -> bsdtar/7z come from apt)
+        python3 \
+        libarchive-tools \
+        p7zip-full \
+        make \
         # FFmpeg 4.4 (runner links libavcodec.so.58/libavformat.so.58)
         libavcodec-dev \
         libavformat-dev \
