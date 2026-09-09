@@ -73,7 +73,10 @@ else()
         # [ps2x raylib patch] batch multi-buffering (4 buffers), no per-flush texture/VAO/program unbinds,
         # draw-call/flush counters + flush timer read by the fps line. Applied once at populate time;
         # the reverse --check makes a re-populate of an already-patched source a no-op.
-        PATCH_COMMAND git apply --reverse --check --quiet "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch" || git apply --ignore-whitespace "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch"
+        # NOTE: keep "--check" WITHOUT "--quiet": Ubuntu 22.04 ships git 2.34, where the
+        # combination exits 129 (usage error), so a patched source would fall through to the
+        # forward apply and fail. Verify with `git apply --reverse --check`.
+        PATCH_COMMAND git apply --reverse --check "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch" || git apply --ignore-whitespace "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch"
     )
     FetchContent_MakeAvailable(raylib)
 
@@ -84,7 +87,7 @@ else()
     # the pristine 5.5 sources (git checkout -- .) and apply it fresh. Idempotent on every configure.
     if(EXISTS "${raylib_SOURCE_DIR}/src/rlgl.h")
         set(_rl_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch")
-        execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --reverse --check --quiet "${_rl_patch}"
+        execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --reverse --check "${_rl_patch}"
                         RESULT_VARIABLE _rl_patched OUTPUT_QUIET ERROR_QUIET)
         if(NOT _rl_patched EQUAL 0)
             execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --check --ignore-whitespace "${_rl_patch}"

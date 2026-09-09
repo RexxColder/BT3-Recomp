@@ -100,6 +100,7 @@ namespace ps2recomp
            << std::dec;
         ss << "\n";
 
+        bool pendingLabel = false;
         for (size_t i = 0; i < instructions.size(); ++i)
         {
             const Instruction &inst = instructions[i];
@@ -107,6 +108,7 @@ namespace ps2recomp
             if (internalTargets.contains(inst.address))
             {
                 ss << "label_" << std::hex << inst.address << std::dec << ":\n";
+                pendingLabel = true;
             }
 
             if (cg.m_emitInstructionComments)
@@ -143,9 +145,11 @@ namespace ps2recomp
                     if (hasDecodedDelaySlot && internalTargets.contains(delaySlot->address))
                     {
                         ss << "label_" << std::hex << delaySlot->address << std::dec << ":\n";
+                        pendingLabel = true;
                     }
 
                     ss << cg.handleBranchDelaySlots(inst, *delaySlot, function, analysisResult);
+                    pendingLabel = false;
 
                     if (hasDecodedDelaySlot)
                     {
@@ -164,8 +168,13 @@ namespace ps2recomp
                     {
                         ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
                            << std::dec;
+                        pendingLabel = false;
                     }
                     ss << "    " << translated;
+                    if (translated.rfind("//", 0) != 0)
+                    {
+                        pendingLabel = false;
+                    }
                     if (inst.isMmio)
                     {
                         ss << " // MMIO: 0x" << std::hex << inst.mmioAddress << std::dec;
@@ -186,6 +195,10 @@ namespace ps2recomp
             }
         }
 
+        if (pendingLabel)
+        {
+            ss << "    ;\n";
+        }
         ss << "}\n";
         return ss.str();
     }
