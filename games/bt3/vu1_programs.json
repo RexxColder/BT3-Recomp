@@ -1,0 +1,92 @@
+{
+  "_comment": "VU1 microprograms of SLUS_216.78 (USA) as ELF file offsets. games/bt3/vu1_programs.py cuts them out of the user's own ELF, verifies the hashes and feeds ps2xRuntime/tools/gen_vu1.py; nothing here is game content. A program stored as VIF MPG packets appears as several segments (the 8-byte MPG header between 2 KB chunks is skipped). fnv1a64 is the hash the runtime matches an uploaded program with.",
+  "elf_sha256": "811188ba9b416500d921cd4d9514df0cbf42f3a41a99cf5aac5a3da37171bf99",
+  "image_size": "0x4000",
+  "programs": [
+    {
+      "id": "3b5dfe97",
+      "extent": "0x3f8",
+      "fnv1a64": "0x0492d545dc59311d",
+      "segments": [
+        {
+          "offset": "0x1c06b8",
+          "length": "0x3f8"
+        }
+      ]
+    },
+    {
+      "id": "925edd7c",
+      "extent": "0x328",
+      "fnv1a64": "0x7e8efb7575b22f69",
+      "segments": [
+        {
+          "offset": "0x1c11c8",
+          "length": "0x328"
+        }
+      ]
+    },
+    {
+      "id": "1627a6cb",
+      "extent": "0xc78",
+      "fnv1a64": "0x0b7f264e0237b48e",
+      "segments": [
+        {
+          "offset": "0x1c14f8",
+          "length": "0x800"
+        },
+        {
+          "offset": "0x1c1d00",
+          "length": "0x478"
+        }
+      ]
+    },
+    {
+      "id": "4d070cb1",
+      "extent": "0xe18",
+      "fnv1a64": "0x05c48715b8434850",
+      "segments": [
+        {
+          "offset": "0x1c2f08",
+          "length": "0x800"
+        },
+        {
+          "offset": "0x1c3710",
+          "length": "0x618"
+        }
+      ]
+    },
+    {
+      "id": "db3bf3bf",
+      "extent": "0x2f0",
+      "fnv1a64": "0x28ce214c0c35fc68",
+      "segments": [
+        {
+          "offset": "0x1c4088",
+          "length": "0x2f0"
+        }
+      ]
+    },
+    {
+      "id": "664061aa",
+      "extent": "0x340",
+      "fnv1a64": "0xff81d66058071344",
+      "segments": [
+        {
+          "offset": "0x1c3d38",
+          "length": "0x340"
+        }
+      ]
+    },
+    {
+      "id": "ccb6aa07",
+      "extent": "0x3e0",
+      "fnv1a64": "0xa0a38043aeaa231a",
+      "segments": [
+        {
+          "offset": "0x1c0ab8",
+          "length": "0x3e0"
+        }
+      ]
+    }
+  ]
+}

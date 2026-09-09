@@ -63,6 +63,8 @@ get the new default — blanking it is not enough, an empty value still counts a
   live in `ps2xRecomp/` and apply during generation.
 - Game-specific runtime fixes (camera-matrix stub, HLE acosf, demo-crash guards,
   sound/pad compatibility) live in `ps2xRuntime/` behind a game descriptor.
+- `games/bt3/vu1_programs.json` locates the VU1 microprograms in the ELF (offsets and hashes only); `vu1_programs.py`
+  cuts them out at setup time and `ps2xRuntime/tools/gen_vu1.py` translates them (output git-ignored).
 - `games/bt3/functions.csv` is the function map; `games/bt3/apply_patches.py` holds
   the few source-level patches that must live inside generated code.
 - Generated sources are never committed.

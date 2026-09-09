@@ -30,6 +30,13 @@ extern const Prog kPrograms[];
 extern const int kProgramCount;
 }
 static thread_local bool t_vuNoJit = false;
+// [vumicro] where the microprogram census / the [vu1jit] miss dump write their 16 KB images: PS2X_VUMICRO_DIR
+// (default: the working directory). Used to be a hard-coded developer path.
+static void vumicroDumpPath(char *out, size_t cap, uint64_t hash)
+{
+    const char *d = std::getenv("PS2X_VUMICRO_DIR");
+    std::snprintf(out, cap, "%s/vumicro_%016llx.bin", d && d[0] ? d : ".", (unsigned long long)hash);
+}
 
 // Shared with ps2_vif1_interpreter.cpp (PS2X_KICKHIST unpack-history ring).
 struct Vif1UnpackRec { uint32_t destQw, cnt, srcGuest, spr; uint64_t frame; };
@@ -966,7 +973,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             s_msGen = gen; s_curHash = h;
             if (s_ms.find(h) == s_ms.end())
             {
-                char path[160]; std::snprintf(path, sizeof path, "/home/z3/Desktop/bt3/work/vumicro_%016llx.bin", (unsigned long long)h);
+                char path[512]; vumicroDumpPath(path, sizeof path, h);
                 if (FILE *f = std::fopen(path, "wb")) { std::fwrite(vuCode, 1, codeSize, f); std::fclose(f); }
             }
         }
@@ -1096,7 +1103,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 std::lock_guard<std::mutex> lk(s_mdMtx);
                 if (s_mdSeen.insert(h).second)
                 {
-                    char path[160]; std::snprintf(path, sizeof path, "/home/z3/Desktop/bt3/work/vumicro_%016llx.bin", (unsigned long long)h);
+                    char path[512]; vumicroDumpPath(path, sizeof path, h);
                     FILE *f = std::fopen(path, "wb"); if (f) { std::fwrite(vuCode, 1, codeSize, f); std::fclose(f); }
                     std::fprintf(stderr, "[vu1jit] uncompiled microcode %016llx extent 0x%x (gen %u) %s %s\n", (unsigned long long)h,
                                  g_vu1MpgHi.load(std::memory_order_relaxed), gen, f ? "dumped to" : "could not write", path);
@@ -4069,4 +4076,13 @@ void VU1Interpreter::jitStatPrint()   // [jitstat]
 }
 
 #include "vu1_jit_ops.inc"
+// [vu1manifest] the translated microprograms are generated from the user's ELF by games/bt3/vu1_programs.py
+// (git-ignored). A tree without the game builds with an empty table: every program runs in the interpreter.
+#if __has_include("vu1_jit_gen.inc")
 #include "vu1_jit_gen.inc"
+#else
+namespace vujit {
+const Prog kPrograms[1] = {};
+const int kProgramCount = 0;
+}
+#endif

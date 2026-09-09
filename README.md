@@ -108,6 +108,7 @@ Known issues:
 | `games/bt3/setup.py` | cross-platform build pipeline (`--deploy`, `--skip-setup`, `--jobs`) |
 | `docs/DEPLOY.md` | the deploy structure and self-extracting launcher documentation |
 | `games/bt3/functions.csv`, `dbzp_*.csv` | function address maps (symbols only) |
+| `games/bt3/vu1_programs.json` | ELF offsets + hashes of the VU1 microprograms (the translation is generated from your ELF at setup) |
 | `games/bt3/gen_overlay.py`, `apply_patches.py` | generators for the game-specific pieces |
 | `ps2xRecomp/` | the static recompiler (with EE FPU/VU semantics fixes) |
 | `ps2xRuntime/` | runtime: memory, GS/GPU renderer, VU1, scheduler, game overrides |

@@ -280,6 +280,15 @@ def main() -> None:
             if os.environ.get("PS2X_SETUP_FORCE") != "1":
                 sys.exit(1)
 
+    # 2b. [vu1manifest] the static VU1 recompiler's input: the game's VU1 microprograms, cut out of the ELF by
+    #     games/bt3/vu1_programs.json (offsets + hashes only) and translated by ps2xRuntime/tools/gen_vu1.py into
+    #     ps2xRuntime/src/lib/vu1_jit_gen.inc (git-ignored, like the EE runner sources). Runs with --skip-setup
+    #     too: it takes seconds, and a tree without the file still builds (VU1 interpreter only).
+    print("== generating VU1 programs from the ELF")
+    sys.path.insert(0, str(HERE))
+    from vu1_programs import generate as generate_vu1
+    generate_vu1(elf, ROOT / "ps2xRuntime", WORK / "vu1")
+
     # 3. Configure + build the recompiler. Configure only once: the globs use
     #    CONFIGURE_DEPENDS, so later builds re-run cmake by themselves when the
     #    source set changes — and an unnecessary reconfigure rewrites the MSVC
