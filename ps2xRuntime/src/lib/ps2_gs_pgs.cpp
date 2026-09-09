@@ -17,8 +17,6 @@
 #include <cstring>
 #include <mutex>
 
-extern std::atomic<uint64_t> g_pgsWaitNs, g_pgsWaitCount, g_pgsIdleNs, g_pgsIdleCount;   // [pgs-waitstat] Granite fence/idle waits
-
 namespace ps2x_pgs
 {
 namespace
@@ -73,7 +71,6 @@ struct State
     struct SlowCall { double ms; uint32_t size, path, nloop, flg, nreg; uint64_t regs; uint32_t firstAD; };   // [pgs-slow] the 3 slowest gif_transfer calls per window
     SlowCall slowCalls[3] = {};
     uint32_t slowOver1ms = 0;
-    uint64_t waitNs0 = 0, waitCnt0 = 0, idleNs0 = 0, idleCnt0 = 0;
     uint64_t streamDispfb1 = 0; bool haveStreamFlip = false;   // the game's DISPFB1 flip, carried in stream order ([displatch] job)
     uint64_t streamFlips = 0, flipMismatch = 0, lastFb1 = 0, lastLive1 = 0, lastLive2 = 0;   // [pgsflip] diagnostics
     uint32_t privHist[0x20] = {};   // privileged stores per 16-byte slot since the last stats line (bus + pseudo regs)
@@ -371,13 +368,10 @@ void onSwap()
         std::fprintf(stderr, "[pgs] cpu gif_transfer %.1f ms/s (%.2f ms/swap) | priv writes/s:", s.xferMs / dt, s.swaps ? s.xferMs / s.swaps : 0.0);
         for (int k = 0; k < 0x20; k++) if (s.privHist[k]) { std::fprintf(stderr, " %02x=%.0f", k << 4, s.privHist[k] / dt); s.privHist[k] = 0; }
         std::fprintf(stderr, " pseudo=%.0f", s.pseudoSeen / dt); s.pseudoSeen = 0;
-        {   // per swap: paraLLEl-GS render passes / copies / palette updates / primitives, and Granite blocking waits
-            const uint64_t wn = g_pgsWaitNs.load(), wc = g_pgsWaitCount.load(), in = g_pgsIdleNs.load(), ic = g_pgsIdleCount.load();
+        {   // per swap: paraLLEl-GS render passes / copies / palette updates / primitives (consume_flush_stats)
             const double sw = s.swaps ? double(s.swaps) : 1.0;
-            std::fprintf(stderr, " | per swap: passes %.1f copies %.1f pal %.1f prims %.0f | fence waits %.1f (%.2f ms) idle waits %.1f (%.2f ms)",
-                         s.fsPasses / sw, s.fsCopies / sw, s.fsPal / sw, s.fsPrims / sw,
-                         (wc - s.waitCnt0) / sw, (wn - s.waitNs0) / 1e6 / sw, (ic - s.idleCnt0) / sw, (in - s.idleNs0) / 1e6 / sw);
-            s.waitNs0 = wn; s.waitCnt0 = wc; s.idleNs0 = in; s.idleCnt0 = ic; s.fsPrims = s.fsPasses = s.fsCopies = s.fsPal = 0;
+            std::fprintf(stderr, " | per swap: passes %.1f copies %.1f pal %.1f prims %.0f", s.fsPasses / sw, s.fsCopies / sw, s.fsPal / sw, s.fsPrims / sw);
+            s.fsPrims = s.fsPasses = s.fsCopies = s.fsPal = 0;
         }
         {   // [pgs-slow]
             std::fprintf(stderr, " | calls>1ms/s %.0f, slowest:", s.slowOver1ms / dt);
