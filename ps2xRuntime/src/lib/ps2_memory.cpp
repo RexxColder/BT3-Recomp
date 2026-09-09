@@ -2389,7 +2389,24 @@ void PS2Memory::stage2Loop()
         const auto t0 = std::chrono::steady_clock::now();
         switch (it.kind)
         {
-        case 0u: for (const auto &pkt : it.pkts) m_gifArbiter->process(pkt); nPkts += it.pkts.size(); break;
+        case 0u:
+            if (ps2x_pgs::enabled() && ps2x_pgs::coalesce())
+            {   // [pgs] one gif_transfer per run of same-path packets, then our own parse with the per-packet hook quiet
+                static std::vector<uint8_t> s_run; uint8_t runPath = 0;
+                auto flush = [&]() { if (!s_run.empty()) { ps2x_pgs::gifTransfer(runPath, s_run.data(), s_run.size()); s_run.clear(); } };
+                for (const auto &pkt : it.pkts)
+                {
+                    const uint8_t pth = static_cast<uint8_t>(pkt.pathId);
+                    if (pth != runPath) { flush(); runPath = pth; }
+                    s_run.insert(s_run.end(), pkt.data.begin(), pkt.data.end());
+                }
+                flush();
+                ps2x_pgs::setSuppressed(true);
+                for (const auto &pkt : it.pkts) m_gifArbiter->process(pkt);
+                ps2x_pgs::setSuppressed(false);
+            }
+            else for (const auto &pkt : it.pkts) m_gifArbiter->process(pkt);
+            nPkts += it.pkts.size(); break;
         case 1u:
             ps2GpuRenderer().swapFrame();
             { std::lock_guard<std::mutex> lk(m_kickMtx); if (m_kickFramesQueued > 0u) --m_kickFramesQueued; m_kickDoneCv.notify_all(); }

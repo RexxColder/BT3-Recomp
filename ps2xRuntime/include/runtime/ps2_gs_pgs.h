@@ -15,6 +15,10 @@ bool enabled();
 bool exclusive();
 // A GIF packet as the arbiter delivers it (path 1..3, qword multiple). Any thread; serialised inside.
 void gifTransfer(uint8_t pathId, const uint8_t *data, size_t size);
+// PS2X_PGS_COALESCE=1: stage 2 hands runs of same-path packets to the backend as ONE gif_transfer (6000 calls per
+// frame otherwise); while a coalesced run is being processed the per-packet hook must stay quiet.
+bool coalesce();
+void setSuppressed(bool on);   // thread-local
 // The guest's privileged register store (offset from 0x12000000, full 64-bit value after the merge).
 void privWrite(uint32_t regOff, uint64_t value, GSRegisters *regs);
 // The live privileged register block (PS2Memory::gs_regs): read at every swap, so every writer is covered.
@@ -28,6 +32,8 @@ void shutdown();
 inline bool enabled() { return false; }
 inline bool exclusive() { return false; }
 inline void gifTransfer(uint8_t, const uint8_t *, size_t) {}
+inline bool coalesce() { return false; }
+inline void setSuppressed(bool) {}
 inline void privWrite(uint32_t, uint64_t, GSRegisters *) {}
 inline void setRegs(GSRegisters *) {}
 inline void onSwap() {}

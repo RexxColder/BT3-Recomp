@@ -9,6 +9,7 @@
 #include "gs_interface.hpp"
 #include "device.hpp"
 #include "context.hpp"
+#include "thread_id.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -65,6 +66,8 @@ struct State
     bool frameFresh = false;
     uint32_t field = 0;
     uint64_t swaps = 0, packets = 0, bytes = 0, noImage = 0;
+    double xferMs = 0.0;   // CPU time inside gif_transfer (the packet parse on our GsThread)
+    bool timestamps = false;
     std::chrono::steady_clock::time_point tStat = std::chrono::steady_clock::now();
     double readbackMs = 0.0, vsyncMs = 0.0;
 };
@@ -72,8 +75,16 @@ State &st() { static State *s = new State; return *s; }   // leaked on purpose: 
 
 bool envOn(const char *name) { const char *v = std::getenv(name); return v && v[0] && v[0] != '0'; }
 
+void registerThread()
+{   // Granite keys per-thread command pools by a registered index; unregistered threads log an error per call.
+    // Every caller here is serialised by the state mutex, so they can all share index 0 (the replayer's main thread).
+    static thread_local bool t_reg = false;
+    if (!t_reg) { Util::register_thread_index(0); t_reg = true; }
+}
+
 bool initLocked(State &s)
 {
+    registerThread();
     if (s.inited) return true;
     if (s.failed) return false;
     s.failed = true;   // until proven otherwise
@@ -95,6 +106,8 @@ bool initLocked(State &s)
     }
     if (!s.iface.init(&s.device, opts)) { std::fprintf(stderr, "[pgs] GSInterface init failed\n"); return false; }
     s.iface.set_signal_interface(&s.signals);
+    s.timestamps = envOn("PS2X_PGS_TIMESTAMPS");
+    if (s.timestamps) { DebugMode dm = {}; dm.timestamps = true; s.iface.set_debug_mode(dm); }
     s.failed = false; s.inited = true;
     std::fprintf(stderr, "[pgs] paraLLEl-GS backend up: %s, ssaa=%u, %s\n",
                  s.device.get_gpu_properties().deviceName, unsigned(opts.super_sampling),
@@ -165,15 +178,20 @@ void readbackLocked(State &s, const ScanoutResult &res)
 } // namespace
 
 bool enabled() { static const bool on = envOn("PS2X_PGS"); return on; }
+bool coalesce() { static const bool c = envOn("PS2X_PGS_COALESCE"); return c; }
+static thread_local bool t_suppressed = false;
+void setSuppressed(bool on) { t_suppressed = on; }
 bool exclusive() { static const bool ex = envOn("PS2X_PGS_EXCLUSIVE"); return ex; }
 
 void gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
 {
-    if (!data || size < 16 || pathId < 1 || pathId > 3) return;
+    if (!data || size < 16 || pathId < 1 || pathId > 3 || t_suppressed) return;
     State &s = st();
     std::lock_guard<std::mutex> lk(s.mtx);
     if (!initLocked(s)) return;
+    const auto t0 = std::chrono::steady_clock::now();
     s.iface.gif_transfer(pathId - 1u, data, size);
+    s.xferMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     s.packets++; s.bytes += size;
 }
 
@@ -231,7 +249,23 @@ void onSwap()
                      s.swaps ? s.vsyncMs / s.swaps : 0.0, s.swaps ? s.readbackMs / s.swaps : 0.0,
                      (unsigned long long)s.privLo[0], (unsigned long long)s.privLo[2], (unsigned long long)s.privLo[7], (unsigned long long)s.privLo[8],
                      (unsigned long long)s.privLo[9], (unsigned long long)s.privLo[10]);
-        s.swaps = s.packets = s.bytes = 0; s.noImage = 0; s.vsyncMs = s.readbackMs = 0.0; s.tStat = t2;
+        std::fprintf(stderr, "[pgs] cpu gif_transfer %.1f ms/s (%.2f ms/swap)", s.xferMs / dt, s.swaps ? s.xferMs / s.swaps : 0.0);
+        if (s.timestamps)
+        {
+            static const char *const names[int(TimestampType::Count)] = { "SyncHostToVRAM", "CopyVRAM", "PaletteUpdate", "TextureUpload", "TriangleSetup", "Binning", "Shading", "Readback", "VSync" };
+            static double last[int(TimestampType::Count)] = {};
+            double total = 0.0;
+            std::fprintf(stderr, " | gpu ms/s:");
+            for (int t = 0; t < int(TimestampType::Count); t++)
+            {
+                const double acc = s.iface.get_accumulated_timestamps(TimestampType(t)) * 1e3;
+                const double ms = (acc - last[t]) / dt; last[t] = acc; total += ms;
+                std::fprintf(stderr, " %s=%.1f", names[t], ms);
+            }
+            std::fprintf(stderr, " total=%.1f (%.2f ms/swap)", total, s.swaps ? total * dt / s.swaps : 0.0);
+        }
+        std::fprintf(stderr, "\n");
+        s.swaps = s.packets = s.bytes = 0; s.noImage = 0; s.vsyncMs = s.readbackMs = s.xferMs = 0.0; s.tStat = t2;
     }
 }
 
