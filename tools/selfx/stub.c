@@ -371,7 +371,7 @@ int main(int argc, char **argv)
                     "cd '%s'\n"
                     "export LD_LIBRARY_PATH=\"$PWD/lib\"\n"
                     "export QT_PLUGIN_PATH=\"$PWD/lib/qt6/plugins\"\n"
-                    "export PS2X_EXEDIR=\"$PWD/data\"\n"
+                    "export PS2X_EXEDIR=\"$PWD\"\n"
                     "exec ./Launcher \"$@\"\n",
                     dir);
             fclose(w);
