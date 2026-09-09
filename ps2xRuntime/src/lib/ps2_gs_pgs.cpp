@@ -15,17 +15,33 @@
 #include "device.hpp"
 #include "context.hpp"
 #include "thread_id.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+const char *ps2xRtStalePageInfo(const GS *gs, uint32_t pg);   // [rtstale] debug text, defined in ps2_gs_gpu.cpp
+bool ps2xGsRegionDrawnSinceWrite(const GS *gs, uint32_t bp, uint32_t bw, uint8_t psm, uint32_t w, uint32_t h, uint32_t *stalePg);   // [rtstale]
 
 namespace ps2x_pgs
 {
 static std::atomic<int> g_enabled{-1};
 static std::atomic<uint32_t> g_presentW{0}, g_presentH{0};   // [pgsfit] on-screen size of the presented frame   // -1 = read the env on first use; 0/1 afterwards (init failure clears it)
+std::atomic<int> g_pgsProbeReq{0};            // [vramprobe] set by the GS parse after the 32-sprite depth-mask pass (ps2x_pgs::)
+std::atomic<unsigned> g_pgsProbeFbp{0}, g_pgsProbeZbp{0};
+// [vramprobe] paraLLEl-GS VRAM byte address of a 32-bit pixel (PSMCT32 / PSMZ32 layout, the fork's swizzle_PS2)
+static inline uint32_t pgsAddr32(uint32_t basePage, uint32_t pageStride, uint32_t x, uint32_t y, bool z)
+{
+    const uint32_t pageIndex = (y >> 5) * pageStride + (x >> 6);
+    const uint32_t bx = (x & 63u) >> 3, by = (y & 31u) >> 3, col = (y & 7u) >> 1, px = x & 7u, py = y & 1u;
+    uint32_t block = (bx & 1u) | ((by & 1u) << 1) | ((bx & 2u) << 1) | ((by & 2u) << 2) | ((bx & 4u) << 2);
+    block += basePage * 32u;
+    if (z) block ^= 0x18u;
+    const uint32_t pix = (px & 1u) | ((py & 1u) << 1) | ((px & 2u) << 1) | ((px & 4u) << 1);
+    return pageIndex * 8192u + block * 256u + col * 64u + pix * 4u;
+}
 namespace
 {
 using namespace Vulkan;
@@ -65,7 +81,7 @@ struct Replacer final : TextureReplacementInterface
 {
     GS *gs = nullptr;
     std::unordered_map<std::string, ImageHandle> cache;   // name -> image (null = known miss)
-    uint64_t hits = 0, misses = 0, skipped = 0;
+    uint64_t hits = 0, misses = 0, skipped = 0, rtstale = 0;
     ImageHandle replace(const TextureDescriptor &desc, uint64_t liveTex0, uint64_t liveTexclut, Device &device) override
     {
         if (!gs || !ps2tex::replacementsEnabled()) { skipped++; return {}; }
@@ -74,10 +90,29 @@ struct Replacer final : TextureReplacementInterface
         GSTex0Reg t{};
         t.tbp0 = uint32_t(desc.tex0.desc.TBP0); t.tbw = uint8_t(desc.tex0.desc.TBW); t.psm = uint8_t(psm);
         t.tw = uint8_t(desc.tex0.desc.TW); t.th = uint8_t(desc.tex0.desc.TH); t.tcc = uint8_t(desc.tex0.desc.TCC); t.tfx = uint8_t(desc.tex0.desc.TFX);
+        {   // [rtstale] pages the game drew into since their last upload/copy hold pixels our mirror never saw: the
+            // hash would be of whatever texture lived there before (the portraits and energy bars that showed up on
+            // the post-process quads). Refuse them; the backend samples its own VRAM.
+            uint32_t stalePg = ~0u;
+            if (ps2xGsRegionDrawnSinceWrite(gs, t.tbp0, t.tbw, uint8_t(psm), 1u << t.tw, 1u << t.th, &stalePg))
+            {
+                rtstale++;
+                static const bool s_log = [](){ const char *v = std::getenv("PS2X_PGS_PACKLOG"); return v && v[0] && v[0] != '0'; }(); static unsigned s_n = 0;
+                if (s_log && s_n < 40) { s_n++; std::fprintf(stderr, "[pgs-rtstale] #%u refused tex tbp0=%u tbw=%u psm=%u tw=%u th=%u: %s\n", s_n, t.tbp0, t.tbw, psm, t.tw, t.th, ps2xRtStalePageInfo(gs, stalePg)); }
+                return {};
+            }
+        }
         // palette address fields come from the LIVE TEX0 (the descriptor zeroes them: paraLLEl-GS keys palettes by bank)
         Reg64<TEX0Bits> lt; lt.bits = liveTex0;
         t.cbp = uint32_t(lt.desc.CBP); t.cpsm = uint8_t(lt.desc.CPSM); t.csm = uint8_t(lt.desc.CSM);
         t.csa = uint8_t(lt.desc.CSA); t.cld = uint8_t(lt.desc.CLD);
+        if (ps2xGsRegionDrawnSinceWrite(gs, t.cbp, 1u, GS_PSM_CT32, 16u, 16u, nullptr))
+        {   // [rtstale] a palette the game rendered (BT3 draws its outline CLUTs); a CSM1 CLUT is a 16x16 CT32 block group
+            rtstale++;
+            static const bool s_log = [](){ const char *v = std::getenv("PS2X_PGS_PACKLOG"); return v && v[0] && v[0] != '0'; }(); static unsigned s_n = 0;
+            if (s_log && s_n < 40) { s_n++; std::fprintf(stderr, "[pgs-rtstale] #%u refused CLUT cbp=%u for tex tbp0=%u: %s\n", s_n, t.cbp, t.tbp0, ps2xRtStalePageInfo(gs, t.cbp / 32u)); }
+            return {};
+        }
         Reg64<TEXCLUTBits> tc; tc.bits = liveTexclut;
         GSTexClutReg texclut{uint8_t(tc.desc.CBW), uint8_t(tc.desc.COU), uint16_t(tc.desc.COV)};
         GSTexaReg texa{uint8_t(desc.texa.desc.TA0), desc.texa.desc.AEM != 0, uint8_t(desc.texa.desc.TA1)};
@@ -88,7 +123,8 @@ struct Replacer final : TextureReplacementInterface
         const std::string name = id.name();
         {   // PS2X_PGS_PACKLOG=1: the first identifications, to compare against the pack's file names
             static const bool s_log = [](){ const char *v = std::getenv("PS2X_PGS_PACKLOG"); return v && v[0] && v[0] != '0'; }(); static unsigned s_n = 0;
-            if (s_log && s_n < 40 && !cache.count(name)) { s_n++; std::fprintf(stderr, "[pgs-pack] #%u %s psm=%u tbp0=%u tbw=%u tw=%u th=%u cbp=%u csa=%u cpsm=%u bank=%u\n", s_n, name.c_str(), psm, t.tbp0, t.tbw, t.tw, t.th, t.cbp, t.csa, t.cpsm, unsigned(desc.palette_bank)); }
+            static const unsigned s_max = [](){ const char *v = std::getenv("PS2X_PGS_PACKLOGN"); return v && v[0] ? unsigned(std::atoi(v)) : 40u; }();
+            if (s_log && s_n < s_max && !cache.count(name)) { s_n++; std::fprintf(stderr, "[pgs-pack] #%u %s psm=%u tbp0=%u tbw=%u tw=%u th=%u cbp=%u csa=%u cpsm=%u bank=%u\n", s_n, name.c_str(), psm, t.tbp0, t.tbw, t.tw, t.th, t.cbp, t.csa, t.cpsm, unsigned(desc.palette_bank)); }
         }
         auto it = cache.find(name);
         if (it != cache.end()) { if (it->second) hits++; else misses++; return it->second; }
@@ -117,7 +153,7 @@ struct Replacer final : TextureReplacementInterface
 };
 
 #else
-struct Replacer { GS *gs = nullptr; std::unordered_map<std::string, int> cache; uint64_t hits = 0, misses = 0, skipped = 0; };   // upstream paraLLEl-GS without the hook: no pack path
+struct Replacer { GS *gs = nullptr; std::unordered_map<std::string, int> cache; uint64_t hits = 0, misses = 0, skipped = 0, rtstale = 0; };   // upstream paraLLEl-GS without the hook: no pack path
 #endif
 
 struct State
@@ -192,7 +228,10 @@ bool initLocked(State &s)
     }
     if (!s.iface.init(&s.device, opts)) return fail("GSInterface init failed");
     s.iface.set_signal_interface(&s.signals);
-    { Hacks hk; hk.force_bilinear = envOn("PS2X_PGS_FORCE_BILINEAR"); s.hacks = hk; s.iface.set_hacks(hk); }
+    { Hacks hk; hk.force_bilinear = envOn("PS2X_PGS_FORCE_BILINEAR");
+      hk.replaced_per_sample = [](){ const char *v = std::getenv("PS2X_PGS_REPLPERSAMPLE"); return !(v && v[0] == '0'); }();   // A/B: 0 = snapped evaluation for replaced sprites
+      hk.skip_kick_mask = [](){ const char *v = std::getenv("PS2X_PGS_SKIPKICK"); return v && v[0] ? uint32_t(std::atoi(v)) : 0u; }();   // bisect: 1 = 16-bit frame kicks, 2 = 24/32-bit reads of block 10752, 4 = frame fbp 336
+      s.hacks = hk; s.iface.set_hacks(hk); }
 #if defined(PARALLEL_GS_TEXREPLACE)
     if (packMode()) s.iface.set_texture_replacement_interface(&s.replacer);   // [pgs-texreplace]
 #else
@@ -201,8 +240,8 @@ bool initLocked(State &s)
     s.timestamps = envOn("PS2X_PGS_TIMESTAMPS");
     if (s.timestamps) { DebugMode dm = {}; dm.timestamps = true; s.iface.set_debug_mode(dm); }
     s.failed = false; s.inited = true;
-    std::fprintf(stderr, "[pgs] paraLLEl-GS backend up: %s, ssaa=%u, force_bilinear=%d, %s\n",
-                 s.device.get_gpu_properties().deviceName, unsigned(opts.super_sampling), s.hacks.force_bilinear ? 1 : 0,
+    std::fprintf(stderr, "[pgs] paraLLEl-GS backend up: %s, ssaa=%u, force_bilinear=%d, replaced_per_sample=%d, skipkick=%u, %s\n",
+                 s.device.get_gpu_properties().deviceName, unsigned(opts.super_sampling), s.hacks.force_bilinear ? 1 : 0, s.hacks.replaced_per_sample ? 1 : 0, unsigned(s.hacks.skip_kick_mask),
                  exclusive() ? "EXCLUSIVE (our GS parse skipped)" : packMode() ? "PACK mode (our GS parse state-only, replacements via the backend)" : "dual (our GL renderer keeps running)");
     return true;
 }
@@ -376,6 +415,31 @@ bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
     const auto t0 = std::chrono::steady_clock::now();
     if (exclusive()) applyPseudoRegsLocked(s, data, size);
     s.iface.gif_transfer(pathId - 1u, data, size);
+    {   // [vramprobe] PS2X_PGS_VRAMPROBE=1: after the depth-mask pass, print the frame's alpha per column and the Z top bytes
+        static const bool s_probe = envOn("PS2X_PGS_VRAMPROBE"); static unsigned s_n = 0;
+        if (s_probe && s_n < 4 && g_pgsProbeReq.exchange(0) != 0)
+        {
+            s_n++;
+            const uint32_t fbp = g_pgsProbeFbp.load(), zbp = g_pgsProbeZbp.load();
+            s.iface.flush();
+            const uint8_t *v = static_cast<const uint8_t *>(s.iface.map_vram_read(0, 4u * 1024u * 1024u));
+            if (v)
+            {
+                for (uint32_t y : { 60u, 200u, 300u })
+                {
+                    std::fprintf(stderr, "[vramprobe] #%u fbp %u y %u alpha:", s_n, fbp, y);
+                    for (uint32_t x = 0; x < 24; x++) { uint32_t w; std::memcpy(&w, v + pgsAddr32(fbp, 8, x, y, false), 4); std::fprintf(stderr, " %02x", w >> 24); }
+                    std::fprintf(stderr, " | rgb x0..7:");
+                    for (uint32_t x = 0; x < 8; x++) { uint32_t w; std::memcpy(&w, v + pgsAddr32(fbp, 8, x, y, false), 4); std::fprintf(stderr, " %06x", w & 0xffffffu); }
+                    std::fprintf(stderr, " | rgb x8..15:");
+                    for (uint32_t x = 8; x < 16; x++) { uint32_t w; std::memcpy(&w, v + pgsAddr32(fbp, 8, x, y, false), 4); std::fprintf(stderr, " %06x", w & 0xffffffu); }
+                    std::fprintf(stderr, "\n[vramprobe] #%u zbp %u y %u z words:", s_n, zbp, y);
+                    for (uint32_t x = 0; x < 16; x++) { uint32_t w; std::memcpy(&w, v + pgsAddr32(zbp, 8, x, y, true), 4); std::fprintf(stderr, " %08x", w); }
+                    std::fprintf(stderr, "\n");
+                }
+            }
+        }
+    }
     const double dtMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     s.xferMs += dtMs;
     if (dtMs > 0.5)
@@ -485,7 +549,7 @@ void onSwap()
         std::fprintf(stderr, "[pgs] cpu gif_transfer %.1f ms/s (%.2f ms/swap) | priv writes/s:", s.xferMs / dt, s.swaps ? s.xferMs / s.swaps : 0.0);
         for (int k = 0; k < 0x20; k++) if (s.privHist[k]) { std::fprintf(stderr, " %02x=%.0f", k << 4, s.privHist[k] / dt); s.privHist[k] = 0; }
         std::fprintf(stderr, " pseudo=%.0f", s.pseudoSeen / dt); s.pseudoSeen = 0;
-        if (packMode()) { std::fprintf(stderr, " | pack: hits %llu misses %llu skipped %llu cached %zu", (unsigned long long)s.replacer.hits, (unsigned long long)s.replacer.misses, (unsigned long long)s.replacer.skipped, s.replacer.cache.size()); s.replacer.hits = s.replacer.misses = s.replacer.skipped = 0; }
+        if (packMode()) { std::fprintf(stderr, " | pack: hits %llu misses %llu skipped %llu rtstale %llu cached %zu", (unsigned long long)s.replacer.hits, (unsigned long long)s.replacer.misses, (unsigned long long)s.replacer.skipped, (unsigned long long)s.replacer.rtstale, s.replacer.cache.size()); s.replacer.hits = s.replacer.misses = s.replacer.skipped = s.replacer.rtstale = 0; }
         {   // per swap: paraLLEl-GS render passes / copies / palette updates / primitives (consume_flush_stats)
             const double sw = s.swaps ? double(s.swaps) : 1.0;
             std::fprintf(stderr, " | per swap: passes %.1f copies %.1f pal %.1f prims %.0f", s.fsPasses / sw, s.fsCopies / sw, s.fsPal / sw, s.fsPrims / sw);
