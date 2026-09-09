@@ -11,9 +11,6 @@ SRC="$1"; RUNNER_BUILD="$2"; LAUNCH_BUILD="$3"; OUT="$4"
 JOBS="${BT3_RELEASE_JOBS:-$(nproc)}"
 export HOME="${HOME:-/w/runner}"
 
-# GCC 11/12 ICE (tsubst_copy) on ps2_gs_memory.h class-type NTTPs; clang is
-# the baseline container compiler (still glibc 2.35).
-export CC=clang CXX=clang++
 # ccache lives inside the persistent runner build dir, so it survives across
 # build.sh runs (and is dropped together with --reuse-deps=off cleaning _deps).
 # mold makes the 96 MB runner link near-instant.
@@ -33,8 +30,18 @@ mkdir -p "$OUT/stage/lib" "$OUT/stage/savedata/BASLUS-21678DBZT3" "$OUT/stage/lo
 if [[ -n "${PS2X_ISO:-}" ]]; then
     log "generating runner + overlay sources from ISO"
     export PS2X_BUILD_DIR="$RUNNER_BUILD/gen"
-    python3 "$SRC/games/bt3/setup.py" "$PS2X_ISO" --gen-only --jobs "$JOBS"
+    # Deterministic from-zero regeneration (nukes any stale cache/toolchain
+    # leftovers from a previous half-run).
+    rm -rf "$PS2X_BUILD_DIR"
+    # The recompiler is built with g++: toml11's std::source_location detection
+    # misfires under clang-14 (Ubuntu 22.04 broke the runner links clean). The
+    # runner/launcher below keep clang (GCC 11 ICE on ps2_gs_memory.h).
+    CC=gcc CXX=g++ python3 "$SRC/games/bt3/setup.py" "$PS2X_ISO" --gen-only --jobs "$JOBS"
 fi
+
+# GCC 11/12 ICE (tsubst_copy) on ps2_gs_memory.h class-type NTTPs; clang is
+# the baseline container compiler (still glibc 2.35).
+export CC=clang CXX=clang++
 
 # ---- 1. runner (bt3-runner), mirrors setup.py's configure ---------------
 if [[ ! -f "$RUNNER_BUILD/CMakeCache.txt" ]]; then
