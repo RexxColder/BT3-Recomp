@@ -17,6 +17,7 @@ namespace
 {
     constexpr uint32_t kCdSectorSize = 2048;
     constexpr uint32_t kCdPseudoLbnStart = 0x00100000;
+    constexpr size_t kIdxSlotNameLen = 48;
 
     struct CdAfTable;
 
@@ -31,12 +32,13 @@ namespace
 
     // One AFS slot (entry id == index into .slots). slotBytes is the physical disk
     // slice [offset, offset+slotBytes): the raw entry bytes plus any padding that was
-    // on the disc, preserved verbatim (idx v2).
+    // on the disc, preserved verbatim (idx v3, or v2 with no name column).
     struct CdAfSlot
     {
         uint32_t offset = 0;
         uint32_t size = 0;        // logical (declared) entry size
         uint32_t slotBytes = 0;   // physical slice size
+        std::string name;         // on-disk file name (empty -> "%06u" of the slot id)
     };
 
     // Folder-backed AFS: the original single .AFS blob is presented as a virtual
@@ -401,7 +403,7 @@ namespace
         {
             return nullptr;
         }
-        if (version != 2u || indexBytes > afsBytes)
+        if ((version != 2u && version != 3u) || indexBytes > afsBytes)
         {
             return nullptr;
         }
@@ -427,7 +429,19 @@ namespace
                     return nullptr;
                 }
             }
-            table->slots.push_back({off, sz, slotBytes});
+            std::string slotName;
+            if (version >= 3u)
+            {
+                char nameBuf[kIdxSlotNameLen] = {};
+                idx.read(nameBuf, kIdxSlotNameLen);
+                if (idx.gcount() != static_cast<std::streamsize>(kIdxSlotNameLen))
+                {
+                    return nullptr;
+                }
+                nameBuf[kIdxSlotNameLen - 1] = '\0';
+                slotName = nameBuf;
+            }
+            table->slots.push_back({off, sz, slotBytes, std::move(slotName)});
         }
 
         table->indexBlob.resize(indexBytes);
@@ -472,11 +486,15 @@ namespace
             if (it != slots.begin())
             {
                 const uint64_t id = static_cast<uint64_t>((it - 1) - slots.begin());
-                char nm[32];
-                std::snprintf(nm, sizeof(nm), "%06llu", static_cast<unsigned long long>(id));
                 const CdAfSlot &slot = *(it - 1);
+                char nm[32];
+                if (slot.name.empty())
+                    std::snprintf(nm, sizeof(nm), "%06llu", static_cast<unsigned long long>(id));
+                const std::string opened = slot.name.empty()
+                                               ? std::string(nm)
+                                               : slot.name;
                 std::printf("[slot-read] \"%s\" off=%llu n=%zu\n",
-                            (table.folder / nm).string().c_str(),
+                            (table.folder / opened).string().c_str(),
                             static_cast<unsigned long long>(relOffset - slot.offset), byteCount);
             }
         }
@@ -537,12 +555,15 @@ namespace
             bool ok = true;
             if (fromFile > 0)
             {
-                char name[32];
                 const uint64_t id = static_cast<uint64_t>(it - 1 - slots.begin());
-                std::snprintf(name, sizeof(name), "%06llu", static_cast<unsigned long long>(id));
-                const std::string filePath = (table.folder / name).string();
+                char nm[32];
+                std::snprintf(nm, sizeof(nm), "%06llu", static_cast<unsigned long long>(id));
+                const std::string opened = slot.name.empty()
+                                               ? std::string(nm)
+                                               : slot.name;
+                const std::string filePath = (table.folder / opened).string();
                 std::cerr << "\"" << filePath << "\"" << std::endl;
-                std::ifstream file(table.folder / name, std::ios::binary);
+                std::ifstream file(table.folder / opened, std::ios::binary);
                 if (file.is_open())
                 {
                     file.seekg(static_cast<std::streamoff>(inFile), std::ios::beg);
