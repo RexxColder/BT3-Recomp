@@ -40,5 +40,6 @@ games/bt3/work
 log.txt
 __pycache__/
 
-# [pgs] local paraLLEl-GS checkout (symlink), see ps2xRuntime/CMakeLists.txt
-ps2xRuntime/third_party/parallel-gs
+
+# local build trees (build_pre, build_pgs, ...)
+build_*/

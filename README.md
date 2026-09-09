@@ -120,3 +120,27 @@ Known issues:
 - *Dragon Ball Z: Budokai Tenkaichi 3* © Spike / Bandai Namco. This project is
   not affiliated with or endorsed by them; it exists for preservation and
   interoperability, and distributes no game content.
+
+## Experimental: paraLLEl-GS backend (branch `parallel-gs`)
+
+This branch carries an experimental second graphics backend: the PS2 GS emulated in Vulkan compute by
+[paraLLEl-GS](https://github.com/Arntzen-Software/parallel-gs) (Arntzen Software, LGPL-3.0-or-later), fed with the
+same GIF packet stream our OpenGL renderer consumes. It is VRAM-exact, so the whole family of render-target aliasing
+workarounds in the GL renderer is unnecessary on this path. Status (2026-09-10): logos, movies, menus and full fights
+render correctly; presentation still goes through a synchronous readback, so it is a correctness build, not a fast one.
+
+Build (Linux; the checkout is a git submodule with its own Granite submodule):
+
+```
+git submodule update --init --recursive
+cmake -S . -B build_pgs -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja -C build_pgs ps2EntryRunner
+```
+
+CMake picks the backend up automatically when `ps2xRuntime/third_party/parallel-gs/CMakeLists.txt` exists
+(`-DPS2X_DISABLE_PGS=ON` to leave it out). Run with `PS2X_PGS=1`. Other knobs: `PS2X_PGS_SSAA=1|2|4|8|16`,
+`PS2X_PGS_HIRES=1`, `PS2X_PGS_COALESCE=1`, `PS2X_PGS_TIMESTAMPS=1` (per-stage GPU times in the `[pgs]` log line),
+`PS2X_PGS_DUMP=<dir>` (write presented frames as PNG), `PS2X_PGS_EXCLUSIVE=1` (skip our own GS parse; not complete yet).
+
+Licence note: paraLLEl-GS is LGPL-3.0-or-later and this repository is GPL-3.0; the combination is distributed under
+GPL-3.0. Its licence text is `ps2xRuntime/third_party/parallel-gs/COPYING.LGPLv3`.
