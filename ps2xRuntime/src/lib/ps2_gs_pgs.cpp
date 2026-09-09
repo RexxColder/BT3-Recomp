@@ -55,6 +55,7 @@ struct Signals final : SignalInterface
     }
 };
 
+#if defined(PARALLEL_GS_TEXREPLACE)
 // [pgs-texreplace] Texture pack on the paraLLEl-GS path. paraLLEl-GS asks at every texture-cache miss; we hash the
 // texture exactly as the GL renderer does (PCSX2-compatible XXH3 over the swizzled VRAM blocks + the palette, from OUR
 // GS parse running state-only in pack mode) and hand back a Vulkan image of the replacement, any size -- the
@@ -109,6 +110,10 @@ struct Replacer final : TextureReplacementInterface
         return img;
     }
 };
+
+#else
+struct Replacer { GS *gs = nullptr; std::unordered_map<std::string, int> cache; uint64_t hits = 0, misses = 0, skipped = 0; };   // upstream paraLLEl-GS without the hook: no pack path
+#endif
 
 struct State
 {
@@ -177,7 +182,11 @@ bool initLocked(State &s)
     }
     if (!s.iface.init(&s.device, opts)) return fail("GSInterface init failed");
     s.iface.set_signal_interface(&s.signals);
+#if defined(PARALLEL_GS_TEXREPLACE)
     if (packMode()) s.iface.set_texture_replacement_interface(&s.replacer);   // [pgs-texreplace]
+#else
+    if (packMode()) std::fprintf(stderr, "[pgs] texture pack requested but this paraLLEl-GS checkout has no replacement hook (upstream); packs stay off\n");
+#endif
     s.timestamps = envOn("PS2X_PGS_TIMESTAMPS");
     if (s.timestamps) { DebugMode dm = {}; dm.timestamps = true; s.iface.set_debug_mode(dm); }
     s.failed = false; s.inited = true;
