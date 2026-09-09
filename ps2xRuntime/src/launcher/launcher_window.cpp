@@ -195,7 +195,9 @@ void LauncherWindow::onPlayClicked()
         const QString dataDir = appDir.filePath(QStringLiteral("data"));
         proc->setArguments({QDir(dataDir).filePath(QStringLiteral("SLUS_216.78"))});
         auto env = QProcessEnvironment::systemEnvironment();
-        env.insert(QStringLiteral("PS2X_EXEDIR"), dataDir);
+        // [deploy] Anchor the runner's savedata/assets/fonts (and bt3_settings.ini)
+        // at the deploy root -- where the launcher wrote them -- not data/.
+        env.insert(QStringLiteral("PS2X_EXEDIR"), appDir.absolutePath());
         env.insert(QStringLiteral("LD_LIBRARY_PATH"), appDir.filePath(QStringLiteral("lib")));
         proc->setProcessEnvironment(env);
     }

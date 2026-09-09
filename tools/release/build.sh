@@ -46,14 +46,19 @@ fi
 mkdir -p "$OUT" "$RUNNER_BUILD" "$LAUNCH_BUILD"
 
 # ---- ISO selection (prompt before exec) ---------------------------------------
+case "$ISO" in
+    none|NONE|None) ISO="" ;;
+esac
 if [[ "$ISO" == "" ]]; then
-    read -r -p "BT3 ISO path (Enter = ${ISO_DEFAULT}, 'none' = build from generated sources): " ISO
-    case "$ISO" in
-        "") ISO="$ISO_DEFAULT" ;;
-        none|NONE|None) ISO="" ;;
-    esac
+    if [[ -t 0 ]]; then
+        read -r -p "BT3 ISO path (Enter = ${ISO_DEFAULT}, 'none' = build from generated sources): " ISO
+        case "$ISO" in
+            "") ISO="$ISO_DEFAULT" ;;
+            none|NONE|None) ISO="" ;;
+        esac
+    fi
 fi
-ISO_ARG=""
+ISO_ARG=()
 if [[ "$ISO" != "" ]]; then
     if [[ ! -f "$ISO" ]]; then
         echo "ERROR: ISO not found: $ISO" >&2; exit 2
@@ -74,16 +79,10 @@ if [[ "$REUSE_DEPS" != "1" ]]; then
 fi
 
 echo "== building runner + launcher + stage (jobs=$JOBS)"
-$D docker run --rm \
-    --user "$(id -u):$(id -g)" \
-    -e HOME=/w/runner \
-    -e BT3_RELEASE_JOBS="$JOBS" \
-    "${ISO_ARG[@]}" \
-    -v "$ROOT:/src" \
-    -v "$RUNNER_BUILD:/w/runner" \
-    -v "$LAUNCH_BUILD:/w/launcher" \
-    -v "$OUT:/out" \
-    "$IMG" /src /w/runner /w/launcher /out
+RUN_ARGS=(docker run --rm --user "$(id -u):$(id -g)" -e HOME=/w/runner -e BT3_RELEASE_JOBS="$JOBS")
+[[ ${#ISO_ARG[@]} -gt 0 ]] && RUN_ARGS+=("${ISO_ARG[@]}")
+RUN_ARGS+=(-v "$ROOT:/src" -v "$RUNNER_BUILD:/w/runner" -v "$LAUNCH_BUILD:/w/launcher" -v "$OUT:/out" "$IMG" /src /w/runner /w/launcher /out)
+$D "${RUN_ARGS[@]}"
 
 echo "== floor gate"
 if [[ -f "${BT3_FLOOR_CHECK:-$ROOT/tools/release/check_floor.sh}" ]]; then
