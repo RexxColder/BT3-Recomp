@@ -604,18 +604,19 @@ static void setEnvDefault(const char *name, const char *value)
     setenv(name, value, 0);
 #endif
 }
-static void exportRendererEnv(int renderer, bool texPack)
+static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
 {
 #if defined(PS2X_HAVE_PGS)
     if (renderer == 2)
     {
         setEnvDefault("PS2X_PGS", "1");
         if (texPack) setEnvDefault("PS2X_PGS_PACK", "1"); else setEnvDefault("PS2X_PGS_EXCLUSIVE", "1");
+        if (forceBilinear) setEnvDefault("PS2X_PGS_FORCE_BILINEAR", "1");
     }
     else
         setEnvDefault("PS2X_PGS", "0");
 #else
-    (void)renderer; (void)texPack;
+    (void)renderer; (void)texPack; (void)forceBilinear;
 #endif
 }
 
@@ -627,9 +628,10 @@ void PS2SettingsOverlay::preloadSettings()
     std::ifstream file(iniPath);
     int rendererPre = Settings::kRendererDefault;   // [renderer] exported below even when no ini exists yet
     bool texPackPre = true;
+    bool forceBilinearPre = true;
     if (!file.is_open())
     {
-        exportRendererEnv(rendererPre, texPackPre);
+        exportRendererEnv(rendererPre, texPackPre, forceBilinearPre);
         return;
     }
 
@@ -669,6 +671,8 @@ void PS2SettingsOverlay::preloadSettings()
         }
         else if (section == "video" && key == "texture_pack")
             texPackPre = (val == "1" || val == "true");
+        else if (section == "video" && key == "force_bilinear")
+            forceBilinearPre = (val == "1" || val == "true");
         else if (section == "video" && key == "render_scale")
         {   // [rscale] authoritative startup application -- runs before anything reads the
             // live scale, so the INI value wins the lazy-init race.
@@ -686,7 +690,7 @@ void PS2SettingsOverlay::preloadSettings()
             s_startupLogLevel = lvl;
         }
     }
-    exportRendererEnv(rendererPre, texPackPre);
+    exportRendererEnv(rendererPre, texPackPre, forceBilinearPre);
 }
 
 void PS2SettingsOverlay::saveSettings() const

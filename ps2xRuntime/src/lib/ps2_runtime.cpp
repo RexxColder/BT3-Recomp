@@ -4782,6 +4782,7 @@ void PS2Runtime::run()
         {
             UploadFrame(frameTex, this, presentWidth, presentHeight);
         }
+        Texture2D *pgsTexPtr = nullptr;   // [pgsfit] set when the paraLLEl-GS scanout is what gets presented
         if (gpuMode && ps2x_pgs::enabled())
         {   // [pgs] the paraLLEl-GS scanout arrives as an RGBA8 buffer; upload it and present that instead
             static Texture2D s_pgsTex{};
@@ -4809,7 +4810,7 @@ void PS2Runtime::run()
                 }
                 else UpdateTexture(s_pgsTex, s_pgsBuf.data());
             }
-            if (s_pgsTex.id) { presentTex = s_pgsTex; flipY = false; presentWidth = s_pw; presentHeight = s_ph; }
+            if (s_pgsTex.id) { presentTex = s_pgsTex; flipY = false; presentWidth = s_pw; presentHeight = s_ph; pgsTexPtr = &s_pgsTex; }
         }
 
 #if defined(__linux__)
@@ -4918,7 +4919,20 @@ void PS2Runtime::run()
         // texture is N x native, and any non-integer window ratio point-decimates --
         // ground shake at 720p windows, HUD shimmer at 1080p. The renderer re-applies
         // its own per-draw filters, so this only affects the present.
-        if (GsGpuRenderer::renderScale() > 1)
+        if (pgsTexPtr)
+        {   // [pgsfit] the backend scanout is 1x/2x/4x of the CRTC size and the window is whatever it is. Point sampling a
+            // larger image onto the window drops whole columns (uneven glyph strokes, "rough edges"); a 2-tap bilinear
+            // drops them too once the ratio passes ~1.5. So: up to 1.5x down = bilinear, beyond = mipmaps + trilinear
+            // (glGenerateMipmap per present, ~0.1 ms on a desktop GPU). Upscales keep the point sampling the GL path has.
+            // PS2X_PGS_PRESENTMIP=0 disables the mip path (bilinear only).
+            static const bool s_mip = [](){ const char *v = std::getenv("PS2X_PGS_PRESENTMIP"); return !(v && v[0] == '0'); }();
+            const float ratio = std::max(srcWidth / std::max(1.0f, dstWidth), srcHeight / std::max(1.0f, dstHeight));
+            ps2x_pgs::setPresentSize(uint32_t(dstWidth + 0.5f), uint32_t(dstHeight + 0.5f));
+            if (s_mip && ratio > 1.5f) { GenTextureMipmaps(pgsTexPtr); SetTextureFilter(*pgsTexPtr, TEXTURE_FILTER_TRILINEAR); }
+            else if (ratio > 1.001f) SetTextureFilter(*pgsTexPtr, TEXTURE_FILTER_BILINEAR);
+            else SetTextureFilter(*pgsTexPtr, TEXTURE_FILTER_POINT);
+        }
+        else if (GsGpuRenderer::renderScale() > 1)
             SetTextureFilter(presentTex, TEXTURE_FILTER_BILINEAR);
         // ...and never let an edge sample wrap to the opposite side of the texture.
         if (s_pEdge) SetTextureWrap(presentTex, TEXTURE_WRAP_CLAMP);

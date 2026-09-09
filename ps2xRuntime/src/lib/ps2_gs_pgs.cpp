@@ -24,7 +24,8 @@
 
 namespace ps2x_pgs
 {
-static std::atomic<int> g_enabled{-1};   // -1 = read the env on first use; 0/1 afterwards (init failure clears it)
+static std::atomic<int> g_enabled{-1};
+static std::atomic<uint32_t> g_presentW{0}, g_presentH{0};   // [pgsfit] on-screen size of the presented frame   // -1 = read the env on first use; 0/1 afterwards (init failure clears it)
 namespace
 {
 using namespace Vulkan;
@@ -128,12 +129,16 @@ struct State
     GSInterface iface;
     Signals signals;
     Replacer replacer;   // [pgs-texreplace]
+    Hacks hacks;
     // privileged register shadow, by hardware offset (0x0000.. and 0x1000..), 64-bit each
     uint64_t privLo[0x100] = {};
     uint64_t privHi[0x100] = {};
     // newest scanout
     std::vector<uint8_t> frame;
     uint32_t frameW = 0, frameH = 0;
+    uint32_t ssaa = 1;                     // super-sampling factor the backend was created with (1/2/4/8/16)
+    uint32_t baseW = 0, baseH = 0;         // [pgsfit] last scanout size in the 1x domain (image extent >> shift)
+    uint32_t lastShift = 0;                // [pgsfit] scanout shift used for the last swap (0 = 1x, 1 = 2x, 2 = 4x)
     bool frameFresh = false;
     uint32_t field = 0;
     uint64_t swaps = 0, packets = 0, bytes = 0, noImage = 0;
@@ -183,9 +188,11 @@ bool initLocked(State &s)
         const char *v = std::getenv("PS2X_PGS_SSAA");
         const int r = v && v[0] ? std::atoi(v) : 1;
         opts.super_sampling = r >= 16 ? SuperSampling::X16 : r >= 8 ? SuperSampling::X8 : r >= 4 ? SuperSampling::X4 : r >= 2 ? SuperSampling::X2 : SuperSampling::X1;
+        s.ssaa = r >= 16 ? 16u : r >= 8 ? 8u : r >= 4 ? 4u : r >= 2 ? 2u : 1u;
     }
     if (!s.iface.init(&s.device, opts)) return fail("GSInterface init failed");
     s.iface.set_signal_interface(&s.signals);
+    { Hacks hk; hk.force_bilinear = envOn("PS2X_PGS_FORCE_BILINEAR"); s.hacks = hk; s.iface.set_hacks(hk); }
 #if defined(PARALLEL_GS_TEXREPLACE)
     if (packMode()) s.iface.set_texture_replacement_interface(&s.replacer);   // [pgs-texreplace]
 #else
@@ -194,8 +201,8 @@ bool initLocked(State &s)
     s.timestamps = envOn("PS2X_PGS_TIMESTAMPS");
     if (s.timestamps) { DebugMode dm = {}; dm.timestamps = true; s.iface.set_debug_mode(dm); }
     s.failed = false; s.inited = true;
-    std::fprintf(stderr, "[pgs] paraLLEl-GS backend up: %s, ssaa=%u, %s\n",
-                 s.device.get_gpu_properties().deviceName, unsigned(opts.super_sampling),
+    std::fprintf(stderr, "[pgs] paraLLEl-GS backend up: %s, ssaa=%u, force_bilinear=%d, %s\n",
+                 s.device.get_gpu_properties().deviceName, unsigned(opts.super_sampling), s.hacks.force_bilinear ? 1 : 0,
                  exclusive() ? "EXCLUSIVE (our GS parse skipped)" : packMode() ? "PACK mode (our GS parse state-only, replacements via the backend)" : "dual (our GL renderer keeps running)");
     return true;
 }
@@ -393,6 +400,14 @@ void streamFlip(uint64_t dispfb1)
     s.streamFlips++;
 }
 
+void setForceBilinear(bool on)
+{   // overlay toggle (Force Filtering): applies to the next primitive
+    State &s = st();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    s.hacks.force_bilinear = on;
+    if (s.inited) s.iface.set_hacks(s.hacks);
+}
+
 void setRegs(GSRegisters *regs)
 {
     State &s = st();
@@ -432,10 +447,26 @@ void onSwap()
     static const bool s_adapth = envOn("PS2X_PGS_ADAPTH");
     info.adapt_to_internal_horizontal_resolution = s_adapth;   // default off: scan out at the CRTC width (640) so the present keeps the GL path's aspect
     info.raw_circuit_scanout = true;
-    static const int s_hires = [](){ const char *v = std::getenv("PS2X_PGS_HIRES"); return v && v[0] ? std::atoi(v) : 0; }();   // 1 = 2x, 2 = 4x (needs SSAA 16)
-    info.high_resolution_scanout = s_hires >= 1;
-    info.high_resolution_scanout_shift = s_hires >= 2 ? 2u : 1u;
+    {   // [pgsfit] scanout resolution: PS2X_PGS_HIRES=0|1|2 (1x / 2x / 4x) forces it; unset = AUTO, the smallest shift
+        // whose scanout covers the on-screen size of the frame. The present downscales anything larger than the window
+        // (2-tap bilinear drops columns at ratios above ~1.5, point sampling drops them at ANY ratio -- that was the
+        // "rough edges around characters": a 2560x1792 scanout point-sampled onto 1920x1080). 2x needs SSAA >= 4, 4x needs 16.
+        static const int s_hires = [](){ const char *v = std::getenv("PS2X_PGS_HIRES"); return v && v[0] ? std::atoi(v) : -1; }();
+        const uint32_t maxShift = s.ssaa >= 16 ? 2u : s.ssaa >= 4 ? 1u : 0u;
+        uint32_t shift = 0;
+        if (s_hires >= 0) shift = std::min<uint32_t>(uint32_t(s_hires), maxShift);
+        else
+        {
+            const uint32_t dw = g_presentW.load(std::memory_order_relaxed), dh = g_presentH.load(std::memory_order_relaxed);
+            const uint32_t bw = s.baseW ? s.baseW : 640u, bh = s.baseH ? s.baseH : 448u;
+            while (shift < maxShift && ((bw << shift) < dw || (bh << shift) < dh)) shift++;
+        }
+        info.high_resolution_scanout = shift >= 1;
+        info.high_resolution_scanout_shift = shift >= 2 ? 2u : 1u;
+        s.lastShift = shift;
+    }
     ScanoutResult res = s.iface.vsync(info);
+    if (res.image) { s.baseW = res.image->get_width() >> res.high_resolution_shift; s.baseH = res.image->get_height() >> res.high_resolution_shift; }
     const auto t1 = std::chrono::steady_clock::now();
     static const bool s_noReadback = envOn("PS2X_PGS_NOREADBACK");   // isolation: skip the sync scanout readback (nothing presented)
     if (res.image && !s_noReadback) readbackLocked(s, res); else if (!res.image) s.noImage++;
@@ -446,8 +477,8 @@ void onSwap()
     const double dt = std::chrono::duration<double>(t2 - s.tStat).count();
     if (dt >= 5.0)
     {
-        std::fprintf(stderr, "[pgs] %.1f swaps/s, %.0f packets/s, %.1f MB/s, scanout %ux%u (no image %llu), flush+vsync %.2f ms/swap, readback %.2f ms/swap | pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx\n",
-                     s.swaps / dt, s.packets / dt, s.bytes / dt / 1048576.0, s.frameW, s.frameH, (unsigned long long)s.noImage,
+        std::fprintf(stderr, "[pgs] %.1f swaps/s, %.0f packets/s, %.1f MB/s, scanout %ux%u shift %u (no image %llu), flush+vsync %.2f ms/swap, readback %.2f ms/swap | pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx\n",
+                     s.swaps / dt, s.packets / dt, s.bytes / dt / 1048576.0, s.frameW, s.frameH, s.lastShift, (unsigned long long)s.noImage,
                      s.swaps ? s.vsyncMs / s.swaps : 0.0, s.swaps ? s.readbackMs / s.swaps : 0.0,
                      (unsigned long long)s.privLo[0], (unsigned long long)s.privLo[2], (unsigned long long)s.privLo[7], (unsigned long long)s.privLo[8],
                      (unsigned long long)s.privLo[9], (unsigned long long)s.privLo[10]);
@@ -488,6 +519,11 @@ void onSwap()
         std::fprintf(stderr, "\n");
         s.swaps = s.packets = s.bytes = 0; s.noImage = 0; s.vsyncMs = s.readbackMs = s.xferMs = 0.0; s.tStat = t2;
     }
+}
+
+void setPresentSize(uint32_t w, uint32_t h)
+{   // [pgsfit]
+    g_presentW.store(w, std::memory_order_relaxed); g_presentH.store(h, std::memory_order_relaxed);
 }
 
 bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &w, uint32_t &h)

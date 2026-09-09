@@ -17,6 +17,7 @@ bool exclusive();
 // PS2X_PGS_PACK=1: texture replacement on the backend (our GS parse runs state-only to feed the hashes; not exclusive)
 bool packMode();
 void setGs(GS *gs);
+void setForceBilinear(bool on);   // the overlay's Force Filtering toggle, mirrored to the backend
 // A GIF packet as the arbiter delivers it (path 1..3, qword multiple). Any thread; serialised inside.
 bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size);   // true = consumed by the backend
 // PS2X_PGS_COALESCE=1: stage 2 hands runs of same-path packets to the backend as ONE gif_transfer (6000 calls per
@@ -31,6 +32,9 @@ void setRegs(GSRegisters *regs);
 void streamFlip(uint64_t dispfb1);
 // Called at the frame swap (GsGpuRenderer::swapFrame): flush, scan out, read the frame back for the present thread.
 void onSwap();
+// [pgsfit] Present thread: the size the frame is drawn at on screen. Auto scanout resolution picks the smallest 2x/4x
+// shift that covers it (PS2X_PGS_HIRES unset); an explicit PS2X_PGS_HIRES=0|1|2 overrides.
+void setPresentSize(uint32_t w, uint32_t h);
 // Present thread: moves the newest scanout into `rgba` (w x h, RGBA8). False when nothing new arrived.
 bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &w, uint32_t &h);
 void shutdown();
@@ -39,6 +43,7 @@ inline bool enabled() { return false; }
 inline bool exclusive() { return false; }
 inline bool packMode() { return false; }
 inline void setGs(GS *) {}
+inline void setForceBilinear(bool) {}
 inline bool gifTransfer(uint8_t, const uint8_t *, size_t) { return false; }
 inline bool coalesce() { return false; }
 inline void setSuppressed(bool) {}
@@ -46,6 +51,7 @@ inline void privWrite(uint32_t, uint64_t, GSRegisters *) {}
 inline void setRegs(GSRegisters *) {}
 inline void streamFlip(uint64_t) {}
 inline void onSwap() {}
+inline void setPresentSize(uint32_t, uint32_t) {}
 inline bool takeFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }
 inline void shutdown() {}
 #endif

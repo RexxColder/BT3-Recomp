@@ -122,7 +122,7 @@ bool ps2xForceBilinear()
     }
     return v != 0;
 }
-void ps2xSetForceBilinear(bool v) { g_forceBilinear.store(v ? 1 : 0, std::memory_order_relaxed); }
+void ps2xSetForceBilinear(bool v) { g_forceBilinear.store(v ? 1 : 0, std::memory_order_relaxed); ps2x_pgs::setForceBilinear(v); /* [pgs] same knob on the backend */ }
 static RenderTexture2D g_gaViewTex[2];         // [gpualias] ping-pong CT16 view of the chain output
 uint32_t g_gaClutData[256];                    // [gpualias] SW-chain palette snapshot (guest writes)
 std::atomic<unsigned> g_gaClutSeq{0};
