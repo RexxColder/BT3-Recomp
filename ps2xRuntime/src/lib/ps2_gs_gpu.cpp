@@ -5079,6 +5079,13 @@ void ps2GsEmitFmvFrame()
     if (!s_on)
         return;
 
+    // [fmvwindow] "a movie frame is being shown" is decided HERE, by the movie player's cadence, not by whether our
+    // GS parse captured the pixels: with the paraLLEl-GS backend in exclusive mode the parse is off, the capture
+    // below never fills, and the early return kept the sceGsSwapDBuff clear active through the whole movie -- the
+    // old "slow movie, black flashes, X does not skip" symptom (see [dbuffclear] in Kernel/Stubs/GS.cpp).
+    g_fmvLastEmitNs.store((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
+
     // Publish the most recent COMPLETED movie frame ([fmvcapture]). This runs once per
     // sceMpegGetPicture -- more often than frames arrive -- and that cadence is deliberate: the
     // CD-tick pump allows 4 disc pumps per PUBLISH (Interrupt.cpp [cdgate]), so publishing only on
