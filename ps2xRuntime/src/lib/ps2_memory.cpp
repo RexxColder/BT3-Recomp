@@ -1,6 +1,9 @@
 #include "ps2_waitprof.h"   // [waitprof]
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_pgs.h"   // [pgs]
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "ps2_log.h"
 #include <array>
@@ -2372,19 +2375,33 @@ void PS2Memory::arbiterDrainOrHandoff()
 void PS2Memory::stage2Loop()
 {
     ps2xEeProfAddCurrentThread("GsThread");   // [eeprof]
+#if !defined(_WIN32)
+    pthread_setname_np(pthread_self(), "GsThread");   // visible to perf/top
+#endif
     uint64_t accNs = 0;
     uint64_t nItems = 0, nPkts = 0, busyNs = 0; size_t maxDepth = 0; auto tStat = std::chrono::steady_clock::now();
     static const bool s_stat = [](){ const char *v = std::getenv("PS2X_VU1PIPESTAT"); const char *e = std::getenv("PS2X_EEPROF");
                                      return (v && v[0] && v[0] != '0') || (e && e[0] && e[0] != '0'); }();
     for (;;)
     {
-        Stage2Item it;
+        Stage2Item it; uint32_t merged = 1u;
         {
             std::unique_lock<std::mutex> lk(m_s2Mtx);
             { Ps2xWaitScope w(WP_STAGE2_IDLE); m_s2Cv.wait(lk, [this]() { return !m_s2q.empty() || m_kickStop; }); }
             if (m_s2q.empty()) return;   // stop
             if (m_s2q.size() > maxDepth) maxDepth = m_s2q.size();
             it = std::move(m_s2q.front()); m_s2q.pop_front();
+            static const bool s_coal = ps2x_pgs::enabled() && ps2x_pgs::coalesce();
+            if (s_coal && it.kind == 0u)
+            {   // [pgs] every item holds one arbiter flush (usually ONE packet); merge the run of queued packet items so
+                // the backend gets one gif_transfer per path run instead of one per packet
+                while (!m_s2q.empty() && m_s2q.front().kind == 0u && it.pkts.size() < 4096u)
+                {
+                    auto &nx = m_s2q.front();
+                    it.pkts.insert(it.pkts.end(), std::make_move_iterator(nx.pkts.begin()), std::make_move_iterator(nx.pkts.end()));
+                    m_s2q.pop_front(); ++merged;
+                }
+            }
         }
         const auto t0 = std::chrono::steady_clock::now();
         switch (it.kind)
@@ -2418,9 +2435,9 @@ void PS2Memory::stage2Loop()
             break;
         }
         const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
-        accNs += ns; busyNs += ns; ++nItems;
+        accNs += ns; busyNs += ns; nItems += merged;
         if (it.kind == 1u) { g_stage2FrameNs.store(accNs, std::memory_order_relaxed); accNs = 0; }
-        if (m_s2Pending.fetch_sub(1u, std::memory_order_acq_rel) == 1u)
+        if (m_s2Pending.fetch_sub(merged, std::memory_order_acq_rel) == merged)
         {   // idle: wake a drain
             std::lock_guard<std::mutex> lk(m_kickMtx);
             m_kickDoneCv.notify_all();

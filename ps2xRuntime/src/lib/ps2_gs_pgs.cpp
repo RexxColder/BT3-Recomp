@@ -67,6 +67,9 @@ struct State
     uint32_t field = 0;
     uint64_t swaps = 0, packets = 0, bytes = 0, noImage = 0;
     double xferMs = 0.0;   // CPU time inside gif_transfer (the packet parse on our GsThread)
+    uint64_t streamDispfb1 = 0; bool haveStreamFlip = false;   // the game's DISPFB1 flip, carried in stream order ([displatch] job)
+    uint32_t privHist[0x20] = {};   // privileged stores per 16-byte slot since the last stats line (bus + pseudo regs)
+    uint64_t pseudoSeen = 0;        // in-stream pseudo A+D registers applied (exclusive mode)
     bool timestamps = false;
     std::chrono::steady_clock::time_point tStat = std::chrono::steady_clock::now();
     double readbackMs = 0.0, vsyncMs = 0.0;
@@ -123,8 +126,11 @@ void copyPrivLocked(State &s)
     {   // live block: bus stores, the sceGs stubs and our GS parse all land here
         put(&p.pmode, r->pmode);     put(&p.smode1, r->smode1 ? r->smode1 : 0x0000000740814504ULL);   put(&p.smode2, r->smode2);   // NTSC default when the CRTC was never programmed
         put(&p.srfsh, r->srfsh);     put(&p.synch1, r->synch1);   put(&p.synch2, r->synch2);
-        put(&p.syncv, r->syncv);     put(&p.dispfb1, r->dispfb1); put(&p.display1, r->display1);
-        put(&p.dispfb2, r->dispfb2); put(&p.display2, r->display2); put(&p.extbuf, r->extbuf);
+        static const bool s_useStream = !envOn("PS2X_PGS_LIVEFLIP");   // PS2X_PGS_LIVEFLIP=1: scan out whatever the bus says right now
+        const uint64_t fb1 = (s_useStream && s.haveStreamFlip) ? s.streamDispfb1 : r->dispfb1;
+        const uint64_t fb2 = (s_useStream && s.haveStreamFlip && r->dispfb2 == r->dispfb1) ? s.streamDispfb1 : r->dispfb2;
+        put(&p.syncv, r->syncv);     put(&p.dispfb1, fb1);        put(&p.display1, r->display1);
+        put(&p.dispfb2, fb2);        put(&p.display2, r->display2); put(&p.extbuf, r->extbuf);
         put(&p.extdata, r->extdata); put(&p.extwrite, r->extwrite); put(&p.bgcolor, r->bgcolor);
         put(&p.csr, r->csr.load(std::memory_order_relaxed)); put(&p.imr, r->imr); put(&p.busdir, r->busdir);
         put(&p.siglblid, r->siglblid);
@@ -175,6 +181,54 @@ void readbackLocked(State &s, const ScanoutResult &res)
     s.device.unmap_host_buffer(*readback, MEMORY_ACCESS_READ_BIT);
     s.frameW = w; s.frameH = h; s.frameFresh = true;
 }
+// [pgs-pseudo] Our sceGs stubs deliver display-environment writes IN-STREAM as A+D writes to pseudo registers
+// (Kernel/Stubs/GS.cpp: 0x41 PMODE, 0x42 SMODE2, 0x59 DISPFB1, 0x5a DISPLAY1, 0x5b DISPFB2, 0x5c DISPLAY2, 0x5f BGCOLOR).
+// Our own GS parse applies them (ps2_gs_gpu.cpp); in exclusive mode that parse is skipped, so walk the packet's tags here.
+// paraLLEl-GS itself treats those addresses as NOPs. Only PACKED tags carrying an A+D descriptor are walked.
+void applyPseudoRegsLocked(State &s, const uint8_t *data, size_t size)
+{
+    GSRegisters *r = s.signals.regs;
+    if (!r) return;
+    size_t off = 0;
+    while (off + 16 <= size)
+    {
+        uint64_t lo, hi; std::memcpy(&lo, data + off, 8); std::memcpy(&hi, data + off + 8, 8);
+        const uint32_t nloop = uint32_t(lo & 0x7FFFu), flg = uint32_t((lo >> 58) & 3u);
+        uint32_t nreg = uint32_t((lo >> 60) & 0xFu); if (nreg == 0) nreg = 16;
+        off += 16;
+        if (nloop == 0) continue;
+        if (flg == 0u)
+        {   // PACKED: nloop * nreg qwords
+            bool hasAD = false;
+            for (uint32_t i = 0; i < nreg; i++) if (((hi >> (4 * i)) & 0xFu) == 0xEu) hasAD = true;
+            const size_t bytes = size_t(nloop) * nreg * 16u;
+            if (hasAD && off + bytes <= size)
+            {
+                for (uint32_t l = 0; l < nloop; l++)
+                    for (uint32_t i = 0; i < nreg; i++)
+                    {
+                        if (((hi >> (4 * i)) & 0xFu) != 0xEu) continue;
+                        const uint8_t *q = data + off + (size_t(l) * nreg + i) * 16u;
+                        uint64_t v, a; std::memcpy(&v, q, 8); std::memcpy(&a, q + 8, 8);
+                        switch (a & 0xFFu)
+                        {
+                        case 0x41: r->pmode = v; s.privHist[0x00 >> 4]++; s.pseudoSeen++; break;
+                        case 0x42: r->smode2 = v; s.privHist[0x20 >> 4]++; s.pseudoSeen++; break;
+                        case 0x59: r->dispfb1 = v; s.privHist[0x70 >> 4]++; s.pseudoSeen++; break;
+                        case 0x5a: r->display1 = v; s.privHist[0x80 >> 4]++; s.pseudoSeen++; break;
+                        case 0x5b: r->dispfb2 = v; s.privHist[0x90 >> 4]++; s.pseudoSeen++; break;
+                        case 0x5c: r->display2 = v; s.privHist[0xA0 >> 4]++; s.pseudoSeen++; break;
+                        case 0x5f: r->bgcolor = v; s.privHist[0xE0 >> 4]++; s.pseudoSeen++; break;
+                        default: break;
+                        }
+                    }
+            }
+            off += bytes;
+        }
+        else if (flg == 1u) off += (size_t(nloop) * nreg + 1u) / 2u * 16u;   // REGLIST: 2 regs per qword
+        else off += size_t(nloop) * 16u;                                       // IMAGE / disabled
+    }
+}
 } // namespace
 
 bool enabled() { static const bool on = envOn("PS2X_PGS"); return on; }
@@ -190,9 +244,17 @@ void gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
     std::lock_guard<std::mutex> lk(s.mtx);
     if (!initLocked(s)) return;
     const auto t0 = std::chrono::steady_clock::now();
+    if (exclusive()) applyPseudoRegsLocked(s, data, size);
     s.iface.gif_transfer(pathId - 1u, data, size);
     s.xferMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     s.packets++; s.bytes += size;
+}
+
+void streamFlip(uint64_t dispfb1)
+{   // [displatch] job executed by stage 2 in stream order: the frame this DISPFB1 belongs to is complete here
+    State &s = st();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    s.streamDispfb1 = dispfb1; s.haveStreamFlip = true;
 }
 
 void setRegs(GSRegisters *regs)
@@ -207,6 +269,7 @@ void privWrite(uint32_t regOff, uint64_t value, GSRegisters *regs)
     State &s = st();
     std::lock_guard<std::mutex> lk(s.mtx);
     s.signals.regs = regs;
+    if (regOff < 0x200u) s.privHist[regOff >> 4]++;
     if (regOff < 0x1000u) s.privLo[(regOff >> 4) & 0xFFu] = value;
     else s.privHi[((regOff - 0x1000u) >> 4) & 0xFFu] = value;
 }
@@ -249,7 +312,9 @@ void onSwap()
                      s.swaps ? s.vsyncMs / s.swaps : 0.0, s.swaps ? s.readbackMs / s.swaps : 0.0,
                      (unsigned long long)s.privLo[0], (unsigned long long)s.privLo[2], (unsigned long long)s.privLo[7], (unsigned long long)s.privLo[8],
                      (unsigned long long)s.privLo[9], (unsigned long long)s.privLo[10]);
-        std::fprintf(stderr, "[pgs] cpu gif_transfer %.1f ms/s (%.2f ms/swap)", s.xferMs / dt, s.swaps ? s.xferMs / s.swaps : 0.0);
+        std::fprintf(stderr, "[pgs] cpu gif_transfer %.1f ms/s (%.2f ms/swap) | priv writes/s:", s.xferMs / dt, s.swaps ? s.xferMs / s.swaps : 0.0);
+        for (int k = 0; k < 0x20; k++) if (s.privHist[k]) { std::fprintf(stderr, " %02x=%.0f", k << 4, s.privHist[k] / dt); s.privHist[k] = 0; }
+        std::fprintf(stderr, " pseudo=%.0f", s.pseudoSeen / dt); s.pseudoSeen = 0;
         if (s.timestamps)
         {
             static const char *const names[int(TimestampType::Count)] = { "SyncHostToVRAM", "CopyVRAM", "PaletteUpdate", "TextureUpload", "TriangleSetup", "Binning", "Shading", "Readback", "VSync" };
