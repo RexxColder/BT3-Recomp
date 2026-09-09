@@ -38,4 +38,5 @@ games/bt3/work
 
 # local build/deploy scratch
 log.txt
+log_*.txt
 __pycache__/

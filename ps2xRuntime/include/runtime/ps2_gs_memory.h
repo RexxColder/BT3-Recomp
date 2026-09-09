@@ -44,8 +44,15 @@ namespace GSMem
 		u32 y{ 0 };
 	};
 
+	// GCC 11/12 ICE (tsubst_copy, cp/pt.cc) when Extent.x/Extent.y are used directly as
+	// std::array extent NTTPs; extract the dimensions as plain usz first to avoid it.
+	namespace detail {
+		template<typename T, usz W, usz H>
+		struct LookupTableStorage { using type = std::array<std::array<T, W>, H>; };
+	}
+
 	template<typename T, Extent2D Extent>
-	using LookupTable = std::array<std::array<T, Extent.x>, Extent.y>;
+	using LookupTable = typename detail::LookupTableStorage<T, static_cast<usz>(Extent.x), static_cast<usz>(Extent.y)>::type;
 
 	constexpr bool IsValidPsm(PixelStorageMode psm)
 	{
@@ -248,8 +255,8 @@ namespace GSMem
 		// gets a pixel address
 		static constexpr u32 Address(const PageLookupTableT& table, u32 block, u32 bw, u32 x, u32 y);
 
-		using PackedT = BitStorageHelper<BitsPerPixel(psm)>::Type;
-		using UnapckedT = BitStorageHelper<UnpackedBitWidth(psm)>::Type;
+		using PackedT = typename BitStorageHelper<BitsPerPixel(psm)>::Type;
+		using UnapckedT = typename BitStorageHelper<UnpackedBitWidth(psm)>::Type;
 
 		// returns a offset into a 32 bit word (P8H, P4HH, P4HL)
 		static constexpr usz BitOffset();

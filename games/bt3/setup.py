@@ -28,7 +28,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
-BUILD = ROOT / "build"
+# Overridable so a container can generate into a build-local dir (PS2X_BUILD_DIR)
+# instead of the host source tree. Defaults to <repo>/build.
+BUILD = Path(os.environ.get("PS2X_BUILD_DIR") or str(ROOT / "build"))
 WORK = HERE / "work"
 ELF_SHA256 = "811188ba9b416500d921cd4d9514df0cbf42f3a41a99cf5aac5a3da37171bf99"
 IS_WINDOWS = os.name == "nt"
@@ -228,7 +230,11 @@ def main() -> None:
                     help="after the build, copy the playable tree into OUT")
     ap.add_argument("--skip-setup", action="store_true",
                     help="skip ISO/recompile/patches; only rebuild the runner (+deploy)")
+    ap.add_argument("--gen-only", action="store_true",
+                    help="stop after recompile/generation/patches (steps 1-6); skip building the runner")
     args = ap.parse_args()
+    if args.skip_setup and args.gen_only:
+        die("--skip-setup and --gen-only are mutually exclusive")
 
     jobs = str(args.jobs)
     if args.skip_setup:
@@ -319,6 +325,10 @@ def main() -> None:
                   exclude=("ps2_recompiled_functions.h", "ps2_recompiled_stubs.h"))
         for h in ("ps2_recompiled_functions.h", "ps2_recompiled_stubs.h"):
             shutil.copyfile(out / h, rt / "include" / h)
+
+    if args.gen_only:
+        print("--gen-only: runner + overlay sources generated (skipping runner build)")
+        return
 
     # 7. Build the game. CONFIGURE_DEPENDS re-globs on Makefile generators, but the
     #    Visual Studio generator does not reliably pick up a changed source SET within

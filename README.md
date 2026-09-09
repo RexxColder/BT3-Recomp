@@ -117,6 +117,9 @@ Known issues:
 
 - Built on [ran-j/PS2Recomp](https://github.com/ran-j/PS2Recomp) — thank you!
   Licensed GPL-3.0, as is this repository (see `LICENSE`).
+- NTSC-U AFS file lists (`PZS3US1.AFL`/`PZS3US2.AFL`) by
+  [ViveTheModder](https://github.com/ViveTheModder/vivethemodder.github.io),
+  distributed under the Apache License 2.0 (see `ps2xRuntime/src/launcher/assets/NOTICE`).
 - *Dragon Ball Z: Budokai Tenkaichi 3* © Spike / Bandai Namco. This project is
   not affiliated with or endorsed by them; it exists for preservation and
   interoperability, and distributes no game content.

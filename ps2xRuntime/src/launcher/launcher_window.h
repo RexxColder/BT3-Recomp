@@ -28,6 +28,7 @@ protected:
 
 private:
     void loadBackground();
+    void updateHint();
     void checkGameData();
     bool openInstallWizard();
 
@@ -41,6 +42,7 @@ private:
     QString m_bgPath;
     QString m_savedataDir;
     QString m_dataDir;
+    bool m_plainRunner = false;
     bool m_gameDataValid = false;
     bool m_wizardShown = false;
 };
