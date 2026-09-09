@@ -327,12 +327,12 @@ int GsGpuRenderer::inkStrengthPct()
             const double f = e && e[0] ? std::atof(e) : 0.0;
             v = (f <= 0.0) ? 199 : (int)((f < 10.0 ? f * 100.0 : f) + 0.5);
         }
-        if (v < 100) v = 100; if (v > 300) v = 300;
+        if (v < 100) v = 100; if (v > 400) v = 400;
         g_uiInk.store(v, std::memory_order_relaxed);
     }
     return v;
 }
-void GsGpuRenderer::setInkStrengthPct(int p) { if (p < 100) p = 100; if (p > 300) p = 300; g_uiInk.store(p); }
+void GsGpuRenderer::setInkStrengthPct(int p) { if (p < 100) p = 100; if (p > 400) p = 400; g_uiInk.store(p); }
 void GsGpuRenderer::setShadows(bool v)     { g_uiShadows.store(v ? 1 : 0); }
 
 // GS texel-corner vs GL texel-centre addressing. 0.5 texel, or 0 with PS2X_HALFTEXEL=0

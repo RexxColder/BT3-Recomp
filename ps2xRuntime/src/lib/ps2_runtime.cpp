@@ -4970,11 +4970,14 @@ void PS2Runtime::run()
                     std::error_code ec;
                     if (std::filesystem::exists(req, ec))
                     {
+                        // Consume the request BEFORE publishing the shot: a driver that requests the next shot the
+                        // moment shot.png appears otherwise has that new request deleted here and times out
+                        // (the rig's poll loop lost every second capture and walked blind into Dragon Universe).
+                        std::filesystem::remove(req, ec);
                         Image im = LoadImageFromScreen();
                         const std::string tmp = std::string(s_shotDir) + "/shot.tmp.png", dst = std::string(s_shotDir) + "/shot.png";
                         ExportImage(im, tmp.c_str()); UnloadImage(im);
                         std::filesystem::rename(tmp, dst, ec);
-                        std::filesystem::remove(req, ec);
                     }
                 }
             }

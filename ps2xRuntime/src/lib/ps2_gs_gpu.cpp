@@ -4067,6 +4067,24 @@ void GS::vertexKick(bool drawing)
             static const int s_censusMode = [](){ const char *v = std::getenv("PS2X_PGS_CENSUS"); return v && v[0] ? std::atoi(v) : 0; }();
             static unsigned s_skyN = 0;
             static unsigned s_c16N = 0;
+            static unsigned s_c336N = 0;
+            static std::unordered_map<uint64_t, uint32_t> s_c336Seen;
+            if (s_censusMode == 4 && s_c336N < 60 && m_vtxCount >= 2 && activeContext().frame.fbp == 336u)
+            {   // the outline chain into page 336: one line per distinct (fbmsk, alpha, tex, U-X, V-Y) class
+                const GSContext &ctx = activeContext();
+                const float ofx = ctx.xyoffset.ofx / 16.0f, ofy = ctx.xyoffset.ofy / 16.0f;
+                const GSVertex &a = m_vtxQueue[0], &b = m_vtxQueue[1];
+                const int dux = int(std::lround((a.u / 16.0f) - (a.x - ofx))), dvy = int(std::lround((a.v / 16.0f) - (a.y - ofy)));
+                const uint64_t key = (uint64_t(ctx.frame.fbmsk) << 32) ^ (uint64_t(ctx.alpha & 0xFFu) << 24) ^ (uint64_t(ctx.tex0.tbp0) << 8) ^ uint64_t(ctx.tex0.psm) ^ (uint64_t(uint32_t(dux + 64)) << 48) ^ (uint64_t(uint32_t(dvy + 64)) << 56);
+                if (s_c336Seen[key]++ == 0u)
+                {
+                    s_c336N++;
+                    std::fprintf(stderr, "[pgsc336] #%u prim %d tme %d abe %d fbw %u psm %u fbmsk %08x alpha %02llx test %llx tex tbp0 %u psm %u %ux%u cbp %u | U-X %d V-Y %d | v0 (%.2f,%.2f uv %.2f,%.2f) v1 (%.2f,%.2f uv %.2f,%.2f)\n",
+                                 s_c336N, int(m_prim.type), m_prim.tme ? 1 : 0, m_prim.abe ? 1 : 0, ctx.frame.fbw, unsigned(ctx.frame.psm), ctx.frame.fbmsk, (unsigned long long)(ctx.alpha & 0xFFu), (unsigned long long)ctx.test,
+                                 ctx.tex0.tbp0, unsigned(ctx.tex0.psm), 1u << ctx.tex0.tw, 1u << ctx.tex0.th, ctx.tex0.cbp, dux, dvy,
+                                 a.x - ofx, a.y - ofy, a.u / 16.0f, a.v / 16.0f, b.x - ofx, b.y - ofy, b.u / 16.0f, b.v / 16.0f);
+                }
+            }
             {   // [vramprobe] the 32-sprite depth-mask pass just finished -> ask the pgs module to dump the frame alpha
                 static unsigned s_c16run = 0;
                 if (activeContext().frame.psm == GS_PSM_CT16) { if (++s_c16run == 32u) { ps2x_pgs::g_pgsProbeFbp.store(activeContext().frame.fbp); ps2x_pgs::g_pgsProbeZbp.store(activeContext().zbuf.zbp); ps2x_pgs::g_pgsProbeReq.store(1); } }

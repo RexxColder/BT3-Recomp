@@ -1,5 +1,6 @@
 #include "runtime/ps2_texreplace.h"
 #include "ps2_settings_overlay.h"
+#include "runtime/ps2_gs_pgs.h"   // [pgsink] backend ink width
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/pad_config.h"
@@ -246,6 +247,30 @@ namespace
 }
 
 bool PS2SettingsOverlay::s_widescreen = false;
+
+// [fsnative] Fullscreen at the MONITOR's resolution. raylib's ToggleFullscreen() keeps the window's current size as
+// the video mode (1024x768 from the INI); on Wayland the compositor then stretches that 4:3 surface across the 16:9
+// panel while the game still sees a 4:3 screen -- neither the true-widescreen FOV patch nor the HUD squeeze engage
+// and the whole picture is stretched. Size the window to the monitor first; restore the saved size on the way out.
+// PS2X_FSNATIVE=0 restores the old toggle.
+static void ps2xSetFullscreen(bool on, int windowW, int windowH)
+{
+    static const bool s_native = [](){ const char *v = std::getenv("PS2X_FSNATIVE"); return !(v && v[0] == '0'); }();
+    if (!s_native) { ToggleFullscreen(); return; }
+    if (on)
+    {
+        if (IsWindowFullscreen()) return;
+        const int m = GetCurrentMonitor();
+        const int mw = GetMonitorWidth(m), mh = GetMonitorHeight(m);
+        if (mw >= 320 && mh >= 240) SetWindowSize(mw, mh);
+        ToggleFullscreen();
+    }
+    else
+    {
+        if (IsWindowFullscreen()) ToggleFullscreen();
+        if (windowW >= 320 && windowH >= 240) SetWindowSize(windowW, windowH);
+    }
+}
 // [wshudmap] live HUD-layout state, defined in ps2_gs_gpu_renderer.cpp
 extern std::atomic<int> g_wsHudLayout;
 extern std::atomic<int> g_wsHudOffLQ, g_wsHudOffCQ, g_wsHudOffRQ;
@@ -333,7 +358,7 @@ void PS2SettingsOverlay::initialize()
         SetWindowSize(m_settings.windowW, m_settings.windowH);
     // Apply fullscreen on startup if the INI says so (or the default is true).
     if (m_settings.fullscreen)
-        ToggleFullscreen();
+        ps2xSetFullscreen(true, m_settings.windowW, m_settings.windowH);
     // Build the device list up front so the gamepad toggle combo works before the
     // overlay is opened for the first time (m_deviceList is otherwise only populated
     // when the overlay opens via resetCaptureState/buildDeviceList).
@@ -492,7 +517,9 @@ void PS2SettingsOverlay::loadSettings()
                     { if (!envUserSet("PS2X_GLOWFIX")) m_settings.glowFix = (val == "1" || val == "true"); }
                 else if (key == "ink_strength")
                     { if (!envUserSet("PS2X_INKSTRENGTH") && !envUserSet("PS2X_ADGS"))
-                          m_settings.inkStrength = std::clamp(std::atoi(val.c_str()), 100, 300); }
+                          m_settings.inkStrength = std::clamp(std::atoi(val.c_str()), 100, 400); }
+                else if (key == "ink_width")
+                    m_settings.inkWidth = std::clamp(std::atoi(val.c_str()), 25, 100);
                 else if (key == "postfx")
                     { if (!envUserSet("PS2X_POSTFX")) m_settings.postfx = (val == "1" || val == "true"); }
                 else if (key == "bilinear")
@@ -710,6 +737,7 @@ void PS2SettingsOverlay::saveSettings() const
     file << "glow=" << (m_settings.glow ? "1" : "0") << "\n";
     file << "glowfix=" << (m_settings.glowFix ? "1" : "0") << "\n";
     file << "ink_strength=" << m_settings.inkStrength << "\n";
+    file << "ink_width=" << m_settings.inkWidth << "\n";
     file << "postfx=" << (m_settings.postfx ? "1" : "0") << "\n";
     file << "bilinear=" << (m_settings.bilinear ? "1" : "0") << "\n";
     file << "halftexel=" << (m_settings.halfTexel ? "1" : "0") << "\n";
@@ -813,6 +841,7 @@ void PS2SettingsOverlay::applySettings()
     // state -- and a partial glow fix is a REGRESSION (it washes the frame out).
     GsGpuRenderer::setGlowFix(m_settings.glowFix);
     GsGpuRenderer::setInkStrengthPct(m_settings.inkStrength);   // [inkstrength] live: it is one shader uniform
+    ps2x_pgs::setInkWidthPct(m_settings.inkWidth);   // [pgsink] backend stroke width
     GsGpuRenderer::setBilinear(m_settings.bilinear);
     GsGpuRenderer::setHalfTexel(m_settings.halfTexel);
     GsGpuRenderer::setSkipPost(m_settings.skipPost);
@@ -1027,7 +1056,7 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
     if (IsKeyPressed(KEY_F11))
     {
         m_settings.fullscreen = !m_settings.fullscreen;
-        ToggleFullscreen();
+        ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
         m_dirty = true;
     }
 
@@ -1322,13 +1351,25 @@ void PS2SettingsOverlay::drawVideoTab()
         ImGui::Text("Ink Strength");
         ImGui::SameLine(120);
         ImGui::SetNextItemWidth(220);
-        if (ImGui::SliderInt("##inkstrength", &m_settings.inkStrength, 100, 260, "%d %%",
+        if (ImGui::SliderInt("##inkstrength", &m_settings.inkStrength, 100, 400, "%d %%",
                              ImGuiSliderFlags_AlwaysClamp))
         {
             GsGpuRenderer::setInkStrengthPct(m_settings.inkStrength);   // live preview
             m_dirty = true;
         }
-        ImGui::TextDisabled("199%% matches the console line. Lower = thinner/lighter ink.");
+        ImGui::TextDisabled("199%% matches the console line. Higher = darker ink.");
+        if (m_settings.renderer == 2)
+        {   // [pgsink] paraLLEl-GS: the stroke width is the outline chain's edge-detect shift, rewritten in the stream
+            ImGui::Text("Ink Width");
+            ImGui::SameLine(120);
+            ImGui::SetNextItemWidth(220);
+            if (ImGui::SliderInt("##inkwidth", &m_settings.inkWidth, 25, 100, "%d %%", ImGuiSliderFlags_AlwaysClamp))
+            {
+                ps2x_pgs::setInkWidthPct(m_settings.inkWidth);   // live
+                m_dirty = true;
+            }
+            ImGui::TextDisabled("100%% = the console's one-pixel stroke; lower = thinner (paraLLEl-GS only).");
+        }
     }
     if (toggleSwitch("Character Shadows", &m_settings.shadows))
         m_dirty = true;
@@ -1396,7 +1437,7 @@ void PS2SettingsOverlay::drawVideoTab()
     sectionHeader("DISPLAY");
     if (toggleSwitch("Fullscreen", &m_settings.fullscreen))
     {
-        ToggleFullscreen();
+        ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
         m_dirty = true;
     }
     if (toggleSwitch("Widescreen (true FOV)", &m_settings.widescreen))
