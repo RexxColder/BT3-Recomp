@@ -639,7 +639,9 @@ static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
     if (renderer == 2)
     {
         setEnvDefault("PS2X_PGS", "1");
-        if (texPack) setEnvDefault("PS2X_PGS_PACK", "1"); else setEnvDefault("PS2X_PGS_EXCLUSIVE", "1");
+        // [pgslive] pack mode whenever a pack is configured, so the toggle can flip LIVE (it needs our state-only parse's VRAM mirror)
+        const char *packDir = std::getenv("PS2X_TEXREPLACE");
+        if (texPack || (packDir && packDir[0])) setEnvDefault("PS2X_PGS_PACK", "1"); else setEnvDefault("PS2X_PGS_EXCLUSIVE", "1");
         if (forceBilinear) setEnvDefault("PS2X_PGS_FORCE_BILINEAR", "1");
     }
     else
@@ -709,6 +711,7 @@ void PS2SettingsOverlay::preloadSettings()
             {
                 int rs = std::atoi(val.c_str());
                 if (rs >= 1 && rs <= 4) GsGpuRenderer::setRenderScale(rs);
+                if (rs >= 1 && rs <= 4 && !envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(rs);   // [pgslive] backend starts at the INI scale
             }
         }
         else if (section == "logging" && key == "log_level")
@@ -854,6 +857,8 @@ void PS2SettingsOverlay::applySettings()
     // on live changes too, and a live scale store would desync the pipeline.
     GsGpuRenderer::setOutline(m_settings.outline);
     GsGpuRenderer::setTexPack(m_settings.texPack);
+    ps2x_pgs::setPackEnabled(m_settings.texPack);    // [pgslive]
+    if (!envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(m_settings.renderScale); // [pgslive] (an explicit launcher SSAA wins until the combo is touched)
     GsGpuRenderer::setShadows(m_settings.shadows);
     GsGpuRenderer::setDofBlur(m_settings.dofBlur);
     GsGpuRenderer::setDofZFar(m_settings.dofZFar);
@@ -1340,6 +1345,7 @@ void PS2SettingsOverlay::drawVideoTab()
         if (toggleSwitch("Texture Replacement", &m_settings.texPack))
         {   // Applies LIVE: setTexPack flushes the texture cache so everything re-decodes.
             GsGpuRenderer::setTexPack(m_settings.texPack);
+            ps2x_pgs::setPackEnabled(m_settings.texPack);   // [pgslive] backend: hook gated + cached textures dropped
             m_dirty = true;
         }
         if (!havePack)
@@ -1435,10 +1441,13 @@ void PS2SettingsOverlay::drawVideoTab()
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
         if (ImGui::Combo("##renderscale", &rsIdx, kScales, 4))
         {
-            m_settings.renderScale = rsIdx + 1;   // persisted to INI; applied on next launch
+            m_settings.renderScale = rsIdx + 1;   // persisted to INI; OpenGL applies on next launch, paraLLEl-GS live
+            ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive]
             m_dirty = true;
         }
-        if (m_settings.renderScale != GsGpuRenderer::renderScale())
+        if (m_settings.renderer == 2)
+            ImGui::TextDisabled("paraLLEl-GS: 1x / 2x / 3x / 4x = 1 / 4 / 8 / 16 samples per pixel, applies live.");
+        else if (m_settings.renderScale != GsGpuRenderer::renderScale())
             ImGui::TextDisabled("(applies on restart)");
     }
     sectionHeader("FILTERING");

@@ -18,6 +18,7 @@
 #include "thread_id.hpp"
 #include <algorithm>
 #include <atomic>
+#include <new>
 #include <vector>
 #include <cmath>
 #include <chrono>
@@ -35,6 +36,10 @@ namespace ps2x_pgs
 {
 static std::atomic<int> g_enabled{-1};
 static std::atomic<uint32_t> g_presentW{0}, g_presentH{0};   // [pgsfit] on-screen size of the presented frame   // -1 = read the env on first use; 0/1 afterwards (init failure clears it)
+static std::atomic<int> g_packOn{1};          // [pgslive] the overlay's Texture Replacement toggle (hook returns nothing when off)
+static std::atomic<int> g_packFlushReq{0};    // [pgslive] toggle changed: drop the backend's cached textures at the next transfer
+static std::atomic<int> g_wantScale{0};       // [pgslive] the overlay's Internal Resolution (1..4; 0 = not set, env/default apply)
+static uint32_t scaleToSsaa(int scale) { return scale >= 4 ? 16u : scale == 3 ? 8u : scale == 2 ? 4u : 1u; }
 static std::atomic<uint32_t> g_inkColor{0};   // [pgsink] outline colour 0xRRGGBB (0 = the game's black); the darkener subtracts, so its RGB is modulated by the complement
 static std::atomic<int> g_inkWidthPct{100};   // [pgsink] outline stroke width, % of a PS2 texel (the edge-detect shift); 100 = native
 std::atomic<int> g_pgsProbeReq{0};            // [vramprobe] set by the GS parse after the 32-sprite depth-mask pass (ps2x_pgs::)
@@ -152,6 +157,7 @@ struct Replacer final : TextureReplacementInterface
     ImageHandle replace(const TextureDescriptor &desc, uint64_t liveTex0, uint64_t liveTexclut, Device &device) override
     {
         if (!gs || !ps2tex::replacementsEnabled()) { skipped++; return {}; }
+        if (!g_packOn.load(std::memory_order_relaxed)) { skipped++; return {}; }   // [pgslive] toggle off: native decode
         const uint32_t psm = uint32_t(desc.tex0.desc.PSM);
         if (psm != GS_PSM_T8 && psm != GS_PSM_T4) { skipped++; return {}; }   // identify() hashes paletted textures only
         GSTex0Reg t{};
@@ -348,7 +354,8 @@ bool initLocked(State &s)
     opts.vram_size = 4 * 1024 * 1024;
     {
         const char *v = std::getenv("PS2X_PGS_SSAA");
-        const int r = v && v[0] ? std::atoi(v) : 1;
+        const int ws = g_wantScale.load(std::memory_order_relaxed);
+        const int r = ws > 0 ? int(scaleToSsaa(ws)) : (v && v[0] ? std::atoi(v) : 1);   // [pgslive] overlay scale > env > 1
         opts.super_sampling = r >= 16 ? SuperSampling::X16 : r >= 8 ? SuperSampling::X8 : r >= 4 ? SuperSampling::X4 : r >= 2 ? SuperSampling::X2 : SuperSampling::X1;
         opts.super_sampled_textures = [](){ const char *v = std::getenv("PS2X_PGS_SSTEX"); return !(v && v[0] == '0'); }();   // [pgsink] per-sample reads of render targets (the outline chain's silhouette buffer; needed for ink widths < 100%)
         s.ssaa = r >= 16 ? 16u : r >= 8 ? 8u : r >= 4 ? 4u : r >= 2 ? 2u : 1u;
@@ -1472,6 +1479,71 @@ void applyPseudoRegsLocked(State &s, const uint8_t *data, size_t size)
 }
 } // namespace
 
+// [pgslive] re-create the backend at another super-sampling level, carrying VRAM (and, in pack mode, our parse's
+// register file) across. Super-sampling is fixed at GSInterface creation; this makes the overlay's Internal
+// Resolution live. Frame contexts and the Vulkan device stay; replacement images (owned by the hook's cache) survive.
+static void drainReadbackLocked(State &s)
+{
+    for (RbSlot &slot : g_rb)
+    {
+        if (slot.pending && slot.fence) { slot.fence->wait(); consumeSlotLocked(s, slot); }
+        slot = RbSlot{};
+    }
+    g_rbIdx = 0;
+}
+static bool reinitLocked(State &s, uint32_t ssaa)
+{
+    drainReadbackLocked(s);
+    s.iface.flush();
+    // the fork's own savestate mechanism: VRAM + the register file + the privileged registers, then clobber
+    std::vector<uint8_t> vram(4u * 1024u * 1024u);
+    if (const void *rd = s.iface.map_vram_read(0, vram.size())) std::memcpy(vram.data(), rd, vram.size());
+    const RegisterState regs = s.iface.get_register_state();
+    const PrivRegisterState priv = s.iface.get_priv_register_state();
+    s.device.wait_idle();
+    s.iface.~GSInterface();
+    new (&s.iface) GSInterface();
+    GSOptions opts = {};
+    opts.vram_size = 4 * 1024 * 1024;
+    opts.super_sampling = ssaa >= 16 ? SuperSampling::X16 : ssaa >= 8 ? SuperSampling::X8 : ssaa >= 4 ? SuperSampling::X4 : ssaa >= 2 ? SuperSampling::X2 : SuperSampling::X1;
+    opts.super_sampled_textures = [](){ const char *v = std::getenv("PS2X_PGS_SSTEX"); return !(v && v[0] == '0'); }();
+    if (!s.iface.init(&s.device, opts)) { std::fprintf(stderr, "[pgs] re-init at ssaa %u FAILED -- backend off\n", ssaa); s.failed = true; s.inited = false; g_enabled.store(0); return false; }
+    s.iface.set_signal_interface(&s.signals);
+    s.iface.set_hacks(s.hacks);
+#if defined(PARALLEL_GS_TEXREPLACE)
+    if (packMode()) s.iface.set_texture_replacement_interface(&s.replacer);
+#endif
+    if (s.timestamps) { DebugMode dm = {}; dm.timestamps = true; s.iface.set_debug_mode(dm); }
+    if (void *w = s.iface.map_vram_write(0, vram.size())) { std::memcpy(w, vram.data(), vram.size()); s.iface.end_vram_write(0, vram.size()); }
+    s.iface.get_register_state() = regs;
+    s.iface.get_priv_register_state() = priv;
+    s.iface.get_register_state().cached_cbp[0] = s.iface.get_register_state().cached_cbp[1] = UINT32_MAX;   // the CLUT cache is empty now
+    s.iface.clobber_register_state();
+    // the palette cache is gone with the old renderer: reload each context's CLUT from VRAM (BT3 keeps them there)
+    for (int c = 0; c < 2; ++c)
+    {
+        const uint64_t tex0 = regs.ctx[c].tex0.bits;
+        if (!tex0) continue;
+        const uint32_t psm = uint32_t(tex0 >> 20) & 0x3f;
+        if (!(psm == 0x13 || psm == 0x14 || psm == 0x1b || psm == 0x24 || psm == 0x2c)) continue;   // paletted only
+        s.iface.write_register(c ? RegisterAddr::TEX0_2 : RegisterAddr::TEX0_1, (tex0 & ~(7ull << 61)) | (1ull << 61));
+        s.iface.get_register_state().ctx[c].tex0.bits = tex0;
+    }
+    s.ssaa = ssaa; s.baseW = s.baseH = 0;
+    std::fprintf(stderr, "[pgs] backend re-created live at ssaa=%u (VRAM + register file carried over)\n", ssaa);
+    return true;
+}
+void setPackEnabled(bool on)
+{
+    const int prev = g_packOn.exchange(on ? 1 : 0);
+    if (prev != (on ? 1 : 0)) g_packFlushReq.store(1);
+}
+void setRenderScale(int scale)
+{
+    if (scale < 1) scale = 1;
+    if (scale > 4) scale = 4;
+    g_wantScale.store(scale, std::memory_order_relaxed);
+}
 bool enabled()
 {
     int v = g_enabled.load(std::memory_order_relaxed);
@@ -1492,6 +1564,7 @@ bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
     std::lock_guard<std::mutex> lk(s.mtx);
     if (!initLocked(s)) return false;
     const auto t0 = std::chrono::steady_clock::now();
+    if (g_packFlushReq.exchange(0)) { s.iface.invalidate_all_cached_textures(); std::fprintf(stderr, "[pgs] texture replacement %s: cached textures dropped\n", g_packOn.load() ? "ON" : "OFF"); }   // [pgslive]
     if (exclusive()) applyPseudoRegsLocked(s, data, size);
     {   // [pgswshud] widescreen HUD squeeze (PS2X_PGS_WSHUD=0 disables): rewrite HUD vertex X before the backend parses
         static const bool s_wshud = [](){ const char *v = std::getenv("PS2X_PGS_WSHUD"); return !(v && v[0] == '0'); }();
@@ -1596,6 +1669,7 @@ void onSwap()
     State &s = st();
     std::lock_guard<std::mutex> lk(s.mtx);
     if (!initLocked(s)) return;
+    { const int ws = g_wantScale.load(std::memory_order_relaxed); if (ws > 0 && scaleToSsaa(ws) != s.ssaa && !reinitLocked(s, scaleToSsaa(ws))) return; }   // [pgslive]
     const auto t0 = std::chrono::steady_clock::now();
     s.iface.flush();
     { const FlushStats fs = s.iface.consume_flush_stats(); s.fsPrims += fs.num_primitives; s.fsPasses += fs.num_render_passes; s.fsCopies += fs.num_copies; s.fsPal += fs.num_palette_updates; }
