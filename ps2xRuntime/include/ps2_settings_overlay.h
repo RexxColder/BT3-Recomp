@@ -18,6 +18,15 @@ public:
         float musicVolume = 1.0f;
         float sfxVolume = 1.0f;
         bool gpuRenderer = true;
+        // [renderer] 0 = OpenGL (our GS renderer), 1 = software rasterizer, 2 = paraLLEl-GS (Vulkan compute; only when
+        // the backend is built in). gpuRenderer stays in sync (renderer != 1) for the code that still reads it.
+        static constexpr int kRendererOpenGL = 0, kRendererSoftware = 1, kRendererParallelGS = 2;
+#if defined(PS2X_HAVE_PGS)
+        static constexpr int kRendererDefault = 2;
+#else
+        static constexpr int kRendererDefault = 0;
+#endif
+        int renderer = kRendererDefault;
         bool glow = true;
         bool postfx = false;
         bool glowFix = true;   // [glowfix] BT3's bloom/glow chain (Kaioken aura); applies on restart

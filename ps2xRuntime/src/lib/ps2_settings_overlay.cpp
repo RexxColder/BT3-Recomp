@@ -364,6 +364,7 @@ bool PS2SettingsOverlay::Settings::operator==(const Settings &o) const
            musicVolume == o.musicVolume &&
            sfxVolume == o.sfxVolume &&
            gpuRenderer == o.gpuRenderer &&
+           renderer == o.renderer &&
            glow == o.glow &&
            postfx == o.postfx &&
            glowFix == o.glowFix &&
@@ -417,6 +418,7 @@ void PS2SettingsOverlay::toggleVisible()
 // [envwins] An env var the USER set explicitly (present, and not one main() defaulted --
 // PS2X_DEFAULTED lists those) outranks the saved INI: play.sh-style launches and A/B runs
 // must behave as commanded regardless of what the overlay saved last session.
+static bool m_sawRendererKey = false;   // [renderer] set while parsing the ini
 static bool envUserSet(const char *name)
 {
     if (!std::getenv(name)) return false;
@@ -428,6 +430,7 @@ static bool envUserSet(const char *name)
 
 void PS2SettingsOverlay::loadSettings()
 {
+    m_sawRendererKey = false;
     // [defaults-sync] Seed from LIVE runtime state (env + main()'s baked defaults) so a
     // missing INI -- or a key the INI doesn't mention -- never pushes this struct's
     // hardcoded values over the validated configuration.
@@ -475,6 +478,14 @@ void PS2SettingsOverlay::loadSettings()
             {
                 if (key == "gpu_renderer")
                     { if (!envUserSet("PS2X_GPU")) m_settings.gpuRenderer = (val == "1" || val == "true"); }
+                else if (key == "renderer")
+                {   // [renderer] 0 OpenGL / 1 software / 2 paraLLEl-GS
+                    int r = std::atoi(val.c_str());
+#if !defined(PS2X_HAVE_PGS)
+                    if (r == Settings::kRendererParallelGS) r = Settings::kRendererOpenGL;
+#endif
+                    if (r >= 0 && r <= 2) { m_settings.renderer = r; m_sawRendererKey = true; }
+                }
                 else if (key == "glow")
                     { if (!envUserSet("PS2X_GLOW")) m_settings.glow = (val == "1" || val == "true"); }
                 else if (key == "glowfix")
@@ -574,6 +585,38 @@ void PS2SettingsOverlay::loadSettings()
         {
         }
     }
+    // [renderer] legacy ini (no `renderer` key): gpu_renderer=0 meant the software rasterizer; otherwise the default
+    // backend, which is paraLLEl-GS when built in. Either way keep gpuRenderer coherent for the older readers.
+    if (!m_sawRendererKey)
+        m_settings.renderer = m_settings.gpuRenderer ? Settings::kRendererDefault : Settings::kRendererSoftware;
+    m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);
+}
+
+// [renderer] The paraLLEl-GS backend reads PS2X_PGS* lazily at its first packet, so the ini choice is exported as
+// environment DEFAULTS here (setenv(...,0): an explicit user override still wins). renderer 2 = backend on, exclusive
+// (our GS parse skipped) unless a texture pack is on, where the backend needs our state-only parse for the hashes.
+static void setEnvDefault(const char *name, const char *value)
+{   // never overwrites: an explicit user env override wins
+    if (std::getenv(name)) return;
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 0);
+#endif
+}
+static void exportRendererEnv(int renderer, bool texPack)
+{
+#if defined(PS2X_HAVE_PGS)
+    if (renderer == 2)
+    {
+        setEnvDefault("PS2X_PGS", "1");
+        if (texPack) setEnvDefault("PS2X_PGS_PACK", "1"); else setEnvDefault("PS2X_PGS_EXCLUSIVE", "1");
+    }
+    else
+        setEnvDefault("PS2X_PGS", "0");
+#else
+    (void)renderer; (void)texPack;
+#endif
 }
 
 void PS2SettingsOverlay::preloadSettings()
@@ -582,8 +625,13 @@ void PS2SettingsOverlay::preloadSettings()
         ? (std::filesystem::current_path() / kConfigFileName).string()
         : (std::filesystem::path(s_configDir) / kConfigFileName).string();
     std::ifstream file(iniPath);
+    int rendererPre = Settings::kRendererDefault;   // [renderer] exported below even when no ini exists yet
+    bool texPackPre = true;
     if (!file.is_open())
+    {
+        exportRendererEnv(rendererPre, texPackPre);
         return;
+    }
 
     std::string section;
     std::string line;
@@ -610,6 +658,17 @@ void PS2SettingsOverlay::preloadSettings()
 
         if (section == "video" && key == "widescreen")
             s_widescreen = (val == "1" || val == "true");
+        else if (section == "video" && key == "renderer")
+        {
+            const int r = std::atoi(val.c_str());
+            if (r >= 0 && r <= 2) rendererPre = r;
+        }
+        else if (section == "video" && key == "gpu_renderer")
+        {   // legacy: 0 = software (only honoured when no `renderer` key follows)
+            if (!(val == "1" || val == "true") && rendererPre == Settings::kRendererDefault) rendererPre = Settings::kRendererSoftware;
+        }
+        else if (section == "video" && key == "texture_pack")
+            texPackPre = (val == "1" || val == "true");
         else if (section == "video" && key == "render_scale")
         {   // [rscale] authoritative startup application -- runs before anything reads the
             // live scale, so the INI value wins the lazy-init race.
@@ -627,6 +686,7 @@ void PS2SettingsOverlay::preloadSettings()
             s_startupLogLevel = lvl;
         }
     }
+    exportRendererEnv(rendererPre, texPackPre);
 }
 
 void PS2SettingsOverlay::saveSettings() const
@@ -642,6 +702,7 @@ void PS2SettingsOverlay::saveSettings() const
 
     file << "[video]\n";
     file << "gpu_renderer=" << (m_settings.gpuRenderer ? "1" : "0") << "\n";
+    file << "renderer=" << m_settings.renderer << "\n";
     file << "glow=" << (m_settings.glow ? "1" : "0") << "\n";
     file << "glowfix=" << (m_settings.glowFix ? "1" : "0") << "\n";
     file << "ink_strength=" << m_settings.inkStrength << "\n";
@@ -739,6 +800,7 @@ void PS2SettingsOverlay::applySettings()
     PS2AudioBackend::setMasterVolume(m_settings.masterVolume);
     PS2AudioBackend::setMusicVolume(m_settings.musicVolume);
     PS2AudioBackend::setSfxVolume(m_settings.sfxVolume);
+    m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);   // [renderer]
     GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
     GsGpuRenderer::setGlow(m_settings.glow);
     GsGpuRenderer::setPostfx(m_settings.postfx);
@@ -991,7 +1053,8 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
         PS2AudioBackend::setMasterVolume(m_settings.masterVolume);
         PS2AudioBackend::setMusicVolume(m_settings.musicVolume);
         PS2AudioBackend::setSfxVolume(m_settings.sfxVolume);
-        GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
+        m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);   // [renderer]
+    GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
         GsGpuRenderer::setGlow(m_settings.glow);
         GsGpuRenderer::setPostfx(m_settings.postfx);
         m_dirty = false;
@@ -1211,8 +1274,25 @@ void PS2SettingsOverlay::drawVideoTab()
 
     // Renderer + Effects (flat, compact — no card borders)
     sectionHeader("RENDERER");
-    if (toggleSwitch("GPU Renderer (OpenGL)", &m_settings.gpuRenderer))
-        m_dirty = true;
+    {   // [renderer] backend dropdown
+#if defined(PS2X_HAVE_PGS)
+        static const char *const kRenderers[] = { "OpenGL", "Software rasterizer", "paraLLEl-GS (Vulkan compute)" };
+        const int nRenderers = 3;
+#else
+        static const char *const kRenderers[] = { "OpenGL", "Software rasterizer" };
+        const int nRenderers = 2;
+#endif
+        int r = std::clamp(m_settings.renderer, 0, nRenderers - 1);
+        ImGui::TextUnformatted("Renderer");
+        ImGui::SameLine(180.0f);
+        ImGui::SetNextItemWidth(260.0f);
+        if (ImGui::Combo("##renderer", &r, kRenderers, nRenderers))
+        {
+            m_settings.renderer = r;
+            m_settings.gpuRenderer = (r != Settings::kRendererSoftware);
+            m_dirty = true;
+        }
+    }
     ImGui::TextDisabled("Takes full effect after restart.");
     if (toggleSwitch("Cel Outline", &m_settings.outline))
         m_dirty = true;

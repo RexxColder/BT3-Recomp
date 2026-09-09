@@ -8,13 +8,17 @@
 #include <cstdint>
 #include <vector>
 struct GSRegisters;
+class GS;
 namespace ps2x_pgs
 {
 #if defined(PS2X_HAVE_PGS)
 bool enabled();
 bool exclusive();
+// PS2X_PGS_PACK=1: texture replacement on the backend (our GS parse runs state-only to feed the hashes; not exclusive)
+bool packMode();
+void setGs(GS *gs);
 // A GIF packet as the arbiter delivers it (path 1..3, qword multiple). Any thread; serialised inside.
-void gifTransfer(uint8_t pathId, const uint8_t *data, size_t size);
+bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size);   // true = consumed by the backend
 // PS2X_PGS_COALESCE=1: stage 2 hands runs of same-path packets to the backend as ONE gif_transfer (6000 calls per
 // frame otherwise); while a coalesced run is being processed the per-packet hook must stay quiet.
 bool coalesce();
@@ -33,7 +37,9 @@ void shutdown();
 #else
 inline bool enabled() { return false; }
 inline bool exclusive() { return false; }
-inline void gifTransfer(uint8_t, const uint8_t *, size_t) {}
+inline bool packMode() { return false; }
+inline void setGs(GS *) {}
+inline bool gifTransfer(uint8_t, const uint8_t *, size_t) { return false; }
 inline bool coalesce() { return false; }
 inline void setSuppressed(bool) {}
 inline void privWrite(uint32_t, uint64_t, GSRegisters *) {}

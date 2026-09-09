@@ -3947,8 +3947,12 @@ void GS::vertexKick(bool drawing)
                                  nn, ff, 100.0 * ff / nn, mx);
             }
         }
+        // [nodraw] PS2X_GS_NODRAW=1 (or the paraLLEl-GS pack mode): keep the GS state machine, VRAM and palettes current but
+        // record no draws -- the cheap parse that feeds texture identification while another backend renders.
+        static const bool s_noDraw = [](){ const char *v = std::getenv("PS2X_GS_NODRAW"); return (v && v[0] && v[0] != '0') || ps2x_pgs::packMode(); }();
         static const bool s_dp = [](){ const char *v = std::getenv("PS2X_DMAPROF"); return v && v[0] && v[0] != '0'; }();
-        if (s_dp)
+        if (s_noDraw) { /* state only */ }
+        else if (s_dp)
         {
             static std::atomic<uint64_t> s_ns{0}, s_n{0}, s_texN{0};
             auto t0 = std::chrono::steady_clock::now();

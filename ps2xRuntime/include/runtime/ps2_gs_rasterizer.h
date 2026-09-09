@@ -28,6 +28,8 @@ struct TexDecodeSrc
 class GSRasterizer
 {
 public:
+    // [pgs-texreplace] the paraLLEl-GS backend's replacement hook builds a palette from OUR VRAM for hashing
+    static int fillClutForBackend(uint32_t *out, uint8_t *vram, const GSTexaReg &texa, const GSTexClutReg &texclut, const GSTex0Reg &tex0) { return fillClutFrom(out, vram, texa, texclut, tex0); }
     void decodeDeferred(const TexDecodeReq &req, uint8_t *vram, size_t vramSize, int &subW, std::vector<uint8_t> &rgba);   // [deferdec] GL thread
     void decodeSnapshot(const DecPoolJob &job, uint8_t *scratch, size_t vramSize, int &subW, std::vector<uint8_t> &rgba);   // [decpool] pool thread
     // [texreplace] the pack-replacement swap, shared by the inline decode and the decode pool: on a hit rgba/upW/upH/upFmt/upScale/upAlpha become the replacement's

@@ -419,6 +419,8 @@ public:
     inline u32 ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const;
 
     uint8_t *vramData() { return m_vram; }
+    const GSTexClutReg &texclutReg() const { return m_texclut; }   // [pgs-texreplace]
+    const GSTexaReg &texaReg() const { return m_texa; }
     // [slice] raw shadow of every general register written via writeRegister (A+D, REGLIST,
     // PACKED). Lets the replay slicer re-emit the full register state as one A+D packet.
     const uint64_t *rawRegs() const { return m_rawRegs; }

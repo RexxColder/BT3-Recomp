@@ -6,6 +6,11 @@
 //     thread uploads as a texture. The readback is a full GPU sync per frame -- fine for first light, not for perf.
 #include "runtime/ps2_gs_pgs.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_gs_gpu.h"        // [pgs-texreplace] GS (VRAM, palettes), register structs
+#include "runtime/ps2_gs_rasterizer.h" // GSRasterizer::fillClutFrom
+#include "runtime/ps2_texreplace.h"    // ps2tex::identify / loadReplacement
+#include <unordered_map>
+#include <string>
 #include "gs_interface.hpp"
 #include "device.hpp"
 #include "context.hpp"
@@ -19,6 +24,7 @@
 
 namespace ps2x_pgs
 {
+static std::atomic<int> g_enabled{-1};   // -1 = read the env on first use; 0/1 afterwards (init failure clears it)
 namespace
 {
 using namespace Vulkan;
@@ -49,6 +55,61 @@ struct Signals final : SignalInterface
     }
 };
 
+// [pgs-texreplace] Texture pack on the paraLLEl-GS path. paraLLEl-GS asks at every texture-cache miss; we hash the
+// texture exactly as the GL renderer does (PCSX2-compatible XXH3 over the swizzled VRAM blocks + the palette, from OUR
+// GS parse running state-only in pack mode) and hand back a Vulkan image of the replacement, any size -- the
+// ubershader samples with normalized coordinates, so a 4x image drops in without shader changes.
+struct Replacer final : TextureReplacementInterface
+{
+    GS *gs = nullptr;
+    std::unordered_map<std::string, ImageHandle> cache;   // name -> image (null = known miss)
+    uint64_t hits = 0, misses = 0, skipped = 0;
+    ImageHandle replace(const TextureDescriptor &desc, Device &device) override
+    {
+        if (!gs || !ps2tex::replacementsEnabled()) { skipped++; return {}; }
+        const uint32_t psm = uint32_t(desc.tex0.desc.PSM);
+        if (psm != GS_PSM_T8 && psm != GS_PSM_T4) { skipped++; return {}; }   // identify() hashes paletted textures only
+        GSTex0Reg t{};
+        t.tbp0 = uint32_t(desc.tex0.desc.TBP0); t.tbw = uint8_t(desc.tex0.desc.TBW); t.psm = uint8_t(psm);
+        t.tw = uint8_t(desc.tex0.desc.TW); t.th = uint8_t(desc.tex0.desc.TH); t.tcc = uint8_t(desc.tex0.desc.TCC); t.tfx = uint8_t(desc.tex0.desc.TFX);
+        t.cbp = uint32_t(desc.tex0.desc.CBP); t.cpsm = uint8_t(desc.tex0.desc.CPSM); t.csm = uint8_t(desc.tex0.desc.CSM);
+        t.csa = uint8_t(desc.tex0.desc.CSA); t.cld = uint8_t(desc.tex0.desc.CLD);
+        GSTexaReg texa{uint8_t(desc.texa.desc.TA0), desc.texa.desc.AEM != 0, uint8_t(desc.texa.desc.TA1)};
+        uint32_t clut[256] = {};
+        const int n = GSRasterizer::fillClutForBackend(clut, gs->vramData(), texa, gs->texclutReg(), t);
+        ps2tex::TexIdent id;
+        if (n <= 0 || !ps2tex::identify(gs->vramData(), t.tbp0, t.tbw, t.psm, t.tw, t.th, clut, texa.ta0, texa.aem, texa.ta1, id)) { skipped++; return {}; }
+        const std::string name = id.name();
+        {   // PS2X_PGS_PACKLOG=1: the first identifications, to compare against the pack's file names
+            static const bool s_log = [](){ const char *v = std::getenv("PS2X_PGS_PACKLOG"); return v && v[0] && v[0] != '0'; }(); static unsigned s_n = 0;
+            if (s_log && s_n < 40 && !cache.count(name)) { s_n++; std::fprintf(stderr, "[pgs-pack] #%u %s psm=%u tbp0=%u tbw=%u tw=%u th=%u cbp=%u csa=%u cpsm=%u bank=%u\n", s_n, name.c_str(), psm, t.tbp0, t.tbw, t.tw, t.th, t.cbp, t.csa, t.cpsm, unsigned(desc.palette_bank)); }
+        }
+        auto it = cache.find(name);
+        if (it != cache.end()) { if (it->second) hits++; else misses++; return it->second; }
+        std::vector<uint8_t> px; int w = 0, h = 0, fmt = 0;
+        if (!ps2tex::loadReplacement(id, px, w, h, fmt) || w <= 0 || h <= 0 || px.empty()) { cache.emplace(name, ImageHandle{}); misses++; return {}; }
+        // raylib PixelFormat values (raylib.h): 7 = R8G8B8A8, 14 = DXT1 RGB, 15 = DXT1 RGBA, 16 = DXT3, 17 = DXT5
+        VkFormat vkfmt = VK_FORMAT_UNDEFINED;
+        switch (fmt)
+        {
+        case 7: vkfmt = VK_FORMAT_R8G8B8A8_UNORM; break;
+        case 14: case 15: vkfmt = VK_FORMAT_BC1_RGBA_UNORM_BLOCK; break;
+        case 16: vkfmt = VK_FORMAT_BC2_UNORM_BLOCK; break;
+        case 17: vkfmt = VK_FORMAT_BC3_UNORM_BLOCK; break;
+        default: break;
+        }
+        if (vkfmt == VK_FORMAT_UNDEFINED) { cache.emplace(name, ImageHandle{}); misses++; return {}; }
+        auto info = ImageCreateInfo::immutable_2d_image(uint32_t(w), uint32_t(h), vkfmt);
+        info.initial_layout = VK_IMAGE_LAYOUT_GENERAL;   // paraLLEl-GS's post-upload barrier moves GENERAL -> READ_ONLY
+        info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ImageInitialData init = {}; init.data = px.data();
+        ImageHandle img = device.create_image(info, &init);
+        if (!img) { cache.emplace(name, ImageHandle{}); misses++; return {}; }
+        cache.emplace(name, img); hits++;
+        return img;
+    }
+};
+
 struct State
 {
     std::mutex mtx;
@@ -57,6 +118,7 @@ struct State
     Device device;
     GSInterface iface;
     Signals signals;
+    Replacer replacer;   // [pgs-texreplace]
     // privileged register shadow, by hardware offset (0x0000.. and 0x1000..), 64-bit each
     uint64_t privLo[0x100] = {};
     uint64_t privHi[0x100] = {};
@@ -96,13 +158,14 @@ bool initLocked(State &s)
     if (s.inited) return true;
     if (s.failed) return false;
     s.failed = true;   // until proven otherwise
-    if (!Context::init_loader(nullptr)) { std::fprintf(stderr, "[pgs] Vulkan loader init failed\n"); return false; }
+    auto fail = [](const char *why) { std::fprintf(stderr, "[pgs] %s -- backend unavailable, falling back to the OpenGL renderer\n", why); g_enabled.store(0, std::memory_order_relaxed); return false; };
+    if (!Context::init_loader(nullptr)) return fail("Vulkan loader init failed");
     s.ctx.set_num_thread_indices(1);
     if (!s.ctx.init_instance_and_device(nullptr, 0, nullptr, 0,
                                         CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
                                         CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
                                         CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
-    { std::fprintf(stderr, "[pgs] Vulkan instance/device init failed\n"); return false; }
+        return fail("Vulkan instance/device init failed");
     s.device.set_context(s.ctx);
     s.device.init_frame_contexts(4);
     GSOptions opts = {};
@@ -112,14 +175,15 @@ bool initLocked(State &s)
         const int r = v && v[0] ? std::atoi(v) : 1;
         opts.super_sampling = r >= 16 ? SuperSampling::X16 : r >= 8 ? SuperSampling::X8 : r >= 4 ? SuperSampling::X4 : r >= 2 ? SuperSampling::X2 : SuperSampling::X1;
     }
-    if (!s.iface.init(&s.device, opts)) { std::fprintf(stderr, "[pgs] GSInterface init failed\n"); return false; }
+    if (!s.iface.init(&s.device, opts)) return fail("GSInterface init failed");
     s.iface.set_signal_interface(&s.signals);
+    if (packMode()) s.iface.set_texture_replacement_interface(&s.replacer);   // [pgs-texreplace]
     s.timestamps = envOn("PS2X_PGS_TIMESTAMPS");
     if (s.timestamps) { DebugMode dm = {}; dm.timestamps = true; s.iface.set_debug_mode(dm); }
     s.failed = false; s.inited = true;
     std::fprintf(stderr, "[pgs] paraLLEl-GS backend up: %s, ssaa=%u, %s\n",
                  s.device.get_gpu_properties().deviceName, unsigned(opts.super_sampling),
-                 exclusive() ? "EXCLUSIVE (our GS parse skipped)" : "dual (our GL renderer keeps running)");
+                 exclusive() ? "EXCLUSIVE (our GS parse skipped)" : packMode() ? "PACK mode (our GS parse state-only, replacements via the backend)" : "dual (our GL renderer keeps running)");
     return true;
 }
 
@@ -270,18 +334,25 @@ void applyPseudoRegsLocked(State &s, const uint8_t *data, size_t size)
 }
 } // namespace
 
-bool enabled() { static const bool on = envOn("PS2X_PGS"); return on; }
-bool coalesce() { static const bool c = envOn("PS2X_PGS_COALESCE"); return c; }
+bool enabled()
+{
+    int v = g_enabled.load(std::memory_order_relaxed);
+    if (v < 0) { v = envOn("PS2X_PGS") ? 1 : 0; g_enabled.store(v, std::memory_order_relaxed); }
+    return v != 0;
+}
+bool packMode() { static const bool p = envOn("PS2X_PGS") && envOn("PS2X_PGS_PACK"); return p; }
+bool coalesce() { static const bool c = envOn("PS2X_PGS_COALESCE") && !packMode(); return c; }   // pack mode needs per-packet order
+void setGs(GS *gs) { State &s = st(); std::lock_guard<std::mutex> lk(s.mtx); s.replacer.gs = gs; }
 static thread_local bool t_suppressed = false;
 void setSuppressed(bool on) { t_suppressed = on; }
-bool exclusive() { static const bool ex = envOn("PS2X_PGS_EXCLUSIVE"); return ex; }
+bool exclusive() { static const bool ex = envOn("PS2X_PGS_EXCLUSIVE") && !packMode(); return ex; }   // pack mode keeps our (state-only) parse
 
-void gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
+bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
 {
-    if (!data || size < 16 || pathId < 1 || pathId > 3 || t_suppressed) return;
+    if (!data || size < 16 || pathId < 1 || pathId > 3 || t_suppressed) return false;
     State &s = st();
     std::lock_guard<std::mutex> lk(s.mtx);
-    if (!initLocked(s)) return;
+    if (!initLocked(s)) return false;
     const auto t0 = std::chrono::steady_clock::now();
     if (exclusive()) applyPseudoRegsLocked(s, data, size);
     s.iface.gif_transfer(pathId - 1u, data, size);
@@ -298,6 +369,7 @@ void gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
         if (c.ms > s.slowCalls[worst].ms) s.slowCalls[worst] = c;
     }
     s.packets++; s.bytes += size;
+    return true;
 }
 
 void streamFlip(uint64_t dispfb1)
@@ -368,6 +440,7 @@ void onSwap()
         std::fprintf(stderr, "[pgs] cpu gif_transfer %.1f ms/s (%.2f ms/swap) | priv writes/s:", s.xferMs / dt, s.swaps ? s.xferMs / s.swaps : 0.0);
         for (int k = 0; k < 0x20; k++) if (s.privHist[k]) { std::fprintf(stderr, " %02x=%.0f", k << 4, s.privHist[k] / dt); s.privHist[k] = 0; }
         std::fprintf(stderr, " pseudo=%.0f", s.pseudoSeen / dt); s.pseudoSeen = 0;
+        if (packMode()) { std::fprintf(stderr, " | pack: hits %llu misses %llu skipped %llu cached %zu", (unsigned long long)s.replacer.hits, (unsigned long long)s.replacer.misses, (unsigned long long)s.replacer.skipped, s.replacer.cache.size()); s.replacer.hits = s.replacer.misses = s.replacer.skipped = 0; }
         {   // per swap: paraLLEl-GS render passes / copies / palette updates / primitives (consume_flush_stats)
             const double sw = s.swaps ? double(s.swaps) : 1.0;
             std::fprintf(stderr, " | per swap: passes %.1f copies %.1f pal %.1f prims %.0f", s.fsPasses / sw, s.fsCopies / sw, s.fsPal / sw, s.fsPrims / sw);

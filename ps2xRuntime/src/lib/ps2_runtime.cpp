@@ -1141,6 +1141,7 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    ps2x_pgs::setGs(&m_gs);   // [pgs-texreplace] the backend's replacement hook hashes this GS's VRAM/palettes
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     {
                                         extern uint8_t g_gifArbCurPath; // set by GifArbiter::drain

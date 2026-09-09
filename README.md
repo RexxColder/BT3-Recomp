@@ -143,7 +143,10 @@ ninja -C build_pgs ps2EntryRunner
 ```
 
 CMake picks the backend up automatically when `ps2xRuntime/third_party/parallel-gs/CMakeLists.txt` exists
-(`-DPS2X_DISABLE_PGS=ON` to leave it out). Run with `PS2X_PGS=1 PS2X_PGS_EXCLUSIVE=1`. Knobs: `PS2X_PGS_SSAA=1|2|4|8|16`
+(`-DPS2X_DISABLE_PGS=ON` to leave it out). The backend is the DEFAULT renderer when built in: the overlay's
+Renderer dropdown (`[video] renderer=` 0 OpenGL, 1 software, 2 paraLLEl-GS, takes effect on restart) selects it, and the
+runtime falls back to OpenGL by itself if Vulkan is unavailable. Environment overrides still work (`PS2X_PGS=0/1`,
+`PS2X_PGS_EXCLUSIVE=1`). Knobs: `PS2X_PGS_SSAA=1|2|4|8|16`
 (4 = render-scale-2 geometry, 16 = render-scale-4), `PS2X_PGS_HIRES=1` (2x scanout), `PS2X_PGS_COALESCE=1`,
 `PS2X_PGS_TIMESTAMPS=1` (per-stage GPU times in the `[pgs]` log line), `PS2X_PGS_DUMP=<dir>` (presented frames as PNG),
 `PS2X_PGS_LIVEFLIP=1`, `PS2X_PGS_SYNCREADBACK=1` / `PS2X_PGS_NOREADBACK=1` (A/B switches). Keyboard input: set the
