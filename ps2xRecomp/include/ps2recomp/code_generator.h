@@ -8,6 +8,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "ps2recomp/control_flow_analyzer.h"
+// Symbol must be complete before m_symbols' unordered_map is instantiated in
+// the class body (libstdc++ on GCC 11 / clang 14 requires it at definition).
+#include "ps2recomp/types.h"
 
 namespace ps2recomp
 {
@@ -15,7 +18,6 @@ namespace ps2recomp
     struct JumpTable;
 	struct Instruction;
 	struct Function;
-	struct Symbol;
 	struct Section;
     class RecompilerReporter;
 
