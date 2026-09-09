@@ -37,4 +37,13 @@ add_custom_command(TARGET Launcher POST_BUILD
         "$<TARGET_FILE_DIR:Launcher>/assets/fonts"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/RussoOne-Regular.ttf"
-        "$<TARGET_FILE_DIR:Launcher>/assets/fonts/RussoOne-Regular.ttf")
+        "$<TARGET_FILE_DIR:Launcher>/assets/fonts/RussoOne-Regular.ttf"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/PZS3US1.afl"
+        "$<TARGET_FILE_DIR:Launcher>/assets/PZS3US1.afl"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/PZS3US2.afl"
+        "$<TARGET_FILE_DIR:Launcher>/assets/PZS3US2.afl"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/NOTICE"
+        "$<TARGET_FILE_DIR:Launcher>/assets/NOTICE")

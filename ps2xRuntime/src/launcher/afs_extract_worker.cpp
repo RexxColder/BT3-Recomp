@@ -2,6 +2,7 @@
 
 #include "afs_archive.h"
 
+#include <QCoreApplication>
 #include <QFile>
 #include <QFileInfo>
 
@@ -40,7 +41,8 @@ void AfsExtractWorker::doWork(const QStringList &afsFiles)
         };
 
         const AfsConvertResult r = convertAfsToFolder(
-            f.toStdString(), info.absolutePath().toStdString(), onStatus, onProgress);
+            f.toStdString(), info.absolutePath().toStdString(), onStatus, onProgress,
+            (QCoreApplication::applicationDirPath() + QStringLiteral("/assets")).toStdString());
 
         if (!r.ok)
         {
