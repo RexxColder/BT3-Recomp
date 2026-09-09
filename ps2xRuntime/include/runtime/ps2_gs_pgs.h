@@ -19,6 +19,7 @@ bool packMode();
 void setGs(GS *gs);
 void setForceBilinear(bool on);   // the overlay's Force Filtering toggle, mirrored to the backend
 void setInkWidthPct(int pct);     // [pgsink] the overlay's Ink Width: outline stroke width in % of a PS2 texel (25..100)
+void setInkColor(uint32_t rgb);   // [pgsink] the overlay's Ink Color, 0xRRGGBB (0 = the game's black)
 // A GIF packet as the arbiter delivers it (path 1..3, qword multiple). Any thread; serialised inside.
 bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size);   // true = consumed by the backend
 // PS2X_PGS_COALESCE=1: stage 2 hands runs of same-path packets to the backend as ONE gif_transfer (6000 calls per
@@ -46,6 +47,7 @@ inline bool packMode() { return false; }
 inline void setGs(GS *) {}
 inline void setForceBilinear(bool) {}
 inline void setInkWidthPct(int) {}
+inline void setInkColor(uint32_t) {}
 inline bool gifTransfer(uint8_t, const uint8_t *, size_t) { return false; }
 inline bool coalesce() { return false; }
 inline void setSuppressed(bool) {}

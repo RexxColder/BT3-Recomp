@@ -520,6 +520,8 @@ void PS2SettingsOverlay::loadSettings()
                           m_settings.inkStrength = std::clamp(std::atoi(val.c_str()), 100, 400); }
                 else if (key == "ink_width")
                     m_settings.inkWidth = std::clamp(std::atoi(val.c_str()), 25, 100);
+                else if (key == "ink_color")
+                    m_settings.inkColor = static_cast<unsigned>(std::strtoul(val.c_str(), nullptr, 16)) & 0xFFFFFFu;
                 else if (key == "postfx")
                     { if (!envUserSet("PS2X_POSTFX")) m_settings.postfx = (val == "1" || val == "true"); }
                 else if (key == "bilinear")
@@ -738,6 +740,7 @@ void PS2SettingsOverlay::saveSettings() const
     file << "glowfix=" << (m_settings.glowFix ? "1" : "0") << "\n";
     file << "ink_strength=" << m_settings.inkStrength << "\n";
     file << "ink_width=" << m_settings.inkWidth << "\n";
+    { char hex[16]; std::snprintf(hex, sizeof hex, "%06x", m_settings.inkColor); file << "ink_color=" << hex << "\n"; }
     file << "postfx=" << (m_settings.postfx ? "1" : "0") << "\n";
     file << "bilinear=" << (m_settings.bilinear ? "1" : "0") << "\n";
     file << "halftexel=" << (m_settings.halfTexel ? "1" : "0") << "\n";
@@ -842,6 +845,7 @@ void PS2SettingsOverlay::applySettings()
     GsGpuRenderer::setGlowFix(m_settings.glowFix);
     GsGpuRenderer::setInkStrengthPct(m_settings.inkStrength);   // [inkstrength] live: it is one shader uniform
     ps2x_pgs::setInkWidthPct(m_settings.inkWidth);   // [pgsink] backend stroke width
+    ps2x_pgs::setInkColor(m_settings.inkColor);       // [pgsink] backend stroke colour
     GsGpuRenderer::setBilinear(m_settings.bilinear);
     GsGpuRenderer::setHalfTexel(m_settings.halfTexel);
     GsGpuRenderer::setSkipPost(m_settings.skipPost);
@@ -1369,6 +1373,22 @@ void PS2SettingsOverlay::drawVideoTab()
                 m_dirty = true;
             }
             ImGui::TextDisabled("100%% = the console's one-pixel stroke; lower = thinner (paraLLEl-GS only).");
+            {   // [pgsink] the darkener subtracts its colour from the scene, so the picker sets the complement it keeps
+                float rgb[3] = { ((m_settings.inkColor >> 16) & 0xFFu) / 255.0f, ((m_settings.inkColor >> 8) & 0xFFu) / 255.0f, (m_settings.inkColor & 0xFFu) / 255.0f };
+                ImGui::Text("Ink Color");
+                ImGui::SameLine(120);
+                ImGui::SetNextItemWidth(220);
+                if (ImGui::ColorEdit3("##inkcolor", rgb, ImGuiColorEditFlags_NoPicker | ImGuiColorEditFlags_NoAlpha | ImGuiColorEditFlags_DisplayRGB | ImGuiColorEditFlags_Uint8))
+                {
+                    auto b = [](float f) { return static_cast<unsigned>(std::clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f); };
+                    m_settings.inkColor = (b(rgb[0]) << 16) | (b(rgb[1]) << 8) | b(rgb[2]);
+                    ps2x_pgs::setInkColor(m_settings.inkColor);   // live
+                    m_dirty = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Black")) { m_settings.inkColor = 0; ps2x_pgs::setInkColor(0); m_dirty = true; }
+                ImGui::TextDisabled("Exact on light backgrounds; darker scenes tint toward it (paraLLEl-GS only).");
+            }
         }
     }
     if (toggleSwitch("Character Shadows", &m_settings.shadows))
@@ -1386,6 +1406,7 @@ void PS2SettingsOverlay::drawVideoTab()
             m_settings.dofZFar = reach * 1000;
             m_dirty = true;
         }
+        if (m_settings.renderer == 2) ImGui::TextDisabled("paraLLEl-GS: off keeps the aura glow (the game blurs through the same pass,\nso a soft halo stays around a charging aura); reach is OpenGL-only.");
         ImGui::TextDisabled("Lower = blur reaches nearer to the camera. 200k matches the console look.");
     }
     // (Glow / Skip Post / Half-Texel / Skip Stale VRAM toggles removed: replay A/B

@@ -35,6 +35,7 @@ namespace ps2x_pgs
 {
 static std::atomic<int> g_enabled{-1};
 static std::atomic<uint32_t> g_presentW{0}, g_presentH{0};   // [pgsfit] on-screen size of the presented frame   // -1 = read the env on first use; 0/1 afterwards (init failure clears it)
+static std::atomic<uint32_t> g_inkColor{0};   // [pgsink] outline colour 0xRRGGBB (0 = the game's black); the darkener subtracts, so its RGB is modulated by the complement
 static std::atomic<int> g_inkWidthPct{100};   // [pgsink] outline stroke width, % of a PS2 texel (the edge-detect shift); 100 = native
 std::atomic<int> g_pgsProbeReq{0};            // [vramprobe] set by the GS parse after the 32-sprite depth-mask pass (ps2x_pgs::)
 std::atomic<unsigned> g_pgsProbeFbp{0}, g_pgsProbeZbp{0};
@@ -283,7 +284,7 @@ struct State
     // rewriting the X of HUD vertices inside the GIF packets before they reach the backend.
     struct WsHud
     {
-        struct Ctx { uint32_t fbp = 0, fbw = 0, fpsm = 0, zte = 0, ztst = 0; float ofx = 0.f, ofy = 0.f; uint64_t test = 0, frame = 0, alpha = 0, tex0 = 0, scissor = 0; };
+        struct Ctx { uint32_t fbp = 0, fbw = 0, fpsm = 0, zte = 0, ztst = 0; float ofx = 0.f, ofy = 0.f; uint64_t test = 0, frame = 0, alpha = 0, tex0 = 0, scissor = 0; size_t tex0Off = ~size_t(0); };
         Ctx ctx[2];
         uint64_t primRaw = 0, prmode = 0; bool prmodeCont = true;
         struct V { size_t off = 0; bool packed = false, mapped = false; uint16_t x = 0, y = 0; uint32_t z = 0; };
@@ -293,7 +294,7 @@ struct State
         // [pgsink] RGBAQ writes since the last kick (packet offsets; packed = 16-byte qword, else 8-byte reg), for the darkener
         struct RgbaW { size_t off; bool packed; }; RgbaW rgba[8]; int rgbaN = 0;
         RgbaW uv[8]; int uvN = 0;   // [pgsink] UV writes since the last kick (the edge-detect shift rewrite)
-        uint64_t inkDropped = 0, inkScaled = 0, inkShifted = 0;
+        uint64_t inkDropped = 0, inkScaled = 0, inkShifted = 0, shadowDropped = 0, dofDropped = 0, maskNeutralized = 0;
     } wshud;
     std::vector<uint8_t> wsBuf;   // [pgswshud] rebuilt packet when quads are subdivided at layout breakpoints
     uint32_t ssaa = 1;                     // super-sampling factor the backend was created with (1/2/4/8/16)
@@ -530,6 +531,62 @@ static void wsHudKickLocked(State &s, uint8_t *data, float inv)
         }
     }
     h.uvN = 0;
+    {   // [pgsfx] DoF off, mode 2: the depth-mask sprites (16-bit view of a scene buffer, FBMSK 0x3fff, reading the Z
+        // buffer as PSMZ16) get their texture alpha turned off (TEX0.TCC := 0) and a vertex alpha of 0x80, so they write
+        // "near" (alpha bit 7 = 1) everywhere: no far blur, while draws after them (the aura) still open the mask.
+        static const int s_dofMode3 = [](){ const char *e = std::getenv("PS2X_PGS_DOFMODE"); return e && e[0] ? std::atoi(e) : 2; }();   // 2 = mask pass writes near (default), 1 = mask pass off, 0 = drop the composite (kills the glow)
+        const bool tmeM = ((attr >> 4) & 1u) != 0;
+        const uint32_t tpsmM = uint32_t((c.tex0 >> 20) & 0x3Fu);
+        if (s_dofMode3 == 2 && !GsGpuRenderer::dofBlurEnabled() && isSprite && tmeM && (c.fpsm == 2u || c.fpsm == 10u) && (c.fbp == 0u || c.fbp == 112u)
+            && uint32_t(c.frame >> 32) == 0x3fffu && (tpsmM == 50u || tpsmM == 58u))
+        {
+            if (c.tex0Off != ~size_t(0) && (c.tex0 & (1ull << 34)))
+            {   // clear TCC once per TEX0 write
+                uint64_t t0 = c.tex0 & ~(1ull << 34);
+                std::memcpy(data + c.tex0Off, &t0, 8);
+                h.ctx[ci].tex0 = t0;
+            }
+            for (int i = 0; i < h.rgbaN; i++) { uint8_t *q = data + h.rgba[i].off; if (h.rgba[i].packed) q[12] = 0x80; else q[3] = 0x80; }
+            h.maskNeutralized++;
+        }
+    }
+    {   // [pgsfx] Character Shadows / Depth-of-Field Blur toggles (the OpenGL renderer's draw classes, ps2_gs_gpu_renderer.cpp
+        // PS2X_NODECAL=1 and PS2X_NODOF): the shadow decal tiles are triangles sampling block 10752 as PSMCT24 256x256 into
+        // the scene; the DoF composite samples block 10752 as PSMCT32 into the scene. Off = collapse the primitive.
+        const bool tmeF = ((attr >> 4) & 1u) != 0;
+        const bool sceneF = (c.fbp == 0u || c.fbp == 112u) && (c.fpsm == 0u || c.fpsm == 1u);
+        if (tmeF && sceneF && (isTri || isSprite) && uint32_t(c.tex0 & 0x3FFFu) == 10752u)
+        {
+            const uint32_t tpsm = uint32_t((c.tex0 >> 20) & 0x3Fu), tw = uint32_t((c.tex0 >> 26) & 0xFu), th = uint32_t((c.tex0 >> 30) & 0xFu);
+            // CT24 256x256 reads of the blur buffer: with a destination-alpha test they are the blur/glow COMPOSITES
+            // (full-screen, lerp where the depth mask allows); without it, the shadow decal tiles on the ground.
+            const bool dateF = ((c.test >> 14) & 1u) != 0;
+            const bool shadowTile = isTri && tpsm == 1u && tw == 8u && th == 8u && !dateF;
+            const bool blurComp = tpsm == 1u && tw == 8u && th == 8u && dateF;
+            // the DoF composite lerps by destination alpha (0x54 / 0x68); the Kaioken glow reads the same page additively
+            const uint32_t bm = uint32_t(c.alpha & 0xFFu);
+            const bool abeF = ((attr >> 6) & 1u) != 0;
+            const uint32_t tbw = uint32_t((c.tex0 >> 14) & 0x3Fu);
+            {   // PS2X_PGS_WSHUDLOG=1: the classes of scene draws that read block 10752 (DoF copy vs glow blur vs shadow tiles)
+                static const bool s_fl = [](){ const char *v = std::getenv("PS2X_PGS_WSHUDLOG"); return v && v[0] && v[0] != '0'; }(); static unsigned s_fn = 0;
+                static uint64_t s_seen[32]; static int s_seenN = 0;
+                const uint64_t key = (uint64_t(tpsm) << 40) | (uint64_t(tbw) << 32) | (uint64_t(tw) << 28) | (uint64_t(th) << 24) | (uint64_t(bm) << 8) | uint64_t(primType) | (uint64_t(abeF) << 4) | (uint64_t((c.test >> 14) & 1u) << 5);
+                bool seen = false; for (int i = 0; i < s_seenN; i++) if (s_seen[i] == key) seen = true;
+                if (s_fl && !seen && s_seenN < 32 && s_fn < 32) { s_seen[s_seenN++] = key; s_fn++; std::fprintf(stderr, "[pgsfx] read of 10752: psm %u tbw %u %ux%u blend %02x abe %d prim %u fbp %u test %llx w %.0f\n", tpsm, tbw, 1u << tw, 1u << th, bm, abeF ? 1 : 0, primType, c.fbp, (unsigned long long)c.test, (h.qn >= 2 ? std::fabs(float(h.q[1].x) - float(h.q[0].x)) / 16.0f : 0.f)); }
+            }
+            // the DoF composite reads the 512-wide (tbw 8) half-height scene copy and lerps by destination alpha; the
+            // Kaioken glow reads the 256x256 blur (tbw 4)
+            static const int s_dofMode2 = [](){ const char *e = std::getenv("PS2X_PGS_DOFMODE"); return e && e[0] ? std::atoi(e) : 2; }();   // 2 = mask pass writes near (default), 1 = mask pass off, 0 = drop the composite (kills the glow)
+            const bool dofComp = s_dofMode2 == 0 && (blurComp || (tpsm == 0u && abeF && (bm == 0x54u || bm == 0x68u)));
+            if ((shadowTile && !GsGpuRenderer::shadowsEnabled()) || (dofComp && !GsGpuRenderer::dofBlurEnabled()))
+            {
+                const int n = isSprite ? 2 : 3;
+                if (h.qn >= n) { const uint16_t x0 = h.q[0].x; for (int i = 0; i < n; i++) { std::memcpy(data + h.q[i].off, &x0, 2); h.q[i].x = x0; h.q[i].mapped = true; } if (shadowTile) h.shadowDropped++; else h.dofDropped++; }
+                h.rgbaN = 0; h.uvN = 0;
+                return;
+            }
+        }
+    }
     {   // [pgsink] the cel-outline DARKENER (the OpenGL path's gate): untextured, blended, ALPHA 0x52 = Cd - Cs * Ad into a
         // scene buffer. Cel Outline OFF collapses its vertices (zero area, nothing drawn); ink strength scales its
         // vertex colour by pct/199 (199% is the hardware coefficient, which the backend already applies).
@@ -544,14 +601,17 @@ static void wsHudKickLocked(State &s, uint8_t *data, float inv)
             else
             {
                 const int pct = GsGpuRenderer::inkStrengthPct();
-                if (pct != 199)
+                const uint32_t col = g_inkColor.load(std::memory_order_relaxed);
+                if (pct != 199 || col != 0u)
                 {
                     const float k = float(pct) / 199.0f;
+                    // colour: the draw SUBTRACTS Cs, so keep of the game's Cs only the complement of the wanted colour
+                    const float kc[3] = { k * float(255u - ((col >> 16) & 0xFFu)) / 255.0f, k * float(255u - ((col >> 8) & 0xFFu)) / 255.0f, k * float(255u - (col & 0xFFu)) / 255.0f };
                     for (int i = 0; i < h.rgbaN; i++)
                     {
                         uint8_t *q = data + h.rgba[i].off;
-                        if (h.rgba[i].packed) { for (int ch = 0; ch < 3; ch++) { const float v = float(q[ch * 4]) * k; q[ch * 4] = uint8_t(v > 255.f ? 255.f : v + 0.5f); } }
-                        else { for (int ch = 0; ch < 3; ch++) { const float v = float(q[ch]) * k; q[ch] = uint8_t(v > 255.f ? 255.f : v + 0.5f); } }
+                        if (h.rgba[i].packed) { for (int ch = 0; ch < 3; ch++) { const float v = float(q[ch * 4]) * kc[ch]; q[ch * 4] = uint8_t(v > 255.f ? 255.f : v + 0.5f); } }
+                        else { for (int ch = 0; ch < 3; ch++) { const float v = float(q[ch]) * kc[ch]; q[ch] = uint8_t(v > 255.f ? 255.f : v + 0.5f); } }
                     }
                     if (h.rgbaN) h.inkScaled++;
                 }
@@ -674,10 +734,22 @@ static void wsHudRegLocked(State &s, uint32_t reg, uint64_t v, uint8_t *data, si
     case 0x18: case 0x19: h.ctx[reg - 0x18].ofx = float(v & 0xFFFFu) / 16.0f; h.ctx[reg - 0x18].ofy = float((v >> 32) & 0xFFFFu) / 16.0f; break;
     case 0x1A: h.prmodeCont = (v & 1u) != 0; break;
     case 0x1B: h.prmode = (h.prmode & 7u) | (v & ~7ull); break;
-    case 0x06: case 0x07: h.ctx[reg - 0x06].tex0 = v; break;
+    case 0x06: case 0x07: h.ctx[reg - 0x06].tex0 = v; h.ctx[reg - 0x06].tex0Off = (rewrite && data) ? off : ~size_t(0); break;
     case 0x42: case 0x43: h.ctx[reg - 0x42].alpha = v; break;
     case 0x47: case 0x48: h.ctx[reg - 0x47].test = v; h.ctx[reg - 0x47].zte = uint32_t((v >> 16) & 1u); h.ctx[reg - 0x47].ztst = uint32_t((v >> 17) & 3u); break;
-    case 0x4C: case 0x4D: h.ctx[reg - 0x4C].frame = v; h.ctx[reg - 0x4C].fbp = uint32_t(v & 0x1FFu); h.ctx[reg - 0x4C].fbw = uint32_t((v >> 16) & 0x3Fu); h.ctx[reg - 0x4C].fpsm = uint32_t((v >> 24) & 0x3Fu); break;
+    case 0x4C: case 0x4D:
+    {   // [pgsfx] DoF off, mode 1: the depth-mask pass (FRAME = 16-bit view of a scene buffer, FBMSK 0x3fff) is made to
+        // write nothing, so the composite sees the scene's own alpha instead of the Z-derived far mask
+        static const int s_dofMode = [](){ const char *e = std::getenv("PS2X_PGS_DOFMODE"); return e && e[0] ? std::atoi(e) : 2; }();   // 2 = mask pass writes near (default), 1 = mask pass off, 0 = drop the composite (kills the glow)
+        const uint32_t fpsm = uint32_t((v >> 24) & 0x3Fu), fbp = uint32_t(v & 0x1FFu), fbmsk = uint32_t(v >> 32);
+        if (s_dofMode == 1 && rewrite && data && !GsGpuRenderer::dofBlurEnabled() && (fpsm == 2u || fpsm == 10u) && (fbp == 0u || fbp == 112u) && fbmsk == 0x3fffu)
+        {
+            v = (v & 0xFFFFFFFFull) | (0xFFFFFFFFull << 32);
+            std::memcpy(data + off, &v, 8);
+            h.maskNeutralized++;
+        }
+    }
+    h.ctx[reg - 0x4C].frame = v; h.ctx[reg - 0x4C].fbp = uint32_t(v & 0x1FFu); h.ctx[reg - 0x4C].fbw = uint32_t((v >> 16) & 0x3Fu); h.ctx[reg - 0x4C].fpsm = uint32_t((v >> 24) & 0x3Fu); break;
     default: break;
     }
 }
@@ -1214,7 +1286,7 @@ void wsHudRewriteLocked(State &s, uint8_t *data, size_t size)
                     switch (r)
                     {
                     case 0x0: { uint64_t v; std::memcpy(&v, data + q, 8); h.primRaw = v & 0x7FFu; h.qn = 0; break; }
-                    case 0x6: case 0x7: { uint64_t v; std::memcpy(&v, data + q, 8); h.ctx[r - 0x6].tex0 = v; break; }
+                    case 0x6: case 0x7: { uint64_t v; std::memcpy(&v, data + q, 8); h.ctx[r - 0x6].tex0 = v; h.ctx[r - 0x6].tex0Off = q; break; }
                     case 0x1: if (h.rgbaN < 8) { h.rgba[h.rgbaN].off = q; h.rgba[h.rgbaN].packed = true; h.rgbaN++; } break;
                     case 0x3: if (h.uvN < 8) { h.uv[h.uvN].off = q; h.uv[h.uvN].packed = true; h.uvN++; } break;
                     case 0x4: case 0x5: case 0xC: case 0xD:
@@ -1242,7 +1314,7 @@ void wsHudRewriteLocked(State &s, uint8_t *data, size_t size)
                 {
                 case 0x0: { uint64_t v; std::memcpy(&v, data + q, 8); h.primRaw = v & 0x7FFu; h.qn = 0; break; }
                 case 0x4: case 0x5: case 0xC: case 0xD: wsHudVertexLocked(s, data, q, false, (r == 0x4 || r == 0xC), (r == 0x4 || r == 0x5), inv); break;
-                case 0x6: case 0x7: { uint64_t v; std::memcpy(&v, data + q, 8); h.ctx[r - 0x6].tex0 = v; break; }
+                case 0x6: case 0x7: { uint64_t v; std::memcpy(&v, data + q, 8); h.ctx[r - 0x6].tex0 = v; h.ctx[r - 0x6].tex0Off = q; break; }
                 case 0x1: if (h.rgbaN < 8) { h.rgba[h.rgbaN].off = q; h.rgba[h.rgbaN].packed = false; h.rgbaN++; } break;
                 case 0x3: if (h.uvN < 8) { h.uv[h.uvN].off = q; h.uv[h.uvN].packed = false; h.uvN++; } break;
                 default: break;   // A+D is not valid in REGLIST
@@ -1323,7 +1395,8 @@ bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
     {   // [pgswshud] widescreen HUD squeeze (PS2X_PGS_WSHUD=0 disables): rewrite HUD vertex X before the backend parses
         static const bool s_wshud = [](){ const char *v = std::getenv("PS2X_PGS_WSHUD"); return !(v && v[0] == '0'); }();
         static const bool s_inkShiftEnvOn = [](){ const char *v = std::getenv("PS2X_PGS_INKSHIFT"); return v && v[0] && std::atof(v) > 0.0; }();
-        const bool inkWork = !GsGpuRenderer::outlineEnabled() || GsGpuRenderer::inkStrengthPct() != 199 || s_inkShiftEnvOn || g_inkWidthPct.load(std::memory_order_relaxed) < 100;   // [pgsink]
+        const bool inkWork = !GsGpuRenderer::outlineEnabled() || GsGpuRenderer::inkStrengthPct() != 199 || s_inkShiftEnvOn || g_inkWidthPct.load(std::memory_order_relaxed) < 100 || g_inkColor.load(std::memory_order_relaxed) != 0u
+                          || !GsGpuRenderer::shadowsEnabled() || !GsGpuRenderer::dofBlurEnabled();   // [pgsink] [pgsfx]
         if (s_wshud && (g_ps2xWsHudInv < 0.999f || s.wshud.active || inkWork))
         {
             const uint8_t *xdata = data; size_t xsize = size;
@@ -1382,6 +1455,10 @@ void streamFlip(uint64_t dispfb1)
     s.streamFlips++;
 }
 
+void setInkColor(uint32_t rgb)
+{   // [pgsink] the overlay's Ink Color (0xRRGGBB)
+    g_inkColor.store(rgb & 0xFFFFFFu, std::memory_order_relaxed);
+}
 void setInkWidthPct(int pct)
 {   // [pgsink] the overlay's Ink Width (25..100 % of a texel)
     if (pct < 25) pct = 25; if (pct > 100) pct = 100;
@@ -1472,7 +1549,7 @@ void onSwap()
         std::fprintf(stderr, "[pgs] cpu gif_transfer %.1f ms/s (%.2f ms/swap) | priv writes/s:", s.xferMs / dt, s.swaps ? s.xferMs / s.swaps : 0.0);
         for (int k = 0; k < 0x20; k++) if (s.privHist[k]) { std::fprintf(stderr, " %02x=%.0f", k << 4, s.privHist[k] / dt); s.privHist[k] = 0; }
         std::fprintf(stderr, " pseudo=%.0f", s.pseudoSeen / dt); s.pseudoSeen = 0;
-        std::fprintf(stderr, " | wshud: inv %.3f (present %.3f) active %d prims/s %.0f verts/s %.0f", s.wshud.lastInv, g_ps2xWsHudInv, s.wshud.active ? 1 : 0, s.wshud.hudPrims / dt, s.wshud.mappedVerts / dt); std::fprintf(stderr, " scissors/s %.0f splits/s %.0f | ink: outline %d strength %d%% width %d%% dropped/s %.0f scaled/s %.0f shifted/s %.0f", s.wshud.scissorsMapped / dt, s.wshud.splitPrims / dt, GsGpuRenderer::outlineEnabled() ? 1 : 0, GsGpuRenderer::inkStrengthPct(), g_inkWidthPct.load(), s.wshud.inkDropped / dt, s.wshud.inkScaled / dt, s.wshud.inkShifted / dt); s.wshud.hudPrims = s.wshud.mappedVerts = s.wshud.scissorsMapped = s.wshud.splitPrims = s.wshud.inkDropped = s.wshud.inkScaled = s.wshud.inkShifted = 0;
+        std::fprintf(stderr, " | wshud: inv %.3f (present %.3f) active %d prims/s %.0f verts/s %.0f", s.wshud.lastInv, g_ps2xWsHudInv, s.wshud.active ? 1 : 0, s.wshud.hudPrims / dt, s.wshud.mappedVerts / dt); std::fprintf(stderr, " scissors/s %.0f splits/s %.0f | ink: outline %d strength %d%% width %d%% dropped/s %.0f scaled/s %.0f shifted/s %.0f | fx: shadows %d dof %d dropped/s %.0f/%.0f masks/s %.0f", s.wshud.scissorsMapped / dt, s.wshud.splitPrims / dt, GsGpuRenderer::outlineEnabled() ? 1 : 0, GsGpuRenderer::inkStrengthPct(), g_inkWidthPct.load(), s.wshud.inkDropped / dt, s.wshud.inkScaled / dt, s.wshud.inkShifted / dt, GsGpuRenderer::shadowsEnabled() ? 1 : 0, GsGpuRenderer::dofBlurEnabled() ? 1 : 0, s.wshud.shadowDropped / dt, s.wshud.dofDropped / dt, s.wshud.maskNeutralized / dt); s.wshud.hudPrims = s.wshud.mappedVerts = s.wshud.scissorsMapped = s.wshud.splitPrims = s.wshud.inkDropped = s.wshud.inkScaled = s.wshud.inkShifted = s.wshud.shadowDropped = s.wshud.dofDropped = s.wshud.maskNeutralized = 0;
         if (packMode()) { std::fprintf(stderr, " | pack: hits %llu misses %llu skipped %llu rtstale %llu gate %llu cached %zu", (unsigned long long)s.replacer.hits, (unsigned long long)s.replacer.misses, (unsigned long long)s.replacer.skipped, (unsigned long long)s.replacer.rtstale, (unsigned long long)s.replacer.gateSkips, s.replacer.cache.size()); s.replacer.hits = s.replacer.misses = s.replacer.skipped = s.replacer.rtstale = s.replacer.gateSkips = 0; }
         {   // per swap: paraLLEl-GS render passes / copies / palette updates / primitives (consume_flush_stats)
             const double sw = s.swaps ? double(s.swaps) : 1.0;

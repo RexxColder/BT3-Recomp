@@ -42,6 +42,7 @@ public:
         bool texPack = true;   // [texreplace] use the PCSX2 replacement pack when one is indexed
         int inkStrength = 199;   // [inkstrength] cel-outline darkener, % of Cs (199 = hardware 255/128)
         int inkWidth = 100;      // [pgsink] paraLLEl-GS: outline stroke width, % of a PS2 texel (100 = native, 25 = thinnest)
+        unsigned inkColor = 0;   // [pgsink] paraLLEl-GS: outline colour 0xRRGGBB (0 = the game's black)
         bool shadows = true;
         bool dofBlur = true;
         int dofZFar = 200000;
