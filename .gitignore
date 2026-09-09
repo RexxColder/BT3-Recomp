@@ -39,3 +39,6 @@ games/bt3/work
 # local build/deploy scratch
 log.txt
 __pycache__/
+
+# [pgs] local paraLLEl-GS checkout (symlink), see ps2xRuntime/CMakeLists.txt
+ps2xRuntime/third_party/parallel-gs

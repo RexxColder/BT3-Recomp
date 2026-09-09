@@ -3,6 +3,7 @@
 #include "runtime/ps2_texreplace.h"   // [texreplace]
 #include <filesystem>
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_gs_pgs.h"   // [pgs]
 #include <iomanip>
 #include <cstdlib>
 #if !defined(_WIN32)
@@ -4780,6 +4781,35 @@ void PS2Runtime::run()
         {
             UploadFrame(frameTex, this, presentWidth, presentHeight);
         }
+        if (gpuMode && ps2x_pgs::enabled())
+        {   // [pgs] the paraLLEl-GS scanout arrives as an RGBA8 buffer; upload it and present that instead
+            static Texture2D s_pgsTex{};
+            static uint32_t s_pw = 0, s_ph = 0;
+            static std::vector<uint8_t> s_pgsBuf;
+            uint32_t pw = 0, ph = 0;
+            if (ps2x_pgs::takeFrame(s_pgsBuf, pw, ph) && pw && ph && s_pgsBuf.size() >= size_t(pw) * ph * 4u)
+            {
+                {   // PS2X_PGS_DUMP=<dir>: write every PS2X_PGS_DUMPEVERY-th (default 60) presented scanout as PNG (Wayland has no X screenshots)
+                    static const char *s_dumpDir = std::getenv("PS2X_PGS_DUMP");
+                    static const int s_dumpEvery = [](){ const char *v = std::getenv("PS2X_PGS_DUMPEVERY"); return v && v[0] ? std::max(1, std::atoi(v)) : 60; }();
+                    static unsigned s_dumpN = 0;
+                    if (s_dumpDir && s_dumpDir[0] && (s_dumpN++ % (unsigned)s_dumpEvery) == 0u)
+                    {
+                        Image im{}; im.data = s_pgsBuf.data(); im.width = (int)pw; im.height = (int)ph; im.mipmaps = 1; im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                        char path[512]; std::snprintf(path, sizeof(path), "%s/pgs_%05u.png", s_dumpDir, s_dumpN - 1u);
+                        ExportImage(im, path);
+                    }
+                }
+                if (pw != s_pw || ph != s_ph)
+                {
+                    if (s_pgsTex.id) UnloadTexture(s_pgsTex);
+                    Image im{}; im.data = s_pgsBuf.data(); im.width = (int)pw; im.height = (int)ph; im.mipmaps = 1; im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                    s_pgsTex = LoadTextureFromImage(im); s_pw = pw; s_ph = ph;
+                }
+                else UpdateTexture(s_pgsTex, s_pgsBuf.data());
+            }
+            if (s_pgsTex.id) { presentTex = s_pgsTex; flipY = false; presentWidth = s_pw; presentHeight = s_ph; }
+        }
 
 #if defined(__linux__)
         // Refresh the native evdev reader for any Linux gamepad that GLFW cannot map.
@@ -4915,6 +4945,24 @@ void PS2Runtime::run()
         {   // [frameprof] PS2X_FRAMEPROF=1: where does the main-loop frame go? (display-path dips)
             static const bool s_fp = [](){ const char *v = std::getenv("PS2X_FRAMEPROF"); return v && v[0] && v[0] != '0'; }();
             extern double g_fpPresent, g_fpBar, g_fpPre, g_fpWait, g_fpLoop; extern int g_fpN;
+            {   // [shotreq] PS2X_SHOT_DIR=<dir>: while <dir>/shot.req exists, write the composited window (what the
+                // user sees, letterbox included) to <dir>/shot.png and remove the request. The rig's drivers used
+                // `import -window`, which captures nothing in a Wayland session.
+                static const char *s_shotDir = std::getenv("PS2X_SHOT_DIR");
+                if (s_shotDir && s_shotDir[0])
+                {
+                    const std::string req = std::string(s_shotDir) + "/shot.req";
+                    std::error_code ec;
+                    if (std::filesystem::exists(req, ec))
+                    {
+                        Image im = LoadImageFromScreen();
+                        const std::string tmp = std::string(s_shotDir) + "/shot.tmp.png", dst = std::string(s_shotDir) + "/shot.png";
+                        ExportImage(im, tmp.c_str()); UnloadImage(im);
+                        std::filesystem::rename(tmp, dst, ec);
+                        std::filesystem::remove(req, ec);
+                    }
+                }
+            }
             const auto tP0 = std::chrono::steady_clock::now();
             EndDrawing();
             if (s_fp)

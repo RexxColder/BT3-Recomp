@@ -1,5 +1,6 @@
 #include "ps2_waitprof.h"   // [waitprof]
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_gs_pgs.h"   // [pgs]
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "ps2_log.h"
 #include <array>
@@ -389,6 +390,15 @@ bool PS2Memory::initialize(size_t ramSize)
         gs_regs.display1 = (0ULL << 0) | (0ULL << 12) | (0ULL << 23) | (0ULL << 27) | (639ULL << 32) | (447ULL << 44);
         gs_regs.dispfb2 = gs_regs.dispfb1;
         gs_regs.display2 = gs_regs.display1;
+        // [crtcdefaults] the BIOS's SetGsCrt programs the CRTC sync registers; our syscall stub never did, and
+        // nothing of ours read them -- but a CRTC-exact scanout (the paraLLEl-GS backend) decodes the video
+        // mode from SMODE1. Values as PCSX2 records them for this NTSC title (2026-09-06 splitscreen dump).
+        gs_regs.smode1 = 0x0000000740814504ULL;
+        gs_regs.srfsh  = 0x0000000000000008ULL;
+        gs_regs.synch1 = 0x0007f5b61f06f040ULL;
+        gs_regs.synch2 = 0x000000000033a4d8ULL;
+        gs_regs.syncv  = 0x00c7800601a01801ULL;
+        ps2x_pgs::setRegs(&gs_regs);   // [pgs] the backend reads this block at every swap
 
         // Allocate GS VRAM (4MB)
         m_gsVRAM = new uint8_t[PS2_GS_VRAM_SIZE];
@@ -940,6 +950,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
             const bool changed = (newVal != *reg);
             *reg = newVal;
+            ps2x_pgs::privWrite(regOff, newVal, &gs_regs);   // [pgs]
             if (regOff == 0x70u) ps2xDispFlipInStream(this, newVal);   // [displatch] DISPFB1
             // DISPFB1 (offset 0x0070) changed => the game swapped display buffers,
             // i.e. the just-rendered frame is complete. Snapshot it now.
@@ -1001,6 +1012,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             *reg = value;
+            ps2x_pgs::privWrite(regOff, value, &gs_regs);   // [pgs]
             if (regOff == 0x70u) ps2xDispFlipInStream(this, value);   // [displatch] DISPFB1
         }
         return;

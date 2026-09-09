@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "runtime/ps2_gs_gpu_renderer.h"
+#include "runtime/ps2_gs_pgs.h"   // [pgs]
 
 #include <cstdlib>
 #include <cstdio>
@@ -6643,6 +6644,7 @@ std::map<uint32_t, int> g_bsPages; long g_bsCmds = 0; std::map<int, int> g_bsSeg
 std::atomic<uint64_t> g_gsGuestSwapCount{0};   // [cdgate] guest frames published (read by the CD-tick pump)
 void GsGpuRenderer::swapFrame()
 {
+    ps2x_pgs::onSwap();   // [pgs] flush + scanout + readback of the paraLLEl-GS frame (no-op when off)
     flushStage();   // [recstage]
     g_gsGuestSwapCount.fetch_add(1, std::memory_order_relaxed);
     {   // [guestbusy] the guest thread's CPU time per published frame (the game paces in whole vsyncs, so the fps counter
