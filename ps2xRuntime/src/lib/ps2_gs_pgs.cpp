@@ -68,6 +68,7 @@ struct State
     uint64_t swaps = 0, packets = 0, bytes = 0, noImage = 0;
     double xferMs = 0.0;   // CPU time inside gif_transfer (the packet parse on our GsThread)
     uint64_t streamDispfb1 = 0; bool haveStreamFlip = false;   // the game's DISPFB1 flip, carried in stream order ([displatch] job)
+    uint64_t streamFlips = 0, flipMismatch = 0, lastFb1 = 0, lastLive1 = 0, lastLive2 = 0;   // [pgsflip] diagnostics
     uint32_t privHist[0x20] = {};   // privileged stores per 16-byte slot since the last stats line (bus + pseudo regs)
     uint64_t pseudoSeen = 0;        // in-stream pseudo A+D registers applied (exclusive mode)
     bool timestamps = false;
@@ -129,6 +130,8 @@ void copyPrivLocked(State &s)
         static const bool s_useStream = !envOn("PS2X_PGS_LIVEFLIP");   // PS2X_PGS_LIVEFLIP=1: scan out whatever the bus says right now
         const uint64_t fb1 = (s_useStream && s.haveStreamFlip) ? s.streamDispfb1 : r->dispfb1;
         const uint64_t fb2 = (s_useStream && s.haveStreamFlip && r->dispfb2 == r->dispfb1) ? s.streamDispfb1 : r->dispfb2;
+        if (fb1 != r->dispfb1) s.flipMismatch++;
+        s.lastFb1 = fb1; s.lastLive1 = r->dispfb1; s.lastLive2 = r->dispfb2;
         put(&p.syncv, r->syncv);     put(&p.dispfb1, fb1);        put(&p.display1, r->display1);
         put(&p.dispfb2, fb2);        put(&p.display2, r->display2); put(&p.extbuf, r->extbuf);
         put(&p.extdata, r->extdata); put(&p.extwrite, r->extwrite); put(&p.bgcolor, r->bgcolor);
@@ -255,6 +258,7 @@ void streamFlip(uint64_t dispfb1)
     State &s = st();
     std::lock_guard<std::mutex> lk(s.mtx);
     s.streamDispfb1 = dispfb1; s.haveStreamFlip = true;
+    s.streamFlips++;
 }
 
 void setRegs(GSRegisters *regs)
@@ -315,6 +319,10 @@ void onSwap()
         std::fprintf(stderr, "[pgs] cpu gif_transfer %.1f ms/s (%.2f ms/swap) | priv writes/s:", s.xferMs / dt, s.swaps ? s.xferMs / s.swaps : 0.0);
         for (int k = 0; k < 0x20; k++) if (s.privHist[k]) { std::fprintf(stderr, " %02x=%.0f", k << 4, s.privHist[k] / dt); s.privHist[k] = 0; }
         std::fprintf(stderr, " pseudo=%.0f", s.pseudoSeen / dt); s.pseudoSeen = 0;
+        std::fprintf(stderr, " | flip: stream calls/s %.0f, scanout fb1=%llx live1=%llx live2=%llx, stream!=live at %.0f%% of swaps",
+                     s.streamFlips / dt, (unsigned long long)s.lastFb1, (unsigned long long)s.lastLive1, (unsigned long long)s.lastLive2,
+                     s.swaps ? 100.0 * s.flipMismatch / s.swaps : 0.0);
+        s.streamFlips = 0; s.flipMismatch = 0;
         if (s.timestamps)
         {
             static const char *const names[int(TimestampType::Count)] = { "SyncHostToVRAM", "CopyVRAM", "PaletteUpdate", "TextureUpload", "TriangleSetup", "Binning", "Shading", "Readback", "VSync" };
