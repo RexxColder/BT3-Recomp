@@ -65,7 +65,7 @@ struct Replacer final : TextureReplacementInterface
     GS *gs = nullptr;
     std::unordered_map<std::string, ImageHandle> cache;   // name -> image (null = known miss)
     uint64_t hits = 0, misses = 0, skipped = 0;
-    ImageHandle replace(const TextureDescriptor &desc, Device &device) override
+    ImageHandle replace(const TextureDescriptor &desc, uint64_t liveTex0, uint64_t liveTexclut, Device &device) override
     {
         if (!gs || !ps2tex::replacementsEnabled()) { skipped++; return {}; }
         const uint32_t psm = uint32_t(desc.tex0.desc.PSM);
@@ -73,11 +73,15 @@ struct Replacer final : TextureReplacementInterface
         GSTex0Reg t{};
         t.tbp0 = uint32_t(desc.tex0.desc.TBP0); t.tbw = uint8_t(desc.tex0.desc.TBW); t.psm = uint8_t(psm);
         t.tw = uint8_t(desc.tex0.desc.TW); t.th = uint8_t(desc.tex0.desc.TH); t.tcc = uint8_t(desc.tex0.desc.TCC); t.tfx = uint8_t(desc.tex0.desc.TFX);
-        t.cbp = uint32_t(desc.tex0.desc.CBP); t.cpsm = uint8_t(desc.tex0.desc.CPSM); t.csm = uint8_t(desc.tex0.desc.CSM);
-        t.csa = uint8_t(desc.tex0.desc.CSA); t.cld = uint8_t(desc.tex0.desc.CLD);
+        // palette address fields come from the LIVE TEX0 (the descriptor zeroes them: paraLLEl-GS keys palettes by bank)
+        Reg64<TEX0Bits> lt; lt.bits = liveTex0;
+        t.cbp = uint32_t(lt.desc.CBP); t.cpsm = uint8_t(lt.desc.CPSM); t.csm = uint8_t(lt.desc.CSM);
+        t.csa = uint8_t(lt.desc.CSA); t.cld = uint8_t(lt.desc.CLD);
+        Reg64<TEXCLUTBits> tc; tc.bits = liveTexclut;
+        GSTexClutReg texclut{uint8_t(tc.desc.CBW), uint8_t(tc.desc.COU), uint16_t(tc.desc.COV)};
         GSTexaReg texa{uint8_t(desc.texa.desc.TA0), desc.texa.desc.AEM != 0, uint8_t(desc.texa.desc.TA1)};
         uint32_t clut[256] = {};
-        const int n = GSRasterizer::fillClutForBackend(clut, gs->vramData(), texa, gs->texclutReg(), t);
+        const int n = GSRasterizer::fillClutForBackend(clut, gs->vramData(), texa, texclut, t);
         ps2tex::TexIdent id;
         if (n <= 0 || !ps2tex::identify(gs->vramData(), t.tbp0, t.tbw, t.psm, t.tw, t.th, clut, texa.ta0, texa.aem, texa.ta1, id)) { skipped++; return {}; }
         const std::string name = id.name();
@@ -428,8 +432,9 @@ void onSwap()
     static const bool s_adapth = envOn("PS2X_PGS_ADAPTH");
     info.adapt_to_internal_horizontal_resolution = s_adapth;   // default off: scan out at the CRTC width (640) so the present keeps the GL path's aspect
     info.raw_circuit_scanout = true;
-    static const bool s_hires = envOn("PS2X_PGS_HIRES");
-    info.high_resolution_scanout = s_hires;
+    static const int s_hires = [](){ const char *v = std::getenv("PS2X_PGS_HIRES"); return v && v[0] ? std::atoi(v) : 0; }();   // 1 = 2x, 2 = 4x (needs SSAA 16)
+    info.high_resolution_scanout = s_hires >= 1;
+    info.high_resolution_scanout_shift = s_hires >= 2 ? 2u : 1u;
     ScanoutResult res = s.iface.vsync(info);
     const auto t1 = std::chrono::steady_clock::now();
     static const bool s_noReadback = envOn("PS2X_PGS_NOREADBACK");   // isolation: skip the sync scanout readback (nothing presented)
