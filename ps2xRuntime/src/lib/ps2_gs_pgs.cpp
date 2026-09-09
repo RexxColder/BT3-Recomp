@@ -17,6 +17,8 @@
 #include <cstring>
 #include <mutex>
 
+extern std::atomic<uint64_t> g_pgsWaitNs, g_pgsWaitCount, g_pgsIdleNs, g_pgsIdleCount;   // [pgs-waitstat] Granite fence/idle waits
+
 namespace ps2x_pgs
 {
 namespace
@@ -67,6 +69,11 @@ struct State
     uint32_t field = 0;
     uint64_t swaps = 0, packets = 0, bytes = 0, noImage = 0;
     double xferMs = 0.0;   // CPU time inside gif_transfer (the packet parse on our GsThread)
+    uint64_t fsPrims = 0, fsPasses = 0, fsCopies = 0, fsPal = 0;   // paraLLEl-GS flush stats per stats window
+    struct SlowCall { double ms; uint32_t size, path, nloop, flg, nreg; uint64_t regs; uint32_t firstAD; };   // [pgs-slow] the 3 slowest gif_transfer calls per window
+    SlowCall slowCalls[3] = {};
+    uint32_t slowOver1ms = 0;
+    uint64_t waitNs0 = 0, waitCnt0 = 0, idleNs0 = 0, idleCnt0 = 0;
     uint64_t streamDispfb1 = 0; bool haveStreamFlip = false;   // the game's DISPFB1 flip, carried in stream order ([displatch] job)
     uint64_t streamFlips = 0, flipMismatch = 0, lastFb1 = 0, lastLive1 = 0, lastLive2 = 0;   // [pgsflip] diagnostics
     uint32_t privHist[0x20] = {};   // privileged stores per 16-byte slot since the last stats line (bus + pseudo regs)
@@ -150,40 +157,72 @@ void copyPrivLocked(State &s)
     put(&p.siglblid, s.privHi[0x80 >> 4]);
 }
 
+// [pgs-asyncrb] Asynchronous scanout readback: a three-deep ring of host buffers + fences. Each swap submits a copy of
+// this frame's scanout and consumes the copy submitted two swaps ago IF its fence is already signalled (never waits).
+// The first version waited for the GPU every frame (wait_idle); with the GPU idle at every frame start paraLLEl-GS
+// took its CPU upload path for the frame's IMAGE transfers, a flat ~6 ms per frame ([pgs-slow] 2026-09-10).
+struct RbSlot { BufferHandle buf; Fence fence; ImageHandle image; uint32_t w = 0, h = 0; bool pending = false; VkFormat fmt = VK_FORMAT_UNDEFINED; };
+static RbSlot g_rb[3];
+static uint32_t g_rbIdx = 0;
+static void consumeSlotLocked(State &s, RbSlot &slot)
+{
+    const auto *src = static_cast<const uint32_t *>(s.device.map_host_buffer(*slot.buf, MEMORY_ACCESS_READ_BIT));
+    const size_t n = size_t(slot.w) * slot.h;
+    s.frame.resize(n * 4u);
+    const bool bgra = slot.fmt == VK_FORMAT_B8G8R8A8_UNORM || slot.fmt == VK_FORMAT_B8G8R8A8_SRGB;
+    if (!bgra)
+    {
+        std::memcpy(s.frame.data(), src, n * 4u);
+        uint32_t *px = reinterpret_cast<uint32_t *>(s.frame.data());
+        for (size_t i = 0; i < n; i++) px[i] |= 0xFF000000u;
+    }
+    else
+        for (size_t i = 0; i < n; i++)
+        {
+            const uint32_t p = src[i];
+            s.frame[i * 4 + 0] = (p >> 16) & 0xff; s.frame[i * 4 + 1] = (p >> 8) & 0xff; s.frame[i * 4 + 2] = p & 0xff; s.frame[i * 4 + 3] = 0xff;
+        }
+    s.device.unmap_host_buffer(*slot.buf, MEMORY_ACCESS_READ_BIT);
+    s.frameW = slot.w; s.frameH = slot.h; s.frameFresh = true;
+    slot.pending = false; slot.image.reset(); slot.fence.reset();
+}
 void readbackLocked(State &s, const ScanoutResult &res)
 {
-    const uint32_t w = res.image->get_width(), h = res.image->get_height();
-    const VkFormat fmt = res.image->get_format();
-    BufferHandle readback;
+    static const bool s_sync = envOn("PS2X_PGS_SYNCREADBACK");   // the old behaviour, for A/B
+    // 1. consume the oldest pending slot without waiting (or with a wait in sync mode)
+    for (int k = 1; k <= 2; k++)
     {
-        auto cmd = s.device.request_command_buffer();
-        cmd->image_barrier(*res.image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
-                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        RbSlot &old = g_rb[(g_rbIdx + k) % 3];
+        if (old.pending && old.fence && (s_sync ? (old.fence->wait(), true) : old.fence->wait_timeout(0))) consumeSlotLocked(s, old);
+    }
+    // 2. submit this frame's copy into the current slot (if it is still in flight, drop this frame)
+    RbSlot &slot = g_rb[g_rbIdx];
+    if (slot.pending) { if (slot.fence && slot.fence->wait_timeout(0)) consumeSlotLocked(s, slot); else return; }
+    const uint32_t w = res.image->get_width(), h = res.image->get_height();
+    if (!slot.buf || slot.w != w || slot.h != h)
+    {
         BufferCreateInfo bi = {};
         bi.size = VkDeviceSize(w) * h * 4u;
         bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         bi.domain = BufferDomain::CachedHost;
-        readback = s.device.create_buffer(bi);
-        cmd->copy_image_to_buffer(*readback, *res.image, 0, {}, { w, h, 1 }, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 });
-        cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
-        s.device.submit(cmd);
-        s.device.wait_idle();
+        slot.buf = s.device.create_buffer(bi);
+        slot.w = w; slot.h = h;
     }
-    const auto *src = static_cast<const uint32_t *>(s.device.map_host_buffer(*readback, MEMORY_ACCESS_READ_BIT));
-    s.frame.resize(size_t(w) * h * 4u);
-    const bool bgra = fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB;
-    for (size_t i = 0; i < size_t(w) * h; i++)
-    {
-        const uint32_t p = src[i];
-        uint8_t r = p & 0xff, g = (p >> 8) & 0xff, b = (p >> 16) & 0xff;
-        if (bgra) std::swap(r, b);
-        s.frame[i * 4 + 0] = r; s.frame[i * 4 + 1] = g; s.frame[i * 4 + 2] = b; s.frame[i * 4 + 3] = 0xff;
-    }
-    s.device.unmap_host_buffer(*readback, MEMORY_ACCESS_READ_BIT);
-    s.frameW = w; s.frameH = h; s.frameFresh = true;
+    slot.fmt = res.image->get_format();
+    auto cmd = s.device.request_command_buffer();
+    cmd->image_barrier(*res.image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
+                       VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    cmd->copy_image_to_buffer(*slot.buf, *res.image, 0, {}, { w, h, 1 }, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 });
+    cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+    Fence fence;
+    s.device.submit(cmd, &fence);
+    slot.fence = std::move(fence); slot.image = res.image; slot.pending = true;
+    g_rbIdx = (g_rbIdx + 1u) % 3u;
+    if (s_sync) { slot.fence->wait(); consumeSlotLocked(s, slot); }
 }
+
 // [pgs-pseudo] Our sceGs stubs deliver display-environment writes IN-STREAM as A+D writes to pseudo registers
 // (Kernel/Stubs/GS.cpp: 0x41 PMODE, 0x42 SMODE2, 0x59 DISPFB1, 0x5a DISPLAY1, 0x5b DISPFB2, 0x5c DISPLAY2, 0x5f BGCOLOR).
 // Our own GS parse applies them (ps2_gs_gpu.cpp); in exclusive mode that parse is skipped, so walk the packet's tags here.
@@ -249,7 +288,18 @@ void gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
     const auto t0 = std::chrono::steady_clock::now();
     if (exclusive()) applyPseudoRegsLocked(s, data, size);
     s.iface.gif_transfer(pathId - 1u, data, size);
-    s.xferMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double dtMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    s.xferMs += dtMs;
+    if (dtMs > 0.5)
+    {   // [pgs-slow] remember the slowest calls with a sketch of their first GIF tag
+        if (dtMs > 1.0) s.slowOver1ms++;
+        uint64_t lo = 0, hi = 0; std::memcpy(&lo, data, 8); std::memcpy(&hi, data + 8, 8);
+        uint32_t firstAD = 0;
+        if (((lo >> 58) & 3u) == 0u && (hi & 0xFu) == 0xEu && size >= 32) { uint64_t a; std::memcpy(&a, data + 24, 8); firstAD = uint32_t(a & 0xFFu); }
+        State::SlowCall c{dtMs, uint32_t(size), pathId, uint32_t(lo & 0x7FFFu), uint32_t((lo >> 58) & 3u), uint32_t((lo >> 60) & 0xFu), hi, firstAD};
+        int worst = 0; for (int i = 1; i < 3; i++) if (s.slowCalls[i].ms < s.slowCalls[worst].ms) worst = i;
+        if (c.ms > s.slowCalls[worst].ms) s.slowCalls[worst] = c;
+    }
     s.packets++; s.bytes += size;
 }
 
@@ -286,6 +336,7 @@ void onSwap()
     if (!initLocked(s)) return;
     const auto t0 = std::chrono::steady_clock::now();
     s.iface.flush();
+    { const FlushStats fs = s.iface.consume_flush_stats(); s.fsPrims += fs.num_primitives; s.fsPasses += fs.num_render_passes; s.fsCopies += fs.num_copies; s.fsPal += fs.num_palette_updates; }
     copyPrivLocked(s);
     VSyncInfo info = {};
     info.phase = s.field ^= 1u;
@@ -303,7 +354,8 @@ void onSwap()
     info.high_resolution_scanout = s_hires;
     ScanoutResult res = s.iface.vsync(info);
     const auto t1 = std::chrono::steady_clock::now();
-    if (res.image) readbackLocked(s, res); else s.noImage++;
+    static const bool s_noReadback = envOn("PS2X_PGS_NOREADBACK");   // isolation: skip the sync scanout readback (nothing presented)
+    if (res.image && !s_noReadback) readbackLocked(s, res); else if (!res.image) s.noImage++;
     const auto t2 = std::chrono::steady_clock::now();
     s.vsyncMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
     s.readbackMs += std::chrono::duration<double, std::milli>(t2 - t1).count();
@@ -319,6 +371,21 @@ void onSwap()
         std::fprintf(stderr, "[pgs] cpu gif_transfer %.1f ms/s (%.2f ms/swap) | priv writes/s:", s.xferMs / dt, s.swaps ? s.xferMs / s.swaps : 0.0);
         for (int k = 0; k < 0x20; k++) if (s.privHist[k]) { std::fprintf(stderr, " %02x=%.0f", k << 4, s.privHist[k] / dt); s.privHist[k] = 0; }
         std::fprintf(stderr, " pseudo=%.0f", s.pseudoSeen / dt); s.pseudoSeen = 0;
+        {   // per swap: paraLLEl-GS render passes / copies / palette updates / primitives, and Granite blocking waits
+            const uint64_t wn = g_pgsWaitNs.load(), wc = g_pgsWaitCount.load(), in = g_pgsIdleNs.load(), ic = g_pgsIdleCount.load();
+            const double sw = s.swaps ? double(s.swaps) : 1.0;
+            std::fprintf(stderr, " | per swap: passes %.1f copies %.1f pal %.1f prims %.0f | fence waits %.1f (%.2f ms) idle waits %.1f (%.2f ms)",
+                         s.fsPasses / sw, s.fsCopies / sw, s.fsPal / sw, s.fsPrims / sw,
+                         (wc - s.waitCnt0) / sw, (wn - s.waitNs0) / 1e6 / sw, (ic - s.idleCnt0) / sw, (in - s.idleNs0) / 1e6 / sw);
+            s.waitNs0 = wn; s.waitCnt0 = wc; s.idleNs0 = in; s.idleCnt0 = ic; s.fsPrims = s.fsPasses = s.fsCopies = s.fsPal = 0;
+        }
+        {   // [pgs-slow]
+            std::fprintf(stderr, " | calls>1ms/s %.0f, slowest:", s.slowOver1ms / dt);
+            for (int i = 0; i < 3; i++) if (s.slowCalls[i].ms > 0.0)
+                std::fprintf(stderr, " [%.2fms path%u %uB nloop=%u flg=%u nreg=%u regs=%llx firstAD=0x%x]", s.slowCalls[i].ms, s.slowCalls[i].path, s.slowCalls[i].size,
+                             s.slowCalls[i].nloop, s.slowCalls[i].flg, s.slowCalls[i].nreg, (unsigned long long)s.slowCalls[i].regs, s.slowCalls[i].firstAD);
+            for (auto &c : s.slowCalls) c = State::SlowCall{}; s.slowOver1ms = 0;
+        }
         std::fprintf(stderr, " | flip: stream calls/s %.0f, scanout fb1=%llx live1=%llx live2=%llx, stream!=live at %.0f%% of swaps",
                      s.streamFlips / dt, (unsigned long long)s.lastFb1, (unsigned long long)s.lastLive1, (unsigned long long)s.lastLive2,
                      s.swaps ? 100.0 * s.flipMismatch / s.swaps : 0.0);
