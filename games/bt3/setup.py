@@ -279,6 +279,14 @@ def main() -> None:
     #    source set changes — and an unnecessary reconfigure rewrites the MSVC
     #    project files, which makes MSBuild rebuild everything from scratch.
     if not args.skip_setup:
+        # [pgs] the paraLLEl-GS backend lives in a git submodule (ps2xRuntime/third_party/parallel-gs, with its own
+        # Granite submodule); CMake builds it in only when the checkout is present, so fetch it here. Harmless when
+        # the tree is not a git checkout or the submodule is already there. PS2X_SETUP_NO_SUBMODULES=1 skips it.
+        if not os.environ.get("PS2X_SETUP_NO_SUBMODULES") and (ROOT / ".gitmodules").exists() and shutil.which("git"):
+            try:
+                run(["git", "-C", ROOT, "submodule", "update", "--init", "--recursive"])
+            except Exception as e:   # noqa: BLE001
+                print(f"== submodule fetch failed ({e}); building without the paraLLEl-GS backend")
         print("== building recompiler")
         if not configured():
             run(["cmake", "-S", ROOT, "-B", BUILD] + cmake_configure_extra())
