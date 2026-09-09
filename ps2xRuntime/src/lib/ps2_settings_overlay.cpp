@@ -639,9 +639,11 @@ static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
     if (renderer == 2)
     {
         setEnvDefault("PS2X_PGS", "1");
-        // [pgslive] pack mode whenever a pack is configured, so the toggle can flip LIVE (it needs our state-only parse's VRAM mirror)
-        const char *packDir = std::getenv("PS2X_TEXREPLACE");
-        if (texPack || (packDir && packDir[0])) setEnvDefault("PS2X_PGS_PACK", "1"); else setEnvDefault("PS2X_PGS_EXCLUSIVE", "1");
+        // [pgslive] pack mode whenever a pack is INDEXED (PS2X_TEXREPLACE or ./textures), so the Texture Replacement
+        // switch can flip live in either direction (pack mode keeps our state-only parse's VRAM mirror alive).
+        // PS2X_PGS_PACK=0 in the env forces the exclusive path.
+        setEnvDefault("PS2X_PGS_PACK", (texPack || ps2tex::replacementsEnabled()) ? "1" : "0");
+        { const char *pk = std::getenv("PS2X_PGS_PACK"); if (!(pk && pk[0] == '1')) setEnvDefault("PS2X_PGS_EXCLUSIVE", "1"); }
         if (forceBilinear) setEnvDefault("PS2X_PGS_FORCE_BILINEAR", "1");
     }
     else
