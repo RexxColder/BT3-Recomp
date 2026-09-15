@@ -4,6 +4,7 @@
 #include <deque>
 #include "runtime/ps2_netplay.h" // [rollback] the netplay controller
 #include "runtime/ps2_statesync.h"   // [statesync] portable snapshot forms
+#include "runtime/ps2_hostchain.h"   // [statesync] Windows: chain walk (RtlVirtualUnwind) + image id
 extern std::atomic<uint64_t> g_bt3FrameCount;   // game_overrides.cpp: the frame hook's counter
 extern "C" bool ps2xFrameStepOn();               // frame-stepped mode (defined with the frame gate below)
 extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defined with the scheduler)
@@ -1811,8 +1812,24 @@ namespace
     }
 }
 
+// [statesync] The RECOMPILED functions are the tables' load-time contents (static initializers in
+// register_functions.cpp / overlay_register.cpp, gap fixes included). Everything installed later
+// through replaceFunction is an HLE hook, and a hook is host code -- the park-signature classifier
+// must not take it for guest code. Captured once, before the first replacement.
+static std::unordered_set<uint64_t> g_generatedStarts;
+static void captureGeneratedTable()
+{
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+    for (uint32_t slot = 0; slot < g_ps2RecompiledFunctionTableSlotCount; ++slot)
+        if (PS2Runtime::RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot]) g_generatedStarts.insert((uint64_t)reinterpret_cast<uintptr_t>(fn));
+    for (uint32_t slot = 0; slot < g_ps2OverlayFunctionTableSlotCount; ++slot)
+        if (PS2Runtime::RecompiledFunction fn = g_ps2OverlayFunctionTable[slot]) g_generatedStarts.insert((uint64_t)reinterpret_cast<uintptr_t>(fn));
+}
 bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
 {
+    captureGeneratedTable();
     uint32_t slot = 0u;
     if (!generatedFunctionTableSlot(address, slot))
     {
@@ -4802,6 +4819,7 @@ extern "C" R5900Context *ps2xWorkerContext(int tid);                         // 
 extern "C" int ps2xWorkerContextTids(int *out, int cap);
 extern "C" bool ps2xKernelThreadWait(int tid, int *status, int *waitType, int *waitId);
 extern "C" int ps2xNetJumpSettledFor(uint32_t session);                       // [netjump] game_overrides.cpp: this session's jump has settled
+namespace ps2_syscalls { void WakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime); }   // [statesync] Kernel/Syscalls/Thread.cpp: the one leaf stub kept opaque
 
 // [statesync] The executable's GNU build id: a synced state is only meaningful between identical
 // binaries (host call chains, struct layouts, and the recompiled code itself must match).
@@ -4834,6 +4852,8 @@ static std::string ps2xBuildId()
         }
         return 0;   // first object is the executable; keep looking only if it had no note
     }, &s_id);
+#else
+    { char id[64]; if (ps2xHostImageId(id, sizeof id)) s_id = id; }   // PE: sections digest (ps2_hostchain_win.cpp)
 #endif
     if (s_id.empty()) s_id = "no-build-id";
     return s_id;
@@ -5017,47 +5037,141 @@ struct Ps2xRollback
         if (fi.kind == FK_UNKNOWN) fi.kind = FK_OPAQUE;
         return s_cache.emplace(startIp, std::move(fi)).first->second;
     }
+    // ---- the host chain of a parked fiber, classified WITHOUT symbols ------------------------
+    // Linux walks it with libunwind (and has the ELF names for the diagnostic below); Windows with
+    // RtlVirtualUnwind (ps2_hostchain_win.cpp) and has no names at all in a release build. Both
+    // platforms classify the same way, from addresses and the chain's shape:
+    //   RECOMPILED   the frame's function is in the function tables' LOAD-TIME contents (every guest
+    //                call goes through dispatchGuestBranch, which resolves its targets there, so the
+    //                set is complete; hooks installed later through replaceFunction are host code);
+    //   dispatch     the frame is PS2Runtime::dispatchGuestBranch (address compare);
+    //   OPAQUE       a registered exception (the kernel's WakeupThread stub, which the name rule
+    //                always treated as opaque), or any other host frame that sits BETWEEN two
+    //                recompiled frames: host code that was called by guest code and itself called
+    //                guest code -- an HLE hook keeping locals derived from the state it saw;
+    //   TRANSPARENT  everything below the innermost recompiled frame (the park plumbing: syscall
+    //                stubs, wait helpers, the frame gate) or above the outermost one (dispatchLoop,
+    //                the fiber entry).
+    // On Linux, PS2X_SYNCTEST_CHAIN=1 also prints every frame where this disagrees with the old
+    // name-based rule (frameInfo), and PS2X_SYNC_NAMERULE=1 lets the name rule decide instead.
+    struct HostFrame { uint64_t ip, start, end, base; std::string name; FrameKind kind; bool dispatch; };
+    static bool isRecompiledStart(uint64_t start)
+    {
+        captureGeneratedTable();   // no-op after the first hook install already captured it
+        return g_generatedStarts.count(start) != 0;
+    }
+    template <typename M> static uint64_t codeAddress(M fn) { uint64_t a = 0; static_assert(sizeof fn >= sizeof a, "pointer"); std::memcpy(&a, &fn, sizeof a); return a; }
+    static uint64_t dispatchStart() { static const uint64_t a = codeAddress(&PS2Runtime::dispatchGuestBranch); return a; }
+    static bool isOpaqueStart(uint64_t start)
+    {
+        static const uint64_t s_wakeup = codeAddress(&ps2_syscalls::WakeupThread);
+        return start == s_wakeup;
+    }
+    // Walk the parked chain, innermost first. Stops at the fiber trampoline.
+    static bool hostChain(const PS2Runtime::SchedThread &st, std::vector<HostFrame> &out)
+    {
+        out.clear();
+        Ps2xFiberRegs regs{};
+        if (!ps2xFiberParkedRegs(st.fiber, &regs)) return false;
+#if defined(_WIN32)
+        Ps2xChainFrame cf[512];
+        const int n = ps2xHostChainWalk(&regs, cf, 512);
+        for (int i = 0; i < n; ++i) out.push_back(HostFrame{cf[i].ip, cf[i].start, cf[i].end, cf[i].base, std::string(), FK_UNKNOWN, false});
+        return n > 0;
+#elif defined(PS2X_HAVE_LIBUNWIND)
+        unw_context_t uctx; std::memset(&uctx, 0, sizeof uctx);
+        {   // x86-64: unw_context_t is a ucontext_t; the unwinder needs ip, sp and the callee-saved registers
+            ucontext_t *u = reinterpret_cast<ucontext_t *>(&uctx);
+            u->uc_mcontext.gregs[REG_RIP] = (greg_t)regs.ip; u->uc_mcontext.gregs[REG_RSP] = (greg_t)regs.sp;
+            u->uc_mcontext.gregs[REG_RBP] = (greg_t)regs.bp; u->uc_mcontext.gregs[REG_RBX] = (greg_t)regs.bx;
+            u->uc_mcontext.gregs[REG_R12] = (greg_t)regs.r12; u->uc_mcontext.gregs[REG_R13] = (greg_t)regs.r13;
+            u->uc_mcontext.gregs[REG_R14] = (greg_t)regs.r14; u->uc_mcontext.gregs[REG_R15] = (greg_t)regs.r15;
+        }
+        unw_cursor_t cur;
+        if (unw_init_local(&cur, &uctx) != 0) return false;
+        int d = 0;
+        do
+        {
+            unw_word_t ip = 0;
+            if (unw_get_reg(&cur, UNW_REG_IP, &ip) != 0) break;
+            if (ps2xFiberIsTrampolineIp((uint64_t)ip)) break;
+            unw_proc_info_t pi{}; const bool havePi = unw_get_proc_info(&cur, &pi) == 0;
+            uint64_t base = 0;
+            Dl_info di{};
+            if (dladdr(reinterpret_cast<void *>(static_cast<uintptr_t>(ip)), &di) && di.dli_fbase) base = (uint64_t)reinterpret_cast<uintptr_t>(di.dli_fbase);
+            char nameBuf[512] = {}; unw_word_t off = 0;
+            if (unw_get_proc_name(&cur, nameBuf, sizeof nameBuf, &off) != 0) nameBuf[0] = 0;
+            out.push_back(HostFrame{(uint64_t)ip, havePi ? (uint64_t)pi.start_ip : (uint64_t)ip, havePi ? (uint64_t)pi.end_ip : 0u, base, std::string(nameBuf), FK_UNKNOWN, false});
+            ++d;
+        } while (d < 512 && unw_step(&cur) > 0);
+        return !out.empty();
+#else
+        return false;
+#endif
+    }
+    static void classifyChain(std::vector<HostFrame> &fr)
+    {
+        int firstRec = -1, lastRec = -1;
+        for (size_t i = 0; i < fr.size(); ++i)
+        {
+            HostFrame &f = fr[i];
+            f.dispatch = f.start == dispatchStart();
+            if (isRecompiledStart(f.start)) { f.kind = FK_RECOMPILED; if (firstRec < 0) firstRec = (int)i; lastRec = (int)i; }
+            else if (f.dispatch) f.kind = FK_TRANSPARENT;
+            else f.kind = FK_UNKNOWN;
+        }
+        for (size_t i = 0; i < fr.size(); ++i)
+        {
+            HostFrame &f = fr[i];
+            if (f.kind != FK_UNKNOWN) continue;
+            if (isOpaqueStart(f.start)) f.kind = FK_OPAQUE;
+            else if (firstRec < 0 || (int)i < firstRec || (int)i > lastRec) f.kind = FK_TRANSPARENT;
+            else f.kind = FK_OPAQUE;
+        }
+    }
     static uint64_t parkSignature(int tid, const PS2Runtime::SchedThread &st, int *depthOut, std::string *opaque)
     {
         uint64_t h = 1469598103934665603ull; int d = 0;
         // PS2X_SYNCTEST_CHAIN=1: print each fiber's host chain (module-relative return addresses,
         // for addr2line) the first few times, to see which host frames a park keeps live.
         static const bool s_chain = [](){ const char *v = std::getenv("PS2X_SYNCTEST_CHAIN"); return v && v[0] && v[0] != '0'; }();
-        static uint32_t s_chainPrints = 0;
+        static const bool s_nameRule = [](){ const char *v = std::getenv("PS2X_SYNC_NAMERULE"); return v && v[0] && v[0] != '0'; }();
+        static uint32_t s_chainPrints = 0, s_disagree = 0;
         const bool print = s_chain && s_chainPrints < 64u;
         if (print) { ++s_chainPrints; std::fprintf(stderr, "[synchain] tid %d frame %llu:", tid, (unsigned long long)g_gate.waitFrame); }
-#if defined(PS2X_HAVE_LIBUNWIND)
-        if (const void *uc = ps2xFiberUContext(st.fiber))
+        static thread_local std::vector<HostFrame> fr;
+        if (hostChain(st, fr))
         {
-            unw_context_t uctx; std::memset(&uctx, 0, sizeof uctx);
-            std::memcpy(&uctx, uc, sizeof(ucontext_t) < sizeof uctx ? sizeof(ucontext_t) : sizeof uctx);   // x86-64: unw_context_t is a ucontext_t
-            unw_cursor_t cur;
-            if (unw_init_local(&cur, &uctx) == 0)
+            classifyChain(fr);
+            FrameKind prevKind = FK_UNKNOWN;
+            for (HostFrame &f : fr)
             {
-                FrameKind prevKind = FK_UNKNOWN;
-                do
+                // The old rule, from the frame's name (Linux only): the decider under PS2X_SYNC_NAMERULE=1,
+                // otherwise a cross-check printed with the chain.
+                const FrameInfo *byName = f.name.empty() ? nullptr : &frameInfo(f.start, f.name.c_str());
+                FrameKind kind = f.kind;
+                if (byName && s_nameRule) kind = byName->kind;
+                if (byName && byName->kind != f.kind && s_chain)
+                {   // one line per distinct frame (the frame kick would otherwise fill the log every boundary)
+                    static std::unordered_set<uint64_t> s_seen;
+                    if (s_seen.insert(f.start).second && ++s_disagree <= 64u)
+                        std::fprintf(stderr, "[synchain] tid %d: frame +%llx (%s) is %s by shape, %s by name\n", tid, (unsigned long long)(f.start - f.base),
+                                     byName->name.substr(0, 70).c_str(), f.kind == FK_OPAQUE ? "OPAQUE" : f.kind == FK_RECOMPILED ? "RECOMPILED" : "TRANSPARENT",
+                                     byName->kind == FK_OPAQUE ? "OPAQUE" : byName->kind == FK_RECOMPILED ? "RECOMPILED" : "TRANSPARENT");
+                }
+                // The dispatcher calls a recompiled target from two sites (hot-call cache hit or
+                // miss) that continue identically: hash the function, not the site, there.
+                uint64_t rel = f.ip - f.base;
+                if (prevKind == FK_RECOMPILED && f.dispatch) rel = f.start - f.base;
+                if (kind == FK_OPAQUE && opaque && opaque->empty())
                 {
-                    unw_word_t ip = 0;
-                    if (unw_get_reg(&cur, UNW_REG_IP, &ip) != 0) break;
-                    unw_proc_info_t pi{}; const bool havePi = unw_get_proc_info(&cur, &pi) == 0;
-                    uint64_t base = 0;
-                    Dl_info di{};
-                    if (dladdr(reinterpret_cast<void *>(static_cast<uintptr_t>(ip)), &di) && di.dli_fbase) base = (uint64_t)reinterpret_cast<uintptr_t>(di.dli_fbase);
-                    const uint64_t startRel = havePi ? (uint64_t)pi.start_ip - base : 0u;
-                    char nameBuf[512] = {}; unw_word_t off = 0;
-                    if (unw_get_proc_name(&cur, nameBuf, sizeof nameBuf, &off) != 0) nameBuf[0] = 0;
-                    const FrameInfo &fi = frameInfo(havePi ? (uint64_t)pi.start_ip : (uint64_t)ip, nameBuf);
-                    // The dispatcher calls a recompiled target from two sites (hot-call cache hit or
-                    // miss) that continue identically: hash the function, not the site, there.
-                    uint64_t rel = (uint64_t)ip - base;
-                    if (prevKind == FK_RECOMPILED && fi.name.compare(0, 33, "PS2Runtime::dispatchGuestBranch(") == 0 && havePi) rel = startRel;
-                    if (fi.kind == FK_OPAQUE && opaque && opaque->empty()) *opaque = fi.name.substr(0, 60);
-                    if (print) std::fprintf(stderr, " %llx%s", (unsigned long long)((uint64_t)ip - base), fi.kind == FK_OPAQUE ? "!" : "");
-                    h ^= rel; h *= kFnvP; ++d; prevKind = fi.kind;
-                } while (d < 512 && unw_step(&cur) > 0);
+                    if (byName) *opaque = byName->name.substr(0, 60);
+                    else { char b[48]; std::snprintf(b, sizeof b, "host frame +%llx", (unsigned long long)(f.start - f.base)); *opaque = b; }
+                }
+                if (print) std::fprintf(stderr, " %llx%s", (unsigned long long)(f.ip - f.base), kind == FK_OPAQUE ? "!" : kind == FK_RECOMPILED ? "" : f.dispatch ? "d" : "t");
+                h ^= rel; h *= kFnvP; ++d; prevKind = kind;
             }
         }
-#endif
         // the guest side of the park: which wait site, its argument, and the guest pc/ra it was reached from
         const auto tl = g_fiberTls.find(tid);
         const int wp = tl != g_fiberTls.end() ? tl->second.waitPoint : -1;

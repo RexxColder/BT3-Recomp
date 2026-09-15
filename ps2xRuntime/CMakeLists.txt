@@ -408,6 +408,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_eeprof.cpp
     src/lib/ps2_stepcensus.cpp
     src/lib/ps2_fiber.cpp
+    src/lib/ps2_hostchain_win.cpp   # [statesync] Windows chain walk + image id (stubs elsewhere)
     src/lib/ps2_gif_arbiter.cpp
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp

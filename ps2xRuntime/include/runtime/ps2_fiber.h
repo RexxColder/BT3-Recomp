@@ -52,9 +52,19 @@ size_t ps2xFiberSnapshotSize(const Ps2xFiber *f);
 bool ps2xFiberSnapshot(const Ps2xFiber *f, void *buf, size_t size);
 bool ps2xFiberRestore(Ps2xFiber *f, const void *buf, size_t size);
 
-// [statesync] The parked fiber's saved register context (a ucontext_t on the ucontext backend, else
-// null), for unwinding its host call chain into a structural signature.
-const void *ps2xFiberUContext(const Ps2xFiber *f);
+// [statesync] The register file of a PARKED fiber, enough to unwind its host call chain into a
+// structural signature: the return address the next switch resumes at, the stack pointer after
+// that return, and the callee-saved registers (si/di only mean something on the Windows ABI).
+struct Ps2xFiberRegs { uint64_t ip, sp, bp, bx, r12, r13, r14, r15, si, di; };
+bool ps2xFiberParkedRegs(const Ps2xFiber *f, Ps2xFiberRegs *out);
+
+// A fiber's host call chain ends at the fiber trampoline, which has no unwind information: a walk
+// that reaches an address inside it is done.
+bool ps2xFiberIsTrampolineIp(uint64_t ip);
+
+// "asm (SysV x86-64)", "asm (Microsoft x64)", "ucontext", "Windows Fibers" or "none". The asm
+// backends are the ones that can snapshot; PS2X_FIBER_BACKEND=asm|uctx|winapi overrides the default.
+const char *ps2xFiberBackendName();
 
 // PS2X_FIBERTEST=1: ping-pong two fibers at startup and report. Proves the primitive works on this
 // toolchain before anything depends on it.
