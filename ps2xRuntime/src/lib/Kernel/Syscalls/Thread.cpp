@@ -1600,6 +1600,15 @@ extern "C" bool ps2xKernelStateRestore(void *h)
 }
 extern "C" void ps2xKernelStateFree(void *h) { delete static_cast<KernelSnap *>(h); }
 // [statesync] portable form (the SIF part is its own sub-blob)
+static uint64_t ps2xLayoutMix(uint64_t h, uint64_t v) { h ^= v; return h * 1099511628211ull; }
+extern "C" uint64_t ps2xKernelStateLayoutHash()
+{   // [statesync] sizes of everything the KRN section writes raw
+    uint64_t h = 1469598103934665603ull;
+    h = ps2xLayoutMix(h, sizeof(decltype(KernelSnap::th)::value_type)); h = ps2xLayoutMix(h, sizeof(decltype(KernelSnap::se)::value_type)); h = ps2xLayoutMix(h, sizeof(decltype(KernelSnap::ev)::value_type));
+    h = ps2xLayoutMix(h, sizeof(decltype(KernelSnap::rpcServers)::mapped_type)); h = ps2xLayoutMix(h, sizeof(decltype(KernelSnap::rpcClients)::mapped_type));
+    h = ps2xLayoutMix(h, sizeof(decltype(KernelSnap::nextThread)));
+    return h;
+}
 extern "C" bool ps2xKernelStateSerialize(const void *h, std::vector<uint8_t> &out)
 {
     const KernelSnap *s = static_cast<const KernelSnap *>(h);

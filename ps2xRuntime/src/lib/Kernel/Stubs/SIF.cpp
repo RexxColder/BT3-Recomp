@@ -1167,6 +1167,13 @@ extern "C" bool ps2xSifStateRestore(void *h)
 }
 extern "C" void ps2xSifStateFree(void *h) { delete static_cast<SifSnap *>(h); }
 // [statesync] portable form
+static uint64_t ps2xLayoutMix(uint64_t h, uint64_t v) { h ^= v; return h * 1099511628211ull; }
+extern "C" uint64_t ps2xSifStateLayoutHash()
+{   // [statesync] sizes of everything the SIF section writes raw
+    uint64_t h = 1469598103934665603ull;
+    h = ps2xLayoutMix(h, sizeof(decltype(SifSnap::regs)::mapped_type)); h = ps2xLayoutMix(h, sizeof(decltype(SifSnap::heap)::mapped_type)); h = ps2xLayoutMix(h, sizeof(decltype(SifSnap::heap)::key_type));
+    return h;
+}
 extern "C" bool ps2xSifStateSerialize(const void *h, std::vector<uint8_t> &out)
 {
     const SifSnap *s = static_cast<const SifSnap *>(h);

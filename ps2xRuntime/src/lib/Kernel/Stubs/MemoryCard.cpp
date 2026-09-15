@@ -797,7 +797,7 @@ namespace ps2_stubs
                             dirEntries.push_back(entry);
                         }
 
-                        std::sort(dirEntries.begin(), dirEntries.end(),
+                        std::stable_sort(dirEntries.begin(), dirEntries.end(),
                                   [](const std::filesystem::directory_entry &lhs,
                                      const std::filesystem::directory_entry &rhs)
                                   {

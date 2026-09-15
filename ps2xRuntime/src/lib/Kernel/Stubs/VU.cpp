@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "VU.h"
 #include <cstdlib>
+#include "runtime/ps2_detmath.h"   // [detmath] deterministic guest libm
 //TODO use glm
 
 namespace ps2_stubs
@@ -550,8 +551,8 @@ namespace ps2_stubs
         if (readVuMatrix4f(rdram, srcAddr, src))
         {
             makeIdentityMatrix(rot);
-            const float cs = std::cos(angle);
-            const float sn = std::sin(angle);
+            const float cs = ps2xDetCosf(angle);   // [detmath]
+            const float sn = ps2xDetSinf(angle);
             rot[5] = cs;
             rot[6] = sn;
             rot[9] = -sn;
@@ -571,8 +572,8 @@ namespace ps2_stubs
         if (readVuMatrix4f(rdram, srcAddr, src))
         {
             makeIdentityMatrix(rot);
-            const float cs = std::cos(angle);
-            const float sn = std::sin(angle);
+            const float cs = ps2xDetCosf(angle);   // [detmath]
+            const float sn = ps2xDetSinf(angle);
             rot[0] = cs;
             rot[2] = -sn;
             rot[8] = sn;
@@ -592,8 +593,8 @@ namespace ps2_stubs
         if (readVuMatrix4f(rdram, srcAddr, src))
         {
             makeIdentityMatrix(rot);
-            const float cs = std::cos(angle);
-            const float sn = std::sin(angle);
+            const float cs = ps2xDetCosf(angle);   // [detmath]
+            const float sn = ps2xDetSinf(angle);
             rot[0] = cs;
             rot[1] = sn;
             rot[4] = -sn;

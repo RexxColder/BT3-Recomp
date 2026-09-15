@@ -408,6 +408,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_eeprof.cpp
     src/lib/ps2_stepcensus.cpp
     src/lib/ps2_fiber.cpp
+    src/lib/ps2_detmath.cpp   # [detmath] deterministic guest libm (cross-platform netplay)
     src/lib/ps2_hostchain_win.cpp   # [statesync] Windows chain walk + image id (stubs elsewhere)
     src/lib/ps2_gif_arbiter.cpp
     src/lib/ps2_audio.cpp
@@ -538,10 +539,15 @@ if(NOT MSVC AND PS2X_TARGET_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     target_compile_options(ps2EntryRunner PRIVATE -msse4.1)
 endif()
 
-# ARM can fuse multiply/add by default; guest VU math requires two roundings.
-if(APPLE)
+# Never fuse multiply/add: guest VU math requires two roundings, and netplay requires two machines
+# (or a -march=native build and a baseline one) to compute the same bits. ARM fuses by default;
+# x86 does as soon as the target has FMA. clang-cl gets /clang:-ffp-contract=off below.
+if(NOT MSVC)
     target_compile_options(ps2_runtime PRIVATE -ffp-contract=off)
-    target_compile_options(ps2EntryRunner PRIVATE -ffp-contract=off -fno-strict-aliasing -fwrapv)
+    target_compile_options(ps2EntryRunner PRIVATE -ffp-contract=off)
+endif()
+if(APPLE)
+    target_compile_options(ps2EntryRunner PRIVATE -fno-strict-aliasing -fwrapv)
 endif()
 
 # Mirror the Linux build on MSVC: the generated runner sources compile WITHOUT

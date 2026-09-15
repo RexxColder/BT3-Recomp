@@ -590,6 +590,13 @@ static void snapReadTransfers(Ps2xByteR &r, std::vector<PS2Memory::PendingTransf
     const size_t n = r.count(9); v.resize(r.ok ? n : 0);
     for (auto &t : v) { t.fromScratchpad = r.u8() != 0; t.srcAddr = r.u32(); t.qwc = r.u32(); r.bytes(t.chainData); }
 }
+static uint64_t ps2xLayoutMix(uint64_t h, uint64_t v) { h ^= v; return h * 1099511628211ull; }
+extern "C" uint64_t ps2xMemDeviceLayoutHash()
+{   // [statesync] sizes of everything the DEV section writes raw
+    uint64_t h = 1469598103934665603ull;
+    h = ps2xLayoutMix(h, sizeof(decltype(MemDeviceSnap::gif)::value_type)); h = ps2xLayoutMix(h, sizeof(decltype(MemDeviceSnap::io)::mapped_type)); h = ps2xLayoutMix(h, sizeof(decltype(MemDeviceSnap::dmac)::value_type));
+    return h;
+}
 extern "C" bool ps2xMemDeviceSerialize(const void *h, std::vector<uint8_t> &out)
 {
     const MemDeviceSnap *s = static_cast<const MemDeviceSnap *>(h);

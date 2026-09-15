@@ -57,6 +57,7 @@ std::atomic<int> g_netJumpHold{0};
 #include <array>
 #include <cctype>
 #include <cmath>
+#include "runtime/ps2_detmath.h"   // [detmath]
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -3495,7 +3496,7 @@ namespace
         (void)rdram; (void)runtime;
         const float in = ctx->f[12];
         const float c = (in > 1.0f) ? 1.0f : ((in < -1.0f) ? -1.0f : (std::isnan(in) ? 1.0f : in));
-        ctx->f[0] = std::acos(c);
+        ctx->f[0] = ps2xDetAcosf(c);   // [detmath] deterministic across hosts
         ctx->pc = getRegU32(ctx, 31); // jr $ra
     }
 
@@ -4832,7 +4833,17 @@ namespace
     extern "C" void ps2xSimSnapFree(void *h) { delete static_cast<SimSnap *>(h); }
     // [statesync] Portable form of the simulation snapshot (same binary on both ends: PODs go raw;
     // the sound HLE's time points are on the virtual clock in stepped mode, so they travel as ns).
-    extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
+    static uint64_t ps2xLayoutMix(uint64_t h, uint64_t v) { h ^= v; return h * 1099511628211ull; }
+extern "C" uint64_t ps2xSimSnapLayoutHash()
+{   // [statesync] sizes of everything the SIM section writes raw
+    uint64_t h = 1469598103934665603ull;
+    h = ps2xLayoutMix(h, sizeof(decltype(SimSnap::v0))); h = ps2xLayoutMix(h, sizeof(decltype(SimSnap::v1))); h = ps2xLayoutMix(h, sizeof(decltype(SimSnap::gs)));
+    h = ps2xLayoutMix(h, sizeof(decltype(SimSnap::sinks)::value_type)); h = ps2xLayoutMix(h, sizeof(decltype(decltype(SimSnap::seVoices)::value_type::pcm)::value_type));
+    h = ps2xLayoutMix(h, sizeof(decltype(std::declval<decltype(SimSnap::rings)::mapped_type>().bufs)::value_type));
+    h = ps2xLayoutMix(h, sizeof(Bt3DevDoneSer));
+    return h;
+}
+extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
     {
         const SimSnap *s = static_cast<const SimSnap *>(h);
         if (!s) return false;

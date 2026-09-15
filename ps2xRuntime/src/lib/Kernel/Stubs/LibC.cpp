@@ -9,6 +9,7 @@ extern std::atomic<uint64_t> g_bt3FrameCount;   // [randlog] defined in game_ove
 #include <ctime>
 #include <cstdlib>
 #include <cstdio>
+#include "runtime/ps2_detmath.h"   // [detmath] deterministic guest libm
 
 namespace ps2_stubs
 {
@@ -935,7 +936,7 @@ namespace ps2_stubs
     void sin(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         float arg = ctx->f[12];
-        ctx->f[0] = ::sinf(arg);
+        ctx->f[0] = ps2xDetSinf(arg);
     }
 
     void __kernel_sinf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -943,20 +944,20 @@ namespace ps2_stubs
         const float x = ctx->f[12];
         const float y = ctx->f[13];
         const int32_t iy = static_cast<int32_t>(getRegU32(ctx, 4));
-        ctx->f[0] = ::sinf(x + (iy != 0 ? y : 0.0f));
+        ctx->f[0] = ps2xDetSinf(x + (iy != 0 ? y : 0.0f));
     }
 
     void cos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         float arg = ctx->f[12];
-        ctx->f[0] = ::cosf(arg);
+        ctx->f[0] = ps2xDetCosf(arg);
     }
 
     void __kernel_cosf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const float x = ctx->f[12];
         const float y = ctx->f[13];
-        ctx->f[0] = ::cosf(x + y);
+        ctx->f[0] = ps2xDetCosf(x + y);
     }
 
     void __ieee754_rem_pio2f(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -985,39 +986,39 @@ namespace ps2_stubs
     void tan(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         float arg = ctx->f[12];
-        ctx->f[0] = ::tanf(arg);
+        ctx->f[0] = ps2xDetTanf(arg);
     }
 
     void atan2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         float y = ctx->f[12];
         float x = ctx->f[14];
-        ctx->f[0] = ::atan2f(y, x);
+        ctx->f[0] = ps2xDetAtan2f(y, x);
     }
 
     void pow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         float base = ctx->f[12];
         float exp = ctx->f[14];
-        ctx->f[0] = ::powf(base, exp);
+        ctx->f[0] = ps2xDetPowf(base, exp);
     }
 
     void exp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         float arg = ctx->f[12];
-        ctx->f[0] = ::expf(arg);
+        ctx->f[0] = ps2xDetExpf(arg);
     }
 
     void log(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         float arg = ctx->f[12];
-        ctx->f[0] = ::logf(arg);
+        ctx->f[0] = ps2xDetLogf(arg);
     }
 
     void log10(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         float arg = ctx->f[12];
-        ctx->f[0] = ::log10f(arg);
+        ctx->f[0] = ps2xDetLog10f(arg);
     }
 
     void ceil(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

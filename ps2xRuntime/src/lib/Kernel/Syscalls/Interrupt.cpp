@@ -143,7 +143,7 @@ namespace ps2_syscalls
                 }
                 handlers.push_back(info);
             }
-            std::sort(handlers.begin(), handlers.end(), [](const IrqHandlerInfo &a, const IrqHandlerInfo &b)
+            std::stable_sort(handlers.begin(), handlers.end(), [](const IrqHandlerInfo &a, const IrqHandlerInfo &b)
                       { return a.order < b.order; });
         }
 
@@ -249,7 +249,7 @@ namespace ps2_syscalls
                 }
                 handlers.push_back(info);
             }
-            std::sort(handlers.begin(), handlers.end(), [](const IrqHandlerInfo &a, const IrqHandlerInfo &b)
+            std::stable_sort(handlers.begin(), handlers.end(), [](const IrqHandlerInfo &a, const IrqHandlerInfo &b)
                       { return a.order < b.order; });
         }
 
