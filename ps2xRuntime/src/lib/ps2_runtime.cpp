@@ -2879,6 +2879,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         uint64_t &s_nestedFairness = g_cadNestedFairness;   // [rollback] cadence counter (file scope)
         constexpr uint64_t kNestedFairnessInterval = 256u;
         ++g_cadBranchesSinceTick;   // [tickbusy]
+        if (ps2xSchedTraceOn() && ((s_nestedFairness + 1u) & 31u) == 0u)   // diagnostic: who makes the non-main dispatches
+            std::fprintf(stderr, "[schedtrace] NF tid=%d nf=%llu target=0x%x src=0x%x main=%d\n", g_schedTid, (unsigned long long)(s_nestedFairness + 1u), targetPc, sourcePc, (int)(ctx == &m_cpuContext));
         if ((++s_nestedFairness % kNestedFairnessInterval) == 0u)
         {
             if (m_fibersEnabled && g_schedIsGuest && !g_schedTickDue && g_cadBranchesSinceTick >= g_tickBranches && ps2xFrameStepOn())
@@ -3788,7 +3790,7 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
             uint32_t &s_dp = g_cadDp;   // [rollback] cadence counter (file scope)
             if (s_dpOn && m_schedEnabled && ctx == &m_cpuContext && ((++s_dp & 0x3FFFu) == 0u))
             {
-                if (ps2xCdTickStale(20u)) ps2xCdTickOnly(rdram, ctx, this);
+                if (ps2xCdTickStale(20u)) { if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] PUMP cdtickonly tid=%d\n", g_schedTid); ps2xCdTickOnly(rdram, ctx, this); }
                 bool othersPresent = false;
                 {   // any other guest thread at all: a thread whose semaphore was just signalled from the RPC/interrupt
                     // path still shows blocked=true until it gets the token, and this loop is the only place the main
@@ -3822,6 +3824,7 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
             }
             if ((samePcCount % 2000u) == 0u && ctx == &m_cpuContext)   // [pumpmain] never run the tick on a sound thread's 2 KB stack
             {   // [spinpump] a busy-poll: advance the CD file server and let other guest threads run (see game_overrides)
+                if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] PUMP spinpump tid=%d\n", g_schedTid);
                 ps2xSpinPump(rdram, ctx, this);
             }
             if ((samePcCount % kSamePcYieldInterval) == 0u)
@@ -4921,7 +4924,7 @@ static std::string ps2xSyncFormatId()
     for (uint32_t slot = 0; slot < g_ps2OverlayFunctionTableSlotCount; ++slot) if (g_ps2OverlayFunctionTable[slot]) program = fnv(program, slot);
     // math: the deterministic libm's results on this build (a differing bit anywhere = a desync)
     const uint64_t math = ps2xDetMathFingerprint();
-    uint64_t h = fnv(fnv(fnv(fnv(1469598103934665603ull, 3u /* format version */), layout), program), math);
+    uint64_t h = fnv(fnv(fnv(fnv(1469598103934665603ull, 4u /* format version */), layout), program), math);
     char b[48]; std::snprintf(b, sizeof b, "sync2-%016llx", (unsigned long long)h);
     s_id = b;
     std::fprintf(stderr, "[statesync] state format %s (layout %016llx, program %016llx, math %016llx, build %s)\n",

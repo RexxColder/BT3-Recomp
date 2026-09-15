@@ -5,6 +5,7 @@ extern "C" void ps2xParkArg(uint64_t arg);   // [statesync] ps2_runtime.cpp: the
 #include "Sync.h"
 
 extern "C" void ps2xSchedSignal();   // [fibers] ps2_runtime.cpp: a blocked fiber may now be runnable
+extern "C" int ps2xSchedTraceOn();
 namespace ps2_syscalls
 {
     static bool looksLikeGuestPointerOrNull(uint32_t value)
@@ -233,6 +234,7 @@ namespace ps2_syscalls
 
     void SignalSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] SignalSema sid=%d by=%d\n", (int)getRegU32(ctx, 4), g_currentThreadId);
         ps2xSchedSignal();   // [fibers] wake site
         int sid = static_cast<int>(getRegU32(ctx, 4));
         auto sema = lookupSemaInfo(sid);
@@ -289,6 +291,7 @@ namespace ps2_syscalls
 
     void WaitSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] WaitSema sid=%d by=%d\n", (int)getRegU32(ctx, 4), g_currentThreadId);
         int sid = static_cast<int>(getRegU32(ctx, 4));
         auto sema = lookupSemaInfo(sid);
         if (!sema)
@@ -414,6 +417,7 @@ namespace ps2_syscalls
 
     void PollSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] PollSema sid=%d by=%d\n", (int)getRegU32(ctx, 4), g_currentThreadId);
         int sid = static_cast<int>(getRegU32(ctx, 4));
         auto sema = lookupSemaInfo(sid);
         if (!sema)

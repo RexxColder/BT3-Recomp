@@ -57,6 +57,9 @@ std::atomic<int> g_netJumpHold{0};
 #include <array>
 #include <cctype>
 #include <cmath>
+#if !defined(_WIN32)
+#include <dlfcn.h>   // [sndwatch] writer names
+#endif
 #include "runtime/ps2_detmath.h"   // [detmath]
 #include <filesystem>
 #include <fstream>
@@ -945,16 +948,26 @@ namespace
         // The guest-store watch (PS2X_ADDRWATCH) is silent for these because the runtime writes
         // them directly into guest RAM, bypassing the recompiled store path entirely.
         {
+            // PS2X_SNDWATCH=<hex lo>[:<hex hi>] (+ PS2X_AWATCH_FROM=<frame>): every host write in the range,
+            // with the writer's function (Linux) -- for the original-vs-re-run diff of the sound lists.
             static const uint32_t s_w = [](){ const char *v = std::getenv("PS2X_SNDWATCH");
                                               return (v && v[0]) ? (uint32_t)std::strtoul(v, nullptr, 16) : 0u; }();
-            if (s_w && (addr & 0x1FFFFFFFu) == (s_w & 0x1FFFFFFFu))
+            static const uint32_t s_wHi = [](){ const char *v = std::getenv("PS2X_SNDWATCH"); const char *c = v ? std::strchr(v, ':') : nullptr;
+                                                return c ? (uint32_t)std::strtoul(c + 1, nullptr, 16) : 0u; }();
+            static const uint64_t s_wFrom = [](){ const char *v = std::getenv("PS2X_AWATCH_FROM"); return v && v[0] ? std::strtoull(v, nullptr, 10) : 0ull; }();
+            const uint32_t a = addr & 0x1FFFFFFFu;
+            if (s_w && (s_wHi ? (a >= (s_w & 0x1FFFFFFFu) && a < (s_wHi & 0x1FFFFFFFu)) : a == (s_w & 0x1FFFFFFFu)))
             {
                 static std::atomic<uint32_t> s_n{0};
-                if (s_n.fetch_add(1u) < 25u)
+                const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+                if (fr >= s_wFrom && (s_wFrom || s_n.fetch_add(1u) < 25u))
                 {
-                    uint32_t old32 = 0; std::memcpy(&old32, rdram + (addr & 0x1FFFFFFFu), 4);
-                    std::fprintf(stderr, "[sndwatch] frame %llu addr 0x%x  %08x -> %08x\n",
-                                 (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), addr, old32, val);
+                    uint32_t old32 = 0; std::memcpy(&old32, rdram + a, 4);
+                    const char *who = "?";
+#if !defined(_WIN32)
+                    Dl_info di{}; if (dladdr(__builtin_return_address(0), &di) && di.dli_sname) who = di.dli_sname;
+#endif
+                    std::fprintf(stderr, "[sndwatch] frame %llu addr 0x%x  %08x -> %08x  by %.60s\n", (unsigned long long)fr, addr, old32, val, who);
                 }
             }
         }
@@ -1075,6 +1088,17 @@ namespace
     // Never the backend's view of the stream, which exists only once the device heard data.
     std::mutex g_streamRateM;
     std::map<uint32_t, uint32_t> g_streamRate;
+    // [rollback] HOOK GATES: "did I already do this on this vsync / frame / for this stream state"
+    // memories that decide whether a hook runs guest code (the ADX tick pump, the movie-load tick,
+    // the disc tick, the stream tick's edge detection). They were function-local statics; a restored
+    // run then compared its restored counters against the ORIGINAL run's last values and pumped at
+    // different points (the dense rollback test: 82 % of re-simulated frames differed in the sound
+    // lists, the first divergence always the ADX tick landing elsewhere). They ride in SimSnap now.
+    std::atomic<uint64_t> g_loadPollLastVsync{~0ull};
+    std::atomic<uint64_t> g_moviePollLastVsync{~0ull};
+    std::mutex g_streamEdgeM;
+    std::map<uint32_t, uint32_t> g_streamLastState;   // bt3SndStreamTick: last seen state per stream object
+    std::map<uint32_t, uint32_t> g_streamLastNode;    // bt3SndStreamTick: last node handed over per sink
     uint32_t sndStreamRate(uint32_t streamId)
     {
         std::lock_guard<std::mutex> lk(g_streamRateM);
@@ -2405,16 +2429,14 @@ namespace
         // window BEFORE the ~2s cutout -- so it can never show what changes AT the cutout.
         // If state flips 1 -> 0 there, the game stopped the stream itself (scene/state change)
         // and the pump is innocent; if it stays 1 while transfers dry up, we are starving it.
-        static std::mutex s_stM;
-        static std::map<uint32_t, uint32_t> s_lastState;
         bool changed = false;
-        {
-            std::lock_guard<std::mutex> lk(s_stM);
-            auto it = s_lastState.find(obj);
-            if (it == s_lastState.end() || it->second != state)
+        {   // [rollback] g_streamLastState rides in the sim snapshot (edge memory must roll back too)
+            std::lock_guard<std::mutex> lk(g_streamEdgeM);
+            auto it = g_streamLastState.find(obj);
+            if (it == g_streamLastState.end() || it->second != state)
             {
                 changed = true;
-                s_lastState[obj] = state;
+                g_streamLastState[obj] = state;
             }
         }
         // This hook is now installed whenever audio is on, so every diagnostic in it has to
@@ -2569,8 +2591,6 @@ namespace
             // one-way leak. Once the pool is dry, reuse the node we last handed over instead:
             // the empty free list proves the game has already taken it, and the empty recycler
             // proves it is not queued there, so it is unlinked and safe to re-arm.
-            static std::mutex s_nodeM;
-            static std::map<uint32_t, uint32_t> s_lastNode;
             // STEREO LOCKSTEP: only advance a pair sink when its PARTNER is starved too.
             // Otherwise one side can receive a buffer the other does not; the game then writes
             // ~2432 extra samples into that channel and L[i]/R[i] refer to source times ~100ms
@@ -2598,9 +2618,9 @@ namespace
                 bool reused = false;
                 if (!node)
                 {
-                    std::lock_guard<std::mutex> lk(s_nodeM);
-                    auto it = s_lastNode.find(sink);
-                    if (it != s_lastNode.end()) { node = it->second; reused = true; }
+                    std::lock_guard<std::mutex> lk(g_streamEdgeM);   // [rollback] snapshotted
+                    auto it = g_streamLastNode.find(sink);
+                    if (it != g_streamLastNode.end()) { node = it->second; reused = true; }
                 }
                 if (node)
                 {
@@ -2693,8 +2713,8 @@ namespace
                         if (!reused)
                             poke(sink, 0x14, peek(node, 0x00)); // pop node off the recycler
                         {   // remember it so we can re-arm with it once the pool runs dry
-                            std::lock_guard<std::mutex> lk(s_nodeM);
-                            s_lastNode[sink] = node;
+                            std::lock_guard<std::mutex> lk(g_streamEdgeM);
+                            g_streamLastNode[sink] = node;
                         }
                         poke(node, 0x00, 0u);               // node->next = null (single entry)
                         poke(node, 0x08, bp);               // describe a real ring buffer
@@ -4759,6 +4779,8 @@ namespace
         VU1State v0{}, v1{};
         std::vector<SinkSer> sinks;
         std::map<uint32_t, uint32_t> streamRate;   // [detsound] declared rate per stream (guest data)
+        uint64_t loadPollLastVsync = ~0ull, moviePollLastVsync = ~0ull, lastCdTickFrame = ~0ull;   // [rollback] hook gates
+        std::map<uint32_t, uint32_t> streamLastState, streamLastNode;
         GsRegSer gs{};
         std::vector<SeVoice> seVoices;   // HLE sound-effect voices (host side of the SE stream)
         // [rollback] The sound HLE's own host bookkeeping, copied whole (time points are on the
@@ -4798,6 +4820,9 @@ namespace
                                             (uint8_t)v.frameClock, 0u });
             }
         { std::lock_guard<std::mutex> lk(g_streamRateM); s->streamRate = g_streamRate; }   // [detsound]
+        s->loadPollLastVsync = g_loadPollLastVsync.load(std::memory_order_relaxed); s->moviePollLastVsync = g_moviePollLastVsync.load(std::memory_order_relaxed);
+        s->lastCdTickFrame = g_lastCdTickFrame.load(std::memory_order_relaxed);
+        { std::lock_guard<std::mutex> lk(g_streamEdgeM); s->streamLastState = g_streamLastState; s->streamLastNode = g_streamLastNode; }
         }
         gsRegPack(mem.gs(), s->gs);
         { std::lock_guard<std::mutex> lk(g_seVoiceM); s->seVoices = g_seVoices; }
@@ -4836,6 +4861,9 @@ namespace
                 d.wallBase = now; d.ringFullSince = now;
             }
             { std::lock_guard<std::mutex> lk(g_streamRateM); g_streamRate = s->streamRate; }   // [detsound]
+            g_loadPollLastVsync.store(s->loadPollLastVsync, std::memory_order_relaxed); g_moviePollLastVsync.store(s->moviePollLastVsync, std::memory_order_relaxed);
+            g_lastCdTickFrame.store(s->lastCdTickFrame, std::memory_order_relaxed);
+            { std::lock_guard<std::mutex> lk(g_streamEdgeM); g_streamLastState = s->streamLastState; g_streamLastNode = s->streamLastNode; }
         }
         gsRegUnpack(s->gs, mem.gs());
         { std::lock_guard<std::mutex> lk(g_seVoiceM); g_seVoices = s->seVoices; }
@@ -4874,12 +4902,13 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
         const SimSnap *s = static_cast<const SimSnap *>(h);
         if (!s) return false;
         Ps2xByteW w(out);
-        w.u32(0x53494d32u);   // 'SIM2' (+ streamRate)
+        w.u32(0x53494d33u);   // 'SIM3' (+ streamRate, hook gates)
         w.u64(s->frame); w.u64(s->rand64); w.u32(s->randCalls);
         w.bytes(s->ram); w.bytes(s->sp); w.bytes(s->iop); w.bytes(s->vu0d); w.bytes(s->vu1d); w.bytes(s->vram); w.bytes(s->vu0c); w.bytes(s->vu1c);
         w.pod(s->v0); w.pod(s->v1);
         w.podVec(s->sinks);
         w.podMap(s->streamRate);   // [detsound]
+        w.u64(s->loadPollLastVsync); w.u64(s->moviePollLastVsync); w.u64(s->lastCdTickFrame); w.podMap(s->streamLastState); w.podMap(s->streamLastNode);   // [rollback] hook gates
         w.pod(s->gs);
         w.u64(s->seVoices.size());
         for (const SeVoice &v : s->seVoices) { w.u32(v.serial); w.podVec(v.pcm); w.u64(v.pos); }
@@ -4903,13 +4932,14 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
     extern "C" void *ps2xSimSnapDeserialize(const uint8_t *data, size_t n, size_t *used)
     {
         Ps2xByteR r(data, n);
-        if (r.u32() != 0x53494d32u) return nullptr;
+        if (r.u32() != 0x53494d33u) return nullptr;
         SimSnap *s = new SimSnap();
         s->frame = r.u64(); s->rand64 = r.u64(); s->randCalls = r.u32();
         r.bytes(s->ram); r.bytes(s->sp); r.bytes(s->iop); r.bytes(s->vu0d); r.bytes(s->vu1d); r.bytes(s->vram); r.bytes(s->vu0c); r.bytes(s->vu1c);
         s->v0 = r.pod<VU1State>(); s->v1 = r.pod<VU1State>();
         r.podVec(s->sinks);
         r.podMap(s->streamRate);   // [detsound]
+        s->loadPollLastVsync = r.u64(); s->moviePollLastVsync = r.u64(); s->lastCdTickFrame = r.u64(); r.podMap(s->streamLastState); r.podMap(s->streamLastNode);
         s->gs = r.pod<GsRegSer>();
         { const size_t k = r.count(4); s->seVoices.resize(r.ok ? k : 0);
           for (SeVoice &v : s->seVoices) { v.serial = r.u32(); r.podVec(v.pcm); v.pos = (size_t)r.u64(); } }
@@ -5812,12 +5842,12 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
         // FUN_00263198 loop calls this thousands of times/frame; pumping the ADX tick
         // every call over-advances and corrupts the ADX state (stuck early / pink).
         // Rate-limiting to once/vsync matches real hardware (CD-paced) and is stable.
-        static thread_local uint64_t s_lastVsync = ~0ull;
         const uint64_t vsync = ps2_syscalls::GetCurrentVSyncTick();
-        const bool vsyncElapsed = (vsync != s_lastVsync);
-        if (!s_inTick && vsyncElapsed && runtime->hasFunction(0x0028a530u))
+        uint64_t lastVsync = g_loadPollLastVsync.load(std::memory_order_relaxed);   // [rollback] snapshotted gate
+        const bool vsyncElapsed = (vsync != lastVsync);
+        if (!s_inTick && vsyncElapsed && runtime->hasFunction(0x0028a530u) && g_loadPollLastVsync.compare_exchange_strong(lastVsync, vsync))
         {
-            s_lastVsync = vsync;
+            if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] PUMP adxtick tid=%d vsync=%llu\n", ps2xSchedTid(), (unsigned long long)vsync);
             s_inTick = true;
             R5900Context tctx = *ctx;
             tctx.r[31] = _mm_setzero_si128();
@@ -5890,7 +5920,7 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
     void bt3MovieLoadPoll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00264af0
     {
         static thread_local bool s_inTick = false;
-        static thread_local uint64_t s_lastVsync = ~0ull;
+        uint64_t s_lastVsync = g_moviePollLastVsync.load(std::memory_order_relaxed);   // [rollback] snapshotted gate
         const uint64_t vsync = ps2_syscalls::GetCurrentVSyncTick();
         // Only tick when the CRI ADXF partition actually exists. FUN_00264af0 is also
         // called early (adxf=NULL) before the AFS is opened; ticking FUN_0028a530 on a
@@ -5921,7 +5951,8 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
         static const bool s_moviePump = [](){ const char *v=std::getenv("PS2X_MOVIEPUMP"); return v&&v[0]&&v[0]!='0'; }();
         if (s_moviePump && adxf != 0u && !s_inTick && vsync != s_lastVsync && runtime->hasFunction(0x0028a530u))
         {
-            s_lastVsync = vsync;
+            g_moviePollLastVsync.store(vsync, std::memory_order_relaxed);
+            if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] PUMP movietick tid=%d vsync=%llu\n", ps2xSchedTid(), (unsigned long long)vsync);
             s_inTick = true;
             R5900Context tctx = *ctx;
             tctx.r[31] = _mm_setzero_si128();

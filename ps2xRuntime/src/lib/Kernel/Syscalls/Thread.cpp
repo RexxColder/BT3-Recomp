@@ -948,6 +948,7 @@ namespace ps2_syscalls
         }
 
         std::lock_guard<std::mutex> lock(info->m);
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] ReferThreadStatus tid=%d -> st=%d wt=%d wid=%d sus=%d wk=%d by=%d\n", tid, info->status, info->waitType, info->waitId, info->suspendCount, info->wakeupCount, g_currentThreadId);
         status->status = info->status;
         status->func = info->entry;
         status->stack = info->stack;
