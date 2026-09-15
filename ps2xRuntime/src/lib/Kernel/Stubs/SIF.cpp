@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "runtime/ps2_statesync.h"   // [statesync]
 extern "C" bool ps2xAudioFeedOn();   // [rollback] ps2_runtime.cpp: false while re-simulating / fast-forwarding
+extern "C" void ps2xSndStreamRateDeclared(uint32_t streamId, uint32_t rate);   // [detsound] game_overrides.cpp
 #include "SIF.h"
 #include "../Syscalls/RPC.h"
 
@@ -820,6 +821,10 @@ namespace ps2_stubs
                         // into the neighbouring stream. Resolve against the registered spans.
                         const uint32_t streamId = runtime->audioBackend().streamIdForAddress(
                             static_cast<uint32_t>(xfer.dest));
+                        // [detsound] The declared rate is guest data (the ADX header); record it for the
+                        // stepped-mode credit BEFORE the feed gate, so a re-simulation and a second
+                        // machine credit at the same rate whether or not their device heard this transfer.
+                        ps2xSndStreamRateDeclared(streamId, s_rate);
                         const uint8_t *p = (xfer.size >= 256)
                                                ? getConstMemPtr(rdram, xfer.src)
                                                : nullptr;

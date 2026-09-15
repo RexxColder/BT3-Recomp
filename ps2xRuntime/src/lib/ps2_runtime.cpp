@@ -4921,7 +4921,7 @@ static std::string ps2xSyncFormatId()
     for (uint32_t slot = 0; slot < g_ps2OverlayFunctionTableSlotCount; ++slot) if (g_ps2OverlayFunctionTable[slot]) program = fnv(program, slot);
     // math: the deterministic libm's results on this build (a differing bit anywhere = a desync)
     const uint64_t math = ps2xDetMathFingerprint();
-    uint64_t h = fnv(fnv(fnv(fnv(1469598103934665603ull, 2u /* format version */), layout), program), math);
+    uint64_t h = fnv(fnv(fnv(fnv(1469598103934665603ull, 3u /* format version */), layout), program), math);
     char b[48]; std::snprintf(b, sizeof b, "sync2-%016llx", (unsigned long long)h);
     s_id = b;
     std::fprintf(stderr, "[statesync] state format %s (layout %016llx, program %016llx, math %016llx, build %s)\n",
@@ -5632,14 +5632,20 @@ struct Ps2xRollback
         // copy per checksum, cheap) and write it when the peer's hash for that frame differs, so the two sides'
         // dumps can be diffed offline (scratchpad/ramdiff.py).
         static const char *s_dumpDir = std::getenv("PS2X_NET_DUMPDIR");
-        static std::vector<uint8_t> s_hashedRam; static uint64_t s_hashedFrame = 0; static bool s_dumped = false;
+        // the last few hashed RAMs: the peer's verdict for a frame arrives a few frames after we hashed it,
+        // and with PS2X_NET_CHECKEVERY=1 a single copy was always overwritten by then
+        static std::deque<std::pair<uint64_t, std::vector<uint8_t>>> s_hashedRing; static bool s_dumped = false;
         if (!ring.empty() && (frame % ps2NetCheckEvery()) == 0u && ring.front().frame + keep <= frame)
         {
             if (const uint8_t *ram = ps2xSimSnapRam(ring.front().sim))
             {   // minus the sound-stream window: the sound service thread's wake count there is the one
                 // known host-timing residual (in-process too); gameplay state is not in that block
                 ps2NetSetChecksum((uint32_t)ring.front().frame, ps2xRamHash(ram, 0x2c0000u, 0x300000u));
-                if (s_dumpDir && s_dumpDir[0] && !s_dumped) { s_hashedRam.assign(ram, ram + 32u * 1024u * 1024u); s_hashedFrame = ring.front().frame; }
+                if (s_dumpDir && s_dumpDir[0] && !s_dumped)
+                {
+                    s_hashedRing.emplace_back(ring.front().frame, std::vector<uint8_t>(ram, ram + 32u * 1024u * 1024u));
+                    while (s_hashedRing.size() > 12u) s_hashedRing.pop_front();
+                }
             }
         }
         if (s_dumpDir && s_dumpDir[0] && !s_dumped)
@@ -5648,11 +5654,12 @@ struct Ps2xRollback
             {
                 s_dumped = true;
                 char path[512]; std::snprintf(path, sizeof path, "%s/desync_%u_p%d.bin", s_dumpDir, df, ps2NetLocalPlayer());
-                const bool have = df == s_hashedFrame && s_hashedRam.size() == 32u * 1024u * 1024u;
+                const std::vector<uint8_t> *have = nullptr;
+                for (const auto &e : s_hashedRing) if (e.first == df) { have = &e.second; break; }
                 std::FILE *f = have ? std::fopen(path, "wb") : nullptr;
-                if (f) { std::fwrite(s_hashedRam.data(), 1, s_hashedRam.size(), f); std::fclose(f); }
-                std::fprintf(stderr, "[desyncdump] frame %u: %s\n", df, f ? path : (have ? "cannot write" : "not the last hashed frame"));
-                s_hashedRam.clear(); s_hashedRam.shrink_to_fit();
+                if (f) { std::fwrite(have->data(), 1, have->size(), f); std::fclose(f); }
+                std::fprintf(stderr, "[desyncdump] frame %u: %s\n", df, f ? path : (have ? "cannot write" : "not among the last hashed frames"));
+                s_hashedRing.clear();
             }
         }
     }

@@ -1070,6 +1070,17 @@ namespace
         }();
         return s_on;
     }
+    // [detsound] The rate each stream was DECLARED at (the ADX header the disc reader saw, recorded
+    // by the SIF DMA path whether or not the device was fed): what the stepped-mode credit uses.
+    // Never the backend's view of the stream, which exists only once the device heard data.
+    std::mutex g_streamRateM;
+    std::map<uint32_t, uint32_t> g_streamRate;
+    uint32_t sndStreamRate(uint32_t streamId)
+    {
+        std::lock_guard<std::mutex> lk(g_streamRateM);
+        const auto it = g_streamRate.find(streamId);
+        return it != g_streamRate.end() && it->second ? it->second : 0u;
+    }
     uint32_t sndDeclaredRate()
     {
         static const uint32_t s_rate = []() -> uint32_t {
@@ -1157,7 +1168,13 @@ namespace
             // At the rate the stream was DECLARED at (the game's ADX header, as the DMA path told the
             // backend) -- not the 24 kHz default: the title music is 48 kHz, and crediting it at half
             // rate fed the device half of what it played (measured: 24 002 vs 48 169 samples/s).
-            const uint32_t rate = (prog.known && prog.sampleRate) ? prog.sampleRate : sndDeclaredRate();
+            // [detsound] the DECLARED rate (guest data, recorded at the DMA push), never the backend's:
+            // the backend only knows a stream once the device heard it, which is host timing -- a
+            // re-simulation and a second machine credited a fresh BGM at 24 kHz for a few frames while
+            // the original ran at 48, the sound thread woke a different number of times, and its
+            // stream record diverged at every music change (the attract-demo desync).
+            const uint32_t declared = sndStreamRate(s.streamId);
+            const uint32_t rate = declared ? declared : sndDeclaredRate();
             playedBytes = s.frameBaseBytes + ((fr - s.frameBase) * (uint64_t)rate * 2ull) / 60u;
             const uint64_t fedTotal = s.returnedBytes + queued;   // the device cannot have played what was never fed
             if (playedBytes > fedTotal) playedBytes = fedTotal;
@@ -4741,6 +4758,7 @@ namespace
         std::vector<uint8_t> ram, sp, iop, vu0d, vu1d, vram, vu0c, vu1c;
         VU1State v0{}, v1{};
         std::vector<SinkSer> sinks;
+        std::map<uint32_t, uint32_t> streamRate;   // [detsound] declared rate per stream (guest data)
         GsRegSer gs{};
         std::vector<SeVoice> seVoices;   // HLE sound-effect voices (host side of the SE stream)
         // [rollback] The sound HLE's own host bookkeeping, copied whole (time points are on the
@@ -4779,6 +4797,7 @@ namespace
                                             v.frameBase, v.frameBaseBytes, (uint8_t)v.wallClock, (uint8_t)v.ringFullIdle,
                                             (uint8_t)v.frameClock, 0u });
             }
+        { std::lock_guard<std::mutex> lk(g_streamRateM); s->streamRate = g_streamRate; }   // [detsound]
         }
         gsRegPack(mem.gs(), s->gs);
         { std::lock_guard<std::mutex> lk(g_seVoiceM); s->seVoices = g_seVoices; }
@@ -4816,6 +4835,7 @@ namespace
                 d.wallClock = ss.wallClock != 0; d.ringFullIdle = ss.ringFullIdle != 0; d.frameClock = ss.frameClock != 0;
                 d.wallBase = now; d.ringFullSince = now;
             }
+            { std::lock_guard<std::mutex> lk(g_streamRateM); g_streamRate = s->streamRate; }   // [detsound]
         }
         gsRegUnpack(s->gs, mem.gs());
         { std::lock_guard<std::mutex> lk(g_seVoiceM); g_seVoices = s->seVoices; }
@@ -4834,6 +4854,12 @@ namespace
     // [statesync] Portable form of the simulation snapshot (same binary on both ends: PODs go raw;
     // the sound HLE's time points are on the virtual clock in stepped mode, so they travel as ns).
     static uint64_t ps2xLayoutMix(uint64_t h, uint64_t v) { h ^= v; return h * 1099511628211ull; }
+extern "C" void ps2xSndStreamRateDeclared(uint32_t streamId, uint32_t rate)
+{   // [detsound] Kernel/Stubs/SIF.cpp: the ADX-declared rate of a stream, at every DMA push
+    if (!rate) return;
+    std::lock_guard<std::mutex> lk(g_streamRateM);
+    g_streamRate[streamId] = rate;
+}
 extern "C" uint64_t ps2xSimSnapLayoutHash()
 {   // [statesync] sizes of everything the SIM section writes raw
     uint64_t h = 1469598103934665603ull;
@@ -4848,11 +4874,12 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
         const SimSnap *s = static_cast<const SimSnap *>(h);
         if (!s) return false;
         Ps2xByteW w(out);
-        w.u32(0x53494d31u);   // 'SIM1'
+        w.u32(0x53494d32u);   // 'SIM2' (+ streamRate)
         w.u64(s->frame); w.u64(s->rand64); w.u32(s->randCalls);
         w.bytes(s->ram); w.bytes(s->sp); w.bytes(s->iop); w.bytes(s->vu0d); w.bytes(s->vu1d); w.bytes(s->vram); w.bytes(s->vu0c); w.bytes(s->vu1c);
         w.pod(s->v0); w.pod(s->v1);
         w.podVec(s->sinks);
+        w.podMap(s->streamRate);   // [detsound]
         w.pod(s->gs);
         w.u64(s->seVoices.size());
         for (const SeVoice &v : s->seVoices) { w.u32(v.serial); w.podVec(v.pcm); w.u64(v.pos); }
@@ -4876,12 +4903,13 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
     extern "C" void *ps2xSimSnapDeserialize(const uint8_t *data, size_t n, size_t *used)
     {
         Ps2xByteR r(data, n);
-        if (r.u32() != 0x53494d31u) return nullptr;
+        if (r.u32() != 0x53494d32u) return nullptr;
         SimSnap *s = new SimSnap();
         s->frame = r.u64(); s->rand64 = r.u64(); s->randCalls = r.u32();
         r.bytes(s->ram); r.bytes(s->sp); r.bytes(s->iop); r.bytes(s->vu0d); r.bytes(s->vu1d); r.bytes(s->vram); r.bytes(s->vu0c); r.bytes(s->vu1c);
         s->v0 = r.pod<VU1State>(); s->v1 = r.pod<VU1State>();
         r.podVec(s->sinks);
+        r.podMap(s->streamRate);   // [detsound]
         s->gs = r.pod<GsRegSer>();
         { const size_t k = r.count(4); s->seVoices.resize(r.ok ? k : 0);
           for (SeVoice &v : s->seVoices) { v.serial = r.u32(); r.podVec(v.pcm); v.pos = (size_t)r.u64(); } }
