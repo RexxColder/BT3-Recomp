@@ -701,7 +701,7 @@ namespace
             if (nMiss <= 20 || (nMiss % 500u) == 0u)
                 std::fprintf(stderr, "[filterchk] #%lu tex %u: cache says %s, GL says %s (%dx%d) -> corrected\n", nMiss, t.id, bilinear ? "bilinear" : "point", glBilinear ? "bilinear" : "point", t.width, t.height);
             flushBatch(__LINE__);
-            SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+            ps2x::gfx::rgSetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
             g_texFilterState.set(t.id, bilinear ? 1u : 0u);
             return;
         }
@@ -711,7 +711,7 @@ namespace
         // (BARBLOCK's chunk pre-renders move the breaks -> the timer's left lobe alternated crisp/blurred).
         static const bool s_ff = [](){ const char *v = std::getenv("PS2X_FILTERFLUSH"); return !(v && v[0] == '0'); }();   // [filterflush] =0: old behaviour (A/B)
         if (s_ff) flushBatch(__LINE__);
-        SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+        ps2x::gfx::rgSetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
         g_texFilterState.set(t.id, bilinear ? 1u : 0u);
     }
     // [flatfbo] g_fbos was an unordered_map looked up dozens of times per DrawCmd (std::_Hashtable was ~5% of the
@@ -962,9 +962,9 @@ namespace
         int prev = 0; glGetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &prev);
         if (snap.texture.id == 0 || snap.texture.width != w || snap.texture.height != h)
         {
-            if (snap.texture.id != 0) UnloadRenderTexture(snap);
+            if (snap.texture.id != 0) ps2x::gfx::rgUnloadRenderTexture(snap);
             if (snap.texture.id != 0) ps2xForgetTexId(snap.texture.id);
-            snap = LoadRenderTexture(w, h); SetTextureFilter(snap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(snap.texture.id);
+            snap = ps2x::gfx::rgLoadRenderTexture(w, h); ps2x::gfx::rgSetTextureFilter(snap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(snap.texture.id);
             g_rtSnapSeq[fbp] = 0xFFFFFFFFu;
         }
         const uint32_t seq = g_glEnterSeq[fbp];
@@ -1096,7 +1096,7 @@ namespace
                 if (hit && cf == fbp && cw && ch)
                 { w = (int)cw; h = (int)ch;
                   if (f.rt.texture.id != 0 && (f.w != (int)cw || f.h != (int)ch))
-                  { ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); f.rt = RenderTexture2D{}; f.w = f.h = 0; }
+                  { ps2xForgetRtTexId(f.rt.texture.id); ps2x::gfx::rgUnloadRenderTexture(f.rt); f.rt = RenderTexture2D{}; f.w = f.h = 0; }
                   if (f.rt.texture.id != 0) return f; }
             }
         }
@@ -1116,7 +1116,7 @@ namespace
         }
         if (f.w != w || f.h != h || f.rt.texture.id == 0)
         {
-            if (f.rt.texture.id != 0) { g_rsTexScale.erase(f.rt.texture.id); g_texAlphaFix.erase(f.rt.texture.id); ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); }
+            if (f.rt.texture.id != 0) { g_rsTexScale.erase(f.rt.texture.id); g_texAlphaFix.erase(f.rt.texture.id); ps2xForgetRtTexId(f.rt.texture.id); ps2x::gfx::rgUnloadRenderTexture(f.rt); }
             const int rsA = rsScaledFbp(fbp) ? rsN() : 1;
             const int wA = w * rsA, hA = h * rsA;
             // PS2X_NODEPTH_RT: create COLOR-ONLY FBOs (no depth renderbuffer). raylib's
@@ -1222,7 +1222,7 @@ namespace
                 f.rt = t;
             }
             else
-                f.rt = LoadRenderTexture(wA, hA);
+                f.rt = ps2x::gfx::rgLoadRenderTexture(wA, hA);
             f.w = w; f.h = h; f.scale = rsA;
 #if defined(_WIN32)
             d3dFboEnsure(f, wA, hA);   // [d3d11] keep a native RT in step with the GL FBO
@@ -1252,8 +1252,8 @@ namespace
             {
                 g_rsTexScale[f.rt.texture.id] = rsA;
                 g_rsTexFbo[f.rt.texture.id] = fbp;
-                if (f.stag.texture.id != 0) { ps2xForgetRtTexId(f.stag.texture.id); UnloadRenderTexture(f.stag); }
-                f.stag = LoadRenderTexture(w, h);
+                if (f.stag.texture.id != 0) { ps2xForgetRtTexId(f.stag.texture.id); ps2x::gfx::rgUnloadRenderTexture(f.stag); }
+                f.stag = ps2x::gfx::rgLoadRenderTexture(w, h);
                 if (f.stag.texture.id == 0)
                 {
                     static int s_ns = 0;
@@ -1262,17 +1262,17 @@ namespace
                 }
                 else
                 {
-                    SetTextureFilter(f.stag.texture, TEXTURE_FILTER_POINT);
+                    ps2x::gfx::rgSetTextureFilter(f.stag.texture, TEXTURE_FILTER_POINT);
                     ps2xForgetTexId(f.stag.texture.id);
                 }
             }
-            SetTextureFilter(f.rt.texture, TEXTURE_FILTER_POINT);
+            ps2x::gfx::rgSetTextureFilter(f.rt.texture, TEXTURE_FILTER_POINT);
             // Clear ONCE on creation. PS2 framebuffers/render targets persist across
             // frames (the game clears explicitly by drawing); auto-clearing every frame
             // would wipe render targets the game rendered once and reuses (logo flicker).
-            BeginTextureMode(f.rt);
+            ps2x::gfx::rgBeginTextureMode(f.rt);
             ps2x::gfx::rgClearBackground(Color{0, 0, 0, 255});
-            EndTextureMode();
+            ps2x::gfx::rgEndTextureMode();
         }
         return f;
     }
@@ -1455,7 +1455,7 @@ namespace
         const AlphaFix want = texAlphaFix(texId);
         if (want == g_curAlphaFix || g_locAlphaFix < 0) return;
         flushBatch(__LINE__);
-        SetShaderValue(g_shader, g_locAlphaFix, want.data(), SHADER_UNIFORM_VEC2);
+        ps2x::gfx::rgSetShaderValue(g_shader, g_locAlphaFix, want.data(), SHADER_UNIFORM_VEC2);
         g_curAlphaFix = want;
     }
     int g_locPal = -1;                  // 256x1 CLUT sampler for indexed RT reads
@@ -1848,8 +1848,8 @@ namespace {
             uint8_t *p = &px[((size_t)y * N + x) * 4]; p[0] = p[1] = p[2] = 0; p[3] = (uint8_t)(a * 255.0f);
         }
         Image im{px.data(), N, N, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
-        g_blobTex = LoadTextureFromImage(im);
-        SetTextureFilter(g_blobTex, TEXTURE_FILTER_BILINEAR);
+        g_blobTex = ps2x::gfx::rgLoadTextureFromImage(im);
+        ps2x::gfx::rgSetTextureFilter(g_blobTex, TEXTURE_FILTER_BILINEAR);
     }
 }
 uint64_t GsGpuRenderer::resolveTextureVersion(uint64_t baseKey, uint32_t pageLo, uint32_t pageHi,
@@ -4339,30 +4339,30 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
     {
         if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); UnloadTexture(s_tex); }
         Image im = GenImageColor(w, h, BLANK);
-        s_tex = LoadTextureFromImage(im); UnloadImage(im);
+        s_tex = ps2x::gfx::rgLoadTextureFromImage(im); UnloadImage(im);
         s_tw = w; s_th = h;
     }
-    UpdateTexture(s_tex, px.data());
+    ps2x::gfx::rgUpdateTexture(s_tex, px.data());
 
     // The blit inherits whatever uniforms the previous draw left behind, so pin the ones it
     // needs -- a stale TCC=0 makes the quad paint solid vertex colour over the whole page.
     { const float one = 1.0f, zero = 0.0f;
-      if (g_locTcc >= 0)      SetShaderValue(g_shader, g_locTcc, &one, SHADER_UNIFORM_FLOAT);
-      if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; SetShaderValue(g_shader, g_locAlphaFix, d.data(), SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }   // [texreplace]
-      if (g_locIdxMode >= 0)  SetShaderValue(g_shader, g_locIdxMode, &zero, SHADER_UNIFORM_FLOAT);
-      if (g_locUViz >= 0)     SetShaderValue(g_shader, g_locUViz, &zero, SHADER_UNIFORM_FLOAT);
-      if (g_locSubScale >= 0) SetShaderValue(g_shader, g_locSubScale, &one, SHADER_UNIFORM_FLOAT);
-      if (g_locTfx >= 0)      SetShaderValue(g_shader, g_locTfx, &one, SHADER_UNIFORM_FLOAT);
+      if (g_locTcc >= 0)      ps2x::gfx::rgSetShaderValue(g_shader, g_locTcc, &one, SHADER_UNIFORM_FLOAT);
+      if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; ps2x::gfx::rgSetShaderValue(g_shader, g_locAlphaFix, d.data(), SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }   // [texreplace]
+      if (g_locIdxMode >= 0)  ps2x::gfx::rgSetShaderValue(g_shader, g_locIdxMode, &zero, SHADER_UNIFORM_FLOAT);
+      if (g_locUViz >= 0)     ps2x::gfx::rgSetShaderValue(g_shader, g_locUViz, &zero, SHADER_UNIFORM_FLOAT);
+      if (g_locSubScale >= 0) ps2x::gfx::rgSetShaderValue(g_shader, g_locSubScale, &one, SHADER_UNIFORM_FLOAT);
+      if (g_locTfx >= 0)      ps2x::gfx::rgSetShaderValue(g_shader, g_locTfx, &one, SHADER_UNIFORM_FLOAT);
       // Select the software-written pixels with the shader's own alpha TEST (GREATER than
       // 0.5) rather than with blending. Blend state is global and easy to inherit wrong -- and
       // it was: the mask carried correct coverage and correct dark values, yet the blit still
       // repainted the whole page with VRAM page-0 RGB, which BT3's CT16 alias passes have
       // legitimately polluted. A discard cannot be defeated by leftover blend factors.
-      if (g_locAtst >= 0)     { const float gt = 6.0f; SetShaderValue(g_shader, g_locAtst, &gt, SHADER_UNIFORM_FLOAT); }
-      if (g_locAref >= 0)     { const float half = 0.5f; SetShaderValue(g_shader, g_locAref, &half, SHADER_UNIFORM_FLOAT); }
+      if (g_locAtst >= 0)     { const float gt = 6.0f; ps2x::gfx::rgSetShaderValue(g_shader, g_locAtst, &gt, SHADER_UNIFORM_FLOAT); }
+      if (g_locAref >= 0)     { const float half = 0.5f; ps2x::gfx::rgSetShaderValue(g_shader, g_locAref, &half, SHADER_UNIFORM_FLOAT); }
       // uTexa.w < 1.5 makes the shader REPLACE the sampled alpha with uTexa.x, which would
       // wipe the coverage mask; 3.0 selects the pass-through branch that keeps t.a.
-      if (g_locTexa >= 0)     { const float t4[4] = {1,1,0,3}; SetShaderValue(g_shader, g_locTexa, t4, SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t4, sizeof t4); } }
+      if (g_locTexa >= 0)     { const float t4[4] = {1,1,0,3}; ps2x::gfx::rgSetShaderValue(g_shader, g_locTexa, t4, SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t4, sizeof t4); } }
 
     {   // PS2X_SWOCMP=1: does the snapshot still match the FBO at EXECUTION time? Everything
         // else is eliminated (placement verified 1:1 with corner markers, plus content,
@@ -4399,7 +4399,7 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
         }
     }
     flushBatch(__LINE__);
-    rlDisableScissorTest();
+    ps2x::gfx::rgDisableScissorTest();
     // Standard alpha blend: the snapshot's alpha is the software pass's own coverage mask, so
     // only the pixels it wrote replace the FBO. RGB only -- the scene's alpha byte is the mask
     // the outline/shadow composites read and must survive untouched.
@@ -4409,9 +4409,9 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
     // lookup and the alpha test -- all driven by uniforms left over from the previous draw.
     // That is why five masking/blending attempts produced byte-identical output while removing
     // the blit changed the frame: the content was never wrong, the shader was re-colouring it.
-    EndShaderMode();
+    ps2x::gfx::rgEndShaderMode();
     glColorMask(1, 1, 1, 0);
-    DrawTexturePro(s_tex, Rectangle{0.0f, 0.0f, (float)w, (float)h},
+    ps2x::gfx::rgDrawTexturePro(s_tex, Rectangle{0.0f, 0.0f, (float)w, (float)h},
                    Rectangle{0.0f, 0.0f, (float)w, (float)h},
                    Vector2{0.0f, 0.0f}, 0.0f, WHITE);
     flushBatch(__LINE__);
@@ -4455,8 +4455,8 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
     }
     glColorMask(1, 1, 1, 1);
     rlEnableColorBlend();
-    BeginShaderMode(g_shader);   // hand the draw loop its shader back
-    if (g_locAtst >= 0) { const float off3 = -1.0f; SetShaderValue(g_shader, g_locAtst, &off3, SHADER_UNIFORM_FLOAT); }
+    ps2x::gfx::rgBeginShaderMode(g_shader);   // hand the draw loop its shader back
+    if (g_locAtst >= 0) { const float off3 = -1.0f; ps2x::gfx::rgSetShaderValue(g_shader, g_locAtst, &off3, SHADER_UNIFORM_FLOAT); }
 }
 
 void GsGpuRenderer::seedSceneAlphaForRebuild(uint32_t fbp)
@@ -4967,9 +4967,9 @@ static Texture2D palTextureFor(uint64_t key)
         ImageDrawPixel(&im, i, 0, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF),
                                         (unsigned char)((v >> 16) & 0xFF), (unsigned char)aUp});
     }
-    Texture2D t = LoadTextureFromImage(im);
+    Texture2D t = ps2x::gfx::rgLoadTextureFromImage(im);
     UnloadImage(im);
-    SetTextureFilter(t, TEXTURE_FILTER_POINT);   // a LUT must never interpolate between entries
+    ps2x::gfx::rgSetTextureFilter(t, TEXTURE_FILTER_POINT);   // a LUT must never interpolate between entries
     rlTextureParameters(t.id, RL_TEXTURE_WRAP_S, RL_TEXTURE_WRAP_CLAMP);
     if (s_cache.size() > 256) s_cache.clear();
     s_cache[key] = t;
@@ -5001,7 +5001,7 @@ static ps2x::gfx::Texture *d3dGsPalFor(uint64_t key)
     g_d3dGsPal[key] = t;
     return t;
 }
-// [d3d11] Bind the CLUT for an indexed-RT draw (the GL path's SetShaderValueTexture(uPal)+bind).
+// [d3d11] Bind the CLUT for an indexed-RT draw (the GL path's ps2x::gfx::rgSetShaderValueTexture(uPal)+bind).
 static void d3dGsSetPal(const GsGpuRenderer::DrawCmd &c, bool idxRt)
 {
     g_d3dGsR.SetTexture1(idxRt ? d3dGsPalFor(c.srcClutKey) : nullptr);
@@ -5069,7 +5069,7 @@ static void ps2xResetIdxMode()
     if (s_en && g_locIdxMode >= 0 && g_curIdxMode != 0.0f)
     {
         const float z = 0.0f;
-        SetShaderValue(g_shader, g_locIdxMode, &z, SHADER_UNIFORM_FLOAT);
+        ps2x::gfx::rgSetShaderValue(g_shader, g_locIdxMode, &z, SHADER_UNIFORM_FLOAT);
         g_curIdxMode = 0.0f;
     }
 }
@@ -5493,10 +5493,10 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
                 {
                     Image im{}; im.data = g_gaClutData; im.width = 256; im.height = 1; im.mipmaps = 1;
                     im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-                    gaPal = LoadTextureFromImage(im);   // uploads a copy; do NOT UnloadImage (borrowed data)
-                    SetTextureFilter(gaPal, TEXTURE_FILTER_POINT);
+                    gaPal = ps2x::gfx::rgLoadTextureFromImage(im);   // uploads a copy; do NOT UnloadImage (borrowed data)
+                    ps2x::gfx::rgSetTextureFilter(gaPal, TEXTURE_FILTER_POINT);
                 }
-                else UpdateTexture(gaPal, g_gaClutData);
+                else ps2x::gfx::rgUpdateTexture(gaPal, g_gaClutData);
                 static int n = 0;
                 if (n++ < 2) std::fprintf(stderr, "[gpualias] SW palette seq %u: [0]=%08x [1]=%08x [3]=%08x [16]=%08x [64]=%08x [128]=%08x [255]=%08x\n",
                                           seq, g_gaClutData[0], g_gaClutData[1], g_gaClutData[3], g_gaClutData[16], g_gaClutData[64], g_gaClutData[128], g_gaClutData[255]);
@@ -5510,26 +5510,26 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
     flushBatch(__LINE__);
     const int dst = 1 - g_gaCur;
     const int rect[4] = { (int)c.dx0, 0, (int)c.dx1, 448 };
-    BeginTextureMode(g_gaViewTex[dst]);
+    ps2x::gfx::rgBeginTextureMode(g_gaViewTex[dst]);
     // State hygiene: the draw loop leaves per-draw GL state behind (glColorMask from FBMSK,
     // scissor, depth). Any of them silently blanks this pass. Neutralize; restore after.
     glColorMask(1, 1, 1, 1); glDisable(0x0B71u /*GL_DEPTH_TEST*/); glDepthMask(0); glDisable(0x0C11u /*GL_SCISSOR_TEST*/);
     rlSetBlendFactors(1 /*GL_ONE*/, 0 /*GL_ZERO*/, 0x8006 /*GL_FUNC_ADD*/);
     ps2x::gfx::rgBeginBlendMode(BLEND_CUSTOM);
-    BeginShaderMode(sh);
-    SetShaderValue(sh, locStage, &stage, SHADER_UNIFORM_INT);
-    SetShaderValue(sh, locM16, &m16, SHADER_UNIFORM_INT);
-    SetShaderValue(sh, locXOff, &xoff, SHADER_UNIFORM_INT);
-    SetShaderValue(sh, locSrcFlip, &srcFlip, SHADER_UNIFORM_INT);
-    SetShaderValue(sh, locSrcH, &srcH, SHADER_UNIFORM_INT);
-    SetShaderValue(sh, locRect, rect, SHADER_UNIFORM_IVEC4);
-    SetShaderValue(sh, locDbg, &s_dbg, SHADER_UNIFORM_INT);
+    ps2x::gfx::rgBeginShaderMode(sh);
+    ps2x::gfx::rgSetShaderValue(sh, locStage, &stage, SHADER_UNIFORM_INT);
+    ps2x::gfx::rgSetShaderValue(sh, locM16, &m16, SHADER_UNIFORM_INT);
+    ps2x::gfx::rgSetShaderValue(sh, locXOff, &xoff, SHADER_UNIFORM_INT);
+    ps2x::gfx::rgSetShaderValue(sh, locSrcFlip, &srcFlip, SHADER_UNIFORM_INT);
+    ps2x::gfx::rgSetShaderValue(sh, locSrcH, &srcH, SHADER_UNIFORM_INT);
+    ps2x::gfx::rgSetShaderValue(sh, locRect, rect, SHADER_UNIFORM_IVEC4);
+    ps2x::gfx::rgSetShaderValue(sh, locDbg, &s_dbg, SHADER_UNIFORM_INT);
     {   // The mask page's FBO alpha stores GS bytes RESCALED x255/128 when the ALPHA128 pipeline
         // wrote it (sampled indices came back 1,5,9,13 = floor(gsByte*255/128) of 1,3,5,7).
         // Undo the rescale exactly the way the main shader's uIdxScale logic does.
         extern bool g_fbpAlphaIsGsByte[512];
         const float scl = (224u < 512u && g_fbpAlphaIsGsByte[224]) ? 255.0f : 128.0f;
-        SetShaderValue(sh, locIdxScl, &scl, SHADER_UNIFORM_FLOAT);
+        ps2x::gfx::rgSetShaderValue(sh, locIdxScl, &scl, SHADER_UNIFORM_FLOAT);
     }
     if (stage != 0)
     {   // SetShaderValueTexture leaves the sampler at unit 0 (= texture0) in this stack -- see the
@@ -5539,8 +5539,8 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
         glActiveTexture(0x84C0u + kSrcUnit); glBindTexture(0x0DE1u, srcA.id);
         glActiveTexture(0x84C0u + kPalUnit); glBindTexture(0x0DE1u, pal.id);
         glActiveTexture(0x84C0u);
-        SetShaderValue(sh, locSrcA, &kSrcUnit, SHADER_UNIFORM_INT);
-        SetShaderValue(sh, locPal, &kPalUnit, SHADER_UNIFORM_INT);
+        ps2x::gfx::rgSetShaderValue(sh, locSrcA, &kSrcUnit, SHADER_UNIFORM_INT);
+        ps2x::gfx::rgSetShaderValue(sh, locPal, &kPalUnit, SHADER_UNIFORM_INT);
         static int shown = 0;
         if (shown < 1)
         {   ++shown;
@@ -5565,11 +5565,11 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
             UnloadImage(pi);
         }
     }
-    DrawTexturePro(g_gaViewTex[g_gaCur].texture, Rectangle{0.0f, 0.0f, 512.0f, 448.0f},
+    ps2x::gfx::rgDrawTexturePro(g_gaViewTex[g_gaCur].texture, Rectangle{0.0f, 0.0f, 512.0f, 448.0f},
                    Rectangle{0.0f, 0.0f, 512.0f, 448.0f}, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-    EndShaderMode();
+    ps2x::gfx::rgEndShaderMode();
     ps2x::gfx::rgEndBlendMode();
-    EndTextureMode();
+    ps2x::gfx::rgEndTextureMode();
     glDepthMask(1); glEnable(0x0B71u); glEnable(0x0C11u);   // restore loop expectations
     g_gaCur = dst; g_gaViewReady = true; ++g_gaExecCount;
     {   // PS2X_GPUALIAS_DUMPSTAGE=1: export the view at each stage boundary, once per stage kind
@@ -5668,10 +5668,10 @@ static bool gaExecShaderInit()
         locSrcA = GetShaderLocation(sh, "uSrcA"); locPal = GetShaderLocation(sh, "uPal");
         locDbg = GetShaderLocation(sh, "uDbg");
         locIdxScl = GetShaderLocation(sh, "uIdxScl");
-        g_gaViewTex[0] = LoadRenderTexture(512, 448); g_gaViewTex[1] = LoadRenderTexture(512, 448);
+        g_gaViewTex[0] = ps2x::gfx::rgLoadRenderTexture(512, 448); g_gaViewTex[1] = ps2x::gfx::rgLoadRenderTexture(512, 448);
         if (g_gaViewTex[0].id == 0 || g_gaViewTex[1].id == 0) { bad = true; return false; }
-        SetTextureFilter(g_gaViewTex[0].texture, TEXTURE_FILTER_POINT);
-        SetTextureFilter(g_gaViewTex[1].texture, TEXTURE_FILTER_POINT);
+        ps2x::gfx::rgSetTextureFilter(g_gaViewTex[0].texture, TEXTURE_FILTER_POINT);
+        ps2x::gfx::rgSetTextureFilter(g_gaViewTex[1].texture, TEXTURE_FILTER_POINT);
         std::fprintf(stderr, "[gpualias] exec: shader + 2x512x448 view textures ready\n");
     }
     return !bad && sh.id != 0;
@@ -5727,10 +5727,10 @@ static bool gaBuildReviewTex(const Texture2D &src, int srcH, int ta0, int ta1, i
         locDbgC = GetShaderLocation(sh2, "uDbgC");
         if (g_gaViewTex[0].id == 0)
         {
-            g_gaViewTex[0] = LoadRenderTexture(512, 448); g_gaViewTex[1] = LoadRenderTexture(512, 448);
+            g_gaViewTex[0] = ps2x::gfx::rgLoadRenderTexture(512, 448); g_gaViewTex[1] = ps2x::gfx::rgLoadRenderTexture(512, 448);
             if (g_gaViewTex[0].id == 0 || g_gaViewTex[1].id == 0) { bad = true; return false; }
-            SetTextureFilter(g_gaViewTex[0].texture, TEXTURE_FILTER_POINT);
-            SetTextureFilter(g_gaViewTex[1].texture, TEXTURE_FILTER_POINT);
+            ps2x::gfx::rgSetTextureFilter(g_gaViewTex[0].texture, TEXTURE_FILTER_POINT);
+            ps2x::gfx::rgSetTextureFilter(g_gaViewTex[1].texture, TEXTURE_FILTER_POINT);
         }
         std::fprintf(stderr, "[gpualias] raw review builder ready (prog %u)\n", prog);
     }
@@ -5932,9 +5932,9 @@ static Texture2D p8hTwinFor(uint64_t clutKey)
     RenderTexture2D &rt = s_tw[clutKey];
     if (rt.texture.id == 0)
     {
-        rt = LoadRenderTexture(512, 512);   // the readers declare srcTex 512x512
+        rt = ps2x::gfx::rgLoadRenderTexture(512, 512);   // the readers declare srcTex 512x512
         if (rt.texture.id == 0) return Texture2D{};
-        SetTextureFilter(rt.texture, TEXTURE_FILTER_POINT);
+        ps2x::gfx::rgSetTextureFilter(rt.texture, TEXTURE_FILTER_POINT);
         s_twSeq[clutKey] = 0xFFFFFFFFu;
         if (s_tw.size() <= 12)
             std::fprintf(stderr, "[p8twin] twin #%zu for clut %llx (tex %u)\n", s_tw.size(), (unsigned long long)clutKey, rt.texture.id);
@@ -7267,7 +7267,7 @@ void GsGpuRenderer::ensureGl(int w, int h)
     if (!g_whiteInit)
     {
         Image wi = GenImageColor(1, 1, WHITE);
-        g_white = LoadTextureFromImage(wi);
+        g_white = ps2x::gfx::rgLoadTextureFromImage(wi);
         UnloadImage(wi);
         g_whiteInit = true;
     }
@@ -7297,7 +7297,7 @@ void GsGpuRenderer::ensureGl(int w, int h)
         float bright = 255.0f / 128.0f;
         if (const char *v = std::getenv("PS2X_BRIGHT")) { float f = std::atof(v); if (f > 0.0f) bright = f; }
         int loc = GetShaderLocation(g_shader, "uBright");
-        SetShaderValue(g_shader, loc, &bright, SHADER_UNIFORM_FLOAT);
+        ps2x::gfx::rgSetShaderValue(g_shader, loc, &bright, SHADER_UNIFORM_FLOAT);
         // GS alpha-test uniforms: default OFF (-1). Per-cmd values set in the replay loop.
         g_locAtst = GetShaderLocation(g_shader, "uAtst");
         g_locAref = GetShaderLocation(g_shader, "uAref");
@@ -7306,25 +7306,25 @@ void GsGpuRenderer::ensureGl(int w, int h)
         { int l2 = GetShaderLocation(g_shader, "uASplit");
           const float v2 = [](){ const char *v = std::getenv("PS2X_ASPLIT");
                                  return (v && v[0] && v[0] != '0') ? 1.0f : 0.0f; }();
-          if (l2 >= 0) SetShaderValue(g_shader, l2, &v2, SHADER_UNIFORM_FLOAT); }
+          if (l2 >= 0) ps2x::gfx::rgSetShaderValue(g_shader, l2, &v2, SHADER_UNIFORM_FLOAT); }
         g_locPal  = GetShaderLocation(g_shader, "uPal");
         g_locIdxMode = GetShaderLocation(g_shader, "uIdxMode");
         g_locFba = GetShaderLocation(g_shader, "uFba");
         g_locIdxScale = GetShaderLocation(g_shader, "uIdxScale");
         g_locFboOne = GetShaderLocation(g_shader, "uFboOne");
-        if (g_locFboOne >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locFboOne, &z, SHADER_UNIFORM_FLOAT); }
+        if (g_locFboOne >= 0) { float z = 0.0f; ps2x::gfx::rgSetShaderValue(g_shader, g_locFboOne, &z, SHADER_UNIFORM_FLOAT); }
         if (g_locIdxScale >= 0)
         {   // PS2X_IDXSCALE: 128 (GS byte, correct) or 255 (the old raw-FBO reading).
             float sc = 128.0f;
             if (const char *v = std::getenv("PS2X_IDXSCALE")) { const float f = (float)std::atof(v); if (f > 0.0f) sc = f; }
-            SetShaderValue(g_shader, g_locIdxScale, &sc, SHADER_UNIFORM_FLOAT);
+            ps2x::gfx::rgSetShaderValue(g_shader, g_locIdxScale, &sc, SHADER_UNIFORM_FLOAT);
         }
-        if (g_locFba >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locFba, &z, SHADER_UNIFORM_FLOAT); }
-        if (g_locIdxMode >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locIdxMode, &z, SHADER_UNIFORM_FLOAT); }
+        if (g_locFba >= 0) { float z = 0.0f; ps2x::gfx::rgSetShaderValue(g_shader, g_locFba, &z, SHADER_UNIFORM_FLOAT); }
+        if (g_locIdxMode >= 0) { float z = 0.0f; ps2x::gfx::rgSetShaderValue(g_shader, g_locIdxMode, &z, SHADER_UNIFORM_FLOAT); }
         g_locUViz = GetShaderLocation(g_shader, "uUViz");
-        if (g_locUViz >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locUViz, &z, SHADER_UNIFORM_FLOAT); }
+        if (g_locUViz >= 0) { float z = 0.0f; ps2x::gfx::rgSetShaderValue(g_shader, g_locUViz, &z, SHADER_UNIFORM_FLOAT); }
         g_locSubScale = GetShaderLocation(g_shader, "uSubScale");
-        if (g_locSubScale >= 0) { float one = 1.0f; SetShaderValue(g_shader, g_locSubScale, &one, SHADER_UNIFORM_FLOAT); }
+        if (g_locSubScale >= 0) { float one = 1.0f; ps2x::gfx::rgSetShaderValue(g_shader, g_locSubScale, &one, SHADER_UNIFORM_FLOAT); }
         g_locAScale = GetShaderLocation(g_shader, "uAScale");
         g_locTexa = GetShaderLocation(g_shader, "uTexa");
         g_locABl128 = GetShaderLocation(g_shader, "uABl128");
@@ -7343,16 +7343,16 @@ void GsGpuRenderer::ensureGl(int w, int h)
         // 1028.0, which is exactly the constant that was fitted to console's 6/7/8/11 values.
         // NOTE: uZScale is NOT set here -- at shader-init time the rasterizer has not published
         // zMax yet, so this would always bake in the 2^32 default. It is set per draw below.
-        if (g_locZTex >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locZTex, &z, SHADER_UNIFORM_FLOAT); }
+        if (g_locZTex >= 0) { float z = 0.0f; ps2x::gfx::rgSetShaderValue(g_shader, g_locZTex, &z, SHADER_UNIFORM_FLOAT); }
         g_locForceA = GetShaderLocation(g_shader, "uForceA");
         if (g_locForceA >= 0) { static const float fa = [](){ const char *v = std::getenv("PS2X_FORCEA");
                                                               return (v && v[0]) ? (float)std::atoi(v) : 0.0f; }();
-                                SetShaderValue(g_shader, g_locForceA, &fa, SHADER_UNIFORM_FLOAT); }
-        if (g_locPerspQ >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locPerspQ, &z, SHADER_UNIFORM_FLOAT); }
-        if (g_locProjClip >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locProjClip, &z, SHADER_UNIFORM_FLOAT); }
-        if (g_locTfx >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locTfx, &z, SHADER_UNIFORM_FLOAT); }
+                                ps2x::gfx::rgSetShaderValue(g_shader, g_locForceA, &fa, SHADER_UNIFORM_FLOAT); }
+        if (g_locPerspQ >= 0) { float z = 0.0f; ps2x::gfx::rgSetShaderValue(g_shader, g_locPerspQ, &z, SHADER_UNIFORM_FLOAT); }
+        if (g_locProjClip >= 0) { float z = 0.0f; ps2x::gfx::rgSetShaderValue(g_shader, g_locProjClip, &z, SHADER_UNIFORM_FLOAT); }
+        if (g_locTfx >= 0) { float z = 0.0f; ps2x::gfx::rgSetShaderValue(g_shader, g_locTfx, &z, SHADER_UNIFORM_FLOAT); }
         if (g_locTexa >= 0) { const float t0[4] = {1.0f, 1.0f, 0.0f, 0.0f};
-                              SetShaderValue(g_shader, g_locTexa, t0, SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t0, sizeof t0); }
+                              ps2x::gfx::rgSetShaderValue(g_shader, g_locTexa, t0, SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t0, sizeof t0); }
         if (g_locAScale >= 0)
         {
             // DEFAULT OFF. finalColor.a does double duty: GL uses it as the SOURCE ALPHA for RGB
@@ -7362,16 +7362,16 @@ void GsGpuRenderer::ensureGl(int w, int h)
             // alpha from glBlendColor/GL_CONSTANT_ALPHA while finalColor.a carries the byte.
             static const bool s_a128 = [](){ const char *v = std::getenv("PS2X_ALPHA128"); return v && v[0] && v[0] != '0'; }();
             float sc = s_a128 ? (128.0f / 255.0f) : 1.0f;
-            SetShaderValue(g_shader, g_locAScale, &sc, SHADER_UNIFORM_FLOAT);
+            ps2x::gfx::rgSetShaderValue(g_shader, g_locAScale, &sc, SHADER_UNIFORM_FLOAT);
         }
         // Guard: a failed shader compile leaves the location at -1, and pushing a uniform
         // to an invalid location segfaulted the game.
-        if (g_locTcc >= 0) { float one = 1.0f; SetShaderValue(g_shader, g_locTcc, &one, SHADER_UNIFORM_FLOAT); }
+        if (g_locTcc >= 0) { float one = 1.0f; ps2x::gfx::rgSetShaderValue(g_shader, g_locTcc, &one, SHADER_UNIFORM_FLOAT); }
         else std::fprintf(stderr, "[shader] WARNING uTcc not found -- TCC handling inactive\n");
-        if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; SetShaderValue(g_shader, g_locAlphaFix, d.data(), SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }
+        if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; ps2x::gfx::rgSetShaderValue(g_shader, g_locAlphaFix, d.data(), SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }
         float off = -1.0f, aref0 = 0.0f;
-        SetShaderValue(g_shader, g_locAtst, &off, SHADER_UNIFORM_FLOAT);
-        SetShaderValue(g_shader, g_locAref, &aref0, SHADER_UNIFORM_FLOAT);
+        ps2x::gfx::rgSetShaderValue(g_shader, g_locAtst, &off, SHADER_UNIFORM_FLOAT);
+        ps2x::gfx::rgSetShaderValue(g_shader, g_locAref, &aref0, SHADER_UNIFORM_FLOAT);
         std::fprintf(stderr, "[shader] g_shader id=%u uBrightLoc=%d bright=%.3f atstLoc=%d arefLoc=%d | uPal=%d uIdxMode=%d uIdxScale=%d uFba=%d uTexa=%d\n", g_shader.id, loc, bright, g_locAtst, g_locAref, g_locPal, g_locIdxMode, g_locIdxScale, g_locFba, g_locTexa);
         g_shaderInit = true;
     }
@@ -8151,7 +8151,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             if (!compressed && glIt != g_glTex.end() && poolableTex(glIt->second)   // [texreplace] BC3 storage cannot take a glTexSubImage2D
                 && glIt->second.width == u.w && glIt->second.height == u.h)
             {
-                UpdateTexture(glIt->second, u.rgba.data());
+                ps2x::gfx::rgUpdateTexture(glIt->second, u.rgba.data());
                 stampTexProps(glIt->second.id, u);
             }
             else
@@ -8177,7 +8177,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 {
                     t = pit->second.back();
                     pit->second.pop_back();
-                    UpdateTexture(t, u.rgba.data());
+                    ps2x::gfx::rgUpdateTexture(t, u.rgba.data());
                     // [filtercache] a pooled object keeps whatever filter it last had, but the per-id
                     // cache may say otherwise -> ps2xApplyTexFilter skipped the real call and alternate
                     // frames rendered the same texture point- vs bilinear-sampled (menu/copyright
@@ -8187,7 +8187,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 }
                 else
                 {
-                    t = LoadTextureFromImage(img);
+                    t = ps2x::gfx::rgLoadTextureFromImage(img);
                 ps2xForgetTexId(t.id);   // [filtercache] a recycled GL id must not inherit the previous object's filter state
                 // [texreplace] Register the replacement's upscale so the UV math treats su/sv as
                 // LOGICAL texels: the draw path computes u = su / (tw / rsTexScale), so without
@@ -8195,9 +8195,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 // sampled, magnified. Alpha range goes with it -- see stampTexProps.
                 stampTexProps(t.id, u);
                     if (g_deletedIds.count(t.id)) { ++g_idReuse; g_deletedIds.erase(t.id); }   // [supdiag]
-                    SetTextureFilter(t, TEXTURE_FILTER_POINT);
+                    ps2x::gfx::rgSetTextureFilter(t, TEXTURE_FILTER_POINT);
                     g_texFilterState.set(t.id, 0u);   // [filtercache] known state
-                    SetTextureWrap(t, TEXTURE_WRAP_CLAMP); // PS2 UI doesn't tile; stop edge repeat
+                    ps2x::gfx::rgSetTextureWrap(t, TEXTURE_WRAP_CLAMP); // PS2 UI doesn't tile; stop edge repeat
                 }
                 g_glTex[u.key] = t;
 #if defined(_WIN32)
@@ -8933,7 +8933,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // never depth-tested; the next depth-using draw re-enables via applyDepth().
         if (depthOn && curDepthTest != 0) { rlDisableDepthTest(); rlEnableDepthMask(); curDepthTest = 0; curDepthFunc = -1; curDepthWrite = 1; }
         if (curMask != 15) { glColorMask(1, 1, 1, 1); curMask = 15; } // full mask for blits/present
-        rlDisableScissorTest(); ps2x::gfx::rgEndBlendMode(); EndShaderMode(); EndTextureMode(); inMode = false; curRealFbp = 0xFFFFFFFFu; } };
+        ps2x::gfx::rgDisableScissorTest(); ps2x::gfx::rgEndBlendMode(); ps2x::gfx::rgEndShaderMode(); ps2x::gfx::rgEndTextureMode(); inMode = false; curRealFbp = 0xFFFFFFFFu; } };
     auto fboSizeFor = [&](uint32_t fbp, int &w, int &h) {
         // PS2X_VIEWSIZE=1: size a split view by its OWN stride + vertical extent. Correct on
         // paper (fbp336 -> 512x448, the relocated DoF view -> 256x256, vs 1024x512 / 512x448
@@ -9009,9 +9009,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     auto ensureAtlas = [&]() {
         if (g_atlas.texture.id == 0) {
             g_atlasW = 2048; g_atlasH = 2048;
-            g_atlas = LoadRenderTexture(g_atlasW, g_atlasH);
-            SetTextureFilter(g_atlas.texture, TEXTURE_FILTER_POINT);
-            BeginTextureMode(g_atlas); ps2x::gfx::rgClearBackground(Color{0, 0, 0, 255}); EndTextureMode();
+            g_atlas = ps2x::gfx::rgLoadRenderTexture(g_atlasW, g_atlasH);
+            ps2x::gfx::rgSetTextureFilter(g_atlas.texture, TEXTURE_FILTER_POINT);
+            ps2x::gfx::rgBeginTextureMode(g_atlas); ps2x::gfx::rgClearBackground(Color{0, 0, 0, 255}); ps2x::gfx::rgEndTextureMode();
             static int s_created = 0;
             std::fprintf(stderr, "[atlas] CREATED #%d id=%u complete=%d\n", ++s_created, g_atlas.texture.id, rlFramebufferComplete(g_atlas.id));
         }
@@ -9077,9 +9077,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 if (sit != g_fbos.end() && sit->second.rt.texture.id != 0)
                 {
                     endMode();
-                    BeginTextureMode(sit->second.rt);
+                    ps2x::gfx::rgBeginTextureMode(sit->second.rt);
                     ps2x::gfx::rgClearBackground(Color{0, 0, 0, 0});
-                    EndTextureMode();
+                    ps2x::gfx::rgEndTextureMode();
                     static int s_scn = 0;
                     static const bool s_scd = [](){ const char *v = std::getenv("PS2X_FBOSIZE"); return v && v[0] && v[0] != '0'; }();
                     if (s_scd && s_scn < 8) { ++s_scn;
@@ -9091,9 +9091,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             // Bind the ONE atlas FBO once; thereafter only move the per-vertex transform to fbp's slot.
             if (curRealFbp != kAtlasFbp) {
                 endMode(); ensureAtlas();
-                BeginTextureMode(g_atlas);
+                ps2x::gfx::rgBeginTextureMode(g_atlas);
                 static const bool s_noshader = [](){ const char *v = std::getenv("PS2X_NOSHADER"); return v && v[0] && v[0] != '0'; }();
-                if (!s_noshader) { BeginShaderMode(g_shader); ps2xResetIdxMode(); }   // PS2 Ã·128 modulate (same as the per-fbp path)
+                if (!s_noshader) { ps2x::gfx::rgBeginShaderMode(g_shader); ps2xResetIdxMode(); }   // PS2 Ã·128 modulate (same as the per-fbp path)
                 ps2x::gfx::rgBeginBlendMode(BLEND_ALPHA);
                 rlDisableBackfaceCulling();  // GS triangles have arbitrary winding
                 inMode = true; curRealFbp = kAtlasFbp;
@@ -9132,7 +9132,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         int w, h; fboSizeFor(rf, w, h);
         Fbo &f = ensureFbo(rf, w, h);
         curRealFbp = rf;
-        BeginTextureMode(f.rt);
+        ps2x::gfx::rgBeginTextureMode(f.rt);
         if (f.scale > 1) rlScalef((float)f.scale, (float)f.scale, 1.0f);   // [rscale] native coords -> Nx pixels
         ++g_glEnterSeq[rf];   // [rtsnap]
         g_lastRenderedFboTex = f.rt.texture.id;   // [texbarrier] sampling this texture later needs a barrier
@@ -9143,7 +9143,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             if (s_hz == "barrier") { flushBatch(__LINE__); glBindTexture(0x0DE1, 0); ps2xTextureBarrier(); }
             else if (s_hz == "finish") { flushBatch(__LINE__); glFinish(); }
             else if (s_hz == "read") { flushBatch(__LINE__); uint32_t px = 0; glReadPixels(0, 0, 1, 1, 0x1908, 0x1401, &px); }
-            else if (s_hz == "rebind") { flushBatch(__LINE__); EndTextureMode(); BeginTextureMode(f.rt);
+            else if (s_hz == "rebind") { flushBatch(__LINE__); ps2x::gfx::rgEndTextureMode(); ps2x::gfx::rgBeginTextureMode(f.rt);
                                           if (f.scale > 1) rlScalef((float)f.scale, (float)f.scale, 1.0f); }
         }
         // PS2X_FBO_CHECK: is this FBO actually complete? An incomplete big FBO would corrupt all
@@ -9186,12 +9186,12 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             { extern unsigned long g_dbgDepthClears; ++g_dbgDepthClears; }
             glClearDepth(1.0); // restore raylib's default clear-depth
         }
-        BeginShaderMode(g_shader);      // PS2 Ã·128 modulate (overbright-capable)
+        ps2x::gfx::rgBeginShaderMode(g_shader);      // PS2 Ã·128 modulate (overbright-capable)
         ps2xResetIdxMode();             // [idxrt] present must never sample through the palette
         ps2x::gfx::rgBeginBlendMode(BLEND_ALPHA);
         rlDisableBackfaceCulling();     // GS triangles have arbitrary winding
         inMode = true; curFbp = fbp; curSx = -0x40000000;
-        // EndTextureMode() may leave GL depth state as the last draw left it; force reapply.
+        // ps2x::gfx::rgEndTextureMode() may leave GL depth state as the last draw left it; force reapply.
         if (depthOn) { curDepthTest = -1; curDepthFunc = -1; curDepthWrite = -1; }
     };
     auto applyScissor = [&](int sx, int sy, int sw, int sh) {
@@ -9199,10 +9199,10 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         {
             if (!cmdFlushed) { flushBatch(__LINE__); cmdFlushed = true; }   // [flushcoalesce]
             curSx = sx; curSy = sy; curSw = sw; curSh = sh;
-            if (s_oneFbo) { rlDisableScissorTest(); return; } // ONE_FBO test: no scissor (content mashes)
+            if (s_oneFbo) { ps2x::gfx::rgDisableScissorTest(); return; } // ONE_FBO test: no scissor (content mashes)
             if (s_atlas) {
                 static const bool s_nosci = [](){ const char *v = std::getenv("PS2X_NOSCI"); return v && v[0] && v[0] != '0'; }();
-                if (s_nosci) { rlDisableScissorTest(); return; } // TEST: is the atlas scissor clipping game draws?
+                if (s_nosci) { ps2x::gfx::rgDisableScissorTest(); return; } // TEST: is the atlas scissor clipping game draws?
                 // Scissor is a RAW GL rect (NOT moved by rlTranslatef) -> offset by the slot manually,
                 // and always clip to the slot so a full/disabled GS scissor can't bleed into neighbours.
                 int lx0 = std::max(0, sx), ly0 = std::max(0, sy);
@@ -9221,7 +9221,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 static const bool s_noSciRt = [](){ const char *v = std::getenv("PS2X_NOSCI_RT");
                                                     return v && v[0] && v[0] != '0'; }();
                 if (s_noSciRt && curRealFbp != 0u && curRealFbp != 112u)
-                { rlDisableScissorTest(); return; }
+                { ps2x::gfx::rgDisableScissorTest(); return; }
             }
             Fbo &f = g_fbos[curRealFbp]; // dimensions of the ACTUAL bound FBO (merged partner has no own entry)
             const bool full = (sx <= 0 && sy <= 0 && sw >= f.w && sh >= f.h);
@@ -9263,7 +9263,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 }
             }
             if (!full && sw > 0 && sh > 0) { ps2x::gfx::rgEnableScissorTest(); ps2x::gfx::rgScissor(sx * rsS, (f.h - (sy + sh)) * rsS, sw * rsS, sh * rsS); }
-            else rlDisableScissorTest();
+            else ps2x::gfx::rgDisableScissorTest();
         }
     };
     // Two consecutive triangles that form an axis-aligned rectangle -> collapse into one
@@ -9314,9 +9314,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     {
         int dw, dh; fboSizeFor(displayFbp, dw, dh);
         Fbo &df = ensureFbo(displayFbp, dw, dh);
-        BeginTextureMode(df.rt);
+        ps2x::gfx::rgBeginTextureMode(df.rt);
         ps2x::gfx::rgClearBackground(Color{0, 0, 0, 255});
-        EndTextureMode();
+        ps2x::gfx::rgEndTextureMode();
     }
 
     // READ-AFTER-WRITE FIX (default ON, disable with PS2X_NO_RAW_FIX): snapshot each BIG sampled
@@ -9336,16 +9336,16 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             Fbo &cp = g_fboCopy[sfbp];
             if (cp.w != cw || cp.h != ch || cp.rt.texture.id == 0)
             {
-                if (cp.rt.texture.id != 0) { ps2xForgetRtTexId(cp.rt.texture.id); UnloadRenderTexture(cp.rt); }
-                cp.rt = LoadRenderTexture(cw, ch); cp.w = cw; cp.h = ch;
-                SetTextureFilter(cp.rt.texture, TEXTURE_FILTER_POINT);
+                if (cp.rt.texture.id != 0) { ps2xForgetRtTexId(cp.rt.texture.id); ps2x::gfx::rgUnloadRenderTexture(cp.rt); }
+                cp.rt = ps2x::gfx::rgLoadRenderTexture(cw, ch); cp.w = cw; cp.h = ch;
+                ps2x::gfx::rgSetTextureFilter(cp.rt.texture, TEXTURE_FILTER_POINT);
             }
-            BeginTextureMode(cp.rt);
+            ps2x::gfx::rgBeginTextureMode(cp.rt);
             // src height negative -> straight (un-flipped) copy so cp matches rt's stored orientation.
-            DrawTexturePro(it->second.rt.texture,
+            ps2x::gfx::rgDrawTexturePro(it->second.rt.texture,
                            Rectangle{0, 0, (float)(cw * it->second.scale), -(float)(ch * it->second.scale)},   // [rscale] physical src
                            Rectangle{0, 0, (float)cw, (float)ch}, Vector2{0, 0}, 0.0f, WHITE);
-            EndTextureMode();
+            ps2x::gfx::rgEndTextureMode();
         }
     }
 
@@ -9362,9 +9362,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (s_dm)
         {
             static Fbo s_dummy;
-            if (s_dummy.rt.texture.id == 0) { s_dummy.rt = LoadRenderTexture(16, 16); s_dummy.w = 16; s_dummy.h = 16; }
-            BeginTextureMode(s_dummy.rt);
-            EndTextureMode(); // bind + unbind, NO fragment writes
+            if (s_dummy.rt.texture.id == 0) { s_dummy.rt = ps2x::gfx::rgLoadRenderTexture(16, 16); s_dummy.w = 16; s_dummy.h = 16; }
+            ps2x::gfx::rgBeginTextureMode(s_dummy.rt);
+            ps2x::gfx::rgEndTextureMode(); // bind + unbind, NO fragment writes
         }
     }
     std::vector<DrawCmd> reorderBuf;
@@ -9657,8 +9657,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (atst == curAtst && (atst < 0.0f || aref == curAref))
             return;
         flushBatch(__LINE__); // flush verts queued under the previous test state
-        SetShaderValue(g_shader, g_locAtst, &atst, SHADER_UNIFORM_FLOAT);
-        SetShaderValue(g_shader, g_locAref, &aref, SHADER_UNIFORM_FLOAT);
+        ps2x::gfx::rgSetShaderValue(g_shader, g_locAtst, &atst, SHADER_UNIFORM_FLOAT);
+        ps2x::gfx::rgSetShaderValue(g_shader, g_locAref, &aref, SHADER_UNIFORM_FLOAT);
         curAtst = atst; curAref = aref;
     };
 
@@ -9670,7 +9670,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         const float want = (!s_tccOn || (tc.texKey != 0 && tc.tcc != 0)) ? 1.0f : 0.0f;
         if (want == curTcc || g_locTcc < 0) return;
         if (!cmdFlushed) { flushBatch(__LINE__); cmdFlushed = true; }   // [flushcoalesce]
-        SetShaderValue(g_shader, g_locTcc, &want, SHADER_UNIFORM_FLOAT);
+        ps2x::gfx::rgSetShaderValue(g_shader, g_locTcc, &want, SHADER_UNIFORM_FLOAT);
         curTcc = want;
     };
 
@@ -9749,15 +9749,15 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         const int LW = 512, LH = 512, ls = std::max(1, lit->second.scale);
         if (g_frontLatch.w != LW || g_frontLatch.h != LH || g_frontLatch.scale != ls || g_frontLatch.rt.texture.id == 0)
         {
-            if (g_frontLatch.rt.texture.id != 0) { ps2xForgetRtTexId(g_frontLatch.rt.texture.id); UnloadRenderTexture(g_frontLatch.rt); }
-            g_frontLatch.rt = LoadRenderTexture(LW * ls, LH * ls); g_frontLatch.w = LW; g_frontLatch.h = LH; g_frontLatch.scale = ls;
-            SetTextureFilter(g_frontLatch.rt.texture, TEXTURE_FILTER_POINT);
+            if (g_frontLatch.rt.texture.id != 0) { ps2xForgetRtTexId(g_frontLatch.rt.texture.id); ps2x::gfx::rgUnloadRenderTexture(g_frontLatch.rt); }
+            g_frontLatch.rt = ps2x::gfx::rgLoadRenderTexture(LW * ls, LH * ls); g_frontLatch.w = LW; g_frontLatch.h = LH; g_frontLatch.scale = ls;
+            ps2x::gfx::rgSetTextureFilter(g_frontLatch.rt.texture, TEXTURE_FILTER_POINT);
         }
-        BeginTextureMode(g_frontLatch.rt);
+        ps2x::gfx::rgBeginTextureMode(g_frontLatch.rt);
         // Blending OFF for the copy: the scene buffers' alpha is junk (opaque game draws
         // legitimately leave a~0), alpha-blending the copy would erase the frame.
         rlDisableColorBlend();
-        DrawTexturePro(lit->second.rt.texture,
+        ps2x::gfx::rgDrawTexturePro(lit->second.rt.texture,
                        Rectangle{0, 0, (float)(cw * lit->second.scale), -(float)(ch * lit->second.scale)},   // [rscale] physical src
                        Rectangle{0, 0, (float)(cw * ls), (float)(ch * ls)}, Vector2{0, 0}, 0.0f, WHITE);
         flushBatch(__LINE__);
@@ -9791,7 +9791,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 s_lsec = 0; s_lt = psxNow();
             }
         }
-        EndTextureMode();
+        ps2x::gfx::rgEndTextureMode();
         g_frontLatchValid = true;
         ++g_frontLatchGen;
 
@@ -10713,36 +10713,36 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         {
                             if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); UnloadTexture(s_tex); }
                             Image im = GenImageColor(ow, oh, BLANK);
-                            s_tex = LoadTextureFromImage(im); UnloadImage(im);
+                            s_tex = ps2x::gfx::rgLoadTextureFromImage(im); UnloadImage(im);
                             s_tw = ow; s_th = oh;
                         }
-                        UpdateTexture(s_tex, px.data());
+                        ps2x::gfx::rgUpdateTexture(s_tex, px.data());
                         // The overlay inherits the PREVIOUS draw's shader uniforms. If that draw had
                         // TCC=0 the shader replaces the texture alpha with the vertex alpha (1.0) and
                         // the quad paints solid black over the whole screen -- which is exactly what
                         // happened. Pin the uniforms this draw needs.
                         { const float one = 1.0f, zero = 0.0f;
-                          if (g_locTcc >= 0)      SetShaderValue(g_shader, g_locTcc, &one, SHADER_UNIFORM_FLOAT);
-                          if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; SetShaderValue(g_shader, g_locAlphaFix, d.data(), SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }   // [texreplace]
-                          if (g_locIdxMode >= 0)  SetShaderValue(g_shader, g_locIdxMode, &zero, SHADER_UNIFORM_FLOAT);
-                          if (g_locUViz >= 0)     SetShaderValue(g_shader, g_locUViz, &zero, SHADER_UNIFORM_FLOAT);
-                          if (g_locSubScale >= 0) SetShaderValue(g_shader, g_locSubScale, &one, SHADER_UNIFORM_FLOAT);
-                          if (g_locAtst >= 0)     { const float off2 = -1.0f; SetShaderValue(g_shader, g_locAtst, &off2, SHADER_UNIFORM_FLOAT); }
-                          if (g_locTexa >= 0)     { const float t4[4] = {0,0,0,0}; SetShaderValue(g_shader, g_locTexa, t4, SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t4, sizeof t4); } }   // [texacache] this reset used to leave the cache stale -> fighter B's decal lost its TEXA mode (the wedge)
+                          if (g_locTcc >= 0)      ps2x::gfx::rgSetShaderValue(g_shader, g_locTcc, &one, SHADER_UNIFORM_FLOAT);
+                          if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; ps2x::gfx::rgSetShaderValue(g_shader, g_locAlphaFix, d.data(), SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }   // [texreplace]
+                          if (g_locIdxMode >= 0)  ps2x::gfx::rgSetShaderValue(g_shader, g_locIdxMode, &zero, SHADER_UNIFORM_FLOAT);
+                          if (g_locUViz >= 0)     ps2x::gfx::rgSetShaderValue(g_shader, g_locUViz, &zero, SHADER_UNIFORM_FLOAT);
+                          if (g_locSubScale >= 0) ps2x::gfx::rgSetShaderValue(g_shader, g_locSubScale, &one, SHADER_UNIFORM_FLOAT);
+                          if (g_locAtst >= 0)     { const float off2 = -1.0f; ps2x::gfx::rgSetShaderValue(g_shader, g_locAtst, &off2, SHADER_UNIFORM_FLOAT); }
+                          if (g_locTexa >= 0)     { const float t4[4] = {0,0,0,0}; ps2x::gfx::rgSetShaderValue(g_shader, g_locTexa, t4, SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t4, sizeof t4); } }   // [texacache] this reset used to leave the cache stale -> fighter B's decal lost its TEXA mode (the wedge)
                         applyDepth(false, 1u, false);
                         rlSetBlendMode(RL_BLEND_ALPHA);
-                        rlSetTexture(s_tex.id);
+                        ps2x::gfx::rgSetTexture(s_tex.id);
                         ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                        rlBegin(RL_QUADS);
-                        rlColor4ub(255, 255, 255, 255); rlNormal3f(0.0f, 0.0f, 1.0f);
+                        ps2x::gfx::rgBegin(RL_QUADS);
+                        ps2x::gfx::rgColor4ub(255, 255, 255, 255); rlNormal3f(0.0f, 0.0f, 1.0f);
                         // offX/offY are per-draw (atlas slot) and not in scope here; the overlay
                         // is full-buffer in FBO space, so origin 0,0 is correct with atlas off.
-                        rlTexCoord2f(0.0f, 1.0f); rlVertex2f(0.0f, 0.0f);
-                        rlTexCoord2f(0.0f, 0.0f); rlVertex2f(0.0f, (float)oh);
-                        rlTexCoord2f(1.0f, 0.0f); rlVertex2f((float)ow, (float)oh);
-                        rlTexCoord2f(1.0f, 1.0f); rlVertex2f((float)ow, 0.0f);
-                        rlEnd();
-                        rlSetTexture(0);
+                        ps2x::gfx::rgTexCoord2f(0.0f, 1.0f); ps2x::gfx::rgVertex2f(0.0f, 0.0f);
+                        ps2x::gfx::rgTexCoord2f(0.0f, 0.0f); ps2x::gfx::rgVertex2f(0.0f, (float)oh);
+                        ps2x::gfx::rgTexCoord2f(1.0f, 0.0f); ps2x::gfx::rgVertex2f((float)ow, (float)oh);
+                        ps2x::gfx::rgTexCoord2f(1.0f, 1.0f); ps2x::gfx::rgVertex2f((float)ow, 0.0f);
+                        ps2x::gfx::rgEnd();
+                        ps2x::gfx::rgSetTexture(0);
                         flushBatch(__LINE__);
                     }
                 }
@@ -11221,11 +11221,11 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         endMode();
                         curFbp = 0xFFFFFFFFu; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;
-                        BeginTextureMode(fit->second.rt);
+                        ps2x::gfx::rgBeginTextureMode(fit->second.rt);
                         char bp[160];
                         std::snprintf(bp, sizeof bp, "/home/z3/Desktop/bt3/work/prog_%02d_f%u.ppm", step, fb);
                         dumpBoundFbo(bp, 512, fit->second.h);
-                        EndTextureMode();
+                        ps2x::gfx::rgEndTextureMode();
                     }
                 }
                 std::fprintf(stderr, "[progdump] step=%d ci=%zu/%zu\n", step, ci, DC.size());
@@ -11259,11 +11259,11 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         endMode();
                         curFbp = 0xFFFFFFFFu; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;
-                        BeginTextureMode(fit->second.rt);
+                        ps2x::gfx::rgBeginTextureMode(fit->second.rt);
                         char bp[160];
                         std::snprintf(bp, sizeof bp, "/home/z3/Desktop/bt3/work/cut_%06zu_f%u.ppm", ci, fb);
                         dumpBoundFbo(bp, 512, fit->second.h);
-                        EndTextureMode();
+                        ps2x::gfx::rgEndTextureMode();
                     }
                 }
                 std::fprintf(stderr, "[drawcut] ci=%zu/%zu dumped\n", ci, DC.size());
@@ -11332,9 +11332,9 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 glColorMask(1, 1, 1, 0);
                 if (depthOn) applyDepth(true, 2 /* GS ZTST GEQUAL */, false); else rlDisableDepthTest();
                 const bool dbg = groundShadowMode() == 2;
-                rlSetTexture(dbg ? g_white.id : g_blobTex.id);
+                ps2x::gfx::rgSetTexture(dbg ? g_white.id : g_blobTex.id);
                 ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                rlBegin(RL_QUADS);
+                ps2x::gfx::rgBegin(RL_QUADS);
                 // [gshadowtune] env-tunable without a rebuild: width factor, height/width, alpha, vertical offset (fraction of h
                 // above the feet line), depth nudge factor (>1 = nearer than the contact patch)
                 static const float s_kw = [](){ const char *v = std::getenv("PS2X_GSHADOW_W"); return v && v[0] ? (float)std::atof(v) : 0.9f; }();
@@ -11348,16 +11348,16 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     const float x0 = b.cx - w * 0.5f, x1 = b.cx + w * 0.5f, y0 = b.feetY - h * s_kdy, y1 = y0 + h;
                     const float zq = std::min(1.0f, b.feetZ * s_kz + 0.0005f);   // slightly nearer than the contact patch
                     { static int nlog = 0; if (nlog++ < 8) std::fprintf(stderr, "[groundshadow] v8 draw cx=%.0f feet=%.0f w=%.0f z=%.4f fbo=%u ci=%zu/%zu\n", b.cx, b.feetY, b.w, zq, sceneFbp, ci, ciEnd); }
-                    if (dbg) rlColor4ub(255, 0, 255, 255); else rlColor4ub(0, 0, 0, (unsigned char)std::min(255, std::max(0, s_ka)));
+                    if (dbg) ps2x::gfx::rgColor4ub(255, 0, 255, 255); else ps2x::gfx::rgColor4ub(0, 0, 0, (unsigned char)std::min(255, std::max(0, s_ka)));
                     rlNormal3f(0.0f, 0.0f, 1.0f);
-                    rlTexCoord2f(0.0f, 0.0f); if (depthOn) rlVertex3f(x0, y0, -zq); else rlVertex2f(x0, y0);
-                    rlTexCoord2f(0.0f, 1.0f); if (depthOn) rlVertex3f(x0, y1, -zq); else rlVertex2f(x0, y1);
-                    rlTexCoord2f(1.0f, 1.0f); if (depthOn) rlVertex3f(x1, y1, -zq); else rlVertex2f(x1, y1);
-                    rlTexCoord2f(1.0f, 0.0f); if (depthOn) rlVertex3f(x1, y0, -zq); else rlVertex2f(x1, y0);
+                    ps2x::gfx::rgTexCoord2f(0.0f, 0.0f); if (depthOn) ps2x::gfx::rgVertex3f(x0, y0, -zq); else ps2x::gfx::rgVertex2f(x0, y0);
+                    ps2x::gfx::rgTexCoord2f(0.0f, 1.0f); if (depthOn) ps2x::gfx::rgVertex3f(x0, y1, -zq); else ps2x::gfx::rgVertex2f(x0, y1);
+                    ps2x::gfx::rgTexCoord2f(1.0f, 1.0f); if (depthOn) ps2x::gfx::rgVertex3f(x1, y1, -zq); else ps2x::gfx::rgVertex2f(x1, y1);
+                    ps2x::gfx::rgTexCoord2f(1.0f, 0.0f); if (depthOn) ps2x::gfx::rgVertex3f(x1, y0, -zq); else ps2x::gfx::rgVertex2f(x1, y0);
                 }
-                rlEnd();
+                ps2x::gfx::rgEnd();
                 flushBatch(__LINE__);
-                rlSetTexture(0);
+                ps2x::gfx::rgSetTexture(0);
                 rlSetShader(g_shader.id, g_shader.locs);
                 curMask = -1; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1; curDepthTest = -1; curDepthFunc = -1; curDepthWrite = -1;
             }
@@ -11413,11 +11413,11 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         endMode();
                         curFbp = 0xFFFFFFFFu; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;
-                        BeginTextureMode(fit->second.rt);
+                        ps2x::gfx::rgBeginTextureMode(fit->second.rt);
                         char bp[160];
                         std::snprintf(bp, sizeof bp, "/home/z3/Desktop/bt3/work/probefb_L%zu_f0.ppm", li);
                         dumpBoundFbo(bp, 512, fit->second.h);
-                        EndTextureMode();
+                        ps2x::gfx::rgEndTextureMode();
                     }
                 }
             }
@@ -11566,7 +11566,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (c.xDX + c.xW > dw) dw = c.xDX + c.xW;
                 if (c.xDY + c.xH > dh) dh = c.xDY + c.xH;
                 Fbo &dstF = ensureFbo(c.xDstFbp, dw, dh);
-                BeginTextureMode(dstF.rt);
+                ps2x::gfx::rgBeginTextureMode(dstF.rt);
                 if (dstF.scale > 1) rlScalef((float)dstF.scale, (float)dstF.scale, 1.0f);   // [rscale]
                 // Both FBOs are bottom-up; negative src height flips to preserve orientation.
                 // Same partial-rect band selection as the sprite composites: source rows
@@ -11582,8 +11582,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 Rectangle sr{static_cast<float>(c.xSX), srcTexH - static_cast<float>(c.xSY) - static_cast<float>(c.xH),
                              static_cast<float>(c.xW), -static_cast<float>(c.xH)};
                 Rectangle dr{static_cast<float>(c.xDX), static_cast<float>(c.xDY), static_cast<float>(c.xW), static_cast<float>(c.xH)};
-                DrawTexturePro(xtex, sr, dr, Vector2{0, 0}, 0.0f, WHITE);
-                EndTextureMode();
+                ps2x::gfx::rgDrawTexturePro(xtex, sr, dr, Vector2{0, 0}, 0.0f, WHITE);
+                ps2x::gfx::rgEndTextureMode();
             }
             curFbp = 0xFFFFFFFFu; // force rebind for the next draw
             { PS2X_GATE_HIT(); continue; }
@@ -11809,7 +11809,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // content and placement both verified identity). Invalidate so the next draw
             // re-applies. Same for the shader/blend/depth caches this path also touched.
             curMask = -1;
-            // ...and the SCISSOR. blitVramPageToBoundFbo calls rlDisableScissorTest() directly,
+            // ...and the SCISSOR. blitVramPageToBoundFbo calls ps2x::gfx::rgDisableScissorTest() directly,
             // while applyScissor early-returns whenever the rect is unchanged -- so the next
             // draw sharing that rect would keep rendering with NO scissor and paint outside its
             // bounds. That is the ground-quad artifact: not the blit's pixels (content and
@@ -11829,7 +11829,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (s_fa224 != 0.0f && g_locForceA >= 0)
             {
                 const float want = (!c.isTransfer && c.destFbp == 224u && c.texKey) ? s_fa224 : 0.0f;
-                if (want != curFA) { flushBatch(__LINE__); SetShaderValue(g_shader, g_locForceA, &want, SHADER_UNIFORM_FLOAT); curFA = want; }
+                if (want != curFA) { flushBatch(__LINE__); ps2x::gfx::rgSetShaderValue(g_shader, g_locForceA, &want, SHADER_UNIFORM_FLOAT); curFA = want; }
             }
         }
         {   // PS2X_PROJCLIP=1: clip the shadow-decal class to its projection. Identified as
@@ -11858,7 +11858,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (!c.isTransfer && c.destFbp != 336u && c.srcTbp0 != 10752u) s_afterPass1 = false;
             const float want = (s_pc && decal) ? 1.0f : 0.0f;
             if (want != curPC && g_locProjClip >= 0)
-            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locProjClip, &want, SHADER_UNIFORM_FLOAT); curPC = want; }
+            { flushBatch(__LINE__); ps2x::gfx::rgSetShaderValue(g_shader, g_locProjClip, &want, SHADER_UNIFORM_FLOAT); curPC = want; }
         }
         {   // PS2X_TRIHALF (default ON): the GS addresses texel CORNERS, GL centres. We already
             // correct that for same-size FBO copies (the shipped blur fix) but never did for
@@ -11889,7 +11889,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     const float want = (c.abe && c.blendMode == 0x62 && c.srcTbp0 == 15680u) ? 1.0f : 0.0f;
                     static float cur = 0.0f;
                     if (want != cur)
-                    { flushBatch(__LINE__); SetShaderValue(g_shader, g_locUViz, &want, SHADER_UNIFORM_FLOAT); cur = want; }
+                    { flushBatch(__LINE__); ps2x::gfx::rgSetShaderValue(g_shader, g_locUViz, &want, SHADER_UNIFORM_FLOAT); cur = want; }
                 }
             }
             {   // PS2X_SUBSCALE applied ONLY to the 0x62 subtractive pass (magnitude A/B).
@@ -11900,14 +11900,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     const float want = (c.abe && c.blendMode == 0x62) ? s_ss : 1.0f;
                     static float cur = 1.0f;
                     if (want != cur)
-                    { flushBatch(__LINE__); SetShaderValue(g_shader, g_locSubScale, &want, SHADER_UNIFORM_FLOAT); cur = want; }
+                    { flushBatch(__LINE__); ps2x::gfx::rgSetShaderValue(g_shader, g_locSubScale, &want, SHADER_UNIFORM_FLOAT); cur = want; }
                 }
             }
             static const bool s_tfxOn = [](){ const char *v = std::getenv("PS2X_TFX"); return v && v[0] && v[0] != '0'; }();
             static float curTfx = -1.0f;
             const float want = (s_tfxOn && c.texKey != 0 && c.tfx == 1u) ? 1.0f : 0.0f;
             if (want != curTfx && g_locTfx >= 0)
-            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locTfx, &want, SHADER_UNIFORM_FLOAT); curTfx = want; }
+            { flushBatch(__LINE__); ps2x::gfx::rgSetShaderValue(g_shader, g_locTfx, &want, SHADER_UNIFORM_FLOAT); curTfx = want; }
         }
         {   // [f224] PS2X_F224=1: fbp224 (the MASK) reads as a pristine clear, yet chaindiag
             // counts 96 draws INTO it. Find where they die: count entry vs the emit.
@@ -12431,7 +12431,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             {
                 flushBatch(__LINE__);
                 const float on = 1.0f;
-                SetShaderValue(g_shader, g_locUViz, &on, SHADER_UNIFORM_FLOAT);
+                ps2x::gfx::rgSetShaderValue(g_shader, g_locUViz, &on, SHADER_UNIFORM_FLOAT);
                 s_a44vizArmed = true;
             }
         }
@@ -12576,7 +12576,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             {
                 flushBatch(__LINE__);
                 const float two = 2.0f;
-                SetShaderValue(g_shader, g_locForceA, &two, SHADER_UNIFORM_FLOAT);
+                ps2x::gfx::rgSetShaderValue(g_shader, g_locForceA, &two, SHADER_UNIFORM_FLOAT);
                 s_mbtaArmed = true;
             }
         }
@@ -12780,7 +12780,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         flushBatch(__LINE__);
                         rlEnableFramebuffer(it0->second.rt.id);
-                        rlDisableScissorTest();               // glClear obeys the scissor; a leftover
+                        ps2x::gfx::rgDisableScissorTest();               // glClear obeys the scissor; a leftover
                                                               // strip scissor clipped this to 1474 px
                         glColorMask(0, 0, 0, 1);              // alpha only -- leave the scene RGB alone
                         glClearColor(0.0f, 0.0f, 0.0f, 128.0f / 255.0f);
@@ -14024,15 +14024,15 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         && nit != g_fbos.end() && nit->second.rt.texture.id != 0)
                     {
                         flushBatch(__LINE__);
-                        BeginTextureMode(nit->second.rt);
-                        rlDisableScissorTest();
+                        ps2x::gfx::rgBeginTextureMode(nit->second.rt);
+                        ps2x::gfx::rgDisableScissorTest();
                         rlDisableColorBlend();
-                        DrawTexturePro(git->second,
+                        ps2x::gfx::rgDrawTexturePro(git->second,
                                        Rectangle{0.0f, 0.0f, (float)git->second.width, (float)git->second.height},
                                        Rectangle{0.0f, 0.0f, (float)cw, (float)ch},
                                        Vector2{0.0f, 0.0f}, 0.0f, WHITE);
                         flushBatch(__LINE__);
-                        EndTextureMode();
+                        ps2x::gfx::rgEndTextureMode();
                         curRealFbp = 0xFFFFFFFFu; inMode = false;
                         std::fprintf(stderr, "[seedfbo] seeded-at-create fbp%u (%dx%d) from decoded tex %u\n",
                                      sfKey, cw, ch, git->second.id);
@@ -14460,14 +14460,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         flushBatch(__LINE__);
                         const int fw9 = fit9->second.w, fh9 = fit9->second.h;
-                        BeginTextureMode(fit9->second.rt);
-                        rlDisableScissorTest();
+                        ps2x::gfx::rgBeginTextureMode(fit9->second.rt);
+                        ps2x::gfx::rgDisableScissorTest();
                         rlDisableColorBlend();
-                        DrawTexturePro(tex, Rectangle{0.0f, 0.0f, (float)tex.width, (float)tex.height},
+                        ps2x::gfx::rgDrawTexturePro(tex, Rectangle{0.0f, 0.0f, (float)tex.width, (float)tex.height},
                                        Rectangle{0.0f, 0.0f, (float)fw9, (float)fh9},
                                        Vector2{0.0f, 0.0f}, 0.0f, WHITE);
                         flushBatch(__LINE__);
-                        EndTextureMode();
+                        ps2x::gfx::rgEndTextureMode();
                         std::fprintf(stderr, "[seedfbo] seeded fbp%u (%dx%d) from decoded VRAM tex %u (%dx%d)\n",
                                      sfKey, fw9, fh9, tex.id, tex.width, tex.height);
                         curRealFbp = 0xFFFFFFFFu;   // force a rebind: we changed the bound FBO
@@ -15327,7 +15327,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             const bool keepCt32Alpha = s_fo32 || ps2xGlowFix();   // [glowfix]
             const float want = (fromFbo && !idxRt && !(keepCt32Alpha && ct32src)) ? 1.0f : 0.0f;
             if (want != curFO && g_locFboOne >= 0)
-            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locFboOne, &want, SHADER_UNIFORM_FLOAT); curFO = want; }
+            { flushBatch(__LINE__); ps2x::gfx::rgSetShaderValue(g_shader, g_locFboOne, &want, SHADER_UNIFORM_FLOAT); curFO = want; }
         }
         {   // PS2X_ADGS=1: our framebuffer alpha stores the GS BYTE, but GL_DST_ALPHA divides it
             // by 255 where the GS divides Ad by 128 -- so EVERY dest-alpha blend runs at 128/255
@@ -15361,7 +15361,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (wantAdgs != curAdgs && g_locSubScale >= 0)
             {
                 flushBatch(__LINE__);
-                SetShaderValue(g_shader, g_locSubScale, &wantAdgs, SHADER_UNIFORM_FLOAT);
+                ps2x::gfx::rgSetShaderValue(g_shader, g_locSubScale, &wantAdgs, SHADER_UNIFORM_FLOAT);
                 curAdgs = wantAdgs;
             }
         }
@@ -15374,7 +15374,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
               if ((nT % 20000ul) == 0ul)
                   std::fprintf(stderr, "[fba] draws with FBA=1: %lu of %lu\n", nF, nT); }
             if (want != curF && g_locFba >= 0)
-            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locFba, &want, SHADER_UNIFORM_FLOAT); curF = want; }
+            { flushBatch(__LINE__); ps2x::gfx::rgSetShaderValue(g_shader, g_locFba, &want, SHADER_UNIFORM_FLOAT); curF = want; }
         }
         {   // Index scale follows the SOURCE page's provenance (see g_fbpAlphaIsGsByte).
             // PS2X_IDXSCALE overrides it for A/B; negative still means "bypass the palette".
@@ -15387,7 +15387,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                  : ((spg < 512u && g_fbpAlphaIsGsByte[spg]) ? 255.0f : 128.0f);
                 static float curS = -12345.0f;
                 if (want != curS)
-                { flushBatch(__LINE__); SetShaderValue(g_shader, g_locIdxScale, &want, SHADER_UNIFORM_FLOAT); curS = want; }
+                { flushBatch(__LINE__); ps2x::gfx::rgSetShaderValue(g_shader, g_locIdxScale, &want, SHADER_UNIFORM_FLOAT); curS = want; }
             }
             // Record what THIS draw leaves in the destination's alpha, for whoever reads it next.
             if (!c.isTransfer && c.destFbp < 512u && (c.fbmsk & 0xFF000000u) != 0xFF000000u)
@@ -15506,7 +15506,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (want != g_curIdxMode && g_locIdxMode >= 0)
             {
                 flushBatch(__LINE__);          // the mode changes how texels are read
-                SetShaderValue(g_shader, g_locIdxMode, &want, SHADER_UNIFORM_FLOAT);
+                ps2x::gfx::rgSetShaderValue(g_shader, g_locIdxMode, &want, SHADER_UNIFORM_FLOAT);
                 g_curIdxMode = want;
             }
             if (idxRt && g_locPal >= 0)
@@ -15532,7 +15532,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (pal.id != 0)
                 {
                     // Bind the LUT to an explicit high texture unit and point the sampler at it.
-                    // SetShaderValueTexture() left uPal at 0 -- and unit 0 is texture0, so the
+                    // ps2x::gfx::rgSetShaderValueTexture() left uPal at 0 -- and unit 0 is texture0, so the
                     // "palette lookup" was silently re-sampling the SOURCE FBO. Unit 8 is above
                     // the units raylib's batch binds/unbinds (0..4), so the binding survives to
                     // the draw.
@@ -15541,7 +15541,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     glActiveTexture(0x84C0u + kPalUnit);   // GL_TEXTURE0 + 8
                     glBindTexture(0x0DE1u, pal.id);
                     glActiveTexture(0x84C0u);              // leave unit 0 current for everything else
-                    SetShaderValue(g_shader, g_locPal, &kPalUnit, SHADER_UNIFORM_INT);
+                    ps2x::gfx::rgSetShaderValue(g_shader, g_locPal, &kPalUnit, SHADER_UNIFORM_INT);
                     {   // Read back AFTER the set -- reading before reports the previous draw's
                         // value and made the fix look like it had not applied.
                         static int shown = 0;
@@ -15560,7 +15560,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 else if (g_locIdxMode >= 0 && g_curIdxMode != 0.0f)
                 {   // no palette published yet -> do not sample garbage, fall back to normal
                     float z = 0.0f; flushBatch(__LINE__);
-                    SetShaderValue(g_shader, g_locIdxMode, &z, SHADER_UNIFORM_FLOAT); g_curIdxMode = 0.0f;
+                    ps2x::gfx::rgSetShaderValue(g_shader, g_locIdxMode, &z, SHADER_UNIFORM_FLOAT); g_curIdxMode = 0.0f;
                 }
             }
         }
@@ -15949,7 +15949,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         }
                         static float cur128 = -1.0f;
                         if (g_locABl128 >= 0 && want128 != cur128)
-                        { flushBatch(__LINE__); SetShaderValue(g_shader, g_locABl128, &want128, SHADER_UNIFORM_FLOAT); cur128 = want128; }
+                        { flushBatch(__LINE__); ps2x::gfx::rgSetShaderValue(g_shader, g_locABl128, &want128, SHADER_UNIFORM_FLOAT); cur128 = want128; }
                     }
                     const float mode = aofKeep ? 4.0f
                                      : (s_texaFbo && fromFbo && c.tcc && tex.id != 0
@@ -16124,7 +16124,7 @@ done.insert(c.texKey);
                         static float curPQ = -1.0f;
                         const float want = (c.isTriangle && c.tri[0].q != 1.0f) ? 1.0f : 0.0f;
                         if (g_locPerspQ >= 0 && want != curPQ)
-                        { flushBatch(__LINE__); SetShaderValue(g_shader, g_locPerspQ, &want, SHADER_UNIFORM_FLOAT); curPQ = want; }
+                        { flushBatch(__LINE__); ps2x::gfx::rgSetShaderValue(g_shader, g_locPerspQ, &want, SHADER_UNIFORM_FLOAT); curPQ = want; }
                     }
                     {   // [bilin] PS2X_BILINDBG=1: is the GS MMAG=1 bilinear flag actually
                         // reaching the character draws? Console sets MMAG=1 on every scene draw;
@@ -16320,7 +16320,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             const float zs = (ovr && ovr[0]) ? (float)std::atof(ovr)
                                                              : (float)(g_zwbZMax / (16384.0 * 255.0));
                             flushBatch(__LINE__);
-                            SetShaderValue(g_shader, g_locZScale, &zs, SHADER_UNIFORM_FLOAT);
+                            ps2x::gfx::rgSetShaderValue(g_shader, g_locZScale, &zs, SHADER_UNIFORM_FLOAT);
                             std::fprintf(stderr, "[zbyte] zMax=%.0f -> uZScale=%.4f%s\n", g_zwbZMax, zs,
                                          (ovr && ovr[0]) ? " (PS2X_ZBYTE override)" : " (derived)");
                         }
@@ -16328,7 +16328,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     {   static float curZT = -1.0f;
                         const float wantZ = zTexBind ? 1.0f : 0.0f;
                         if (g_locZTex >= 0 && wantZ != curZT)
-                        { flushBatch(__LINE__); SetShaderValue(g_shader, g_locZTex, &wantZ, SHADER_UNIFORM_FLOAT); curZT = wantZ; }
+                        { flushBatch(__LINE__); ps2x::gfx::rgSetShaderValue(g_shader, g_locZTex, &wantZ, SHADER_UNIFORM_FLOAT); curZT = wantZ; }
                     }
                     {   // [celu] PS2X_CELU=1: histogram the ramp coordinate the cel/outline pass
                         // (tbp 15680, bm 0x62) actually samples. A toon ramp should put most of
@@ -16436,7 +16436,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                            tv[2] != curTexa[2] || tv[3] != curTexa[3]))
                     {
                         flushBatch(__LINE__); // TEXA changes sampled alpha: flush pending verts
-                        SetShaderValue(g_shader, g_locTexa, tv, SHADER_UNIFORM_VEC4);
+                        ps2x::gfx::rgSetShaderValue(g_shader, g_locTexa, tv, SHADER_UNIFORM_VEC4);
                         curTexa[0] = tv[0]; curTexa[1] = tv[1]; curTexa[2] = tv[2]; curTexa[3] = tv[3];
                     }
                 }
@@ -16637,14 +16637,14 @@ if (done.size() < 14 && !done.count(c.texKey))
         if (s_mbtaArmed)
         {   flushBatch(__LINE__);
             const float off4 = 0.0f;
-            if (g_locForceA >= 0) SetShaderValue(g_shader, g_locForceA, &off4, SHADER_UNIFORM_FLOAT);
+            if (g_locForceA >= 0) ps2x::gfx::rgSetShaderValue(g_shader, g_locForceA, &off4, SHADER_UNIFORM_FLOAT);
             s_mbtaArmed = false;
         }
         if (s_a44vizArmed)
         {   // disarm from the PREVIOUS draw before this one is submitted
             flushBatch(__LINE__);
             const float off = 0.0f;
-            if (g_locUViz >= 0) SetShaderValue(g_shader, g_locUViz, &off, SHADER_UNIFORM_FLOAT);
+            if (g_locUViz >= 0) ps2x::gfx::rgSetShaderValue(g_shader, g_locUViz, &off, SHADER_UNIFORM_FLOAT);
             s_a44vizArmed = false;
         }
         applyScissor(c.sx, c.sy, c.sw, c.sh);
@@ -16729,7 +16729,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         {
                             const int w = sit->second.w, h = sit->second.h;
                             if (g_decalSnap.texture.id == 0 || g_decalSnap.texture.width != w || g_decalSnap.texture.height != h)
-                            { if (g_decalSnap.texture.id) { ps2xForgetTexId(g_decalSnap.texture.id); UnloadRenderTexture(g_decalSnap); } g_decalSnap = LoadRenderTexture(w, h); SetTextureFilter(g_decalSnap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(g_decalSnap.texture.id); }
+                            { if (g_decalSnap.texture.id) { ps2xForgetTexId(g_decalSnap.texture.id); ps2x::gfx::rgUnloadRenderTexture(g_decalSnap); } g_decalSnap = ps2x::gfx::rgLoadRenderTexture(w, h); ps2x::gfx::rgSetTextureFilter(g_decalSnap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(g_decalSnap.texture.id); }
                             glBindFramebuffer(0x8CA8 /*READ*/, sit->second.rt.id); glBindFramebuffer(0x8CA9 /*DRAW*/, g_decalSnap.id);
                             glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, 0x4000 /*COLOR*/, 0x2600 /*NEAREST*/);
                             glBindFramebuffer(0x8D40 /*FRAMEBUFFER*/, 0);
@@ -16858,7 +16858,7 @@ if (done.size() < 14 && !done.count(c.texKey))
             if (!isShadowDecal && g_curReg[3] > 0.5f && g_locRegion >= 0)
             {   // [region] the clamp uniform persists across draws; disable it before any non-decal command (sprites never set it)
                 flushBatch(__LINE__); const float off[4] = {1.f, 0.f, 1.f, 0.f};
-                SetShaderValue(g_shader, g_locRegion, off, SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, off, sizeof off);
+                ps2x::gfx::rgSetShaderValue(g_shader, g_locRegion, off, SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, off, sizeof off);
                 // [decalend] the FIRST sprite after a decal batch was lost (the second fighter's 336 clear missed its first
                 // 32-px column -> 17 px of fighter A's silhouette survived -> fighter B's decal projected them = the sliver).
                 // A forced real FBO re-bind before that command (what the readback probes did by accident) fixes it.
@@ -16887,7 +16887,7 @@ if (done.size() < 14 && !done.count(c.texKey))
             {   // [decaldbg 6] the visualiser uniform persists too: turn it off before any non-decal command
                 static int loc = -2; if (loc == -2) loc = GetShaderLocation(g_shader, "uUViz");
                 static bool on = false;
-                if (loc >= 0) { flushBatch(__LINE__); const float z = 0.f; SetShaderValue(g_shader, loc, &z, SHADER_UNIFORM_FLOAT); on = false; }
+                if (loc >= 0) { flushBatch(__LINE__); const float z = 0.f; ps2x::gfx::rgSetShaderValue(g_shader, loc, &z, SHADER_UNIFORM_FLOAT); on = false; }
             }
             {   // [decaldbg] PS2X_DECALDBG=1: draw the shadow-decal tiles UNTEXTURED (vertex colour, no alpha test) to see
                 // their screen coverage; =2: textured but alpha test off; =3: like 1 but depth test off too.
@@ -17022,21 +17022,21 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); ps2x::gfx::rgSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
                     ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                    rlBegin(RL_QUADS);
+                    ps2x::gfx::rgBegin(RL_QUADS);
                     for (int k = 0; k < 4; ++k)
                     {
-                        rlColor4ub(q[k].r, q[k].g, q[k].b, q[k].a);
-                        rlTexCoord2f(q[k].u, q[k].v);
+                        ps2x::gfx::rgColor4ub(q[k].r, q[k].g, q[k].b, q[k].a);
+                        ps2x::gfx::rgTexCoord2f(q[k].u, q[k].v);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
                         // ortho maps window_depth = -q[k].z, so pass -q[k].z to store q[k].z.
-                        if (depthOn) rlVertex3f(q[k].x + offX, q[k].y + offY, -q[k].z);
-                        else rlVertex2f(q[k].x + offX, q[k].y + offY);
+                        if (depthOn) ps2x::gfx::rgVertex3f(q[k].x + offX, q[k].y + offY, -q[k].z);
+                        else ps2x::gfx::rgVertex2f(q[k].x + offX, q[k].y + offY);
                     }
-                    rlEnd();
-                    rlSetTexture(0);
+                    ps2x::gfx::rgEnd();
+                    ps2x::gfx::rgSetTexture(0);
                     ++ci;
                     { PS2X_GATE_HIT(); continue; }
                 }
@@ -17386,7 +17386,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); ps2x::gfx::rgSetTexture(tex.id);
                 ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
 #if defined(_WIN32)
                 if (d3dGsOn() && d3dGsEnsure())
@@ -17417,33 +17417,33 @@ if (done.size() < 14 && !done.count(c.texKey))
                 else
 #endif
                 {
-                rlBegin(RL_QUADS);
+                ps2x::gfx::rgBegin(RL_QUADS);
                 {   // [emitA] PS2X_CMPWR=1: the vertex alpha actually emitted for the mask composites
                     static const bool s_ea = [](){ const char *v = std::getenv("PS2X_CMPWR"); return v && v[0] && v[0] != '0'; }();
                     static int ean = 0;
                     if (s_ea && g_replayInWindow && ean < 40 && (c.destFbp == 224u || c.destFbp == 336u) && c.srcPsm == 27u && c.texKey)
-                    { ++ean; std::fprintf(stderr, "[emitA] dest=f%u #%d rlColor4ub(%u,%u,%u,%u) tex=%u bm=%02x fbmsk=%08x curRealFbp=%u\n", c.destFbp, ean, c.r, c.g, c.b, c.a, tex.id, (unsigned)c.blendMode, c.fbmsk, curRealFbp); }
+                    { ++ean; std::fprintf(stderr, "[emitA] dest=f%u #%d ps2x::gfx::rgColor4ub(%u,%u,%u,%u) tex=%u bm=%02x fbmsk=%08x curRealFbp=%u\n", c.destFbp, ean, c.r, c.g, c.b, c.a, tex.id, (unsigned)c.blendMode, c.fbmsk, curRealFbp); }
                 }
                 g_emitPath = "quadA";
-                rlColor4ub(c.r, c.g, c.b, c.a);
+                ps2x::gfx::rgColor4ub(c.r, c.g, c.b, c.a);
                 rlNormal3f(0.0f, 0.0f, 1.0f);
                 if (sprDepth)
                 {
                     const float sz = -(float)c.z;
-                    rlTexCoord2f(u0, v0); rlVertex3f(c.dx0 + offX, c.dy0 + offY, sz);
-                    rlTexCoord2f(u0, v1); rlVertex3f(c.dx0 + offX, c.dy1 + offY, sz);
-                    rlTexCoord2f(u1, v1); rlVertex3f(c.dx1 + offX, c.dy1 + offY, sz);
-                    rlTexCoord2f(u1, v0); rlVertex3f(c.dx1 + offX, c.dy0 + offY, sz);
+                    ps2x::gfx::rgTexCoord2f(u0, v0); ps2x::gfx::rgVertex3f(c.dx0 + offX, c.dy0 + offY, sz);
+                    ps2x::gfx::rgTexCoord2f(u0, v1); ps2x::gfx::rgVertex3f(c.dx0 + offX, c.dy1 + offY, sz);
+                    ps2x::gfx::rgTexCoord2f(u1, v1); ps2x::gfx::rgVertex3f(c.dx1 + offX, c.dy1 + offY, sz);
+                    ps2x::gfx::rgTexCoord2f(u1, v0); ps2x::gfx::rgVertex3f(c.dx1 + offX, c.dy0 + offY, sz);
                 }
                 else
                 {
-                    rlTexCoord2f(u0, v0); rlVertex2f(c.dx0 + offX, c.dy0 + offY);
-                    rlTexCoord2f(u0, v1); rlVertex2f(c.dx0 + offX, c.dy1 + offY);
-                    rlTexCoord2f(u1, v1); rlVertex2f(c.dx1 + offX, c.dy1 + offY);
-                    rlTexCoord2f(u1, v0); rlVertex2f(c.dx1 + offX, c.dy0 + offY);
+                    ps2x::gfx::rgTexCoord2f(u0, v0); ps2x::gfx::rgVertex2f(c.dx0 + offX, c.dy0 + offY);
+                    ps2x::gfx::rgTexCoord2f(u0, v1); ps2x::gfx::rgVertex2f(c.dx0 + offX, c.dy1 + offY);
+                    ps2x::gfx::rgTexCoord2f(u1, v1); ps2x::gfx::rgVertex2f(c.dx1 + offX, c.dy1 + offY);
+                    ps2x::gfx::rgTexCoord2f(u1, v0); ps2x::gfx::rgVertex2f(c.dx1 + offX, c.dy0 + offY);
                 }
-                rlEnd();
-                rlSetTexture(0);
+                ps2x::gfx::rgEnd();
+                ps2x::gfx::rgSetTexture(0);
                 }
                 if (isolateDraw) flushBatch(__LINE__);   // and submit it before anything can change the uniforms
                 {   // [edgestage] PS2X_EDGESTAGE=1: dump the base f336 FBO when the edge generator moves from one
@@ -17731,23 +17731,23 @@ if (done.size() < 14 && !done.count(c.texKey))
                     const float thf = (float)(tex.height > 0 ? tex.height : 1);
                     const float nu0 = src.x / twf, nv0 = src.y / thf;
                     const float nu1 = (src.x + src.width) / twf, nv1 = (src.y + src.height) / thf;
-                    rlSetTexture(tex.id);
-                    rlBegin(RL_QUADS);
-                    rlColor4ub(c.r, c.g, c.b, c.a);
+                    ps2x::gfx::rgSetTexture(tex.id);
+                    ps2x::gfx::rgBegin(RL_QUADS);
+                    ps2x::gfx::rgColor4ub(c.r, c.g, c.b, c.a);
                     rlNormal3f(0.0f, 0.0f, 1.0f);
-                    rlTexCoord2f(nu0, nv0); rlVertex2f(dst.x, dst.y);
-                    rlTexCoord2f(nu0, nv1); rlVertex2f(dst.x, dst.y + dst.height);
-                    rlTexCoord2f(nu1, nv1); rlVertex2f(dst.x + dst.width, dst.y + dst.height);
-                    rlTexCoord2f(nu1, nv0); rlVertex2f(dst.x + dst.width, dst.y);
-                    rlEnd();
-                    rlSetTexture(0);
+                    ps2x::gfx::rgTexCoord2f(nu0, nv0); ps2x::gfx::rgVertex2f(dst.x, dst.y);
+                    ps2x::gfx::rgTexCoord2f(nu0, nv1); ps2x::gfx::rgVertex2f(dst.x, dst.y + dst.height);
+                    ps2x::gfx::rgTexCoord2f(nu1, nv1); ps2x::gfx::rgVertex2f(dst.x + dst.width, dst.y + dst.height);
+                    ps2x::gfx::rgTexCoord2f(nu1, nv0); ps2x::gfx::rgVertex2f(dst.x + dst.width, dst.y);
+                    ps2x::gfx::rgEnd();
+                    ps2x::gfx::rgSetTexture(0);
                     flushBatch(__LINE__);
                     { static int ff = 0; if (std::getenv("PS2X_FORCEFLIPDBG") && ff++ < 12)
                         std::fprintf(stderr, "[forceflip] tbp=%u su=%.1f..%.1f sv=%.1f..%.1f dst=(%.0f,%.0f)-(%.0f,%.0f) tex=%dx%d\n",
                                      c.srcTbp0, c.su0, c.su1, c.sv0, c.sv1, dst.x, dst.y, dst.x + dst.width, dst.y + dst.height, tex.width, tex.height); }
                 }
                 else
-                DrawTexturePro(tex, src, dst, Vector2{0, 0}, 0.0f, Color{c.r, c.g, c.b, c.a});
+                ps2x::gfx::rgDrawTexturePro(tex, src, dst, Vector2{0, 0}, 0.0f, Color{c.r, c.g, c.b, c.a});
             }
             { static const bool s_sk3 = [](){ const char *v = std::getenv("PS2X_SEGCHK"); return v && v[0] && v[0] != '0'; }();
               static int n5 = 0; if (s_sk3 && c.destFbp == 224u && c.texKey && n5 < 6) ps2xDbgCol0("after-DrawTexturePro", ++n5); }
@@ -17893,22 +17893,22 @@ if (done.size() < 14 && !done.count(c.texKey))
                     depthForCmd(c);
                     const uint64_t h = c.texKey * 2654435761ull;
                     const uint8_t hr = 64 + (uint8_t)(h & 0xBF), hg = 64 + (uint8_t)((h >> 8) & 0xBF), hb = 64 + (uint8_t)((h >> 16) & 0xBF);
-                    rlSetTexture(g_white.id);
+                    ps2x::gfx::rgSetTexture(g_white.id);
                     rlCheckRenderBatchLimit(4);
                     ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                    rlBegin(RL_QUADS);
+                    ps2x::gfx::rgBegin(RL_QUADS);
                     const int q2[4] = {0, 1, 2, 2};
                     for (int k = 0; k < 4; ++k)
                     {
                         const int i = q2[k];
-                        rlColor4ub(hr, hg, hb, 255);
-                        rlTexCoord2f(0.5f, 0.5f);
+                        ps2x::gfx::rgColor4ub(hr, hg, hb, 255);
+                        ps2x::gfx::rgTexCoord2f(0.5f, 0.5f);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
-                        if (depthOn) rlVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
-                        else rlVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
+                        if (depthOn) ps2x::gfx::rgVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
+                        else ps2x::gfx::rgVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
                     }
-                    rlEnd();
-                    rlSetTexture(0);
+                    ps2x::gfx::rgEnd();
+                    ps2x::gfx::rgSetTexture(0);
                     { PS2X_GATE_HIT(); continue; }
                 }
             }
@@ -17962,17 +17962,17 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); ps2x::gfx::rgSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
                     ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                    rlBegin(RL_QUADS);
-                    rlColor4ub(255, 255, 255, 255);
+                    ps2x::gfx::rgBegin(RL_QUADS);
+                    ps2x::gfx::rgColor4ub(255, 255, 255, 255);
                     rlNormal3f(0.0f, 0.0f, 1.0f);
-                    rlTexCoord2f(0.0f, 0.0f); rlVertex2f(300.0f, 300.0f);
-                    rlTexCoord2f(0.0f, 1.0f); rlVertex2f(300.0f, 430.0f);
-                    rlTexCoord2f(1.0f, 1.0f); rlVertex2f(430.0f, 430.0f);
-                    rlTexCoord2f(1.0f, 0.0f); rlVertex2f(430.0f, 300.0f);
-                    rlEnd();
+                    ps2x::gfx::rgTexCoord2f(0.0f, 0.0f); ps2x::gfx::rgVertex2f(300.0f, 300.0f);
+                    ps2x::gfx::rgTexCoord2f(0.0f, 1.0f); ps2x::gfx::rgVertex2f(300.0f, 430.0f);
+                    ps2x::gfx::rgTexCoord2f(1.0f, 1.0f); ps2x::gfx::rgVertex2f(430.0f, 430.0f);
+                    ps2x::gfx::rgTexCoord2f(1.0f, 0.0f); ps2x::gfx::rgVertex2f(430.0f, 300.0f);
+                    ps2x::gfx::rgEnd();
                 }
             }
             // [dstinfo] PS2X_DSTINFO=<fbp>: count commands targeting that fbp that SURVIVE every
@@ -18213,7 +18213,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); ps2x::gfx::rgSetTexture(tex.id);
                         rlCheckRenderBatchLimit(4);
                         ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
 #if defined(_WIN32)
@@ -18240,11 +18240,11 @@ if (done.size() < 14 && !done.count(c.texKey))
                         else
 #endif
                         {
-                        rlBegin(RL_QUADS);
+                        ps2x::gfx::rgBegin(RL_QUADS);
                         const int qd[4] = {0, 1, 2, 2};
                         for (int k = 0; k < 4; ++k) {
                             const int i = qd[k];
-                            rlColor4ub(c.tri[i].r, c.tri[i].g, c.tri[i].b, c.tri[i].a);
+                            ps2x::gfx::rgColor4ub(c.tri[i].r, c.tri[i].g, c.tri[i].b, c.tri[i].a);
                             rlNormal3f(c.tri[i].q, 0.0f, 1.0f);
                             {   // [fbouv] PS2X_FBOUV=1: the draw's UVs are normalized to the source
                                 // it DECLARED (srcTexW/H, e.g. the 256x256 silhouette buffer), but an
@@ -18260,16 +18260,16 @@ if (done.size() < 14 && !done.count(c.texKey))
                                     && tex.width > 0 && tex.height > 0
                                     && (tex.width != c.srcTexW || tex.height != c.srcTexH))
                                 { uu *= (float)c.srcTexW / (float)tex.width; vv *= (float)c.srcTexH / (float)tex.height; }
-                                rlTexCoord2f(uu, vflip ? 1.0f - vv : vv);
+                                ps2x::gfx::rgTexCoord2f(uu, vflip ? 1.0f - vv : vv);
                                 if (g_dbgDecalCmd == &c && i == 0) { static int n3 = 0; if (n3++ < 60) std::fprintf(stderr, "[decaldbg]   EMIT FBOUV-site tri: curFbp=%u fromFbo=%d idxRt=%d tex=%dx%d src=%dx%d rescaled=%d u/v=(%.3f,%.3f)\n", curFbp, (int)fromFbo, (int)idxRt, tex.width, tex.height, (int)c.srcTexW, (int)c.srcTexH, (int)(s_fbouv && fromFbo && !idxRt), uu, vv); }
                             }
                             rlNormal3f(0.0f, 0.0f, 1.0f);
-                            if (depthOn) rlVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
-                            else rlVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
+                            if (depthOn) ps2x::gfx::rgVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
+                            else ps2x::gfx::rgVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
                         }
-                        rlEnd();
+                        ps2x::gfx::rgEnd();
                         }
-                        rlSetTexture(0);
+                        ps2x::gfx::rgSetTexture(0);
                         flushBatch(__LINE__);
                         uint32_t px = 0;
                         // glReadPixels is BOTTOM-UP while our screen coords are top-down; reading
@@ -18302,11 +18302,11 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); ps2x::gfx::rgSetTexture(tex.id);
             rlCheckRenderBatchLimit(4);
             {   // [region] declared/actual clamp for RT-sourced draws (see uRegion)
                 static int s_locUViz = -2; if (s_locUViz == -2) s_locUViz = GetShaderLocation(g_shader, "uUViz");
-                { const float v = (g_decalUViz && g_curDecalCmd == &c) ? g_decalUVizMode : 0.f; if (s_locUViz >= 0 && v > 0.5f) { flushBatch(__LINE__); SetShaderValue(g_shader, s_locUViz, &v, SHADER_UNIFORM_FLOAT); } }
+                { const float v = (g_decalUViz && g_curDecalCmd == &c) ? g_decalUVizMode : 0.f; if (s_locUViz >= 0 && v > 0.5f) { flushBatch(__LINE__); ps2x::gfx::rgSetShaderValue(g_shader, s_locUViz, &v, SHADER_UNIFORM_FLOAT); } }
                         float reg[4] = {1.f, 0.f, 1.f, 0.f};
             if (g_curDecalCmd == &c && fromFbo && c.srcTexW > 0 && c.srcTexH > 0 && tex.width > 0 && tex.height > 0 && (tex.width != c.srcTexW || tex.height != c.srcTexH))
             {   // clamp INSIDE the declared region by half a texel: the texel just past the region is live FBO data
@@ -18315,7 +18315,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         const float hu = s_inset / (float)tex.width, hv = s_inset / (float)tex.height;
                         reg[0] = ku - hu; reg[1] = vflip ? 1.0f - kv + hv : hv; reg[2] = vflip ? 1.0f - hv : kv - hv; reg[3] = 1.f; }
             if (g_locRegion >= 0 && (reg[0] != g_curReg[0] || reg[1] != g_curReg[1] || reg[2] != g_curReg[2] || reg[3] != g_curReg[3]))
-            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locRegion, reg, SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, reg, sizeof reg); }
+            { flushBatch(__LINE__); ps2x::gfx::rgSetShaderValue(g_shader, g_locRegion, reg, SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, reg, sizeof reg); }
             }
             // [glhoist] one pass per triangle of the run (nEmit == 1 for an ordinary command). Everything
             // above ran ONCE; only the vertices differ, so only this loop repeats -- and it must redo every
@@ -18379,7 +18379,7 @@ if (done.size() < 14 && !done.count(c.texKey))
             }
 #endif
             ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-            rlBegin(RL_QUADS);
+            ps2x::gfx::rgBegin(RL_QUADS);
             const int quad[4] = {0, 1, 2, 2};
             // PS2X_TRIWHITE: diagnostic â€” draw triangles with WHITE vertex color, exposing the raw
             // texture sample (separates color-modulation bugs from UV/sampling bugs).
@@ -18387,18 +18387,18 @@ if (done.size() < 14 && !done.count(c.texKey))
             for (int k = 0; k < 4; ++k)
             {
                 const int i = quad[k];
-                if (s_triWhite) rlColor4ub(255, 255, 255, 255);
-                else rlColor4ub(TV[i].r, TV[i].g, TV[i].b, TV[i].a);
+                if (s_triWhite) ps2x::gfx::rgColor4ub(255, 255, 255, 255);
+                else ps2x::gfx::rgColor4ub(TV[i].r, TV[i].g, TV[i].b, TV[i].a);
                 // PS2X_TRIUVGRID: force screen-derived UVs. If textures appear smeared across the
                 // scene, GL sampling works and the recorded UV values are the bug; if still flat,
                 // the batch texcoord path itself is broken.
                 static const bool s_uvGrid = [](){ const char *v = std::getenv("PS2X_TRIUVGRID"); return v && v[0] && v[0] != '0'; }();
                 if (s_uvGrid)
                 {
-                    rlTexCoord2f(TV[i].x / 512.0f, TV[i].y / 448.0f);
+                    ps2x::gfx::rgTexCoord2f(TV[i].x / 512.0f, TV[i].y / 448.0f);
                     rlNormal3f(0.0f, 0.0f, 1.0f);
-                    if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
-                    else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
+                    if (depthOn) ps2x::gfx::rgVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                    else ps2x::gfx::rgVertex2f(TV[i].x + offX, TV[i].y + offY);
                     { PS2X_GATE_HIT(); continue; }
                 }
                 // PS2X_RAMPU=<u>: force a CONSTANT u on the cel/ramp class (tbp 15680), which
@@ -18409,10 +18409,10 @@ if (done.size() < 14 && !done.count(c.texKey))
                                                    return v && v[0] ? (float)std::atof(v) : -1.0f; }();
                 if (s_rampU >= 0.0f && c.srcTbp0 == 15680u)
                 {
-                    rlTexCoord2f(s_rampU, vflip ? 1.0f - TV[i].v : TV[i].v);
+                    ps2x::gfx::rgTexCoord2f(s_rampU, vflip ? 1.0f - TV[i].v : TV[i].v);
                     rlNormal3f(0.0f, 0.0f, 1.0f);
-                    if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
-                    else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
+                    if (depthOn) ps2x::gfx::rgVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                    else ps2x::gfx::rgVertex2f(TV[i].x + offX, TV[i].y + offY);
                     { PS2X_GATE_HIT(); continue; }
                 }
                 // PS2X_SSUV=<tbp>: force SCREEN-SPACE UVs for one source class. The fbp502
@@ -18425,17 +18425,17 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (s_ssuv >= 0 && (int)c.srcTbp0 == (unsigned)s_ssuv)
                 {
                     const float su = TV[i].x / 512.0f, sv = TV[i].y / 448.0f;
-                    rlTexCoord2f(su, vflip ? 1.0f - sv : sv);
+                    ps2x::gfx::rgTexCoord2f(su, vflip ? 1.0f - sv : sv);
                     rlNormal3f(0.0f, 0.0f, 1.0f);
-                    if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
-                    else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
+                    if (depthOn) ps2x::gfx::rgVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                    else ps2x::gfx::rgVertex2f(TV[i].x + offX, TV[i].y + offY);
                     { PS2X_GATE_HIT(); continue; }
                 }
                 if (fromFbo && s_atlas && srcSlot) {
                     // remap source-normalized UV into the atlas slot (V flipped for bottom-up GL)
                     float au = ((float)srcSlot->x + TV[i].u * (float)srcSlot->w) / (float)g_atlasW;
                     float av = 1.0f - ((float)srcSlot->y + TV[i].v * (float)srcSlot->h) / (float)g_atlasH;
-                    rlTexCoord2f(au, av);
+                    ps2x::gfx::rgTexCoord2f(au, av);
                 } else
                 {
                     float uu = TV[i].u, vv = TV[i].v; const float q = TV[i].q;
@@ -18446,17 +18446,17 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if ((q != 1.0f || s_fbouv2 || g_curDecalCmd == &c) && fromFbo && c.srcTexW > 0 && c.srcTexH > 0 && tex.width > 0 && tex.height > 0
                         && (tex.width != c.srcTexW || tex.height != c.srcTexH))
                     { uu *= (float)c.srcTexW / (float)tex.width; vv *= (float)c.srcTexH / (float)tex.height; }
-                    if (q != 1.0f) rlTexCoord2f(uu, vflip ? (q - vv) : vv);
-                    else rlTexCoord2f(uu, vflip ? 1.0f - vv : vv);
+                    if (q != 1.0f) ps2x::gfx::rgTexCoord2f(uu, vflip ? (q - vv) : vv);
+                    else ps2x::gfx::rgTexCoord2f(uu, vflip ? 1.0f - vv : vv);
                 }
                 if (g_dbgDecalCmd == &c && i == 0) { static int n4 = 0; if (n4++ < 6) { auto fit3 = g_fbos.find(336u); if (fit3 != g_fbos.end()) { int prevFb = 0, att = -1, attType = -1; glGetIntegerv(0x8CA6, &prevFb); glBindFramebuffer(0x8D40, fit3->second.rt.id); glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD1, &att); glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD0, &attType); glBindFramebuffer(0x8D40, (unsigned)prevFb); std::fprintf(stderr, "[decaldbg]   ATTACH fbp336 fbo=%u colour attachment name=%d type=0x%x | decal samples tex.id=%u (rt.texture.id=%u)\n", fit3->second.rt.id, att, attType, tex.id, fit3->second.rt.texture.id); } } }
                 if (g_dbgDecalCmd == &c && i == 0) { static int n2 = 0; float gt[4] = {-9,-9,-9,-9}, gf = -9, gp = -9, gc = -9, gi = -9, gx = -9, ga = -9, gr = -9, gz = -9, gzs = -9; if (g_locZTex >= 0) glGetUniformfv(g_shader.id, g_locZTex, &gz); { int lz = GetShaderLocation(g_shader, "uZScale"); if (lz >= 0) glGetUniformfv(g_shader.id, lz, &gzs); } if (g_locTexa >= 0) glGetUniformfv(g_shader.id, g_locTexa, gt); if (g_locTcc >= 0) glGetUniformfv(g_shader.id, g_locTcc, &gc); if (g_locIdxMode >= 0) glGetUniformfv(g_shader.id, g_locIdxMode, &gi); if (g_locTfx >= 0) glGetUniformfv(g_shader.id, g_locTfx, &gx); if (g_locAtst >= 0) glGetUniformfv(g_shader.id, g_locAtst, &ga); if (g_locAref >= 0) glGetUniformfv(g_shader.id, g_locAref, &gr); if (g_locFboOne >= 0) glGetUniformfv(g_shader.id, g_locFboOne, &gf); if (g_locPerspQ >= 0) glGetUniformfv(g_shader.id, g_locPerspQ, &gp); if (n2++ < 6000) std::fprintf(stderr, "[decaldbg]   EMIT generic tri: chunk=%d curFbp=%u vflip=%d fromFbo=%d tex.id=%u %dx%d src=%dx%d u/v/q v0=(%.3f,%.3f,%.4f) uRegion=(%.4f,%.4f,%.4f,%.0f) | GL uTexa=(%.2f,%.2f,%.2f,%.2f) cache=(%.2f,%.2f,%.2f,%.2f) uFboOne=%.1f uPerspQ=%.1f uTcc=%.1f uIdxMode=%.1f uTfx=%.1f uAtst=%.1f uAref=%.2f uZTex=%.1f uZScale=%.3f\n", (int)m_chunkMode, curFbp, (int)vflip, (int)fromFbo, tex.id, tex.width, tex.height, (int)c.srcTexW, (int)c.srcTexH, TV[0].u, TV[0].v, TV[0].q, g_curReg[0], g_curReg[1], g_curReg[2], g_curReg[3], gt[0], gt[1], gt[2], gt[3], g_curTexa[0], g_curTexa[1], g_curTexa[2], g_curTexa[3], gf, gp, gc, gi, gx, ga, gr, gz, gzs); }
                 rlNormal3f(TV[i].q, 0.0f, 1.0f);   // .x carries the GS q (PS2X_PERSPQ)
                 // ortho maps window_depth = -z, so pass -z to store the intended depth.
-                if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
-                else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
+                if (depthOn) ps2x::gfx::rgVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                else ps2x::gfx::rgVertex2f(TV[i].x + offX, TV[i].y + offY);
             }
-            rlEnd();
+            ps2x::gfx::rgEnd();
             }   // [glhoist] end of the per-triangle emit
             {   // [decalbatch] consecutive shadow-decal pieces share every GL state and the same FBO texture: keep the
                 // texture bound so rlgl accumulates them in ONE draw entry (one glDrawArrays per run of pieces instead of
@@ -18467,7 +18467,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     const GsGpuRenderer::DrawCmd &n = DC[ci + 1];
                     return n.isTriangle && n.srcPsm == 1u && n.srcTbp0 == 10752u && (n.blendMode & 0xFFu) == 0x44u && !n.isTransfer && n.destFbp == c.destFbp;
                 };
-                if (!nextIsDecal()) rlSetTexture(0);
+                if (!nextIsDecal()) ps2x::gfx::rgSetTexture(0);
             }
 
             // [pixprobe] (with PS2X_SRCDIAG): after emitting a character triangle, flush the
@@ -18612,16 +18612,16 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); ps2x::gfx::rgSetTexture(tex.id);
                         ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                        rlBegin(RL_QUADS);
-                        rlColor4ub(255, 255, 255, 255);
+                        ps2x::gfx::rgBegin(RL_QUADS);
+                        ps2x::gfx::rgColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
-                        rlTexCoord2f(0.02f, 0.25f); rlVertex2f(10, 10);
-                        rlTexCoord2f(0.02f, 0.25f); rlVertex2f(10, 18);
-                        rlTexCoord2f(0.02f, 0.25f); rlVertex2f(18, 18);
-                        rlTexCoord2f(0.02f, 0.25f); rlVertex2f(18, 10);
-                        rlEnd();
+                        ps2x::gfx::rgTexCoord2f(0.02f, 0.25f); ps2x::gfx::rgVertex2f(10, 10);
+                        ps2x::gfx::rgTexCoord2f(0.02f, 0.25f); ps2x::gfx::rgVertex2f(10, 18);
+                        ps2x::gfx::rgTexCoord2f(0.02f, 0.25f); ps2x::gfx::rgVertex2f(18, 18);
+                        ps2x::gfx::rgTexCoord2f(0.02f, 0.25f); ps2x::gfx::rgVertex2f(18, 10);
+                        ps2x::gfx::rgEnd();
                         // Twin quad with NEGATIVE V (like the real char draws) at (30,10):
                         // GL REPEAT should wrap -0.75 -> 0.25 and give the same color as the
                         // positive twin. If this one is black, negative UVs are the killer.
@@ -18664,17 +18664,17 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); ps2x::gfx::rgSetTexture(tex.id);
                         ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                        rlBegin(RL_QUADS);
-                        rlColor4ub(255, 255, 255, 255);
+                        ps2x::gfx::rgBegin(RL_QUADS);
+                        ps2x::gfx::rgColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(30, 10);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(30, 18);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(38, 18);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(38, 10);
-                        rlEnd();
-                        rlSetTexture(0);
+                        ps2x::gfx::rgTexCoord2f(0.02f, -0.75f); ps2x::gfx::rgVertex2f(30, 10);
+                        ps2x::gfx::rgTexCoord2f(0.02f, -0.75f); ps2x::gfx::rgVertex2f(30, 18);
+                        ps2x::gfx::rgTexCoord2f(0.02f, -0.75f); ps2x::gfx::rgVertex2f(38, 18);
+                        ps2x::gfx::rgTexCoord2f(0.02f, -0.75f); ps2x::gfx::rgVertex2f(38, 10);
+                        ps2x::gfx::rgEnd();
+                        ps2x::gfx::rgSetTexture(0);
                         flushBatch(__LINE__);
                         rlEnableColorBlend();
                         // Third twin at (50,10): drawn under the CHAR DRAW'S OWN blend state
@@ -18719,17 +18719,17 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); ps2x::gfx::rgSetTexture(tex.id);
                         ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                        rlBegin(RL_QUADS);
-                        rlColor4ub(128, 128, 128, 255);
+                        ps2x::gfx::rgBegin(RL_QUADS);
+                        ps2x::gfx::rgColor4ub(128, 128, 128, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(50, 10);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(50, 18);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(58, 18);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(58, 10);
-                        rlEnd();
-                        rlSetTexture(0);
+                        ps2x::gfx::rgTexCoord2f(0.02f, -0.75f); ps2x::gfx::rgVertex2f(50, 10);
+                        ps2x::gfx::rgTexCoord2f(0.02f, -0.75f); ps2x::gfx::rgVertex2f(50, 18);
+                        ps2x::gfx::rgTexCoord2f(0.02f, -0.75f); ps2x::gfx::rgVertex2f(58, 18);
+                        ps2x::gfx::rgTexCoord2f(0.02f, -0.75f); ps2x::gfx::rgVertex2f(58, 10);
+                        ps2x::gfx::rgEnd();
+                        ps2x::gfx::rgSetTexture(0);
                         flushBatch(__LINE__);
                         unsigned char q[4] = {9, 9, 9, 9};
                         unsigned char qn[4] = {9, 9, 9, 9};
@@ -18825,16 +18825,16 @@ if (done.size() < 14 && !done.count(c.texKey))
         beginFbp(displayFbp);
         Texture2D tt = g_glTex.begin()->second;
         for (auto &kv : g_glTex) if (kv.second.width >= 256) { tt = kv.second; break; }
-        rlSetTexture(tt.id);
-        rlBegin(RL_QUADS);
-        rlColor4ub(255, 255, 255, 255);
+        ps2x::gfx::rgSetTexture(tt.id);
+        ps2x::gfx::rgBegin(RL_QUADS);
+        ps2x::gfx::rgColor4ub(255, 255, 255, 255);
         rlNormal3f(0.0f, 0.0f, 1.0f);
-        rlTexCoord2f(0.0f, 0.0f); rlVertex2f(50.0f, 300.0f);
-        rlTexCoord2f(0.0f, 1.0f); rlVertex2f(50.0f, 430.0f);
-        rlTexCoord2f(1.0f, 1.0f); rlVertex2f(250.0f, 430.0f);
-        rlTexCoord2f(1.0f, 0.0f); rlVertex2f(250.0f, 300.0f);
-        rlEnd();
-        rlSetTexture(0);
+        ps2x::gfx::rgTexCoord2f(0.0f, 0.0f); ps2x::gfx::rgVertex2f(50.0f, 300.0f);
+        ps2x::gfx::rgTexCoord2f(0.0f, 1.0f); ps2x::gfx::rgVertex2f(50.0f, 430.0f);
+        ps2x::gfx::rgTexCoord2f(1.0f, 1.0f); ps2x::gfx::rgVertex2f(250.0f, 430.0f);
+        ps2x::gfx::rgTexCoord2f(1.0f, 0.0f); ps2x::gfx::rgVertex2f(250.0f, 300.0f);
+        ps2x::gfx::rgEnd();
+        ps2x::gfx::rgSetTexture(0);
         flushBatch(__LINE__);
     }
 
@@ -18860,13 +18860,13 @@ if (done.size() < 14 && !done.count(c.texKey))
             if (fit != g_fbos.end() && fit->second.rt.texture.id != 0)
             {
                 endMode();
-                BeginTextureMode(fit->second.rt);
+                ps2x::gfx::rgBeginTextureMode(fit->second.rt);
                 const int fh2 = fit->second.h;
                 const int rx = 60, rw = 170, ryTop = 15, rh = 20;
                 const int ry = fh2 - (ryTop + rh); // FBO is bottom-up
                 std::vector<uint8_t> px((size_t)rw * rh * 4);
                 glReadPixels(rx, ry, rw, rh, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, px.data());
-                EndTextureMode();
+                ps2x::gfx::rgEndTextureMode();
                 char prof[176];
                 for (int x = 0; x < rw; x += 2)
                 {
@@ -18890,11 +18890,11 @@ if (done.size() < 14 && !done.count(c.texKey))
     if (s_atlas && std::getenv("PS2X_ATLASTEST") && g_atlas.texture.id != 0 && g_atlasSlots.count(displayFbp))
     {
         AtlasSlot &ts = g_atlasSlots[displayFbp];
-        BeginTextureMode(g_atlas);
-        rlDisableScissorTest();
+        ps2x::gfx::rgBeginTextureMode(g_atlas);
+        ps2x::gfx::rgDisableScissorTest();
         DrawRectangle(ts.x + 40, ts.y + 40, 200, 160, Color{255, 0, 255, 255});
         flushBatch(__LINE__);
-        EndTextureMode();
+        ps2x::gfx::rgEndTextureMode();
     }
 
     // PS2X_TEXDIAG: per-frame draw census -> pin WHY the battle is black in GPU. Logs how draws
@@ -19459,11 +19459,11 @@ if (done.size() < 14 && !done.count(c.texKey))
             for (auto &kv : g_fbos)
             {
                 if (kv.second.rt.texture.id != outId) continue;
-                BeginTextureMode(kv.second.rt);
-                rlDisableScissorTest();
+                ps2x::gfx::rgBeginTextureMode(kv.second.rt);
+                ps2x::gfx::rgDisableScissorTest();
                 DrawRectangle(60, 60, 120, 120, Color{255, 0, 255, 255});
                 flushBatch(__LINE__);
-                EndTextureMode();
+                ps2x::gfx::rgEndTextureMode();
                 break;
             }
         }
