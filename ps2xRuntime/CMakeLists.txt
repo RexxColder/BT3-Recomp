@@ -236,6 +236,30 @@ if(WIN32 AND NOT PS2X_IS_VITA)
     endif()
 endif()
 
+# [altGL probe] The standalone OpenGL render layer (loader + gfx/gl + present). Built on every
+# platform so the port can be validated in parallel with the raylib GL path and the D3D11 layer.
+# raylib is used ONLY for the window/context here (transition); see tools/gl_probe/main.cpp.
+if(NOT PS2X_IS_VITA)
+    add_executable(ps2xGlProbe
+        tools/gl_probe/main.cpp
+        src/gfx/gl/GlApi.cpp
+        src/gfx/gl/GlDevice.cpp
+        src/gfx/gl/GlGfx.cpp
+    )
+    target_include_directories(ps2xGlProbe PRIVATE src)
+    if(WIN32)
+        target_link_libraries(ps2xGlProbe PRIVATE raylib opengl32)
+    else()
+        find_package(OpenGL REQUIRED)
+        target_link_libraries(ps2xGlProbe PRIVATE raylib OpenGL::GL ${CMAKE_DL_LIBS})
+    endif()
+    if(MSVC)
+        target_compile_options(ps2xGlProbe PRIVATE /W4)
+    else()
+        target_compile_options(ps2xGlProbe PRIVATE -Wall -Wextra)
+    endif()
+endif()
+
 add_library(ps2_host_backend INTERFACE)
 
 set(PS2X_DEFAULT_BOOT_ELF_DEFINE "")
