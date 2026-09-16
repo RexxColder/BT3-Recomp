@@ -82,9 +82,12 @@ namespace ps2x::gfx { namespace gl
         Shader(const Shader &) = delete;
         Shader &operator=(const Shader &) = delete;
 
-        // GLSL sources; dual-source outputs (location 0 index 0/1) are bound when the driver
-        // exposes glBindFragDataLocationIndexed.
-        bool Compile(GlDevice &dev, const char *vsSource, const char *psSource);
+        // GLSL sources. For dual-source blending pass outIndex0/outIndex1 (e.g. "finalColor" /
+        // "blendAlpha"): they are bound with glBindFragDataLocationIndexed before linking. Some
+        // drivers (AMD) ignore the layout(location,index) qualifier and alias the two outputs
+        // unless this is called, which silently drops the draw.
+        bool Compile(GlDevice &dev, const char *vsSource, const char *psSource,
+                     const char *outIndex0 = nullptr, const char *outIndex1 = nullptr);
         void Destroy();
         void Bind(GlDevice &dev);                          // glUseProgram
         void SetFloat(const char *name, float v);

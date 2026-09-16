@@ -182,6 +182,7 @@ namespace ps2x::gfx { namespace gl
     unsigned RenderTarget::GLFramebuffer() const { return m_impl->fbo; }
 
     // ------------------------------------------------------------------ Shader
+    static unsigned g_curProg = 0;   // last program made current through this layer
     struct Shader::Impl
     {
         unsigned prog = 0;
@@ -217,7 +218,8 @@ namespace ps2x::gfx { namespace gl
         return s;
     }
 
-    bool Shader::Compile(GlDevice &dev, const char *vsSource, const char *psSource)
+    bool Shader::Compile(GlDevice &dev, const char *vsSource, const char *psSource,
+                         const char *outIndex0, const char *outIndex1)
     {
         (void)dev;
         Impl &s = *m_impl;
@@ -227,6 +229,13 @@ namespace ps2x::gfx { namespace gl
         s.prog = ps2xgl::glCreateProgram();
         ps2xgl::glAttachShader(s.prog, vs);
         ps2xgl::glAttachShader(s.prog, fs);
+        // Dual-source outputs must be bound before linking: AMD aliases location 0 index 0/1 (and
+        // drops the draw) if only the layout qualifier is used. No-op for single-output shaders.
+        if (outIndex0 && outIndex1 && ps2xgl::glBindFragDataLocationIndexed)
+        {
+            ps2xgl::glBindFragDataLocationIndexed(s.prog, 0u, 0u, outIndex0);
+            ps2xgl::glBindFragDataLocationIndexed(s.prog, 0u, 1u, outIndex1);
+        }
         ps2xgl::glLinkProgram(s.prog);
         ps2xgl::glDeleteShader(vs);
         ps2xgl::glDeleteShader(fs);
@@ -251,13 +260,21 @@ namespace ps2x::gfx { namespace gl
         s.prog = 0; s.locs.clear();
     }
 
-    void Shader::Bind(GlDevice &dev) { (void)dev; if (m_impl->prog) ps2xgl::glUseProgram(m_impl->prog); }
-    void Shader::SetFloat(const char *n, float v) { const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform1f(l, v); }
-    void Shader::SetVec2(const char *n, float x, float y) { const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform2f(l, x, y); }
-    void Shader::SetVec3(const char *n, float x, float y, float z) { const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform3f(l, x, y, z); }
-    void Shader::SetVec4(const char *n, float x, float y, float z, float w) { const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform4f(l, x, y, z, w); }
-    void Shader::SetInt(const char *n, int v) { const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform1i(l, v); }
-    void Shader::SetMat4(const char *n, const float m[16]) { const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniformMatrix4fv(l, 1, ps2xgl::GL_FALSE, m); }
+    void Shader::Bind(GlDevice &dev)
+    {
+        (void)dev;
+        if (m_impl->prog) { ps2xgl::glUseProgram(m_impl->prog); g_curProg = m_impl->prog; }
+    }
+    // Uniform setters silently no-op (and raise GL_INVALID_OPERATION) if no program is current,
+    // which for a GS shader leaves e.g. uAtst at 0 -> every fragment is alpha-tested away and the
+    // draw disappears. Make each setter guarantee its program is bound.
+    static void ensureCurrent(unsigned prog) { if (prog && g_curProg != prog) { ps2xgl::glUseProgram(prog); g_curProg = prog; } }
+    void Shader::SetFloat(const char *n, float v) { ensureCurrent(m_impl->prog); const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform1f(l, v); }
+    void Shader::SetVec2(const char *n, float x, float y) { ensureCurrent(m_impl->prog); const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform2f(l, x, y); }
+    void Shader::SetVec3(const char *n, float x, float y, float z) { ensureCurrent(m_impl->prog); const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform3f(l, x, y, z); }
+    void Shader::SetVec4(const char *n, float x, float y, float z, float w) { ensureCurrent(m_impl->prog); const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform4f(l, x, y, z, w); }
+    void Shader::SetInt(const char *n, int v) { ensureCurrent(m_impl->prog); const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform1i(l, v); }
+    void Shader::SetMat4(const char *n, const float m[16]) { ensureCurrent(m_impl->prog); const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniformMatrix4fv(l, 1, ps2xgl::GL_FALSE, m); }
     bool Shader::Valid() const { return m_impl->prog != 0; }
 
     // ----------------------------------------------------------------- Renderer
