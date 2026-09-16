@@ -615,11 +615,32 @@ static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
 #endif
 }
 
+extern "C" const char *ps2xExeDirC();   // [mergefix] main.cpp: <exeDir> (honors PS2X_EXEDIR)
+
 void PS2SettingsOverlay::preloadSettings()
 {
-    const std::string configPath = s_configDir.empty()
-        ? (std::filesystem::current_path() / kConfigFileName).string()
-        : (std::filesystem::path(s_configDir) / kConfigFileName).string();
+    // [cfgpath] The deploy keeps settings.toml in <exeDir>/savedata, but the overlay only
+    // looked in the CWD unless setConfigDirectory() had been called (never, in practice), so a
+    // launch that did not set the CWD to the deploy silently dropped every setting -- notably
+    // texture_pack, i.e. "the texture pack does not load". Prefer an existing file: CWD first,
+    // then <exeDir>/savedata, then <exeDir>; fall back to the CWD path.
+    std::filesystem::path cfgPath;
+    if (!s_configDir.empty())
+        cfgPath = std::filesystem::path(s_configDir) / kConfigFileName;
+    else
+    {
+        const std::filesystem::path cwd = std::filesystem::current_path() / kConfigFileName;
+        const char *xd = ps2xExeDirC();
+        std::error_code ec;
+        const std::filesystem::path exeSaved = (xd && xd[0]) ? (std::filesystem::path(xd) / "savedata" / kConfigFileName) : std::filesystem::path();
+        const std::filesystem::path exeRoot = (xd && xd[0]) ? (std::filesystem::path(xd) / kConfigFileName) : std::filesystem::path();
+        if (std::filesystem::exists(cwd, ec)) cfgPath = cwd;
+        else if (!exeSaved.empty() && std::filesystem::exists(exeSaved, ec)) cfgPath = exeSaved;
+        else if (!exeRoot.empty() && std::filesystem::exists(exeRoot, ec)) cfgPath = exeRoot;
+        else cfgPath = cwd;
+    }
+    const std::string configPath = cfgPath.string();
+    s_configDir = cfgPath.parent_path().string();
     int rendererPre = Settings::kRendererDefault;   // [renderer] exported below even when no toml exists yet
     bool texPackPre = false;
     bool forceBilinearPre = true;

@@ -327,17 +327,22 @@ bool loadReplacement(const TexIdent &id, uint64_t texKey, std::vector<uint8_t> &
     std::lock_guard<std::mutex> lk(st->mtx);
     auto rd = st->ready.find(key);
     if (rd != st->ready.end())
-    {
+    {   // [texreplace-persist] COPY the blob out instead of consuming it. The old one-shot
+        // move+erase made every re-decode of the same texture MISS: the original drew again
+        // until the worker re-decoded it, so the 2D UI visibly cycled original -> new -> original
+        // every few seconds. Keep the decoded blob cached (bounded by PS2X_TEXPACK_CACHE_MB,
+        // oldest-first eviction) so any re-decode is a stable HIT. PS2X_TEXPACK_ONESHOT=1
+        // restores the old consume-on-use behaviour.
+        static const bool s_oneShot = [](){ const char *v = std::getenv("PS2X_TEXPACK_ONESHOT"); return v && v[0] && v[0] != '0'; }();
         Blob &b = rd->second;
-        rgba = std::move(b.rgba); w = b.w; h = b.h; fmt = b.fmt;
-        st->readyBytes -= rgba.size();
-        st->ready.erase(rd);
+        rgba = b.rgba; w = b.w; h = b.h; fmt = b.fmt;
         st->swap.erase(texKey);
         ++st->consumed;
+        if (s_oneShot) { st->readyBytes -= rgba.size(); st->ready.erase(rd); }
         {   static unsigned long s_n = 0;
             if (++s_n <= 3 || (s_n % 500) == 0)
-                std::fprintf(stderr, "[texpackasync] swapped in #%lu (decoded %lu, dropped %lu, pending %zu)\n",
-                             s_n, st->decoded, st->dropped, st->pending.size()); }
+                std::fprintf(stderr, "[texpackasync] swapped in #%lu (decoded %lu, dropped %lu, pending %zu)%s\n",
+                             s_n, st->decoded, st->dropped, st->pending.size(), s_oneShot ? "" : " [persistent]"); }
         return true;
     }
     if (st->failed.count(key) || st->pending.count(key)) return false;
