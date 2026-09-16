@@ -5014,7 +5014,9 @@ void PS2Runtime::run()
             }
             {   // [texmega] PS2X_TEXMEGA=1: F9 arms a 6-second texture-replacement mega dump
                 // (lookups + originals/replacements + pack index) into <exeDir>/logs/texmega.
-                static const bool s_tm = [](){ const char *v = std::getenv("PS2X_TEXMEGA"); return v && v[0] && v[0] != '0'; }();
+                // [texmega] ON by default so the Launcher (no env) can trigger it: press F9.
+                // PS2X_TEXMEGA=0 disables.
+                static const bool s_tm = [](){ const char *v = std::getenv("PS2X_TEXMEGA"); return !(v && v[0] == '0'); }();
                 if (s_tm && IsKeyPressed(KEY_F9))
                 {
                     const char *xd = ps2xExeDirC();
