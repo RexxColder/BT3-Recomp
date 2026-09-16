@@ -5513,6 +5513,28 @@ struct Ps2xRollback
         }
         if (ps2NetSyncIsHost())
         {
+            // [statesync] Character select is not adoptable until its initial load has finished. The jump
+            // "settles" the instant the screen appears, but the game then spends a couple of seconds
+            // loading the roster and building per-character structures. A state captured mid-init leaves a
+            // handle half-set (t6=0xffffffff, polled forever in FUN_00263278) so the joiner freezes -- even
+            // with no desync (bt34.log: a sync at settle+~67 frames froze; the working sync in bt32.log was
+            // settle+~6900). Wait a stabilisation window after the settle before publishing. Frames since
+            // the screen appeared; env PS2X_NET_SYNC_SETTLE (default 300 = ~5 s). Auto-jump only: the manual
+            // path syncs from a screen the user already parked on.
+            if (ps2NetAutoJump())
+            {
+                static const uint32_t s_settleWin = [](){ const char *v = std::getenv("PS2X_NET_SYNC_SETTLE"); const int n = v && v[0] ? std::atoi(v) : 300; return n > 0 ? (uint32_t)n : 0u; }();
+                static uint32_t s_settleSession = 0xFFFFFFFFu; static uint64_t s_settleFrame = 0;
+                if (s_settleSession != ps2NetSession()) { s_settleSession = ps2NetSession(); s_settleFrame = g_gate.waitFrame; }   // first host boundary past the settle gate ~= when the screen appeared
+                if (g_gate.waitFrame < s_settleFrame + s_settleWin)
+                {
+                    static uint32_t s_n = 0;
+                    if ((s_n++ % 120u) == 0u)
+                        std::fprintf(stderr, "[statesync] host: letting character select stabilise (%llu/%u frames since it appeared)\n",
+                                     (unsigned long long)(g_gate.waitFrame - s_settleFrame), s_settleWin);
+                    return false;
+                }
+            }
             // Not from inside the boot: the logo / movie-skip phase reaches the frame kick through call
             // chains the joiner passes exactly once, early -- a state published there is never adoptable
             // later. The title is up by ~frame 230 with the intro skipped; wait a little past that.
