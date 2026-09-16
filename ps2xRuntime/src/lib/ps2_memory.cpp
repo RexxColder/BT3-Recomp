@@ -594,7 +594,9 @@ static uint64_t ps2xLayoutMix(uint64_t h, uint64_t v) { h ^= v; return h * 10995
 extern "C" uint64_t ps2xMemDeviceLayoutHash()
 {   // [statesync] sizes of everything the DEV section writes raw
     uint64_t h = 1469598103934665603ull;
-    h = ps2xLayoutMix(h, sizeof(decltype(MemDeviceSnap::gif)::value_type)); h = ps2xLayoutMix(h, sizeof(decltype(MemDeviceSnap::io)::mapped_type)); h = ps2xLayoutMix(h, sizeof(decltype(MemDeviceSnap::dmac)::value_type));
+    // transfers are written field by field (snapWriteTransfers); PendingTransfer holds a std::vector whose size
+    // is a standard-library detail, so it must not be part of the layout
+    h = ps2xLayoutMix(h, sizeof(decltype(MemDeviceSnap::io)::mapped_type)); h = ps2xLayoutMix(h, sizeof(decltype(MemDeviceSnap::dmac)::value_type));
     return h;
 }
 extern "C" bool ps2xMemDeviceSerialize(const void *h, std::vector<uint8_t> &out)

@@ -4916,7 +4916,9 @@ static std::string ps2xSyncFormatId()
     auto fnv = [](uint64_t h, uint64_t v) { h ^= v; return h * 1099511628211ull; };
     // layout: the sizes of everything written raw
     uint64_t layout = 1469598103934665603ull;
-    layout = fnv(layout, sizeof(R5900Context)); layout = fnv(layout, sizeof(GuestTls)); layout = fnv(layout, sizeof(FrameGate)); layout = fnv(layout, sizeof(Ps2xSchedExtra));
+    // only types the blob writes RAW belong here: GuestTls (holds an unordered_map) and FrameGate (pointers) are
+    // never serialized, and their sizes differ between standard libraries
+    layout = fnv(layout, sizeof(R5900Context)); layout = fnv(layout, sizeof(Ps2xSchedExtra));
     layout = fnv(layout, ps2xSimSnapLayoutHash()); layout = fnv(layout, ps2xKernelStateLayoutHash()); layout = fnv(layout, ps2xSifStateLayoutHash()); layout = fnv(layout, ps2xMemDeviceLayoutHash());
     // program: which table slots hold code (the same ELF, patches and overlay)
     uint64_t program = fnv(fnv(1469598103934665603ull, g_ps2RecompiledFunctionTableBase), g_ps2RecompiledFunctionTableSlotCount);
