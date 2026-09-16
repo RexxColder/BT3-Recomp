@@ -46,6 +46,7 @@ namespace
     bool g_d3dGsInit = false;
     std::unordered_map<uint64_t, ps2x::gfx::Texture *> g_d3dGsTex;   // texKey -> D3D texture
     ps2x::gfx::RenderTarget *g_d3dGsRt = nullptr;   // this frame's render target
+    ps2x::gfx::Texture *g_d3dPresentTex = nullptr;  // native texture of the fbp being presented
     int g_d3dGsRtW = 0, g_d3dGsRtH = 0;
     uint32_t g_d3dGsBegun = 0xFFFFFFFFu;            // frameGen the RT was last bound+cleared for
     inline ps2x::gfx::Texture *d3dGsTexFor(uint64_t key)
@@ -1349,6 +1350,37 @@ namespace
         const float W = (float)(w > 0 ? w : 512), H = (float)(h > 0 ? h : 448);
         const float m[16] = {2.0f / W, 0, 0, 0,  0, -2.0f / H, 0, 0,  0, 0, 1, 0,  -1, 1, 0, 1};
         g_d3dGsSh.SetMat4("mvp", m);
+    }
+    // Bind the dest fbp's native RT (clear once per frameGen), mirror the uniforms/state and set
+    // the MVP. Returns false when there is no native RT for the current draw target.
+    static bool d3dGsPrepDest(uint32_t curRealFbp, uint32_t frameGen, int &rtW, int &rtH)
+    {
+        ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+        auto dit = g_fbos.find(curRealFbp);
+        if (dit == g_fbos.end() || !dit->second.d3dRt) return false;
+        if (dit->second.d3dGen != frameGen)
+        { dit->second.d3dRt->Bind(*dev); dit->second.d3dRt->Clear(*dev, 0, 0, 0, 1); dit->second.d3dGen = frameGen; }
+        else dit->second.d3dRt->Bind(*dev);
+        rtW = (int)dit->second.d3dRt->Width(); rtH = (int)dit->second.d3dRt->Height();
+        d3dGsMirrorUniforms();
+        d3dGsMirrorState(rtH, rtH);
+        d3dGsSetMvp(rtW, rtH);
+        return true;
+    }
+    static ps2x::gfx::Vertex d3dGsVtx(const GsGpuRenderer::Vtx &v, float offX, float offY, bool vflip, bool depthOn)
+    {
+        ps2x::gfx::Vertex o{};
+        o.x = v.x + offX; o.y = v.y + offY;
+        o.u = v.u; o.v = vflip ? 1.0f - v.v : v.v;
+        o.r = v.r; o.g = v.g; o.b = v.b; o.a = v.a;
+        o.q = v.q; o.z = depthOn ? -v.z : 0.0f;
+        return o;
+    }
+    static ps2x::gfx::Vertex d3dGsVtxXY(float x, float y, float u, float v, unsigned char r, unsigned char g, unsigned char b, unsigned char a, float q, float z)
+    {
+        ps2x::gfx::Vertex o{};
+        o.x = x; o.y = y; o.u = u; o.v = v; o.r = r; o.g = g; o.b = b; o.a = a; o.q = q; o.z = z;
+        return o;
     }
 #endif
     // [texreplace] Push uAlphaFix for the texture about to be BOUND -- a pack replacement is
@@ -9528,7 +9560,14 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     // ---- Completed-frame latch (PS2X_FRONTLATCH=0 disables) ----
     // Per list: which scene buffer (f0/f112) it predominantly draws. A frame COMPLETES at
     // the boundary where this switches buffers; latch a copy of the finished one there.
-    static const bool s_latch = [](){ const char *v = std::getenv("PS2X_FRONTLATCH"); return !(v && v[0] == '0'); }();
+    static const bool s_latch = [](){
+#if defined(_WIN32)
+        // [d3d11] the front-latch is a GL render texture with no native counterpart yet, so in
+        // the native GS path present the display fbp directly (otherwise the present would be
+        // a GL latch the D3D present cannot see).
+        if (d3dGsOn()) return false;
+#endif
+        const char *v = std::getenv("PS2X_FRONTLATCH"); return !(v && v[0] == '0'); }();
     ragStat.phase(8);
     std::vector<uint32_t> listSceneFbp;
     // [latchseg] A barrier segment render (m_segMode) is NOT a frame list: its predominant
@@ -17158,6 +17197,28 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
                     || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                 ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
+#if defined(_WIN32)
+                if (d3dGsOn() && d3dGsEnsure())
+                {
+                    int rtW = 0, rtH = 0;
+                    if (d3dGsPrepDest(curRealFbp, frameGen, rtW, rtH))
+                    {
+                        g_d3dGsSh.SetVec4("colDiffuse", 1, 1, 1, 1);
+                        g_d3dGsR.SetShader(&g_d3dGsSh);
+                        ps2x::gfx::Texture *dt = d3dFboTexForGl(tex.id);
+                        if (!dt) dt = d3dGsTexFor(c.texKey);
+                        g_d3dGsR.SetTexture(dt);
+                        const float zz = sprDepth ? -(float)c.z : 0.0f;
+                        g_d3dGsR.DrawQuad(
+                            d3dGsVtxXY(c.dx0 + offX, c.dy0 + offY, u0, v0, c.r, c.g, c.b, c.a, 1.0f, zz),
+                            d3dGsVtxXY(c.dx0 + offX, c.dy1 + offY, u0, v1, c.r, c.g, c.b, c.a, 1.0f, zz),
+                            d3dGsVtxXY(c.dx1 + offX, c.dy1 + offY, u1, v1, c.r, c.g, c.b, c.a, 1.0f, zz),
+                            d3dGsVtxXY(c.dx1 + offX, c.dy0 + offY, u1, v0, c.r, c.g, c.b, c.a, 1.0f, zz));
+                    }
+                }
+                else
+#endif
+                {
                 rlBegin(RL_QUADS);
                 {   // [emitA] PS2X_CMPWR=1: the vertex alpha actually emitted for the mask composites
                     static const bool s_ea = [](){ const char *v = std::getenv("PS2X_CMPWR"); return v && v[0] && v[0] != '0'; }();
@@ -17185,6 +17246,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 }
                 rlEnd();
                 rlSetTexture(0);
+                }
                 if (isolateDraw) flushBatch(__LINE__);   // and submit it before anything can change the uniforms
                 {   // [edgestage] PS2X_EDGESTAGE=1: dump the base f336 FBO when the edge generator moves from one
                     // stage to the next (DECAL -> R-sub -> G-sub -> stamps), classified by fbmsk; logs the fields too.
@@ -17907,6 +17969,37 @@ if (done.size() < 14 && !done.count(c.texKey))
                     || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                         rlCheckRenderBatchLimit(4);
                         ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
+#if defined(_WIN32)
+                        if (d3dGsOn() && d3dGsEnsure())
+                        {
+                            ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+                            auto dit = g_fbos.find(curRealFbp);
+                            ps2x::gfx::RenderTarget *dest = (dit != g_fbos.end()) ? dit->second.d3dRt : nullptr;
+                            if (dest)
+                            {
+                                if (dit->second.d3dGen != frameGen)
+                                { dest->Bind(*dev); dest->Clear(*dev, 0, 0, 0, 1); dit->second.d3dGen = frameGen; }
+                                else dest->Bind(*dev);
+                                const int rtW = (int)dest->Width(), rtH = (int)dest->Height();
+                                d3dGsMirrorUniforms(); d3dGsMirrorState(rtH, rtH); d3dGsSetMvp(rtW, rtH);
+                                g_d3dGsSh.SetVec4("colDiffuse", 1, 1, 1, 1);
+                                g_d3dGsR.SetShader(&g_d3dGsSh);
+                                ps2x::gfx::Texture *dt = d3dFboTexForGl(tex.id);
+                                if (!dt) dt = d3dGsTexFor(c.texKey);
+                                g_d3dGsR.SetTexture(dt);
+                                auto mktri = [&](int i) {
+                                    ps2x::gfx::Vertex vx{};
+                                    vx.x = c.tri[i].x + offX; vx.y = c.tri[i].y + offY;
+                                    vx.u = c.tri[i].u; vx.v = vflip ? 1.0f - c.tri[i].v : c.tri[i].v;
+                                    vx.r = c.tri[i].r; vx.g = c.tri[i].g; vx.b = c.tri[i].b; vx.a = c.tri[i].a;
+                                    vx.q = c.tri[i].q; vx.z = depthOn ? -c.tri[i].z : 0.0f;
+                                    return vx; };
+                                g_d3dGsR.DrawTriangle(mktri(0), mktri(1), mktri(2));
+                            }
+                        }
+                        else
+#endif
+                        {
                         rlBegin(RL_QUADS);
                         const int qd[4] = {0, 1, 2, 2};
                         for (int k = 0; k < 4; ++k) {
@@ -17935,6 +18028,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             else rlVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
                         }
                         rlEnd();
+                        }
                         rlSetTexture(0);
                         flushBatch(__LINE__);
                         uint32_t px = 0;
@@ -18010,6 +18104,29 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (tbad) continue;
                 if (et > 0u) rlCheckRenderBatchLimit(4);   // et == 0 was checked above with the region setup
             }
+#if defined(_WIN32)
+            if (d3dGsOn() && d3dGsEnsure())
+            {   // [d3d11] emit this triangle natively and skip the rlgl batch.
+                int rtW = 0, rtH = 0;
+                if (d3dGsPrepDest(curRealFbp, frameGen, rtW, rtH))
+                {
+                    g_d3dGsSh.SetVec4("colDiffuse", 1, 1, 1, 1);
+                    g_d3dGsR.SetShader(&g_d3dGsSh);
+                    ps2x::gfx::Texture *dt = d3dFboTexForGl(tex.id);
+                    if (!dt) dt = d3dGsTexFor(c.texKey);
+                    g_d3dGsR.SetTexture(dt);
+                    auto mkT = [&](int i) {
+                        ps2x::gfx::Vertex vx{};
+                        vx.x = TV[i].x + offX; vx.y = TV[i].y + offY;
+                        vx.u = TV[i].u; vx.v = vflip ? 1.0f - TV[i].v : TV[i].v;
+                        vx.r = TV[i].r; vx.g = TV[i].g; vx.b = TV[i].b; vx.a = TV[i].a;
+                        vx.q = TV[i].q; vx.z = depthOn ? -TV[i].z : 0.0f;
+                        return vx; };
+                    g_d3dGsR.DrawTriangle(mkT(0), mkT(1), mkT(2));
+                }
+                continue;
+            }
+#endif
             ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
             rlBegin(RL_QUADS);
             const int quad[4] = {0, 1, 2, 2};
@@ -19455,6 +19572,11 @@ if (done.size() < 14 && !done.count(c.texKey))
     }
     clrProbeCols("post-present", frameGen);
     g_lastOutId = outId;
+#if defined(_WIN32)
+    // [d3d11] remember the native texture that matches the presented GL texture, so the present
+    // shows the fbp the GL path actually chose (display parity/latch), not a fixed buffer.
+    g_d3dPresentTex = d3dFboTexForGl(outId);
+#endif
     return outId;
 }
 
@@ -19577,38 +19699,25 @@ bool GsGpuRenderer::copyPresentPixels(std::vector<unsigned char> &outRgba, int &
 void *GsGpuRenderer::d3dPresentSRV() const
 {
 #if defined(_WIN32)
-    // The display buffers are fbp0 / fbp112; present whichever has a native RT.
-    for (uint32_t fbp : {0u, 112u})
-    {
-        auto it = g_fbos.find(fbp);
-        if (it != g_fbos.end() && it->second.d3dRt && it->second.d3dRt->NativeRTV())
-            return it->second.d3dRt->Color().NativeSRV();
-    }
-#endif
-    return nullptr;
-}
-
-static const ps2x::gfx::RenderTarget *d3dDisplayRt()
-{
-#if defined(_WIN32)
-    for (uint32_t fbp : {0u, 112u})
-    {
-        auto it = g_fbos.find(fbp);
-        if (it != g_fbos.end() && it->second.d3dRt && it->second.d3dRt->NativeRTV())
-            return it->second.d3dRt;
-    }
+    if (g_d3dPresentTex) return g_d3dPresentTex->NativeSRV();
 #endif
     return nullptr;
 }
 
 unsigned GsGpuRenderer::d3dPresentWidth() const
 {
-    const ps2x::gfx::RenderTarget *rt = d3dDisplayRt();
-    return rt ? (unsigned)rt->Width() : 0u;
+#if defined(_WIN32)
+    return g_d3dPresentTex ? g_d3dPresentTex->Width() : 0u;
+#else
+    return 0u;
+#endif
 }
 
 unsigned GsGpuRenderer::d3dPresentHeight() const
 {
-    const ps2x::gfx::RenderTarget *rt = d3dDisplayRt();
-    return rt ? (unsigned)rt->Height() : 0u;
+#if defined(_WIN32)
+    return g_d3dPresentTex ? g_d3dPresentTex->Height() : 0u;
+#else
+    return 0u;
+#endif
 }
