@@ -5052,13 +5052,23 @@ void PS2Runtime::run()
                     if (s_lastSrv != nativeSrv || s_rtTex.Width() != rw || s_rtTex.Height() != rh)
                     { s_rtTex.AdoptSRV(g_ps2xD3D11, nativeSrv, rw, rh); s_lastSrv = nativeSrv; }
                     const float W = (float)g_ps2xD3D11.Width(), H = (float)g_ps2xD3D11.Height();
+                    // [presentcrop] Crop to the DISPLAY size, not the RT/texture size: the leaf RT
+                    // can be 512x512 (a 512x448 display plus dead rows) and sampling the full 0..1
+                    // showed those dead rows as a constant black band. displayWidth/Height is what the
+                    // GL present crops to. This texture is top-down, so the display rows are v 0..sH/rh.
+                    const int dW = ps2GpuRenderer().displayWidth();
+                    const int dH = ps2GpuRenderer().displayHeight();
+                    const float sW = std::min(std::min((float)(rw ? rw : 1), (dW > 0 ? (float)dW : (float)(rw ? rw : 1))), (float)FB_WIDTH);
+                    const float sH = std::min(std::min((float)(rh ? rh : 1), (dH > 0 ? (float)dH : (float)(rh ? rh : 1))), (float)DEFAULT_DISPLAY_HEIGHT);
+                    const float u1n = sW / (float)(rw ? rw : 1);
+                    const float v1n = sH / (float)(rh ? rh : 1);
                     // [truews] Widescreen: the GS renders a WIDER view squeezed into the 4:3
                     // buffer, so the present must STRETCH it to the window (dw=W, dh=H) -- exactly
                     // what the GL present and the D3D FMV path do. Letterboxing here (aspect-preserved)
                     // is why truews "did nothing" on the native D3D present.
                     float dw2, dh2;
                     if (PS2SettingsOverlay::isWidescreen() || wsTrigActive()) { dw2 = W; dh2 = H; }
-                    else { const float sc = std::min(W / (float)(rw ? rw : 1), H / (float)(rh ? rh : 1)); dw2 = rw * sc; dh2 = rh * sc; }
+                    else { const float sc = std::min(W / sW, H / sH); dw2 = sW * sc; dh2 = sH * sc; }
                     const float x0 = (W - dw2) * 0.5f, y0 = (H - dh2) * 0.5f, x1 = x0 + dw2, y1 = y0 + dh2;
                     auto ndcX = [&](float x) { return 2.0f * x / W - 1.0f; };
                     auto ndcY = [&](float y) { return 1.0f - 2.0f * y / H; };
@@ -5068,8 +5078,8 @@ void PS2Runtime::run()
                     g_d3dBlit.SetShader(&g_d3dBlitShader);
                     g_d3dBlit.SetTexture(&s_rtTex);
                     ps2x::gfx::BlendDesc opaque; opaque.enable = false; g_d3dBlit.SetBlend(opaque);
-                    g_d3dBlit.DrawQuad(mk(ndcX(x0), ndcY(y0), 0, 0), mk(ndcX(x1), ndcY(y0), 1, 0),
-                                       mk(ndcX(x1), ndcY(y1), 1, 1), mk(ndcX(x0), ndcY(y1), 0, 1));
+                    g_d3dBlit.DrawQuad(mk(ndcX(x0), ndcY(y0), 0, 0), mk(ndcX(x1), ndcY(y0), u1n, 0),
+                                       mk(ndcX(x1), ndcY(y1), u1n, v1n), mk(ndcX(x0), ndcY(y1), 0, v1n));
                 }
                 else
                 {
@@ -5095,10 +5105,20 @@ void PS2Runtime::run()
                     // [truews] Stretch to the window when widescreen is on (the GS rendered a wider
                     // squeezed view); otherwise letterbox preserving the source aspect. Flip V
                     // (the readback is bottom-up).
+                    // [presentcrop] Crop to the display size: the readback texture can be taller than
+                    // the 448-row display (a 512-tall leaf RT/latch), and sampling the full 0..1 showed
+                    // the dead rows as a constant black band. Bottom-up, so the display occupies the
+                    // HIGH-V rows: v in [1 - sH/ph, 1].
                     const float W = (float)g_ps2xD3D11.Width(), H = (float)g_ps2xD3D11.Height();
+                    const int dW = ps2GpuRenderer().displayWidth();
+                    const int dH = ps2GpuRenderer().displayHeight();
+                    const float sW = std::min(std::min((float)pw, (dW > 0 ? (float)dW : (float)pw)), (float)FB_WIDTH);
+                    const float sH = std::min(std::min((float)ph, (dH > 0 ? (float)dH : (float)ph)), (float)DEFAULT_DISPLAY_HEIGHT);
+                    const float u1b = sW / (float)pw;
+                    const float vBot = 1.0f - sH / (float)ph;
                     float dw, dh;
                     if (PS2SettingsOverlay::isWidescreen() || wsTrigActive()) { dw = W; dh = H; }
-                    else { const float s = std::min(W / (float)pw, H / (float)ph); dw = pw * s; dh = ph * s; }
+                    else { const float s = std::min(W / sW, H / sH); dw = sW * s; dh = sH * s; }
                     const float x0 = (W - dw) * 0.5f, y0 = (H - dh) * 0.5f, x1 = x0 + dw, y1 = y0 + dh;
                     auto ndcX = [&](float x) { return 2.0f * x / W - 1.0f; };
                     auto ndcY = [&](float y) { return 1.0f - 2.0f * y / H; };
@@ -5114,9 +5134,9 @@ void PS2Runtime::run()
                     g_d3dBlit.SetBlend(opaque);
                     g_d3dBlit.DrawQuad(
                         mk(ndcX(x0), ndcY(y0), 0.0f, 1.0f),
-                        mk(ndcX(x1), ndcY(y0), 1.0f, 1.0f),
-                        mk(ndcX(x1), ndcY(y1), 1.0f, 0.0f),
-                        mk(ndcX(x0), ndcY(y1), 0.0f, 0.0f));
+                        mk(ndcX(x1), ndcY(y0), u1b, 1.0f),
+                        mk(ndcX(x1), ndcY(y1), u1b, vBot),
+                        mk(ndcX(x0), ndcY(y1), 0.0f, vBot));
                 }
                 }
             }
