@@ -3657,6 +3657,8 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                         ++s_miss;
                     }
                 }
+                ps2tex::megaLookup(id, texKey, tex0.tbp0, tex0.tbw, tex0.psm, tex0.tw, tex0.th, found,
+                                   rgba.data(), subW, texH, rep.data(), rw, rh, rfmt);   // [texmega]
                 if (found)
                 {
                     // The UV path can only express an INTEGER, UNIFORM upscale

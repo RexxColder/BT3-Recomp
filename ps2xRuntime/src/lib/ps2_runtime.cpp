@@ -30,6 +30,7 @@
 #include "gfx/d3d11/gs_shader_hlsl.h"
 #include "gfx/video_state.h"
 #include "gfx/ps2x_ui.h"
+extern "C" const char *ps2xExeDirC();   // [mergefix] main.cpp: <exeDir>
 namespace
 {
     ps2x::gfx::D3D11Device g_ps2xD3D11;
@@ -5009,6 +5010,18 @@ void PS2Runtime::run()
                         std::fprintf(stderr, "[d3ddump] frame %d -> %s (%dx%d) ok=%d\n", n, p,
                                      (int)g_d3dPresent.Width(), (int)g_d3dPresent.Height(), (int)ok);
                     }
+                }
+            }
+            {   // [texmega] PS2X_TEXMEGA=1: F9 arms a 6-second texture-replacement mega dump
+                // (lookups + originals/replacements + pack index) into <exeDir>/logs/texmega.
+                static const bool s_tm = [](){ const char *v = std::getenv("PS2X_TEXMEGA"); return v && v[0] && v[0] != '0'; }();
+                if (s_tm && IsKeyPressed(KEY_F9))
+                {
+                    const char *xd = ps2xExeDirC();
+                    const std::string d = std::string((xd && xd[0]) ? xd : ".") + "/logs/texmega";
+                    ps2tex::megaArm(d.c_str(), 6.0);
+                    ps2tex::megaDumpIndex();
+                    std::fprintf(stderr, "[texmega] armed -> %s\n", d.c_str());
                 }
             }
             static const bool s_uiTest = [](){ const char *v = std::getenv("PS2X_UI_TEST"); return v && v[0] && v[0] != '0'; }();
