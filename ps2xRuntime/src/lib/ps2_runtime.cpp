@@ -1241,7 +1241,10 @@ bool PS2Runtime::initialize(const char *title)
             if (v && v[0] && v[0] != '0') SetConfigFlags(FLAG_VSYNC_HINT);
         }
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        int hostWinW = HOST_WINDOW_WIDTH, hostWinH = HOST_WINDOW_HEIGHT;
+        if (const char *w = std::getenv("PS2X_WINDOW_W")) { const int v = std::atoi(w); if (v > 0) hostWinW = v; }
+        if (const char *h = std::getenv("PS2X_WINDOW_H")) { const int v = std::atoi(h); if (v > 0) hostWinH = v; }
+        InitWindow(hostWinW, hostWinH, title);
         // [icon] Carry the launcher's icon onto the runner window. Same asset
         // convention as the overlay font (<exeDir>/assets/icon.png); exeDir is
         // PS2X_EXEDIR (deploy root) else the executable's own directory.
@@ -1289,10 +1292,11 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
 #if defined(_WIN32)
-        {   // [d3d11] PS2X_D3D11=1: present through a native D3D11 swap chain on raylib's HWND.
-            // raylib keeps the window, input and audio; only the video present is native.
+        {   // [d3d11] Native D3D11 present is the DEFAULT on Windows (PS2X_D3D11=0 disables it).
+            // raylib keeps the window, input and audio; the video present is native.
             const char *d3dv = std::getenv("PS2X_D3D11");
-            if (d3dv && d3dv[0] && d3dv[0] != '0')
+            const bool wantD3D = !(d3dv && d3dv[0] == '0');
+            if (wantD3D)
             {
                 g_ps2xD3D11Mode = g_ps2xD3D11.Init(GetWindowHandle(),
                                                    static_cast<uint32_t>(GetScreenWidth()),
@@ -1300,7 +1304,11 @@ bool PS2Runtime::initialize(const char *title)
                 if (!g_ps2xD3D11Mode)
                     std::fprintf(stderr, "[d3d11] init failed; staying on the raylib GL presenter\n");
                 else
+                {
+                    // [vsync] D3D present sync interval. PS2X_VSYNC=0 disables it (present(0)); default on.
+                    { const char *vy = std::getenv("PS2X_VSYNC"); g_ps2xD3D11.SetVSync(!(vy && vy[0] == '0')); }
                     ps2x::gfx::SetVideoDevice(&g_ps2xD3D11);   // overlay uses imgui_impl_dx11
+                }
             }
         }
 #endif
@@ -1311,6 +1319,11 @@ bool PS2Runtime::initialize(const char *title)
             // (The pack lives in <exeDir>/data/Textures -- the deploy's data/ dir next to the
             // extracted ISO tree; the folder is created if absent.)
             ps2tex::replacementsEnabled();
+        }
+        {   // [fps60] PS2X_FPS60=1: enable the 60-fps fight mode from the env (loads fps60_sites.txt,
+            // staged next to the runner). Lets the perf A/B be run without touching settings.toml.
+            const char *f60 = std::getenv("PS2X_FPS60");
+            if (f60 && f60[0] && f60[0] != '0') ps2Set60Fps(true, nullptr);
         }
         {   // [fmvoverride] If the opening-video override is active (env, or Texture Replacement on
             // with the pack installed), serve the pack's opening PSS/ADX in place of the game's.
@@ -5039,9 +5052,14 @@ void PS2Runtime::run()
                     if (s_lastSrv != nativeSrv || s_rtTex.Width() != rw || s_rtTex.Height() != rh)
                     { s_rtTex.AdoptSRV(g_ps2xD3D11, nativeSrv, rw, rh); s_lastSrv = nativeSrv; }
                     const float W = (float)g_ps2xD3D11.Width(), H = (float)g_ps2xD3D11.Height();
-                    const float sc = std::min(W / (float)(rw ? rw : 1), H / (float)(rh ? rh : 1));
-                    const float dw = rw * sc, dh = rh * sc;
-                    const float x0 = (W - dw) * 0.5f, y0 = (H - dh) * 0.5f, x1 = x0 + dw, y1 = y0 + dh;
+                    // [truews] Widescreen: the GS renders a WIDER view squeezed into the 4:3
+                    // buffer, so the present must STRETCH it to the window (dw=W, dh=H) -- exactly
+                    // what the GL present and the D3D FMV path do. Letterboxing here (aspect-preserved)
+                    // is why truews "did nothing" on the native D3D present.
+                    float dw2, dh2;
+                    if (PS2SettingsOverlay::isWidescreen() || wsTrigActive()) { dw2 = W; dh2 = H; }
+                    else { const float sc = std::min(W / (float)(rw ? rw : 1), H / (float)(rh ? rh : 1)); dw2 = rw * sc; dh2 = rh * sc; }
+                    const float x0 = (W - dw2) * 0.5f, y0 = (H - dh2) * 0.5f, x1 = x0 + dw2, y1 = y0 + dh2;
                     auto ndcX = [&](float x) { return 2.0f * x / W - 1.0f; };
                     auto ndcY = [&](float y) { return 1.0f - 2.0f * y / H; };
                     auto mk = [](float x, float y, float u, float v) {
@@ -5074,11 +5092,13 @@ void PS2Runtime::run()
                     g_d3dPresent.Update(g_ps2xD3D11, g_d3dPresentPx.data());
                     g_d3dPresent.SetSampler(g_ps2xD3D11, ps2x::gfx::Filter::Point, ps2x::gfx::Wrap::Clamp);
 
-                    // Letterbox the source into the window (aspect preserved) and flip V
+                    // [truews] Stretch to the window when widescreen is on (the GS rendered a wider
+                    // squeezed view); otherwise letterbox preserving the source aspect. Flip V
                     // (the readback is bottom-up).
                     const float W = (float)g_ps2xD3D11.Width(), H = (float)g_ps2xD3D11.Height();
-                    const float s = std::min(W / (float)pw, H / (float)ph);
-                    const float dw = pw * s, dh = ph * s;
+                    float dw, dh;
+                    if (PS2SettingsOverlay::isWidescreen() || wsTrigActive()) { dw = W; dh = H; }
+                    else { const float s = std::min(W / (float)pw, H / (float)ph); dw = pw * s; dh = ph * s; }
                     const float x0 = (W - dw) * 0.5f, y0 = (H - dh) * 0.5f, x1 = x0 + dw, y1 = y0 + dh;
                     auto ndcX = [&](float x) { return 2.0f * x / W - 1.0f; };
                     auto ndcY = [&](float y) { return 1.0f - 2.0f * y / H; };

@@ -609,6 +609,12 @@ if (APPLE AND NOT PS2X_FORCE_PGS)
     set(PS2X_DISABLE_PGS ON)
     set(PS2X_PGS_SKIP_REASON "not supported on macOS (Granite needs clock_nanosleep)")
 endif()
+# [d3d11] Windows uses the native D3D11 renderer; paraLLEl-GS is retired here so it can neither
+# be built nor compete with the new path. PS2X_FORCE_PGS=ON opts back in for A/B work.
+if (WIN32 AND NOT PS2X_FORCE_PGS)
+    set(PS2X_DISABLE_PGS ON)
+    set(PS2X_PGS_SKIP_REASON "retired on Windows (native D3D11 renderer)")
+endif()
 # [pgs submodule] Fetch it ourselves rather than requiring every clone to remember
 # --recursive. Without this a plain `git clone` + build produces a runner with NO
 # paraLLEl-GS renderer and only a STATUS line to say so, which is easy to miss and
@@ -787,6 +793,8 @@ endif()
 # Work around WinAPI vs raylib symbol clash for CloseWindow on x64
 if(MSVC)
     target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
+    # [prof] emit a linker map so sampled RIPs can be resolved to function names.
+    target_link_options(ps2EntryRunner PRIVATE "/MAP:${CMAKE_BINARY_DIR}/ps2EntryRunner.map")
 endif()
 
 install(TARGETS ps2_runtime ps2EntryRunner
