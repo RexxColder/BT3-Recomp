@@ -29,6 +29,7 @@
 
 #include "raylib.h"
 #include "rlgl.h"
+#include "gfx/gs_rt.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"   // [crtcdisp] GSRegisters (the CRTC registers are memory-mapped)
 
@@ -961,9 +962,9 @@ namespace
         int prev = 0; glGetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &prev);
         if (snap.texture.id == 0 || snap.texture.width != w || snap.texture.height != h)
         {
-            if (snap.texture.id != 0) UnloadRenderTexture(snap);
+            if (snap.texture.id != 0) ps2x::gfx::GsRtUnload(snap);
             if (snap.texture.id != 0) ps2xForgetTexId(snap.texture.id);
-            snap = LoadRenderTexture(w, h); SetTextureFilter(snap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(snap.texture.id);
+            snap = ps2x::gfx::GsRtCreate(w, h); SetTextureFilter(snap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(snap.texture.id);
             g_rtSnapSeq[fbp] = 0xFFFFFFFFu;
         }
         const uint32_t seq = g_glEnterSeq[fbp];
@@ -1095,7 +1096,7 @@ namespace
                 if (hit && cf == fbp && cw && ch)
                 { w = (int)cw; h = (int)ch;
                   if (f.rt.texture.id != 0 && (f.w != (int)cw || f.h != (int)ch))
-                  { ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); f.rt = RenderTexture2D{}; f.w = f.h = 0; }
+                  { ps2xForgetRtTexId(f.rt.texture.id); ps2x::gfx::GsRtUnload(f.rt); f.rt = RenderTexture2D{}; f.w = f.h = 0; }
                   if (f.rt.texture.id != 0) return f; }
             }
         }
@@ -1115,7 +1116,7 @@ namespace
         }
         if (f.w != w || f.h != h || f.rt.texture.id == 0)
         {
-            if (f.rt.texture.id != 0) { g_rsTexScale.erase(f.rt.texture.id); g_texAlphaFix.erase(f.rt.texture.id); ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); }
+            if (f.rt.texture.id != 0) { g_rsTexScale.erase(f.rt.texture.id); g_texAlphaFix.erase(f.rt.texture.id); ps2xForgetRtTexId(f.rt.texture.id); ps2x::gfx::GsRtUnload(f.rt); }
             const int rsA = rsScaledFbp(fbp) ? rsN() : 1;
             const int wA = w * rsA, hA = h * rsA;
             // PS2X_NODEPTH_RT: create COLOR-ONLY FBOs (no depth renderbuffer). raylib's
@@ -1221,7 +1222,7 @@ namespace
                 f.rt = t;
             }
             else
-                f.rt = LoadRenderTexture(wA, hA);
+                f.rt = ps2x::gfx::GsRtCreate(wA, hA);
             f.w = w; f.h = h; f.scale = rsA;
 #if defined(_WIN32)
             d3dFboEnsure(f, wA, hA);   // [d3d11] keep a native RT in step with the GL FBO
@@ -1251,8 +1252,8 @@ namespace
             {
                 g_rsTexScale[f.rt.texture.id] = rsA;
                 g_rsTexFbo[f.rt.texture.id] = fbp;
-                if (f.stag.texture.id != 0) { ps2xForgetRtTexId(f.stag.texture.id); UnloadRenderTexture(f.stag); }
-                f.stag = LoadRenderTexture(w, h);
+                if (f.stag.texture.id != 0) { ps2xForgetRtTexId(f.stag.texture.id); ps2x::gfx::GsRtUnload(f.stag); }
+                f.stag = ps2x::gfx::GsRtCreate(w, h);
                 if (f.stag.texture.id == 0)
                 {
                     static int s_ns = 0;
@@ -5667,7 +5668,7 @@ static bool gaExecShaderInit()
         locSrcA = GetShaderLocation(sh, "uSrcA"); locPal = GetShaderLocation(sh, "uPal");
         locDbg = GetShaderLocation(sh, "uDbg");
         locIdxScl = GetShaderLocation(sh, "uIdxScl");
-        g_gaViewTex[0] = LoadRenderTexture(512, 448); g_gaViewTex[1] = LoadRenderTexture(512, 448);
+        g_gaViewTex[0] = ps2x::gfx::GsRtCreate(512, 448); g_gaViewTex[1] = ps2x::gfx::GsRtCreate(512, 448);
         if (g_gaViewTex[0].id == 0 || g_gaViewTex[1].id == 0) { bad = true; return false; }
         SetTextureFilter(g_gaViewTex[0].texture, TEXTURE_FILTER_POINT);
         SetTextureFilter(g_gaViewTex[1].texture, TEXTURE_FILTER_POINT);
@@ -5726,7 +5727,7 @@ static bool gaBuildReviewTex(const Texture2D &src, int srcH, int ta0, int ta1, i
         locDbgC = GetShaderLocation(sh2, "uDbgC");
         if (g_gaViewTex[0].id == 0)
         {
-            g_gaViewTex[0] = LoadRenderTexture(512, 448); g_gaViewTex[1] = LoadRenderTexture(512, 448);
+            g_gaViewTex[0] = ps2x::gfx::GsRtCreate(512, 448); g_gaViewTex[1] = ps2x::gfx::GsRtCreate(512, 448);
             if (g_gaViewTex[0].id == 0 || g_gaViewTex[1].id == 0) { bad = true; return false; }
             SetTextureFilter(g_gaViewTex[0].texture, TEXTURE_FILTER_POINT);
             SetTextureFilter(g_gaViewTex[1].texture, TEXTURE_FILTER_POINT);
@@ -5931,7 +5932,7 @@ static Texture2D p8hTwinFor(uint64_t clutKey)
     RenderTexture2D &rt = s_tw[clutKey];
     if (rt.texture.id == 0)
     {
-        rt = LoadRenderTexture(512, 512);   // the readers declare srcTex 512x512
+        rt = ps2x::gfx::GsRtCreate(512, 512);   // the readers declare srcTex 512x512
         if (rt.texture.id == 0) return Texture2D{};
         SetTextureFilter(rt.texture, TEXTURE_FILTER_POINT);
         s_twSeq[clutKey] = 0xFFFFFFFFu;
@@ -9008,7 +9009,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     auto ensureAtlas = [&]() {
         if (g_atlas.texture.id == 0) {
             g_atlasW = 2048; g_atlasH = 2048;
-            g_atlas = LoadRenderTexture(g_atlasW, g_atlasH);
+            g_atlas = ps2x::gfx::GsRtCreate(g_atlasW, g_atlasH);
             SetTextureFilter(g_atlas.texture, TEXTURE_FILTER_POINT);
             BeginTextureMode(g_atlas); ClearBackground(Color{0, 0, 0, 255}); EndTextureMode();
             static int s_created = 0;
@@ -9335,8 +9336,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             Fbo &cp = g_fboCopy[sfbp];
             if (cp.w != cw || cp.h != ch || cp.rt.texture.id == 0)
             {
-                if (cp.rt.texture.id != 0) { ps2xForgetRtTexId(cp.rt.texture.id); UnloadRenderTexture(cp.rt); }
-                cp.rt = LoadRenderTexture(cw, ch); cp.w = cw; cp.h = ch;
+                if (cp.rt.texture.id != 0) { ps2xForgetRtTexId(cp.rt.texture.id); ps2x::gfx::GsRtUnload(cp.rt); }
+                cp.rt = ps2x::gfx::GsRtCreate(cw, ch); cp.w = cw; cp.h = ch;
                 SetTextureFilter(cp.rt.texture, TEXTURE_FILTER_POINT);
             }
             BeginTextureMode(cp.rt);
@@ -9361,7 +9362,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (s_dm)
         {
             static Fbo s_dummy;
-            if (s_dummy.rt.texture.id == 0) { s_dummy.rt = LoadRenderTexture(16, 16); s_dummy.w = 16; s_dummy.h = 16; }
+            if (s_dummy.rt.texture.id == 0) { s_dummy.rt = ps2x::gfx::GsRtCreate(16, 16); s_dummy.w = 16; s_dummy.h = 16; }
             BeginTextureMode(s_dummy.rt);
             EndTextureMode(); // bind + unbind, NO fragment writes
         }
@@ -9748,8 +9749,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         const int LW = 512, LH = 512, ls = std::max(1, lit->second.scale);
         if (g_frontLatch.w != LW || g_frontLatch.h != LH || g_frontLatch.scale != ls || g_frontLatch.rt.texture.id == 0)
         {
-            if (g_frontLatch.rt.texture.id != 0) { ps2xForgetRtTexId(g_frontLatch.rt.texture.id); UnloadRenderTexture(g_frontLatch.rt); }
-            g_frontLatch.rt = LoadRenderTexture(LW * ls, LH * ls); g_frontLatch.w = LW; g_frontLatch.h = LH; g_frontLatch.scale = ls;
+            if (g_frontLatch.rt.texture.id != 0) { ps2xForgetRtTexId(g_frontLatch.rt.texture.id); ps2x::gfx::GsRtUnload(g_frontLatch.rt); }
+            g_frontLatch.rt = ps2x::gfx::GsRtCreate(LW * ls, LH * ls); g_frontLatch.w = LW; g_frontLatch.h = LH; g_frontLatch.scale = ls;
             SetTextureFilter(g_frontLatch.rt.texture, TEXTURE_FILTER_POINT);
         }
         BeginTextureMode(g_frontLatch.rt);
@@ -16728,7 +16729,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         {
                             const int w = sit->second.w, h = sit->second.h;
                             if (g_decalSnap.texture.id == 0 || g_decalSnap.texture.width != w || g_decalSnap.texture.height != h)
-                            { if (g_decalSnap.texture.id) { ps2xForgetTexId(g_decalSnap.texture.id); UnloadRenderTexture(g_decalSnap); } g_decalSnap = LoadRenderTexture(w, h); SetTextureFilter(g_decalSnap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(g_decalSnap.texture.id); }
+                            { if (g_decalSnap.texture.id) { ps2xForgetTexId(g_decalSnap.texture.id); ps2x::gfx::GsRtUnload(g_decalSnap); } g_decalSnap = ps2x::gfx::GsRtCreate(w, h); SetTextureFilter(g_decalSnap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(g_decalSnap.texture.id); }
                             glBindFramebuffer(0x8CA8 /*READ*/, sit->second.rt.id); glBindFramebuffer(0x8CA9 /*DRAW*/, g_decalSnap.id);
                             glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, 0x4000 /*COLOR*/, 0x2600 /*NEAREST*/);
                             glBindFramebuffer(0x8D40 /*FRAMEBUFFER*/, 0);

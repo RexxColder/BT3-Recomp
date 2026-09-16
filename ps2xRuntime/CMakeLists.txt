@@ -671,7 +671,8 @@ target_sources(ps2_runtime PRIVATE
     src/gfx/gl/GlDevice.cpp
     src/gfx/gl/GlGfx.cpp
     src/gfx/gl_context.cpp
-    src/gfx/gs_resources.cpp)
+    src/gfx/gs_resources.cpp
+    src/gfx/gs_rt.cpp)
 if(WIN32)
     target_link_libraries(ps2_runtime PUBLIC opengl32)
 else()

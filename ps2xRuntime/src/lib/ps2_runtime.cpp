@@ -1459,6 +1459,11 @@ bool PS2Runtime::initialize(const char *title)
                 }
             }
         }
+#if defined(_WIN32)
+        // [altGL] Bring the shared gfx::gl context up BEFORE the GS renderer creates any render
+        // target: GsRtCreate needs it, and the renderer runs long before the first present.
+        if (AltGlEnabled()) AltGlInit();
+#endif
         // [hostio] audio and gamepads go through the host layers (SDL2 by default, raylib on
         // PS2X_HOSTAUDIO=raylib / PS2X_HOSTPAD=raylib); the window and keyboard stay raylib's.
         ps2x_audio::init();
