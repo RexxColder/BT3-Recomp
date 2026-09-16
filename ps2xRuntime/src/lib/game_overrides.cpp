@@ -3197,6 +3197,18 @@ namespace
     extern "C" int ps2xSchedTid();
     static void bt3RunCdTickInline(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // [detsound] In frame-step mode (netplay/rollback) tick the CD file server (0x28a3b0) at most ONCE
+        // PER FRAME. Its pollers -- bt3AfsStatusPoll, bt3CdReadStatePoll, ps2xSpinPump -- run a HOST-PACED
+        // number of times per frame, and pumping the server per poll advances the AFS/streamed-file list a
+        // host-paced number of nodes. Character select's preview loader (tid1) READS that streamed-file
+        // progress into its stack locals (0x1effdc0..0x1effe20), so a host-paced tick count leaks straight
+        // into gameplay -> the loader picks the wrong asset and the joiner freezes; measured ~15x fewer
+        // main-stack leaks with this gate than without. g_lastCdTickFrame is set just below and rides in the
+        // rollback snapshot, so a re-simulation and a second machine tick the same number of times. Normal
+        // play keeps per-poll ticking (bt3FileLoadPoll rate-limits its own pump there).
+        if (ps2xFrameStepOn() &&
+            g_lastCdTickFrame.load(std::memory_order_relaxed) == g_bt3FrameCount.load(std::memory_order_relaxed))
+            return;
         if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] CDTICK tid=%d pc=0x%x\n", ps2xSchedTid(), ctx ? ctx->pc : 0u);
         if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] CDTICK tid=%d pc=0x%x\n", ps2xSchedTid(), ctx ? ctx->pc : 0u);
         g_lastCdTickNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);   // [dispatchpump]
