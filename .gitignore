@@ -54,3 +54,7 @@ AGENTS.md
 deploy/
 fmv_build/
 launcher-build-log.txt
+
+# runtime-generated game save data + imgui layout (local only)
+games/bt3/savedata/
+imgui.ini
