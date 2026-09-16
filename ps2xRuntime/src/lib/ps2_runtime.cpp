@@ -1245,6 +1245,10 @@ bool PS2Runtime::initialize(const char *title)
         if (const char *w = std::getenv("PS2X_WINDOW_W")) { const int v = std::atoi(w); if (v > 0) hostWinW = v; }
         if (const char *h = std::getenv("PS2X_WINDOW_H")) { const int v = std::atoi(h); if (v > 0) hostWinH = v; }
         InitWindow(hostWinW, hostWinH, title);
+        {   // [monitor] PS2X_MONITOR=<index>: move the window to that monitor (0 = primary).
+            const char *mon = std::getenv("PS2X_MONITOR");
+            if (mon && mon[0]) { const int idx = std::atoi(mon); if (idx >= 0 && idx < GetMonitorCount()) SetWindowMonitor(idx); }
+        }
         // [icon] Carry the launcher's icon onto the runner window. Same asset
         // convention as the overlay font (<exeDir>/assets/icon.png); exeDir is
         // PS2X_EXEDIR (deploy root) else the executable's own directory.
@@ -4974,19 +4978,36 @@ void PS2Runtime::run()
                 g_ps2xD3D11.Resize(static_cast<uint32_t>(GetScreenWidth()),
                                    static_cast<uint32_t>(GetScreenHeight()));
             PollInputEvents();
-            {   // [diag] PS2X_D3DDUMP=1: write the native present texture to a PNG a few frames in.
+            {   // [diag] PS2X_D3DDUMP=1: write the native present texture to a PNG. PS2X_D3DDUMP=key
+                // dumps ONE frame when the user presses F9 (grab the exact moment to inspect), any
+                // other truthy value dumps periodically.
                 static int s_dumpN = 0;
                 static const char *s_dumpEnv = std::getenv("PS2X_D3DDUMP");
                 if (s_dumpEnv && s_dumpEnv[0] && s_dumpEnv[0] != '0')
                 {
+                    const bool keyMode = (std::strcmp(s_dumpEnv, "key") == 0);
                     const int n = ++s_dumpN;
-                    if ((n % 600) == 0 && n <= 7200)
+                    const bool fire = keyMode ? (IsKeyPressed(KEY_F9) || n == 1800) : ((n % 60) == 0 && n <= 36000);
+                    if (fire)
                     {
                         char p[256];
-                        std::snprintf(p, sizeof p, "C:\\Users\\Rexx\\AppData\\Local\\Temp\\opencode\\present_%d.png", n);
-                        const bool ok = ps2GpuRenderer().d3dDumpPresent(p);
+                        std::snprintf(p, sizeof p, "C:\\Users\\Rexx\\Desktop\\present_%d.png", n);
+                        bool ok = false;
+                        // Dump whichever texture actually feeds the D3D present: the bridge texture
+                        // (GL replay, uploaded from the readback) when it is valid, else the native RT.
+                        if (g_d3dPresent.Valid())
+                        {
+                            std::vector<uint8_t> buf;
+                            if (ps2x::gfx::ReadbackRGBA(g_ps2xD3D11, g_d3dPresent, buf) && g_d3dPresent.Width() > 0)
+                            {
+                                Image img(static_cast<void *>(buf.data()), (int)g_d3dPresent.Width(),
+                                          (int)g_d3dPresent.Height(), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+                                ok = ExportImage(img, p);
+                            }
+                        }
+                        if (!ok) ok = ps2GpuRenderer().d3dDumpPresent(p);
                         std::fprintf(stderr, "[d3ddump] frame %d -> %s (%dx%d) ok=%d\n", n, p,
-                                     ps2GpuRenderer().d3dPresentWidth(), ps2GpuRenderer().d3dPresentHeight(), (int)ok);
+                                     (int)g_d3dPresent.Width(), (int)g_d3dPresent.Height(), (int)ok);
                     }
                 }
             }
@@ -5181,7 +5202,11 @@ void PS2Runtime::run()
         // 4:3 proportions, drew it round). PS2X_SQPIX=1 restores the old square-pixel
         // letterbox (the rig's boot screen-matching references were captured that way).
         {
-            static const bool s_sqpix = [](){ const char *v = std::getenv("PS2X_SQPIX"); return v && v[0] && v[0] != '0'; }();
+            // [tv43] DEFAULT: square pixels (no horizontal stretch). The ~8% "TV pixel"
+            // stretch made the present wider than the buffer and cut the right/bottom edge of
+            // full-frame 2D art (the pause popup's frame) on the OpenGL present. PS2X_SQPIX=0
+            // re-enables the authentic TV-pixel stretch.
+            static const bool s_sqpix = [](){ const char *v = std::getenv("PS2X_SQPIX"); return !(v && v[0] == '0'); }();
             static const float s_pixk = [](){ const char *v = std::getenv("PS2X_PIXK"); const float f = v ? (float)std::atof(v) : 1.08f; return (f > 0.5f && f < 2.0f) ? f : 1.08f; }();
             if (!s_sqpix)
             {   // measured against a native-4:3 Wii longplay capture: authentic TV pixels are

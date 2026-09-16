@@ -12713,43 +12713,45 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 { mm.tri[i].r = 255; mm.tri[i].g = 0; mm.tri[i].b = 255; mm.tri[i].a = 128; }
             }
         }
-        {   // [texdump] PS2X_TEXDUMP=<tbp>: dump the DECODED texture for that source, RGB and
-            // ALPHA separately. The scene's alpha channel is what feeds the whole mask/outline
-            // chain, and for a TCC=1 draw the alpha written to the frame comes straight from the
-            // texture -- so if a character page decodes with alpha 0 the chain can never start.
-            static const int s_td = [](){ const char *v = std::getenv("PS2X_TEXDUMP");
-                                          return v && v[0] ? std::atoi(v) : -1; }();
-            if (s_td >= 0 && (int)c.srcTbp0 == s_td && c.texKey)
+        {   // [texdump] PS2X_TEXDUMP=<tbp[,tbp...]>: dump the DECODED texture for those sources,
+            // RGB and ALPHA separately, once each. PS2X_TEXDUMP_DIR selects the output folder
+            // (default: cwd). Lets a candidate texture be pulled out of VRAM for identification.
+            static const std::vector<int> s_td = [](){ std::vector<int> v; const char *e = std::getenv("PS2X_TEXDUMP");
+                                                       if (e && e[0]) { std::string s(e); size_t p = 0;
+                                                           while (p <= s.size()) { const size_t q = s.find(',', p);
+                                                               const std::string t = s.substr(p, q == std::string::npos ? std::string::npos : q - p);
+                                                               if (!t.empty()) v.push_back(std::atoi(t.c_str()));
+                                                               if (q == std::string::npos) break; p = q + 1; } }
+                                                       return v; }();
+            static const char *s_tdd = [](){ const char *v = std::getenv("PS2X_TEXDUMP_DIR"); return (v && v[0]) ? v : "."; }();
+            static std::set<int> s_tdDone;
+            if (!s_td.empty() && c.texKey && !s_tdDone.count((int)c.srcTbp0)
+                && std::find(s_td.begin(), s_td.end(), (int)c.srcTbp0) != s_td.end())
             {
-                static int done = 0;
-                if (done < 1)
+                auto ti = m_texCache.find(c.texKey);
+                if (ti != m_texCache.end() && ti->second.w > 0 && ti->second.h > 0
+                    && ti->second.rgba.size() >= (size_t)ti->second.w * ti->second.h * 4)
                 {
-                    auto ti = m_texCache.find(c.texKey);
-                    if (ti != m_texCache.end() && ti->second.w > 0 && ti->second.h > 0
-                        && ti->second.rgba.size() >= (size_t)ti->second.w * ti->second.h * 4)
+                    s_tdDone.insert((int)c.srcTbp0);
+                    const int tw = ti->second.w, th = ti->second.h;
+                    Image ic = GenImageColor(tw, th, BLACK), ia = GenImageColor(tw, th, BLACK);
+                    unsigned long anz = 0; std::map<unsigned, unsigned long> ah;
+                    for (int y = 0; y < th; ++y) for (int x = 0; x < tw; ++x)
                     {
-                        done = 1;
-                        const int tw = ti->second.w, th = ti->second.h;
-                        Image ic = GenImageColor(tw, th, BLACK), ia = GenImageColor(tw, th, BLACK);
-                        unsigned long anz = 0; std::map<unsigned, unsigned long> ah;
-                        for (int y = 0; y < th; ++y) for (int x = 0; x < tw; ++x)
-                        {
-                            const uint8_t *px = &ti->second.rgba[((size_t)y * tw + x) * 4];
-                            ImageDrawPixel(&ic, x, y, Color{px[0], px[1], px[2], 255});
-                            ImageDrawPixel(&ia, x, y, Color{px[3], px[3], px[3], 255});
-                            if (px[3]) ++anz; ++ah[px[3] / 32];
-                        }
-                        char p1[176], p2[176];
-                        std::snprintf(p1, sizeof p1, "/home/z3/Desktop/bt3/work/shots/tex%d_rgb.png", s_td);
-                        std::snprintf(p2, sizeof p2, "/home/z3/Desktop/bt3/work/shots/tex%d_alpha.png", s_td);
-                        ExportImage(ic, p1); ExportImage(ia, p2);
-                        UnloadImage(ic); UnloadImage(ia);
-                        std::fprintf(stderr, "[texdump] tbp=%d %dx%d psm=%u tcc=%u  alpha!=0 %.1f%%  buckets:",
-                                     s_td, tw, th, (unsigned)c.srcPsm, (unsigned)c.tcc,
-                                     100.0 * anz / ((double)tw * th));
-                        for (auto &kv : ah) std::fprintf(stderr, " %u:%lu", kv.first * 32, kv.second);
-                        std::fprintf(stderr, "\n");
+                        const uint8_t *px = &ti->second.rgba[((size_t)y * tw + x) * 4];
+                        ImageDrawPixel(&ic, x, y, Color{px[0], px[1], px[2], 255});
+                        ImageDrawPixel(&ia, x, y, Color{px[3], px[3], px[3], 255});
+                        if (px[3]) ++anz; ++ah[px[3] / 32];
                     }
+                    char p1[384], p2[384];
+                    std::snprintf(p1, sizeof p1, "%s/tex_%d_%dx%d_rgb.png", s_tdd, (int)c.srcTbp0, tw, th);
+                    std::snprintf(p2, sizeof p2, "%s/tex_%d_%dx%d_a.png", s_tdd, (int)c.srcTbp0, tw, th);
+                    ExportImage(ic, p1); ExportImage(ia, p2);
+                    UnloadImage(ic); UnloadImage(ia);
+                    std::fprintf(stderr, "[texdump] tbp=%d %dx%d psm=%u tcc=%u -> %s (alpha!=0 %.1f%%)\n",
+                                 (int)c.srcTbp0, tw, th, (unsigned)c.srcPsm, (unsigned)c.tcc, p1,
+                                 100.0 * anz / ((double)tw * th));
+                    (void)ah;
                 }
             }
         }
@@ -17710,7 +17712,36 @@ if (done.size() < 14 && !done.count(c.texKey))
             }
             else
 #endif
-            DrawTexturePro(tex, src, dst, Vector2{0, 0}, 0.0f, Color{c.r, c.g, c.b, c.a});
+            {   // [forceflip] A sprite whose source rect is REVERSED (su1<su0 or sv1<sv0) is a
+                // MIRRORED copy -- BT3's popup frame draws one top-left corner tile 4 times with
+                // reversed UVs. Draw those with the UVs written PER VERTEX (u0/v0..u1/v1 in rect
+                // order) so the mirror is explicit and never depends on DrawTexturePro's negative-
+                // rect handling. The 3 mirrored quadrants then show their borders (TR/BL/BR).
+                if (c.su1 < c.su0 || c.sv1 < c.sv0)
+                {
+                    flushBatch(__LINE__);
+                    const float twf = (float)(tex.width > 0 ? tex.width : 1);
+                    const float thf = (float)(tex.height > 0 ? tex.height : 1);
+                    const float nu0 = src.x / twf, nv0 = src.y / thf;
+                    const float nu1 = (src.x + src.width) / twf, nv1 = (src.y + src.height) / thf;
+                    rlSetTexture(tex.id);
+                    rlBegin(RL_QUADS);
+                    rlColor4ub(c.r, c.g, c.b, c.a);
+                    rlNormal3f(0.0f, 0.0f, 1.0f);
+                    rlTexCoord2f(nu0, nv0); rlVertex2f(dst.x, dst.y);
+                    rlTexCoord2f(nu0, nv1); rlVertex2f(dst.x, dst.y + dst.height);
+                    rlTexCoord2f(nu1, nv1); rlVertex2f(dst.x + dst.width, dst.y + dst.height);
+                    rlTexCoord2f(nu1, nv0); rlVertex2f(dst.x + dst.width, dst.y);
+                    rlEnd();
+                    rlSetTexture(0);
+                    flushBatch(__LINE__);
+                    { static int ff = 0; if (std::getenv("PS2X_FORCEFLIPDBG") && ff++ < 12)
+                        std::fprintf(stderr, "[forceflip] tbp=%u su=%.1f..%.1f sv=%.1f..%.1f dst=(%.0f,%.0f)-(%.0f,%.0f) tex=%dx%d\n",
+                                     c.srcTbp0, c.su0, c.su1, c.sv0, c.sv1, dst.x, dst.y, dst.x + dst.width, dst.y + dst.height, tex.width, tex.height); }
+                }
+                else
+                DrawTexturePro(tex, src, dst, Vector2{0, 0}, 0.0f, Color{c.r, c.g, c.b, c.a});
+            }
             { static const bool s_sk3 = [](){ const char *v = std::getenv("PS2X_SEGCHK"); return v && v[0] && v[0] != '0'; }();
               static int n5 = 0; if (s_sk3 && c.destFbp == 224u && c.texKey && n5 < 6) ps2xDbgCol0("after-DrawTexturePro", ++n5); }
             }

@@ -4983,10 +4983,10 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
         // REGION_* wrap modes whose window params (MINU/MAXU/MINV/MAXV) we currently drop?
         {
             static const bool s_rr = [](){ const char *v = std::getenv("PS2X_REGIONREC"); return v && v[0] && v[0] != '0'; }();
-            // Log REGION-mode draws on ANY texture (window params are currently dropped by
-            // the GPU DrawCmd — the 2026-07-30 window-decode experiment was reverted after
-            // it caused 2D-screen flashing; the only in-fight user is the FB-copy 512x448).
-            if (s_rr && tme && (wms >= 2u || wmt >= 2u))
+            // [regionrec] also log a specific tbp (PS2X_REGIONTBP=<tbp>) regardless of its wrap
+            // mode, so a plain REPEAT/CLAMP draw like the pause-popup corner can be inspected.
+            static const uint32_t s_rtbp = [](){ const char *v = std::getenv("PS2X_REGIONTBP"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 0xFFFFFFFFu; }();
+            if (s_rr && tme && (wms >= 2u || wmt >= 2u || ctx.tex0.tbp0 == s_rtbp))
             {
                 static std::atomic<uint32_t> s_rn{0};
                 const uint32_t n = s_rn.fetch_add(1);
