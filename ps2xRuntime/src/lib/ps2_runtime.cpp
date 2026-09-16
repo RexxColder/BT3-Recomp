@@ -166,12 +166,11 @@ float g_ps2xWsSrcW = 512.0f;
 #include "gfx/gl/GlGfx.h"
 #include "gfx/gl/GlApi.h"
 #include "gfx/gl/gl_shader_glsl.h"
+#include "gfx/gl_context.h"
 extern "C" __declspec(dllimport) void *__stdcall wglGetProcAddress(const char *);
 namespace
 {
     bool g_altglOk = false, g_altglTried = false;
-    ps2x::gfx::gl::GlDevice g_altglDev;
-    ps2x::gfx::gl::Renderer g_altglR;
     ps2x::gfx::gl::Shader   g_altglBlit;
     ps2x::gfx::gl::Texture  g_altglSrc;
     unsigned g_altglSrcId = 0;
@@ -182,12 +181,11 @@ namespace
     {
         if (g_altglTried) return g_altglOk;
         g_altglTried = true;
-        ps2x::gfx::gl::GlPlatform plat{};
-        plat.window = GetWindowHandle();
-        plat.getProc = [](const char *n) { return (void *)wglGetProcAddress(n); };
-        g_altglOk = g_altglDev.Init(plat, (uint32_t)GetScreenWidth(), (uint32_t)GetScreenHeight())
-                 && g_altglR.Init(g_altglDev)
-                 && g_altglBlit.Compile(g_altglDev, ps2x::gfx::gl::kGlBlitVertexShader,
+        // Shared, process-wide gfx::gl context (also used by the GS backend from A1 on).
+        g_altglOk = ps2x::gfx::gl::EnsureContext(GetWindowHandle(),
+                                                 [](const char *n) { return (void *)wglGetProcAddress(n); },
+                                                 (uint32_t)GetScreenWidth(), (uint32_t)GetScreenHeight())
+                 && g_altglBlit.Compile(ps2x::gfx::gl::Device(), ps2x::gfx::gl::kGlBlitVertexShader,
                                         ps2x::gfx::gl::kGlBlitFragmentShader);
         std::fprintf(stderr, "[altgl] present init %s (GL %s)\n", g_altglOk ? "ok" : "FAILED",
                      (const char *)ps2xgl::glGetString(ps2xgl::GL_VERSION));
@@ -198,11 +196,13 @@ namespace
     bool AltGlPresent(Texture2D &tex, const Rectangle &src, const Rectangle &dst, bool bilinear)
     {
         if (!AltGlEnabled() || !tex.id || !AltGlInit()) return false;
+        ps2x::gfx::gl::GlDevice &dev = ps2x::gfx::gl::Device();
+        ps2x::gfx::gl::Renderer &r = ps2x::gfx::gl::RendererRef();
         const float W = (float)GetScreenWidth(), H = (float)GetScreenHeight();
         if (g_altglSrcId != tex.id || g_altglSrc.Width() != (uint32_t)tex.width ||
             g_altglSrc.Height() != (uint32_t)tex.height)
-        { g_altglSrc.AdoptGL(g_altglDev, tex.id, (uint32_t)tex.width, (uint32_t)tex.height); g_altglSrcId = tex.id; }
-        g_altglSrc.SetSamplerUV(g_altglDev, bilinear ? ps2x::gfx::gl::Filter::Linear : ps2x::gfx::gl::Filter::Point,
+        { g_altglSrc.AdoptGL(dev, tex.id, (uint32_t)tex.width, (uint32_t)tex.height); g_altglSrcId = tex.id; }
+        g_altglSrc.SetSamplerUV(dev, bilinear ? ps2x::gfx::gl::Filter::Linear : ps2x::gfx::gl::Filter::Point,
                                 ps2x::gfx::gl::Wrap::Clamp, ps2x::gfx::gl::Wrap::Clamp);
         // Mirror raylib's DrawTexturePro texcoord maths exactly (including the negative-height
         // flip used by the GPU present): the flip moves source.y up instead of negating V, which
@@ -220,16 +220,16 @@ namespace
         auto V = [](float x, float y, float u, float v) {
             ps2x::gfx::gl::Vertex p{}; p.x = x; p.y = y; p.u = u; p.v = v;
             p.r = p.g = p.b = p.a = 255; p.q = 1.0f; p.z = 0.0f; return p; };
-        g_altglR.SetShader(&g_altglBlit);
-        g_altglR.SetTexture(&g_altglSrc);
-        ps2x::gfx::gl::BlendDesc opaque; opaque.enable = false;
-        g_altglR.SetBlend(opaque);
-        g_altglR.SetScissor(nullptr);
-        g_altglR.SetColorMask(true, true, true, true);
-        g_altglR.SetDepth(false, false, 0x0203);
-        ps2xgl::glDisable(ps2xgl::GL_CULL_FACE);   // raylib's rlgl leaves culling on
         g_altglBlit.SetMat4("mvp", m);
-        g_altglR.DrawQuad(V(x0, y0, u0, vTop), V(x1, y0, u1, vTop), V(x1, y1, u1, vBottom), V(x0, y1, u0, vBottom));
+        r.SetShader(&g_altglBlit);
+        r.SetTexture(&g_altglSrc);
+        ps2x::gfx::gl::BlendDesc opaque; opaque.enable = false;
+        r.SetBlend(opaque);
+        r.SetScissor(nullptr);
+        r.SetColorMask(true, true, true, true);
+        r.SetDepth(false, false, 0x0203);
+        ps2xgl::glDisable(ps2xgl::GL_CULL_FACE);   // raylib's rlgl leaves culling on
+        r.DrawQuad(V(x0, y0, u0, vTop), V(x1, y0, u1, vTop), V(x1, y1, u1, vBottom), V(x0, y1, u0, vBottom));
         // [altGL] Hand the GL state back through RAYLIB'S OWN rlgl API. Our direct draws changed
         // GL (blend disabled, our program/texture/VAO bound) but rlgl's cached state still says
         // "alpha blend on, rlgl's program/texture bound" and therefore re-applies NOTHING. The

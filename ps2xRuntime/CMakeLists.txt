@@ -669,7 +669,8 @@ endif()
 target_sources(ps2_runtime PRIVATE
     src/gfx/gl/GlApi.cpp
     src/gfx/gl/GlDevice.cpp
-    src/gfx/gl/GlGfx.cpp)
+    src/gfx/gl/GlGfx.cpp
+    src/gfx/gl_context.cpp)
 if(WIN32)
     target_link_libraries(ps2_runtime PUBLIC opengl32)
 else()
