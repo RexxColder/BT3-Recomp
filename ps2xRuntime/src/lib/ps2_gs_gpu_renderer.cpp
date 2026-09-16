@@ -29,6 +29,7 @@
 
 #include "raylib.h"
 #include "rlgl.h"
+#include "gfx/gs_backend.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"   // [crtcdisp] GSRegisters (the CRTC registers are memory-mapped)
 
@@ -1270,7 +1271,7 @@ namespace
             // frames (the game clears explicitly by drawing); auto-clearing every frame
             // would wipe render targets the game rendered once and reuses (logo flicker).
             BeginTextureMode(f.rt);
-            ClearBackground(Color{0, 0, 0, 255});
+            ps2x::gfx::rgClearBackground(Color{0, 0, 0, 255});
             EndTextureMode();
         }
         return f;
@@ -5514,7 +5515,7 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
     // scissor, depth). Any of them silently blanks this pass. Neutralize; restore after.
     glColorMask(1, 1, 1, 1); glDisable(0x0B71u /*GL_DEPTH_TEST*/); glDepthMask(0); glDisable(0x0C11u /*GL_SCISSOR_TEST*/);
     rlSetBlendFactors(1 /*GL_ONE*/, 0 /*GL_ZERO*/, 0x8006 /*GL_FUNC_ADD*/);
-    BeginBlendMode(BLEND_CUSTOM);
+    ps2x::gfx::rgBeginBlendMode(BLEND_CUSTOM);
     BeginShaderMode(sh);
     SetShaderValue(sh, locStage, &stage, SHADER_UNIFORM_INT);
     SetShaderValue(sh, locM16, &m16, SHADER_UNIFORM_INT);
@@ -5567,7 +5568,7 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
     DrawTexturePro(g_gaViewTex[g_gaCur].texture, Rectangle{0.0f, 0.0f, 512.0f, 448.0f},
                    Rectangle{0.0f, 0.0f, 512.0f, 448.0f}, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
     EndShaderMode();
-    EndBlendMode();
+    ps2x::gfx::rgEndBlendMode();
     EndTextureMode();
     glDepthMask(1); glEnable(0x0B71u); glEnable(0x0C11u);   // restore loop expectations
     g_gaCur = dst; g_gaViewReady = true; ++g_gaExecCount;
@@ -8932,7 +8933,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // never depth-tested; the next depth-using draw re-enables via applyDepth().
         if (depthOn && curDepthTest != 0) { rlDisableDepthTest(); rlEnableDepthMask(); curDepthTest = 0; curDepthFunc = -1; curDepthWrite = 1; }
         if (curMask != 15) { glColorMask(1, 1, 1, 1); curMask = 15; } // full mask for blits/present
-        rlDisableScissorTest(); EndBlendMode(); EndShaderMode(); EndTextureMode(); inMode = false; curRealFbp = 0xFFFFFFFFu; } };
+        rlDisableScissorTest(); ps2x::gfx::rgEndBlendMode(); EndShaderMode(); EndTextureMode(); inMode = false; curRealFbp = 0xFFFFFFFFu; } };
     auto fboSizeFor = [&](uint32_t fbp, int &w, int &h) {
         // PS2X_VIEWSIZE=1: size a split view by its OWN stride + vertical extent. Correct on
         // paper (fbp336 -> 512x448, the relocated DoF view -> 256x256, vs 1024x512 / 512x448
@@ -9010,7 +9011,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             g_atlasW = 2048; g_atlasH = 2048;
             g_atlas = LoadRenderTexture(g_atlasW, g_atlasH);
             SetTextureFilter(g_atlas.texture, TEXTURE_FILTER_POINT);
-            BeginTextureMode(g_atlas); ClearBackground(Color{0, 0, 0, 255}); EndTextureMode();
+            BeginTextureMode(g_atlas); ps2x::gfx::rgClearBackground(Color{0, 0, 0, 255}); EndTextureMode();
             static int s_created = 0;
             std::fprintf(stderr, "[atlas] CREATED #%d id=%u complete=%d\n", ++s_created, g_atlas.texture.id, rlFramebufferComplete(g_atlas.id));
         }
@@ -9077,7 +9078,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 {
                     endMode();
                     BeginTextureMode(sit->second.rt);
-                    ClearBackground(Color{0, 0, 0, 0});
+                    ps2x::gfx::rgClearBackground(Color{0, 0, 0, 0});
                     EndTextureMode();
                     static int s_scn = 0;
                     static const bool s_scd = [](){ const char *v = std::getenv("PS2X_FBOSIZE"); return v && v[0] && v[0] != '0'; }();
@@ -9093,7 +9094,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 BeginTextureMode(g_atlas);
                 static const bool s_noshader = [](){ const char *v = std::getenv("PS2X_NOSHADER"); return v && v[0] && v[0] != '0'; }();
                 if (!s_noshader) { BeginShaderMode(g_shader); ps2xResetIdxMode(); }   // PS2 Ã·128 modulate (same as the per-fbp path)
-                BeginBlendMode(BLEND_ALPHA);
+                ps2x::gfx::rgBeginBlendMode(BLEND_ALPHA);
                 rlDisableBackfaceCulling();  // GS triangles have arbitrary winding
                 inMode = true; curRealFbp = kAtlasFbp;
             }
@@ -9187,7 +9188,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         }
         BeginShaderMode(g_shader);      // PS2 Ã·128 modulate (overbright-capable)
         ps2xResetIdxMode();             // [idxrt] present must never sample through the palette
-        BeginBlendMode(BLEND_ALPHA);
+        ps2x::gfx::rgBeginBlendMode(BLEND_ALPHA);
         rlDisableBackfaceCulling();     // GS triangles have arbitrary winding
         inMode = true; curFbp = fbp; curSx = -0x40000000;
         // EndTextureMode() may leave GL depth state as the last draw left it; force reapply.
@@ -9207,9 +9208,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 int lx0 = std::max(0, sx), ly0 = std::max(0, sy);
                 int lx1 = std::min(curSlotW, sx + sw), ly1 = std::min(curSlotH, sy + sh);
                 int aw = lx1 - lx0, ah = ly1 - ly0;
-                if (aw <= 0 || ah <= 0) { rlEnableScissorTest(); rlScissor(0, 0, 0, 0); return; }
+                if (aw <= 0 || ah <= 0) { ps2x::gfx::rgEnableScissorTest(); ps2x::gfx::rgScissor(0, 0, 0, 0); return; }
                 int ax = curSlotX + lx0, ay = curSlotY + ly0;
-                rlEnableScissorTest(); rlScissor(ax, g_atlasH - (ay + ah), aw, ah);
+                ps2x::gfx::rgEnableScissorTest(); ps2x::gfx::rgScissor(ax, g_atlasH - (ay + ah), aw, ah);
                 return;
             }
             // PS2X_NOSCI_RT=1: drop the scissor for non-scene destinations. fbp336 receives 96
@@ -9249,8 +9250,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                         if (gw > 0 && gw <= 16)                        // a divider, not a real gap in coverage
                         {
                             flushBatch(__LINE__);
-                            rlEnableScissorTest();
-                            rlScissor(gx * rsS, 0, gw * rsS, f.h * rsS);
+                            ps2x::gfx::rgEnableScissorTest();
+                            ps2x::gfx::rgScissor(gx * rsS, 0, gw * rsS, f.h * rsS);
                             rlClearColor(0, 0, 0, 255);
                             rlClearScreenBuffers();
                             static int sgn = 0;
@@ -9261,7 +9262,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     }
                 }
             }
-            if (!full && sw > 0 && sh > 0) { rlEnableScissorTest(); rlScissor(sx * rsS, (f.h - (sy + sh)) * rsS, sw * rsS, sh * rsS); }
+            if (!full && sw > 0 && sh > 0) { ps2x::gfx::rgEnableScissorTest(); ps2x::gfx::rgScissor(sx * rsS, (f.h - (sy + sh)) * rsS, sw * rsS, sh * rsS); }
             else rlDisableScissorTest();
         }
     };
@@ -9314,7 +9315,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         int dw, dh; fboSizeFor(displayFbp, dw, dh);
         Fbo &df = ensureFbo(displayFbp, dw, dh);
         BeginTextureMode(df.rt);
-        ClearBackground(Color{0, 0, 0, 255});
+        ps2x::gfx::rgClearBackground(Color{0, 0, 0, 255});
         EndTextureMode();
     }
 
@@ -9612,7 +9613,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 if (dstRGB == 0x0302) dstRGB = F_SRC1_A;
                 else if (dstRGB == 0x0303) dstRGB = F_1M_SRC1_A;
             }
-            rlSetBlendFactorsSeparate(srcRGB, dstRGB, F_ONE, F_ZERO, eqRGB, E_ADD);
+            ps2x::gfx::rgSetBlendFactorsSeparate(srcRGB, dstRGB, F_ONE, F_ZERO, eqRGB, E_ADD);
             rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
         }
         else
@@ -10234,17 +10235,17 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 dateSnapDone = true;
                 flushBatch(__LINE__);
                 const float bw = (g_ps2xWsSrcW >= 320.0f && g_ps2xWsSrcW <= 1024.0f) ? g_ps2xWsSrcW : 512.0f;
-                rlColorMask(false, false, false, true);
+                ps2x::gfx::rgColorMask(false, false, false, true);
                 // pass 1: dstA = clamp(dstA - 127/255)
                 rlSetBlendMode(RL_BLEND_ALPHA);
-                rlSetBlendFactorsSeparate(1 /*ONE*/, 1 /*ONE*/, 1 /*ONE*/, 1 /*ONE*/,
+                ps2x::gfx::rgSetBlendFactorsSeparate(1 /*ONE*/, 1 /*ONE*/, 1 /*ONE*/, 1 /*ONE*/,
                                           0x8006 /*FUNC_ADD*/, 0x800B /*FUNC_REVERSE_SUBTRACT*/);
                 rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
                 DrawRectangle(0, 0, (int)bw + 2, 56, Color{0, 0, 0, 127});
                 flushBatch(__LINE__);
                 // passes 2..9: dstA = clamp(2*dstA)
                 rlSetBlendMode(RL_BLEND_ALPHA);
-                rlSetBlendFactorsSeparate(1, 1, 0x0304 /*DST_ALPHA*/, 1 /*ONE*/,
+                ps2x::gfx::rgSetBlendFactorsSeparate(1, 1, 0x0304 /*DST_ALPHA*/, 1 /*ONE*/,
                                           0x8006, 0x8006);
                 rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
                 for (int dp = 0; dp < 8; ++dp)
@@ -10252,7 +10253,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     DrawRectangle(0, 0, (int)bw + 2, 56, Color{0, 0, 0, 255});
                     flushBatch(__LINE__);
                 }
-                rlColorMask(true, true, true, true);
+                ps2x::gfx::rgColorMask(true, true, true, true);
                 curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;   // force blend reapply
                 static int s_dbn = 0;
                 if (s_dbn < 3) { ++s_dbn; std::fprintf(stderr, "[datebin] snapped HUD band alpha (w=%.0f)\n", bw); }
