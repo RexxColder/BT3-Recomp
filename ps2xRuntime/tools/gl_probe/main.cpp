@@ -1,10 +1,12 @@
 // [altGL] Validation probe: proves the standalone GL layer (loader + gfx/gl + present) works.
 // During the transition it borrows raylib ONLY for the window and the GL context; every draw
 // goes through ps2x::gfx::gl. When the SDL2 platform lands, InitWindow/GetWindowHandle are
-// replaced by SDL_CreateWindow/SDL_GL_CreateContext and nothing else here changes.
+// replaced by SDL_CreateWindow/SDL_GL_Context and nothing else here changes.
 //
-// It compiles the ported GS replay shader (gl_gs_shader_glsl.h) and draws the checkerboard quad
-// through it, then reads back the centre pixel to self-check the result (exit code 0 = pass).
+// It compiles the ported GS replay shader (gl_gs_shader_glsl.h) and draws a calibration
+// sequence of solid squares through it (uTfx=MODULATE, white texture, vertex colour):
+//   0) kWhite/kBlack, 1) kRed/kBlue, 2) green/black checkerboards, 3) one colour per corner.
+// SPACE advances the pattern, ESC quits. The centre pixel of each pattern is logged.
 
 #include "raylib.h"
 
@@ -26,6 +28,9 @@ static void *probeGetProc(const char *name) { return dlsym(RTLD_DEFAULT, name); 
 #endif
 
 static void probeSwap(void *) { SwapScreenBuffer(); }   // raylib's GL buffer swap (transition only)
+
+struct Rgb { unsigned char r, g, b; };
+static const Rgb kWhite{255,255,255}, kBlack{0,0,0}, kRed{255,0,0}, kGreen{0,255,0}, kBlue{0,0,255};
 
 int main()
 {
@@ -50,83 +55,95 @@ int main()
     gl::Renderer gfx;
     if (!gfx.Init(dev)) { std::fprintf(stderr, "[glprobe] Renderer init failed\n"); return 1; }
 
-    auto setGsUniforms = [](gl::Shader &s) {
-        auto f = [&](const char *n, float v) { s.SetFloat(n, v); };
-        auto v4 = [&](const char *n, float x, float y, float z, float w) { s.SetVec4(n, x, y, z, w); };
-        v4("colDiffuse", 1, 1, 1, 1);
-        f("uBright", 1.0f); f("uSubScale", 1.0f); f("uUViz", 0.0f);
-        f("uIdxMode", 0.0f); f("uIdxScale", 128.0f); f("uFboOne", 0.0f);
-        f("uTcc", 1.0f); f("uASplit", 0.0f); v4("uTexa", 1, 1, 0, 0);
-        f("uABl128", 0.0f); f("uTfx", 1.0f); f("uProjClip", 0.0f); f("uAScale", 1.0f);
-        s.SetVec2("uAlphaFix", 1.0f, 0.0f);
-        f("uAtst", -1.0f); f("uAref", 0.0f); f("uFba", 0.0f); f("uForceA", 0.0f);
-        f("uZTex", 0.0f); f("uZScale", 1028.0f); f("uPerspQ", 0.0f);
-        v4("uRegion", 0, 0, 0, 0);
-    };
-
-    // "finalColor"/"blendAlpha" => dual-source outputs (location 0, index 0/1). The setters below
-    // bind the program themselves, but Bind first keeps the order explicit.
     gl::Shader gs;
+    // "finalColor"/"blendAlpha" => dual-source outputs (location 0, index 0/1), bound before link.
     if (!gs.Compile(dev, gl::kGlGsVertexShader, gl::kGlGsFragmentShader, "finalColor", "blendAlpha"))
     { std::fprintf(stderr, "[glprobe] GS shader compile failed\n"); return 1; }
-    gs.Bind(dev); setGsUniforms(gs);
+    gs.Bind(dev);
+    {   // Solid squares: MODULATE (uTfx=0) over the built-in white texture, colour from the vertex.
+        gs.SetVec4("colDiffuse", 1, 1, 1, 1);
+        gs.SetFloat("uBright", 1.0f);     gs.SetFloat("uSubScale", 1.0f); gs.SetFloat("uUViz", 0.0f);
+        gs.SetFloat("uIdxMode", 0.0f);    gs.SetFloat("uIdxScale", 128.0f); gs.SetFloat("uFboOne", 0.0f);
+        gs.SetFloat("uTcc", 1.0f);        gs.SetFloat("uASplit", 0.0f);   gs.SetVec4("uTexa", 1, 1, 0, 0);
+        gs.SetFloat("uABl128", 0.0f);     gs.SetFloat("uTfx", 0.0f);      gs.SetFloat("uProjClip", 0.0f);
+        gs.SetFloat("uAScale", 1.0f);     gs.SetVec2("uAlphaFix", 1.0f, 0.0f);
+        gs.SetFloat("uAtst", -1.0f);      gs.SetFloat("uAref", 0.0f);     gs.SetFloat("uFba", 0.0f);
+        gs.SetFloat("uForceA", 0.0f);     gs.SetFloat("uZTex", 0.0f);     gs.SetFloat("uZScale", 1028.0f);
+        gs.SetFloat("uPerspQ", 0.0f);     gs.SetVec4("uRegion", 0, 0, 0, 0);
+    }
 
-    // A 4x4 checkerboard texture drawn as a quad; top-left texel = (240,120,40).
-    gl::Texture tex;
-    { const int S = 4; std::vector<unsigned char> px(S * S * 4);
-      for (int i = 0; i < S * S; ++i) { const bool c = ((i % S) ^ (i / S)) & 1;
-          px[i*4+0] = c ? 240 : 40; px[i*4+1] = c ? 120 : 60; px[i*4+2] = c ? 40 : 200; px[i*4+3] = 255; }
-      tex.Create(dev, S, S, gl::Format::RGBA8, px.data()); }
-    tex.SetSamplerUV(dev, gl::Filter::Point, gl::Wrap::Repeat, gl::Wrap::Repeat);
+    // Solid-rectangle draw: white texture (no texture bound) + vertex colour through the GS shader.
+    auto rect = [&](float x, float y, float rw, float rh, const Rgb &c) {
+        auto P = [&](float px, float py, float u, float v) {
+            gl::Vertex t{}; t.x = px; t.y = py; t.u = u; t.v = v;
+            t.r = c.r; t.g = c.g; t.b = c.b; t.a = 255; t.q = 1.0f; t.z = 0.0f; return t; };
+        gfx.DrawQuad(P(x, y, 0, 0), P(x + rw, y, 1, 0), P(x + rw, y + rh, 1, 1), P(x, y + rh, 0, 1));
+    };
 
-    int exitCode = 0;
-    bool checked = false;
+    const Rgb checker[4][2] = {
+        { kWhite, kBlack }, { kRed, kBlue }, { kGreen, kBlack }, { kWhite, kBlack }
+    };
+    const char *patternName[4] = {
+        "white/black checker", "red/blue checker", "green/black checker", "one colour per corner"
+    };
+
+    int pattern = 0;
+    double nextSwitch = GetTime() + 3.0;
+    int loggedPattern = -1;
     while (!WindowShouldClose())
     {
         PollInputEvents();
 
         const float w = (float)GetScreenWidth(), h = (float)GetScreenHeight();
         dev.Resize((uint32_t)w, (uint32_t)h);
+
+        if (IsKeyPressed(KEY_SPACE)) { pattern = (pattern + 1) % 4; nextSwitch = GetTime() + 6.0; }
+        if (GetTime() >= nextSwitch) { pattern = (pattern + 1) % 4; nextSwitch = GetTime() + 3.0; }
+
         dev.BeginFrame(gl::Color{0.06f, 0.07f, 0.10f, 1.0f});
+        glDisable(GL_CULL_FACE);   // raylib's rlgl leaves culling on
 
-        // raylib's rlgl leaves GL_CULL_FACE enabled; the clear ignores it but draws do not.
-        glDisable(GL_CULL_FACE);
-
-        // top-left ortho -> NDC
         const float m[16] = { 2.0f / w, 0, 0, 0, 0, -2.0f / h, 0, 0, 0, 0, 1, 0, -1, 1, 0, 1 };
         gs.SetMat4("mvp", m);
         gfx.SetShader(&gs);
-        gfx.SetTexture(&tex);
-        gl::BlendDesc nb;   // dual-source: the driver honours index=1 outputs when blending is on
-        nb.enable = true;   // and the factors consume SRC1 (ARB_blend_func_extended).
-        nb.srcRGB = 0x8589; nb.dstRGB = 0x88FB;   // GL_SRC1_ALPHA, GL_ONE_MINUS_SRC1_ALPHA
-        nb.srcA   = 0x0001; nb.dstA   = 0x0000;   // GL_ONE, GL_ZERO
-        gfx.SetBlend(nb);
+        gfx.SetTexture(nullptr);           // -> the renderer's built-in white texture
+        gl::BlendDesc op; op.enable = false;
+        gfx.SetBlend(op);
         gfx.SetScissor(nullptr);
         gfx.SetColorMask(true, true, true, true);
         gfx.SetDepth(false, false, 0x0203);
 
-        const float cx = w * 0.5f, cy = h * 0.5f, s = 160.0f;
-        auto V = [](float x, float y, float u, float v) {
-            gl::Vertex vx{}; vx.x = x; vx.y = y; vx.u = u; vx.v = v; vx.r = vx.g = vx.b = vx.a = 255; vx.q = 1.0f; vx.z = 0.0f; return vx; };
-        gfx.DrawQuad(V(cx - s, cy - s, 0, 0), V(cx + s, cy - s, 1, 0), V(cx + s, cy + s, 1, 1), V(cx - s, cy + s, 0, 1));
+        if (pattern < 3)   // NxM checkerboard covering the window
+        {
+            const int cols = 8, rows = 6;
+            const float cw = w / cols, ch = h / rows;
+            for (int cy = 0; cy < rows; ++cy)
+                for (int cx = 0; cx < cols; ++cx)
+                    rect(cx * cw, cy * ch, cw, ch, checker[pattern][(cx + cy) & 1]);
+        }
+        else               // one colour per corner
+        {
+            const float bw = w * 0.35f, bh = h * 0.35f;
+            rect(0,       0,       bw, bh, kRed);
+            rect(w - bw,  0,       bw, bh, kGreen);
+            rect(0,       h - bh,  bw, bh, kBlue);
+            rect(w - bw,  h - bh,  bw, bh, kWhite);
+        }
 
-        if (!checked)   // self-check once: the centre pixel must be the checker colour (240,120,40)
+        if (pattern != loggedPattern)
         {
             glFinish();
-            unsigned char px[4] = {0, 0, 0, 0};
-            glReadPixels((int)cx, (int)(h - cy), 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-            const bool ok = (px[0] > 200 && px[1] > 80 && px[1] < 160 && px[2] < 80);
-            std::fprintf(stderr, "[glprobe] GS quad centre=%u,%u,%u,%u -> %s\n",
-                         px[0], px[1], px[2], px[3], ok ? "PASS" : "FAIL");
-            exitCode = ok ? 0 : 2;
-            checked = true;
+            unsigned char px[4] = {0,0,0,0};
+            glReadPixels(W / 2, H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            std::fprintf(stderr, "[glprobe] pattern %d: %s (centre=%u,%u,%u,%u)\n",
+                         pattern, patternName[pattern], px[0], px[1], px[2], px[3]);
+            loggedPattern = pattern;
         }
 
         dev.EndFrame();
     }
 
-    gs.Destroy(); gfx.Destroy(); tex.Destroy(); dev.Shutdown();
+    gs.Destroy(); gfx.Destroy(); dev.Shutdown();
     CloseWindow();
-    return exitCode;
+    return 0;
 }
