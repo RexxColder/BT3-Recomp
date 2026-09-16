@@ -12,8 +12,6 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #include <link.h>
-#include <sys/syscall.h>
-#include <unistd.h>
 #endif
 #if defined(PS2X_HAVE_LIBUNWIND)
 #define UNW_LOCAL_ONLY
@@ -2882,7 +2880,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         constexpr uint64_t kNestedFairnessInterval = 256u;
         ++g_cadBranchesSinceTick;   // [tickbusy]
         if (ps2xSchedTraceOn() && ((s_nestedFairness + 1u) & 31u) == 0u)   // diagnostic: who makes the non-main dispatches
-            std::fprintf(stderr, "[schedtrace] NF tid=%d nf=%llu target=0x%x src=0x%x main=%d ostid=%ld\n", g_schedTid, (unsigned long long)(s_nestedFairness + 1u), targetPc, sourcePc, (int)(ctx == &m_cpuContext), (long)syscall(SYS_gettid));
+            std::fprintf(stderr, "[schedtrace] NF tid=%d nf=%llu target=0x%x src=0x%x main=%d ostid=%ld\n", g_schedTid, (unsigned long long)(s_nestedFairness + 1u), targetPc, sourcePc, (int)(ctx == &m_cpuContext), (long)(std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFFFFu));
         if ((++s_nestedFairness % kNestedFairnessInterval) == 0u)
         {
             if (m_fibersEnabled && g_schedIsGuest && !g_schedTickDue && g_cadBranchesSinceTick >= g_tickBranches && ps2xFrameStepOn())
