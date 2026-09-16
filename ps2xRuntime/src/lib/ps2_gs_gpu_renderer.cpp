@@ -533,7 +533,31 @@ namespace
     // BT3 READS the Z buffer as a texture -- fbp224 IS the depth buffer (ZBP=224 on every draw),
     // and the outline is an edge detect over it.
     struct Fbo { RenderTexture2D rt{}; int w = 0, h = 0; unsigned int depthTex = 0; int lastDraw = -1; /* [slice] replay vsync of last use */
-                 int scale = 1; RenderTexture2D stag{}; unsigned stagSeq = 0; /* [rscale] physical = logical*scale; stag = 1x staging + freshness */ };
+                 int scale = 1; RenderTexture2D stag{}; unsigned stagSeq = 0; /* [rscale] physical = logical*scale; stag = 1x staging + freshness */
+#if defined(_WIN32)
+                 ps2x::gfx::RenderTarget *d3dRt = nullptr;   // [d3d11] parallel native RT for this fbp
+                 unsigned d3dGen = 0xFFFFFFFFu;              // frameGen the D3D RT was last cleared for
+#endif
+               };
+#if defined(_WIN32)
+    // [d3d11] GL texture id -> the D3D texture that mirrors it (FBO colour textures), so draws
+    // that sample a render target resolve to the native RT instead of the readback path.
+    std::unordered_map<unsigned, ps2x::gfx::Texture *> g_d3dRtByGlTex;
+    static void d3dFboEnsure(Fbo &f, int w, int h)
+    {
+        if (!d3dGsOn() || w <= 0 || h <= 0) return;
+        ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+        if (!f.d3dRt) f.d3dRt = new ps2x::gfx::RenderTarget();
+        if (f.d3dRt->Width() != (uint32_t)w || f.d3dRt->Height() != (uint32_t)h || !f.d3dRt->NativeRTV())
+            f.d3dRt->Create(*dev, (uint32_t)w, (uint32_t)h, false);
+        if (f.rt.texture.id != 0) g_d3dRtByGlTex[f.rt.texture.id] = &f.d3dRt->Color();
+    }
+    inline ps2x::gfx::Texture *d3dFboTexForGl(unsigned glTexId)
+    {
+        auto it = g_d3dRtByGlTex.find(glTexId);
+        return it == g_d3dRtByGlTex.end() ? nullptr : it->second;
+    }
+#endif
     // [bilinear] GS TEX1.MMAG per-draw filter. The GS filters magnified textures bilinearly
     // when MMAG is set (BT3 sets it on 99.4% of draws, with no mipmaps -- MXL is 0), so
     // forcing every texture to GL_NEAREST reads back blocky. It shows most where the game
@@ -1171,6 +1195,9 @@ namespace
             else
                 f.rt = LoadRenderTexture(wA, hA);
             f.w = w; f.h = h; f.scale = rsA;
+#if defined(_WIN32)
+            d3dFboEnsure(f, wA, hA);   // [d3d11] keep a native RT in step with the GL FBO
+#endif
             {   // [fboalloc] LoadRenderTexture CAN FAIL -- it returns id 0 and says nothing. At
                 // render scale N a target is N*N times the pixels and our FBOs are grow-only, so a
                 // page that is 1024x512 natively asks for 4096x2048 at 4x; enough of those, or one
@@ -17375,37 +17402,40 @@ if (done.size() < 14 && !done.count(c.texKey))
             if (d3dGsOn() && d3dGsEnsure())
             {
                 ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
-                if (!g_d3dGsRt) g_d3dGsRt = new ps2x::gfx::RenderTarget();
-                if (g_d3dGsRtW != (int)m_fboW || g_d3dGsRtH != (int)m_fboH)
+                auto dit = g_fbos.find(curRealFbp);
+                ps2x::gfx::RenderTarget *dest = (dit != g_fbos.end()) ? dit->second.d3dRt : nullptr;
+                if (dest)
                 {
-                    g_d3dGsRt->Create(*dev, (uint32_t)m_fboW, (uint32_t)m_fboH, false);
-                    g_d3dGsRtW = (int)m_fboW; g_d3dGsRtH = (int)m_fboH; g_d3dGsBegun = 0xFFFFFFFFu;
+                    if (dit->second.d3dGen != frameGen)
+                    {
+                        dest->Bind(*dev);
+                        dest->Clear(*dev, 0, 0, 0, 1);
+                        dit->second.d3dGen = frameGen;
+                    }
+                    else dest->Bind(*dev);
+                    const int rtW = (int)dest->Width(), rtH = (int)dest->Height();
+                    d3dGsMirrorUniforms();
+                    d3dGsMirrorState(rtH, rtH);
+                    d3dGsSetMvp(rtW, rtH);
+                    g_d3dGsSh.SetVec4("colDiffuse", c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, c.a / 255.0f);
+                    g_d3dGsR.SetShader(&g_d3dGsSh);
+                    ps2x::gfx::Texture *dt = d3dFboTexForGl(tex.id);
+                    if (!dt) dt = d3dGsTexFor(c.texKey);   // null -> Renderer's white tex
+                    g_d3dGsR.SetTexture(dt);
+                    const float tw = (float)(tex.width > 0 ? tex.width : 1), th = (float)(tex.height > 0 ? tex.height : 1);
+                    const float u0 = src.x / tw, v0 = src.y / th;
+                    const float u1 = (src.x + src.width) / tw, v1 = (src.y + src.height) / th;
+                    auto mkv = [](float x, float y, float u, float v) {
+                        ps2x::gfx::Vertex vx{};
+                        vx.x = x; vx.y = y; vx.u = u; vx.v = v;
+                        vx.r = vx.g = vx.b = vx.a = 255; vx.q = 1.0f; vx.z = 0.0f;
+                        return vx;
+                    };
+                    g_d3dGsR.DrawQuad(mkv(dst.x, dst.y, u0, v0),
+                                      mkv(dst.x + dst.width, dst.y, u1, v0),
+                                      mkv(dst.x + dst.width, dst.y + dst.height, u1, v1),
+                                      mkv(dst.x, dst.y + dst.height, u0, v1));
                 }
-                if (g_d3dGsBegun != frameGen)
-                {
-                    g_d3dGsRt->Bind(*dev);
-                    g_d3dGsRt->Clear(*dev, 0, 0, 0, 1);
-                    g_d3dGsBegun = frameGen;
-                }
-                d3dGsMirrorUniforms();
-                d3dGsMirrorState(g_d3dGsRtH, g_d3dGsRtH);
-                d3dGsSetMvp(g_d3dGsRtW, g_d3dGsRtH);
-                g_d3dGsSh.SetVec4("colDiffuse", c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, c.a / 255.0f);
-                g_d3dGsR.SetShader(&g_d3dGsSh);
-                g_d3dGsR.SetTexture(d3dGsTexFor(c.texKey));   // null -> Renderer's white tex
-                const float tw = (float)(tex.width > 0 ? tex.width : 1), th = (float)(tex.height > 0 ? tex.height : 1);
-                const float u0 = src.x / tw, v0 = src.y / th;
-                const float u1 = (src.x + src.width) / tw, v1 = (src.y + src.height) / th;
-                auto mkv = [](float x, float y, float u, float v) {
-                    ps2x::gfx::Vertex vx{};
-                    vx.x = x; vx.y = y; vx.u = u; vx.v = v;
-                    vx.r = vx.g = vx.b = vx.a = 255; vx.q = 1.0f; vx.z = 0.0f;
-                    return vx;
-                };
-                g_d3dGsR.DrawQuad(mkv(dst.x, dst.y, u0, v0),
-                                  mkv(dst.x + dst.width, dst.y, u1, v0),
-                                  mkv(dst.x + dst.width, dst.y + dst.height, u1, v1),
-                                  mkv(dst.x, dst.y + dst.height, u0, v1));
             }
             else
 #endif
@@ -19547,25 +19577,38 @@ bool GsGpuRenderer::copyPresentPixels(std::vector<unsigned char> &outRgba, int &
 void *GsGpuRenderer::d3dPresentSRV() const
 {
 #if defined(_WIN32)
-    if (g_d3dGsRt) return g_d3dGsRt->Color().NativeSRV();
+    // The display buffers are fbp0 / fbp112; present whichever has a native RT.
+    for (uint32_t fbp : {0u, 112u})
+    {
+        auto it = g_fbos.find(fbp);
+        if (it != g_fbos.end() && it->second.d3dRt && it->second.d3dRt->NativeRTV())
+            return it->second.d3dRt->Color().NativeSRV();
+    }
+#endif
+    return nullptr;
+}
+
+static const ps2x::gfx::RenderTarget *d3dDisplayRt()
+{
+#if defined(_WIN32)
+    for (uint32_t fbp : {0u, 112u})
+    {
+        auto it = g_fbos.find(fbp);
+        if (it != g_fbos.end() && it->second.d3dRt && it->second.d3dRt->NativeRTV())
+            return it->second.d3dRt;
+    }
 #endif
     return nullptr;
 }
 
 unsigned GsGpuRenderer::d3dPresentWidth() const
 {
-#if defined(_WIN32)
-    return g_d3dGsRt ? (unsigned)g_d3dGsRt->Width() : 0u;
-#else
-    return 0u;
-#endif
+    const ps2x::gfx::RenderTarget *rt = d3dDisplayRt();
+    return rt ? (unsigned)rt->Width() : 0u;
 }
 
 unsigned GsGpuRenderer::d3dPresentHeight() const
 {
-#if defined(_WIN32)
-    return g_d3dGsRt ? (unsigned)g_d3dGsRt->Height() : 0u;
-#else
-    return 0u;
-#endif
+    const ps2x::gfx::RenderTarget *rt = d3dDisplayRt();
+    return rt ? (unsigned)rt->Height() : 0u;
 }
