@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Audio.h"
+extern "C" bool ps2xFrameStepOn();   // [detsound] ps2_runtime.cpp: netplay/rollback frame-stepped mode
 
 namespace ps2_stubs
 {
@@ -21,6 +22,8 @@ namespace ps2_stubs
             uint32_t currentBlockOffset = 0u;
             uint32_t blockStatusTraceCount = 0u;
             bool blockTransferActive = false;
+            uint64_t lastStatusFrame = ~0ull;   // [detsound] frame of the last head advance (stepped mode)
+            uint32_t pollsThisFrame = 0u;        // [detsound] diagnostic: poll count within a frame
         };
 
         std::mutex g_audio_stub_mutex;
@@ -104,6 +107,34 @@ namespace ps2_stubs
                  g_audio_stub_state.blockTransferActive &&
                  g_audio_stub_state.currentBlockSize != 0u)
         {
+            // [detsound] The SPU transfer head must follow FRAME progress, not poll count. The streamed-sound
+            // player polls this status a HOST-PACED number of times per frame (the sound thread loops a
+            // host-dependent amount), so advancing the head per poll drifts it between two machines and
+            // diverges the player's clock -- which then steers character select's preview loader to the wrong
+            // asset and freezes the joiner. In frame-step mode (netplay/rollback) advance a fixed, tunable
+            // amount ONCE per delivered vblank instead: deterministic and part of the frame cadence. Normal
+            // play keeps the per-poll behaviour. PS2X_SND_XFERPF sets the per-frame units (default 8192 ~=
+            // the measured per-frame poll throughput); PS2X_SND_XFERLOG=1 logs the real per-frame poll count.
+            if (ps2xFrameStepOn())
+            {
+                static const uint32_t s_perFrame = [](){ const char *v = std::getenv("PS2X_SND_XFERPF");
+                                                         return (v && v[0]) ? (uint32_t)std::strtoul(v, nullptr, 0) : 8192u; }();
+                static const bool s_log = [](){ const char *v = std::getenv("PS2X_SND_XFERLOG"); return v && v[0] && v[0] != '0'; }();
+                const uint64_t fr = ps2_syscalls::GetCurrentVSyncTick();
+                if (fr != g_audio_stub_state.lastStatusFrame)
+                {
+                    if (s_log && g_audio_stub_state.lastStatusFrame != ~0ull)
+                        std::fprintf(stderr, "[sndxfer] frame %llu polls=%u (per-poll unit %u -> would advance %u; frame-fixed %u)\n",
+                                     (unsigned long long)g_audio_stub_state.lastStatusFrame, g_audio_stub_state.pollsThisFrame,
+                                     kAudioTransferUnit, g_audio_stub_state.pollsThisFrame * kAudioTransferUnit, s_perFrame);
+                    g_audio_stub_state.lastStatusFrame = fr;
+                    g_audio_stub_state.pollsThisFrame = 0u;
+                    g_audio_stub_state.currentBlockOffset =
+                        (g_audio_stub_state.currentBlockOffset + s_perFrame) % g_audio_stub_state.currentBlockSize;
+                }
+                ++g_audio_stub_state.pollsThisFrame;
+            }
+            else
             g_audio_stub_state.currentBlockOffset =
                 (g_audio_stub_state.currentBlockOffset + kAudioTransferUnit) %
                 g_audio_stub_state.currentBlockSize;
