@@ -5271,7 +5271,7 @@ struct Ps2xRollback
         if (depthOut) *depthOut = d;
         return h;
     }
-    struct SigEnt { int32_t tid; uint64_t sig; int32_t depth, wp, kst, kwt, kwid; uint32_t bpc, bra; uint64_t warg; uint8_t opaque; char opaqueName[47]; };
+    struct SigEnt { int32_t tid; uint64_t sig; int32_t depth, wp, kst, kwt, kwid; uint32_t bpc, bra; uint64_t warg; uint8_t opaque; uint8_t blocked; char opaqueName[46]; };
     static std::vector<SigEnt> mySignatures(PS2Runtime &rt)
     {
         std::vector<SigEnt> v;
@@ -5287,7 +5287,7 @@ struct Ps2xRollback
             { const auto tl = g_fiberTls.find(kv.first); e.warg = tl != g_fiberTls.end() ? tl->second.waitArg : 0u; }
             const auto tl = g_fiberTls.find(kv.first); e.wp = tl != g_fiberTls.end() ? tl->second.waitPoint : -1;
             int st_ = -1, wt = -1, wid = -1; if (ps2xKernelThreadWait(kv.first, &st_, &wt, &wid)) { e.kst = st_; e.kwt = wt; e.kwid = wid; } else { e.kst = e.kwt = e.kwid = -1; }
-            e.bpc = st.blockPc; e.bra = st.blockRa;
+            e.bpc = st.blockPc; e.bra = st.blockRa; e.blocked = st.blocked ? 1u : 0u;
             v.push_back(e);
         }
         return v;
@@ -5301,7 +5301,7 @@ struct Ps2xRollback
         void *dev = ps2xMemDeviceCapture(&rt.m_memory);
         out.clear(); out.reserve(48u << 20);
         Ps2xByteW w(out);
-        w.raw("BT3SYNC2", 8); w.u32(3u); w.str(ps2xSyncFormatId()); w.str(ps2xBuildId()); w.u64(g_syncLayout); w.u64(g_syncProgram); w.u64(g_syncMath); w.u64(g_gate.waitFrame);
+        w.raw("BT3SYNC2", 8); w.u32(4u); w.str(ps2xSyncFormatId()); w.str(ps2xBuildId()); w.u64(g_syncLayout); w.u64(g_syncProgram); w.u64(g_syncMath); w.u64(g_gate.waitFrame);
         bool ok = sim && krn && dev;
         auto section = [&](uint32_t tag, auto &&fn)
         {
@@ -5341,12 +5341,17 @@ struct Ps2xRollback
         ps2xSimSnapFree(sim); ps2xKernelStateFree(krn); ps2xMemDeviceFree(dev);
         return ok;
     }
+    // PS2X_SYNC_BLOCKCHK: 1 (default) = the scheduler's blocked flags must agree per thread; 0 = the pre-fix acceptance (rig A/B);
+    // 2 / 3 (rig) = host publishes / joiner adopts ONLY a boundary where tid 3's flag DISAGREES -- 2: past its wait (token wait)
+    // there, inside it here (the freeze); 3: the reverse (the dead thread)
+    static int syncBlockMode() { static const int m = [](){ const char *v = std::getenv("PS2X_SYNC_BLOCKCHK"); return v && v[0] ? std::atoi(v) : 1; }(); return m; }
     static std::string sigLine(const SigEnt &e)
     {
         char b[240];
         std::snprintf(b, sizeof b, "sig=%016llx depth=%d wp=%d arg=%llx kst=%d kwt=%d kwid=%d pc=0x%x ra=0x%x%s%s",
                       (unsigned long long)e.sig, e.depth, e.wp, (unsigned long long)e.warg, e.kst, e.kwt, e.kwid, e.bpc, e.bra,
                       e.opaque ? " inside " : "", e.opaque ? e.opaqueName : "");
+        if (e.blocked == 0) std::strncat(b, " (token wait)", sizeof b - std::strlen(b) - 1u);
         return b;
     }
     // Adopt a portable snapshot. Returns false with `why` set: a permanent problem ("build id",
@@ -5357,7 +5362,7 @@ struct Ps2xRollback
         Ps2xByteR r(data, n);
         char magic[8] = {}; r.raw(magic, 8);
         if (std::memcmp(magic, "BT3SYNC2", 8) != 0) { why = "bad magic (an older peer?)"; return false; }
-        if (r.u32() != 3u) { why = "version (an older peer?)"; return false; }
+        if (r.u32() != 4u) { why = "version (an older peer?)"; return false; }
         const std::string fmt = r.str(); const std::string bid = r.str();
         const uint64_t tLayout = r.u64(), tProgram = r.u64(), tMath = r.u64();
         (void)ps2xSyncFormatId();   // computes ours
@@ -5429,6 +5434,8 @@ struct Ps2xRollback
         *permanent = false;
         // ---- structural check: every guest fiber parked where theirs is
         {
+            const int s_blockMode = syncBlockMode();
+            const bool s_blockChk = s_blockMode == 1;
             const std::vector<SigEnt> mine = mySignatures(rt);
             std::string bad;
             for (const SigEnt &t : sigs)
@@ -5436,6 +5443,17 @@ struct Ps2xRollback
                 const SigEnt *m = nullptr; for (const SigEnt &x : mine) if (x.tid == t.tid) { m = &x; break; }
                 if (!m) { bad += " tid " + std::to_string(t.tid) + ": absent here;"; continue; }
                 if (t.opaque || m->opaque) { bad += " tid " + std::to_string(t.tid) + ": parked inside " + (t.opaque ? t.opaqueName : m->opaqueName) + (t.opaque ? " (theirs);" : " (ours);"); continue; }
+                // [statesync] The scheduler's `blocked` flag is a HOST-EXECUTION fact the blob carries: false means that
+                // fiber is past its wait's predicate and only waits for the token (guestWaitEnd/schedAcquire), true means
+                // it is inside the predicate loop. The same guest chain, wait point and kernel status cannot tell the two
+                // apart, and adopting the wrong one is fatal: a joiner fiber inside the loop that is marked runnable and
+                // handed the token re-evaluates a predicate the adopted kernel state keeps false (the sound thread's
+                // suspend count, re-armed by the host's tid 1 before the boundary) and is re-run forever -- tid 1 never
+                // gets the token again (the Windows-host/Linux-joiner freeze at frame 2943). The reverse leaves a
+                // fiber that already passed its wait marked blocked: it is only ever probed, never scheduled, and the
+                // thread is dead. So the flags must agree; the boundaries alternate, a match comes within a few frames.
+                if (s_blockChk && (t.blocked != 0) != (m->blocked != 0))
+                { bad += " tid " + std::to_string(t.tid) + (t.blocked ? ": inside its wait there, past it here;" : ": past its wait there (token wait), inside it here;"); continue; }
                 if (m->sig != t.sig || m->kst != t.kst || m->kwt != t.kwt || m->kwid != t.kwid)
                 {
                     auto chainText = [](const std::vector<ShadowEnt> &ch) { std::string o; char b[40]; for (const ShadowEnt &e : ch) { const uint32_t k = e.site >> 29; std::snprintf(b, sizeof b, " %c%x@%x", k == SK_CALL ? 'c' : k == SK_JUMP ? 'j' : k == SK_SYSCALL ? 's' : 'l', e.target, e.site & 0x1FFFFFFFu); o += b; } return o; };
@@ -5444,6 +5462,15 @@ struct Ps2xRollback
                 }
             }
             for (const SigEnt &m : mine) { bool found = false; for (const SigEnt &t : sigs) if (t.tid == m.tid) { found = true; break; } if (!found) bad += " tid " + std::to_string(m.tid) + ": absent there;"; }
+            if (bad.empty() && (s_blockMode == 2 || s_blockMode == 3))
+            {   // rig: hold out for the mismatched boundary the default rule refuses, to show what adopting it does
+                const SigEnt *t3 = nullptr, *m3 = nullptr;
+                for (const SigEnt &t : sigs) if (t.tid == 3) t3 = &t;
+                for (const SigEnt &m : mine) if (m.tid == 3) m3 = &m;
+                const bool want = t3 && m3 && (s_blockMode == 2 ? (t3->blocked == 0 && m3->blocked != 0) : (t3->blocked != 0 && m3->blocked == 0));
+                if (!want) bad += std::string(" (rig mode ") + std::to_string(s_blockMode) + ": waiting for a tid 3 flag mismatch; theirs blocked=" + (t3 ? std::to_string((int)t3->blocked) : "?") + " ours " + (m3 ? std::to_string((int)m3->blocked) : "?") + ")";
+                else std::fprintf(stderr, "[statesync] rig mode %d: adopting a boundary where tid 3 is %s\n", s_blockMode, s_blockMode == 2 ? "past its wait there (token wait) and inside it here" : "inside its wait there and past it here");
+            }
             for (const auto &wk : workers) if (!ps2xWorkerContext(wk.first)) bad += " tid " + std::to_string(wk.first) + ": no worker context here;";
             if (!bad.empty()) { why = "not comparable:" + bad; return false; }
         }
@@ -5518,6 +5545,14 @@ struct Ps2xRollback
                 }
                 if (!busy.empty()) std::fprintf(stderr, "[statesync] host: no clean boundary in %u frames, publishing anyway:%s\n", s_unclean, busy.c_str());
                 s_unclean = 0;
+            }
+            if (syncBlockMode() == 2 || syncBlockMode() == 3)
+            {   // rig: publish only a boundary where tid 3 is past its wait (mode 2) / inside it (mode 3)
+                bool want = false;
+                for (const SigEnt &e : mySignatures(rt)) if (e.tid == 3) want = (syncBlockMode() == 2) ? e.blocked == 0 : e.blocked != 0;
+                static uint32_t s_n = 0;
+                if (!want) { if ((++s_n % 120u) == 1u) std::fprintf(stderr, "[statesync] host: rig mode %d: waiting for a boundary where tid 3 is %s (%u so far)\n", syncBlockMode(), syncBlockMode() == 2 ? "past its wait (token wait)" : "inside its wait", s_n); return false; }
+                std::fprintf(stderr, "[statesync] host: rig mode %d: publishing a boundary where tid 3 is %s\n", syncBlockMode(), syncBlockMode() == 2 ? "past its wait (token wait)" : "inside its wait");
             }
             std::vector<uint8_t> blob;
             const auto t0 = clock::now();

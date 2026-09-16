@@ -5536,7 +5536,11 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
         bt3MemBlock(rdram);          // [memblock]
         bt3DumpKey(rdram);           // [dumpkey]
         bt3NetJumpCharSelect(rdram, ctx, runtime); // [netjump]
-        ps2NetInit();   // [netplay] no-op unless PS2X_NET / PS2X_NET_LISTEN is set
+        {   // [netplay] no-op unless PS2X_NET / PS2X_NET_LISTEN is set. PS2X_NET_CONNECT_FRAME=<n> (rig) holds the
+            // connect/listen until game frame n: a scripted way to sync two instances that are already mid-fight.
+            static const uint64_t s_connectAt = [](){ const char *v = std::getenv("PS2X_NET_CONNECT_FRAME"); return v && v[0] ? std::strtoull(v, nullptr, 10) : 0ull; }();
+            if (g_bt3FrameCount.load(std::memory_order_relaxed) >= s_connectAt) ps2NetInit();
+        }
         ps2NetFrame(static_cast<uint32_t>(g_bt3FrameCount.load(std::memory_order_relaxed)));
         ps2DetHashFrame(rdram, ctx->vu0_r);   // [dethash]
         if (g_ps2StepCensus.load(std::memory_order_relaxed)) ps2StepCensusFrame(ctx);   // [stepcensus]
