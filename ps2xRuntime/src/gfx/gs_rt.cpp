@@ -3,6 +3,9 @@
 #include "gfx/gl_context.h"
 #include "gfx/gl/GlGfx.h"
 
+#include "raylib.h"
+#include "rlgl.h"   // rlEnableFramebuffer / rlViewport / rlDrawRenderBatchActive (A1 submit is still rlgl)
+
 #include <cstdio>
 #include <memory>
 #include <unordered_map>
@@ -48,5 +51,20 @@ namespace ps2x::gfx
             s_targets.erase(it);
         }
         rt = RenderTexture2D{};
+    }
+
+    void GsRtBegin(const RenderTexture2D &rt)
+    {
+        rlDrawRenderBatchActive();   // raylib's BeginTextureMode flushes too: don't leak draws into it
+        rlEnableFramebuffer(rt.id);
+        rlViewport(0, 0, rt.texture.width > 0 ? rt.texture.width : 1,
+                          rt.texture.height > 0 ? rt.texture.height : 1);
+    }
+
+    void GsRtEnd()
+    {
+        rlDrawRenderBatchActive();
+        rlEnableFramebuffer(0);
+        rlViewport(0, 0, GetScreenWidth(), GetScreenHeight());
     }
 }
