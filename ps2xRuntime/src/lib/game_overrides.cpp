@@ -3240,7 +3240,19 @@ namespace
             if (s_dir && s_dir[0] && rdram && ctx && ctx->pc >= 0x263278u && ctx->pc < 0x263478u && ps2NetActive())
             {
                 static std::atomic<uint32_t> s_n{0};
-                if (s_n.fetch_add(1u) == 2u)   // 3rd in-range spin tick: the decompressor only yields a few times before the loop stops preempting
+                const uint32_t k = s_n.fetch_add(1u);
+                if (k < 3u)   // log registers on the first few spin ticks (before the overflow trashes everything)
+                {
+                    auto R = [&](int r){ return getRegU32(ctx, r); };
+                    // source read ptr (t0=r8) and the loop bounds (a2=r6 length, a1=r5 out off, a3=r7 target); a0=r4 out ptr now
+                    std::fprintf(stderr, "[freezereg] #%u pc=0x%x sp=0x%x | a0=0x%x a1=0x%x a2=0x%x a3=0x%x t0=0x%x t1=0x%x v0=0x%x v1=0x%x ra=0x%x\n",
+                                 k, ctx->pc, R(29), R(4), R(5), R(6), R(7), R(8), R(9), R(2), R(3), R(31));
+                    // dump 32 bytes of source around t0 (the compressed data being read)
+                    const uint32_t t0 = R(8);
+                    char hx[80] = {0}; for (int i = 0; i < 24; ++i) { if (const uint8_t *b = getConstMemPtr(rdram, t0 - 8u + (uint32_t)i)) std::snprintf(hx + i*2, 3, "%02x", *b); }
+                    std::fprintf(stderr, "[freezereg] #%u src@t0-8: %s\n", k, hx);
+                }
+                if (k == 2u)
                 {
                     const uint32_t sp = getRegU32(ctx, 29);
                     char path[512]; std::snprintf(path, sizeof path, "%s/freeze_%llu_p%d.bin", s_dir, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), ps2NetLocalPlayer());
