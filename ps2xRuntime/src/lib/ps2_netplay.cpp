@@ -764,7 +764,12 @@ bool ps2NetSyncWaitDone(uint32_t timeoutMs)
             const SOCKET c = ::accept(g.syncListen, reinterpret_cast<sockaddr *>(&from), &fl);
             if (c != INVALID_SOCKET)
             {
-#if !defined(_WIN32)
+                // The accepted socket must BLOCK for the 40 MB send. Linux gives accept()ed sockets a fresh
+                // blocking mode; Windows makes them inherit the listener's non-blocking mode, and every
+                // send then failed at once with WSAEWOULDBLOCK ("sent ... in 0.00 s (FAILED)").
+#if defined(_WIN32)
+                { u_long zero = 0; ioctlsocket(c, FIONBIO, &zero); }
+#else
                 const int fl2 = fcntl(c, F_GETFL, 0); fcntl(c, F_SETFL, fl2 & ~O_NONBLOCK);
 #endif
                 sockTimeouts(c, 30000);
