@@ -4975,6 +4975,32 @@ void PS2Runtime::run()
             }
             if (g_d3dBlitInit)
             {
+                void *nativeSrv = ps2GpuRenderer().d3dPresentSRV();
+                if (nativeSrv)
+                {   // [d3d11 gs] the GS rendered natively into a D3D render target: bind its SRV.
+                    const uint32_t rw = ps2GpuRenderer().d3dPresentWidth();
+                    const uint32_t rh = ps2GpuRenderer().d3dPresentHeight();
+                    static ps2x::gfx::Texture s_rtTex;
+                    static void *s_lastSrv = (void *)0x1;
+                    if (s_lastSrv != nativeSrv || s_rtTex.Width() != rw || s_rtTex.Height() != rh)
+                    { s_rtTex.AdoptSRV(g_ps2xD3D11, nativeSrv, rw, rh); s_lastSrv = nativeSrv; }
+                    const float W = (float)g_ps2xD3D11.Width(), H = (float)g_ps2xD3D11.Height();
+                    const float sc = std::min(W / (float)(rw ? rw : 1), H / (float)(rh ? rh : 1));
+                    const float dw = rw * sc, dh = rh * sc;
+                    const float x0 = (W - dw) * 0.5f, y0 = (H - dh) * 0.5f, x1 = x0 + dw, y1 = y0 + dh;
+                    auto ndcX = [&](float x) { return 2.0f * x / W - 1.0f; };
+                    auto ndcY = [&](float y) { return 1.0f - 2.0f * y / H; };
+                    auto mk = [](float x, float y, float u, float v) {
+                        ps2x::gfx::Vertex vx{}; vx.x = x; vx.y = y; vx.u = u; vx.v = v;
+                        vx.r = vx.g = vx.b = vx.a = 255; vx.q = 1.0f; vx.z = 0.0f; return vx; };
+                    g_d3dBlit.SetShader(&g_d3dBlitShader);
+                    g_d3dBlit.SetTexture(&s_rtTex);
+                    ps2x::gfx::BlendDesc opaque; opaque.enable = false; g_d3dBlit.SetBlend(opaque);
+                    g_d3dBlit.DrawQuad(mk(ndcX(x0), ndcY(y0), 0, 0), mk(ndcX(x1), ndcY(y0), 1, 0),
+                                       mk(ndcX(x1), ndcY(y1), 1, 1), mk(ndcX(x0), ndcY(y1), 0, 1));
+                }
+                else
+                {
                 int pw = 0, ph = 0;
                 if (ps2GpuRenderer().copyPresentPixels(g_d3dPresentPx, pw, ph) && pw > 0 && ph > 0)
                 {
@@ -5017,6 +5043,7 @@ void PS2Runtime::run()
                         mk(ndcX(x1), ndcY(y0), 1.0f, 1.0f),
                         mk(ndcX(x1), ndcY(y1), 1.0f, 0.0f),
                         mk(ndcX(x0), ndcY(y1), 0.0f, 0.0f));
+                }
                 }
             }
             if (s_uiTest)

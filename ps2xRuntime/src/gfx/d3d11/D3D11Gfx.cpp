@@ -91,6 +91,15 @@ namespace ps2x::gfx
         ctx->UpdateSubresource(t.tex.Get(), 0, nullptr, pixels, pitchBytes, 0);
     }
 
+    void Texture::AdoptSRV(D3D11Device &dev, void *srv, uint32_t w, uint32_t h)
+    {
+        Impl &t = *m_impl;
+        t.device = static_cast<ID3D11Device *>(dev.NativeDevice());
+        t.w = w; t.h = h;
+        t.srv = static_cast<ID3D11ShaderResourceView *>(srv);
+        SetSampler(dev, Filter::Point, Wrap::Clamp);
+    }
+
     void Texture::SetSampler(D3D11Device &dev, Filter filter, Wrap wrap)
     {
         Impl &t = *m_impl;
@@ -325,6 +334,7 @@ namespace ps2x::gfx
     void Shader::SetVec3(const char *n, float x, float y, float z) { float a[3] = {x, y, z}; writeConst(*m_impl, n, a, 12); }
     void Shader::SetVec4(const char *n, float x, float y, float z, float w) { float a[4] = {x, y, z, w}; writeConst(*m_impl, n, a, 16); }
     void Shader::SetInt(const char *n, int v) { writeConst(*m_impl, n, &v, 4); }
+    void Shader::SetMat4(const char *n, const float m[16]) { writeConst(*m_impl, n, m, 64); }
     bool Shader::Valid() const { return m_impl->vs != nullptr; }
 
     // ----------------------------------------------------------------- Renderer
@@ -547,6 +557,7 @@ namespace ps2x::gfx
     bool Texture::Create(D3D11Device &, uint32_t, uint32_t, Format, const void *, bool) { return false; }
     void Texture::Destroy() {}
     void Texture::Update(D3D11Device &, const void *, uint32_t) {}
+    void Texture::AdoptSRV(D3D11Device &, void *, uint32_t, uint32_t) {}
     void Texture::SetSampler(D3D11Device &, Filter, Wrap) {}
     bool Texture::Valid() const { return false; }
     uint32_t Texture::Width() const { return 0; }
@@ -578,6 +589,7 @@ namespace ps2x::gfx
     void Shader::SetVec3(const char *, float, float, float) {}
     void Shader::SetVec4(const char *, float, float, float, float) {}
     void Shader::SetInt(const char *, int) {}
+    void Shader::SetMat4(const char *, const float *) {}
     bool Shader::Valid() const { return false; }
 
     struct Renderer::Impl {};

@@ -36,6 +36,9 @@ namespace ps2x::gfx
         void Destroy();
         // Upload the whole surface (RGBA8: 4 bytes/px, R8: 1 byte/px).
         void Update(D3D11Device &dev, const void *pixels, uint32_t pitchBytes = 0);
+        // Adopt an existing shader resource view (e.g. a RenderTarget's colour texture) without
+        // owning it, so it can be bound by the Renderer (present/blit path).
+        void AdoptSRV(D3D11Device &dev, void *srv, uint32_t w, uint32_t h);
         void SetSampler(D3D11Device &dev, Filter filter, Wrap wrap);
 
         bool Valid() const;
@@ -97,6 +100,7 @@ namespace ps2x::gfx
         void SetVec3(const char *name, float x, float y, float z);
         void SetVec4(const char *name, float x, float y, float z, float w);
         void SetInt(const char *name, int v);
+        void SetMat4(const char *name, const float m[16]);   // 16 floats, row-major
 
         bool Valid() const;
 
@@ -110,10 +114,11 @@ namespace ps2x::gfx
     struct BlendDesc
     {
         bool enable = true;
-        uint32_t srcRGB = 6;   // D3D11_BLEND_SRC_ALPHA
-        uint32_t dstRGB = 7;   // D3D11_BLEND_INV_SRC_ALPHA
-        uint32_t srcA = 1;     // D3D11_BLEND_ONE
-        uint32_t dstA = 0;     // D3D11_BLEND_ZERO
+        // D3D11_BLEND_* values: ZERO=1, ONE=2, SRC_ALPHA=5, INV_SRC_ALPHA=6.
+        uint32_t srcRGB = 5;   // SRC_ALPHA
+        uint32_t dstRGB = 6;   // INV_SRC_ALPHA
+        uint32_t srcA = 2;     // ONE
+        uint32_t dstA = 6;     // INV_SRC_ALPHA
         uint32_t opRGB = 1;    // D3D11_BLEND_OP_ADD
         uint32_t opA = 1;
     };

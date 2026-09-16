@@ -29,32 +29,7 @@ float4 PSMain(VSOut i):SV_Target{ return float4(tex.Sample(smp, i.uv).rgb, 1.0);
     inline const char *kGsVertexShaderHlsl = R"HLSL(
 cbuffer CB : register(b0)
 {
-    float4x4 mvp;
-    float4x4 _unused_mvpPad;
-    float4   colDiffuse;
-    float    uBright;
-    float    uSubScale;
-    float    uUViz;
-    float    uIdxMode;
-    float    uIdxScale;
-    float    uFboOne;
-    float    uTcc;
-    float    uASplit;
-    float4   uTexa;
-    float    uABl128;
-    float    uTfx;
-    float    uProjClip;
-    float    uAScale;
-    float2   uAlphaFix;
-    float    uAtst;
-    float    uAref;
-    float    uFba;
-    float    uForceA;
-    float    uZTex;
-    float    uZScale;
-    float    uPerspQ;
-    float3   _unused_perspPad;
-    float4   uRegion;
+    row_major float4x4 mvp;
 };
 
 struct VSIn
@@ -76,7 +51,7 @@ struct VSOut
 VSOut VSMain(VSIn i)
 {
     VSOut o;
-    o.pos = float4(i.pos, i.z, 1.0);
+    o.pos = mul(float4(i.pos, i.z, 1.0), mvp);
     o.uv  = i.uv;
     o.col = i.col;
     o.q   = i.q;
@@ -92,8 +67,6 @@ SamplerState samp1    : register(s1);
 
 cbuffer CB : register(b0)
 {
-    float4x4 mvp;
-    float4x4 _unused_mvpPad;
     float4   colDiffuse;
     float    uBright;
     float    uSubScale;

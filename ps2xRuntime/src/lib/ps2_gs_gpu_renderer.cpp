@@ -45,6 +45,14 @@ namespace
     ps2x::gfx::Shader   g_d3dGsSh;
     bool g_d3dGsInit = false;
     std::unordered_map<uint64_t, ps2x::gfx::Texture *> g_d3dGsTex;   // texKey -> D3D texture
+    ps2x::gfx::RenderTarget *g_d3dGsRt = nullptr;   // this frame's render target
+    int g_d3dGsRtW = 0, g_d3dGsRtH = 0;
+    uint32_t g_d3dGsBegun = 0xFFFFFFFFu;            // frameGen the RT was last bound+cleared for
+    inline ps2x::gfx::Texture *d3dGsTexFor(uint64_t key)
+    {
+        auto it = g_d3dGsTex.find(key);
+        return it == g_d3dGsTex.end() ? nullptr : it->second;
+    }
     // [d3d11] PS2X_D3D11_GS=1 switches the GS replay onto the native D3D path. Opt-in until it
     // covers what the GL replay does; the readback bridge stays the default meanwhile.
     bool d3dGsOn()
@@ -1224,6 +1232,98 @@ namespace
     int g_locTcc = -1;                  // GS TEX0.TCC
     int g_locAlphaFix = -1;             // [texreplace] replacement alpha rescale + two-level snap
     AlphaFix g_curAlphaFix{1.0f, 0.0f}; // [texreplace] last value pushed to uAlphaFix
+#if defined(_WIN32)
+    // [d3d11] Native GS draw helpers (PS2X_D3D11_GS). The GL program stays the source of truth
+    // for the per-draw uniforms and for blend/scissor/colour-mask (read back with glGet*); we
+    // mirror them onto the D3D shader/state and rasterise through gfx:: instead of rlgl.
+    static bool d3dGsEnsure()
+    {
+        ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+        if (!dev) return false;
+        if (!g_d3dGsInit)
+        {
+            if (!g_d3dGsR.Init(*dev)) return false;
+            if (!g_d3dGsSh.Compile(*dev, ps2x::gfx::kGsVertexShaderHlsl,
+                                   ps2x::gfx::kGsFragmentShaderHlsl)) return false;
+            g_d3dGsInit = true;
+        }
+        return true;
+    }
+    static uint32_t d3dBlendFromGL(int gl)
+    {
+        switch (gl)
+        {
+            case 0x0000: return 1;   // GL_ZERO
+            case 0x0001: return 2;   // GL_ONE
+            case 0x0300: return 3;   // SRC_COLOR
+            case 0x0301: return 4;   // 1-SRC_COLOR
+            case 0x0302: return 5;   // SRC_ALPHA
+            case 0x0303: return 6;   // 1-SRC_ALPHA
+            case 0x0304: return 7;   // DST_ALPHA
+            case 0x0305: return 8;   // 1-DST_ALPHA
+            case 0x0306: return 9;   // DST_COLOR
+            case 0x0307: return 10;  // 1-DST_COLOR
+            case 0x0308: return 11;  // SRC_ALPHA_SAT
+            case 0x8589: return 16;  // SRC1_ALPHA
+            case 0x88FB: return 17;  // 1-SRC1_ALPHA
+            default:     return 2;
+        }
+    }
+    static uint32_t d3dBlendOpFromGL(int gl)
+    { return gl == 0x800A ? 2u : (gl == 0x800B ? 3u : 1u); }   // SUBTRACT / REV_SUBTRACT / ADD
+    static void d3dGsMirrorUniforms()
+    {
+        struct U { const char *n; int ncomp; };
+        static const U u[] = {
+            {"colDiffuse",4},{"uBright",1},{"uSubScale",1},{"uUViz",1},{"uIdxMode",1},
+            {"uIdxScale",1},{"uFboOne",1},{"uTcc",1},{"uASplit",1},{"uTexa",4},
+            {"uABl128",1},{"uTfx",1},{"uProjClip",1},{"uAScale",1},{"uAlphaFix",2},
+            {"uAtst",1},{"uAref",1},{"uFba",1},{"uForceA",1},{"uZTex",1},{"uZScale",1},
+            {"uPerspQ",1},{"uRegion",4},
+        };
+        for (const U &e : u)
+        {
+            const int loc = GetShaderLocation(g_shader, e.n);
+            if (loc < 0) continue;
+            float v[4] = {0, 0, 0, 0};
+            glGetUniformfv(g_shader.id, loc, v);
+            if (e.ncomp == 1) g_d3dGsSh.SetFloat(e.n, v[0]);
+            else if (e.ncomp == 2) g_d3dGsSh.SetVec2(e.n, v[0], v[1]);
+            else g_d3dGsSh.SetVec4(e.n, v[0], v[1], v[2], v[3]);
+        }
+    }
+    static void d3dGsMirrorState(int rtW, int rtH)
+    {
+        ps2x::gfx::BlendDesc b;
+        b.enable = glIsEnabled(0x0BE2 /*GL_BLEND*/) != 0;
+        int f = 0;
+        glGetIntegerv(0x80C9, &f); b.srcRGB = d3dBlendFromGL(f);
+        glGetIntegerv(0x80C8, &f); b.dstRGB = d3dBlendFromGL(f);
+        glGetIntegerv(0x80CB, &f); b.srcA = d3dBlendFromGL(f);
+        glGetIntegerv(0x80CA, &f); b.dstA = d3dBlendFromGL(f);
+        glGetIntegerv(0x8009, &f); b.opRGB = d3dBlendOpFromGL(f);
+        glGetIntegerv(0x883D, &f); b.opA = d3dBlendOpFromGL(f);
+        g_d3dGsR.SetBlend(b);
+        unsigned char m[4] = {1, 1, 1, 1};
+        glGetBooleanv(0x0C23 /*GL_COLOR_WRITEMASK*/, m);
+        g_d3dGsR.SetColorMask(m[0] != 0, m[1] != 0, m[2] != 0, m[3] != 0);
+        if (glIsEnabled(0x0C11 /*GL_SCISSOR_TEST*/))
+        {
+            int box[4] = {0, 0, 0, 0};
+            glGetIntegerv(0x0C10 /*GL_SCISSOR_BOX*/, box);
+            const int y = rtH - (box[1] + box[3]);   // GL bottom-up -> D3D top-down
+            const int sc[4] = {box[0], y, box[2], box[3]};
+            g_d3dGsR.SetScissor(sc);
+        }
+        else g_d3dGsR.SetScissor(nullptr);
+    }
+    static void d3dGsSetMvp(int w, int h)
+    {
+        const float W = (float)(w > 0 ? w : 512), H = (float)(h > 0 ? h : 448);
+        const float m[16] = {2.0f / W, 0, 0, 0,  0, -2.0f / H, 0, 0,  0, 0, 1, 0,  -1, 1, 0, 1};
+        g_d3dGsSh.SetMat4("mvp", m);
+    }
+#endif
     // [texreplace] Push uAlphaFix for the texture about to be BOUND -- a pack replacement is
     // uploaded raw and still carries PS2 alpha (0x80 == opaque) while everything the GS decoder
     // produced was already expanded to 0..255 on the CPU, so the rescale is per-texture.
@@ -17271,6 +17371,44 @@ if (done.size() < 14 && !done.count(c.texKey))
                 const int tsP = rsTexScale(tex.id);
                 if (tsP > 1) { src.x *= tsP; src.y *= tsP; src.width *= tsP; src.height *= tsP; }
             }
+#if defined(_WIN32)
+            if (d3dGsOn() && d3dGsEnsure())
+            {
+                ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+                if (!g_d3dGsRt) g_d3dGsRt = new ps2x::gfx::RenderTarget();
+                if (g_d3dGsRtW != (int)m_fboW || g_d3dGsRtH != (int)m_fboH)
+                {
+                    g_d3dGsRt->Create(*dev, (uint32_t)m_fboW, (uint32_t)m_fboH, false);
+                    g_d3dGsRtW = (int)m_fboW; g_d3dGsRtH = (int)m_fboH; g_d3dGsBegun = 0xFFFFFFFFu;
+                }
+                if (g_d3dGsBegun != frameGen)
+                {
+                    g_d3dGsRt->Bind(*dev);
+                    g_d3dGsRt->Clear(*dev, 0, 0, 0, 1);
+                    g_d3dGsBegun = frameGen;
+                }
+                d3dGsMirrorUniforms();
+                d3dGsMirrorState(g_d3dGsRtH, g_d3dGsRtH);
+                d3dGsSetMvp(g_d3dGsRtW, g_d3dGsRtH);
+                g_d3dGsSh.SetVec4("colDiffuse", c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, c.a / 255.0f);
+                g_d3dGsR.SetShader(&g_d3dGsSh);
+                g_d3dGsR.SetTexture(d3dGsTexFor(c.texKey));   // null -> Renderer's white tex
+                const float tw = (float)(tex.width > 0 ? tex.width : 1), th = (float)(tex.height > 0 ? tex.height : 1);
+                const float u0 = src.x / tw, v0 = src.y / th;
+                const float u1 = (src.x + src.width) / tw, v1 = (src.y + src.height) / th;
+                auto mkv = [](float x, float y, float u, float v) {
+                    ps2x::gfx::Vertex vx{};
+                    vx.x = x; vx.y = y; vx.u = u; vx.v = v;
+                    vx.r = vx.g = vx.b = vx.a = 255; vx.q = 1.0f; vx.z = 0.0f;
+                    return vx;
+                };
+                g_d3dGsR.DrawQuad(mkv(dst.x, dst.y, u0, v0),
+                                  mkv(dst.x + dst.width, dst.y, u1, v0),
+                                  mkv(dst.x + dst.width, dst.y + dst.height, u1, v1),
+                                  mkv(dst.x, dst.y + dst.height, u0, v1));
+            }
+            else
+#endif
             DrawTexturePro(tex, src, dst, Vector2{0, 0}, 0.0f, Color{c.r, c.g, c.b, c.a});
             { static const bool s_sk3 = [](){ const char *v = std::getenv("PS2X_SEGCHK"); return v && v[0] && v[0] != '0'; }();
               static int n5 = 0; if (s_sk3 && c.destFbp == 224u && c.texKey && n5 < 6) ps2xDbgCol0("after-DrawTexturePro", ++n5); }
@@ -19404,4 +19542,30 @@ bool GsGpuRenderer::copyPresentPixels(std::vector<unsigned char> &outRgba, int &
     sCur ^= 1;
     sPending = true;
     return filled;
+}
+
+void *GsGpuRenderer::d3dPresentSRV() const
+{
+#if defined(_WIN32)
+    if (g_d3dGsRt) return g_d3dGsRt->Color().NativeSRV();
+#endif
+    return nullptr;
+}
+
+unsigned GsGpuRenderer::d3dPresentWidth() const
+{
+#if defined(_WIN32)
+    return g_d3dGsRt ? (unsigned)g_d3dGsRt->Width() : 0u;
+#else
+    return 0u;
+#endif
+}
+
+unsigned GsGpuRenderer::d3dPresentHeight() const
+{
+#if defined(_WIN32)
+    return g_d3dGsRt ? (unsigned)g_d3dGsRt->Height() : 0u;
+#else
+    return 0u;
+#endif
 }
