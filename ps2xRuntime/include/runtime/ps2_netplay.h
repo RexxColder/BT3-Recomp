@@ -55,5 +55,6 @@ bool     ps2NetSyncWaitDone(uint32_t timeoutMs);                 // host: serve 
 bool     ps2NetSyncOffered(uint32_t *frameAbs, uint64_t *bytes); // joiner: an offer arrived
 bool     ps2NetSyncFetch(std::vector<uint8_t> &out);            // joiner: pull the blob over TCP (blocking, 30 s timeout)
 void     ps2NetSyncApplied(uint32_t frameAbs);                   // joiner: state adopted; sets the base, sends DONE
+void     ps2NetRequestResync();                                 // [freezerecover] joiner: ask the host for a fresh state after the char-select decompressor freeze; re-arms the local sync
 uint32_t ps2NetCheckEvery();      // PS2X_NET_CHECKEVERY: confirmed-state checksum interval (default 60)
 uint32_t ps2NetDesyncFrame();     // [desyncdump] the first frame whose confirmed hashes differed, 0 = none

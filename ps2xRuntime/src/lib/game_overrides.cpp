@@ -1,6 +1,8 @@
 #include "ps2_waitprof.h"   // [waitprof]
 #include "runtime/ps2_statesync.h"   // [statesync]
 extern "C" bool ps2xAudioFeedOn();   // [rollback] ps2_runtime.cpp: false while re-simulating / fast-forwarding (no device feed)
+extern "C" void ps2xNetFreezeRecoverBegin();   // [freezerecover] ps2_runtime.cpp
+extern "C" void ps2xGuestSleepMs(unsigned ms);   // [fibers] ps2_runtime.cpp: parks the fiber
 #include "ps2_runtime_macros.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
@@ -539,6 +541,18 @@ namespace
         if (ps2NetActive())
         {
             const uint32_t frame = static_cast<uint32_t>(g_bt3FrameCount.load(std::memory_order_relaxed));
+            // [freezerecover] TEST hook (PS2X_NET_FREEZE_TEST=<game frame>): a synced joiner forces ONE
+            // recovery there, with no real freeze, to validate the re-sync path in loopback. Off by default.
+            {
+                static const uint32_t s_ftf = [](){ const char *v = std::getenv("PS2X_NET_FREEZE_TEST"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
+                static std::atomic<bool> s_ftDone{false};
+                if (s_ftf && !ps2NetSyncIsHost() && !ps2NetSyncPending() && frame >= s_ftf && !s_ftDone.exchange(true))
+                {
+                    std::fprintf(stderr, "[freezerecover] TEST: forcing a recovery at frame %u\n", frame);
+                    ps2xNetFreezeRecoverBegin();
+                    ps2xGuestSleepMs(5000u);
+                }
+            }
             const int pl = static_cast<int>(socket & 3u) + 1;          // socket 0/1 -> player 1/2
             // [netjump] The jump's confirm press is a P1 press (the versus menu listens to player 1 only).
             // In lockstep the host's P1 press crosses the wire, so injecting on the LOCAL player was right;
@@ -683,6 +697,7 @@ namespace
     }
     extern "C" int ps2xSchedTraceOn();   // [schedtrace] ps2_runtime.cpp
     extern "C" int ps2xSchedTid();
+    extern "C" void ps2xNetFreezeRecoverBegin();   // [freezerecover] ps2_runtime.cpp
     void bt3CdReadStatePoll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00270dd0
     {
         const uint32_t handle = getRegU32(ctx, 4); // a0 = read handle
@@ -3271,6 +3286,27 @@ namespace
                     if (std::FILE *f = std::fopen(path, "wb")) { std::fwrite(rdram, 1, PS2_RAM_SIZE, f); std::fclose(f);
                         std::fprintf(stderr, "[freezedump] pc=0x%x sp=0x%x -> %s\n", ctx->pc, sp, path); }
                 }
+            }
+        }
+        // [freezerecover] Recovery (not just the [freezedump] diagnostic above): a SYNCED JOINER whose
+        // char-select preview LZ decompressor (0x263278..0x263478) has clearly hung asks the host for a
+        // fresh state instead of freezing. The spinpump only runs on a genuine spin, so a handful of ticks
+        // in this range means the loop is runaway (its legit path returns after ~6 yields). Block the fiber
+        // so the runaway cannot overflow further while the re-sync arrives; the controller's idle path then
+        // re-adopts the host's clean state onto this very fiber (ps2xFreezeRecoveryAdopt). Env off: =0.
+        if (ctx && ctx->pc >= 0x263278u && ctx->pc < 0x263478u && ps2NetActive() && !ps2NetSyncIsHost())
+        {
+            static const bool s_rec = [](){ const char *v = std::getenv("PS2X_NET_FREEZE_RECOVER"); return !(v && v[0] == '0'); }();
+            static std::atomic<uint32_t> s_rk{0};
+            if (s_rec && s_rk.fetch_add(1u) >= 2u)   // the spinpump only runs on a genuine spin; 3rd tick = a sustained runaway
+            {
+                ps2xNetFreezeRecoverBegin();
+                // Park this fiber (stop the runaway from overflowing further) until the host's fresh state
+                // arrives: the controller's idle path adopts it and syncApply overwrites THIS fiber, so this
+                // sleep never returns on a successful recovery. If it does return (no re-sync), the loop
+                // re-enters here and tries again.
+                ps2xGuestSleepMs(5000u);
+                return;
             }
         }
         static const bool s_on = [](){ const char *v = std::getenv("PS2X_SPINPUMP"); return !(v && v[0] == '0'); }();

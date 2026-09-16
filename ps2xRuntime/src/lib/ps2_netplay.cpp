@@ -334,6 +334,17 @@ void pump()
             if (g.listening && p.baseFrame == g.syncFrame) g.syncDone = true;
             continue;
         }
+        if (p.kind == 3u)
+        {   // [freezerecover] the joiner hit the char-select decompressor freeze and needs a fresh state.
+            // Re-arm this host's sync so its boundary-driven syncStep re-publishes (same proven path as
+            // the initial sync). Ignored unless we are the host and currently synced.
+            if (g.listening && g.synced)
+            {
+                g.synced = false; g.syncOffered = false; g.syncDone = false;
+                std::fprintf(stderr, "[freezerecover] host: joiner requested a re-sync -- re-publishing state\n");
+            }
+            continue;
+        }
         if (g.fakeLagMs) g.held.emplace_back(std::chrono::steady_clock::now(), p);
         else applyInputs(p);
     }
@@ -823,6 +834,15 @@ void ps2NetSyncApplied(uint32_t frameAbs)
     syncResetTables(frameAbs);
     sendSyncDone(frameAbs);
     std::fprintf(stderr, "[netplay] frame base = %u (state sync)\n", frameAbs);
+}
+
+void ps2NetRequestResync()
+{   // [freezerecover] joiner side: tell the host to re-publish, and re-arm the local sync so the
+    // idle-path recovery re-adopts the host's fresh offer (see ps2xNetFreezeRecoverBegin).
+    if (!g.active || !g.connected || g.listening) return;   // joiner only
+    for (int i = 0; i < 4; ++i) sendSyncCtl(3u, g.base, 0u, nullptr);
+    { std::lock_guard<std::mutex> lk(g.mtx); g.synced = false; g.syncOffered = false; g.syncDone = false; }
+    std::fprintf(stderr, "[freezerecover] joiner: requested a re-sync from the host\n");
 }
 uint32_t ps2NetCheckEvery() { return g.checkEvery; }
 uint32_t ps2NetDesyncFrame() { return g.desyncFrame; }

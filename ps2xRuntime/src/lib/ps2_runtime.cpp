@@ -8,6 +8,7 @@
 #include "runtime/ps2_detmath.h"     // [statesync] the deterministic libm's fingerprint is part of the state format id
 extern std::atomic<uint64_t> g_bt3FrameCount;   // game_overrides.cpp: the frame hook's counter
 extern "C" bool ps2xFrameStepOn();               // frame-stepped mode (defined with the frame gate below)
+extern "C" void ps2xNetFreezeRecoverBegin();     // [freezerecover] joiner: spinpump signals a char-select decompressor hang
 extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defined with the scheduler)
 #if !defined(_WIN32)
 #include <dlfcn.h>
@@ -4145,6 +4146,9 @@ namespace
     // ~80k yields/s in a fight = most of the re-simulation cost); now it does so only when the
     // generation moved since the last probe, with a probe every 64 yields as a safety net.
     std::atomic<uint64_t> g_schedSignalGen{0};
+    // [freezerecover] set by ps2xNetFreezeRecoverBegin when a synced joiner hits the char-select
+    // decompressor freeze; the controller's idle path then re-adopts the host's fresh state onto tid1.
+    std::atomic<bool> g_freezeRecovering{false};
     // [rollbacktest] where the re-simulation's time goes (accumulated while g_rollbackUnpaced)
     uint64_t g_rbTicks = 0, g_rbTickNs = 0, g_rbSwitches = 0, g_rbProbes = 0, g_rbIdles = 0, g_rbBoundaries = 0, g_rbBoundaryNs = 0;
     // Keyed by tid, and deliberately NOT in SchedThread: keeping it here avoids touching
@@ -4361,6 +4365,7 @@ bool PS2Runtime::schedFiberLoopUntil(bool (*stop)(void *), void *stopCtx)
 }
 
 static void ps2xRollbackAtBoundary(PS2Runtime &rt);   // [rollback] defined with Ps2xRollback below
+static bool ps2xFreezeRecoveryAdopt(PS2Runtime &rt);   // [freezerecover] defined below (drives the joiner re-adopt)
 extern "C" void ps2xSchedSignal();                     // [fibers] defined with ps2xFrameStepOn below
 extern "C" void ps2xInterruptTick(uint8_t *rdram, PS2Runtime *runtime);   // [rollback] Kernel/Syscalls/Interrupt.cpp: one vblank
 extern "C" void ps2xVirtualClockEnable();                                  // [rollback] ps2_memory.cpp: EE timers on the stepped clock
@@ -4452,6 +4457,10 @@ void PS2Runtime::schedFiberBoot(int mainTid, int mainPrio, std::function<void()>
                   g_rbTickNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t0).count(); ++g_rbTicks; }
                 if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] f=%llu TICK cur=%d nf %llu -> %llu tick %llu -> %llu\n", (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), m_schedCurrent,
                                                      (unsigned long long)nfBefore, (unsigned long long)g_cadNestedFairness, (unsigned long long)tkBefore, (unsigned long long)g_cadTickCounter);
+                // [freezerecover] the frozen joiner reaches this idle tick while its main thread is parked
+                // (spinpump/schedBeginBlock); re-adopt the host's fresh state here (never at a boundary --
+                // the frozen thread never hits the frame gate).
+                if (g_freezeRecovering.load(std::memory_order_relaxed)) ps2xFreezeRecoveryAdopt(*this);
                 continue;
             }
             { const auto t0 = clock::now(); ps2xRollbackAtBoundary(*this); ++g_rbBoundaries;
@@ -4836,6 +4845,17 @@ void PS2Runtime::guestWaitEnd(void *handle)
 // lock held; parks the fiber until the controller opens the gate for this frame. Off unless a
 // frame-stepped feature enabled it, and a no-op on the thread path.
 extern "C" bool ps2xFrameStepOn() { return g_gate.on && g_waitHookRuntime && g_waitHookRuntime->fibersEnabled(); }
+extern "C" void ps2xNetFreezeRecoverBegin()
+{   // [freezerecover] The joiner's char-select preview LZ decompressor has hung on a wrong (voice) asset
+    // because the host-paced sound state drifted. Gameplay is still in sync, so recover by asking the host
+    // for a fresh state snapshot; the controller's idle path re-adopts it, overwriting the frozen fiber.
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_NET_FREEZE_RECOVER"); return !(v && v[0] == '0'); }();
+    if (!s_on) return;
+    if (!ps2NetActive() || ps2NetSyncIsHost()) return;             // joiner only; the host does not freeze
+    if (g_freezeRecovering.exchange(true, std::memory_order_relaxed)) return;   // one request per freeze
+    std::fprintf(stderr, "[freezerecover] joiner: char-select decompressor freeze detected -- requesting a re-sync from the host\n");
+    ps2NetRequestResync();
+}
 extern "C" void ps2xSchedSignal() { g_schedSignalGen.fetch_add(1u, std::memory_order_relaxed); }
 extern "C" void ps2xFrameGateWait(uint64_t frame, uint8_t *rdram, R5900Context *ctx)
 {
@@ -5641,6 +5661,19 @@ struct Ps2xRollback
         return false;
     }
 
+    static bool freezeRecoveryAdopt(PS2Runtime &rt)
+    {   // [freezerecover] Called from the controller idle path while the frozen joiner's main thread is
+        // parked. Runs the ordinary joiner adopt (syncStep): once the host's fresh offer has arrived it
+        // fetches the blob and syncApply restores EVERY fiber, replacing the runaway decompressor's stack
+        // with the host's clean one. Returns true when recovered.
+        if (!g_freezeRecovering.load(std::memory_order_relaxed)) return false;
+        if (!ps2NetActive() || ps2NetSyncIsHost()) { g_freezeRecovering.store(false, std::memory_order_relaxed); return false; }
+        if (!ps2NetSyncPending()) { g_freezeRecovering.store(false, std::memory_order_relaxed); return true; }
+        const bool done = syncStep(rt);
+        if (done) { g_freezeRecovering.store(false, std::memory_order_relaxed); std::fprintf(stderr, "[freezerecover] joiner: recovered via re-sync\n"); }
+        return done;
+    }
+
     static void netAtBoundary(PS2Runtime &rt)
     {
         // Not cached: the transport parses PS2X_NET_ROLLBACK when it starts, which is later than the
@@ -5929,6 +5962,7 @@ struct Ps2xRollback
     }
 };
 static void ps2xRollbackAtBoundary(PS2Runtime &rt) { Ps2xRollback::atBoundary(rt); }
+static bool ps2xFreezeRecoveryAdopt(PS2Runtime &rt) { return Ps2xRollback::freezeRecoveryAdopt(rt); }   // [freezerecover]
 
 extern "C" void *ps2xGuestWaitBegin() { gprof::enter(gprof::WAIT); return g_waitHookRuntime ? g_waitHookRuntime->guestWaitBegin() : nullptr; }   // [guestprof] WAIT
 extern "C" void ps2xGuestWaitEnd(void *h) { gprof::leave(); if (h && g_waitHookRuntime) g_waitHookRuntime->guestWaitEnd(h); }
