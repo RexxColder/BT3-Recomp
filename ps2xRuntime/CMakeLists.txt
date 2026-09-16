@@ -664,6 +664,19 @@ if(WIN32)
     target_link_libraries(ps2_runtime PUBLIC d3d11 dxgi d3dcompiler dxguid)
 endif()
 
+# [altGL] Standalone OpenGL layer (own loader + gfx/gl). Opt-in present (PS2X_ALTGL=1) while the
+# renderer is migrated off raylib; coexists with the D3D11 device in the same TU.
+target_sources(ps2_runtime PRIVATE
+    src/gfx/gl/GlApi.cpp
+    src/gfx/gl/GlDevice.cpp
+    src/gfx/gl/GlGfx.cpp)
+if(WIN32)
+    target_link_libraries(ps2_runtime PUBLIC opengl32)
+else()
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(ps2_runtime PUBLIC OpenGL::GL ${CMAKE_DL_LIBS})
+endif()
+
 # [statesync] libunwind: the netplay state sync unwinds each parked guest fiber's host call chain into a
 # structural signature (the peer only adopts a state at a matching park). Optional: without it the
 # signature falls back to the wait point + guest pc/ra, which is weaker.

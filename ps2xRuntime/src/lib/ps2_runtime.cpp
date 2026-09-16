@@ -157,6 +157,78 @@ float g_ps2xWsHudInv = 1.0f;
 // by FBW shoved the center window into a bridge zone and stretched the timer plaque.
 float g_ps2xWsSrcW = 512.0f;
 #include "rlgl.h" // rlSetBlendFactorsSeparate for the blend-free present blit
+
+#if defined(_WIN32)
+// [altGL] Opt-in present through the standalone GL layer (PS2X_ALTGL=1): the game frame is drawn
+// with gfx::gl instead of raylib's DrawTexturePro. The GS still renders through rlgl for now;
+// only the final blit moves. Borrows raylib's window/context during the transition (tools/gl_probe).
+#include "gfx/gl/GlDevice.h"
+#include "gfx/gl/GlGfx.h"
+#include "gfx/gl/GlApi.h"
+#include "gfx/gl/gl_shader_glsl.h"
+extern "C" __declspec(dllimport) void *__stdcall wglGetProcAddress(const char *);
+namespace
+{
+    bool g_altglOk = false, g_altglTried = false;
+    ps2x::gfx::gl::GlDevice g_altglDev;
+    ps2x::gfx::gl::Renderer g_altglR;
+    ps2x::gfx::gl::Shader   g_altglBlit;
+    ps2x::gfx::gl::Texture  g_altglSrc;
+    unsigned g_altglSrcId = 0;
+
+    bool AltGlEnabled()
+    { static const bool s = [](){ const char *v = std::getenv("PS2X_ALTGL"); return v && v[0] && v[0] != '0'; }(); return s; }
+
+    bool AltGlInit()
+    {
+        if (g_altglTried) return g_altglOk;
+        g_altglTried = true;
+        ps2x::gfx::gl::GlPlatform plat{};
+        plat.window = GetWindowHandle();
+        plat.getProc = [](const char *n) { return (void *)wglGetProcAddress(n); };
+        g_altglOk = g_altglDev.Init(plat, (uint32_t)GetScreenWidth(), (uint32_t)GetScreenHeight())
+                 && g_altglR.Init(g_altglDev)
+                 && g_altglBlit.Compile(g_altglDev, ps2x::gfx::gl::kGlBlitVertexShader,
+                                        ps2x::gfx::gl::kGlBlitFragmentShader);
+        std::fprintf(stderr, "[altgl] present init %s (GL %s)\n", g_altglOk ? "ok" : "FAILED",
+                     (const char *)ps2xgl::glGetString(ps2xgl::GL_VERSION));
+        return g_altglOk;
+    }
+
+    // Returns true when gfx::gl drew the frame (the caller then skips the raylib present).
+    bool AltGlPresent(Texture2D &tex, const Rectangle &src, const Rectangle &dst, bool bilinear)
+    {
+        if (!AltGlEnabled() || !tex.id || !AltGlInit()) return false;
+        const float W = (float)GetScreenWidth(), H = (float)GetScreenHeight();
+        if (g_altglSrcId != tex.id || g_altglSrc.Width() != (uint32_t)tex.width ||
+            g_altglSrc.Height() != (uint32_t)tex.height)
+        { g_altglSrc.AdoptGL(g_altglDev, tex.id, (uint32_t)tex.width, (uint32_t)tex.height); g_altglSrcId = tex.id; }
+        g_altglSrc.SetSamplerUV(g_altglDev, bilinear ? ps2x::gfx::gl::Filter::Linear : ps2x::gfx::gl::Filter::Point,
+                                ps2x::gfx::gl::Wrap::Clamp, ps2x::gfx::gl::Wrap::Clamp);
+        const float u0 = src.x / (float)tex.width,  u1 = (src.x + src.width) / (float)tex.width;
+        const float v0 = src.y / (float)tex.height, v1 = (src.y + src.height) / (float)tex.height;
+        const float x0 = dst.x, y0 = dst.y, x1 = dst.x + dst.width, y1 = dst.y + dst.height;
+        const float m[16] = { 2.0f / W, 0, 0, 0, 0, -2.0f / H, 0, 0, 0, 0, 1, 0, -1, 1, 0, 1 };
+        auto V = [](float x, float y, float u, float v) {
+            ps2x::gfx::gl::Vertex p{}; p.x = x; p.y = y; p.u = u; p.v = v;
+            p.r = p.g = p.b = p.a = 255; p.q = 1.0f; p.z = 0.0f; return p; };
+        g_altglR.SetShader(&g_altglBlit);
+        g_altglR.SetTexture(&g_altglSrc);
+        ps2x::gfx::gl::BlendDesc opaque; opaque.enable = false;
+        g_altglR.SetBlend(opaque);
+        g_altglR.SetScissor(nullptr);
+        g_altglR.SetColorMask(true, true, true, true);
+        g_altglR.SetDepth(false, false, 0x0203);
+        ps2xgl::glDisable(ps2xgl::GL_CULL_FACE);   // raylib's rlgl leaves culling on
+        g_altglBlit.SetMat4("mvp", m);
+        g_altglR.DrawQuad(V(x0, y0, u0, v0), V(x1, y0, u1, v0), V(x1, y1, u1, v1), V(x0, y1, u0, v1));
+        return true;
+    }
+}
+#else
+namespace { bool AltGlPresent(Texture2D &, const Rectangle &, const Rectangle &, bool) { return false; } }
+#endif
+
 namespace ps2_syscalls { bool bt3WakeThreadByEntry(uint32_t entry); }
 
 #include <iostream>
@@ -6892,7 +6964,9 @@ void PS2Runtime::run()
             SetTextureFilter(presentTex, TEXTURE_FILTER_BILINEAR);
         // ...and never let an edge sample wrap to the opposite side of the texture.
         if (s_pEdge) SetTextureWrap(presentTex, TEXTURE_WRAP_CLAMP);
-        DrawTexturePro(presentTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        // [altGL] PS2X_ALTGL=1: draw the frame through gfx::gl instead of raylib's DrawTexturePro.
+        if (!AltGlPresent(presentTex, srcRect, dstRect, pgsTexPtr ? true : GsGpuRenderer::renderScale() > 1))
+            DrawTexturePro(presentTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         EndBlendMode();
         }
         { extern double g_fpBlit; g_fpBlit += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tBlit).count(); }
