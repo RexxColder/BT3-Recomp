@@ -76,12 +76,28 @@ unrelated to the frame rate.
 
 ## Known issues / next
 
-- **Overlay text is garbled once the game is booted** (fine before boot). The overlay draws through
-  rlImGui; a state we leave after our direct GL draw is not re-applied by rlgl. A first attempt
-  (unbind texture units, `rlDisableTexture/Shader`, flush) did not fix it. Next: log the ImGui font
-  atlas TexID + bound program/unit/texture + `GL_UNPACK_ALIGNMENT` before/after `rlImGuiEnd()` and
-  diff the pre-boot (good) against the post-boot (bad) state, then restore the offending state
-  through rlgl's own APIs (`rlSetBlendMode`/`rlDisableDepthTest`/`rlColorMask`/`rlEnableColorBlend`).
-- Launcher selector `OpenGL (altGL)` (renderer 4 → `PS2X_D3D11=0`, `PS2X_ALTGL=1`) so the mode can
-  be picked without environment variables.
+- **Launcher selector** `OpenGL (altGL)` (renderer 4 → `PS2X_D3D11=0`, `PS2X_ALTGL=1`) so the mode
+  can be picked without environment variables.
 - Migrate the GS replay itself off rlgl to `gfx::` (`rg*` wrappers, then the D3D11/GL backends).
+
+## Fixed: garbled overlay text
+
+The in-game settings overlay (drawn by rlImGui through rlgl) came out with every glyph as an
+opaque block once the game was booted. Root cause: our altGL present sets GL blend state with
+**raw GL calls** (`glDisable(GL_BLEND)`), but rlgl caches its own blend mode and therefore
+re-applies nothing; the overlay then rendered with blending off, so each glyph quad wrote its
+full quad as an opaque rectangle of the text colour instead of an alpha-blended glyph. rlgl's
+cache is a lie whenever GL is touched directly, so the fix re-asserts the state through **rlgl's
+own APIs** right after the altGL draw:
+
+```cpp
+rlEnableColorBlend();
+rlSetBlendMode(RL_BLEND_ALPHA);
+rlActiveTextureSlot(0); rlDisableTexture(); rlDisableShader();
+rlDrawRenderBatchActive();
+```
+
+Diagnosed by logging the GL state before/after `rlImGuiEnd()` (`PS2X_ALTGL=1`): `blend=0` with
+`cull`/`vao`/`prog` mismatched versus rlgl's cache, identical pre-boot and post-boot, which
+pointed at the blend state rather than the font atlas or texture units.
+

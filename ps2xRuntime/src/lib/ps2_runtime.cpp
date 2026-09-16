@@ -178,7 +178,6 @@ namespace
 
     bool AltGlEnabled()
     { static const bool s = [](){ const char *v = std::getenv("PS2X_ALTGL"); return v && v[0] && v[0] != '0'; }(); return s; }
-
     bool AltGlInit()
     {
         if (g_altglTried) return g_altglOk;
@@ -231,6 +230,17 @@ namespace
         ps2xgl::glDisable(ps2xgl::GL_CULL_FACE);   // raylib's rlgl leaves culling on
         g_altglBlit.SetMat4("mvp", m);
         g_altglR.DrawQuad(V(x0, y0, u0, vTop), V(x1, y0, u1, vTop), V(x1, y1, u1, vBottom), V(x0, y1, u0, vBottom));
+        // [altGL] Hand the GL state back through RAYLIB'S OWN rlgl API. Our direct draws changed
+        // GL (blend disabled, our program/texture/VAO bound) but rlgl's cached state still says
+        // "alpha blend on, rlgl's program/texture bound" and therefore re-applies NOTHING. The
+        // overlay (rlImGui) is drawn by rlgl right after and then renders with blending OFF, so
+        // every glyph quad becomes an opaque block of the text colour (the "garbled" overlay).
+        rlEnableColorBlend();
+        rlSetBlendMode(RL_BLEND_ALPHA);
+        rlActiveTextureSlot(0);
+        rlDisableTexture();
+        rlDisableShader();
+        rlDrawRenderBatchActive();
         return true;
     }
 }
