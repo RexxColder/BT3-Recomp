@@ -3240,7 +3240,7 @@ namespace
             if (s_dir && s_dir[0] && rdram && ctx && ctx->pc >= 0x263278u && ctx->pc < 0x263478u && ps2NetActive())
             {
                 static std::atomic<uint32_t> s_n{0};
-                if (s_n.fetch_add(1u) == 200u)
+                if (s_n.fetch_add(1u) == 2u)   // 3rd in-range spin tick: the decompressor only yields a few times before the loop stops preempting
                 {
                     const uint32_t sp = getRegU32(ctx, 29);
                     char path[512]; std::snprintf(path, sizeof path, "%s/freeze_%llu_p%d.bin", s_dir, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), ps2NetLocalPlayer());
