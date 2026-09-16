@@ -45,6 +45,13 @@ namespace
     ps2x::gfx::Shader   g_d3dGsSh;
     bool g_d3dGsInit = false;
     std::unordered_map<uint64_t, ps2x::gfx::Texture *> g_d3dGsTex;   // texKey -> D3D texture
+    // [d3d11] PS2X_D3D11_GS=1 switches the GS replay onto the native D3D path. Opt-in until it
+    // covers what the GL replay does; the readback bridge stays the default meanwhile.
+    bool d3dGsOn()
+    {
+        static const bool s = [](){ const char *v = std::getenv("PS2X_D3D11_GS"); return v && v[0] && v[0] != '0'; }();
+        return s && ps2x::gfx::NativeVideo();
+    }
 }
 #endif
 extern "C" void glFinish(void);   // [unloadmode] drain experiment
@@ -7894,6 +7901,28 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     SetTextureWrap(t, TEXTURE_WRAP_CLAMP); // PS2 UI doesn't tile; stop edge repeat
                 }
                 g_glTex[u.key] = t;
+#if defined(_WIN32)
+                if (d3dGsOn() && !compressed)
+                {   // [d3d11] parallel D3D copy so the native replay can bind it without a readback.
+                    ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+                    ps2x::gfx::Texture *dt = nullptr;
+                    auto dit = g_d3dGsTex.find(u.key);
+                    if (dit != g_d3dGsTex.end()) dt = dit->second;
+                    if (!dt || dt->Width() != (uint32_t)u.w || dt->Height() != (uint32_t)u.h)
+                    {
+                        delete dt;
+                        dt = new ps2x::gfx::Texture();
+                        if (!dt->Create(*dev, (uint32_t)u.w, (uint32_t)u.h, ps2x::gfx::Format::RGBA8, nullptr))
+                        { delete dt; dt = nullptr; }
+                        else g_d3dGsTex[u.key] = dt;
+                    }
+                    if (dt)
+                    {
+                        dt->Update(*dev, u.rgba.data());
+                        dt->SetSampler(*dev, ps2x::gfx::Filter::Point, ps2x::gfx::Wrap::Clamp);
+                    }
+                }
+#endif
                 // Diagnostic: export each decoded texture once so we can view it.
                 {
                     static const bool s_dx = [](){ const char *v = std::getenv("PS2X_GPU_DIAG"); return v && v[0] && v[0] != '0'; }();
