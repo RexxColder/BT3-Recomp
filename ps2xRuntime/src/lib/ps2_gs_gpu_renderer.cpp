@@ -47,6 +47,8 @@ namespace
     std::unordered_map<uint64_t, ps2x::gfx::Texture *> g_d3dGsTex;   // texKey -> D3D texture
     ps2x::gfx::RenderTarget *g_d3dGsRt = nullptr;   // this frame's render target
     ps2x::gfx::Texture *g_d3dPresentTex = nullptr;  // native texture of the fbp being presented
+    ps2x::gfx::RenderTarget *g_d3dLatchRt = nullptr; // [d3d11] completed-frame latch (native)
+    ps2x::gfx::Shader g_d3dLatchSh;                  // plain blit shader for the latch copy
     int g_d3dGsRtW = 0, g_d3dGsRtH = 0;
     uint32_t g_d3dGsBegun = 0xFFFFFFFFu;            // frameGen the RT was last bound+cleared for
     inline ps2x::gfx::Texture *d3dGsTexFor(uint64_t key)
@@ -1369,6 +1371,10 @@ namespace
         // produced the alternating-brightness flicker.
         dit->second.d3dRt->Bind(*dev);
         (void)frameGen;
+        // [d3d11] the display buffers are fbp0/fbp112: keep the last one DRAWN as the present
+        // source, so the present never falls back to a stale/unmapped buffer.
+        if (curRealFbp == 0u || curRealFbp == 112u)
+            g_d3dPresentTex = &dit->second.d3dRt->Color();
         rtW = (int)dit->second.d3dRt->Width(); rtH = (int)dit->second.d3dRt->Height();
         d3dGsMirrorUniforms();
         d3dGsMirrorState(rtH, rtH);
@@ -9568,14 +9574,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     // ---- Completed-frame latch (PS2X_FRONTLATCH=0 disables) ----
     // Per list: which scene buffer (f0/f112) it predominantly draws. A frame COMPLETES at
     // the boundary where this switches buffers; latch a copy of the finished one there.
-    static const bool s_latch = [](){
-#if defined(_WIN32)
-        // [d3d11] the front-latch is a GL render texture with no native counterpart yet, so in
-        // the native GS path present the display fbp directly (otherwise the present would be
-        // a GL latch the D3D present cannot see).
-        if (d3dGsOn()) return false;
-#endif
-        const char *v = std::getenv("PS2X_FRONTLATCH"); return !(v && v[0] == '0'); }();
+    static const bool s_latch = [](){ const char *v = std::getenv("PS2X_FRONTLATCH"); return !(v && v[0] == '0'); }();
     ragStat.phase(8);
     std::vector<uint32_t> listSceneFbp;
     // [latchseg] A barrier segment render (m_segMode) is NOT a frame list: its predominant
@@ -9664,6 +9663,41 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         EndTextureMode();
         g_frontLatchValid = true;
         ++g_frontLatchGen;
+
+#if defined(_WIN32)
+        // [d3d11] Native completed-frame latch: copy the just-finished scene RT into a stable
+        // native latch RT and present THAT. Without it the present can show a buffer that is
+        // still being redrawn -> the content flicker.
+        if (d3dGsOn() && d3dGsEnsure() && lit->second.d3dRt)
+        {
+            ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+            if (!g_d3dLatchRt) g_d3dLatchRt = new ps2x::gfx::RenderTarget();
+            if (g_d3dLatchRt->Width() != 512u || g_d3dLatchRt->Height() != 512u)
+                g_d3dLatchRt->Create(*dev, 512u, 512u, false);
+            if (!g_d3dLatchSh.Valid())
+                g_d3dLatchSh.Compile(*dev, ps2x::gfx::kBlitVertexShaderHlsl,
+                                     ps2x::gfx::kBlitFragmentShaderHlsl);
+            g_d3dLatchRt->Bind(*dev);
+            g_d3dLatchRt->Clear(*dev, 0, 0, 0, 1);
+            const float sw = (float)lit->second.d3dRt->Width(), sh = (float)lit->second.d3dRt->Height();
+            const float x1 = -1.0f + 2.0f * sw / 512.0f;
+            const float y1 = 1.0f - 2.0f * sh / 512.0f;
+            g_d3dGsR.SetShader(&g_d3dLatchSh);
+            g_d3dGsR.SetTexture(&lit->second.d3dRt->Color());
+            ps2x::gfx::BlendDesc opaque; opaque.enable = false; g_d3dGsR.SetBlend(opaque);
+            g_d3dGsR.SetScissor(nullptr);
+            g_d3dGsR.SetColorMask(true, true, true, true);
+            g_d3dGsR.SetDepth(false, false, 0);
+            auto mkl = [](float x, float y, float u, float v) {
+                ps2x::gfx::Vertex vx{};
+                vx.x = x; vx.y = y; vx.u = u; vx.v = v;
+                vx.r = vx.g = vx.b = vx.a = 255; vx.q = 1.0f; vx.z = 0.0f;
+                return vx;
+            };
+            g_d3dGsR.DrawQuad(mkl(-1, 1, 0, 0), mkl(x1, 1, 1, 0), mkl(x1, y1, 1, 1), mkl(-1, y1, 0, 1));
+            g_d3dPresentTex = &g_d3dLatchRt->Color();
+        }
+#endif
 
         // FBO -> VRAM writeback, taken HERE because this is the only moment the scene buffer
         // provably holds a COMPLETED frame. Doing it at end of renderAndGetTextureId read a
@@ -19562,8 +19596,10 @@ if (done.size() < 14 && !done.count(c.texKey))
     g_lastOutId = outId;
 #if defined(_WIN32)
     // [d3d11] remember the native texture that matches the presented GL texture, so the present
-    // shows the fbp the GL path actually chose (display parity/latch), not a fixed buffer.
-    g_d3dPresentTex = d3dFboTexForGl(outId);
+    // shows the fbp the GL path actually chose (display parity/latch), not a fixed buffer. Only
+    // overwrite when the mapping exists -- a null here would drop the present to the readback
+    // path, which reads an empty GL buffer in native mode (a black frame -> flicker).
+    if (ps2x::gfx::Texture *pt = d3dFboTexForGl(outId)) g_d3dPresentTex = pt;
 #endif
     return outId;
 }

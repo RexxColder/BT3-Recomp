@@ -104,20 +104,36 @@ namespace ps2x::gfx
         };
         D3D_FEATURE_LEVEL got = D3D_FEATURE_LEVEL_11_0;
 
-        HRESULT hr = D3D11CreateDeviceAndSwapChain(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createFlags,
-            levels, static_cast<UINT>(sizeof(levels) / sizeof(levels[0])),
-            D3D11_SDK_VERSION, &sd, d.swapChain.GetAddressOf(),
-            d.device.GetAddressOf(), &got, d.context.GetAddressOf());
-
-        // 11_1 can be rejected on older runtimes: retry without it before giving up.
-        if (hr == E_INVALIDARG)
+        // Prefer the DXGI flip model (recommended for D3D11; preserves/rotates back buffers
+        // and gives stable presentation), falling back to the blt DISCARD model if the flip
+        // swap chain cannot be created on this HWND.
+        const DXGI_SWAP_EFFECT effects[] = {
+            DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            DXGI_SWAP_EFFECT_DISCARD,
+        };
+        HRESULT hr = E_FAIL;
+        for (DXGI_SWAP_EFFECT eff : effects)
         {
+            sd.SwapEffect = eff;
             hr = D3D11CreateDeviceAndSwapChain(
                 nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createFlags,
-                levels + 1, static_cast<UINT>(sizeof(levels) / sizeof(levels[0])) - 1,
+                levels, static_cast<UINT>(sizeof(levels) / sizeof(levels[0])),
                 D3D11_SDK_VERSION, &sd, d.swapChain.GetAddressOf(),
                 d.device.GetAddressOf(), &got, d.context.GetAddressOf());
+            if (hr == E_INVALIDARG)   // 11_1 rejected on older runtimes: retry without it
+                hr = D3D11CreateDeviceAndSwapChain(
+                    nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createFlags,
+                    levels + 1, static_cast<UINT>(sizeof(levels) / sizeof(levels[0])) - 1,
+                    D3D11_SDK_VERSION, &sd, d.swapChain.GetAddressOf(),
+                    d.device.GetAddressOf(), &got, d.context.GetAddressOf());
+            if (SUCCEEDED(hr))
+            {
+                std::fprintf(stderr, "[d3d11] swap effect = %d (flip=%d)\n",
+                             (int)eff, eff == DXGI_SWAP_EFFECT_DISCARD ? 0 : 1);
+                break;
+            }
+            d.swapChain.Reset(); d.device.Reset(); d.context.Reset();
         }
 
         if (FAILED(hr))
