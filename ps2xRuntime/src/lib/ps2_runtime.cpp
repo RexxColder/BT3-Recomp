@@ -4908,6 +4908,7 @@ extern "C" uint64_t ps2xSimSnapLayoutHash();       // game_overrides.cpp
 extern "C" uint64_t ps2xKernelStateLayoutHash();   // Kernel/Syscalls/Thread.cpp
 extern "C" uint64_t ps2xSifStateLayoutHash();      // Kernel/Stubs/SIF.cpp
 extern "C" uint64_t ps2xMemDeviceLayoutHash();     // ps2_memory.cpp
+static uint64_t g_syncLayout = 0, g_syncProgram = 0, g_syncMath = 0;   // [statesync] the format id's parts, for the peer comparison
 static std::string ps2xSyncFormatId()
 {
     static std::string s_id;
@@ -4926,7 +4927,7 @@ static std::string ps2xSyncFormatId()
     const uint64_t math = ps2xDetMathFingerprint();
     uint64_t h = fnv(fnv(fnv(fnv(1469598103934665603ull, 4u /* format version */), layout), program), math);
     char b[48]; std::snprintf(b, sizeof b, "sync2-%016llx", (unsigned long long)h);
-    s_id = b;
+    s_id = b; g_syncLayout = layout; g_syncProgram = program; g_syncMath = math;
     std::fprintf(stderr, "[statesync] state format %s (layout %016llx, program %016llx, math %016llx, build %s)\n",
                  s_id.c_str(), (unsigned long long)layout, (unsigned long long)program, (unsigned long long)math, ps2xBuildId().c_str());
     return s_id;
@@ -5298,7 +5299,7 @@ struct Ps2xRollback
         void *dev = ps2xMemDeviceCapture(&rt.m_memory);
         out.clear(); out.reserve(48u << 20);
         Ps2xByteW w(out);
-        w.raw("BT3SYNC2", 8); w.u32(2u); w.str(ps2xSyncFormatId()); w.str(ps2xBuildId()); w.u64(g_gate.waitFrame);
+        w.raw("BT3SYNC2", 8); w.u32(3u); w.str(ps2xSyncFormatId()); w.str(ps2xBuildId()); w.u64(g_syncLayout); w.u64(g_syncProgram); w.u64(g_syncMath); w.u64(g_gate.waitFrame);
         bool ok = sim && krn && dev;
         auto section = [&](uint32_t tag, auto &&fn)
         {
@@ -5354,13 +5355,26 @@ struct Ps2xRollback
         Ps2xByteR r(data, n);
         char magic[8] = {}; r.raw(magic, 8);
         if (std::memcmp(magic, "BT3SYNC2", 8) != 0) { why = "bad magic (an older peer?)"; return false; }
-        if (r.u32() != 2u) { why = "version"; return false; }
+        if (r.u32() != 3u) { why = "version (an older peer?)"; return false; }
         const std::string fmt = r.str(); const std::string bid = r.str();
-        if (fmt != ps2xSyncFormatId()) { why = "state format differs: theirs " + fmt + " ours " + ps2xSyncFormatId() + " (different sources, patches or snapshot layout)"; return false; }
-        if (bid != ps2xBuildId())
-        {   // allowed: the format matches and the park signatures are guest-level; say so once
+        const uint64_t tLayout = r.u64(), tProgram = r.u64(), tMath = r.u64();
+        (void)ps2xSyncFormatId();   // computes ours
+        // Only the LAYOUT (how the blob's bytes are laid out) can make an adopted state wrong. A different
+        // program (a function registered on one side only) or different math results mean a desync is
+        // coming, but the sync itself is sound -- adopt, and say exactly which part differs so the log tells
+        // the story when the desync arrives.
+        if (tLayout != g_syncLayout) { why = "state layout differs: theirs " + std::to_string(tLayout) + " ours " + std::to_string(g_syncLayout) + " (different snapshot struct sizes)"; return false; }
+        if (fmt != ps2xSyncFormatId() || bid != ps2xBuildId())
+        {
             static bool s_said = false;
-            if (!s_said) { s_said = true; std::fprintf(stderr, "[statesync] different builds: theirs %s, ours %s -- the state format matches, syncing anyway\n", bid.c_str(), ps2xBuildId().c_str()); }
+            if (!s_said)
+            {
+                s_said = true;
+                std::fprintf(stderr, "[statesync] peer differs: build theirs %s ours %s; program %s (theirs %016llx ours %016llx); math %s (theirs %016llx ours %016llx) -- layout matches, syncing anyway%s\n",
+                             bid.c_str(), ps2xBuildId().c_str(), tProgram == g_syncProgram ? "same" : "DIFFERENT", (unsigned long long)tProgram, (unsigned long long)g_syncProgram,
+                             tMath == g_syncMath ? "same" : "DIFFERENT", (unsigned long long)tMath, (unsigned long long)g_syncMath,
+                             (tProgram != g_syncProgram || tMath != g_syncMath) ? " (expect a desync where they differ)" : "");
+            }
         }
         const uint64_t frame = r.u64();
         struct Owned { void *sim = nullptr, *krn = nullptr, *dev = nullptr;
