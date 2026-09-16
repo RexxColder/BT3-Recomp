@@ -8,6 +8,7 @@
 #include "gfx/gl/GlDevice.h"
 #include "gfx/gl/GlGfx.h"
 #include "gfx/gl/gl_shader_glsl.h"
+#include "gfx/gl/gl_gs_shader_glsl.h"
 
 #include <cstdio>
 #include <cstring>
@@ -49,6 +50,12 @@ int main()
     gl::Shader blit;
     if (!blit.Compile(dev, gl::kGlBlitVertexShader, gl::kGlBlitFragmentShader))
     { std::fprintf(stderr, "[glprobe] shader compile failed\n"); return 1; }
+    {   // [altGL] Validate the ported GS replay shader (same uniforms/dual-source outputs).
+        gl::Shader gs;
+        const bool ok = gs.Compile(dev, gl::kGlGsVertexShader, gl::kGlGsFragmentShader);
+        std::fprintf(stderr, "[glprobe] GS shader link=%d\n", (int)ok);
+        gs.Destroy();
+    }
 
     // A 4x4 checkerboard texture drawn as a quad.
     gl::Texture tex;
