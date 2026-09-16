@@ -47,14 +47,21 @@ int main()
     }
     gl::Renderer gfx;
     if (!gfx.Init(dev)) { std::fprintf(stderr, "[glprobe] Renderer init failed\n"); return 1; }
-    gl::Shader blit;
-    if (!blit.Compile(dev, gl::kGlBlitVertexShader, gl::kGlBlitFragmentShader))
-    { std::fprintf(stderr, "[glprobe] shader compile failed\n"); return 1; }
-    {   // [altGL] Validate the ported GS replay shader (same uniforms/dual-source outputs).
-        gl::Shader gs;
-        const bool ok = gs.Compile(dev, gl::kGlGsVertexShader, gl::kGlGsFragmentShader);
-        std::fprintf(stderr, "[glprobe] GS shader link=%d\n", (int)ok);
-        gs.Destroy();
+    gl::Shader gs;
+    if (!gs.Compile(dev, gl::kGlGsVertexShader, gl::kGlGsFragmentShader))
+    { std::fprintf(stderr, "[glprobe] GS shader compile failed\n"); return 1; }
+    {   // Pass-through GS uniforms (DECAL, texture on, no alpha test / palette / FBA / perspective).
+        auto f = [&](const char *n, float v) { gs.SetFloat(n, v); };
+        auto v4 = [&](const char *n, float x, float y, float z, float w) { gs.SetVec4(n, x, y, z, w); };
+        v4("colDiffuse", 1, 1, 1, 1);
+        f("uBright", 1.0f); f("uSubScale", 1.0f); f("uUViz", 0.0f);
+        f("uIdxMode", 0.0f); f("uIdxScale", 128.0f); f("uFboOne", 0.0f);
+        f("uTcc", 1.0f); f("uASplit", 0.0f); v4("uTexa", 1, 1, 0, 0);
+        f("uABl128", 0.0f); f("uTfx", 1.0f); f("uProjClip", 0.0f); f("uAScale", 1.0f);
+        gs.SetVec2("uAlphaFix", 1.0f, 0.0f);
+        f("uAtst", -1.0f); f("uAref", 0.0f); f("uFba", 0.0f); f("uForceA", 0.0f);
+        f("uZTex", 0.0f); f("uZScale", 1028.0f); f("uPerspQ", 0.0f);
+        v4("uRegion", 0, 0, 0, 0);
     }
 
     // A 4x4 checkerboard texture drawn as a quad.
@@ -75,12 +82,12 @@ int main()
 
         // top-left ortho -> NDC
         const float m[16] = { 2.0f / w, 0, 0, 0, 0, -2.0f / h, 0, 0, 0, 0, 1, 0, -1, 1, 0, 1 };
-        blit.Bind(dev);
-        blit.SetMat4("mvp", m);
-        blit.SetVec4("colDiffuse", 1, 1, 1, 1);
-        gfx.SetShader(&blit);
+        gs.Bind(dev);
+        gs.SetMat4("mvp", m);
+        gfx.SetShader(&gs);
         gfx.SetTexture(&tex);
-        gfx.SetBlend(gl::BlendDesc{});
+        gl::BlendDesc nb; nb.enable = false;   // opaque: show finalColor (dual-source not needed)
+        gfx.SetBlend(nb);
         gfx.SetScissor(nullptr);
         gfx.SetColorMask(true, true, true, true);
         gfx.SetDepth(false, false, 0x0203);
@@ -93,7 +100,7 @@ int main()
         dev.EndFrame();
     }
 
-    blit.Destroy(); gfx.Destroy(); tex.Destroy(); dev.Shutdown();
+    gs.Destroy(); gfx.Destroy(); tex.Destroy(); dev.Shutdown();
     CloseWindow();
     return 0;
 }
