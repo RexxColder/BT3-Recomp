@@ -6013,6 +6013,36 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
     // the compressed header) and, on a repeat with a caller-supplied output buffer, memcpy
     // the cached bytes instead of decompressing. On the FIRST call (miss) we run the real
     // function and record its output. Env-gated (PS2X_DECOMPCACHE).
+    // [voicelog] PS2X_NET_VOICELOG=1: on entry to the LZ decompressor FUN_00263278 during a netplay
+    // character-select, log (frame, src, outSize, count, a 64-bit hash of the first 4 KB of the compressed
+    // input). The joiner hangs in this decompressor when the per-character asset it is fed diverged; both
+    // machines process the swap on the same synced frame, so comparing the two logs at that frame shows
+    // whether the input differs (and its size/count). Cheap; no RAM dump. Off unless the env is set.
+    PS2Runtime::RecompiledFunction g_origVoice263278 = nullptr;
+    void bt3VoiceDecompLog(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00263278 diagnostic
+    {
+        uint32_t bt3State = 0xffffffffu, sp0 = 0u;
+        if (const uint8_t *p = getConstMemPtr(rdram, 0x2ff10cu)) std::memcpy(&sp0, p, 4);
+        if (sp0) { if (const uint8_t *p = getConstMemPtr(rdram, (sp0 & 0x1FFFFFFFu) + 0x18u)) std::memcpy(&bt3State, p, 4); }
+        if (ps2NetActive() && bt3State == 0x27u)
+        {
+            const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6);
+            const uint8_t *inp = (a0 != 0u) ? getConstMemPtr(rdram, a0) : nullptr;
+            uint32_t outSize = 0u, count = 0u;
+            if (inp && getConstMemPtr(rdram, a0 + 8u)) { std::memcpy(&outSize, inp, 4); std::memcpy(&count, inp + 4, 4); }
+            static std::atomic<uint32_t> s_n{0};
+            const uint32_t k = s_n.fetch_add(1u);
+            if (k < 4000u && inp)
+            {
+                uint64_t h = 1469598103934665603ull;
+                const uint32_t nb = (outSize && outSize < 0x400000u) ? (outSize < 4096u ? outSize : 4096u) : 256u;
+                for (uint32_t i = 0u; i < nb; ++i) { if (const uint8_t *b = getConstMemPtr(rdram, a0 + i)) { h ^= *b; h *= 1099511628211ull; } }
+                std::fprintf(stderr, "[voicelog] f=%llu src=0x%x a1=0x%x a2=0x%x outSize=%u count=%u in4k=%016llx\n",
+                             (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), a0, a1, a2, outSize, count, (unsigned long long)h);
+            }
+        }
+        if (g_origVoice263278) g_origVoice263278(rdram, ctx, runtime);
+    }
     PS2Runtime::RecompiledFunction g_orig263278 = nullptr;
     void bt3DecompressCached(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00263278
     {
@@ -6629,6 +6659,11 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
         {
             g_orig263278 = runtime.lookupFunction(0x00263278u);
             if (g_orig263278) runtime.replaceFunction(0x00263278u, &bt3DecompressCached);
+        }
+        else if (std::getenv("PS2X_NET_VOICELOG"))
+        {   // [voicelog] diagnostic hook (mutually exclusive with the cache; only one hook per address)
+            g_origVoice263278 = runtime.lookupFunction(0x00263278u);
+            if (g_origVoice263278) runtime.replaceFunction(0x00263278u, &bt3VoiceDecompLog);
         }
         // NOTE: bt3MovieLoadPoll (hook on FUN_00264af0) REVERTED again -- even guarded to
         // only tick with a valid adxf partition, installing it destabilizes the post-logos
