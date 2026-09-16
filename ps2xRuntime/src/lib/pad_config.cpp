@@ -1,5 +1,6 @@
 #include "runtime/pad_config.h"
-#include "ps2_host_backend.h"
+#include "runtime/ps2_host_pad.h"
+#include "ps2_host_backend.h"   // raylib: keyboard (IsKeyDown), IsWindowReady, the KEY_*/GAMEPAD_* enums
 
 #if defined(__linux__)
 #include "runtime/pad_evdev_linux.h"
@@ -80,7 +81,7 @@ namespace ps2_stubs
         {
             for (int pad : pads)
             {
-                const char *name = GetGamepadName(pad);
+                const char *name = ps2x_pad::name(pad);
                 if (name && native.matchesName(name))
                     return true;
             }
@@ -99,117 +100,44 @@ namespace ps2_stubs
             return clampToByte(static_cast<int>(std::lround(128.0f + v * 127.0f)));
         }
 
-        // One-time gamepad mapping setup (8BitDo Ultimate + PS2X_PAD_MAPPINGS file).
-        void ensureGamepadMappings()
-        {
-            static bool s_mapped = false;
-            if (s_mapped)
-            {
-                return;
-            }
-            s_mapped = true;
-            SetGamepadMappings(
-                "03000000c82d00000631000014010000,8BitDo Ultimate Wireless,platform:Linux,"
-                "a:b0,b:b1,x:b2,y:b3,back:b6,start:b7,guide:b8,leftstick:b9,rightstick:b10,"
-                "leftshoulder:b4,rightshoulder:b5,dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,"
-                "leftx:a0,lefty:a1,rightx:a3,righty:a4,lefttrigger:a2,righttrigger:a5");
-            // Microsoft Xbox Controller via xone (0x045e:0x0b12): bus 06 means GLFW counts
-            // buttons from BTN_MISC, so the button indices are the offset 0x30..0x3e from
-            // BTN_A..BTN_THUMBR. The native evdev reader is the primary path, but this
-            // mapping is a fallback in case another pad appears with the same GUID.
-            SetGamepadMappings(
-                "060000005e040000120b000017050000,Microsoft Xbox Controller,platform:Linux,"
-                "a:b48,b:b49,x:b51,y:b52,back:b58,start:b59,guide:b60,leftstick:b61,rightstick:b62,"
-                "leftshoulder:b54,rightshoulder:b55,dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,"
-                "leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:a4,righttrigger:a5");
-            if (const char *mf = std::getenv("PS2X_PAD_MAPPINGS"))
-            {
-                if (FILE *f = std::fopen(mf, "rb"))
-                {
-                    std::fseek(f, 0, SEEK_END);
-                    long sz = std::ftell(f);
-                    std::fseek(f, 0, SEEK_SET);
-                    if (sz > 0 && sz < 4 * 1024 * 1024)
-                    {
-                        char *buf = static_cast<char *>(std::malloc(static_cast<size_t>(sz) + 1));
-                        if (buf && std::fread(buf, 1, static_cast<size_t>(sz), f) == static_cast<size_t>(sz))
-                        {
-                            buf[sz] = '\0';
-                            SetGamepadMappings(buf);
-                        }
-                        std::free(buf);
-                    }
-                    std::fclose(f);
-                }
-            }
-        }
-
-        // Declared here rather than including GLFW/glfw3.h, which clashes with raylib.h.
-        extern "C" int glfwJoystickIsGamepad(int jid);
-        extern "C" const float *glfwGetJoystickAxes(int jid, int *count);
-        extern "C" const unsigned char *glfwGetJoystickButtons(int jid, int *count);
-        extern "C" const char *glfwGetJoystickName(int jid);
-        bool slotLooksLikeGamepad(int g); // defined below
-
-        // [padlog] PS2X_PADLOG=1: what does raylib actually see? The Device dropdown is built
-        // from IsGamepadAvailable(), which only reports pads that have a GAMEPAD MAPPING -- a
-        // controller the kernel exposes fine but GLFW has no mapping for never appears. That is
-        // what happened to the 8BitDo (hence the hardcoded SetGamepadMappings above). Print
-        // every slot once so a missing pad can be told apart from a mis-mapped one.
+        // [padlog] PS2X_PADLOG=1: what does the host pad layer actually see? The Device dropdown
+        // only lists slots that pass the controller test, so a controller the kernel exposes
+        // fine but that has no mapping and fails the layout test never appears. Print every
+        // slot once so a missing pad can be told apart from a mis-mapped one. (Mappings for
+        // pads outside the databases: PS2X_PAD_MAPPINGS, loaded by ps2x_pad::init().)
         void logGamepadSlotsOnce()
         {
             static const bool s_on = [](){ const char *v = std::getenv("PS2X_PADLOG"); return v && v[0] == '1'; }();
             static bool s_done = false;
             if (!s_on || s_done)
                 return;
-            // Only latch once a pad has actually appeared: GLFW enumerates joysticks during the
+            // Only latch once a pad has actually appeared: joysticks are enumerated during the
             // first frames, so logging at the very first call reports an empty list and hides
             // whatever turns up a moment later.
             bool any = false;
-            for (int g = 0; g < 16 && !any; ++g) any = IsGamepadAvailable(g);
+            for (int g = 0; g < ps2x_pad::kMaxSlots && !any; ++g) any = ps2x_pad::available(g);
             if (!any)
                 return;
             s_done = true;
-            for (int g = 0; g < 16; ++g)
+            for (int g = 0; g < ps2x_pad::kMaxSlots; ++g)
             {
-                const bool avail = IsGamepadAvailable(g);
-                const char *nm = avail ? glfwGetJoystickName(g) : nullptr; // raylib's buffer overflows
-                if (avail)
-                    std::fprintf(stderr, "[padlog] slot %d: AVAILABLE name='%s' axes=%d listed=%d\n",
-                                 g, nm ? nm : "?", GetGamepadAxisCount(g),
-                                 slotLooksLikeGamepad(g) ? 1 : 0);
+                if (ps2x_pad::available(g))
+                {
+                    const char *nm = ps2x_pad::name(g);
+                    std::fprintf(stderr, "[padlog] slot %d: AVAILABLE name='%s' axes=%d buttons=%d listed=%d\n",
+                                 g, nm ? nm : "?", ps2x_pad::axisCount(g), ps2x_pad::buttonCount(g),
+                                 ps2x_pad::isController(g) ? 1 : 0);
+                }
                 else
                     std::fprintf(stderr, "[padlog] slot %d: not available (no mapping, or empty)\n", g);
             }
         }
 
-        // GLFW knows what is a controller; raylib does not expose it.
-        //
-        // raylib reports MAX_GAMEPAD_AXIS for every slot, so its axis count cannot tell a
-        // DualSense from a keyboard -- both come back as 6. GLFW reports the truth: 1 axis for
-        // the "KBDFans System Control"/"Consumer Control" devices that udev mislabels with
-        // ID_INPUT_JOYSTICK, 6 for a real pad. It also knows whether a slot has an SDL gamepad
-        // mapping. raylib links GLFW statically, so query it directly.
-        //
-        // A slot is offered if it has a gamepad mapping OR enough real axes to be a controller.
-        // The mapping test alone is not enough: pads whose GUID is missing from the database
-        // (the 8BitDo Ultimate here) report no mapping yet are perfectly usable once bound.
+        // Is this slot a controller worth offering? The host layer answers (mapping present, or
+        // enough axes and buttons to be a pad -- see ps2x_pad::isController).
         bool slotLooksLikeGamepad(int g)
         {
-            if (!IsGamepadAvailable(g))
-                return false;
-            static const bool s_all = [](){ const char *v = std::getenv("PS2X_PAD_ALLDEV"); return v && v[0] == '1'; }();
-            if (s_all) // escape hatch if this ever rejects a legitimate pad
-                return true;
-            if (glfwJoystickIsGamepad(g))
-                return true;
-            // Axes alone are not enough: a DualSense also publishes separate "Motion Sensors"
-            // and "Touchpad" joysticks that report 6 axes each. Buttons separate them -- those
-            // have 0 and 4, a real pad has 15-17, and the mislabelled keyboards have 1-2 axes.
-            int nAxes = 0, nButtons = 0;
-            glfwGetJoystickAxes(g, &nAxes);
-            glfwGetJoystickButtons(g, &nButtons);
-            return nAxes >= 4 && nButtons >= 8;
+            return ps2x_pad::isController(g);
         }
 
         std::vector<int> availableGamepads();
@@ -225,7 +153,7 @@ namespace ps2_stubs
             {
                 return avail[index];
             }
-            if (IsGamepadAvailable(index))
+            if (ps2x_pad::available(index))
             {
                 return index;
             }
@@ -248,7 +176,7 @@ namespace ps2_stubs
                     return static_cast<int>(i);
                 }
             }
-            return IsGamepadAvailable(glfwSlot) ? glfwSlot : -1;
+            return ps2x_pad::available(glfwSlot) ? glfwSlot : -1;
         }
 
         std::vector<int> availableGamepads()
@@ -376,7 +304,7 @@ namespace ps2_stubs
 #endif
             auto mergeAxis = [&](int pad, int axis, float &dst)
             {
-                float v = GetGamepadAxisMovement(pad, axis);
+                float v = ps2x_pad::axis(pad, axis);
 #if defined(__linux__)
                 if (nativeOk)
                 {
@@ -402,7 +330,7 @@ namespace ps2_stubs
 
                 auto btn = [&](PadAction a, int button)
                 {
-                    if (IsGamepadButtonDown(pad, button) ||
+                    if (ps2x_pad::buttonDown(pad, button) ||
                         (nativeOk && native.isButtonDown(button)))
                     {
                         pkt.buttons = static_cast<uint16_t>(pkt.buttons & ~buttonMaskForAction(a));
@@ -1135,7 +1063,6 @@ namespace ps2_stubs
         {
             return pkt;
         }
-        ensureGamepadMappings();
         if (!IsWindowReady())
         {
             return pkt;
@@ -1161,7 +1088,7 @@ namespace ps2_stubs
             // reports as a controller), not the raw GLFW slot. Resolve it so a
             // single Xbox on GLFW slot 1 still matches "Gamepad 0".
             const int slot = padGamepadSlot(cfg.device.gamepad);
-            if (slot >= 0 && IsGamepadAvailable(slot))
+            if (slot >= 0 && ps2x_pad::available(slot))
             {
                 pads.push_back(slot);
             }
@@ -1208,7 +1135,7 @@ namespace ps2_stubs
             {
                 for (int pad : pads)
                 {
-                    if (IsGamepadButtonDown(pad, bind.value) ||
+                    if (ps2x_pad::buttonDown(pad, bind.value) ||
                         (nativeOk && native.isButtonDown(bind.value)))
                     {
                         pressed = true;
@@ -1224,7 +1151,7 @@ namespace ps2_stubs
                 // magnitude for the button state.
                 for (int pad : pads)
                 {
-                    if (std::fabs(GetGamepadAxisMovement(pad, bind.value)) > bind.deadzone)
+                    if (std::fabs(ps2x_pad::axis(pad, bind.value)) > bind.deadzone)
                     {
                         pressed = true;
                         break;
@@ -1263,7 +1190,7 @@ namespace ps2_stubs
                     // would feed every matching player the same physical axes,
                     // breaking per-player assignment when two controllers are
                     // used (sticks of P1 appear on P2).
-                    float v = GetGamepadAxisMovement(pad, bind.value);
+                    float v = ps2x_pad::axis(pad, bind.value);
                     // Direction filter: only keep values in the bind's
                     // direction.  Without this, the opposing Neg/Pos slots
                     // both read the same underlying axis and cancel out
@@ -1357,19 +1284,19 @@ namespace ps2_stubs
                     std::fprintf(stdout, "[padprobe] slot=%d nativeAvail=%d nativeMatch=%d\n",
                                  pad, native.isAvailable() ? 1 : 0, nativeOk ? 1 : 0);
                     std::fprintf(stdout, "[padprobe] raylib axes 0..5: %.3f %.3f %.3f %.3f %.3f %.3f\n",
-                                 GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_X),
-                                 GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_Y),
-                                 GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_X),
-                                 GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_Y),
-                                 GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_TRIGGER),
-                                 GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_TRIGGER));
+                                 ps2x_pad::axis(pad, GAMEPAD_AXIS_LEFT_X),
+                                 ps2x_pad::axis(pad, GAMEPAD_AXIS_LEFT_Y),
+                                 ps2x_pad::axis(pad, GAMEPAD_AXIS_RIGHT_X),
+                                 ps2x_pad::axis(pad, GAMEPAD_AXIS_RIGHT_Y),
+                                 ps2x_pad::axis(pad, GAMEPAD_AXIS_LEFT_TRIGGER),
+                                 ps2x_pad::axis(pad, GAMEPAD_AXIS_RIGHT_TRIGGER));
                     std::fprintf(stdout, "[padprobe] native  axes 0..5: %.3f %.3f %.3f %.3f %.3f %.3f\n",
                                  native.getAxis(GAMEPAD_AXIS_LEFT_X), native.getAxis(GAMEPAD_AXIS_LEFT_Y),
                                  native.getAxis(GAMEPAD_AXIS_RIGHT_X), native.getAxis(GAMEPAD_AXIS_RIGHT_Y),
                                  native.getAxis(GAMEPAD_AXIS_LEFT_TRIGGER), native.getAxis(GAMEPAD_AXIS_RIGHT_TRIGGER));
                     std::fprintf(stdout, "[padprobe] buttons raylib(9,10,16,17)=%d%d%d%d native(16,17)=%d%d\n",
-                                 IsGamepadButtonDown(pad, 9), IsGamepadButtonDown(pad, 10),
-                                 IsGamepadButtonDown(pad, 16), IsGamepadButtonDown(pad, 17),
+                                 ps2x_pad::buttonDown(pad, 9), ps2x_pad::buttonDown(pad, 10),
+                                 ps2x_pad::buttonDown(pad, 16), ps2x_pad::buttonDown(pad, 17),
                                  native.isButtonDown(16), native.isButtonDown(17));
                 }
             }

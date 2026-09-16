@@ -1,11 +1,13 @@
 #include "ps2_runtime.h"   // [fps60] ps2Set60Fps
 #include "runtime/ps2_texreplace.h"
 #include "ps2_settings_overlay.h"
+#include "runtime/ps2_netplay.h"   // [netplay]
 #include "runtime/ps2_gs_pgs.h"   // [pgsink] backend ink width
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "runtime/ps2_render_scale.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/pad_config.h"
+#include "runtime/ps2_host_pad.h"
 #if defined(__linux__)
 #include "runtime/pad_evdev_linux.h"
 #endif
@@ -335,10 +337,6 @@ void PS2SettingsOverlay::setConfigDirectory(const std::string &dir)
         std::filesystem::create_directories(s_configDir, ec);
     }
 }
-
-// Declared here rather than including GLFW/glfw3.h, which clashes with raylib.h.
-extern "C" int glfwJoystickIsGamepad(int jid);
-extern "C" const char *glfwGetJoystickName(int jid);
 
 void PS2SettingsOverlay::initialize()
 {
@@ -848,7 +846,13 @@ void PS2SettingsOverlay::applySettings()
             {
                 continue; // slot not (yet) a controller; leave the player alone
             }
-            if (cfg.device.kind != dev.kind || cfg.device.gamepad != idx)
+            if (cfg.device.kind != dev.kind)
+            {   // [padbinds] a different KIND of device gets that kind's default bindings (keyboard keys vs
+                // gamepad buttons) instead of the old ones, which no longer refer to anything on it
+                pcfg.setPlayerDefaults(p, dev.kind);
+                pcfg.setDevice(p, ps2_stubs::PadDevice{dev.kind, idx});
+            }
+            else if (cfg.device.gamepad != idx)
                 pcfg.setDevice(p, ps2_stubs::PadDevice{dev.kind, idx});
         }
     }
@@ -867,16 +871,14 @@ void PS2SettingsOverlay::buildDeviceList()
     // 1: Keyboard
     m_deviceList.push_back({"Keyboard", -1, false, ps2_stubs::PadDeviceKind::Keyboard});
 
-    // 2+: GLFW gamepads
-    for (int g = 0; g < 16; ++g)
+    // 2+: host gamepad slots
+    for (int g = 0; g < ps2x_pad::kMaxSlots; ++g)
     {
-        if (!IsGamepadAvailable(g))
+        if (!ps2x_pad::available(g))
             continue;
 
-        const char *name = GetGamepadName(g);
-        if (!name || !name[0])
-            name = glfwGetJoystickName(g);
-        std::string devName = name ? name : ("Gamepad slot " + std::to_string(g));
+        const char *name = ps2x_pad::name(g);
+        std::string devName = (name && name[0]) ? name : ("Gamepad slot " + std::to_string(g));
 
 #if defined(__linux__)
         bool evdevMatch = false;
@@ -925,17 +927,17 @@ void PS2SettingsOverlay::readGamepadStateForDevice(
 
     if (dev.kind == ps2_stubs::PadDeviceKind::None)
     {
-        // Auto: merge all GLFW gamepads + evdev
-        for (int g = 0; g < 16; ++g)
+        // Auto: merge all host gamepads + evdev
+        for (int g = 0; g < ps2x_pad::kMaxSlots; ++g)
         {
-            if (!IsGamepadAvailable(g))
+            if (!ps2x_pad::available(g))
                 continue;
             for (int b = 0; b < 32; ++b)
-                if (IsGamepadButtonDown(g, b))
+                if (ps2x_pad::buttonDown(g, b))
                     btnDown[b] = 1;
             for (int a = 0; a < 6; ++a)
             {
-                float v = GetGamepadAxisMovement(g, a);
+                float v = ps2x_pad::axis(g, a);
                 if (std::fabs(v) > std::fabs(axis[a]))
                     axis[a] = v;
             }
@@ -958,14 +960,14 @@ void PS2SettingsOverlay::readGamepadStateForDevice(
     }
     else if (dev.kind == ps2_stubs::PadDeviceKind::Gamepad)
     {
-        // Read from specific GLFW slot
-        if (dev.glfwSlot >= 0 && IsGamepadAvailable(dev.glfwSlot))
+        // Read from the specific host slot
+        if (dev.glfwSlot >= 0 && ps2x_pad::available(dev.glfwSlot))
         {
             for (int b = 0; b < 32; ++b)
-                if (IsGamepadButtonDown(dev.glfwSlot, b))
+                if (ps2x_pad::buttonDown(dev.glfwSlot, b))
                     btnDown[b] = 1;
             for (int a = 0; a < 6; ++a)
-                axis[a] = GetGamepadAxisMovement(dev.glfwSlot, a);
+                axis[a] = ps2x_pad::axis(dev.glfwSlot, a);
         }
         // Also read from evdev if it matches
         if (dev.isEvdev)
@@ -1178,6 +1180,12 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
                 {
                     m_activeTab = 2;
                     drawControllersTab();
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("  Netplay"))
+                {
+                    m_activeTab = 4;
+                    drawNetplayTab();
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("  Logging"))
@@ -1741,8 +1749,8 @@ void PS2SettingsOverlay::drawControllersTab()
     ImGui::TextDisabled("Overlay Shortcuts");
     ImGui::Text("Keyboard:  Shift + Tab");
     bool anyPad = false;
-    for (int g = 0; g < 16 && !anyPad; ++g)
-        anyPad = IsGamepadAvailable(g);
+    for (int g = 0; g < ps2x_pad::kMaxSlots && !anyPad; ++g)
+        anyPad = ps2x_pad::available(g);
     if (anyPad)
         ImGui::Text("Gamepad:   Select + Start");
     else
@@ -1973,6 +1981,121 @@ void PS2SettingsOverlay::drawBindingsPopup()
 
         ImGui::EndPopup();
     }
+}
+
+// [netplay] Host / Join without a terminal. The peer's address is remembered in the ini --
+// typing an IP on a gamepad is miserable, so recall matters more than a text field.
+// Join does BOTH things the user asked for: it connects AND, on the host, kicks off the canned
+// menu sequence so both sides land on character select together (see ps2NetBeginAutoStart).
+void PS2SettingsOverlay::drawNetplayTab()
+{
+    static char s_peer[64] = "127.0.0.1";
+    static int  s_port = 7777;
+    static bool s_loaded = false;
+    if (!s_loaded)
+    {
+        s_loaded = true;
+        if (const char *e = std::getenv("PS2X_NET_PEER")) { std::snprintf(s_peer, sizeof s_peer, "%s", e); }
+    }
+
+    ImGui::TextUnformatted("Online play (deterministic lockstep)");
+    ImGui::Separator();
+
+    if (ps2NetActive())
+    {
+        ImGui::Text("Status: %s", ps2NetPeerConnected() ? "CONNECTED" : "waiting for peer...");
+        ImGui::Text("You are player %d", ps2NetLocalPlayer());
+        ImGui::Text("Input delay: %u frames (%u ms at 30 fps)", ps2NetDelay(), ps2NetDelay() * 33u);
+        { const char *bn[] = {"Single Battle","Team Battle","DP Battle"};
+          const int bt = ps2NetBattleType();
+          const char *tn[] = {"60 s","90 s","180 s","240 s","no limit"};
+          const int tl = ps2NetTimeLimit();
+          const char *dn[] = {"10 DP","15 DP","20 DP"};
+          const int dp = ps2NetDpLimit();
+          ImGui::Text("Game mode: %s%s%s   |   time limit: %s",
+                      (bt >= 0 && bt < 3) ? bn[bt] : "?",
+                      bt == 2 ? " / " : "", (bt == 2 && dp >= 0 && dp < 3) ? dn[dp] : "",
+                      (tl >= 0 && tl < 5) ? tn[tl] : "?"); }
+        if (ps2NetAutoJump()) ImGui::TextUnformatted("Will jump to character select on connect.");
+        if (ps2NetRollbackWindow()) ImGui::Text("Rollback window: %u frames%s", ps2NetRollbackWindow(),
+                                                ps2NetSyncPending() ? "   |   state sync in progress..." : (ps2NetSyncOn() ? "   |   state synced" : ""));
+        else ImGui::TextUnformatted("Lockstep (no rollback)");
+        ImGui::Separator();
+        if (ImGui::Button("Disconnect"))
+            ps2NetDisconnect("overlay");
+        ImGui::SameLine();
+        ImGui::TextDisabled("restores local pads and splitscreen");
+        ImGui::Separator();
+        ImGui::TextWrapped("Only buttons cross the wire. Each side renders its own player "
+                           "full-screen.");
+        return;
+    }
+
+    static int  s_delay = 2;
+    static int  s_battle = 0;
+    static int  s_time = 3;
+    static int  s_dp = 0;          // DP Battle budget: 0 = 10 DP, 1 = 15, 2 = 20
+    static bool s_jump = true;
+    static int  s_rollback = ps2NetRollbackSetting();   // [rollback] env default, 0 = lockstep
+    static bool s_sync = ps2NetSyncSetting();            // [statesync]
+    const bool syncLive = s_sync && s_rollback > 0;
+    ImGui::Checkbox("Go to character select once connected", &s_jump);
+    if (syncLive) ImGui::TextDisabled("The HOST's choice applies to both. Both sides jump, then the host's state is synced into the joiner.");
+    else          ImGui::TextDisabled("The HOST's choice applies to both; the menus are hidden while it happens.");
+    ImGui::Separator();
+    ImGui::SliderInt("Rollback window (frames)", &s_rollback, 0, 30);
+    ImGui::TextDisabled("0 = lockstep (every frame waits for the peer's input). 4-8 = rollback: a missing input is");
+    ImGui::TextDisabled("predicted and the game rewinds when the real one differs. Needs PS2X_FIBERS=1.");
+    if (s_rollback > 0)
+    {
+        ImGui::Checkbox("Sync game state on connect", &s_sync);
+        ImGui::TextDisabled("The host sends its game state (40 MB) to the joiner, so both play the same match from");
+        ImGui::TextDisabled("wherever the host is. Connect while both are on the same screen (title or main menu).");
+    }
+    ImGui::Separator();
+    // Only Join uses the address: hosting binds the port and learns the peer from its first
+    // packet, which is why only one side needs a reachable port.
+    ImGui::InputText("Host address (Join only)", s_peer, sizeof s_peer);
+    ImGui::InputInt("Port", &s_port);
+    const char *kBattle[] = { "Single Battle", "Team Battle", "DP Battle" };
+    ImGui::Combo("Game mode", &s_battle, kBattle, 3);
+    // DP Battle's point budget is a SEPARATE row of the versus menu (duelObj+0x118, committed to
+    // stateObj+0x630 = RetroAchievements' 0x6af7b0). Selecting DP without it left the screen
+    // playing like Team Battle: the right type with no budget behind it.
+    if (s_battle == 2)
+    {
+        const char *kDp[] = { "10 DP", "15 DP", "20 DP" };
+        ImGui::Combo("DP limit", &s_dp, kDp, 3);
+    }
+    // Battle Settings time-limit indices, confirmed in game:
+    //   0 = 60 s, 1 = 90 s, 2 = 180 s, 3 = 240 s (default), 4 = no limit
+    const char *kTime[] = { "60 seconds", "90 seconds", "180 seconds", "240 seconds (default)", "No limit" };
+    ImGui::Combo("Time limit", &s_time, kTime, 5);
+    ImGui::TextDisabled("The HOST's choices apply to both players.");
+    ImGui::SliderInt("Input delay (frames)", &s_delay, 1, 10);
+    ImGui::TextDisabled("BT3 runs at 30 fps, so each frame is 33 ms. Use 1 on the same machine,");
+    ImGui::TextDisabled("2 on a LAN. Raise it only if you see stalls.");
+    if (s_port < 1 || s_port > 65535) s_port = 7777;
+
+    if (ImGui::Button("Host (you are Player 1)"))
+    {
+        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay); ps2NetSetBattleType(s_battle);
+        ps2NetSetTimeLimit(s_time); ps2NetSetDpLimit(s_dp);
+        ps2NetSetRollback(s_rollback); ps2NetSetSync(s_sync);
+        ps2NetHost(s_port, 1);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Join (you are Player 2)"))
+    {
+        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay);   // the host's game mode wins
+        ps2NetSetRollback(s_rollback); ps2NetSetSync(s_sync);
+        char hp[96]; std::snprintf(hp, sizeof hp, "%s:%d", s_peer, s_port);
+        ps2NetJoin(hp, 2);
+    }
+    ImGui::Separator();
+    ImGui::TextWrapped("HOST: just press Host -- leave the address blank, give the other player "
+                       "your IP and this port. JOIN: type the host's IP above, then press Join. "
+                       "Only the host needs the UDP port reachable.");
 }
 
 void PS2SettingsOverlay::drawLoggingTab()

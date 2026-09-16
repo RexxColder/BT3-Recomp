@@ -1,10 +1,12 @@
 #include "ps2_waitprof.h"   // [waitprof]
+#include "runtime/ps2_statesync.h"   // [statesync]
 #include "ps2_runtime_macros.h"
 #include "Common.h"
 #include "Thread.h"
 
 extern std::atomic<uint32_t> g_bt3StateLive; // [eeround2] gate (ps2_runtime.cpp)
 
+extern "C" void ps2xSchedSignal();   // [fibers] ps2_runtime.cpp: a blocked fiber may now be runnable
 namespace ps2_syscalls
 {
     static void applySuspendStatusLocked(ThreadInfo &info)
@@ -288,6 +290,39 @@ namespace ps2_syscalls
         setReturnS32(ctx, KE_OK);
     }
 
+    // [statesync] Every running worker's R5900 context, by tid. The context is a local on the
+    // worker's own fiber stack (it travels with the in-process fiber snapshot); the state sync
+    // needs to read and overwrite it in place, so the worker registers its address for its lifetime.
+    static std::mutex g_workerCtxM;
+    static std::map<int, R5900Context *> g_workerCtx;
+    extern "C" R5900Context *ps2xWorkerContext(int tid)
+    {
+        std::lock_guard<std::mutex> lk(g_workerCtxM);
+        auto it = g_workerCtx.find(tid);
+        return it == g_workerCtx.end() ? nullptr : it->second;
+    }
+    extern "C" int ps2xWorkerContextTids(int *out, int cap)
+    {
+        std::lock_guard<std::mutex> lk(g_workerCtxM);
+        int n = 0;
+        for (const auto &kv : g_workerCtx) if (n < cap) out[n++] = kv.first;
+        return n;
+    }
+    // [statesync] The kernel's view of a thread's park (status / wait kind / wait object), for the
+    // structural check before a synced state is adopted.
+    extern "C" bool ps2xKernelThreadWait(int tid, int *status, int *waitType, int *waitId)
+    {
+        std::lock_guard<std::mutex> lk(g_thread_map_mutex);
+        auto it = g_threads.find(tid);
+        if (it == g_threads.end() || !it->second) return false;
+        ThreadInfo &i = *it->second;
+        std::lock_guard<std::mutex> il(i.m);
+        *status = i.status; *waitType = i.waitType; *waitId = i.waitId;
+        return true;
+    }
+    extern "C" uint64_t *ps2xSchedStepCount(int tid);   // [statesync] ps2_runtime.cpp: the worker loop's yield quantum counter, runtime-owned
+    extern "C" int ps2xSchedTraceOn();                   // ps2_runtime.cpp: PS2X_SCHEDTRACE window
+    extern "C" uint32_t *ps2xSchedU32(int tid, int which);   // [statesync] 0 = same-pc counter, 1 = last pc (they gate the spin sleeps)
     void StartThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int tid = static_cast<int>(getRegU32(ctx, 4)); // $a0 = thread id
@@ -378,7 +413,9 @@ namespace ps2_syscalls
         g_activeThreads.fetch_add(1, std::memory_order_relaxed);
         try
         {
-            std::thread worker([=]() mutable
+            // [fibers] The body is identical either way; only who drives it changes -- a host
+            // std::thread, or a fiber the scheduler switches to on its own thread.
+            auto workerBody = [=]() mutable
                                {
             {
                 std::string name = "PS2Thread_" + std::to_string(tid);
@@ -390,6 +427,7 @@ namespace ps2_syscalls
             }
             R5900Context threadCtxCopy{};
             R5900Context *threadCtx = &threadCtxCopy;
+            { std::lock_guard<std::mutex> lk(g_workerCtxM); g_workerCtx[tid] = threadCtx; }   // [statesync]
             // VU0 vf0 is hardwired read-only to (0,0,0,1) on real hardware; a zero-init
             // context leaves it (0,0,0,0), which poisons every VU0 macro-mode matrix (the
             // identity basis is built by rotating vf0). Seed the constant for this thread.
@@ -460,12 +498,14 @@ namespace ps2_syscalls
             }
             try
             {
-                uint32_t lastPc = 0xFFFFFFFFu;
-                uint32_t samePcCount = 0;
+                uint32_t &lastPc = *ps2xSchedU32(tid, 1); lastPc = 0xFFFFFFFFu;        // [statesync] runtime-owned
+                uint32_t &samePcCount = *ps2xSchedU32(tid, 0); samePcCount = 0;
                 constexpr uint32_t kSamePcYieldMask = 0xFFu;
                 constexpr uint32_t kSamePcWarnInterval = 0x20000u;
                 constexpr uint64_t kSchedQuantum = 1024u;
-                uint64_t stepCount = 0u;
+                // [statesync] runtime-owned (a synced peer adopts it with the rest of the scheduler state)
+                uint64_t &stepCount = *ps2xSchedStepCount(tid);
+                stepCount = 0u;
 
                 while (runtime && !runtime->isStopRequested())
                 {
@@ -625,8 +665,14 @@ namespace ps2_syscalls
             // Notify anybody waiting for termination (like TerminateThread)
             info->cv.notify_all();
 
-            g_activeThreads.fetch_sub(1, std::memory_order_relaxed); });
-            registerHostThread(tid, std::move(worker));
+            { std::lock_guard<std::mutex> lk(g_workerCtxM); g_workerCtx.erase(tid); }   // [statesync]
+            g_activeThreads.fetch_sub(1, std::memory_order_relaxed); };
+            if (!(runtime && runtime->fibersEnabled() &&
+                  runtime->schedFiberSpawn(tid, static_cast<int>(info->currentPriority), workerBody)))
+            {
+                std::thread worker(workerBody);
+                registerHostThread(tid, std::move(worker));
+            }
         }
         catch (const std::exception &e)
         {
@@ -650,6 +696,7 @@ namespace ps2_syscalls
 
     void ExitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         RUNTIME_LOG("[ExitThread] Game requested thread exit! PC=0x" << std::hex << ctx->pc
                                                                      << " RA=0x" << getRegU32(ctx, 31) << std::dec << " tid=" << g_currentThreadId << std::endl);
 
@@ -673,6 +720,7 @@ namespace ps2_syscalls
 
     void ExitDeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         int tid = g_currentThreadId;
         RUNTIME_LOG("[ExitDeleteThread] Game requested thread exit & delete! PC=0x" << std::hex << ctx->pc
                                                                                     << " RA=0x" << getRegU32(ctx, 31) << std::dec << " tid=" << tid << std::endl);
@@ -701,6 +749,7 @@ namespace ps2_syscalls
 
     void TerminateThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
             tid = g_currentThreadId;
@@ -739,15 +788,11 @@ namespace ps2_syscalls
             // Block until the target thread actually finishes unwinding and becomes dormant.
             // Drop the thread mutex before reacquiring GuestExecutionScope to avoid lock inversion.
             std::unique_lock<std::mutex> lock(info->m);
-            waitWithGuestExecutionReleasedUntilUnlocked(
-                runtime,
-                lock,
-                [&]()
-                {
-                    Ps2xWaitScope wdorm(WP_SYNC_OTHER);
-                    info->cv.wait(lock, [&]()
-                                  { return !info->started && info->status == THS_DORMANT; });
-                });
+            // [fibers] Woken by another guest thread (whoever makes this one dormant).
+            waitGuestUntil(
+                runtime, lock, info->cv,
+                [&]() { return !info->started && info->status == THS_DORMANT; },
+                WP_SYNC_OTHER);
         }
 
         setReturnS32(ctx, KE_OK);
@@ -777,6 +822,7 @@ namespace ps2_syscalls
 
     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] SuspendThread tid=%d by=%d\n", (int)getRegU32(ctx, 4), g_currentThreadId);
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
             tid = g_currentThreadId;
@@ -804,15 +850,12 @@ namespace ps2_syscalls
         {
             std::unique_lock<std::mutex> lock(info->m);
             bool terminated = false;
-            waitWithGuestExecutionReleasedUntilUnlocked(
-                runtime,
-                lock,
-                [&]()
-                {
-                    Ps2xWaitScope wsusp(WP_SYNC_OTHER);
-                    info->cv.wait(lock, [&]()
-                                  { return info->suspendCount == 0 || info->terminated.load(); });
-                },
+            // [fibers] ResumeThread is issued by another guest thread, so this must park in the
+            // scheduler rather than block the shared host thread.
+            waitGuestUntil(
+                runtime, lock, info->cv,
+                [&]() { return info->suspendCount == 0 || info->terminated.load(); },
+                WP_SYNC_OTHER,
                 [&]()
                 {
                     terminated = info->terminated.load();
@@ -833,6 +876,8 @@ namespace ps2_syscalls
 
     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] ResumeThread tid=%d by=%d\n", (int)getRegU32(ctx, 4), g_currentThreadId);
+        ps2xSchedSignal();   // [fibers] wake site
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
             tid = g_currentThreadId;
@@ -982,15 +1027,17 @@ namespace ps2_syscalls
             info->waitId = 0;
             info->forceRelease = false;
 
-            waitWithGuestExecutionReleasedUntilUnlocked(
+            // [fibers] SleepThread is woken by ANOTHER GUEST THREAD, so under PS2X_FIBERS the waker
+            // is a fiber on this very host thread -- a condition_variable wait here would park the
+            // only thread that could ever deliver the wakeup. waitGuestUntil parks in the scheduler
+            // instead. The predicate only reads state, so re-checking it is free of side effects.
+            waitGuestUntil(
                 runtime,
                 lock,
+                info->cv,
                 [&]()
-                {
-                    Ps2xWaitScope wsleep(WP_THREAD_SLEEP);
-                    info->cv.wait(lock, [&]()
-                                  { return info->wakeupCount > 0 || info->forceRelease.load() || info->terminated.load(); });
-                },
+                { return info->wakeupCount > 0 || info->forceRelease.load() || info->terminated.load(); },
+                WP_THREAD_SLEEP,
                 [&]()
                 {
                     terminated = info->terminated.load();
@@ -1045,6 +1092,8 @@ namespace ps2_syscalls
 
     void WakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] WakeupThread tid=%d by=%d\n", (int)getRegU32(ctx, 4), g_currentThreadId);
+        ps2xSchedSignal();   // [fibers] wake site
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
         {
@@ -1122,6 +1171,8 @@ namespace ps2_syscalls
 
     void iWakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] iWakeupThread tid=%d by=%d\n", (int)getRegU32(ctx, 4), g_currentThreadId);
+        ps2xSchedSignal();   // [fibers] wake site
         WakeupThread(rdram, ctx, runtime);
     }
 
@@ -1251,6 +1302,7 @@ namespace ps2_syscalls
 
     void ReleaseWaitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0 || tid == g_currentThreadId)
         {
@@ -1304,6 +1356,7 @@ namespace ps2_syscalls
 
     void iReleaseWaitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         ReleaseWaitThread(rdram, ctx, runtime);
     }
 
@@ -1374,4 +1427,226 @@ extern "C" bool ps2xThreadWaitInfo(int tid, int *waitType, int *waitId, int *sem
         if (sema) { *semaCount = sema->count; *semaWaiters = sema->waiters; }
     }
     return true;
+}
+
+// [fibers] The kernel's per-thread identity, exposed so PS2Runtime::schedFiberLoop can swap it per
+// fiber. g_currentThreadId is thread_local, and under PS2X_FIBERS every guest thread shares one
+// host thread: without the swap the last StartThread's tid became everyone's identity, and
+// SleepThread/GetThreadId/ensureCurrentThreadInfo (which key on it) all acted on the wrong thread.
+int  ps2xKernelCurrentTid() { return g_currentThreadId; }
+void ps2xKernelSetCurrentTid(int tid) { g_currentThreadId = tid; }
+
+// [rollback] The host side of the EE kernel: thread records, semaphores, event flags and the id
+// counters, plus the vsync tick/registration (Interrupt.cpp). A rolled-back fiber parked inside
+// SleepThread is inconsistent with a live ThreadInfo that says RUN, and the game's timer service
+// consults ReferThreadStatus before waking anyone -- that was the first post-rollback freeze.
+// Alarms are not covered (BT3 sets none). Records the live maps have that the snapshot lacks are
+// left alone; ones the snapshot has that vanished are reported and skipped.
+namespace
+{
+    struct KThread { int tid; uint32_t entry, stack, stackSize, gp, priority, attr, option, arg, tlsBase, currentPc;
+                     bool started, ownsStack, terminated, forceRelease; int status, waitType, waitId, wakeupCount, currentPriority, suspendCount; };
+    struct KSema   { int id; int count, maxCount, initCount; uint32_t attr, option; int waiters; bool deleted; };
+    struct KEvf    { int id; uint32_t attr, option, initBits, bits; int waiters; bool deleted; };
+    struct KernelSnap { std::vector<KThread> th; std::vector<KSema> se; std::vector<KEvf> ev;
+                        int nextThread = 2, nextSema = 1, nextEvf = 1; uint64_t vsyncTick = 0; uint32_t vsFlag = 0, vsTick = 0;
+                        uint64_t cdFrame = 0; uint32_t cdPumps = 0, cdTicks = 0;   // [cdgate] the CD pump's gate counters
+                        // SIF RPC bookkeeping (State.h) and the SIF stub's own state (SIF.cpp)
+                        std::unordered_map<uint32_t, RpcServerState> rpcServers; std::unordered_map<uint32_t, RpcClientState> rpcClients;
+                        uint64_t rpcSeq = 0; bool rpcInit = false; uint32_t rpcNextId = 1, rpcPacket = 0, rpcServer = 0, rpcQueue = 0;
+                        void *sif = nullptr;
+                        void *mc = nullptr;    // [statesync] Kernel/Stubs/MemoryCard.cpp
+                        ~KernelSnap(); };
+    extern "C" void ps2xSifStateFree(void *);
+    extern "C" void ps2xMcStateFree(void *);
+    KernelSnap::~KernelSnap() { if (sif) ps2xSifStateFree(sif); if (mc) ps2xMcStateFree(mc); }
+}
+extern "C" void *ps2xMcStateCapture();
+extern "C" bool ps2xMcStateRestore(void *);
+extern "C" bool ps2xMcStateSerialize(const void *, std::vector<uint8_t> &);
+extern "C" void *ps2xMcStateDeserialize(const uint8_t *, size_t, size_t *);
+extern "C" void ps2xVsyncStateGet(uint64_t *tick, uint32_t *flagAddr, uint32_t *tickAddr, uint64_t *cdFrame, uint32_t *cdPumps, uint32_t *cdTicks);
+extern "C" void ps2xVsyncStateSet(uint64_t tick, uint32_t flagAddr, uint32_t tickAddr, uint64_t cdFrame, uint32_t cdPumps, uint32_t cdTicks);
+extern "C" void *ps2xSifStateCapture();
+extern "C" bool ps2xSifStateRestore(void *);
+extern "C" void *ps2xKernelStateCapture()
+{
+    KernelSnap *s = new KernelSnap();
+    {
+        std::lock_guard<std::mutex> lk(g_rpc_mutex);
+        s->rpcServers = g_rpc_servers; s->rpcClients = g_rpc_clients; s->rpcSeq = g_sif_rpc_debug_next_seq;
+        s->rpcInit = g_rpc_initialized; s->rpcNextId = g_rpc_next_id; s->rpcPacket = g_rpc_packet_index;
+        s->rpcServer = g_rpc_server_index; s->rpcQueue = g_rpc_active_queue;
+    }
+    s->sif = ps2xSifStateCapture();
+    s->mc = ps2xMcStateCapture();
+    {
+        std::lock_guard<std::mutex> lk(g_thread_map_mutex);
+        for (auto &kv : g_threads)
+        {
+            if (!kv.second) continue;
+            ThreadInfo &i = *kv.second;
+            std::lock_guard<std::mutex> il(i.m);
+            s->th.push_back(KThread{ kv.first, i.entry, i.stack, i.stackSize, i.gp, i.priority, i.attr, i.option, i.arg, i.tlsBase,
+                                     i.currentPc.load(), i.started, i.ownsStack, i.terminated.load(), i.forceRelease.load(),
+                                     i.status, i.waitType, i.waitId, i.wakeupCount, i.currentPriority, i.suspendCount });
+        }
+        s->nextThread = g_nextThreadId;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_sema_map_mutex);
+        for (auto &kv : g_semas)
+        {
+            if (!kv.second) continue;
+            SemaInfo &i = *kv.second; std::lock_guard<std::mutex> il(i.m);
+            s->se.push_back(KSema{ kv.first, i.count, i.maxCount, i.initCount, i.attr, i.option, i.waiters, i.deleted });
+        }
+        s->nextSema = g_nextSemaId;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_event_flag_map_mutex);
+        for (auto &kv : g_eventFlags)
+        {
+            if (!kv.second) continue;
+            EventFlagInfo &i = *kv.second; std::lock_guard<std::mutex> il(i.m);
+            s->ev.push_back(KEvf{ kv.first, i.attr, i.option, i.initBits, i.bits, i.waiters, i.deleted });
+        }
+        s->nextEvf = g_nextEventFlagId;
+    }
+    ps2xVsyncStateGet(&s->vsyncTick, &s->vsFlag, &s->vsTick, &s->cdFrame, &s->cdPumps, &s->cdTicks);
+    {   // PS2X_KSNAPLOG=1: what the snapshot holds per thread (status / wait / wakeups / suspends)
+        static const bool s_log = [](){ const char *v = std::getenv("PS2X_KSNAPLOG"); return v && v[0] && v[0] != '0'; }();
+        if (s_log)
+        {
+            std::fprintf(stderr, "[ksnap] capture:");
+            for (const KThread &t : s->th) std::fprintf(stderr, " tid%d(st=%d wt=%d wid=%d wk=%d sus=%d pc=0x%x)", t.tid, t.status, t.waitType, t.waitId, t.wakeupCount, t.suspendCount, t.currentPc);
+            std::fprintf(stderr, "\n");
+        }
+    }
+    return s;
+}
+extern "C" bool ps2xKernelStateRestore(void *h)
+{
+    const KernelSnap *s = static_cast<const KernelSnap *>(h);
+    if (!s) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_thread_map_mutex);
+        for (const KThread &t : s->th)
+        {
+            auto it = g_threads.find(t.tid);
+            if (it == g_threads.end() || !it->second) { std::fprintf(stderr, "[rollback] kernel: thread %d vanished\n", t.tid); continue; }
+            ThreadInfo &i = *it->second;
+            { std::lock_guard<std::mutex> il(i.m);
+              i.entry = t.entry; i.stack = t.stack; i.stackSize = t.stackSize; i.gp = t.gp; i.priority = t.priority; i.attr = t.attr;
+              i.option = t.option; i.arg = t.arg; i.tlsBase = t.tlsBase; i.currentPc.store(t.currentPc); i.started = t.started;
+              i.ownsStack = t.ownsStack; i.terminated.store(t.terminated); i.forceRelease.store(t.forceRelease);
+              i.status = t.status; i.waitType = t.waitType; i.waitId = t.waitId; i.wakeupCount = t.wakeupCount;
+              i.currentPriority = t.currentPriority; i.suspendCount = t.suspendCount; }
+            i.cv.notify_all();
+        }
+        g_nextThreadId = s->nextThread;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_sema_map_mutex);
+        for (const KSema &t : s->se)
+        {
+            auto it = g_semas.find(t.id);
+            if (it == g_semas.end() || !it->second)
+            {   // [statesync] a synced peer created it after we diverged: make the record
+                std::fprintf(stderr, "[rollback] kernel: sema %d missing here, created\n", t.id);
+                g_semas[t.id] = std::make_shared<SemaInfo>(); it = g_semas.find(t.id);
+            }
+            SemaInfo &i = *it->second;
+            { std::lock_guard<std::mutex> il(i.m); i.count = t.count; i.maxCount = t.maxCount; i.initCount = t.initCount; i.attr = t.attr; i.option = t.option; i.waiters = t.waiters; i.deleted = t.deleted; }
+            i.cv.notify_all();
+        }
+        g_nextSemaId = s->nextSema;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_event_flag_map_mutex);
+        for (const KEvf &t : s->ev)
+        {
+            auto it = g_eventFlags.find(t.id);
+            if (it == g_eventFlags.end() || !it->second)
+            {
+                std::fprintf(stderr, "[rollback] kernel: evf %d missing here, created\n", t.id);
+                g_eventFlags[t.id] = std::make_shared<EventFlagInfo>(); it = g_eventFlags.find(t.id);
+            }
+            EventFlagInfo &i = *it->second;
+            { std::lock_guard<std::mutex> il(i.m); i.attr = t.attr; i.option = t.option; i.initBits = t.initBits; i.bits = t.bits; i.waiters = t.waiters; i.deleted = t.deleted; }
+            i.cv.notify_all();
+        }
+        g_nextEventFlagId = s->nextEvf;
+    }
+    ps2xVsyncStateSet(s->vsyncTick, s->vsFlag, s->vsTick, s->cdFrame, s->cdPumps, s->cdTicks);
+    {
+        std::lock_guard<std::mutex> lk(g_rpc_mutex);
+        g_rpc_servers = s->rpcServers; g_rpc_clients = s->rpcClients; g_sif_rpc_debug_next_seq = s->rpcSeq;
+        g_rpc_initialized = s->rpcInit; g_rpc_next_id = s->rpcNextId; g_rpc_packet_index = s->rpcPacket;
+        g_rpc_server_index = s->rpcServer; g_rpc_active_queue = s->rpcQueue;
+    }
+    if (s->sif && !ps2xSifStateRestore(s->sif)) return false;
+    if (s->mc && !ps2xMcStateRestore(s->mc)) return false;
+    {
+        static const bool s_log = [](){ const char *v = std::getenv("PS2X_KSNAPLOG"); return v && v[0] && v[0] != '0'; }();
+        if (s_log)
+        {
+            std::fprintf(stderr, "[ksnap] restore:");
+            for (const KThread &t : s->th) std::fprintf(stderr, " tid%d(st=%d wt=%d wid=%d wk=%d sus=%d)", t.tid, t.status, t.waitType, t.waitId, t.wakeupCount, t.suspendCount);
+            std::fprintf(stderr, "\n");
+        }
+    }
+    return true;
+}
+extern "C" void ps2xKernelStateFree(void *h) { delete static_cast<KernelSnap *>(h); }
+// [statesync] portable form (the SIF part is its own sub-blob)
+extern "C" bool ps2xKernelStateSerialize(const void *h, std::vector<uint8_t> &out)
+{
+    const KernelSnap *s = static_cast<const KernelSnap *>(h);
+    if (!s) return false;
+    Ps2xByteW w(out);
+    w.u32(0x4b524e31u);   // 'KRN1'
+    w.podVec(s->th); w.podVec(s->se); w.podVec(s->ev);
+    w.pod(s->nextThread); w.pod(s->nextSema); w.pod(s->nextEvf);
+    w.u64(s->vsyncTick); w.u32(s->vsFlag); w.u32(s->vsTick);
+    w.u64(s->cdFrame); w.u32(s->cdPumps); w.u32(s->cdTicks);
+    w.podUMap(s->rpcServers); w.podUMap(s->rpcClients);
+    w.u64(s->rpcSeq); w.u8(s->rpcInit); w.u32(s->rpcNextId); w.u32(s->rpcPacket); w.u32(s->rpcServer); w.u32(s->rpcQueue);
+    w.u8(s->sif != nullptr);
+    if (s->sif && !ps2xSifStateSerialize(s->sif, out)) return false;
+    w.u8(s->mc != nullptr);
+    if (s->mc && !ps2xMcStateSerialize(s->mc, out)) return false;
+    return true;
+}
+extern "C" void *ps2xKernelStateDeserialize(const uint8_t *data, size_t n, size_t *used)
+{
+    Ps2xByteR r(data, n);
+    if (r.u32() != 0x4b524e31u) return nullptr;
+    KernelSnap *s = new KernelSnap();
+    r.podVec(s->th); r.podVec(s->se); r.podVec(s->ev);
+    s->nextThread = r.pod<int>(); s->nextSema = r.pod<int>(); s->nextEvf = r.pod<int>();
+    s->vsyncTick = r.u64(); s->vsFlag = r.u32(); s->vsTick = r.u32();
+    s->cdFrame = r.u64(); s->cdPumps = r.u32(); s->cdTicks = r.u32();
+    r.podUMap(s->rpcServers); r.podUMap(s->rpcClients);
+    s->rpcSeq = r.u64(); s->rpcInit = r.u8() != 0; s->rpcNextId = r.u32(); s->rpcPacket = r.u32(); s->rpcServer = r.u32(); s->rpcQueue = r.u32();
+    const bool hasSif = r.u8() != 0;
+    if (!r.ok) { delete s; return nullptr; }
+    if (hasSif)
+    {
+        size_t sub = 0;
+        s->sif = ps2xSifStateDeserialize(r.p, r.left(), &sub);
+        if (!s->sif) { delete s; return nullptr; }
+        r.p += sub;
+    }
+    const bool hasMc = r.u8() != 0;
+    if (hasMc && r.ok)
+    {
+        size_t sub = 0;
+        s->mc = ps2xMcStateDeserialize(r.p, r.left(), &sub);
+        if (!s->mc) { delete s; return nullptr; }
+        r.p += sub;
+    }
+    if (!r.ok) { delete s; return nullptr; }
+    if (used) *used = (size_t)(r.p - data);
+    return s;
 }

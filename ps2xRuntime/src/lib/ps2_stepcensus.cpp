@@ -140,7 +140,12 @@ void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint6
         static uint32_t s_w[6] = {0}; static uint32_t s_n[6] = {0}; static int s_cnt = 0;
         if (s_cnt == 0) { for (int k = 0; k < g_addrWatchCnt; ++k) s_w[k] = g_addrWatchList[k]; s_cnt = g_addrWatchCnt; }
         const uint32_t a = guestAddr & 0x1FFFFFFFu;
-        const bool active = ps2HalfStepFightActive();
+        // [addrwatch] PS2X_ADDRWATCH_ALL=1: watch from BOOT instead of waiting for the fight gate.
+        // Needed to chase determinism divergence, which appears at boot frame 1 -- the default
+        // gate makes the watch silent for exactly the window under study.
+        static const bool s_all = [](){ const char *v = std::getenv("PS2X_ADDRWATCH_ALL");
+                                        return v && v[0] && v[0] != '0'; }();
+        const bool active = s_all || ps2HalfStepFightActive();
         static bool s_trig = (g_awTrigAddr == 0); static bool s_haveBase = false; static float s_base[2] = {0.f, 0.f};
         if (!s_trig && active)
         {

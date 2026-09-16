@@ -5,6 +5,7 @@
 //   * at the swap: flush + vsync, then a synchronous readback of the scanout to an RGBA8 buffer that the present
 //     thread uploads as a texture. The readback is a full GPU sync per frame -- fine for first light, not for perf.
 #include "runtime/ps2_gs_pgs.h"
+#include "runtime/ps2_netplay.h"   // [vpdrop] follow the netplay player
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_gpu.h"        // [pgs-texreplace] GS (VRAM, palettes), register structs
 #include "runtime/ps2_gs_gpu_renderer.h"   // [pgsink] the overlay's Cel Outline / ink strength (static getters)
@@ -748,6 +749,20 @@ static void wsHudVertexLocked(State &s, uint8_t *data, size_t off, bool packed, 
 // HUD's tight bar scissors (top band, narrower than 0.8 W) follow the layout map, as the OpenGL path's [wsscissor]:
 // the squeezed bar otherwise extends past the unmapped scissor and its outer strip is clipped, exposing the layer
 // underneath (the yellow sliver at the left end of the opponent's bar).
+// [vpdrop] PS2X_VPKEEP=1|2: which player's viewport this client keeps. Paired with PS2X_NETVIEW,
+// which makes the LOCAL player's viewport full-width (0..511) in the guest; the OTHER player's
+// stays half-width, and we blank it here by rewriting its SCISSOR to an empty rect (x0 > x1).
+// This lives in the paraLLEl-GS packet path because the GL renderer's vertexKick drop never runs
+// under the PGS backend in EXCLUSIVE mode ("our GS parse skipped") -- the first live test drew
+// BOTH views for exactly that reason.
+static int ps2xVpKeep()
+{
+    static const int s_env = [](){ const char *e = std::getenv("PS2X_VPKEEP");
+                                   return (e && e[0]) ? std::atoi(e) : 0; }();
+    if (s_env) return s_env;
+    return ps2NetActive() ? ps2NetLocalPlayer() : 0;   // follow netplay: host = 1, joiner = 2
+}
+
 static void wsHudRegLocked(State &s, uint32_t reg, uint64_t v, uint8_t *data, size_t off, float inv, bool rewrite = true)
 {
     State::WsHud &h = s.wshud;
@@ -758,6 +773,31 @@ static void wsHudRegLocked(State &s, uint32_t reg, uint64_t v, uint8_t *data, si
     case 0x40: case 0x41:
     {
         h.ctx[reg - 0x40].scissor = v;
+        if (const int keep = ps2xVpKeep(); keep && rewrite && data)
+        {   // full-height, half-width == a splitscreen viewport. The local player's is already
+            // 0..511 under PS2X_NETVIEW, so it never matches here.
+            const uint32_t sx0 = uint32_t(v & 0x7FFu), sx1 = uint32_t((v >> 16) & 0x7FFu);
+            const uint32_t sy0 = uint32_t((v >> 32) & 0x7FFu), sy1 = uint32_t((v >> 48) & 0x7FFu);
+            {   // [vpcensus] the distinct full-height scissors this path sees (first 16): which values the fight views carry
+                static std::vector<uint64_t> s_seen;
+                if (sy1 >= 400u && s_seen.size() < 16u && std::find(s_seen.begin(), s_seen.end(), v) == s_seen.end())
+                { s_seen.push_back(v); std::fprintf(stderr, "[vpcensus] scissor_%u x %u..%u y %u..%u\n", reg - 0x40 + 1, sx0, sx1, sy0, sy1); }
+            }
+            const bool leftVp  = (sy1 >= 400u && sx0 == 0u && sx1 > 0u && sx1 <= 255u);
+            const bool rightVp = (sy1 >= 400u && sx0 >= 256u);
+            const bool p1Full  = (sy1 >= 400u && sx0 == 0u && sx1 == 511u && sy0 == 1u);   // [netview] symmetric full-screen views: marked in y0
+            const bool p2Full  = (sy1 >= 400u && sx0 == 0u && sx1 == 511u && sy0 == 2u);
+            if ((keep == 1 && (rightVp || p2Full)) || (keep == 2 && (leftVp || p1Full)))
+            {
+                const uint64_t empty = (v & ~(0x7FFull | (0x7FFull << 16))) | 0x7FFull;   // x0 = 2047 > x1 = 0
+                std::memcpy(data + off, &empty, sizeof empty);
+                h.ctx[reg - 0x40].scissor = empty;
+                static std::atomic<uint32_t> s_said{0};
+                if (s_said.fetch_add(1u) < 4u)
+                    std::fprintf(stderr, "[vpdrop] keeping player %d: blanking the other viewport (x %u..%u, y %u..%u)\n", keep, sx0, sx1, sy0, sy1);
+                break;
+            }
+        }
         if (!rewrite) break;
         {
             static const bool s_log2 = [](){ const char *v2 = std::getenv("PS2X_PGS_WSHUDLOG"); return v2 && v2[0] && v2[0] != '0'; }(); static unsigned s_n2 = 0;
@@ -1618,7 +1658,9 @@ bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
         static const bool s_inkShiftEnvOn = [](){ const char *v = std::getenv("PS2X_PGS_INKSHIFT"); return v && v[0] && std::atof(v) > 0.0; }();
         const bool inkWork = !GsGpuRenderer::outlineEnabled() || GsGpuRenderer::inkStrengthPct() != 199 || s_inkShiftEnvOn || g_inkWidthPct.load(std::memory_order_relaxed) < 100 || g_inkColor.load(std::memory_order_relaxed) != 0u
                           || !GsGpuRenderer::shadowsEnabled() || !GsGpuRenderer::dofBlurEnabled();   // [pgsink] [pgsfx]
-        if (s_wshud && (g_ps2xWsHudInv < 0.999f || s.wshud.active || inkWork))
+        // [vpdrop] force the pass on for PS2X_VPKEEP: with inv==1.0 and stock ink/fx this gate is
+        // otherwise CLOSED (and self-latching -- wshud.active is only set from inside the pass).
+        if ((s_wshud && (g_ps2xWsHudInv < 0.999f || s.wshud.active || inkWork)) || ps2xVpKeep())
         {
             const uint8_t *xdata = data; size_t xsize = size;
             if (wsHudSubdivideLocked(s, data, size, s.wshud.lastInv)) { xdata = s.wsBuf.data(); xsize = s.wsBuf.size(); }

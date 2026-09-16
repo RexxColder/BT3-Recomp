@@ -6,6 +6,7 @@ extern "C" void ps2xWinCrashHandlerInstall();   // ps2_win_timer.cpp: [wincrash]
 extern "C" void ps2xWinHostInfo();             // ps2_win_timer.cpp: [host] cpu / clock / core count
 #endif
 #include "runtime/ps2_gs_gpu_renderer.h"
+#include "runtime/ps2_fiber.h"   // [fibers]
 #include "games_database.h"
 #if !defined(PLATFORM_VITA)
 #include "ps2_settings_overlay.h"
@@ -545,6 +546,7 @@ int main(int argc, char *argv[])
     std::signal(SIGINT, ps2xGsRecordOnSignal);
     std::signal(SIGTERM, ps2xGsRecordOnSignal);
     setupTerminateLogger();
+    ps2xFiberSelfTest();   // [fibers] PS2X_FIBERTEST=1: prove the primitive on this toolchain
 
     // ---- BT3 defaults ----------------------------------------------------------
     // The validated playing configuration (GPU path + outline/ink chain + graded DoF

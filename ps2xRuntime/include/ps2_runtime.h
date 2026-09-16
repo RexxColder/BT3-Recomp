@@ -670,6 +670,43 @@ public:
     void schedYield(int tid);             // hand token to next runnable, then re-acquire
     void schedBeginBlock(int tid);        // hand off token + mark blocked (caller waits, then schedAcquire)
 
+    // [fibers] PS2X_FIBERS=1 (requires PS2X_SCHED): run guest threads as fibers on ONE host
+    // thread so the host owns the frame boundary -- the prerequisite for rollback's
+    // advance_frame(). Scaffolding only so far; the flag is not yet end-to-end.
+    //
+    // Why every guest wait has to route through guestWait(): with one host thread shared by all
+    // guest fibers, ANY blocking wait stops the fibers the token was just handed to, so a
+    // condition_variable wait deadlocks even when the signaller is a host worker. Under fibers
+    // this parks in the scheduler and re-checks; under threads it is exactly today's
+    // cv.wait_for, so the default path is unchanged.
+    bool fibersEnabled() const { return m_fibersEnabled; }
+    // Take over THIS host thread as the fiber scheduler: adopt it as the scheduler context, run
+    // `mainEntry` as guest tid 1's fiber, and drive the round-robin until the runtime stops.
+    // Returns when every guest fiber has finished or a stop was requested.
+    void schedFiberBoot(int mainTid, int mainPrio, std::function<void()> mainEntry);
+    // Register a guest thread as a fiber instead of a host std::thread. It does not run until the
+    // scheduler picks it.
+    bool schedFiberSpawn(int tid, int prio, std::function<void()> body);
+    // Returns true when pred() became true, false if the runtime is stopping.
+    bool guestWait(std::condition_variable &cv, std::unique_lock<std::mutex> &lk,
+                   const std::function<bool()> &pred, int waitPoint,
+                   std::chrono::milliseconds slice = std::chrono::milliseconds(250));
+    // [rollback] Heap-free form for park sites. A rollback restores a parked fiber's STACK, so a
+    // frame parked here must not point at heap that may since have been freed -- and std::function
+    // may heap-allocate its target. The predicate lives on the caller's stack; only its address
+    // crosses. Prefer guestWaitT everywhere a fiber can park.
+    bool guestWaitFn(std::condition_variable &cv, std::unique_lock<std::mutex> &lk,
+                     bool (*pred)(void *), void *predCtx, int waitPoint,
+                     std::chrono::milliseconds slice = std::chrono::milliseconds(250));
+    template <typename P>
+    bool guestWaitT(std::condition_variable &cv, std::unique_lock<std::mutex> &lk, P &pred, int waitPoint,
+                    std::chrono::milliseconds slice = std::chrono::milliseconds(250))
+    {
+        return guestWaitFn(cv, lk, [](void *p) { return (*static_cast<P *>(p))(); },
+                           static_cast<void *>(&pred), waitPoint, slice);
+    }
+    friend struct Ps2xRollback;   // [rollback] the snapshot/restore of scheduler + fiber state (ps2_runtime.cpp)
+
 private:
     struct SchedThread
     {
@@ -679,9 +716,17 @@ private:
         uint64_t order = 0;
         uint32_t blockPc = 0, blockRa = 0;   // [schedwhy] guest pc/ra at the last block (which wait parked it)
         std::condition_variable cv;
+        struct Ps2xFiber *fiber = nullptr;   // [fibers] null while this tid runs as a host thread
+        bool finished = false;               // [fibers] entry returned; the fiber may be reclaimed
     };
     int schedPickNextLocked(int afterTid);
+    void schedFiberPark();                   // [fibers] switch this guest fiber back to the scheduler
+    void schedFiberLoop();                   // [fibers] the scheduler body, runs on m_schedFiber
+    bool schedFiberLoopUntil(bool (*stop)(void *), void *stopCtx);   // [rollback] ... until stop() (true) or every fiber finished (false)
+    bool schedFiberRunnableLocked(int tid) const;
     bool m_schedEnabled = false;
+    bool m_fibersEnabled = false;            // [fibers] PS2X_FIBERS=1 and m_schedEnabled
+    struct Ps2xFiber *m_schedFiber = nullptr; // [fibers] the host thread that runs the guest fibers
     std::mutex m_schedMutex;
     std::map<int, std::unique_ptr<SchedThread>> m_schedThreads;
     int m_schedCurrent = -1;

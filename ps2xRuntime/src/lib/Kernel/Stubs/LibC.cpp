@@ -1,4 +1,6 @@
 #include "Common.h"
+#include <atomic>
+extern std::atomic<uint64_t> g_bt3FrameCount;   // [randlog] defined in game_overrides.cpp (global namespace)
 #include "LibC.h"
 #include "ps2_log.h"
 #include <atomic>
@@ -1129,6 +1131,8 @@ namespace ps2_stubs
 
     static std::atomic<uint32_t> g_randCalls{0};
     uint32_t ps2RandCallCount() { return g_randCalls.load(std::memory_order_relaxed); }
+    uint64_t ps2RandState() { return g_ps2Rand64; }   // [dethash] RNG stream comparison
+    void ps2RandRestore(uint64_t state, uint32_t calls) { g_ps2Rand64 = state; g_randCalls.store(calls, std::memory_order_relaxed); }   // [savestate]
 
     void rand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -1138,10 +1142,20 @@ namespace ps2_stubs
         g_ps2Rand64 = g_ps2Rand64 * 6364136223846793005ull + 1ull;
         const int32_t r = static_cast<int32_t>((g_ps2Rand64 >> 32) & 0x7FFFFFFFu);
         const uint32_t n = g_randCalls.fetch_add(1, std::memory_order_relaxed);
-        static const bool s_log = [](){ const char *v = std::getenv("PS2X_RANDLOG");
-                                        return v && v[0] && v[0] != '0'; }();
-        if (s_log && n < 400u)
-            std::fprintf(stderr, "[randlog] #%u -> %d  ra=0x%x\n", n, r, getRegU32(ctx, 31));
+        // [randlog] PS2X_RANDLOG=<max calls to log> (1 == the old 400-call default). Logging the
+        // FRAME alongside the index and caller is what distinguishes "the simulation consumed the
+        // RNG differently" from "the same call landed either side of the frame hook" -- the
+        // per-frame count jitter (~0.07% over a fight) needed exactly this to resolve.
+        static const uint32_t s_logMax = [](){ const char *v = std::getenv("PS2X_RANDLOG");
+                                               if (!v || !v[0] || v[0] == '0') return 0u;
+                                               const long m = std::atol(v);
+                                               return m <= 1 ? 400u : (uint32_t)m; }();
+        if (n < s_logMax)
+        {
+            std::fprintf(stderr, "[randlog] f=%llu #%u -> %d  ra=0x%x\n",
+                         (unsigned long long)::g_bt3FrameCount.load(std::memory_order_relaxed),
+                         n, r, getRegU32(ctx, 31));
+        }
         setReturnS32(ctx, r);
     }
 

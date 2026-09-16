@@ -1,5 +1,6 @@
 #include "ps2_waitprof.h"   // [waitprof]
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_statesync.h"   // [statesync]
 #include "runtime/ps2_gs_pgs.h"   // [pgs]
 #if !defined(_WIN32)
 #include <pthread.h>
@@ -235,8 +236,34 @@ namespace
                address == kEeTimer0Hold;
     }
 
+    // [rollback] VIRTUAL CLOCK. The EE timers advance on this clock; in frame-stepped mode the
+    // scheduler's controller drives it (1/60 s per delivered vblank) instead of the wall clock, so
+    // Timer2 counts -- which the game's timer service compares against guest-side deadlines to
+    // decide which thread to wake -- become a function of guest progress. That is what lets a
+    // rolled-back re-run reproduce the original, and two netplay machines agree.
+    bool     g_vclockOn = false;
+    uint64_t g_vclockNs = 0;
+}
+// [rollback] In frame-stepped mode the DMA channels report IDLE as soon as the kick is queued: the
+// worker's completion time is host time, and a guest spin on CHCR.STR would run a different number
+// of iterations paced vs unpaced -- the last non-deterministic input the self-test showed. The
+// controller's vblank pacing replaces the pacing the busy report provided (jobs copy their data at
+// enqueue, so buffer reuse after "done" is safe, as [syncrelax] already relies on).
+extern "C" bool ps2xFrameStepOn();
+// [rollback] RENDER SKIP for re-simulation: a rolled-back frame is never displayed, so its GIF and
+// VIF1 work (VU1 programs, display lists, GS packets) is dropped at the DMA level while every
+// completion side effect the guest can observe (CHCR.STR, D_STAT, the DMAC interrupt) still
+// happens. VIF0 is NOT skipped: it feeds VU0, which the game's logic uses. Whether any RAM the
+// game reads depends on the skipped rendering (VRAM readbacks) is exactly what the self-test's
+// hash answers when this is on during the re-run.
+std::atomic<bool> g_ps2xRenderSkip{false};
+extern "C" void ps2xRenderSkipSet(bool on) { g_ps2xRenderSkip.store(on, std::memory_order_relaxed); }
+extern "C" bool ps2xRenderSkipOn() { return g_ps2xRenderSkip.load(std::memory_order_relaxed); }
+namespace
+{
     inline uint64_t steadyClockNs()
     {
+        if (g_vclockOn) return g_vclockNs;
         using namespace std::chrono;
         return static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
     }
@@ -491,6 +518,108 @@ void PS2Memory::updateEeTimer0Counter()
 bool PS2Memory::isScratchpad(uint32_t address) const
 {
     return ps2IsScratchpadAddress(address);
+}
+
+// [rollback] virtual clock control (see steadyClockNs)
+extern "C" void ps2xVirtualClockEnable()
+{
+    if (g_vclockOn) return;
+    using namespace std::chrono;
+    g_vclockNs = static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+    g_vclockOn = true;
+}
+extern "C" void ps2xVirtualClockAdvance(uint64_t ns) { if (g_vclockOn) g_vclockNs += ns; }
+extern "C" uint64_t ps2xVirtualClockGet() { return g_vclockNs; }
+extern "C" bool ps2xVirtualClockOn() { return g_vclockOn; }
+extern "C" void ps2xVirtualClockSet(uint64_t ns) { g_vclockNs = ns; }
+
+// [rollback] The device state PS2Memory keeps outside guest memory: the I/O register file (EE
+// timers, INTC, DMAC, SIF...), the timers' clock bookkeeping, pending DMA completions, the PATH3
+// mask and its parked FIFO, the VIF1 image-transfer carry, and the virtual clock. Pending GIF/VIF
+// transfers are expected empty at a frame boundary and are copied anyway.
+namespace
+{
+    struct MemDeviceSnap
+    {
+        std::unordered_map<uint32_t, uint32_t> io;
+        uint64_t t0Last = 0, t0Frac = 0, tLast[4] = {}, tFrac[4] = {};
+        std::vector<uint32_t> dmac;
+        bool path3Masked = false, vif1DirectHl = false;
+        uint32_t vif1ImgQwc = 0;
+        std::vector<std::vector<uint8_t>> path3Fifo;
+        std::vector<PS2Memory::PendingTransfer> gif, vif0, vif1;
+        uint64_t vclock = 0;
+    };
+}
+extern "C" void *ps2xMemDeviceCapture(PS2Memory *m)
+{
+    MemDeviceSnap *s = new MemDeviceSnap();
+    s->io = m->m_ioRegisters;
+    s->t0Last = m->m_timer0LastHostNs; s->t0Frac = m->m_timer0FractionNs;
+    for (int i = 0; i < 4; ++i) { s->tLast[i] = g_eeTimerLastNs[i]; s->tFrac[i] = g_eeTimerFracNs[i]; }
+    { std::lock_guard<std::mutex> lk(m->m_completedDmacMutex); s->dmac = m->m_completedDmacCauses; }
+    s->path3Masked = m->m_path3Masked; s->vif1DirectHl = m->m_vif1PendingPath2DirectHl; s->vif1ImgQwc = m->m_vif1PendingPath2ImageQwc;
+    s->path3Fifo = m->m_path3MaskedFifo;
+    s->gif = m->m_pendingGifTransfers; s->vif0 = m->m_pendingVif0Transfers; s->vif1 = m->m_pendingVif1Transfers;
+    s->vclock = g_vclockNs;
+    return s;
+}
+extern "C" bool ps2xMemDeviceRestore(PS2Memory *m, void *h)
+{
+    const MemDeviceSnap *s = static_cast<const MemDeviceSnap *>(h);
+    if (!s) return false;
+    m->m_ioRegisters = s->io;
+    m->m_timer0LastHostNs = s->t0Last; m->m_timer0FractionNs = s->t0Frac;
+    for (int i = 0; i < 4; ++i) { g_eeTimerLastNs[i] = s->tLast[i]; g_eeTimerFracNs[i] = s->tFrac[i]; }
+    { std::lock_guard<std::mutex> lk(m->m_completedDmacMutex); m->m_completedDmacCauses = s->dmac; }
+    m->m_path3Masked = s->path3Masked; m->m_vif1PendingPath2DirectHl = s->vif1DirectHl; m->m_vif1PendingPath2ImageQwc = s->vif1ImgQwc;
+    m->m_path3MaskedFifo = s->path3Fifo;
+    m->m_pendingGifTransfers = s->gif; m->m_pendingVif0Transfers = s->vif0; m->m_pendingVif1Transfers = s->vif1;
+    g_vclockNs = s->vclock;
+    return true;
+}
+extern "C" void ps2xMemDeviceFree(void *h) { delete static_cast<MemDeviceSnap *>(h); }
+// [statesync] portable form
+static void snapWriteTransfers(Ps2xByteW &w, const std::vector<PS2Memory::PendingTransfer> &v)
+{
+    w.u64(v.size());
+    for (const auto &t : v) { w.u8(t.fromScratchpad); w.u32(t.srcAddr); w.u32(t.qwc); w.bytes(t.chainData); }
+}
+static void snapReadTransfers(Ps2xByteR &r, std::vector<PS2Memory::PendingTransfer> &v)
+{
+    const size_t n = r.count(9); v.resize(r.ok ? n : 0);
+    for (auto &t : v) { t.fromScratchpad = r.u8() != 0; t.srcAddr = r.u32(); t.qwc = r.u32(); r.bytes(t.chainData); }
+}
+extern "C" bool ps2xMemDeviceSerialize(const void *h, std::vector<uint8_t> &out)
+{
+    const MemDeviceSnap *s = static_cast<const MemDeviceSnap *>(h);
+    if (!s) return false;
+    Ps2xByteW w(out);
+    w.u32(0x44455631u);   // 'DEV1'
+    w.podUMap(s->io);
+    w.u64(s->t0Last); w.u64(s->t0Frac); for (int i = 0; i < 4; ++i) { w.u64(s->tLast[i]); w.u64(s->tFrac[i]); }
+    w.podVec(s->dmac);
+    w.u8(s->path3Masked); w.u8(s->vif1DirectHl); w.u32(s->vif1ImgQwc);
+    w.u64(s->path3Fifo.size()); for (const auto &f : s->path3Fifo) w.bytes(f);
+    snapWriteTransfers(w, s->gif); snapWriteTransfers(w, s->vif0); snapWriteTransfers(w, s->vif1);
+    w.u64(s->vclock);
+    return true;
+}
+extern "C" void *ps2xMemDeviceDeserialize(const uint8_t *data, size_t n, size_t *used)
+{
+    Ps2xByteR r(data, n);
+    if (r.u32() != 0x44455631u) return nullptr;
+    MemDeviceSnap *s = new MemDeviceSnap();
+    r.podUMap(s->io);
+    s->t0Last = r.u64(); s->t0Frac = r.u64(); for (int i = 0; i < 4; ++i) { s->tLast[i] = r.u64(); s->tFrac[i] = r.u64(); }
+    r.podVec(s->dmac);
+    s->path3Masked = r.u8() != 0; s->vif1DirectHl = r.u8() != 0; s->vif1ImgQwc = r.u32();
+    { const size_t k = r.count(8); s->path3Fifo.resize(r.ok ? k : 0); for (auto &f : s->path3Fifo) r.bytes(f); }
+    snapReadTransfers(r, s->gif); snapReadTransfers(r, s->vif0); snapReadTransfers(r, s->vif1);
+    s->vclock = r.u64();
+    if (!r.ok) { delete s; return nullptr; }
+    if (used) *used = (size_t)(r.p - data);
+    return s;
 }
 
 uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit)
@@ -2559,6 +2688,7 @@ void PS2Memory::processPendingTransfers()
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
         auto &p = m_pendingGifTransfers[idx];
+        if (g_ps2xRenderSkip.load(std::memory_order_relaxed)) continue;   // [rollback] re-simulation: never seen
         if (asyncKickEnabled())
         {
             // Hand the transfer to the kick worker. chainData is already a self-contained
@@ -2760,6 +2890,7 @@ void PS2Memory::processPendingTransfers()
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
     for (auto &p : m_pendingVif1Transfers)
     {
+        if (g_ps2xRenderSkip.load(std::memory_order_relaxed)) continue;   // [rollback] re-simulation: never seen
         if (asyncKickEnabled())
         {
             if (!p.chainData.empty())
@@ -3317,7 +3448,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
                 // On the i5-12400 the drain + this spin were ~600 ms/s of the game thread ([waitprof]).
                 // =0 restores the always-busy report; =2 never reports busy (dev only: fast-forwards fast boxes).
                 if (asyncKickEnabled() && chan < 3u &&
-                    m_asyncChanBusy[chan].load(std::memory_order_acquire) > 0 && !ps2xAsyncPaceRelaxed())
+                    m_asyncChanBusy[chan].load(std::memory_order_acquire) > 0 && !ps2xAsyncPaceRelaxed() && !ps2xFrameStepOn())
                     return m_ioRegisters[address] | 0x100u;   // still RUNNING
 
                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;

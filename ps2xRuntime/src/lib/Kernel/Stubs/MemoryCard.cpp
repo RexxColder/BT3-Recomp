@@ -1,4 +1,5 @@
 #include "Common.h"
+#include "runtime/ps2_statesync.h"   // [statesync]
 #include "MemoryCard.h"
 #include <cstdarg>
 
@@ -1546,4 +1547,84 @@ namespace ps2_stubs
     {
         setReturnS32(ctx, 1);
     }
+}
+
+// [statesync] The memory-card HLE's host state: what sceMcSync will answer (the last command and its
+// result), the per-port latches (the first GetInfo after boot answers "card changed"), the fd counter
+// and the open files (path relative to the card root + position, reopened on restore). A peer that
+// adopted our RAM mid-transaction otherwise answers its own last result and libmc's state machine
+// (the table at 0x331d80) takes a different step ~30 frames after a sync -- the first netplay desync.
+namespace
+{
+    struct McSnap
+    {
+        int32_t nextFd = 1, lastCmd = 0, lastResult = 0, cvCursor = 0;
+        struct Port { std::string currentDir; bool formatted, infoQueried; } ports[2];
+        struct File { int32_t fd, port; std::string rel; int64_t pos; };
+        std::vector<File> files;
+    };
+}
+extern "C" void *ps2xMcStateCapture()
+{
+    McSnap *s = new McSnap();
+    std::lock_guard<std::mutex> lock(ps2_stubs::g_mcStateMutex);
+    s->nextFd = ps2_stubs::g_mcNextFd; s->lastCmd = ps2_stubs::g_mcLastCmd; s->lastResult = ps2_stubs::g_mcLastResult; s->cvCursor = ps2_stubs::g_cvMcFileCursor;
+    for (int i = 0; i < 2; ++i) { s->ports[i].currentDir = ps2_stubs::g_mcPorts[i].currentDir; s->ports[i].formatted = ps2_stubs::g_mcPorts[i].formatted; s->ports[i].infoQueried = ps2_stubs::g_mcPorts[i].infoQueried; }
+    for (const auto &kv : ps2_stubs::g_mcFiles)
+    {
+        const ps2_stubs::McOpenFile &f = kv.second;
+        std::error_code ec;
+        const std::filesystem::path root = ps2_stubs::getMcRootPath(f.port);
+        const std::filesystem::path rel = f.hostPath.lexically_relative(root);
+        const long pos = f.file ? std::ftell(f.file) : 0L;
+        s->files.push_back(McSnap::File{ kv.first, f.port, (rel.empty() ? f.hostPath : rel).generic_string(), pos < 0 ? 0 : (int64_t)pos });
+    }
+    return s;
+}
+extern "C" bool ps2xMcStateRestore(void *h)
+{
+    const McSnap *s = static_cast<const McSnap *>(h);
+    if (!s) return false;
+    std::lock_guard<std::mutex> lock(ps2_stubs::g_mcStateMutex);
+    ps2_stubs::g_mcNextFd = s->nextFd; ps2_stubs::g_mcLastCmd = s->lastCmd; ps2_stubs::g_mcLastResult = s->lastResult; ps2_stubs::g_cvMcFileCursor = s->cvCursor;
+    for (int i = 0; i < 2; ++i) { ps2_stubs::g_mcPorts[i].currentDir = s->ports[i].currentDir; ps2_stubs::g_mcPorts[i].formatted = s->ports[i].formatted; ps2_stubs::g_mcPorts[i].infoQueried = s->ports[i].infoQueried; }
+    for (auto &kv : ps2_stubs::g_mcFiles) if (kv.second.file) std::fclose(kv.second.file);
+    ps2_stubs::g_mcFiles.clear();
+    for (const McSnap::File &f : s->files)
+    {
+        ps2_stubs::McOpenFile of; of.port = f.port;
+        of.hostPath = (ps2_stubs::getMcRootPath(f.port) / f.rel).lexically_normal();
+        of.file = std::fopen(of.hostPath.string().c_str(), "r+b");
+        if (!of.file) of.file = std::fopen(of.hostPath.string().c_str(), "rb");
+        if (of.file) std::fseek(of.file, (long)f.pos, SEEK_SET);
+        else std::fprintf(stderr, "[statesync] mc: cannot reopen fd %d (%s)\n", f.fd, of.hostPath.string().c_str());
+        ps2_stubs::g_mcFiles[f.fd] = of;
+    }
+    return true;
+}
+extern "C" void ps2xMcStateFree(void *h) { delete static_cast<McSnap *>(h); }
+extern "C" bool ps2xMcStateSerialize(const void *h, std::vector<uint8_t> &out)
+{
+    const McSnap *s = static_cast<const McSnap *>(h);
+    if (!s) return false;
+    Ps2xByteW w(out);
+    w.u32(0x4d434131u);   // 'MCA1'
+    w.pod(s->nextFd); w.pod(s->lastCmd); w.pod(s->lastResult); w.pod(s->cvCursor);
+    for (int i = 0; i < 2; ++i) { w.str(s->ports[i].currentDir); w.u8(s->ports[i].formatted); w.u8(s->ports[i].infoQueried); }
+    w.u64(s->files.size());
+    for (const auto &f : s->files) { w.pod(f.fd); w.pod(f.port); w.str(f.rel); w.i64(f.pos); }
+    return true;
+}
+extern "C" void *ps2xMcStateDeserialize(const uint8_t *data, size_t n, size_t *used)
+{
+    Ps2xByteR r(data, n);
+    if (r.u32() != 0x4d434131u) return nullptr;
+    McSnap *s = new McSnap();
+    s->nextFd = r.pod<int32_t>(); s->lastCmd = r.pod<int32_t>(); s->lastResult = r.pod<int32_t>(); s->cvCursor = r.pod<int32_t>();
+    for (int i = 0; i < 2; ++i) { s->ports[i].currentDir = r.str(); s->ports[i].formatted = r.u8() != 0; s->ports[i].infoQueried = r.u8() != 0; }
+    const size_t k = r.count(20);
+    for (size_t i = 0; i < k && r.ok; ++i) { McSnap::File f; f.fd = r.pod<int32_t>(); f.port = r.pod<int32_t>(); f.rel = r.str(); f.pos = r.i64(); s->files.push_back(f); }
+    if (!r.ok) { delete s; return nullptr; }
+    if (used) *used = (size_t)(r.p - data);
+    return s;
 }

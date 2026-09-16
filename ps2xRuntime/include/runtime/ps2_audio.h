@@ -56,6 +56,7 @@ public:
         uint64_t consumedSamples = 0;   // cumulative samples accepted by the device
         uint64_t gapSamples = 0;        // guest samples that never reached the device
         size_t pending = 0;             // samples still queued ahead of the device
+        uint32_t sampleRate = 0;        // the rate this stream was declared at (what the device consumes per second)
     };
     StreamProgress streamProgress(uint32_t streamId);
     // "The guest cannot queue any more -- start with what you have." The start cushion is a

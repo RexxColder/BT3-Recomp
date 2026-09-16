@@ -1,4 +1,6 @@
 #include "ps2_waitprof.h"   // [waitprof]
+#include "runtime/ps2_statesync.h"   // [statesync]
+extern "C" bool ps2xAudioFeedOn();   // [rollback] ps2_runtime.cpp: false while re-simulating / fast-forwarding (no device feed)
 #include "ps2_runtime_macros.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
@@ -39,6 +41,17 @@ extern "C" unsigned long long ps2xWinThreadCpuNs();
 #include "ps2_log.h"
 #include "runtime/pad_config.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_netplay.h"   // [netplay]
+
+// [netjump] Frames of display HOLD remaining. While non-zero, GsGpuRenderer::swapFrame() returns
+// immediately, so the screen keeps showing the last presented frame. The menu transition needs a
+// few frames of real menu (the duel module's object only exists while the versus menu is up, and
+// func_356090 loads character select's assets on the confirm) -- this hides those frames instead
+// of pretending they are not needed. Counts DOWN in swapFrame so a failed transition cannot
+// freeze the picture forever.
+std::atomic<int> g_netJumpHold{0};
+#define XXH_INLINE_ALL
+#include "thirdparty/xxhash.h"   // [dethash]
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include <algorithm>
 #include <array>
@@ -71,6 +84,9 @@ extern const uint32_t g_ps2OverlayFunctionTableSlotCount;
 namespace ps2_stubs
 {
     uint16_t ps2xLivePadButtons(int player, uint8_t &lx, uint8_t &ly, uint8_t &rx, uint8_t &ry);
+    uint32_t ps2RandCallCount();   // [dethash]
+    uint64_t ps2RandState();      // [dethash]
+    void     ps2RandRestore(uint64_t state, uint32_t calls);   // [savestate]
 }
 
 // External-linkage game-frame counter (read by the [fps] line in ps2_runtime.cpp).
@@ -376,6 +392,66 @@ namespace
     // cleanly. Per-player input is routed by socket index (a0): scePad2CreateSocket
     // is overridden to return the descriptor's player byte (0/1), and each read
     // accessor maps socket -> player profile from the host pad configurator.
+    // [inrec] 12-byte records: frame, player, buttons, rx, ry, lx, ly
+    #pragma pack(push, 1)
+    struct Ps2xPadSample { uint32_t frame; uint8_t player, pad0; uint16_t buttons; uint8_t rx, ry, lx, ly; };
+    #pragma pack(pop)
+    static_assert(sizeof(Ps2xPadSample) == 12, "pad sample must stay 12 bytes");
+    static std::mutex g_inRecMtx;
+    static void ps2xInRecWrite(uint32_t frame, uint32_t player, uint16_t buttons, uint8_t rx, uint8_t ry, uint8_t lx, uint8_t ly)
+    {
+        static std::FILE *f = [](){ const char *v = std::getenv("PS2X_INREC");
+            if (!v || !v[0]) { std::fprintf(stderr, "[inrec] PS2X_INREC not set -- not recording\n"); return (std::FILE *)nullptr; }
+            std::FILE *h = std::fopen(v, "wb");
+            std::fprintf(stderr, h ? "[inrec] recording pad input to %s\n" : "[inrec] FAILED to open %s\n", v);
+            return h; }();
+        if (!f) return;
+        const Ps2xPadSample e{frame, static_cast<uint8_t>(player), 0u, buttons, rx, ry, lx, ly};
+        std::lock_guard<std::mutex> lk(g_inRecMtx);
+        std::fwrite(&e, sizeof e, 1, f);
+        std::fflush(f);
+    }
+    static const std::map<uint64_t, Ps2xPadSample> &ps2xInPlayMap()
+    {
+        static const std::map<uint64_t, Ps2xPadSample> m = [](){
+            std::map<uint64_t, Ps2xPadSample> out;
+            const char *v = std::getenv("PS2X_INPLAY");
+            if (!v || !v[0]) return out;
+            std::FILE *h = std::fopen(v, "rb");
+            if (!h) { std::fprintf(stderr, "[inrec] FAILED to open %s for replay\n", v); return out; }
+            Ps2xPadSample e{};
+            while (std::fread(&e, sizeof e, 1, h) == 1) out[(uint64_t(e.frame) << 8) | e.player] = e;
+            std::fclose(h);
+            std::fprintf(stderr, "[inrec] replaying %zu pad samples from %s\n", out.size(), v);
+            return out; }();
+        return m;
+    }
+    static bool ps2xInPlayActive() { static const bool on = !ps2xInPlayMap().empty(); return on; }
+    static bool ps2xInPlayLookup(uint32_t frame, uint32_t player, Ps2xPadSample &out)
+    {
+        const auto &m = ps2xInPlayMap();
+        const auto it = m.find((uint64_t(frame) << 8) | uint8_t(player));
+        if (it == m.end()) return false;
+        out = it->second; return true;
+    }
+
+    // [netjump] frames of synthetic CROSS remaining, consumed by writeNeutralPadPacket.
+    // Everything about the destination is set directly (screen state, versus mode, battle type);
+    // this is only the CONFIRM, because func_356090 loads character select's assets and the duel
+    // module polls it -- it completes on a press, and no amount of variable writing substitutes
+    // for that loading. One press at a state we chose and can verify, not menu navigation.
+    std::atomic<int> g_netJumpPressCross{0};
+    // [statesync] 0 = no jump this session, 1 = jumping, 2 = settled / gave up. The state sync waits for
+    // 2 on both sides: the host publishes AFTER its jump (so the joiner adopts character select), the
+    // joiner adopts only once its own jump has it in the same screen (comparable call chains).
+    std::atomic<int> g_netJumpState{0};
+    std::atomic<uint32_t> g_netJumpSession{0};   // the netplay session the state belongs to
+    extern "C" int ps2xNetJumpState() { return g_netJumpState.load(std::memory_order_relaxed); }
+    // True once THIS session's jump has settled (or given up). A session the jump has not looked at yet
+    // (it runs from the frame hook, after the boundary that first sees the peer) counts as not settled.
+    extern "C" int ps2xNetJumpSettledFor(uint32_t session)
+    { return g_netJumpSession.load(std::memory_order_relaxed) == session && g_netJumpState.load(std::memory_order_relaxed) == 2; }
+
     void writeNeutralPadPacket(uint8_t *rdram, uint32_t bufAddr, uint32_t socket)
     {
         // TEST (env PS2X_SOUNDREADY): force the sound-ready flags that FUN_0026d9a0
@@ -401,7 +477,11 @@ namespace
         // PS2 pad packet. buttons active-low (0xff = released); game does
         // (hi<<8|lo) ^ 0xffff.
         uint8_t lx = 0x80u, ly = 0x80u, rx = 0x80u, ry = 0x80u;
-        const uint16_t buttons = ps2_stubs::ps2xLivePadButtons(static_cast<int>(socket & 3u), lx, ly, rx, ry);
+        // [netplay] The LOCAL player's buttons always come from this machine's PRIMARY device (player-1
+        // config): a joiner is player 2, whose socket would otherwise poll the second-gamepad slot and
+        // read nothing while the only controller sits on slot 0.
+        const int liveSlot = (ps2NetActive() && static_cast<int>(socket & 3u) + 1 == ps2NetLocalPlayer()) ? 0 : static_cast<int>(socket & 3u);
+        const uint16_t buttons = ps2_stubs::ps2xLivePadButtons(liveSlot, lx, ly, rx, ry);
         uint8_t b0 = static_cast<uint8_t>(buttons & 0xffu);
         uint8_t b1 = static_cast<uint8_t>((buttons >> 8) & 0xffu);
         // TEST (env PS2X_AUTOSTART): also tap START+CROSS periodically to auto-advance.
@@ -440,6 +520,64 @@ namespace
                 return v ? (uint32_t)std::strtoul(v, nullptr, 16) : 0x4008u; }();
             b0 = static_cast<uint8_t>(b0 & ~(uint8_t)(s_skipMask & 0xffu));
             b1 = static_cast<uint8_t>(b1 & ~(uint8_t)((s_skipMask >> 8) & 0xffu));
+        }
+        // [inrec] Deterministic input record/replay -- THE NETPLAY SEAM.
+        // NOTE: BT3 does NOT use libpad. scePadRead/readPadPortData in Kernel/Stubs/Pad.cpp are
+        // never called (verified: the trace printed no entry at all); the game reads pads through
+        // its own FUN_00296090 / FUN_00295fb8, which land here. A hook in Pad.cpp therefore
+        // records nothing -- that cost three user runs before the startup banner made it obvious.
+        //   PS2X_INREC=<file>   capture per frame       PS2X_INPLAY=<file>   feed it back
+        // Later the remote player's buttons arrive here off a socket instead of out of a file.
+        // [netplay] When a peer is connected, the LOCAL player's buttons come from this machine's
+        // pad and are sent to the peer; the REMOTE player's arrive over UDP. The game reads two
+        // pads and cannot tell the difference. Input sampled now is applied delay frames later,
+        // so the packet has that long to cross the network.
+        if (ps2NetActive())
+        {
+            const uint32_t frame = static_cast<uint32_t>(g_bt3FrameCount.load(std::memory_order_relaxed));
+            const int pl = static_cast<int>(socket & 3u) + 1;          // socket 0/1 -> player 1/2
+            // [netjump] The jump's confirm press is a P1 press (the versus menu listens to player 1 only).
+            // In lockstep the host's P1 press crosses the wire, so injecting on the LOCAL player was right;
+            // while a state sync is pending nothing crosses and each side drives its own menus, so it must
+            // be injected on socket 0 whoever we are.
+            const bool injectHere = ps2NetSyncPending() ? (pl == 1) : (pl == ps2NetLocalPlayer());
+            if (injectHere && g_netJumpPressCross.load(std::memory_order_relaxed) > 0)
+            {
+                g_netJumpPressCross.fetch_sub(1, std::memory_order_relaxed);
+                b1 = static_cast<uint8_t>(b1 & ~0x40u);   // CROSS (active low), bit 14
+            }
+            if (pl == ps2NetLocalPlayer())
+            {
+                Ps2xNetInput live{static_cast<uint16_t>(b0 | (uint16_t(b1) << 8)), rx, ry, lx, ly};
+                Ps2xNetInput canned{};
+                if (ps2NetAutoInput(canned)) live = canned;   // [netplay] host-driven auto-start
+                ps2NetSubmitLocal(frame, live);
+            }
+            Ps2xNetInput use{};
+            if (ps2NetGetInput(frame, pl, use))
+            {
+                b0 = static_cast<uint8_t>(use.buttons & 0xFFu);
+                b1 = static_cast<uint8_t>((use.buttons >> 8) & 0xFFu);
+                rx = use.rx; ry = use.ry; lx = use.lx; ly = use.ly;
+            }
+            p[0] = b0; p[1] = b1; p[2] = rx; p[3] = ry; p[4] = lx; p[5] = ly;
+            return;
+        }
+        {
+            const uint32_t plyr = socket & 3u;
+            uint16_t recB = static_cast<uint16_t>(b0 | (uint16_t(b1) << 8));
+            if (ps2xInPlayActive())
+            {
+                Ps2xPadSample sm{};
+                if (ps2xInPlayLookup(static_cast<uint32_t>(g_bt3FrameCount.load(std::memory_order_relaxed)), plyr, sm))
+                { recB = sm.buttons; rx = sm.rx; ry = sm.ry; lx = sm.lx; ly = sm.ly; }
+                else
+                { recB = 0xFFFFu; rx = ry = lx = ly = 0x80u; }   // neutral, never a live pad
+                b0 = static_cast<uint8_t>(recB & 0xFFu);
+                b1 = static_cast<uint8_t>((recB >> 8) & 0xFFu);
+            }
+            else
+                ps2xInRecWrite(static_cast<uint32_t>(g_bt3FrameCount.load(std::memory_order_relaxed)), plyr, recB, rx, ry, lx, ly);
         }
         p[0] = b0; // buttons low
         p[1] = b1; // buttons high
@@ -755,6 +893,8 @@ namespace
     struct SinkRing { std::vector<std::pair<uint32_t, uint32_t>> bufs; size_t next = 0; };
     std::mutex g_sinkRingM;
     std::map<uint32_t, SinkRing> g_sinkRings;
+    std::mutex g_sndRateM;                                                            // [rollback] the consumer's per-sink feed
+    std::map<uint32_t, std::chrono::steady_clock::time_point> g_sndRateLast;          //   rate limiter, snapshotted with the rest
     // The two sinks whose audio stream ids are 0 and 1 -- i.e. the L/R halves of the BGM.
     uint32_t g_pairSink[2] = {0u, 0u};
     uint64_t g_pairReturns[2] = {0u, 0u}; // buffers handed to each side, for balance
@@ -800,6 +940,23 @@ namespace
     }
     inline void sndWr32(uint8_t *rdram, uint32_t addr, uint32_t val)
     {
+        // [sndwatch] PS2X_SNDWATCH=<hex addr>: name the HOST-side writer of one sound-block slot.
+        // The guest-store watch (PS2X_ADDRWATCH) is silent for these because the runtime writes
+        // them directly into guest RAM, bypassing the recompiled store path entirely.
+        {
+            static const uint32_t s_w = [](){ const char *v = std::getenv("PS2X_SNDWATCH");
+                                              return (v && v[0]) ? (uint32_t)std::strtoul(v, nullptr, 16) : 0u; }();
+            if (s_w && (addr & 0x1FFFFFFFu) == (s_w & 0x1FFFFFFFu))
+            {
+                static std::atomic<uint32_t> s_n{0};
+                if (s_n.fetch_add(1u) < 25u)
+                {
+                    uint32_t old32 = 0; std::memcpy(&old32, rdram + (addr & 0x1FFFFFFFu), 4);
+                    std::fprintf(stderr, "[sndwatch] frame %llu addr 0x%x  %08x -> %08x\n",
+                                 (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), addr, old32, val);
+                }
+            }
+        }
         if (uint8_t *p = getMemPtr(rdram, addr & 0x1FFFFFFFu))
             *reinterpret_cast<uint32_t *>(p) = val;
     }
@@ -863,9 +1020,46 @@ namespace
         uint64_t wallBaseBytes = 0u;
         bool ringFullIdle = false;   // ring full but the device has not started playing
         std::chrono::steady_clock::time_point ringFullSince{};
+        // [detsound] deterministic pacing: same idea as wallBase/wallBaseBytes but counted in
+        // GUEST FRAMES instead of host milliseconds, so two machines credit the stream
+        // identically. Wall-clock pacing is the measured root of boot non-determinism
+        // (12 bytes differ at frame 1, all of them stream-position counters).
+        bool  frameClock = false;
+        uint64_t frameBase = 0u;
+        uint64_t frameBaseBytes = 0u;
     };
+    // [detsound] PS2X_DETSOUND=<fps> (1 => 60). When set, stream credit advances on the guest
+    // frame counter rather than the host clock, making the sound engine's consumption identical
+    // on two machines. This is what lets two independently-booted clients stay in step without a
+    // savestate transfer. Off by default: it decouples credit from real playback, so audio can
+    // drift if the guest frame rate is not what is declared here.
+    static uint32_t detSoundFps()
+    {
+        static const uint32_t s_fps = [](){ const char *v = std::getenv("PS2X_DETSOUND");
+            if (!v || !v[0] || v[0] == '0') return 0u;
+            const long n = std::atol(v);
+            const uint32_t f = (n <= 1) ? 60u : (uint32_t)n;
+            std::fprintf(stderr, "[detsound] stream credit paced by the GUEST FRAME COUNTER at %u fps (deterministic)\n", f);
+            return f; }();
+        return s_fps;
+    }
     std::mutex g_iopSinkM;
     std::map<uint32_t, IopSink> g_iopSinks;
+    extern "C" bool ps2xFrameStepOn();   // [rollback] ps2_runtime.cpp
+    extern "C" bool ps2xVirtualClockOn();      // [rollback] ps2_memory.cpp
+    extern "C" uint64_t ps2xVirtualClockGet();
+    // [rollback] The sound/CD HLE's notion of "now": the virtual clock in frame-stepped mode (it advances
+    // 1/60 s per delivered vblank and is part of the snapshot), the wall clock otherwise. Every timing
+    // decision the guest can observe through this HLE routes through here, so a rolled-back re-run
+    // makes the same decisions.
+    static std::chrono::steady_clock::time_point ps2xNowSteady()
+    {
+        if (ps2xVirtualClockOn())
+            return std::chrono::steady_clock::time_point(std::chrono::nanoseconds(ps2xVirtualClockGet()));
+        return std::chrono::steady_clock::now();
+    }
+    // Deterministic pacing is on under PS2X_DETSOUND or in frame-stepped mode.
+    static bool ps2xDetPacing() { return detSoundFps() != 0u || ps2xFrameStepOn(); }
 
     bool sndIopEnabled()
     {
@@ -918,7 +1112,8 @@ namespace
         s.returnedBytes = 0u;
         s.wallClock = false;
         s.ringFullIdle = false;
-        if (runtime)
+        s.frameClock = false;   // [rollback] a new stream re-bases its frame/tick clock
+        if (runtime && !ps2xFrameStepOn())   // [rollback] stepped mode never consults the device's progress
         {
             const auto prog = runtime->audioBackend().streamProgress(id);
             if (prog.known)
@@ -942,7 +1137,32 @@ namespace
         s.heldBytes = queued;
 
         uint64_t playedBytes = 0u;
-        const auto prog = runtime->audioBackend().streamProgress(s.streamId);
+        const auto prog = runtime->audioBackend().streamProgress(s.streamId);   // (stepped mode: diagnostics only)
+        if (ps2xFrameStepOn())
+        {   // [rollback] Frame-stepped mode NEVER consults the device: whether the host stream has
+            // started, how much it has played and whether the ring looks full to it are real-time
+            // facts that differ between a run and its re-simulation (and between two machines). The
+            // early return below for "device not started yet" withheld the credit in one run and not
+            // the other, so the stream thread issued one SIF DMA more -- the last sound-block
+            // divergence. Credit by vblank ticks only; the device starts on its own once fed.
+            s.wallClock = false; s.ringFullIdle = false;
+            // Nothing queued = nothing playing: no credit, and the clock re-bases when data next arrives
+            // (a stream that has just started). Measured without this: the clock ran from boot on an
+            // empty sink, so the first BGM was credited 35 s of "played" the moment it started, the game
+            // refilled at full speed and the device sat 4 s behind, trimming forever.
+            if (queued == 0u) { s.frameClock = false; return; }
+            const uint64_t fr = ps2_syscalls::GetCurrentVSyncTick();
+            if (!s.frameClock) { s.frameClock = true; s.frameBase = fr; s.frameBaseBytes = s.returnedBytes; }
+            // At the rate the stream was DECLARED at (the game's ADX header, as the DMA path told the
+            // backend) -- not the 24 kHz default: the title music is 48 kHz, and crediting it at half
+            // rate fed the device half of what it played (measured: 24 002 vs 48 169 samples/s).
+            const uint32_t rate = (prog.known && prog.sampleRate) ? prog.sampleRate : sndDeclaredRate();
+            playedBytes = s.frameBaseBytes + ((fr - s.frameBase) * (uint64_t)rate * 2ull) / 60u;
+            const uint64_t fedTotal = s.returnedBytes + queued;   // the device cannot have played what was never fed
+            if (playedBytes > fedTotal) playedBytes = fedTotal;
+        }
+        else
+        {
         if (prog.known)
         {
             s.wallClock = false;
@@ -954,7 +1174,7 @@ namespace
                 // deadlock -- no playback, no returns, no more data, forever. Give the normal
                 // cushion a generous head start, then start with whatever is there.
                 const bool ringFull = queued && sndRd32(rdram, sink + kSinkList0) == 0u;
-                const auto now = std::chrono::steady_clock::now();
+                const auto now = ps2xNowSteady();
                 if (!ringFull)
                 {
                     s.ringFullIdle = false;
@@ -979,13 +1199,22 @@ namespace
             // the same, so it counts as consumed -- otherwise it is never returned and the ring
             // loses that much capacity permanently.
             playedBytes = (prog.consumedSamples + prog.gapSamples) * 2ull;
+            if (const uint32_t fps = ps2xFrameStepOn() ? 60u : detSoundFps())
+            {   // [detsound] ignore the device's real progress; credit by frames instead.
+                // [rollback] In frame-stepped mode the clock is the VSYNC TICK: 60 Hz by construction
+                // (the controller delivers it), independent of the game's 30/60 fps, and part of the
+                // snapshot -- so a rolled-back re-run credits the stream identically.
+                const uint64_t fr = ps2xFrameStepOn() ? ps2_syscalls::GetCurrentVSyncTick() : g_bt3FrameCount.load(std::memory_order_relaxed);
+                if (!s.frameClock) { s.frameClock = true; s.frameBase = fr; s.frameBaseBytes = s.returnedBytes; }
+                playedBytes = s.frameBaseBytes + ((fr - s.frameBase) * sndDeclaredRate() * 2ull) / fps;
+            }
         }
         else
         {
             // Nothing is rendering this stream (PS2X_SNDPLAY off, or an id the DMA path never
             // feeds). Advance on a wall clock at the declared rate so the guest's sound engine
             // still runs instead of wedging on a ring that never drains.
-            const auto now = std::chrono::steady_clock::now();
+            const auto now = ps2xNowSteady();
             if (!s.wallClock)
             {
                 s.wallClock = true;
@@ -995,6 +1224,13 @@ namespace
             const uint64_t ms = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - s.wallBase).count());
             playedBytes = s.wallBaseBytes + (ms * sndDeclaredRate() * 2ull) / 1000ull;
+            if (const uint32_t fps = ps2xFrameStepOn() ? 60u : detSoundFps())
+            {
+                const uint64_t fr = ps2xFrameStepOn() ? ps2_syscalls::GetCurrentVSyncTick() : g_bt3FrameCount.load(std::memory_order_relaxed);
+                if (!s.frameClock) { s.frameClock = true; s.frameBase = fr; s.frameBaseBytes = s.returnedBytes; }
+                playedBytes = s.frameBaseBytes + ((fr - s.frameBase) * sndDeclaredRate() * 2ull) / fps;
+            }
+        }
         }
         if (playedBytes <= s.returnedBytes)
             return;
@@ -1078,8 +1314,9 @@ namespace
             auto it = g_iopSinks.find(sink);
             if (it != g_iopSinks.end() && it->second.streamId != 0xFFFFFFFFu)
             {
-                const auto prog = runtime->audioBackend().streamProgress(it->second.streamId);
-                if (prog.pending > 0u)
+                const bool audible = ps2xFrameStepOn() ? (sndListBytes(rdram, sink, kSinkList1) != 0u)   // [rollback] guest queue, not device
+                                                       : (runtime->audioBackend().streamProgress(it->second.streamId).pending > 0u);
+                if (audible)
                     return; // still audible: this is a retrigger, not a fresh stream
             }
         }
@@ -1121,9 +1358,10 @@ namespace
             kept = prog.pending;
             // Rebase the play clock. `pending` is audio already counted into the ring we just
             // flushed, so it must not be credited a second time as it drains.
-            s.returnedBytes = prog.known
+            s.returnedBytes = (prog.known && !ps2xFrameStepOn())
                                   ? (prog.consumedSamples + prog.gapSamples + prog.pending) * 2ull
                                   : 0u;
+            s.frameClock = false;   // [rollback] re-base the tick clock after a flush
         }
         s.wallClock = false;
         s.ringFullIdle = false;
@@ -1543,6 +1781,10 @@ namespace
     };
     std::mutex g_seVoiceM;
     std::vector<SeVoice> g_seVoices;
+    // [rollback] Stepped-mode SE pacing: samples are generated per vsync tick (22050/60 each) instead
+    // of per the device's pending level, so voice positions and completions follow guest progress.
+    // Both are part of the snapshot.
+    uint64_t g_seTickBase = 0, g_seTickCarry = 0;
 
     void seAddVoice(uint32_t serial, std::vector<int16_t> &&pcm)
     {
@@ -1581,16 +1823,52 @@ namespace
     {
         if (!runtime)
             return;
+        // [rollback] stepped mode: a fixed budget of samples per vsync tick, whatever the device holds
+        const bool stepped = ps2xFrameStepOn();
+        uint64_t budget = 0;   // samples this call may mix (stepped mode)
+        if (stepped)
+        {
+            // The budget is kept in 1/60-sample units (g_seTickCarry) so nothing is ever lost: one
+            // vblank is 367.5 samples and a chunk is 512, so at 60 fps a budget that was thrown away
+            // whenever it fell short of a chunk never mixed anything (the logo chime, every menu
+            // sound), and at 30 fps it mixed one chunk per two ticks and dropped the rest (effects
+            // at ~70 % rate: crackly voices). Unspent whole samples go back into the carry below.
+            const uint64_t tick = ps2_syscalls::GetCurrentVSyncTick();
+            if (g_seTickBase == 0 || tick < g_seTickBase) g_seTickBase = tick;
+            const uint64_t ticks = tick - g_seTickBase;
+            g_seTickBase = tick;
+            const uint64_t acc60 = g_seTickCarry + ticks * kSeMixRate;
+            budget = acc60 / 60u; g_seTickCarry = acc60 % 60u;
+        }
         for (int guard = 0; guard < 64; ++guard)
         {
             {
                 std::lock_guard<std::mutex> lk(g_seVoiceM);
                 if (g_seVoices.empty())
+                {
+                    if (stepped) g_seTickCarry = 0u;   // nothing to play: do not bank time for a later burst
                     return;
+                }
             }
-            const auto prog = runtime->audioBackend().streamProgress(kSeStreamId);
-            if (prog.pending >= kSeTargetPending)
-                return;
+            if (stepped)
+            {
+                if (budget < kSeChunk) { g_seTickCarry += budget * 60u; return; }   // keep the remainder for the next call
+                budget -= kSeChunk;
+            }
+            else
+            {
+                const auto prog = runtime->audioBackend().streamProgress(kSeStreamId);
+                if (prog.pending >= kSeTargetPending)
+                {
+                    // The target IS this stream's whole cushion -- nothing more is produced until
+                    // the device drains some -- so tell the backend to start with it. Without this
+                    // it waited for the 100 ms "one-shot idle" rule to fire, which also padded the
+                    // partial chunk with silence: the click on the memory-card prompt sound.
+                    if (prog.known && !prog.started)
+                        runtime->audioBackend().requestStreamStart(kSeStreamId);
+                    return;
+                }
+            }
             int32_t acc[kSeChunk];
             std::memset(acc, 0, sizeof(acc));
             size_t used = 0;
@@ -1619,6 +1897,21 @@ namespace
                 if (v > 32767) v = 32767;
                 if (v < -32768) v = -32768;
                 out[i] = static_cast<int16_t>(v);
+            }
+            // [rollback] Stepped mode mixes by ticks (the deterministic part: voice positions), but the
+            // device is fed by its own queue level, like the wall-clock path: a chunk the device has no
+            // room for is dropped rather than queued behind everything else, so a burst of ticks can
+            // never turn into lasting latency. Nothing is fed during a re-simulation or catch-up.
+            if (stepped)
+            {
+                if (!ps2xAudioFeedOn()) continue;
+                const auto prog = runtime->audioBackend().streamProgress(kSeStreamId);
+                if (prog.known && prog.pending >= kSeTargetPending)
+                {
+                    if (!prog.started)
+                        runtime->audioBackend().requestStreamStart(kSeStreamId);   // same as the wall-clock path
+                    continue;
+                }
             }
             runtime->audioBackend().onStreamPcm(kSeStreamId, out,
                                                 static_cast<uint32_t>(used), kSeMixRate);
@@ -2331,7 +2624,7 @@ namespace
 
                     bool due = false;
                     size_t backlog = 0u;
-                    if (runtime && bp)
+                    if (runtime && bp && !ps2xFrameStepOn())   // [rollback] stepped mode: the rate limiter below (virtual clock), never the device
                     {
                         const uint32_t sid = bp >> 14;
                         if (sid == 0u || sid == 1u)
@@ -2363,15 +2656,13 @@ namespace
                     }
                     else
                     {
-                        static std::mutex s_m;
-                        static std::map<uint32_t, std::chrono::steady_clock::time_point> s_last;
-                        const auto now = std::chrono::steady_clock::now();
-                        std::lock_guard<std::mutex> lk(s_m);
-                        auto it = s_last.find(sink);
-                        if (it == s_last.end() ||
+                        const auto now = ps2xNowSteady();
+                        std::lock_guard<std::mutex> lk(g_sndRateM);
+                        auto it = g_sndRateLast.find(sink);
+                        if (it == g_sndRateLast.end() ||
                             std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count() >= s_ms)
                         {
-                            s_last[sink] = now;
+                            g_sndRateLast[sink] = now;
                             due = true;
                         }
                     }
@@ -2434,7 +2725,7 @@ namespace
         const uint32_t obj = getRegU32(ctx, 4);
         {
             std::lock_guard<std::mutex> lk(g_streamStartM);
-            g_streamStart[obj] = std::chrono::steady_clock::now();
+            g_streamStart[obj] = ps2xNowSteady();
         }
         if (sndIopEnabled())
         {
@@ -2522,7 +2813,11 @@ namespace
                 if (it != g_sinkRings.end() && !it->second.bufs.empty())
                     bufPtr = it->second.bufs.front().first;
             }
-            if (bufPtr)
+            if (bufPtr && ps2xFrameStepOn())
+            {   // [rollback] stepped mode: the device's backlog is host-paced; the guest's own queue is not
+                stillPlaying = sink && sndListBytes(rdram, sink, kSinkList1) != 0u;
+            }
+            else if (bufPtr)
             {
                 // One sub-buffer of slack: below that it is effectively done.
                 const size_t backlog = runtime->audioBackend().streamBacklog(bufPtr >> 14);
@@ -2554,7 +2849,7 @@ namespace
                 if (it != g_streamStart.end())
                 {
                     const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - it->second).count();
+                                         ps2xNowSteady() - it->second).count();
                     if (age < s_graceMs)
                         stillPlaying = true;
                 }
@@ -2736,9 +3031,11 @@ namespace
     struct Bt3DevDone { std::atomic<uint32_t> dev{0u}; std::atomic<uint32_t> reported{1u};
                         std::atomic<uint32_t> stream{0u}; std::atomic<uint32_t> idleWait{0u};
                         std::atomic<uint32_t> activeReq{0u}; };   // [cdedge2] pending request ([stream+8]) the device was seen busy/done for
+    static Bt3DevDone s_bt3DevSlots[8];
+    Bt3DevDone *bt3DevSlotAt(int i) { return &s_bt3DevSlots[(i < 0 || i >= 8) ? 0 : i]; }   // [statesync]
     inline Bt3DevDone *bt3DevSlot(uint32_t dev)
     {
-        static Bt3DevDone s_slots[8];
+        Bt3DevDone (&s_slots)[8] = s_bt3DevSlots;
         for (Bt3DevDone &c : s_slots)
         {
             const uint32_t h = c.dev.load(std::memory_order_relaxed);
@@ -2752,6 +3049,27 @@ namespace
             }
         }
         return nullptr;
+    }
+
+    // [statesync] The slots are host-side latches that decide which device read-state the game sees
+    // (bt3CdStateEdge, the tick pump): they must travel with a snapshot, or a peer that adopts our RAM
+    // mid-read continues on its own latches and its loader takes a different branch ~30 frames later.
+    struct Bt3DevDoneSer { uint32_t dev, reported, stream, idleWait, activeReq; };
+    static void bt3DevSlotsCapture(Bt3DevDoneSer out[8])
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            Bt3DevDone *c = bt3DevSlotAt(i);
+            out[i] = Bt3DevDoneSer{ c->dev.load(), c->reported.load(), c->stream.load(), c->idleWait.load(), c->activeReq.load() };
+        }
+    }
+    static void bt3DevSlotsRestore(const Bt3DevDoneSer in[8])
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            Bt3DevDone *c = bt3DevSlotAt(i);
+            c->dev.store(in[i].dev); c->reported.store(in[i].reported); c->stream.store(in[i].stream); c->idleWait.store(in[i].idleWait); c->activeReq.store(in[i].activeReq);
+        }
     }
 
     PS2Runtime::RecompiledFunction g_orig270dd0 = nullptr;
@@ -2827,15 +3145,33 @@ namespace
     // Run the CD file-server tick (FUN_0028a3b0) inline on the calling guest thread.
     // [dispatchpump] when the CD server last ran (any path); the dispatch-loop pump only fires when this is stale
     static std::atomic<int64_t> g_lastCdTickNs{0};
+    static std::atomic<uint64_t> g_lastCdTickFrame{~0ull};   // [detsound]
     extern "C" bool ps2xCdTickStale(unsigned ms)
     {
+        // [detsound] Deterministic pacing. Gating the disc pump on ELAPSED MILLISECONDS makes the
+        // number of CD ticks per frame depend on how fast this machine is, so disc data lands at
+        // different rates on two machines -- measured as the 12 bytes that differ at boot frame 1,
+        // all of them stream-position counters. Under PS2X_DETSOUND the pump fires exactly once
+        // per guest frame instead, which is identical everywhere.
+        if (ps2xDetPacing())
+        {
+            const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+            return g_lastCdTickFrame.load(std::memory_order_relaxed) != fr;
+        }
         const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         const int64_t last = g_lastCdTickNs.load(std::memory_order_relaxed);
         return last == 0 || (now - last) > (int64_t)ms * 1000000LL;
     }
+    extern "C" int ps2xSchedTraceOn();
+    extern "C" int ps2xSchedTid();
+    extern "C" int ps2xSchedTraceOn();
+    extern "C" int ps2xSchedTid();
     static void bt3RunCdTickInline(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] CDTICK tid=%d pc=0x%x\n", ps2xSchedTid(), ctx ? ctx->pc : 0u);
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] CDTICK tid=%d pc=0x%x\n", ps2xSchedTid(), ctx ? ctx->pc : 0u);
         g_lastCdTickNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);   // [dispatchpump]
+        g_lastCdTickFrame.store(g_bt3FrameCount.load(std::memory_order_relaxed), std::memory_order_relaxed);   // [detsound]
         R5900Context tctx = *ctx;             // inherit gp/sp
         tctx.r[31] = _mm_setzero_si128();     // ra = 0 => run until return
         tctx.pc = 0x0028a3b0u;                // CD file-server tick
@@ -2862,6 +3198,7 @@ namespace
     }
     extern "C" void *ps2xGuestWaitBegin();
     extern "C" void ps2xGuestWaitEnd(void *);
+    extern "C" void ps2xGuestSleepMs(unsigned ms);   // [fibers] parks the guest fiber, not the host thread
     extern "C" void ps2xSpinPump(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         static const bool s_on = [](){ const char *v = std::getenv("PS2X_SPINPUMP"); return !(v && v[0] == '0'); }();
@@ -2875,7 +3212,7 @@ namespace
         if (k < 6u || (k % 5000u) == 0u)
             std::fprintf(stderr, "[spinpump] guest thread spinning at pc 0x%x: ticked the CD server + yielded (x%u)\n", ctx->pc, k + 1u);
         void *scope = ps2xGuestWaitBegin();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ps2xGuestSleepMs(1u);   // [fibers] a host sleep here would stop the very threads the CD tick serves
         ps2xGuestWaitEnd(scope);
     }
 
@@ -3476,6 +3813,7 @@ namespace
     // half3/half5/half6. func_11F548 (wrap angle into [-r, r] by repeated +-2r) never terminates on a huge angle
     // (half4's hang). Both get a guard + a probe naming the caller and the data.
     PS2Runtime::RecompiledFunction g_orig121d48 = nullptr, g_orig11f548 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig23e770 = nullptr;   // [netview]
     // func_121A10(poly, plane, count) -> new count: one clip pass. With NaN vertices every edge "crosses" and the
     // count can double per pass (5 passes), overflowing the caller's stack polygon before the transform ever runs.
     PS2Runtime::RecompiledFunction g_orig121a10 = nullptr;
@@ -3496,6 +3834,65 @@ namespace
                 std::fprintf(stderr, "[clipguard] func_121A10 in=%u out=%u (>9) ra=0x%x poly=0x%x v0=(%g %g %g %g) frame=%llu (log only)\n", nin, nout, ra, poly, v[0], v[1], v[2], v[3], (unsigned long long)g_bt3FrameCount.load());
             }
         }
+    }
+    // [netview] FUN_0023e770(viewObject, mode) is BT3's viewport configurator. $a1 selects:
+    //     0 -> FULL SCREEN   : scissor (0,511,0,447),   viewport centre X 2048.0
+    //     1 -> left half     : scissor (0,254,0,447),   centre X 1920.0  (2048 - 128)
+    //     2 -> right half    : scissor (257,511,0,447), centre X 2176.0  (2048 + 128)
+    //     >=2 other values return without doing anything.
+    // It does NOT just set the scissor -- it calls func_121E28 (projection setup) with the
+    // mode's parameters and stores the bounds into the view object at +0x208/+0x20C. That is
+    // why splitscreen loses scenery: the narrower frustum culls props, so outside each half
+    // only the terrain sheet (tbp0 10752) survives -- measured 14-15 distinct textures per
+    // column inside a viewport versus exactly ONE outside it.
+    // For "online, each player full-screen" we therefore do not widen the scissor by hand (that
+    // gives a wider terrain vista with no props). We ask the GAME for its full-screen setup and
+    // let its own culling follow. PS2X_NETVIEW=1|2 says which player this client is; pair it
+    // with PS2X_VPKEEP so the other player's (still half-width) draws are dropped.
+    void bt3NetViewSelect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_0023e770
+    {
+        // Follow the netplay player automatically when connected -- hosting makes you player 1,
+        // joining player 2, so the full-screen viewport should not need its own env var. The env
+        // var stays as an override for offline testing.
+        static const int s_env = [](){ const char *v = ::getenv("PS2X_NETVIEW");
+                                       return (v && v[0]) ? std::atoi(v) : 0; }();
+        const int s_player = s_env ? s_env : (ps2NetActive() ? ps2NetLocalPlayer() : 0);
+        if (s_player == 1 || s_player == 2)
+        {
+            const uint32_t mode = getRegU32(ctx, 5);
+            // [statesync] SYMMETRIC (default under netplay; PS2X_NETVIEW_SYM=0 restores the old way): BOTH
+            // players' views become full screen on BOTH machines, so the fight's guest state is identical
+            // on the two sides (verified: 3 bytes differ instead of 12 KB, all in the sound block). The
+            // local player's view is then chosen at the renderer, which tells the two identical views
+            // apart by a mark the guest carries into its own SCISSOR: the view object's +0x208 is the
+            // scissor's y0 (FUN_001027c8/FUN_00112548 pack it as y0 << 32), so player 1's view starts at
+            // y = 1 and player 2's at y = 2. The HUD keeps y0 = 0 and is never dropped. One or two
+            // pixel rows at the top of the view, in the overscan, are the whole visual cost.
+            static const bool s_sym = [](){ const char *v = ::getenv("PS2X_NETVIEW_SYM"); return !(v && v[0] == '0'); }();
+            if (s_sym && (mode == 1u || mode == 2u))
+            {
+                const uint32_t view = getRegU32(ctx, 4);
+                static std::atomic<uint32_t> s_said{0};
+                if (s_said.fetch_add(1u) < 2u)
+                    std::fprintf(stderr, "[netview] player %d: viewport mode %u -> 0 (full screen, marked y0=%u)\n", s_player, mode, mode);
+                ctx->r[5] = _mm_set_epi64x(0, 0);
+                if (g_orig23e770) g_orig23e770(rdram, ctx, runtime);
+                auto put32 = [&](uint32_t addr, uint32_t v) { if (uint8_t *q = getMemPtr(rdram, addr & 0x1FFFFFFFu)) std::memcpy(q, &v, sizeof v); };
+                put32(view + 0x208u, mode);   // scissor y0 = 1 (P1) / 2 (P2)
+                return;
+            }
+            // Leave the OTHER player's call untouched: it keeps its half-width viewport, and
+            // PS2X_VPKEEP drops its draws at the rasteriser. Skipping this call instead would
+            // leave that view object unconfigured and it would render from stale bounds.
+            if (mode == static_cast<uint32_t>(s_player))
+            {
+                static std::atomic<uint32_t> s_said{0};
+                if (s_said.fetch_add(1u) == 0u)
+                    std::fprintf(stderr, "[netview] player %d: viewport mode %u -> 0 (full screen)\n", s_player, mode);
+                ctx->r[5] = _mm_set_epi64x(0, 0);
+            }
+        }
+        if (g_orig23e770) g_orig23e770(rdram, ctx, runtime);
     }
     void bt3ClipXformGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_121D48
     {
@@ -4050,6 +4447,992 @@ namespace
         if (g_orig1201b8) g_orig1201b8(rdram, ctx, runtime);
     }
 
+    // [dethash] PS2X_DETHASH=N -- hash the guest's simulation state every N frames and print it.
+    // This is the determinism gate for online play: record a fight's inputs once (PS2X_INREC),
+    // replay it twice (PS2X_INPLAY) and diff the two hash logs. The FIRST differing frame names
+    // the cause. Same-machine divergence must be fixed before cross-machine is even worth testing;
+    // the two standing suspects are [asyncpace] (the guest polls CHCR busy, which tracks how fast
+    // the host worker drains) and [framegate] (vsync cadence decided from measured g_workerFrameNs).
+    // EE RAM only, deliberately: guest state lives there, while the CPU context is transient
+    // between frames and the R5900Context holds host pointers that would hash differently by
+    // construction. ~2-3 ms/frame for 32 MB, which is fine for a diagnostic.
+    static void ps2DetHashFrame(const uint8_t *rdram, __m128 ctxR)
+    {
+        static const int s_every = [](){ const char *v = std::getenv("PS2X_DETHASH");
+                                         const int n = (v && v[0]) ? std::atoi(v) : 0;
+                                         if (n > 0) std::fprintf(stderr, "[dethash] hashing EE RAM every %d frame(s)\n", n);
+                                         return n; }();
+        if (s_every <= 0 || !rdram) return;
+        const unsigned long long f = g_bt3FrameCount.load(std::memory_order_relaxed);
+        if (f % (unsigned long long)s_every) return;
+        const uint64_t h = XXH3_64bits(rdram, PS2_RAM_SIZE);
+        // Second hash EXCLUDING the sound-stream / disc-stream window. Measured 2026-09-14: two
+        // identical-input runs differ by only 12 bytes at frame 1 and 432 at frame 600, ALL of it
+        // inside the sound stream control block at 0x2c9350 and its neighbours -- stream position
+        // counters (0x25b vs 0x25c, byte offsets 0x46050 vs 0x46438) that advance on WALL CLOCK
+        // because disc/ADX delivery is host-paced. Whether GAMEPLAY state is deterministic is the
+        // question netplay actually depends on, so hash it separately.
+        // PS2X_DETSKIP=0 reports only the full hash.
+        static const bool s_skip = [](){ const char *v = std::getenv("PS2X_DETSKIP");
+                                         return !(v && v[0] == '0'); }();
+        if (s_skip)
+        {
+            constexpr uint32_t kStreamLo = 0x002c0000u, kStreamHi = 0x00300000u;   // sndblk dumps reach 0x2f72a0
+            XXH3_state_t *st = XXH3_createState();
+            XXH3_64bits_reset(st);
+            XXH3_64bits_update(st, rdram, kStreamLo);
+            XXH3_64bits_update(st, rdram + kStreamHi, PS2_RAM_SIZE - kStreamHi);
+            const uint64_t g = XXH3_64bits_digest(st);
+            XXH3_freeState(st);
+            // [dethash] also report the RNG STREAM. The user's concern is the classic desync
+            // cause: if particles/effects draw from the same rand() sequence as gameplay and the
+            // two machines consume it at different rates, every later gameplay roll drifts.
+            // calls = how many rand() calls have happened; state = the 64-bit LCG. Both matching
+            // every frame means the stream is in lockstep, which is the thing that actually
+            // matters -- BT3 particles are known rand() consumers (aura wisps) and there is a
+            // SECOND generator, the VU0 R register, used by other effects.
+            // [dethash] plus the VU0 R register -- BT3's SECOND random source, used by effects
+            // (see [[bt3-kaioken-white]]: the recompiler's VU0 R ops were once invented outright).
+            // NOTE VU1's R is a different story: RNEXT/RGET/RINIT/RXOR in ps2_vu1.cpp are all
+            // no-ops, so VU1 has no random source at all -- trivially deterministic, but a real
+            // rendering gap in its own right.
+            ps2NetSetChecksum((uint32_t)f, g);   // [netplay] desync detector (needs PS2X_DETHASH=1)
+            uint32_t r4[4]; std::memcpy(r4, &ctxR, sizeof r4);
+            std::fprintf(stderr, "[dethash] frame %llu ee=%016llx gp=%016llx rng=%u:%016llx vu0r=%08x%08x%08x%08x\n",
+                         f, (unsigned long long)h, (unsigned long long)g,
+                         ps2_stubs::ps2RandCallCount(), (unsigned long long)ps2_stubs::ps2RandState(),
+                         r4[0], r4[1], r4[2], r4[3]);
+        }
+        else
+            std::fprintf(stderr, "[dethash] frame %llu ee=%016llx\n", f, (unsigned long long)h);
+        {   // PS2X_DETDUMP=<frame> + PS2X_DETDUMPFILE=<path>: write EE RAM once, so two runs can be
+            // diffed byte-for-byte to find WHICH addresses diverge rather than just that they do.
+            // PS2X_DETDUMP takes a COMMA LIST of frames; PS2X_DETDUMPFILE is a prefix and each
+            // frame lands in "<prefix>.<frame>.bin". Several dumps from ONE run is what finds a
+            // screen/sub-state variable: a word that is constant while a menu screen is up and
+            // changes only at transitions stands out across a handful of samples, with no need
+            // to see the screen at all.
+            static const std::vector<unsigned long long> s_at = [](){
+                std::vector<unsigned long long> v;
+                const char *e = std::getenv("PS2X_DETDUMP");
+                if (e && e[0]) { const char *q = e; while (*q) { v.push_back(std::strtoull(q, nullptr, 10));
+                                 const char *c = std::strchr(q, ','); if (!c) break; q = c + 1; } }
+                return v; }();
+            if (!s_at.empty() && std::find(s_at.begin(), s_at.end(), f) != s_at.end())
+            {
+                const char *fp = std::getenv("PS2X_DETDUMPFILE");
+                if (fp && fp[0])
+                {
+                    char path[512];
+                    if (s_at.size() > 1) std::snprintf(path, sizeof path, "%s.%llu.bin", fp, f);
+                    else                 std::snprintf(path, sizeof path, "%s", fp);
+                    if (std::FILE *o = std::fopen(path, "wb"))
+                    {
+                        std::fwrite(rdram, 1, PS2_RAM_SIZE, o);
+                        std::fclose(o);
+                        std::fprintf(stderr, "[dethash] dumped EE RAM at frame %llu -> %s\n", f, path);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // [savestate] Snapshot / restore of the guest SIMULATION, for netplay's state sync at connect
+    // (and, later, for rollback and for a fight-determinism test that does not inherit boot drift).
+    //
+    // WHY IT IS SAVED AND LOADED AT THE FRAME HOOK, and nowhere else:
+    // the host C++ stack MIRRORS the guest call chain -- dispatchLoop's own comment notes that
+    // "BT3's nested CDVD wait loops never unwind back to this top-level loop". So state cannot be
+    // restored at an arbitrary point: the host stack would describe a call chain that no longer
+    // matches guest memory. FUN_00100ab8 is reached the same way every frame, so two instances
+    // sitting in this hook have STRUCTURALLY IDENTICAL host stacks, and swapping guest memory and
+    // registers underneath them is safe. Save and load must therefore use this one site.
+    //
+    //   PS2X_SAVESTATE=<frame>:<path>   write a snapshot once, at that frame
+    //   PS2X_LOADSTATE=<path>           restore it at the next frame hook, once
+    //
+    // v1 covers EE RAM, the scratchpad, the calling context and the RNG. NOT covered: IOP RAM
+    // (sound), GS VRAM (picture only), VU memory, and the other guest threads' host stacks --
+    // those threads are parked in their own nesting, so this is sound only while the cooperative
+    // scheduler (PS2X_SCHED=1) keeps them out of the way. Widen it once v1 is proven.
+    struct SaveHdr { char magic[8]; uint32_t version, ramSize, spSize, ctxSize; uint64_t frame, rand64;
+                     uint32_t randCalls, iopSize, vu0Size, vu1Size, vramSize;
+                     uint32_t vu0CodeSize, vu1CodeSize, vuStateSize, sinkCount, gsRegCount; };
+    // GS PRIVILEGED registers (PMODE / DISPFB1,2 / DISPLAY1,2 / ...). I first left these out as
+    // "picture only, cannot cause a desync" -- true about desync, wrong about being optional: they
+    // are what SELECT the framebuffer being shown, so a restored instance displayed whatever its
+    // own boot had left configured and came up BLACK. The guest does not re-emit them, because it
+    // resumes mid-execution long after it set the display up.
+    // GSRegisters is 19 uint64s (there is a static_assert on that) but holds `csr` as an atomic,
+    // so it is packed field by field rather than copied.
+    struct GsRegSer { uint64_t v[19]; };
+    static void gsRegPack(const GSRegisters &g, GsRegSer &o)
+    {
+        o.v[0]=g.pmode;   o.v[1]=g.smode1;  o.v[2]=g.smode2;   o.v[3]=g.srfsh;
+        o.v[4]=g.synch1;  o.v[5]=g.synch2;  o.v[6]=g.syncv;
+        o.v[7]=g.dispfb1; o.v[8]=g.display1; o.v[9]=g.dispfb2; o.v[10]=g.display2;
+        o.v[11]=g.extbuf; o.v[12]=g.extdata; o.v[13]=g.extwrite; o.v[14]=g.bgcolor;
+        o.v[15]=g.csr.load(std::memory_order_relaxed);
+        o.v[16]=g.imr;    o.v[17]=g.busdir; o.v[18]=g.siglblid;
+    }
+    static void gsRegUnpack(const GsRegSer &o, GSRegisters &g)
+    {
+        g.pmode=o.v[0];   g.smode1=o.v[1];  g.smode2=o.v[2];   g.srfsh=o.v[3];
+        g.synch1=o.v[4];  g.synch2=o.v[5];  g.syncv=o.v[6];
+        g.dispfb1=o.v[7]; g.display1=o.v[8]; g.dispfb2=o.v[9]; g.display2=o.v[10];
+        g.extbuf=o.v[11]; g.extdata=o.v[12]; g.extwrite=o.v[13]; g.bgcolor=o.v[14];
+        // csr (o.v[15]) is deliberately NOT restored: the vsync worker toggles its FIELD bit and
+        // the GIF sets SIGNAL/FINISH from other threads, so a stale value would either clobber the
+        // live field parity or re-raise an interrupt flag that has already been serviced. It is
+        // saved for diagnostics only.
+        g.imr=o.v[16];    g.busdir=o.v[17]; g.siglblid=o.v[18];
+    }
+    // Peek just the frame number a snapshot was taken at, without reading the 38 MB body.
+    static uint64_t bt3PeekStateFrame(const char *path)
+    {
+        std::FILE *f = std::fopen(path, "rb");
+        if (!f) return 0u;
+        SaveHdr h{};
+        const bool ok = std::fread(&h, sizeof h, 1, f) == 1 && std::memcmp(h.magic, "BT3STATE", 8) == 0;
+        std::fclose(f);
+        return ok ? h.frame : 0u;
+    }
+    // v3 adds the state that lives on the HOST side of the emulation rather than in guest memory,
+    // which is what v2 still inherited from the loading instance's own boot:
+    //   * VU0/VU1 MICRO memory -- the uploaded microprograms. Guest RAM holds the source, but the
+    //     copy VU1 actually executes is in ps2xRuntime's own buffer.
+    //   * The VU interpreters' registers (vf/vi/ACC/Q and the Q pipeline). m_vu0/m_vu1 are
+    //     PS2Runtime members, so these persist between kicks and are genuinely live state.
+    //   * The IOP sound sinks' stream bookkeeping -- measured as the ONLY bytes that differ
+    //     between two instances at frame 1 ([[bt3-determinism]]).
+    // NOT yet covered: GS register state (VRAM is saved, so this is picture-only), and the other
+    // guest threads' host stacks -- sound only while PS2X_SCHED=1 parks them.
+    //
+    // The sinks cannot be memcpy'd: IopSink holds steady_clock::time_points, whose epoch is
+    // per-process, so a snapshot moved to another machine (or reloaded in a later run) would carry
+    // a meaningless origin. Serialise the byte counters and RE-ANCHOR the clocks to "now" on load,
+    // which is what the pacing code would do for a stream that has just started.
+    struct SinkSer { uint32_t key, streamId; uint64_t returnedBytes, heldBytes, wallBaseBytes,
+                     frameBase, frameBaseBytes; uint8_t wallClock, ringFullIdle, frameClock, pad; };
+    static bool bt3SaveState(const char *path, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::FILE *f = std::fopen(path, "wb");
+        if (!f) { std::fprintf(stderr, "[savestate] cannot write %s\n", path); return false; }
+        uint8_t *sp = ps2GetScratchpadHostPtr();
+        SaveHdr h{}; std::memcpy(h.magic, "BT3STATE", 8);
+        // v2 adds every other guest-visible memory region. v1 restored only EE RAM + scratchpad
+        // and diverged one frame after the load, because the loading instance kept its OWN sound
+        // (IOP), VU and VRAM state from its own boot and those write back into EE RAM.
+        PS2Memory &mem = runtime->memory();
+        // Collect the sinks BEFORE the header goes out: the count belongs in it, and the lock
+        // should not be held across file writes.
+        std::vector<SinkSer> sinks;
+        {
+            std::lock_guard<std::mutex> lk(g_iopSinkM);
+            sinks.reserve(g_iopSinks.size());
+            for (const auto &kv : g_iopSinks)
+            {
+                const IopSink &v = kv.second;
+                sinks.push_back(SinkSer{ kv.first, v.streamId, v.returnedBytes, v.heldBytes,
+                                         v.wallBaseBytes, v.frameBase, v.frameBaseBytes,
+                                         (uint8_t)v.wallClock, (uint8_t)v.ringFullIdle,
+                                         (uint8_t)v.frameClock, 0u });
+            }
+        }
+        h.version = 3u; h.ramSize = PS2_RAM_SIZE; h.spSize = sp ? PS2_SCRATCHPAD_SIZE : 0u;
+        h.ctxSize = (uint32_t)sizeof(R5900Context);
+        h.iopSize = 2u * 1024u * 1024u; h.vu0Size = PS2_VU0_DATA_SIZE;
+        h.vu1Size = PS2_VU1_DATA_SIZE;   h.vramSize = (uint32_t)PS2_GS_VRAM_SIZE;
+        h.vu0CodeSize = PS2_VU0_CODE_SIZE; h.vu1CodeSize = PS2_VU1_CODE_SIZE;
+        h.vuStateSize = (uint32_t)sizeof(VU1State); h.sinkCount = (uint32_t)sinks.size();
+        h.gsRegCount = 19u;
+        h.frame = g_bt3FrameCount.load(std::memory_order_relaxed);
+        h.rand64 = ps2_stubs::ps2RandState(); h.randCalls = ps2_stubs::ps2RandCallCount();
+        std::fwrite(&h, sizeof h, 1, f);
+        std::fwrite(rdram, 1, PS2_RAM_SIZE, f);
+        if (sp) std::fwrite(sp, 1, PS2_SCRATCHPAD_SIZE, f);
+        std::fwrite(ctx, sizeof(R5900Context), 1, f);
+        std::fwrite(mem.getIOPRAM(),  1, h.iopSize,  f);
+        std::fwrite(mem.getVU0Data(), 1, h.vu0Size,  f);
+        std::fwrite(mem.getVU1Data(), 1, h.vu1Size,  f);
+        std::fwrite(mem.getGSVRAM(),  1, h.vramSize, f);
+        std::fwrite(mem.getVU0Code(), 1, h.vu0CodeSize, f);
+        std::fwrite(mem.getVU1Code(), 1, h.vu1CodeSize, f);
+        { const VU1State v0 = runtime->vu0().state(); std::fwrite(&v0, sizeof v0, 1, f); }
+        { const VU1State v1 = runtime->vu1().state(); std::fwrite(&v1, sizeof v1, 1, f); }
+        if (!sinks.empty()) std::fwrite(sinks.data(), sizeof(SinkSer), sinks.size(), f);
+        { GsRegSer gr{}; gsRegPack(mem.gs(), gr); std::fwrite(&gr, sizeof gr, 1, f); }
+        std::fclose(f);
+        std::fprintf(stderr, "[savestate] saved frame %llu -> %s (%.1f MB: ee+sp+ctx+iop+vu+vram"
+                     "+vucode+vustate+%u sinks)\n",
+                     (unsigned long long)h.frame, path,
+                     (PS2_RAM_SIZE + h.spSize + h.ctxSize + h.iopSize + h.vu0Size + h.vu1Size
+                      + h.vramSize + h.vu0CodeSize + h.vu1CodeSize) / 1048576.0, h.sinkCount);
+        return true;
+    }
+    static bool bt3LoadState(const char *path, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::FILE *f = std::fopen(path, "rb");
+        if (!f) { std::fprintf(stderr, "[savestate] cannot read %s\n", path); return false; }
+        SaveHdr h{};
+        if (std::fread(&h, sizeof h, 1, f) != 1 || std::memcmp(h.magic, "BT3STATE", 8) != 0 ||
+            h.version != 3u || h.ramSize != PS2_RAM_SIZE || h.ctxSize != sizeof(R5900Context))
+        { std::fprintf(stderr, "[savestate] %s is not a matching snapshot\n", path); std::fclose(f); return false; }
+        if (std::fread(rdram, 1, PS2_RAM_SIZE, f) != PS2_RAM_SIZE) { std::fclose(f); return false; }
+        if (h.spSize)
+        {
+            uint8_t *sp = ps2GetScratchpadHostPtr();
+            if (sp && h.spSize == PS2_SCRATCHPAD_SIZE) std::fread(sp, 1, h.spSize, f);
+            else std::fseek(f, (long)h.spSize, SEEK_CUR);
+        }
+        // The context is restored EXCEPT pc: we are inside the frame hook, and the host stack
+        // expects to return through it normally. Guest pc/ra are re-established by that return.
+        R5900Context tmp{};
+        if (std::fread(&tmp, sizeof tmp, 1, f) != 1) { std::fclose(f); return false; }
+        const uint32_t keepPc = ctx->pc;
+        *ctx = tmp; ctx->pc = keepPc;
+        {
+            PS2Memory &mem = runtime->memory();
+            if (h.iopSize  == 2u * 1024u * 1024u)   std::fread(mem.getIOPRAM(),  1, h.iopSize,  f);
+            if (h.vu0Size  == PS2_VU0_DATA_SIZE)    std::fread(mem.getVU0Data(), 1, h.vu0Size,  f);
+            if (h.vu1Size  == PS2_VU1_DATA_SIZE)    std::fread(mem.getVU1Data(), 1, h.vu1Size,  f);
+            if (h.vramSize == PS2_GS_VRAM_SIZE)     std::fread(mem.getGSVRAM(),  1, h.vramSize, f);
+            if (h.vu0CodeSize == PS2_VU0_CODE_SIZE) std::fread(mem.getVU0Code(), 1, h.vu0CodeSize, f);
+            if (h.vu1CodeSize == PS2_VU1_CODE_SIZE) std::fread(mem.getVU1Code(), 1, h.vu1CodeSize, f);
+            if (h.vuStateSize == sizeof(VU1State))
+            {
+                VU1State v{};
+                if (std::fread(&v, sizeof v, 1, f) == 1) runtime->vu0().state() = v;
+                if (std::fread(&v, sizeof v, 1, f) == 1) runtime->vu1().state() = v;
+            }
+            else std::fseek(f, (long)(2u * h.vuStateSize), SEEK_CUR);
+        }
+        if (h.sinkCount)
+        {
+            std::vector<SinkSer> sinks(h.sinkCount);
+            if (std::fread(sinks.data(), sizeof(SinkSer), h.sinkCount, f) == h.sinkCount)
+            {
+                // Re-anchor the clocks: the saved epoch is meaningless in this process, and a
+                // stream resuming from restored byte counts is exactly a stream that has just
+                // started. frameBase is a GUEST frame number, so it transfers as-is.
+                const auto now = std::chrono::steady_clock::now();
+                std::lock_guard<std::mutex> lk(g_iopSinkM);
+                for (const SinkSer &ss : sinks)
+                {
+                    IopSink &d = g_iopSinks[ss.key];
+                    d.streamId = ss.streamId; d.returnedBytes = ss.returnedBytes;
+                    d.heldBytes = ss.heldBytes; d.wallBaseBytes = ss.wallBaseBytes;
+                    d.frameBase = ss.frameBase; d.frameBaseBytes = ss.frameBaseBytes;
+                    d.wallClock = ss.wallClock != 0; d.ringFullIdle = ss.ringFullIdle != 0;
+                    d.frameClock = ss.frameClock != 0;
+                    d.wallBase = now; d.ringFullSince = now;
+                }
+            }
+        }
+        if (h.gsRegCount == 19u)
+        {
+            GsRegSer gr{};
+            if (std::fread(&gr, sizeof gr, 1, f) == 1) gsRegUnpack(gr, runtime->memory().gs());
+        }
+        std::fclose(f);
+        g_bt3FrameCount.store(h.frame, std::memory_order_relaxed);
+        ps2_stubs::ps2RandRestore(h.rand64, h.randCalls);
+        std::fprintf(stderr, "[savestate] restored frame %llu from %s (v%u, %u sinks)\n",
+                     (unsigned long long)h.frame, path, h.version, h.sinkCount);
+        return true;
+    }
+
+    // [rollback] In-memory snapshot of the guest simulation for rollback: the same regions and
+    // device state savestate v3 writes to disk, kept as one heap object so a restore is a handful
+    // of memcpys (a 32 MB copy is ~0.5 ms). The fiber stacks and scheduler state are the runtime's
+    // half (Ps2xRollback in ps2_runtime.cpp); the two are captured together at a frame gate.
+    struct SimSnap
+    {
+        uint64_t frame = 0, rand64 = 0; uint32_t randCalls = 0;
+        std::vector<uint8_t> ram, sp, iop, vu0d, vu1d, vram, vu0c, vu1c;
+        VU1State v0{}, v1{};
+        std::vector<SinkSer> sinks;
+        GsRegSer gs{};
+        std::vector<SeVoice> seVoices;   // HLE sound-effect voices (host side of the SE stream)
+        // [rollback] The sound HLE's own host bookkeeping, copied whole (time points are on the
+        // virtual clock in stepped mode, so they transfer exactly): the sinks with their clocks,
+        // the consumer's ring cursors, the stereo-pair balance, stream-start times, feed limiter.
+        std::map<uint32_t, IopSink> sinksFull;
+        decltype(g_sinkRings) rings;
+        uint32_t pairSink[2] = {0u, 0u}; uint64_t pairReturns[2] = {0u, 0u};
+        decltype(g_streamStart) streamStart;
+        decltype(g_sndRateLast) rateLast;
+        uint64_t seTickBase = 0, seTickCarry = 0;
+        Bt3DevDoneSer devSlots[8] = {};   // [statesync] the CD device-done latches (bt3CdStateEdge)
+    };
+    static void snapCopy(std::vector<uint8_t> &dst, const uint8_t *src, size_t n) { dst.resize(n); if (n) std::memcpy(dst.data(), src, n); }
+    extern "C" void *ps2xSimSnapCapture(PS2Runtime *runtime, uint8_t *rdram)
+    {
+        SimSnap *s = new SimSnap();
+        PS2Memory &mem = runtime->memory();
+        s->frame = g_bt3FrameCount.load(std::memory_order_relaxed);
+        s->rand64 = ps2_stubs::ps2RandState(); s->randCalls = ps2_stubs::ps2RandCallCount();
+        snapCopy(s->ram, rdram, PS2_RAM_SIZE);
+        if (uint8_t *sp = ps2GetScratchpadHostPtr()) snapCopy(s->sp, sp, PS2_SCRATCHPAD_SIZE);
+        snapCopy(s->iop,  mem.getIOPRAM(),  2u * 1024u * 1024u);
+        snapCopy(s->vu0d, mem.getVU0Data(), PS2_VU0_DATA_SIZE);
+        snapCopy(s->vu1d, mem.getVU1Data(), PS2_VU1_DATA_SIZE);
+        snapCopy(s->vram, mem.getGSVRAM(),  PS2_GS_VRAM_SIZE);
+        snapCopy(s->vu0c, mem.getVU0Code(), PS2_VU0_CODE_SIZE);
+        snapCopy(s->vu1c, mem.getVU1Code(), PS2_VU1_CODE_SIZE);
+        s->v0 = runtime->vu0().state(); s->v1 = runtime->vu1().state();
+        {
+            std::lock_guard<std::mutex> lk(g_iopSinkM);
+            for (const auto &kv : g_iopSinks)
+            {
+                const IopSink &v = kv.second;
+                s->sinks.push_back(SinkSer{ kv.first, v.streamId, v.returnedBytes, v.heldBytes, v.wallBaseBytes,
+                                            v.frameBase, v.frameBaseBytes, (uint8_t)v.wallClock, (uint8_t)v.ringFullIdle,
+                                            (uint8_t)v.frameClock, 0u });
+            }
+        }
+        gsRegPack(mem.gs(), s->gs);
+        { std::lock_guard<std::mutex> lk(g_seVoiceM); s->seVoices = g_seVoices; }
+        { std::lock_guard<std::mutex> lk(g_iopSinkM); s->sinksFull = g_iopSinks; }
+        { std::lock_guard<std::mutex> lk(g_sinkRingM); s->rings = g_sinkRings; s->pairSink[0] = g_pairSink[0]; s->pairSink[1] = g_pairSink[1];
+          s->pairReturns[0] = g_pairReturns[0]; s->pairReturns[1] = g_pairReturns[1]; }
+        { std::lock_guard<std::mutex> lk(g_streamStartM); s->streamStart = g_streamStart; }
+        { std::lock_guard<std::mutex> lk(g_sndRateM); s->rateLast = g_sndRateLast; }
+        s->seTickBase = g_seTickBase; s->seTickCarry = g_seTickCarry;
+        bt3DevSlotsCapture(s->devSlots);
+        return s;
+    }
+    extern "C" bool ps2xSimSnapRestore(void *h, PS2Runtime *runtime, uint8_t *rdram)
+    {
+        const SimSnap *s = static_cast<const SimSnap *>(h);
+        if (!s || s->ram.size() != PS2_RAM_SIZE) return false;
+        PS2Memory &mem = runtime->memory();
+        std::memcpy(rdram, s->ram.data(), PS2_RAM_SIZE);
+        if (uint8_t *sp = ps2GetScratchpadHostPtr()) if (s->sp.size() == PS2_SCRATCHPAD_SIZE) std::memcpy(sp, s->sp.data(), PS2_SCRATCHPAD_SIZE);
+        std::memcpy(mem.getIOPRAM(),  s->iop.data(),  s->iop.size());
+        std::memcpy(mem.getVU0Data(), s->vu0d.data(), s->vu0d.size());
+        std::memcpy(mem.getVU1Data(), s->vu1d.data(), s->vu1d.size());
+        std::memcpy(mem.getGSVRAM(),  s->vram.data(), s->vram.size());
+        std::memcpy(mem.getVU0Code(), s->vu0c.data(), s->vu0c.size());
+        std::memcpy(mem.getVU1Code(), s->vu1c.data(), s->vu1c.size());
+        runtime->vu0().state() = s->v0; runtime->vu1().state() = s->v1;
+        {
+            const auto now = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lk(g_iopSinkM);
+            for (const SinkSer &ss : s->sinks)
+            {
+                IopSink &d = g_iopSinks[ss.key];
+                d.streamId = ss.streamId; d.returnedBytes = ss.returnedBytes; d.heldBytes = ss.heldBytes;
+                d.wallBaseBytes = ss.wallBaseBytes; d.frameBase = ss.frameBase; d.frameBaseBytes = ss.frameBaseBytes;
+                d.wallClock = ss.wallClock != 0; d.ringFullIdle = ss.ringFullIdle != 0; d.frameClock = ss.frameClock != 0;
+                d.wallBase = now; d.ringFullSince = now;
+            }
+        }
+        gsRegUnpack(s->gs, mem.gs());
+        { std::lock_guard<std::mutex> lk(g_seVoiceM); g_seVoices = s->seVoices; }
+        { std::lock_guard<std::mutex> lk(g_iopSinkM); g_iopSinks = s->sinksFull; }   // exact clocks, no re-anchoring
+        { std::lock_guard<std::mutex> lk(g_sinkRingM); g_sinkRings = s->rings; g_pairSink[0] = s->pairSink[0]; g_pairSink[1] = s->pairSink[1];
+          g_pairReturns[0] = s->pairReturns[0]; g_pairReturns[1] = s->pairReturns[1]; }
+        { std::lock_guard<std::mutex> lk(g_streamStartM); g_streamStart = s->streamStart; }
+        { std::lock_guard<std::mutex> lk(g_sndRateM); g_sndRateLast = s->rateLast; }
+        g_seTickBase = s->seTickBase; g_seTickCarry = s->seTickCarry;
+        bt3DevSlotsRestore(s->devSlots);
+        g_bt3FrameCount.store(s->frame, std::memory_order_relaxed);
+        ps2_stubs::ps2RandRestore(s->rand64, s->randCalls);
+        return true;
+    }
+    extern "C" void ps2xSimSnapFree(void *h) { delete static_cast<SimSnap *>(h); }
+    // [statesync] Portable form of the simulation snapshot (same binary on both ends: PODs go raw;
+    // the sound HLE's time points are on the virtual clock in stepped mode, so they travel as ns).
+    extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
+    {
+        const SimSnap *s = static_cast<const SimSnap *>(h);
+        if (!s) return false;
+        Ps2xByteW w(out);
+        w.u32(0x53494d31u);   // 'SIM1'
+        w.u64(s->frame); w.u64(s->rand64); w.u32(s->randCalls);
+        w.bytes(s->ram); w.bytes(s->sp); w.bytes(s->iop); w.bytes(s->vu0d); w.bytes(s->vu1d); w.bytes(s->vram); w.bytes(s->vu0c); w.bytes(s->vu1c);
+        w.pod(s->v0); w.pod(s->v1);
+        w.podVec(s->sinks);
+        w.pod(s->gs);
+        w.u64(s->seVoices.size());
+        for (const SeVoice &v : s->seVoices) { w.u32(v.serial); w.podVec(v.pcm); w.u64(v.pos); }
+        w.u64(s->sinksFull.size());
+        for (const auto &kv : s->sinksFull)
+        {
+            const IopSink &v = kv.second;
+            w.u32(kv.first); w.u32(v.streamId); w.u64(v.returnedBytes); w.u64(v.heldBytes); w.u8(v.wallClock); w.tp(v.wallBase);
+            w.u64(v.wallBaseBytes); w.u8(v.ringFullIdle); w.tp(v.ringFullSince); w.u8(v.frameClock); w.u64(v.frameBase); w.u64(v.frameBaseBytes);
+        }
+        w.u64(s->rings.size());
+        for (const auto &kv : s->rings) { w.u32(kv.first); w.podVec(kv.second.bufs); w.u64(kv.second.next); }
+        w.u32(s->pairSink[0]); w.u32(s->pairSink[1]); w.u64(s->pairReturns[0]); w.u64(s->pairReturns[1]);
+        w.u64(s->streamStart.size()); for (const auto &kv : s->streamStart) { w.u32(kv.first); w.tp(kv.second); }
+        w.u64(s->rateLast.size());    for (const auto &kv : s->rateLast)    { w.u32(kv.first); w.tp(kv.second); }
+        w.u64(s->seTickBase); w.u64(s->seTickCarry);
+        w.raw(s->devSlots, sizeof s->devSlots);
+        w.u32(0x53494d45u);   // 'SIME'
+        return true;
+    }
+    extern "C" void *ps2xSimSnapDeserialize(const uint8_t *data, size_t n, size_t *used)
+    {
+        Ps2xByteR r(data, n);
+        if (r.u32() != 0x53494d31u) return nullptr;
+        SimSnap *s = new SimSnap();
+        s->frame = r.u64(); s->rand64 = r.u64(); s->randCalls = r.u32();
+        r.bytes(s->ram); r.bytes(s->sp); r.bytes(s->iop); r.bytes(s->vu0d); r.bytes(s->vu1d); r.bytes(s->vram); r.bytes(s->vu0c); r.bytes(s->vu1c);
+        s->v0 = r.pod<VU1State>(); s->v1 = r.pod<VU1State>();
+        r.podVec(s->sinks);
+        s->gs = r.pod<GsRegSer>();
+        { const size_t k = r.count(4); s->seVoices.resize(r.ok ? k : 0);
+          for (SeVoice &v : s->seVoices) { v.serial = r.u32(); r.podVec(v.pcm); v.pos = (size_t)r.u64(); } }
+        { const size_t k = r.count(8);
+          for (size_t i = 0; i < k && r.ok; ++i)
+          {
+              const uint32_t key = r.u32(); IopSink &v = s->sinksFull[key];
+              v.streamId = r.u32(); v.returnedBytes = r.u64(); v.heldBytes = r.u64(); v.wallClock = r.u8() != 0; v.wallBase = r.tp();
+              v.wallBaseBytes = r.u64(); v.ringFullIdle = r.u8() != 0; v.ringFullSince = r.tp(); v.frameClock = r.u8() != 0; v.frameBase = r.u64(); v.frameBaseBytes = r.u64();
+          } }
+        { const size_t k = r.count(8);
+          for (size_t i = 0; i < k && r.ok; ++i) { const uint32_t key = r.u32(); SinkRing &ring = s->rings[key]; r.podVec(ring.bufs); ring.next = (size_t)r.u64(); } }
+        s->pairSink[0] = r.u32(); s->pairSink[1] = r.u32(); s->pairReturns[0] = r.u64(); s->pairReturns[1] = r.u64();
+        { const size_t k = r.count(12); for (size_t i = 0; i < k && r.ok; ++i) { const uint32_t key = r.u32(); s->streamStart[key] = r.tp(); } }
+        { const size_t k = r.count(12); for (size_t i = 0; i < k && r.ok; ++i) { const uint32_t key = r.u32(); s->rateLast[key] = r.tp(); } }
+        s->seTickBase = r.u64(); s->seTickCarry = r.u64();
+        r.raw(s->devSlots, sizeof s->devSlots);
+        if (r.u32() != 0x53494d45u || !r.ok || s->ram.size() != PS2_RAM_SIZE) { delete s; return nullptr; }
+        if (used) *used = (size_t)(r.p - data);
+        return s;
+    }
+    extern "C" const uint8_t *ps2xSimSnapRam(const void *h) { const SimSnap *s = static_cast<const SimSnap *>(h); return s && s->ram.size() == PS2_RAM_SIZE ? s->ram.data() : nullptr; }
+    extern "C" uint64_t ps2xSimSnapFrame(const void *h) { const SimSnap *s = static_cast<const SimSnap *>(h); return s ? s->frame : 0u; }
+    extern "C" uint64_t ps2xRamHash(const uint8_t *rdram, uint32_t skipLo, uint32_t skipHi)
+    {   // 64-bit FNV-1a over 8-byte words (~10 ms for 32 MB), optionally skipping [skipLo, skipHi)
+        uint64_t h = 1469598103934665603ull;
+        const uint64_t *w = reinterpret_cast<const uint64_t *>(rdram);
+        const size_t lo = skipLo / 8u, hi = skipHi / 8u;
+        for (size_t i = 0; i < PS2_RAM_SIZE / 8u; ++i) { if (i >= lo && i < hi) continue; h ^= w[i]; h *= 1099511628211ull; }
+        return h;
+    }
+
+    // [memwatch] PS2X_MEMWATCH=<hex>[,<hex>...] -- print these EE words whenever any of them
+    // changes. Built to verify the RetroAchievements-documented menu variables against this
+    // build, since a static dump cannot: menu variables are typically only meaningful WHILE their
+    // screen is up, so they must be watched live while the cursor moves.
+    //   RA notes: 0x6af7a0 versus mode (0 = 1vCPU, 1 = 1v2, 2 = CPUvCPU)
+    //             0x6af7a4 battle type (0 = Single, 1 = Team)
+    //             0x6af1ac current mode
+    static void bt3MemWatch(uint8_t *rdram)
+    {
+        static std::vector<uint32_t> s_addrs = [](){
+            std::vector<uint32_t> v; const char *e = std::getenv("PS2X_MEMWATCH");
+            if (e && e[0]) { const char *q = e;
+                while (*q) { v.push_back((uint32_t)std::strtoul(q, nullptr, 16) & 0x1FFFFFFFu);
+                             const char *c = std::strchr(q, ','); if (!c) break; q = c + 1; } }
+            if (!v.empty()) { std::fprintf(stderr, "[memwatch] watching %zu slot(s)\n", v.size()); }
+            return v; }();
+        if (s_addrs.empty() || !rdram) return;
+        static std::vector<uint32_t> s_prev(s_addrs.size(), 0xdeadbeefu);
+        bool changed = false;
+        std::vector<uint32_t> cur(s_addrs.size());
+        for (size_t i = 0; i < s_addrs.size(); ++i)
+        {
+            std::memcpy(&cur[i], rdram + (s_addrs[i] & PS2_RAM_MASK), 4);
+            if (cur[i] != s_prev[i]) changed = true;
+        }
+        if (!changed) return;
+        std::fprintf(stderr, "[memwatch] frame %llu |", (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed));
+        for (size_t i = 0; i < s_addrs.size(); ++i)
+            std::fprintf(stderr, " 0x%06x=%-6u%s", s_addrs[i], cur[i], cur[i] != s_prev[i] ? "*" : " ");
+        std::fprintf(stderr, "\n");
+        s_prev = cur;
+    }
+
+    static uint32_t rd32(const uint8_t *r, uint32_t a) { uint32_t v; std::memcpy(&v, r + (a & PS2_RAM_MASK), 4); return v; }
+    static void     wr32(uint8_t *r, uint32_t a, uint32_t v) { std::memcpy(r + (a & PS2_RAM_MASK), &v, 4); }
+
+    // [netjump] func_356090 IS the versus menu: it loops internally and its RETURN VALUE decides
+    // the transition --  0x352d88 jal func_356090 / beq $v0,$zero,stay / sw state=0x27.
+    // So the seamless 0x26 -> 0x27 is simply "make it return non-zero", with the two side effects
+    // the real function performs before returning (0x356234: stateObj+0x620/+0x624 = the duel
+    // object's 0x110/0x114). No synthetic button presses, no walking menus.
+    // Team Battle and DP Battle do NOT use character select 0x27. The duel dispatcher picks the
+    // screen from the battle type on the way out of the versus menu (0x352da8..0x352db4):
+    //     lw $a0, 0x624($v0)      ; battle type
+    //     daddu $v1, $s5, $zero   ; $s5 = 0x28   (set at 0x352d28)
+    //     movz $v1, $s3, $a0      ; $s3 = 0x27   (set at 0x352d1c) -- taken only when type == 0
+    //     sw $v1, 0x18($v0)
+    // So Single -> 0x27, Team and DP -> 0x28 (the multi-character roster screen). Everything below
+    // used to compare against a literal 0x27, so for Team/DP the driver never recognised that it
+    // had arrived: it sat in the pulse loop for its full 20 s timeout with the display frozen, and
+    // the step-3 re-assert -- which is what holds 1P VS 2P against the screen's own entry code --
+    // returned on its first line every frame. That is why DP came up as 1P vs COM.
+    // The fight does NOT read duelObj+0x13c. That is only Battle Settings' working copy -- it
+    // reads 0 until the menu is opened, while the game's default is 240 s, which is why writing it
+    // alone changed nothing. Leaving Battle Settings commits it into a PER-SLOT table
+    // (0x355c3c..0x355c58):
+    //     base = [0x2ff28c] ; slot = duelObj->0x134 ; base[slot*4 + 0xc34] = duelObj->0x13c
+    // Confirmed against four full-RAM dumps: the only word in 32 MB that held 0, then 4, then 2
+    // across three time-limit settings was 0x6be254, and [0x2ff28c] + 0xc34 lands exactly there.
+    // (The neighbouring 0x140 -> +0xc38 commit is a different Battle Settings option we do not
+    // expose; leave it alone so the game's stored default survives.)
+    static void bt3NetCommitTimeLimit(uint8_t *rdram, uint32_t duelObj,
+                                      uint32_t (*rd)(const uint8_t *, uint32_t),
+                                      void (*wr)(uint8_t *, uint32_t, uint32_t))
+    {
+        const uint32_t base = rd(rdram, 0x2ff28cu) & 0x1FFFFFFFu;
+        if (!base || !duelObj) return;
+        const uint32_t slot = rd(rdram, duelObj + 0x134u);
+        if (slot >= 64u) return;          // it indexes a table: do not scribble on a wild value
+        wr(rdram, base + slot * 4u + 0xc34u, (uint32_t)ps2NetTimeLimit());
+    }
+
+    static uint32_t bt3NetTargetState() { return ps2NetBattleType() == 0 ? 0x27u : 0x28u; }
+
+    std::atomic<bool> g_netJumpWantConfirm{false};
+    PS2Runtime::RecompiledFunction g_orig356090 = nullptr;
+    void bt3VersusMenuGate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_356090
+    {
+        if (!g_netJumpWantConfirm.load(std::memory_order_relaxed))
+        {
+            if (g_orig356090) g_orig356090(rdram, ctx, runtime);
+            return;
+        }
+        const uint32_t duelObj  = rd32(rdram, 0x3b38e8u) & 0x1FFFFFFFu;
+        const uint32_t stateObj = rd32(rdram, 0x2ff10cu) & 0x1FFFFFFFu;
+        if (!duelObj || !stateObj)
+        {
+            // The duel module has not allocated yet (or has been torn down). Confirming now would
+            // commit NOTHING and still return non-zero, so the caller would transition on whatever
+            // stale setup the state object still holds -- which is how a DP match came up with the
+            // default 10 DP budget. Stay armed, run the real menu, and try again next frame.
+            if (g_orig356090) g_orig356090(rdram, ctx, runtime);
+            return;
+        }
+        g_netJumpWantConfirm.store(false, std::memory_order_relaxed);
+        {
+            wr32(rdram, duelObj + 0x110u, 1u);                                  // 1P VS 2P
+            // 0x114 is the battle type: 0 Single, 1 Team, 2 DP. Taken from the netplay session
+            // (the host's choice, which it stamps into every packet) so both machines build the
+            // SAME match -- they each run this hook independently, so disagreeing here would set
+            // up two different fights.
+            wr32(rdram, duelObj + 0x114u, (uint32_t)ps2NetBattleType());
+            // +0x118 is DP Battle's point budget (0 = 10 DP, 1 = 15, 2 = 20), the row of the
+            // versus menu we never visit. Measured with [matchwatch]: picking 20 DP moved it to 2
+            // and confirm committed it to stateObj+0x630, which is RetroAchievements' 0x6af7b0.
+            // Leaving it at the default is why DP came up playing like Team -- the screen had a
+            // DP type with no budget behind it.
+            wr32(rdram, duelObj + 0x118u, (uint32_t)ps2NetDpLimit());
+            bt3NetCommitTimeLimit(rdram, duelObj, &rd32, &wr32);
+            // +0x13c is Battle Settings' working copy. Keep writing it so the menu agrees with the
+            // table if it is ever displayed; the commit above is what the fight actually reads., found by dumping RAM at four settings and
+            // keeping the only pointer-reachable value that tracked 3 -> 2 -> 1 -> 0 in order.
+            wr32(rdram, duelObj + 0x13cu, (uint32_t)ps2NetTimeLimit());
+            wr32(rdram, stateObj + 0x620u, rd32(rdram, duelObj + 0x110u));      // what 0x356234 does
+            wr32(rdram, stateObj + 0x624u, rd32(rdram, duelObj + 0x114u));
+            // The real commit copies THREE fields, not two (0x35622c..0x35625c). We were dropping
+            // the last one. stateObj+0x630 is read by the duel module at 0x34b780 and 0x353f94,
+            // so leaving it stale is a real difference -- mirror it exactly as the game does.
+            wr32(rdram, stateObj + 0x630u, rd32(rdram, duelObj + 0x118u));
+        }
+        std::fprintf(stderr, "[netjump] versus-menu gate -> confirm (duelObj=0x%x)\n", duelObj);
+        setReturnS32(ctx, 1);   // non-zero: the caller now performs its own 0x26 -> 0x27
+    }
+
+    // [netjump] On peer connect, take BOTH machines straight to character select instead of
+    // making each player walk the menus.
+    //
+    // The top-level state IS the screen selector -- I originally mislabelled its values from the
+    // [hstate] probe's guesswork. Measured by dumping RAM on known screens (PS2X_DUMPKEY):
+    //     0x04 = main menu      0x26 = versus/duel menu      0x27 = CHARACTER SELECT
+    // It lives at [[0x2ff10c] + 0x18] -- resolved through the pointer, so it survives whatever
+    // the allocator does (RetroAchievements' fixed addresses do NOT transfer to this build: that
+    // region is heap and our allocator places it differently than PCSX2).
+    //
+    // Writing the state is deliberately the ONLY thing done here. The per-player "is CPU"
+    // flags found at 0x0f88208 / 0x0f883d0 are heap addresses with no pointer to resolve them
+    // from, so hard-coding them would be exactly the mistake the RA addresses already were.
+    // If the jump lands on character select but with a CPU opponent, that is the next thing to
+    // chase -- through a pointer, not a literal.
+    // Perform BT3's own "the player chose Duel" transition, rather than poking a state value.
+    // Reverse-engineered from the main-menu overlay module at 0x3364f4..0x336534, which is a jump
+    // table of menu rows (each loads its target state into $t1: 0x06, 0x0d, 0x21, 0x26=Duel) that
+    // falls into this common tail:
+    //     menuObj = [0x3b0e80]
+    //     menuObj->0x108 |= 1 ;  menuObj->0x108 |= 2 ;  menuObj->0x110 = 0x0f
+    //     stateObj->0x18 = <target state>          (stateObj = [0x2ff10c])
+    //     func_10D878(menuObj + 0x10)              <-- the call that actually drives it
+    // Writing the state alone does nothing from the main menu: the duel module is not being
+    // ticked yet, so nothing reads the value. This call is what activates it.
+
+    static bool bt3MenuGoto(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t targetState)
+    {
+        const uint32_t menuObj = rd32(rdram, 0x3b0e80u) & 0x1FFFFFFFu;
+        const uint32_t stateObj = rd32(rdram, 0x2ff10cu) & 0x1FFFFFFFu;
+        if (!menuObj || !stateObj) return false;
+        wr32(rdram, menuObj + 0x108u, rd32(rdram, menuObj + 0x108u) | 1u);
+        wr32(rdram, menuObj + 0x108u, rd32(rdram, menuObj + 0x108u) | 2u);
+        wr32(rdram, menuObj + 0x110u, 0x0fu);
+        wr32(rdram, stateObj + 0x18u, targetState);
+        // run func_10D878(menuObj + 0x10) on a private context, ra = 0 so it returns to us
+        R5900Context t = *ctx;
+        t.r[4] = _mm_set_epi64x(0, (int64_t)(menuObj + 0x10u));
+        t.r[31] = _mm_setzero_si128();
+        t.pc = 0x0010d878u;
+        uint32_t steps = 0u;
+        while (t.pc != 0u && steps++ < 2000000u)
+        {
+            PS2Runtime::RecompiledFunction f = runtime->lookupFunction(t.pc);
+            if (!f) break;
+            f(rdram, &t, runtime);
+        }
+        std::fprintf(stderr, "[netjump] menuGoto(0x%02x): menuObj=0x%x stateObj=0x%x, func_10D878 ran %u steps\n",
+                     targetState, menuObj, stateObj, steps);
+        return true;
+    }
+
+    static void bt3NetJumpCharSelect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // PS2X_NET_JUMP=1  go via the versus menu (0x04 -> 0x26 -> 0x27), the path the game
+        //                   itself takes, so whatever the versus menu establishes gets set.
+        // PS2X_NET_JUMP=2  jump straight to character select (0x04 -> 0x27). The main menu's
+        //                   jump table uses ONE common tail for every row and only varies the
+        //                   target state, so func_10D878 is a generic "go to screen N" -- the
+        //                   duel module handles 0x26..0x29, so 0x27 should activate it directly.
+        static const int s_env = [](){ const char *v = std::getenv("PS2X_NET_JUMP");
+                                       return (v && v[0]) ? std::atoi(v) : 0; }();
+        // The overlay's "jump on connect" checkbox drives this now; PS2X_NET_JUMP stays as an
+        // override for headless runs. Mode 2 (straight to 0x27) is env-only -- it cannot set the
+        // versus mode, because the duel object that holds it is freed before character select.
+        const int s_mode = s_env > 0 ? s_env : (ps2NetAutoJump() ? 1 : 0);
+        if (s_mode <= 0 || !rdram || !ps2NetActive() || !ps2NetPeerConnected()) return;
+        // Reset per connection, so disconnecting and reconnecting jumps again instead of
+        // remembering that it already ran once this process.
+        static uint32_t s_session = 0;
+        static int s_step = 0; static uint64_t s_waitUntil = 0;
+        // s_pulseStart lives HERE, not inside step 2, because a static in there survives the
+        // connection: on a second connect it still held the first one's frame, so the 600-frame
+        // timeout had already expired and step 2 gave up on its very first tick. Every piece of
+        // this state machine has to be reset per session, the armed gate flag included -- a gate
+        // left armed from a failed attempt fires on the NEXT connect before the duel module is up.
+        static uint64_t s_pulseStart = 0;
+        if (s_session != ps2NetSession())
+        { s_session = ps2NetSession(); s_step = 0; s_waitUntil = 0; s_pulseStart = 0; g_netJumpState.store(1, std::memory_order_relaxed);
+          g_netJumpSession.store(s_session, std::memory_order_relaxed);
+          g_netJumpWantConfirm.store(false, std::memory_order_relaxed);
+          g_netJumpHold.store(0, std::memory_order_relaxed); }
+        if (s_step >= 3)
+        {
+            // HOLD the match setup. Writing it once is not enough: the mode is normally committed
+            // inside func_356090 (the confirm gate) at 0x35622c, 25 frames BEFORE the 0x26 -> 0x27
+            // transition. Jumping straight to character select skips that, and the screen's own
+            // entry code then puts the default (1P vs CPU) back. So re-assert it every frame while
+            // character select is up, and stop as soon as the screen changes.
+            const uint32_t so = rd32(rdram, 0x2ff10cu) & 0x1FFFFFFFu;
+            if (!so) return;
+            if (rd32(rdram, so + 0x18u) != bt3NetTargetState()) return;   // left the screen: done
+            if (rd32(rdram, so + 0x620u) != 1u)
+            {
+                wr32(rdram, so + 0x620u, 1u);                  // 1P VS 2P
+                wr32(rdram, so + 0x624u, (uint32_t)ps2NetBattleType());
+                wr32(rdram, so + 0x630u, (uint32_t)ps2NetDpLimit());
+                static std::atomic<uint32_t> s_n{0};
+                if (s_n.fetch_add(1u) < 5u)
+                    std::fprintf(stderr, "[netjump] re-asserted 1P VS 2P (something reset it)\n");
+            }
+            return;
+        }
+        const uint64_t now = g_bt3FrameCount.load(std::memory_order_relaxed);
+        if (now < s_waitUntil) return;
+        const uint32_t stateObj = rd32(rdram, 0x2ff10cu) & 0x1FFFFFFFu;
+        if (!stateObj) return;
+        const uint32_t cur = rd32(rdram, stateObj + 0x18u);
+        if (s_step == 0)
+        {
+            if (cur == bt3NetTargetState()) { s_step = 3; g_netJumpState.store(2, std::memory_order_relaxed); std::fprintf(stderr, "[netjump] already at character select\n"); return; }
+            if (cur != 0x04u) return;                       // wait until the main menu is up
+            if (s_mode >= 2)
+            {   // straight to character select
+                if (!bt3MenuGoto(rdram, ctx, runtime, bt3NetTargetState())) return;
+                std::fprintf(stderr, "[netjump] 0x04 -> 0x%02x direct (character select)\n", bt3NetTargetState());
+                s_step = 2; s_waitUntil = now + 90u; return;
+            }
+            if (!bt3MenuGoto(rdram, ctx, runtime, 0x26u)) return;
+            g_netJumpHold.store(600, std::memory_order_relaxed);   // hide the menus (~20 s cap)
+            s_step = 1; return;   // no fixed wait: step 1 polls for the module itself
+        }
+        if (s_step == 1)
+        {
+            if (cur != 0x26u) return;   // still switching modules: poll, do not give up
+            // Choose 1P VS 2P *here*, on the versus menu, because this is the only place it can
+            // be chosen: the duel module's object [0x3b38e8] holds the real setting and is FREED
+            // by the time character select is up.
+            //     duelObj->0x110  versus mode (0 = 1P vs CPU, 1 = 1P vs 2P, 2 = CPU vs CPU)
+            //     duelObj->0x114  battle type (0 = Single Battle)
+            // It tracks the menu cursor live, and func_356090 later COPIES it to stateObj+0x620
+            // (see 0x356234..0x356238). Writing stateObj+0x620 directly, which is what the last
+            // three attempts did, only edits that copy -- the screen goes on reading the source.
+            // This is also why a direct 0x04 -> 0x27 jump can never set the mode.
+            const uint32_t duelObj = rd32(rdram, 0x3b38e8u) & 0x1FFFFFFFu;
+            if (!duelObj) return;                       // module still coming up: wait
+            wr32(rdram, duelObj + 0x110u, 1u);          // 1P VS 2P
+            // Take the battle type from the netplay session (the host stamps its choice into
+            // every packet) instead of forcing Single -- this write is what the versus menu would
+            // have made had the player navigated it, and the gate below reads it back out.
+            wr32(rdram, duelObj + 0x114u, (uint32_t)ps2NetBattleType());
+            wr32(rdram, duelObj + 0x118u, (uint32_t)ps2NetDpLimit());
+            wr32(rdram, duelObj + 0x13cu, (uint32_t)ps2NetTimeLimit());
+            bt3NetCommitTimeLimit(rdram, duelObj, &rd32, &wr32);
+            std::fprintf(stderr, "[netjump] duelObj=0x%x: mode -> 1 (1P VS 2P), type -> %u, dp -> %u\n",
+                         duelObj, (unsigned)ps2NetBattleType(), (unsigned)ps2NetDpLimit());
+            // Advance with a PLAIN WRITE, not bt3MenuGoto: that helper needs the MAIN-MENU object
+            // [0x3b0e80], which is freed the moment we leave the main menu, so it returned false
+            // every frame here and the sequence span forever re-writing the mode.
+            // A plain write is enough now for the reason it was not before: the duel module is
+            // genuinely ACTIVE (menuGoto(0x26) loaded it), and its dispatcher at 0x352d30
+            // branches on this very slot -- 0x27 goes to the character-select handler at 0x352dd8.
+            // Do NOT write the state here: the module must run its own 0x26 -> 0x27 path so
+            // func_356090 loads the screen. Press confirm and let the game do it.
+            g_netJumpWantConfirm.store(true, std::memory_order_relaxed);
+            std::fprintf(stderr, "[netjump] arming the versus-menu gate on frame %llu\n", (unsigned long long)now);
+            s_step = 2; return;
+        }
+        if (s_step == 2)
+        {
+            if (cur != bt3NetTargetState())
+            {
+                // PULSE the confirm: there are TWO menus to get through (versus mode, then
+                // battle type), and a held button is ONE press -- a second menu needs a release
+                // in between. 3 frames down, 5 up, so roughly four presses a second. The previous
+                // version pressed once and waited 240 frames before retrying, which is the 8-second
+                // "slow clicking" -- that was my retry timer, not the game being slow.
+                if (!s_pulseStart) s_pulseStart = now;
+                if (now - s_pulseStart > 600u)      // ~20 s: something is wrong, stop hiding it
+                {
+                    std::fprintf(stderr, "[netjump] stuck at state 0x%02x (wanted 0x%02x) -- giving up\n",
+                                 cur, bt3NetTargetState());
+                    g_netJumpHold.store(0, std::memory_order_relaxed); s_step = 3; g_netJumpState.store(2, std::memory_order_relaxed); return;
+                }
+                if (cur == 0x26u && ((now - s_pulseStart) % 8u) == 0u)
+                    g_netJumpPressCross.store(3, std::memory_order_relaxed);
+                return;
+            }
+            // Set the match up as 1P VS 2P, Single Battle.
+            // These live INSIDE the state object, so they are reached through the pointer at
+            // 0x2ff10c like the state itself -- no heap literal:
+            //     stateObj + 0x620  versus mode  (0 = 1P vs CPU, 1 = 1P vs 2P, 2 = CPU vs CPU)
+            //     stateObj + 0x624  battle type  (0 = Single Battle, 1 = Team Battle)
+            // The duel module reads +0x624 at 0x352da8 on the way to character select.
+            // Found via the RetroAchievements map: every RA address is OURS MINUS 0x4000 (their
+            // 0x6af198 screen id is our 0x6b3198). They did not transfer directly because that
+            // 16 KB shift makes each one land in unrelated data -- which is what made the earlier
+            // 0x6af7a0 reading look like a table of positions and score thresholds.
+            // The mode only COMMITS on confirm, which is why diffing dumps taken with the rows
+            // merely highlighted showed no difference and sent me after the per-player "is CPU"
+            // heap flags instead.
+            wr32(rdram, stateObj + 0x620u, 1u);   // 1P VS 2P
+            wr32(rdram, stateObj + 0x624u, (uint32_t)ps2NetBattleType());
+            wr32(rdram, stateObj + 0x630u, (uint32_t)ps2NetDpLimit());
+            g_netJumpHold.store(0, std::memory_order_relaxed);   // character select is up: show it
+            static const char *kType[] = { "Single", "Team", "DP" };
+            const unsigned bt = (unsigned)ps2NetBattleType();
+            static const char *kDp[] = { "10 DP", "15 DP", "20 DP" };
+            const unsigned dp = (unsigned)ps2NetDpLimit();
+            std::fprintf(stderr, "[netjump] settled at state 0x%02x | mode=%u type=%u dp=%u (1P VS 2P, %s Battle%s%s)\n",
+                         cur, rd32(rdram, stateObj + 0x620u), rd32(rdram, stateObj + 0x624u),
+                         rd32(rdram, stateObj + 0x630u), bt < 3 ? kType[bt] : "?",
+                         bt == 2 ? ", " : "", (bt == 2 && dp < 3) ? kDp[dp] : "");
+            s_step = 3; g_netJumpState.store(2, std::memory_order_relaxed);
+        }
+    }
+
+    // [dumpkey] PS2X_DUMPKEY=<prefix>: press F9 to write EE RAM to "<prefix>.<n>.bin".
+    // Needed because the RetroAchievements addresses do NOT transfer to this build: everything
+    // at 0x6afxxx is HEAP (the ELF's loaded segments end at 0x334bf8), and our recompilation
+    // runs its own allocator, so the game's menu objects land at different addresses than they
+    // do under PCSX2. Our own layout IS stable run to run (the state object is at 0x6b3180 every
+    // time), so the equivalents can be found -- but only by dumping at KNOWN screens and diffing,
+    // which means letting the player mark the moment.
+    extern "C" bool IsKeyPressed(int key);   // raylib; KEY_F9 == 298
+    static void bt3DumpKey(uint8_t *rdram)
+    {
+        static const char *s_prefix = std::getenv("PS2X_DUMPKEY");
+        if (!s_prefix || !s_prefix[0] || !rdram) return;
+        static bool s_said = false;
+        if (!s_said) { s_said = true; std::fprintf(stderr, "[dumpkey] press F9 to dump EE RAM to %s.<n>.bin\n", s_prefix); }
+        if (!IsKeyPressed(298)) return;
+        static int s_n = 0;
+        char path[512]; std::snprintf(path, sizeof path, "%s.%d.bin", s_prefix, s_n);
+        if (std::FILE *o = std::fopen(path, "wb"))
+        {
+            std::fwrite(rdram, 1, PS2_RAM_SIZE, o); std::fclose(o);
+            std::fprintf(stderr, "[dumpkey] dump #%d at frame %llu -> %s\n", s_n, 
+                         (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), path);
+            ++s_n;
+        }
+    }
+
+    // [memblock] PS2X_MEMBLOCK=<hex addr>:<word count> -- print the block whenever any word in it
+    // changes, marking the changed ones with '*'. Used to find the menu SCREEN selector now that
+    // the RetroAchievements mode variables are confirmed for this build:
+    //     0x6af7a0 versus mode (0 = 1vCPU, 1 = 1v2, 2 = CPUvCPU)   CONFIRMED
+    //     0x6af7a4 battle type (0 = Single, 1 = Team)              CONFIRMED
+    //     0x6af1ac "current mode"                                  WRONG for this build
+    // The screen selector is most likely a neighbour of the two that are right.
+    static void bt3MemBlock(uint8_t *rdram)
+    {
+        static uint32_t s_base = 0u; static int s_words = 0; static bool s_init = false;
+        if (!s_init)
+        {
+            s_init = true;
+            if (const char *e = std::getenv("PS2X_MEMBLOCK"))
+            {
+                char *end = nullptr;
+                s_base = (uint32_t)std::strtoul(e, &end, 16) & 0x1FFFFFFFu;
+                s_words = (end && *end == ':') ? std::atoi(end + 1) : 32;
+                if (s_words < 1 || s_words > 256) s_words = 32;
+                std::fprintf(stderr, "[memblock] watching 0x%06x for %d words\n", s_base, s_words);
+            }
+        }
+        if (!s_words || !rdram) return;
+        static std::vector<uint32_t> prev;
+        std::vector<uint32_t> cur((size_t)s_words);
+        std::memcpy(cur.data(), rdram + (s_base & PS2_RAM_MASK), (size_t)s_words * 4u);
+        if (prev.size() == cur.size() && std::memcmp(prev.data(), cur.data(), cur.size() * 4u) == 0) return;
+        std::fprintf(stderr, "[memblock] frame %llu\n", (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed));
+        for (int i = 0; i < s_words; i += 8)
+        {
+            std::fprintf(stderr, "   0x%06x ", s_base + (uint32_t)i * 4u);
+            for (int k = i; k < i + 8 && k < s_words; ++k)
+                std::fprintf(stderr, " %c%08x", (prev.size() == cur.size() && cur[k] != prev[k]) ? '*' : ' ', cur[k]);
+            std::fprintf(stderr, "\n");
+        }
+        prev = cur;
+    }
+
+    // [statewatch] PS2X_STATEWATCH=1: log every change of BT3's top-level state machine.
+    // The state lives at [[0x2ff10c] + 0x18] -- a pointer to the state object, state value at
+    // +0x18 (the same slot the status probe reads as "bt3state"). Known values so far:
+    //   0x01 BOOT   0x04 MENU   0x26 PREFIGHT_SETUP   0x27 FIGHT-LOAD   0x2d IN-FIGHT
+    // Walking the menus with this on names the CHARACTER-SELECT state, which is what a direct
+    // "jump both players to character select" needs instead of replaying canned button presses.
+    // Also logs the guest pc/ra at the moment of the change, to point at the code that sets it.
+    // [matchwatch] PS2X_MATCHWATCH=1 -- print the whole match-setup tuple whenever any part of it
+    // changes. Team Battle and DP Battle share character-select screen 0x28, and stateObj+0x624
+    // (the battle type) has exactly ONE writer in the overlay -- 0x356248, inside the confirm
+    // function we replace -- so setting it to 2 cannot be what is missing when DP comes up playing
+    // like Team. The remaining candidate is the third field the real confirm commits,
+    // duelObj+0x118 -> stateObj+0x630, which the versus menu would have filled in from a sub-row we
+    // never visit. Rather than guess its value: walk to DP Battle by hand once with this on, and
+    // the line printed on confirm IS the answer.
+    //     stateObj = [0x2ff10c]   +0x18 screen  +0x620 mode  +0x624 type  +0x628 ?  +0x630 ?
+    //     duelObj  = [0x3b38e8]   +0x110 mode   +0x114 type  +0x118 ?     +0x13c time limit
+    //     cfgObj   = [0x3b38d8]   +0x3c38/+0x3c3c/+0x3c40  <- where char-select copies the trio
+    //                                                          (0x34b760..0x34b784)
+    static void bt3MatchWatch(uint8_t *rdram)
+    {
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_MATCHWATCH");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (!s_on || !rdram) return;
+        auto ld = [&](uint32_t a) -> uint32_t { uint32_t v = 0; std::memcpy(&v, rdram + (a & PS2_RAM_MASK), 4); return v; };
+        const uint32_t so = ld(0x2ff10cu) & 0x1FFFFFFFu;
+        const uint32_t du = ld(0x3b38e8u) & 0x1FFFFFFFu;
+        const uint32_t cf = ld(0x3b38d8u) & 0x1FFFFFFFu;
+        uint32_t cur[14] = {0};
+        if (so) { cur[0] = ld(so + 0x18u);  cur[1] = ld(so + 0x620u); cur[2] = ld(so + 0x624u);
+                  cur[3] = ld(so + 0x628u); cur[4] = ld(so + 0x630u); }
+        if (du) { cur[5] = ld(du + 0x110u); cur[6] = ld(du + 0x114u); cur[7] = ld(du + 0x118u);
+                  cur[8] = ld(du + 0x13cu); }
+        if (cf) { cur[9] = ld(cf + 0x3c38u); cur[10] = ld(cf + 0x3c3cu); cur[11] = ld(cf + 0x3c40u); }
+        // The COMMITTED time limit, reached the way the game reaches it (0x355c3c..0x355c58)
+        // rather than as a heap literal: base = [0x2ff28c], slot = duelObj->0x134.
+        const uint32_t tlb = ld(0x2ff28cu) & 0x1FFFFFFFu;
+        const uint32_t slot = du ? ld(du + 0x134u) : 0u;
+        cur[12] = slot;
+        cur[13] = (tlb && slot < 64u) ? ld(tlb + slot * 4u + 0xc34u) : 0u;
+        static uint32_t s_prev[14]; static bool s_have = false;
+        if (s_have && std::memcmp(cur, s_prev, sizeof cur) == 0) return;
+        static const char *kName[14] = { "screen", "st.mode", "st.type", "st.628", "st.630",
+                                         "du.110", "du.114", "du.118", "du.13c",
+                                         "cf.3c38", "cf.3c3c", "cf.3c40", "tl.slot", "tl.value" };
+        std::fprintf(stderr, "[matchwatch] frame %llu |", (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed));
+        for (int i = 0; i < 14; ++i)
+            std::fprintf(stderr, " %s=%u%s", kName[i], cur[i], (s_have && cur[i] != s_prev[i]) ? "*" : "");
+        std::fprintf(stderr, "%s%s\n", du ? "" : "  (no duelObj)", so ? "" : "  (no stateObj)");
+        std::memcpy(s_prev, cur, sizeof cur); s_have = true;
+    }
+
+    // [matchwatch] PS2X_MATCHWATCH=2 also reports every word of the duel object's first 0x400
+    // bytes that changes. duelObj+0x13c was picked by diffing whole-RAM dumps at four time-limit
+    // settings, and it reads 0 when the game's default is 3 -- so it is probably the wrong field.
+    // Walking Battle Settings with this on names the right one directly.
+    static void bt3MatchScan(uint8_t *rdram)
+    {
+        static const int s_lvl = [](){ const char *v = std::getenv("PS2X_MATCHWATCH");
+                                       return (v && v[0]) ? std::atoi(v) : 0; }();
+        if (s_lvl < 2 || !rdram) return;
+        uint32_t du = 0; std::memcpy(&du, rdram + (0x3b38e8u & PS2_RAM_MASK), 4);
+        du &= 0x1FFFFFFFu;
+        static uint32_t s_base = 0; static uint32_t s_prev[0x100]; static bool s_have = false;
+        if (!du) { s_have = false; return; }
+        if (du != s_base) { s_base = du; s_have = false; }
+        uint32_t cur[0x100];
+        std::memcpy(cur, rdram + (du & PS2_RAM_MASK), sizeof cur);
+        if (!s_have) { std::memcpy(s_prev, cur, sizeof cur); s_have = true; return; }
+        if (std::memcmp(cur, s_prev, sizeof cur) == 0) return;
+        std::fprintf(stderr, "[matchscan] frame %llu duelObj=0x%x |",
+                     (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), du);
+        for (int i = 0; i < 0x100; ++i)
+            if (cur[i] != s_prev[i]) std::fprintf(stderr, " +0x%03x: %u -> %u", i * 4, s_prev[i], cur[i]);
+        std::fprintf(stderr, "\n");
+        std::memcpy(s_prev, cur, sizeof cur); s_have = true;
+    }
+
+    static void bt3StateWatch(uint8_t *rdram, R5900Context *ctx)
+    {
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_STATEWATCH");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (!s_on || !rdram) return;
+        uint32_t p = 0u, st = 0xffffffffu;
+        std::memcpy(&p, rdram + (0x2ff10cu & PS2_RAM_MASK), 4);
+        if (!p) return;
+        const uint32_t stateAddr = ((p & 0x1FFFFFFFu) + 0x18u) & PS2_RAM_MASK;
+        std::memcpy(&st, rdram + stateAddr, 4);
+        // [statewatch] PS2X_STATEWATCH=2 also dumps the state OBJECT's first 0x40 bytes whenever
+        // any of them changes. The top-level state is coarse -- the whole menu flow (main menu,
+        // Duel, 1P VS 2P, character select, stage select) is ONE value, 0x04 -- so the
+        // character-select screen is a SUB-STATE held elsewhere. The neighbouring fields of the
+        // same object are the cheapest place to look for it.
+        static const int s_deep = [](){ const char *v = std::getenv("PS2X_STATEWATCH");
+                                        return (v && v[0]) ? std::atoi(v) : 0; }();
+        if (s_deep >= 2)
+        {
+            static uint32_t s_prev[16] = {0}; static bool s_have = false;
+            uint32_t cur[16];
+            std::memcpy(cur, rdram + ((p & 0x1FFFFFFFu) & PS2_RAM_MASK), sizeof cur);
+            if (!s_have || std::memcmp(cur, s_prev, sizeof cur) != 0)
+            {
+                std::fprintf(stderr, "[statewatch2] frame %llu st=0x%02x |", 
+                             (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), st);
+                for (int i = 0; i < 16; ++i)
+                    std::fprintf(stderr, " %c%08x", (s_have && cur[i] != s_prev[i]) ? '*' : ' ', cur[i]);
+                std::fprintf(stderr, "\n");
+                std::memcpy(s_prev, cur, sizeof cur); s_have = true;
+            }
+        }
+        static uint32_t s_last = 0xdeadbeefu;
+        if (st == s_last) return;
+        std::fprintf(stderr, "[statewatch] frame %llu  state 0x%02x -> 0x%02x   (obj 0x%x, slot 0x%x)  pc=0x%x ra=0x%x\n",
+                     (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed),
+                     s_last == 0xdeadbeefu ? 0u : s_last, st, p, stateAddr + 0u,
+                     ctx ? ctx->pc : 0u, ctx ? getRegU32(ctx, 31) : 0u);
+        s_last = st;
+    }
+
+    extern "C" void ps2xFrameGateWait(uint64_t frame, uint8_t *rdram, R5900Context *ctx);   // [rollback] ps2_runtime.cpp
+    extern "C" bool ps2xFrameStepOn();                                                        // [rollback] ps2_runtime.cpp
+    extern "C" bool ps2xRenderSkipOn();                                                       // [rollback] ps2_memory.cpp
     void bt3FrameKick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00100ab8
     {
         // Keep the SE stream fed from the active voices. Effects are produced incrementally so
@@ -4057,6 +5440,45 @@ namespace
         // would only advance when the next SE command happened to arrive.
         seServiceVoices(runtime);
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
+        // [rollback] the frame gate: in frame-stepped mode tid 1 parks here until the host controller
+        // has had the boundary (snapshot / rollback) and opened the gate. No-op otherwise.
+        ps2xFrameGateWait(g_bt3FrameCount.load(std::memory_order_relaxed), rdram, ctx);
+        {   // [savestate] one save, one load, both at this hook -- see the note above
+            static const char *s_save = std::getenv("PS2X_SAVESTATE");
+            static const char *s_load = std::getenv("PS2X_LOADSTATE");
+            static bool s_loaded = false, s_saved = false;
+            // Do NOT load at the first hook we happen to reach. The host C++ stack MIRRORS the
+            // guest call chain (see the note on bt3SaveState), so a snapshot taken deep in the
+            // title loop must be restored at a structurally comparable point -- dropping frame 900
+            // into a process still nested in boot leaves the stack describing a call chain that no
+            // longer matches guest memory. Default: wait until THIS instance's own frame counter
+            // reaches the frame the snapshot was taken at, which both instances arrive at by the
+            // same boot path. PS2X_LOADSTATE_AT=<frame> overrides (0 = the old load-immediately).
+            if (s_load && s_load[0] && !s_loaded)
+            {
+                static const long s_at = [](){ const char *v = std::getenv("PS2X_LOADSTATE_AT");
+                                               return (v && v[0]) ? std::atol(v) : -1L; }();
+                static const uint64_t s_want = (s_at >= 0) ? (uint64_t)s_at : bt3PeekStateFrame(s_load);
+                if (g_bt3FrameCount.load(std::memory_order_relaxed) >= s_want)
+                { s_loaded = true; bt3LoadState(s_load, rdram, ctx, runtime); }
+            }
+            if (s_save && s_save[0] && !s_saved)
+            {
+                const char *c = std::strchr(s_save, ':');
+                const unsigned long long at = std::strtoull(s_save, nullptr, 10);
+                if (c && g_bt3FrameCount.load(std::memory_order_relaxed) >= at) { s_saved = true; bt3SaveState(c + 1, rdram, ctx, runtime); }
+            }
+        }
+        bt3StateWatch(rdram, ctx);   // [statewatch]
+        bt3MatchWatch(rdram);        // [matchwatch]
+        bt3MatchScan(rdram);         // [matchwatch] level 2
+        bt3MemWatch(rdram);          // [memwatch]
+        bt3MemBlock(rdram);          // [memblock]
+        bt3DumpKey(rdram);           // [dumpkey]
+        bt3NetJumpCharSelect(rdram, ctx, runtime); // [netjump]
+        ps2NetInit();   // [netplay] no-op unless PS2X_NET / PS2X_NET_LISTEN is set
+        ps2NetFrame(static_cast<uint32_t>(g_bt3FrameCount.load(std::memory_order_relaxed)));
+        ps2DetHashFrame(rdram, ctx->vu0_r);   // [dethash]
         if (g_ps2StepCensus.load(std::memory_order_relaxed)) ps2StepCensusFrame(ctx);   // [stepcensus]
         ps2HalfStepFrame(ctx);        // [halfstep] (no-op unless configured; raises the macro switch on fight frames only)
         {   // [findclock] PS2X_FINDCLOCK=<start value>: when the fight gate opens, remember every 32-bit slot holding a value
@@ -4151,7 +5573,8 @@ namespace
             static const bool s_forceHeavy = [](){ const char *v = std::getenv("PS2X_FRAMEGATE_FORCEHEAVY"); return v && v[0] && v[0] != '0'; }();
             const bool heavy = s_forceHeavy || g_workerFrameNs.load(std::memory_order_relaxed) > s_vsyncNs;
             g_ps2xFrameGateHeavy.store(s_gate && heavy && PS2Memory::asyncKickEnabled(), std::memory_order_relaxed);   // [syncrelax]
-            if (s_gate && heavy && PS2Memory::asyncKickEnabled())
+            // [rollback] in frame-stepped mode the controller paces vblanks; a host sleep here would only starve them
+            if (s_gate && heavy && PS2Memory::asyncKickEnabled() && !ps2xFrameStepOn())
             {
                 static uint64_t s_lastTick = 0;
                 // [fps60gate] The 2-tick target IS a 30 fps lock: two vsyncs at 60 Hz = 33.3 ms. That is
@@ -4342,6 +5765,7 @@ namespace
         // because per-flip publishing risks partial/extra frames + cadence jitter on the menus.
         static const bool s_dfPub = [](){ const char *v = std::getenv("PS2X_DISPFB_PUBLISH"); return v && v[0] && v[0] != '0'; }();
         if (GsGpuRenderer::enabled() && !s_dfPub)
+        if (!ps2xRenderSkipOn())   // [rollback] a re-simulated frame has nothing to publish
         {
             // Async kick mode: the frame's draws are still in the kick-worker queue, so the
             // publish must be enqueued after them (stream order), not executed here.
@@ -4834,6 +6258,15 @@ namespace
             g_orig102060 = runtime.lookupFunction(0x00102060u);
             if (g_orig102060) runtime.replaceFunction(0x00102060u, &bt3VStep);
             g_orig115950 = runtime.lookupFunction(0x00115950u);
+            g_orig23e770 = runtime.lookupFunction(0x0023e770u);   // [netview]
+            if (g_orig23e770) runtime.replaceFunction(0x0023e770u, &bt3NetViewSelect);
+            {   // [netjump] the versus-menu loop, in the OVERLAY (base 0x334c00)
+                g_orig356090 = runtime.lookupFunction(0x00356090u);
+                if (g_orig356090 && runtime.replaceFunction(0x00356090u, &bt3VersusMenuGate))
+                    std::fprintf(stderr, "[netjump] versus-menu gate hooked at 0x356090\n");
+                else
+                    std::fprintf(stderr, "[netjump] could NOT hook 0x356090 (overlay not resident yet?)\n");
+            }
             g_orig121d48 = runtime.lookupFunction(0x00121d48u);   // [clipguard]
             if (g_orig121d48) runtime.replaceFunction(0x00121d48u, &bt3ClipXformGuard);
             g_orig11f548 = runtime.lookupFunction(0x0011f548u);
@@ -5250,6 +6683,7 @@ namespace
     PS2Runtime::RecompiledFunction g_orig113478 = nullptr;
     extern "C" void *ps2xGuestWaitBegin();
     extern "C" void ps2xGuestWaitEnd(void *);
+    extern "C" void ps2xGuestSleepMs(unsigned ms);   // [fibers] parks the guest fiber, not the host thread
     // Wait (yielding the guest execution token so the loader threads can run) until the 32-bit
     // field at `addr` becomes non-zero. Returns the value (0 after the cap).
     static uint32_t bt3WaitFieldNonZero(uint8_t *rdram, uint32_t addr, const char *what, uint32_t pc, R5900Context *ctx = nullptr, PS2Runtime *runtime = nullptr)
@@ -5272,7 +6706,7 @@ namespace
                 if (tickGuard.engaged) { bt3RunCdTickInline(rdram, ctx, runtime); s_bt3CdTicking = false; }
             }
             void *scope = ps2xGuestWaitBegin();
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            ps2xGuestSleepMs(2u);   // [fibers] the loader is a fiber on this host thread: park, do not sleep
             ps2xGuestWaitEnd(scope);
             waited += 2;
             v = rd();

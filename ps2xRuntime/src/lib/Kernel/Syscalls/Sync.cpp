@@ -1,7 +1,10 @@
+#include <cstdint>
+extern "C" void ps2xParkArg(uint64_t arg);   // [statesync] ps2_runtime.cpp: the wait's guest-derived argument, for the park signature
 #include "ps2_waitprof.h"   // [waitprof]
 #include "Common.h"
 #include "Sync.h"
 
+extern "C" void ps2xSchedSignal();   // [fibers] ps2_runtime.cpp: a blocked fiber may now be runnable
 namespace ps2_syscalls
 {
     static bool looksLikeGuestPointerOrNull(uint32_t value)
@@ -230,6 +233,7 @@ namespace ps2_syscalls
 
     void SignalSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         int sid = static_cast<int>(getRegU32(ctx, 4));
         auto sema = lookupSemaInfo(sid);
         if (!sema)
@@ -279,6 +283,7 @@ namespace ps2_syscalls
 
     void iSignalSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         SignalSema(rdram, ctx, runtime);
     }
 
@@ -327,19 +332,22 @@ namespace ps2_syscalls
             }
 
             sema->waiters++;
-            waitWithGuestExecutionReleasedUntilUnlocked(
+            ps2xParkArg((uint64_t)sid);   // [statesync]
+            // [fibers] A semaphore is signalled by another GUEST thread, so the same reasoning as
+            // SleepThread applies: under PS2X_FIBERS the signaller shares this host thread. The
+            // predicate only TESTS count > 0 -- the decrement happens in finishFn below -- so it is
+            // safe to re-evaluate on every schedule, which the fiber path does.
+            waitGuestUntil(
                 runtime,
                 lock,
+                sema->cv,
                 [&]()
                 {
-                    Ps2xWaitScope wsema(WP_SEMA);
-                    sema->cv.wait(lock, [&]()
-                                  {
-                                      const bool forced = info ? info->forceRelease.load() : false;
-                                      const bool isTerminated = info ? info->terminated.load() : false;
-                                      return sema->count > 0 || sema->deleted || forced || isTerminated;
-                                  });
+                    const bool forced = info ? info->forceRelease.load() : false;
+                    const bool isTerminated = info ? info->terminated.load() : false;
+                    return sema->count > 0 || sema->deleted || forced || isTerminated;
                 },
+                WP_SEMA,
                 [&]()
                 {
                     sema->waiters--;
@@ -525,6 +533,7 @@ namespace ps2_syscalls
 
     void SetEventFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         int eid = static_cast<int>(getRegU32(ctx, 4));
         uint32_t bits = getRegU32(ctx, 5);
         auto info = lookupEventFlagInfo(eid);
@@ -569,6 +578,7 @@ namespace ps2_syscalls
 
     void iSetEventFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         SetEventFlag(rdram, ctx, runtime);
     }
 
@@ -711,14 +721,12 @@ namespace ps2_syscalls
 
             info->waiters++;
             waitedWithGuestRelease = true;
-            waitWithGuestExecutionReleasedUntilUnlocked(
-                runtime,
-                lock,
-                [&]()
-                {
-                    Ps2xWaitScope wsync(WP_SYNC_OTHER);
-                    info->cv.wait(lock, satisfied);
-                },
+            ps2xParkArg(((uint64_t)mode << 32) | waitBits);   // [statesync] the pattern this park depends on
+            // [fibers] Event flags are set by other guest threads. `satisfied` only tests the
+            // pattern; the clear-on-wake happens in finishFn, so re-evaluating it is side-effect
+            // free -- which the fiber path requires.
+            waitGuestUntil(
+                runtime, lock, info->cv, satisfied, WP_SYNC_OTHER,
                 [&]()
                 {
                     info->waiters--;

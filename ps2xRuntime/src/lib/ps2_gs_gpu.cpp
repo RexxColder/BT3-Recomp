@@ -1,3 +1,4 @@
+#include "runtime/ps2_netplay.h"   // [vpdrop] follow the netplay player
 #include "runtime/ps2_guestprof.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_pgs.h"   // [pgs]
@@ -613,6 +614,8 @@ void GS::reset()
         m_ctx[i].xyoffset = {0, 0};
     }
 }
+
+static uint16_t g_vpBaseOfx[2] = {0, 0};   // [vpwide] see the SCISSOR/XYOFFSET handlers
 
 GSContext &GS::activeContext()
 {
@@ -3302,6 +3305,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         int ci = (regAddr == GS_REG_XYOFFSET_2) ? 1 : 0;
         m_ctx[ci].xyoffset.ofx = static_cast<uint16_t>(value & 0xFFFF);
         m_ctx[ci].xyoffset.ofy = static_cast<uint16_t>((value >> 32) & 0xFFFF);
+        g_vpBaseOfx[ci] = m_ctx[ci].xyoffset.ofx;   // [vpwide] pristine value for recentring
         break;
     }
     case GS_REG_PRMODECONT:
@@ -3344,6 +3348,37 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_ctx[ci].scissor.x1 = static_cast<uint16_t>((value >> 16) & 0x7FF);
         m_ctx[ci].scissor.y0 = static_cast<uint16_t>((value >> 32) & 0x7FF);
         m_ctx[ci].scissor.y1 = static_cast<uint16_t>((value >> 48) & 0x7FF);
+        // [vpwide] PS2X_VPWIDE=1|2 -- widen the kept player's splitscreen viewport to the FULL
+        // frame. Measured on oursplit.gs: 31.3% of viewport-1's drawing kicks land OUTSIDE its
+        // own 0..254 scissor (window X spans -1784..+2302), i.e. VU1 does NOT clip to the
+        // viewport -- the SCISSOR is the only thing cropping each player to their half. So the
+        // surrounding world is already in the stream and widening the box reveals it, with no
+        // projection change and no guest edit. Use with PS2X_VPKEEP to drop the other player.
+        // y1>=400 qualifies "full-height scene viewport" and keeps the 256-tall glow page
+        // (scissor 0,255,0,255) out of this.
+        {
+            static const int s_wide = [](){ const char *v = ::getenv("PS2X_VPWIDE");
+                                            return (v && v[0]) ? std::atoi(v) : 0; }();
+            if (s_wide && m_ctx[ci].scissor.y1 >= 400)
+            {
+                const uint16_t x0 = m_ctx[ci].scissor.x0, x1 = m_ctx[ci].scissor.x1;
+                // Widening alone leaves the picture OFF-CENTRE: the kept half's content stays
+                // centred where its old viewport was (127 or 384) instead of 255.5. XYOFFSET
+                // shifts where vertices land, so nudge it by the same 128 px, opposite ways.
+                // 12.4 fixed point -> 128 px == 2048.
+                const uint16_t base = g_vpBaseOfx[ci] ? g_vpBaseOfx[ci] : m_ctx[ci].xyoffset.ofx;
+                if (s_wide == 1 && x0 == 0 && x1 > 0 && x1 <= 255)
+                {
+                    m_ctx[ci].scissor.x1 = 511;
+                    m_ctx[ci].xyoffset.ofx = static_cast<uint16_t>(base + 2048u);
+                }
+                else if (s_wide == 2 && x0 >= 256)
+                {
+                    m_ctx[ci].scissor.x0 = 0;
+                    m_ctx[ci].xyoffset.ofx = static_cast<uint16_t>(base - 2048u);
+                }
+            }
+        }
         // PS2X_SCIWATCH: context-2 draws (the fight's ground mesh) see an EMPTY scissor
         // (x0>x1) + garbage zbp — some write scatters junk into ctx2 registers. Log every
         // SCISSOR write; flag inverted rects with the raw value + source path
@@ -4042,6 +4077,40 @@ void GS::vertexKick(bool drawing)
 
     if (!drawing)
         goto slideWindow; // ADC kick: no rasterization, but the window still advances
+
+    // [vpdrop] PS2X_VPKEEP=1|2 -- "online, each player full-screen" experiment. In a 2P fight
+    // BT3 splits LEFT/RIGHT via SCISSOR (measured on oursplit.gs: P1 = x 0..254, P2 = x 257..511,
+    // 38751 vs 38752 kicks). An online client would render only its own half, so this drops the
+    // other one to see whether the SHARED post-passes (shadow fbp 224, glow/outline fbp
+    // 336/368/502/504 -- all full-width, once per frame, AFTER both viewports) still produce a
+    // correct picture for the half that survives.
+    // Suppression goes through the ADC path deliberately: the window bookkeeping above MUST
+    // still run, or strips assemble from stale slots (see the note above this switch).
+    // Full-width draws are never dropped -- that is the HUD and the post-passes, which are
+    // shared rather than per-viewport.
+    {
+        static const int s_vpEnv = [](){ const char *v = ::getenv("PS2X_VPKEEP");
+                                         return (v && v[0]) ? std::atoi(v) : 0; }();
+        const int s_vpKeep = s_vpEnv ? s_vpEnv : (ps2NetActive() ? ps2NetLocalPlayer() : 0);   // follow netplay: host = 1, joiner = 2
+        if (s_vpKeep)
+        {
+            // Scissor X alone is NOT enough to identify a viewport: the glow/outline page
+            // (fbp 336, fbw 4) draws with scissor (0,255,0,255), which an x-only test reads as
+            // "the left viewport" -- dropping it corrupted the shared outline buffer and put a
+            // grey character-silhouette blob on screen. The real viewports are FULL HEIGHT on
+            // the 512-wide scene buffer, so qualify on that too.
+            const GSContext &gc = activeContext();
+            const GSScissorReg &sc = gc.scissor;
+            const bool sceneTarget = (gc.frame.fbw >= 8 && sc.y1 >= 400);
+            const bool leftVp  = sceneTarget && (sc.x0 == 0 && sc.x1 > 0 && sc.x1 <= 255);
+            const bool rightVp = sceneTarget && (sc.x0 >= 256);
+            // [netview] symmetric full-screen views carry a mark in the scissor's TOP row: player 1 y0 = 1, player 2 y0 = 2
+            const bool p1Full  = sceneTarget && (sc.x0 == 0 && sc.x1 == 511 && sc.y0 == 1);
+            const bool p2Full  = sceneTarget && (sc.x0 == 0 && sc.x1 == 511 && sc.y0 == 2);
+            if ((s_vpKeep == 1 && (rightVp || p2Full)) || (s_vpKeep == 2 && (leftVp || p1Full)))
+                goto slideWindow;
+        }
+    }
 
     {
         {   // [zkick] PS2X_ZKICK=1: at the DRAWING kick, before any rasteriser cull, does the

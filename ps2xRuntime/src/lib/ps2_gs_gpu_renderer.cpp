@@ -6966,6 +6966,12 @@ std::map<uint32_t, int> g_bsPages; long g_bsCmds = 0; std::map<int, int> g_bsSeg
 std::atomic<uint64_t> g_gsGuestSwapCount{0};   // [cdgate] guest frames published (read by the CD-tick pump)
 void GsGpuRenderer::swapFrame()
 {
+    {   // [netjump] hold the picture while the menu transition runs, so the versus / battle-type
+        // menus are never seen being operated. Counts down here so a stuck transition self-heals.
+        extern std::atomic<int> g_netJumpHold;
+        int h = g_netJumpHold.load(std::memory_order_relaxed);
+        if (h > 0) { g_netJumpHold.store(h - 1, std::memory_order_relaxed); return; }
+    }
     ps2x_pgs::onSwap();   // [pgs] flush + scanout + readback of the paraLLEl-GS frame (no-op when off)
     flushStage();   // [recstage]
     g_gsGuestSwapCount.fetch_add(1, std::memory_order_relaxed);

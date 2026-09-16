@@ -25,6 +25,11 @@ namespace ps2_stubs
     public:
         static PadEvdevLinux &instance();
 
+        // Off when the SDL2 pad backend is live: SDL reads evdev itself, and a second reader of
+        // the same node would double up every input. Set once at startup by ps2x_pad::init().
+        static void setEnabled(bool on);
+        static bool enabled();
+
         void update();
 
         bool isAvailable() const;

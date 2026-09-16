@@ -1,8 +1,12 @@
 #include "Common.h"
 #include "Pad.h"
 #include "runtime/pad_config.h"
+#include "runtime/ps2_host_pad.h"
 
 #include <atomic>
+#include <map>
+#include <set>
+#include <string>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -29,7 +33,7 @@ namespace ps2_stubs
         {
             for (int g = 0; g < 8; ++g)
             {
-                if (IsGamepadAvailable(g))
+                if (ps2x_pad::available(g))
                 {
                     return g;
                 }
@@ -54,6 +58,20 @@ namespace ps2_stubs
         constexpr uint16_t kPadBtnCross = 1u << 14;
         constexpr uint16_t kPadBtnSquare = 1u << 15;
 
+        // [inrec] Deterministic input record/replay -- the seam ONLINE PLAY will use.
+        //   PS2X_INREC=<file>   append the pad state each frame
+        //   PS2X_INPLAY=<file>  feed it back instead of the host pads
+        // Recording a fight once and replaying it twice is how same-machine determinism gets
+        // tested (diff the [dethash] logs); later the same override point takes the REMOTE
+        // player's buttons off a socket instead of out of a file, which is why this lives here
+        // rather than in a test harness.
+        // Keyed on (frame, port, slot) and overwritten within a frame, so a pad read twice in
+        // one frame replays identically -- more deterministic than honouring read order.
+        #pragma pack(push, 1)
+        struct Ps2xInRecEntry { uint32_t frame; uint8_t port, slot; uint16_t buttons; uint8_t rx, ry, lx, ly; };
+        #pragma pack(pop)
+        static_assert(sizeof(Ps2xInRecEntry) == 12, "input record must stay 12 bytes");
+
         struct PadInputState
         {
             uint16_t buttons = 0xFFFF; // active-low
@@ -62,6 +80,41 @@ namespace ps2_stubs
             uint8_t lx = kPadAnalogCenter;
             uint8_t ly = kPadAnalogCenter;
         };
+
+        std::mutex g_inRecMutex;
+        // [inrec] startup banner -- runs at static-init, so it reports the env even if the pad
+        // path below is never reached. Distinguishes "var missing" from "hook not on the path".
+        static const bool g_inRecBanner = [](){
+            const char *r = std::getenv("PS2X_INREC"); const char *p3 = std::getenv("PS2X_INPLAY");
+            std::fprintf(stderr, "[inrec] startup: PS2X_INREC=%s PS2X_INPLAY=%s\n", r && r[0] ? r : "(unset)", p3 && p3[0] ? p3 : "(unset)");
+            return true; }();
+        static std::FILE *ps2xInRecFile()
+        {
+            static std::FILE *f = [](){ const char *p2 = std::getenv("PS2X_INREC");
+                                        if (!p2 || !p2[0]) { std::fprintf(stderr, "[inrec] PS2X_INREC not set -- not recording\n"); return (std::FILE *)nullptr; }
+                                        std::FILE *h = std::fopen(p2, "wb");
+                                        std::fprintf(stderr, h ? "[inrec] recording pad input to %s\n"
+                                                               : "[inrec] FAILED to open %s for writing\n", p2);
+                                        return h; }();
+            return f;
+        }
+        static const std::map<uint64_t, Ps2xInRecEntry> &ps2xInPlayMap()
+        {
+            static const std::map<uint64_t, Ps2xInRecEntry> m = [](){
+                std::map<uint64_t, Ps2xInRecEntry> out;
+                const char *p2 = std::getenv("PS2X_INPLAY");
+                if (!p2 || !p2[0]) return out;
+                std::FILE *h = std::fopen(p2, "rb");
+                if (!h) { std::fprintf(stderr, "[inrec] FAILED to open %s for replay\n", p2); return out; }
+                Ps2xInRecEntry e{};
+                while (std::fread(&e, sizeof e, 1, h) == 1)
+                    out[(uint64_t(e.frame) << 16) | (uint64_t(e.port) << 8) | e.slot] = e;
+                std::fclose(h);
+                std::fprintf(stderr, "[inrec] replaying %zu pad samples from %s\n", out.size(), p2);
+                return out; }();
+            return m;
+        }
+        static bool ps2xInPlayActive() { static const bool on = !ps2xInPlayMap().empty(); return on; }
 
         struct PadPortState
         {
@@ -186,8 +239,15 @@ namespace ps2_stubs
             data[19] = pressureValue(state, portState, kPadBtnR2);
         }
 
+        static void inrecTrace(const char *what)
+        {   // one line per distinct site, once
+            static std::mutex m; static std::set<std::string> seen;
+            std::lock_guard<std::mutex> lk(m);
+            if (seen.insert(what).second) std::fprintf(stderr, "[inrec] path: %s\n", what);
+        }
         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
         {
+            inrecTrace("readPadPortData entered");
             if (!outData)
             {
                 return false;
@@ -199,6 +259,7 @@ namespace ps2_stubs
                 const PadPortState *sharedPortState = lookupPadPortStateLocked(port, slot);
                 if (!sharedPortState || !sharedPortState->open)
                 {
+                    inrecTrace("readPadPortData EARLY-OUT: port not open");
                     return false;
                 }
                 portState = *sharedPortState;
@@ -242,6 +303,36 @@ namespace ps2_stubs
                 }
             }
 
+            {   // [inrec] replay overrides the host pads; recording captures whatever was sampled.
+                // Resolve the recorder FIRST, unconditionally: its banner then prints on the very
+                // first pad read whatever the mode, which distinguishes "PS2X_INREC was not set"
+                // from "this code path is never reached" -- the two were indistinguishable when
+                // the open was hidden inside the else-branch.
+                std::FILE *const recFile = ps2xInRecFile();
+                const uint32_t fr = static_cast<uint32_t>(ps2xInputLogFrame());
+                const uint64_t key = (uint64_t(fr) << 16) | (uint64_t(uint8_t(port)) << 8) | uint8_t(slot);
+                if (ps2xInPlayActive())
+                {
+                    const auto &m = ps2xInPlayMap();
+                    const auto it = m.find(key);
+                    if (it != m.end())
+                    {
+                        state.buttons = it->second.buttons;
+                        state.rx = it->second.rx; state.ry = it->second.ry;
+                        state.lx = it->second.lx; state.ly = it->second.ly;
+                    }
+                    else
+                    {
+                        state = PadInputState{};   // nothing recorded for this frame: neutral, never a live pad
+                    }
+                }
+                else if (std::FILE *h = recFile)
+                {
+                    const Ps2xInRecEntry e{fr, uint8_t(port), uint8_t(slot), state.buttons, state.rx, state.ry, state.lx, state.ly};
+                    std::lock_guard<std::mutex> lk(g_inRecMutex);
+                    std::fwrite(&e, sizeof e, 1, h);
+                }
+            }
             fillPadStatus(outData, state, portState);
 
             {
@@ -562,6 +653,7 @@ namespace ps2_stubs
             return;
         }
 
+        inrecTrace("scePadRead called");
         if (!readPadPortData(port, slot, runtime, data, dataAddr))
         {
             setReturnS32(ctx, 0);
@@ -573,7 +665,7 @@ namespace ps2_stubs
             {
                 const int gamepad = firstAvailableGamepad();
                 const bool gamepadStartPressed =
-                    (gamepad >= 0) && IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT);
+                    (gamepad >= 0) && ps2x_pad::buttonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT);
                 const bool startPressed = (data[2] != 0xFFu || data[3] != 0xFFu ||
                                            IsKeyDown(KEY_ENTER) || gamepadStartPressed);
                 if (startPressed)

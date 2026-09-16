@@ -1,3 +1,4 @@
+#include "ps2_waitprof.h"   // [fibers] WP_* wait points used by waitGuestUntil
 struct ThreadExitException final : public std::exception
 {
     const char *what() const noexcept override
@@ -31,23 +32,57 @@ static void waitWithGuestExecutionReleasedUntilUnlocked(PS2Runtime *runtime,
                                                         WaitFn waitFn,
                                                         FinishFn finishFn)
 {
-    auto releaseGuestExecution = std::make_unique<PS2Runtime::GuestExecutionReleaseScope>(runtime);
-
-    waitFn();
-    finishFn();
-
-    if (lock.owns_lock())
+    // [rollback] A stack object, not a unique_ptr: a fiber parked inside waitFn() is restored from
+    // its stack by a rollback, and a restored frame must not point at heap that was freed since.
+    // The ordering the heap version bought is kept by scoping: the local lock is released BEFORE
+    // this scope's destructor reacquires guest execution.
     {
-        lock.unlock();
-    }
+        PS2Runtime::GuestExecutionReleaseScope releaseGuestExecution(runtime);
 
-    releaseGuestExecution.reset();
+        waitFn();
+        finishFn();
+
+        if (lock.owns_lock())
+        {
+            lock.unlock();
+        }
+    }
 }
 
 template <typename Lock, typename WaitFn>
 static void waitWithGuestExecutionReleasedUntilUnlocked(PS2Runtime *runtime, Lock &lock, WaitFn waitFn)
 {
     waitWithGuestExecutionReleasedUntilUnlocked(runtime, lock, waitFn, []() {});
+}
+
+// [fibers] Predicate form. Prefer this over passing a lambda that calls cv.wait directly: it hands
+// the wait to PS2Runtime::guestWait, which under PS2X_FIBERS parks the calling guest fiber in the
+// scheduler instead of blocking the host thread that every other guest fiber shares. On the default
+// thread path it is the same condition_variable wait as before.
+//
+// The predicate MUST be re-checkable: under fibers it is evaluated every time the fiber is
+// scheduled, not once per notify, so it has to describe the condition rather than consume it.
+template <typename Lock, typename Pred, typename FinishFn>
+static void waitGuestUntil(PS2Runtime *runtime, Lock &lock, std::condition_variable &cv,
+                           Pred pred, int waitPoint, FinishFn finishFn)
+{
+    waitWithGuestExecutionReleasedUntilUnlocked(
+        runtime, lock,
+        [&]()
+        {
+            // Ps2xWaitScope (the [waitprof] per-site bracket) is not visible from this header, and
+            // the null-runtime path is a fallback that guest code never takes, so it goes without.
+            if (runtime) runtime->guestWaitT(cv, lock, pred, waitPoint);   // [rollback] heap-free: pred stays on this stack
+            else { (void)waitPoint; cv.wait(lock, pred); }
+        },
+        finishFn);
+}
+
+template <typename Lock, typename Pred>
+static void waitGuestUntil(PS2Runtime *runtime, Lock &lock, std::condition_variable &cv,
+                           Pred pred, int waitPoint)
+{
+    waitGuestUntil(runtime, lock, cv, pred, waitPoint, []() {});
 }
 
 static void waitWhileSuspended(const std::shared_ptr<ThreadInfo> &info, PS2Runtime *runtime = nullptr)
@@ -63,14 +98,11 @@ static void waitWhileSuspended(const std::shared_ptr<ThreadInfo> &info, PS2Runti
         info->waitId = 0;
 
         bool terminated = false;
-        waitWithGuestExecutionReleasedUntilUnlocked(
-            runtime,
-            lock,
-            [&]()
-            {
-                info->cv.wait(lock, [&]()
-                              { return info->suspendCount == 0 || info->terminated.load(); });
-            },
+        // [fibers] Same shape as SuspendThread: the resumer is another guest thread.
+        waitGuestUntil(
+            runtime, lock, info->cv,
+            [&]() { return info->suspendCount == 0 || info->terminated.load(); },
+            WP_SYNC_OTHER,
             [&]()
             {
                 terminated = info->terminated.load();

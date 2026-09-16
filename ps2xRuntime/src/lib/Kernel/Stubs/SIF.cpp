@@ -1,4 +1,6 @@
 #include "Common.h"
+#include "runtime/ps2_statesync.h"   // [statesync]
+extern "C" bool ps2xAudioFeedOn();   // [rollback] ps2_runtime.cpp: false while re-simulating / fast-forwarding
 #include "SIF.h"
 #include "../Syscalls/RPC.h"
 
@@ -821,7 +823,12 @@ namespace ps2_stubs
                         const uint8_t *p = (xfer.size >= 256)
                                                ? getConstMemPtr(rdram, xfer.src)
                                                : nullptr;
-                        if (p)
+                        if (p && !ps2xAudioFeedOn())
+                        {   // [rollback] a re-simulated (or fast-forwarded) transfer: the device already heard this
+                            runtime->audioBackend().noteStreamGap(
+                                streamId, static_cast<uint32_t>(xfer.size));
+                        }
+                        else if (p)
                         {
                             runtime->audioBackend().onStreamPcm(
                                 streamId,
@@ -1119,4 +1126,65 @@ namespace ps2_stubs
     {
         setReturnS32(ctx, 0);
     }
+}
+
+// [rollback] The SIF stub's host state: the DMA transfer-id counter the guest stores into its sound
+// packets (the write-watch found a rolled-back re-run continuing from the FUTURE id), the SIF
+// registers, command handlers and buffers, and the IOP heap allocations. Captured/restored with
+// the kernel snapshot (Thread.cpp).
+namespace
+{
+    struct SifSnap
+    {
+        uint32_t nextDmaId = 1u, cmdBuffer = 0u, sysCmdBuffer = 0u, heapNext = 0u;
+        bool cmdInitialized = false;
+        std::unordered_map<uint32_t, uint32_t> regs, sregs, cmdHandlers;
+        std::map<uint32_t, uint32_t> heap;
+    };
+}
+extern "C" void *ps2xSifStateCapture()
+{
+    SifSnap *s = new SifSnap();
+    { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifDmaTransferMutex); s->nextDmaId = ps2_stubs::g_nextSifDmaTransferId; }
+    { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifCmdStateMutex); s->regs = ps2_stubs::g_sifRegs; s->sregs = ps2_stubs::g_sifSregs;
+      s->cmdHandlers = ps2_stubs::g_sifCmdHandlers; s->cmdBuffer = ps2_stubs::g_sifCmdBuffer; s->sysCmdBuffer = ps2_stubs::g_sifSysCmdBuffer;
+      s->cmdInitialized = ps2_stubs::g_sifCmdInitialized; }
+    { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifHeapMutex); s->heap = ps2_stubs::g_sifHeapAllocations;
+      s->heapNext = g_iopHeapNext; }   // [statesync] the bump cursor, so a synced peer allocates the same IOP addresses
+    return s;
+}
+extern "C" bool ps2xSifStateRestore(void *h)
+{
+    const SifSnap *s = static_cast<const SifSnap *>(h);
+    if (!s) return false;
+    { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifDmaTransferMutex); ps2_stubs::g_nextSifDmaTransferId = s->nextDmaId; }
+    { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifCmdStateMutex); ps2_stubs::g_sifRegs = s->regs; ps2_stubs::g_sifSregs = s->sregs;
+      ps2_stubs::g_sifCmdHandlers = s->cmdHandlers; ps2_stubs::g_sifCmdBuffer = s->cmdBuffer; ps2_stubs::g_sifSysCmdBuffer = s->sysCmdBuffer;
+      ps2_stubs::g_sifCmdInitialized = s->cmdInitialized; }
+    { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifHeapMutex); ps2_stubs::g_sifHeapAllocations = s->heap;
+      if (s->heapNext) g_iopHeapNext = s->heapNext; }
+    return true;
+}
+extern "C" void ps2xSifStateFree(void *h) { delete static_cast<SifSnap *>(h); }
+// [statesync] portable form
+extern "C" bool ps2xSifStateSerialize(const void *h, std::vector<uint8_t> &out)
+{
+    const SifSnap *s = static_cast<const SifSnap *>(h);
+    if (!s) return false;
+    Ps2xByteW w(out);
+    w.u32(0x53494631u);   // 'SIF1'
+    w.u32(s->nextDmaId); w.u32(s->cmdBuffer); w.u32(s->sysCmdBuffer); w.u32(s->heapNext); w.u8(s->cmdInitialized);
+    w.podUMap(s->regs); w.podUMap(s->sregs); w.podUMap(s->cmdHandlers); w.podMap(s->heap);
+    return true;
+}
+extern "C" void *ps2xSifStateDeserialize(const uint8_t *data, size_t n, size_t *used)
+{
+    Ps2xByteR r(data, n);
+    if (r.u32() != 0x53494631u) return nullptr;
+    SifSnap *s = new SifSnap();
+    s->nextDmaId = r.u32(); s->cmdBuffer = r.u32(); s->sysCmdBuffer = r.u32(); s->heapNext = r.u32(); s->cmdInitialized = r.u8() != 0;
+    r.podUMap(s->regs); r.podUMap(s->sregs); r.podUMap(s->cmdHandlers); r.podMap(s->heap);
+    if (!r.ok) { delete s; return nullptr; }
+    if (used) *used = (size_t)(r.p - data);
+    return s;
 }

@@ -306,8 +306,14 @@ namespace ps2_stubs
         rebuildRawState();
     }
 
+    static bool s_evdevEnabled = true;
+    void PadEvdevLinux::setEnabled(bool on) { s_evdevEnabled = on; }
+    bool PadEvdevLinux::enabled() { return s_evdevEnabled; }
+
     void PadEvdevLinux::update()
     {
+        if (!s_evdevEnabled)
+            return;
         if (m_fd < 0)
         {
             // [perf] Rescan /dev/input ONLY when its contents change. The timed rescan
@@ -529,7 +535,7 @@ namespace ps2_stubs
 
     bool PadEvdevLinux::isAvailable() const
     {
-        return m_ready && m_fd >= 0;
+        return s_evdevEnabled && m_ready && m_fd >= 0;
     }
 
     bool PadEvdevLinux::isOpen() const
