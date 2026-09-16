@@ -17,6 +17,9 @@
 #include <atomic>
 #include <string>
 #include <vector>
+#include <chrono>
+#include <map>
+#include <algorithm>
 #include "raylib.h"
 extern "C" const char *ps2xExeDirC();   // [mergefix] main.cpp
 
@@ -327,17 +330,22 @@ bool loadReplacement(const TexIdent &id, uint64_t texKey, std::vector<uint8_t> &
     std::lock_guard<std::mutex> lk(st->mtx);
     auto rd = st->ready.find(key);
     if (rd != st->ready.end())
-    {
+    {   // [texreplace-persist] COPY the blob out instead of consuming it. The old one-shot
+        // move+erase made every re-decode of the same texture MISS: the original drew again
+        // until the worker re-decoded it, so the 2D UI visibly cycled original -> new -> original
+        // every few seconds. Keep the decoded blob cached (bounded by PS2X_TEXPACK_CACHE_MB,
+        // oldest-first eviction) so any re-decode is a stable HIT. PS2X_TEXPACK_ONESHOT=1
+        // restores the old consume-on-use behaviour.
+        static const bool s_oneShot = [](){ const char *v = std::getenv("PS2X_TEXPACK_ONESHOT"); return v && v[0] && v[0] != '0'; }();
         Blob &b = rd->second;
-        rgba = std::move(b.rgba); w = b.w; h = b.h; fmt = b.fmt;
-        st->readyBytes -= rgba.size();
-        st->ready.erase(rd);
+        rgba = b.rgba; w = b.w; h = b.h; fmt = b.fmt;
         st->swap.erase(texKey);
         ++st->consumed;
+        if (s_oneShot) { st->readyBytes -= rgba.size(); st->ready.erase(rd); }
         {   static unsigned long s_n = 0;
             if (++s_n <= 3 || (s_n % 500) == 0)
-                std::fprintf(stderr, "[texpackasync] swapped in #%lu (decoded %lu, dropped %lu, pending %zu)\n",
-                             s_n, st->decoded, st->dropped, st->pending.size()); }
+                std::fprintf(stderr, "[texpackasync] swapped in #%lu (decoded %lu, dropped %lu, pending %zu)%s\n",
+                             s_n, st->decoded, st->dropped, st->pending.size(), s_oneShot ? "" : " [persistent]"); }
         return true;
     }
     if (st->failed.count(key) || st->pending.count(key)) return false;
@@ -355,5 +363,124 @@ bool takeReadySwap(uint64_t texKey)
     if (it == g_async->swap.end()) return false;
     g_async->swap.erase(it);
     return true;
+}
+
+// ---------------------------------------------------------------- [texmega]
+namespace
+{
+    std::string s_megaDir;
+    FILE *s_megaLookup = nullptr;
+    std::mutex s_megaMx;
+    std::atomic<long long> s_megaUntilMs{0};
+    std::unordered_set<uint64_t> s_megaPngDone;
+    unsigned long s_megaN = 0, s_megaHit = 0, s_megaMiss = 0, s_megaPng = 0;
+    std::map<uint32_t, unsigned long> s_megaMissByPsm;
+    std::map<std::string, unsigned long> s_megaMissByName;
+    bool s_megaFinalized = true;
+
+    long long megaNowMs()
+    {
+        using namespace std::chrono;
+        return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    }
+
+    // Write an RGBA8 buffer as a PNG next to the dump. Bounded; best-effort.
+    void megaPng(const std::string &name, const uint8_t *rgba, int w, int h)
+    {
+        if (!rgba || w <= 0 || h <= 0 || s_megaPng >= 800u) return;
+        Image img(static_cast<void *>(const_cast<uint8_t *>(rgba)), w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+        const std::string p = s_megaDir + "/" + name + ".png";
+        if (ExportImage(img, p.c_str())) ++s_megaPng;
+    }
+
+    void megaFinalizeLocked()
+    {
+        if (s_megaLookup)
+        {
+            FILE *f = std::fopen((s_megaDir + "/summary.txt").c_str(), "w");
+            if (f)
+            {
+                std::fprintf(f, "[texmega] lookups=%lu hit=%lu miss=%lu pngs=%lu\n",
+                             s_megaN, s_megaHit, s_megaMiss, s_megaPng);
+                std::fprintf(f, "miss by psm:\n");
+                for (auto &kv : s_megaMissByPsm) std::fprintf(f, "  psm=%u : %lu\n", kv.first, kv.second);
+                std::fprintf(f, "top misses:\n");
+                std::vector<std::pair<unsigned long, std::string>> v;
+                for (auto &kv : s_megaMissByName) v.push_back({kv.second, kv.first});
+                std::sort(v.rbegin(), v.rend());
+                for (size_t i = 0; i < v.size() && i < 60; ++i)
+                    std::fprintf(f, "  %lu  %s\n", v[i].first, v[i].second.c_str());
+                std::fclose(f);
+            }
+            std::fclose(s_megaLookup);
+            s_megaLookup = nullptr;
+        }
+        s_megaFinalized = true;
+    }
+
+    // Called under s_megaMx at entry.
+    bool megaEnsureOpen()
+    {
+        if (!s_megaFinalized && megaNowMs() > s_megaUntilMs.load(std::memory_order_relaxed))
+            megaFinalizeLocked();
+        return s_megaLookup != nullptr;
+    }
+}
+
+void megaArm(const char *dir, double seconds)
+{
+    std::lock_guard<std::mutex> lk(s_megaMx);
+    if (s_megaLookup) megaFinalizeLocked();
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    s_megaDir = dir ? dir : ".";
+    s_megaLookup = std::fopen((s_megaDir + "/texlookup.tsv").c_str(), "w");
+    if (s_megaLookup)
+        std::fprintf(s_megaLookup, "result\ttex0Hash\tclutHash\tbits\tname\ttexKey\ttbp0\ttbw\tpsm\ttw\tth\thorig\trep_fmt\trep_wh\n");
+    s_megaPngDone.clear();
+    s_megaN = s_megaHit = s_megaMiss = s_megaPng = 0;
+    s_megaMissByPsm.clear(); s_megaMissByName.clear();
+    s_megaUntilMs.store(megaNowMs() + (long long)(seconds * 1000.0), std::memory_order_relaxed);
+    s_megaFinalized = false;
+}
+
+bool megaActive()
+{
+    std::lock_guard<std::mutex> lk(s_megaMx);
+    return megaEnsureOpen();
+}
+
+void megaDumpIndex()
+{
+    std::call_once(g_once, buildIndex);
+    std::lock_guard<std::mutex> lk(s_megaMx);
+    if (s_megaDir.empty()) return;
+    FILE *f = std::fopen((s_megaDir + "/texpack_index.tsv").c_str(), "w");
+    if (!f) return;
+    std::fprintf(f, "pairKey\tpath\n");
+    for (auto &kv : g_index) std::fprintf(f, "%016llx\t%s\n", (unsigned long long)kv.first, kv.second.c_str());
+    std::fclose(f);
+}
+
+void megaLookup(const TexIdent &id, uint64_t texKey, uint32_t tbp0, uint32_t tbw,
+                uint8_t psm, uint8_t tw, uint8_t th, bool hit,
+                const uint8_t *origRgba, int ow, int oh,
+                const uint8_t *repRgba, int rw, int rh, int rfmt)
+{
+    std::lock_guard<std::mutex> lk(s_megaMx);
+    if (!megaEnsureOpen()) return;
+    const std::string nm = id.name();
+    std::fprintf(s_megaLookup, "%s\t%016llx\t%016llx\t%08x\t%s\t%llx\t%u\t%u\t%u\t%u\t%u\t%dx%d\t%d\t%dx%d\n",
+                 hit ? "HIT" : "MISS", (unsigned long long)id.tex0Hash, (unsigned long long)id.clutHash,
+                 id.bits, nm.c_str(), (unsigned long long)texKey, tbp0, tbw, psm, tw, th, ow, oh, rfmt, rw, rh);
+    ++s_megaN;
+    if (hit) ++s_megaHit; else { ++s_megaMiss; ++s_megaMissByPsm[psm]; ++s_megaMissByName[nm]; }
+    // Dump the ORIGINAL decode and, when present, the replacement -- one PNG pair per identity.
+    const uint64_t dn = id.tex0Hash ^ (id.clutHash << 1);
+    if (s_megaPngDone.insert(dn).second)
+    {
+        megaPng(nm + "_orig", origRgba, ow, oh);
+        if (repRgba && rfmt == 0) megaPng(nm + "_new", repRgba, rw, rh);
+    }
 }
 }

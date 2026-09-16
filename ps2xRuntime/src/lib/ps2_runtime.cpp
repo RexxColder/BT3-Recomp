@@ -21,6 +21,31 @@
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_gpu_renderer.h"
 
+#if defined(_WIN32)
+// [d3d11] Native video device. Present path only for now (PS2X_D3D11=1): the GS still
+// renders through the existing GL renderer until it is ported (P3); this swaps the final
+// presentation from raylib's GL swap chain to a D3D11 one on raylib's own HWND.
+#include "gfx/d3d11/D3D11Device.h"
+#include "gfx/d3d11/D3D11Gfx.h"
+#include "gfx/d3d11/gs_shader_hlsl.h"
+#include "gfx/video_state.h"
+#include "gfx/ps2x_ui.h"
+extern "C" const char *ps2xExeDirC();   // [mergefix] main.cpp: <exeDir>
+namespace
+{
+    ps2x::gfx::D3D11Device g_ps2xD3D11;
+    bool g_ps2xD3D11Mode = false;   // PS2X_D3D11=1 and the device came up
+
+    // [d3d11] Present bridge: the GS still renders through GL, so the D3D11 present reads the
+    // presented texture back to CPU and blits it. Replaced by the native GS port (P3.3).
+    ps2x::gfx::Renderer g_d3dBlit;
+    ps2x::gfx::Shader   g_d3dBlitShader;
+    ps2x::gfx::Texture  g_d3dPresent;
+    bool g_d3dBlitInit = false;
+    std::vector<unsigned char> g_d3dPresentPx;
+}
+#endif
+
 #if defined(__linux__)
 #include "runtime/pad_evdev_linux.h"
 #include <pthread.h>
@@ -1217,7 +1242,14 @@ bool PS2Runtime::initialize(const char *title)
             if (v && v[0] && v[0] != '0') SetConfigFlags(FLAG_VSYNC_HINT);
         }
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        int hostWinW = HOST_WINDOW_WIDTH, hostWinH = HOST_WINDOW_HEIGHT;
+        if (const char *w = std::getenv("PS2X_WINDOW_W")) { const int v = std::atoi(w); if (v > 0) hostWinW = v; }
+        if (const char *h = std::getenv("PS2X_WINDOW_H")) { const int v = std::atoi(h); if (v > 0) hostWinH = v; }
+        InitWindow(hostWinW, hostWinH, title);
+        {   // [monitor] PS2X_MONITOR=<index>: move the window to that monitor (0 = primary).
+            const char *mon = std::getenv("PS2X_MONITOR");
+            if (mon && mon[0]) { const int idx = std::atoi(mon); if (idx >= 0 && idx < GetMonitorCount()) SetWindowMonitor(idx); }
+        }
         // [icon] Carry the launcher's icon onto the runner window. Same asset
         // convention as the overlay font (<exeDir>/assets/icon.png); exeDir is
         // PS2X_EXEDIR (deploy root) else the executable's own directory.
@@ -1264,6 +1296,27 @@ bool PS2Runtime::initialize(const char *title)
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
+#if defined(_WIN32)
+        {   // [d3d11] Native D3D11 present is the DEFAULT on Windows (PS2X_D3D11=0 disables it).
+            // raylib keeps the window, input and audio; the video present is native.
+            const char *d3dv = std::getenv("PS2X_D3D11");
+            const bool wantD3D = !(d3dv && d3dv[0] == '0');
+            if (wantD3D)
+            {
+                g_ps2xD3D11Mode = g_ps2xD3D11.Init(GetWindowHandle(),
+                                                   static_cast<uint32_t>(GetScreenWidth()),
+                                                   static_cast<uint32_t>(GetScreenHeight()));
+                if (!g_ps2xD3D11Mode)
+                    std::fprintf(stderr, "[d3d11] init failed; staying on the raylib GL presenter\n");
+                else
+                {
+                    // [vsync] D3D present sync interval. PS2X_VSYNC=0 disables it (present(0)); default on.
+                    { const char *vy = std::getenv("PS2X_VSYNC"); g_ps2xD3D11.SetVSync(!(vy && vy[0] == '0')); }
+                    ps2x::gfx::SetVideoDevice(&g_ps2xD3D11);   // overlay uses imgui_impl_dx11
+                }
+            }
+        }
+#endif
         SetTargetFPS(60);
         {   // [texreplace] Index replacements at STARTUP rather than lazily on the first texture
             // decode, so the overlay's Texture Replacement switch is correctly enabled/disabled
@@ -1271,6 +1324,11 @@ bool PS2Runtime::initialize(const char *title)
             // (The pack lives in <exeDir>/data/Textures -- the deploy's data/ dir next to the
             // extracted ISO tree; the folder is created if absent.)
             ps2tex::replacementsEnabled();
+        }
+        {   // [fps60] PS2X_FPS60=1: enable the 60-fps fight mode from the env (loads fps60_sites.txt,
+            // staged next to the runner). Lets the perf A/B be run without touching settings.toml.
+            const char *f60 = std::getenv("PS2X_FPS60");
+            if (f60 && f60[0] && f60[0] != '0') ps2Set60Fps(true, nullptr);
         }
         {   // [fmvoverride] If the opening-video override is active (env, or Texture Replacement on
             // with the pack installed), serve the pack's opening PSS/ADX in place of the game's.
@@ -4910,6 +4968,225 @@ void PS2Runtime::run()
           if (gpuMode) ps2GpuRenderer().serviceBlockingBarriers();   // [barblock]
           extern double g_fpSbb; g_fpSbb += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t).count(); }
         const auto _tBegin = std::chrono::steady_clock::now();
+#if defined(_WIN32)
+        if (g_ps2xD3D11Mode)
+        {   // [d3d11] Native video frame. The GS replay already ran (renderAndGetTextureId
+            // above); present through the D3D11 swap chain instead of raylib's GL one, so
+            // there is no BeginDrawing/EndDrawing and no GL swap to fight the D3D11 present.
+            // Input still updates through PollInputEvents. Until the GS renderer is ported
+            // (P3) this shows a flat clear.
+            if (IsWindowResized())
+                g_ps2xD3D11.Resize(static_cast<uint32_t>(GetScreenWidth()),
+                                   static_cast<uint32_t>(GetScreenHeight()));
+            PollInputEvents();
+            {   // [diag] PS2X_D3DDUMP=1: write the native present texture to a PNG. PS2X_D3DDUMP=key
+                // dumps ONE frame when the user presses F9 (grab the exact moment to inspect), any
+                // other truthy value dumps periodically.
+                static int s_dumpN = 0;
+                static const char *s_dumpEnv = std::getenv("PS2X_D3DDUMP");
+                if (s_dumpEnv && s_dumpEnv[0] && s_dumpEnv[0] != '0')
+                {
+                    const bool keyMode = (std::strcmp(s_dumpEnv, "key") == 0);
+                    const int n = ++s_dumpN;
+                    const bool fire = keyMode ? (IsKeyPressed(KEY_F9) || n == 1800) : ((n % 60) == 0 && n <= 36000);
+                    if (fire)
+                    {
+                        char p[256];
+                        std::snprintf(p, sizeof p, "C:\\Users\\Rexx\\Desktop\\present_%d.png", n);
+                        bool ok = false;
+                        // Dump whichever texture actually feeds the D3D present: the bridge texture
+                        // (GL replay, uploaded from the readback) when it is valid, else the native RT.
+                        if (g_d3dPresent.Valid())
+                        {
+                            std::vector<uint8_t> buf;
+                            if (ps2x::gfx::ReadbackRGBA(g_ps2xD3D11, g_d3dPresent, buf) && g_d3dPresent.Width() > 0)
+                            {
+                                Image img(static_cast<void *>(buf.data()), (int)g_d3dPresent.Width(),
+                                          (int)g_d3dPresent.Height(), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+                                ok = ExportImage(img, p);
+                            }
+                        }
+                        if (!ok) ok = ps2GpuRenderer().d3dDumpPresent(p);
+                        std::fprintf(stderr, "[d3ddump] frame %d -> %s (%dx%d) ok=%d\n", n, p,
+                                     (int)g_d3dPresent.Width(), (int)g_d3dPresent.Height(), (int)ok);
+                    }
+                }
+            }
+            {   // [texmega] PS2X_TEXMEGA=1: F9 arms a 6-second texture-replacement mega dump
+                // (lookups + originals/replacements + pack index) into <exeDir>/logs/texmega.
+                // [texmega] ON by default so the Launcher (no env) can trigger it: press F9.
+                // PS2X_TEXMEGA=0 disables.
+                static const bool s_tm = [](){ const char *v = std::getenv("PS2X_TEXMEGA"); return !(v && v[0] == '0'); }();
+                if (s_tm && IsKeyPressed(KEY_F9))
+                {
+                    const char *xd = ps2xExeDirC();
+                    const std::string d = std::string((xd && xd[0]) ? xd : ".") + "/logs/texmega";
+                    ps2tex::megaArm(d.c_str(), 6.0);
+                    ps2tex::megaDumpIndex();
+                    std::fprintf(stderr, "[texmega] armed -> %s\n", d.c_str());
+                }
+            }
+            static const bool s_uiTest = [](){ const char *v = std::getenv("PS2X_UI_TEST"); return v && v[0] && v[0] != '0'; }();
+            const ps2x::gfx::Color d3dClear = s_uiTest
+                ? ps2x::gfx::Color{0.85f, 0.85f, 0.90f, 1.0f}   // bright, so the dark ImGui shows
+                : ps2x::gfx::Color{0.06f, 0.07f, 0.10f, 1.0f};
+            g_ps2xD3D11.BeginFrame(d3dClear);
+            // TODO(P3.3): replace this bridge with the native GS replay.
+            if (!g_d3dBlitInit)
+            {
+                g_d3dBlitInit = g_d3dBlit.Init(g_ps2xD3D11) &&
+                    g_d3dBlitShader.Compile(g_ps2xD3D11, ps2x::gfx::kBlitVertexShaderHlsl,
+                                            ps2x::gfx::kBlitFragmentShaderHlsl);
+            }
+            if (g_d3dBlitInit)
+            {
+                // [fmvoverride] D3D path for the opening movie: consume a frame, upload it and
+                // draw it full-window; while it shows, skip the GS present (same as the GL path).
+                bool d3dFmvDrew = false;
+                {
+                    extern std::atomic<uint32_t> g_ps2MovieActive;
+                    ps2x_fmv::FmvOverrideFrame of{};
+                    if (ps2x_fmv::tick(g_ps2MovieActive.load(std::memory_order_relaxed) != 0u, of))
+                    {
+                        static ps2x::gfx::Texture s_fmvTex;
+                        static int s_tw = 0, s_th = 0;
+                        static uint64_t s_gen = ~0ull;
+                        if (!s_fmvTex.Valid() || of.w != s_tw || of.h != s_th)
+                        {
+                            s_fmvTex.Create(g_ps2xD3D11, (uint32_t)of.w, (uint32_t)of.h,
+                                            ps2x::gfx::Format::RGBA8, nullptr);
+                            s_fmvTex.SetSampler(g_ps2xD3D11, ps2x::gfx::Filter::Linear, ps2x::gfx::Wrap::Clamp);
+                            s_tw = of.w; s_th = of.h; s_gen = ~0ull;
+                        }
+                        if (of.gen != s_gen) { s_fmvTex.Update(g_ps2xD3D11, of.rgba); s_gen = of.gen; }
+                        const float W = (float)g_ps2xD3D11.Width(), H = (float)g_ps2xD3D11.Height();
+                        float dw, dh;
+                        if (PS2SettingsOverlay::isWidescreen() || wsTrigActive()) { dw = W; dh = H; }
+                        else { const float s = std::min(W / (float)of.w, H / (float)of.h); dw = of.w * s; dh = of.h * s; }
+                        const float x0 = (W - dw) * 0.5f, y0 = (H - dh) * 0.5f, x1 = x0 + dw, y1 = y0 + dh;
+                        auto ndcX = [&](float x) { return 2.0f * x / W - 1.0f; };
+                        auto ndcY = [&](float y) { return 1.0f - 2.0f * y / H; };
+                        auto mkf = [](float x, float y, float u, float v) {
+                            ps2x::gfx::Vertex vx{}; vx.x = x; vx.y = y; vx.u = u; vx.v = v;
+                            vx.r = vx.g = vx.b = vx.a = 255; vx.q = 1.0f; vx.z = 0.0f; return vx; };
+                        g_d3dBlit.SetShader(&g_d3dBlitShader);
+                        g_d3dBlit.SetTexture(&s_fmvTex);
+                        ps2x::gfx::BlendDesc ab;   // alpha
+                        g_d3dBlit.SetBlend(ab);
+                        g_d3dBlit.DrawQuad(mkf(ndcX(x0), ndcY(y0), 0, 0), mkf(ndcX(x1), ndcY(y0), 1, 0),
+                                           mkf(ndcX(x1), ndcY(y1), 1, 1), mkf(ndcX(x0), ndcY(y1), 0, 1));
+                        d3dFmvDrew = true;
+                    }
+                }
+                void *nativeSrv = d3dFmvDrew ? nullptr : ps2GpuRenderer().d3dPresentSRV();
+                if (nativeSrv)
+                {   // [d3d11 gs] the GS rendered natively into a D3D render target: bind its SRV.
+                    const uint32_t rw = ps2GpuRenderer().d3dPresentWidth();
+                    const uint32_t rh = ps2GpuRenderer().d3dPresentHeight();
+                    static ps2x::gfx::Texture s_rtTex;
+                    static void *s_lastSrv = (void *)0x1;
+                    if (s_lastSrv != nativeSrv || s_rtTex.Width() != rw || s_rtTex.Height() != rh)
+                    { s_rtTex.AdoptSRV(g_ps2xD3D11, nativeSrv, rw, rh); s_lastSrv = nativeSrv; }
+                    const float W = (float)g_ps2xD3D11.Width(), H = (float)g_ps2xD3D11.Height();
+                    // [presentcrop] Crop to the DISPLAY size, not the RT/texture size: the leaf RT
+                    // can be 512x512 (a 512x448 display plus dead rows) and sampling the full 0..1
+                    // showed those dead rows as a constant black band. displayWidth/Height is what the
+                    // GL present crops to. This texture is top-down, so the display rows are v 0..sH/rh.
+                    const int dW = ps2GpuRenderer().displayWidth();
+                    const int dH = ps2GpuRenderer().displayHeight();
+                    const float sW = std::min(std::min((float)(rw ? rw : 1), (dW > 0 ? (float)dW : (float)(rw ? rw : 1))), (float)FB_WIDTH);
+                    const float sH = std::min(std::min((float)(rh ? rh : 1), (dH > 0 ? (float)dH : (float)(rh ? rh : 1))), (float)DEFAULT_DISPLAY_HEIGHT);
+                    const float u1n = sW / (float)(rw ? rw : 1);
+                    const float v1n = sH / (float)(rh ? rh : 1);
+                    // [truews] Widescreen: the GS renders a WIDER view squeezed into the 4:3
+                    // buffer, so the present must STRETCH it to the window (dw=W, dh=H) -- exactly
+                    // what the GL present and the D3D FMV path do. Letterboxing here (aspect-preserved)
+                    // is why truews "did nothing" on the native D3D present.
+                    float dw2, dh2;
+                    if (PS2SettingsOverlay::isWidescreen() || wsTrigActive()) { dw2 = W; dh2 = H; }
+                    else { const float sc = std::min(W / sW, H / sH); dw2 = sW * sc; dh2 = sH * sc; }
+                    const float x0 = (W - dw2) * 0.5f, y0 = (H - dh2) * 0.5f, x1 = x0 + dw2, y1 = y0 + dh2;
+                    auto ndcX = [&](float x) { return 2.0f * x / W - 1.0f; };
+                    auto ndcY = [&](float y) { return 1.0f - 2.0f * y / H; };
+                    auto mk = [](float x, float y, float u, float v) {
+                        ps2x::gfx::Vertex vx{}; vx.x = x; vx.y = y; vx.u = u; vx.v = v;
+                        vx.r = vx.g = vx.b = vx.a = 255; vx.q = 1.0f; vx.z = 0.0f; return vx; };
+                    g_d3dBlit.SetShader(&g_d3dBlitShader);
+                    g_d3dBlit.SetTexture(&s_rtTex);
+                    ps2x::gfx::BlendDesc opaque; opaque.enable = false; g_d3dBlit.SetBlend(opaque);
+                    g_d3dBlit.DrawQuad(mk(ndcX(x0), ndcY(y0), 0, 0), mk(ndcX(x1), ndcY(y0), u1n, 0),
+                                       mk(ndcX(x1), ndcY(y1), u1n, v1n), mk(ndcX(x0), ndcY(y1), 0, v1n));
+                }
+                else
+                {
+                int pw = 0, ph = 0;
+                if (ps2GpuRenderer().copyPresentPixels(g_d3dPresentPx, pw, ph) && pw > 0 && ph > 0)
+                {
+                    static int s_dbg = 0;
+                    if (s_dbg < 6)
+                    {
+                        ++s_dbg;
+                        unsigned mx = 0;
+                        for (size_t i = 0; i + 3 < g_d3dPresentPx.size(); i += 4)
+                            mx = std::max(mx, (unsigned)std::max(g_d3dPresentPx[i], std::max(g_d3dPresentPx[i+1], g_d3dPresentPx[i+2])));
+                        std::fprintf(stderr, "[d3d11 bridge] present %dx%d maxRGB=%u blitInit=%d\n", pw, ph, mx, (int)g_d3dBlitInit);
+                    }
+                    if (!g_d3dPresent.Valid() || g_d3dPresent.Width() != (uint32_t)pw ||
+                        g_d3dPresent.Height() != (uint32_t)ph)
+                        g_d3dPresent.Create(g_ps2xD3D11, (uint32_t)pw, (uint32_t)ph,
+                                            ps2x::gfx::Format::RGBA8, nullptr);
+                    g_d3dPresent.Update(g_ps2xD3D11, g_d3dPresentPx.data());
+                    g_d3dPresent.SetSampler(g_ps2xD3D11, ps2x::gfx::Filter::Point, ps2x::gfx::Wrap::Clamp);
+
+                    // [truews] Stretch to the window when widescreen is on (the GS rendered a wider
+                    // squeezed view); otherwise letterbox preserving the source aspect. Flip V
+                    // (the readback is bottom-up).
+                    // [presentcrop] Crop to the display size: the readback texture can be taller than
+                    // the 448-row display (a 512-tall leaf RT/latch), and sampling the full 0..1 showed
+                    // the dead rows as a constant black band. Bottom-up, so the display occupies the
+                    // HIGH-V rows: v in [1 - sH/ph, 1].
+                    const float W = (float)g_ps2xD3D11.Width(), H = (float)g_ps2xD3D11.Height();
+                    const int dW = ps2GpuRenderer().displayWidth();
+                    const int dH = ps2GpuRenderer().displayHeight();
+                    const float sW = std::min(std::min((float)pw, (dW > 0 ? (float)dW : (float)pw)), (float)FB_WIDTH);
+                    const float sH = std::min(std::min((float)ph, (dH > 0 ? (float)dH : (float)ph)), (float)DEFAULT_DISPLAY_HEIGHT);
+                    const float u1b = sW / (float)pw;
+                    const float vBot = 1.0f - sH / (float)ph;
+                    float dw, dh;
+                    if (PS2SettingsOverlay::isWidescreen() || wsTrigActive()) { dw = W; dh = H; }
+                    else { const float s = std::min(W / sW, H / sH); dw = sW * s; dh = sH * s; }
+                    const float x0 = (W - dw) * 0.5f, y0 = (H - dh) * 0.5f, x1 = x0 + dw, y1 = y0 + dh;
+                    auto ndcX = [&](float x) { return 2.0f * x / W - 1.0f; };
+                    auto ndcY = [&](float y) { return 1.0f - 2.0f * y / H; };
+                    auto mk = [](float x, float y, float u, float v) {
+                        ps2x::gfx::Vertex vx{};
+                        vx.x = x; vx.y = y; vx.u = u; vx.v = v;
+                        vx.r = vx.g = vx.b = vx.a = 255; vx.q = 1.0f; vx.z = 0.0f;
+                        return vx;
+                    };
+                    g_d3dBlit.SetShader(&g_d3dBlitShader);
+                    g_d3dBlit.SetTexture(&g_d3dPresent);
+                    ps2x::gfx::BlendDesc opaque; opaque.enable = false;
+                    g_d3dBlit.SetBlend(opaque);
+                    g_d3dBlit.DrawQuad(
+                        mk(ndcX(x0), ndcY(y0), 0.0f, 1.0f),
+                        mk(ndcX(x1), ndcY(y0), u1b, 1.0f),
+                        mk(ndcX(x1), ndcY(y1), u1b, vBot),
+                        mk(ndcX(x0), ndcY(y1), 0.0f, vBot));
+                }
+                }
+            }
+            if (s_uiTest)
+            {   // [d3d11 uitest] minimal ImGui draw to prove imgui_impl_dx11 renders.
+                ps2x::gfx::UiDrawTestWindow();
+            }
+            else if (m_debugUiInitialized && m_debugUiDrawCallback)
+                m_debugUiDrawCallback(*this, m_debugUiUserData);   // overlay via imgui_impl_dx11
+            g_ps2xD3D11.EndFrame();
+        }
+        else
+        {
+#endif
         BeginDrawing();
         {   // [presentstate] pre-render chunks and barrier services run GL work between presents and
             // leave the GS emulation state behind (blend off / GS blend factors, scissor, colour mask,
@@ -4940,7 +5217,11 @@ void PS2Runtime::run()
         // 4:3 proportions, drew it round). PS2X_SQPIX=1 restores the old square-pixel
         // letterbox (the rig's boot screen-matching references were captured that way).
         {
-            static const bool s_sqpix = [](){ const char *v = std::getenv("PS2X_SQPIX"); return v && v[0] && v[0] != '0'; }();
+            // [tv43] DEFAULT: square pixels (no horizontal stretch). The ~8% "TV pixel"
+            // stretch made the present wider than the buffer and cut the right/bottom edge of
+            // full-frame 2D art (the pause popup's frame) on the OpenGL present. PS2X_SQPIX=0
+            // re-enables the authentic TV-pixel stretch.
+            static const bool s_sqpix = [](){ const char *v = std::getenv("PS2X_SQPIX"); return !(v && v[0] == '0'); }();
             static const float s_pixk = [](){ const char *v = std::getenv("PS2X_PIXK"); const float f = v ? (float)std::atof(v) : 1.08f; return (f > 0.5f && f < 2.0f) ? f : 1.08f; }();
             if (!s_sqpix)
             {   // measured against a native-4:3 Wii longplay capture: authentic TV pixels are
@@ -5142,6 +5423,9 @@ void PS2Runtime::run()
                 }
             }
         }
+#if defined(_WIN32)
+        }   // end !g_ps2xD3D11Mode (raylib GL present path)
+#endif
         {   // [ftspike] PS2X_FTSPIKE=1: PER-FRAME time spikes. The [fps] line is a ~1s average;
             // a 29.9 mean can hide 50-80 ms hitch frames that FEEL like dips ("the dips are
             // noticable" with min-28.8 logs). Tracks inter-present deltas: per second prints

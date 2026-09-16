@@ -53,5 +53,18 @@ namespace ps2tex
     // decoded blob from here. PS2X_TEXPACK_ASYNC=0 restores the synchronous load.
     bool loadReplacement(const TexIdent &id, uint64_t texKey, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt);
     bool takeReadySwap(uint64_t texKey);
+
+    // [texmega] One-shot diagnostic dump (enable PS2X_TEXMEGA=1, arm with F9). While armed it
+    // writes to <dir>: texlookup.tsv (every lookup, HIT/MISS + full identity), the original
+    // decode and the replacement as PNG pairs (<name>_orig / <name>_new), the whole pack index
+    // (texpack_index.tsv) and a summary. Bounded, so a single capture is enough to see why a
+    // texture is not replaced.
+    void megaArm(const char *dir, double seconds);
+    bool megaActive();
+    void megaDumpIndex();
+    void megaLookup(const TexIdent &id, uint64_t texKey, uint32_t tbp0, uint32_t tbw,
+                    uint8_t psm, uint8_t tw, uint8_t th, bool hit,
+                    const uint8_t *origRgba, int ow, int oh,
+                    const uint8_t *repRgba, int rw, int rh, int rfmt);
 }
 #endif

@@ -31,10 +31,10 @@ public:
     void setSfxVolume(float v) { m_sfx = v; }
 
     // --- [video] ---
-    // [renderer] 0 = OpenGL, 1 = software rasterizer, 2 = paraLLEl-GS (Vulkan).
+    // [renderer] 0 = OpenGL, 1 = software rasterizer, 2 = paraLLEl-GS (Vulkan), 3 = Direct3D 11 native.
     // Mirrors PS2SettingsOverlay::Settings; the legacy bool gpuRenderer stays in
     // sync (true when renderer != 1) for the old readers.
-    static constexpr int kRendererOpenGL = 0, kRendererSoftware = 1, kRendererParallelGS = 2;
+    static constexpr int kRendererOpenGL = 0, kRendererSoftware = 1, kRendererParallelGS = 2, kRendererD3D11 = 3;
     int renderer() const { return m_renderer; }
     bool gpuRenderer() const { return m_renderer != kRendererSoftware; }
     bool glow() const { return m_glow; }
@@ -64,7 +64,13 @@ public:
     int hudOffR() const { return m_hudOffR; }
 
     void setRenderer(int v) { m_renderer = v; }
-    void setGpuRenderer(bool v) { m_renderer = (v != false) ? kRendererParallelGS : kRendererSoftware; }
+    void setGpuRenderer(bool v) { m_renderer = (v != false) ?
+#if defined(_WIN32)
+        kRendererD3D11 :
+#else
+        kRendererParallelGS :
+#endif
+        kRendererSoftware; }
     void setGlow(bool v) { m_glow = v; }
     void setGlowFix(bool v) { m_glowFix = v; }
     void setBilinear(bool v) { m_bilinear = v; }
@@ -117,7 +123,11 @@ private:
     bool m_sawRenderer = false;   // [renderer] set when the ini had an explicit `renderer` key
     QString m_dir;
     float m_master = 1.0f, m_music = 1.0f, m_sfx = 1.0f;
+#if defined(_WIN32)
+    int m_renderer = kRendererD3D11;   // [d3d11] native D3D11 present is the Windows default
+#else
     int m_renderer = kRendererParallelGS;
+#endif
     bool m_glow = true, m_glowFix = true;
     bool m_bilinear = true, m_halfTexel = true, m_skipPost = true, m_skipStaleVram = true;
     int m_renderScale = 1;

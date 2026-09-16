@@ -11,7 +11,7 @@
 #endif
 
 #include "imgui.h"
-#include "rlImGui.h"
+#include "gfx/ps2x_ui.h"   // UiSetup/Begin/End: rlImGui (GL) or imgui_impl_dx11 (PS2X_D3D11)
 #include "raylib.h"
 
 #include "runtime/ps2_toml.h"
@@ -40,13 +40,14 @@ namespace
     // --- settings.toml helpers -----------------------------------------------
     const char *rendererName(int r)
     {
-        switch (r) { case 0: return "opengl"; case 1: return "software"; case 2: return "parallel-gs"; default: return "parallel-gs"; }
+        switch (r) { case 0: return "opengl"; case 1: return "software"; case 2: return "parallel-gs"; case 3: return "d3d11"; default: return "opengl"; }
     }
     int nameToRenderer(const std::string &s, int def)
     {
         if (s == "opengl" || s == "gl") return 0;
         if (s == "software" || s == "sw") return 1;
         if (s == "parallel-gs" || s == "parallel_gs" || s == "pgs") return 2;
+        if (s == "d3d11" || s == "dx11" || s == "d3d") return 3;
         return def;
     }
     std::string colorToHex(unsigned c)
@@ -367,7 +368,7 @@ void PS2SettingsOverlay::initialize()
             std::fprintf(stderr, "[overlay] Russo One font not found at %s, falling back to default font\n",
                         fontPath.string().c_str());
     }
-    rlImGuiSetup(true);
+    ps2x::gfx::UiSetup();
     // The rlImGui version used here has no rlImGuiSetLoadFontsCallback() hook, so load
     // the Capsule HUD fonts directly after setup — ImGui rebuilds the atlas lazily on
     // the first frame.
@@ -411,7 +412,7 @@ void PS2SettingsOverlay::shutdown()
     // ini untouched so launcher-authored settings survive a play session.
     if (!(m_settings == m_settingsAtBoot) || !std::filesystem::exists(m_configPath))
         saveSettings();
-    rlImGuiShutdown();
+    ps2x::gfx::UiShutdown();
     m_initialized = false;
 }
 
@@ -509,7 +510,12 @@ void PS2SettingsOverlay::loadSettings()
 #if !defined(PS2X_HAVE_PGS)
         if (r == Settings::kRendererParallelGS) r = Settings::kRendererOpenGL;
 #endif
-        if (r >= 0 && r <= 2) { m_settings.renderer = r; m_sawRendererKey = true; }
+#if defined(_WIN32)
+        if (r == Settings::kRendererParallelGS) r = Settings::kRendererD3D11;   // [d3d11] retired on Windows
+#else
+        if (r == Settings::kRendererD3D11) r = Settings::kRendererOpenGL;       // [d3d11] Windows-only
+#endif
+        if (r >= 0 && r <= 3) { m_settings.renderer = r; m_sawRendererKey = true; }
     }
     if (!envUserSet("PS2X_GLOW")) m_settings.glow = doc.getB("video.glow", m_settings.glow);
     if (!envUserSet("PS2X_GLOWFIX")) m_settings.glowFix = doc.getB("video.glowfix", m_settings.glowFix);
@@ -580,6 +586,16 @@ static void setEnvDefault(const char *name, const char *value)
 }
 static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
 {
+#if defined(_WIN32)
+    // [d3d11] renderer 3 = native Direct3D 11 present (Windows). PGS retired in that mode.
+    if (renderer == 3)
+    {
+        setEnvDefault("PS2X_D3D11", "1");
+        setEnvDefault("PS2X_PGS", "0");
+        return;
+    }
+    setEnvDefault("PS2X_D3D11", "0");
+#endif
 #if defined(PS2X_HAVE_PGS)
     if (renderer == 2)
     {
@@ -599,11 +615,32 @@ static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
 #endif
 }
 
+extern "C" const char *ps2xExeDirC();   // [mergefix] main.cpp: <exeDir> (honors PS2X_EXEDIR)
+
 void PS2SettingsOverlay::preloadSettings()
 {
-    const std::string configPath = s_configDir.empty()
-        ? (std::filesystem::current_path() / kConfigFileName).string()
-        : (std::filesystem::path(s_configDir) / kConfigFileName).string();
+    // [cfgpath] The deploy keeps settings.toml in <exeDir>/savedata, but the overlay only
+    // looked in the CWD unless setConfigDirectory() had been called (never, in practice), so a
+    // launch that did not set the CWD to the deploy silently dropped every setting -- notably
+    // texture_pack, i.e. "the texture pack does not load". Prefer an existing file: CWD first,
+    // then <exeDir>/savedata, then <exeDir>; fall back to the CWD path.
+    std::filesystem::path cfgPath;
+    if (!s_configDir.empty())
+        cfgPath = std::filesystem::path(s_configDir) / kConfigFileName;
+    else
+    {
+        const std::filesystem::path cwd = std::filesystem::current_path() / kConfigFileName;
+        const char *xd = ps2xExeDirC();
+        std::error_code ec;
+        const std::filesystem::path exeSaved = (xd && xd[0]) ? (std::filesystem::path(xd) / "savedata" / kConfigFileName) : std::filesystem::path();
+        const std::filesystem::path exeRoot = (xd && xd[0]) ? (std::filesystem::path(xd) / kConfigFileName) : std::filesystem::path();
+        if (std::filesystem::exists(cwd, ec)) cfgPath = cwd;
+        else if (!exeSaved.empty() && std::filesystem::exists(exeSaved, ec)) cfgPath = exeSaved;
+        else if (!exeRoot.empty() && std::filesystem::exists(exeRoot, ec)) cfgPath = exeRoot;
+        else cfgPath = cwd;
+    }
+    const std::string configPath = cfgPath.string();
+    s_configDir = cfgPath.parent_path().string();
     int rendererPre = Settings::kRendererDefault;   // [renderer] exported below even when no toml exists yet
     bool texPackPre = false;
     bool forceBilinearPre = true;
@@ -1057,7 +1094,7 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
     const bool wasVisible = m_visible;
     try
     {
-        rlImGuiBegin();
+        ps2x::gfx::UiBegin();
 
         pushDbzTheme();
         DbzThemeScope dbzTheme;   // pops all 40 style colours on scope exit
@@ -1213,7 +1250,7 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
         // Never let an overlay rendering fault kill the whole game.
         m_visible = false;
     }
-    rlImGuiEnd();
+    ps2x::gfx::UiEnd();
 }
 
 void PS2SettingsOverlay::drawAudioTab()
@@ -1251,21 +1288,32 @@ void PS2SettingsOverlay::drawVideoTab()
     // Renderer + Effects (flat, compact — no card borders)
     sectionHeader("RENDERER");
     {   // [renderer] backend dropdown
+        static const char *const kLabels[] = { "OpenGL", "Software rasterizer",
 #if defined(PS2X_HAVE_PGS)
-        static const char *const kRenderers[] = { "OpenGL", "Software rasterizer", "paraLLEl-GS (Vulkan compute)" };
-        const int nRenderers = 3;
-#else
-        static const char *const kRenderers[] = { "OpenGL", "Software rasterizer" };
-        const int nRenderers = 2;
+            "paraLLEl-GS (Vulkan compute)",
 #endif
-        int r = std::clamp(m_settings.renderer, 0, nRenderers - 1);
+#if defined(_WIN32)
+            "Direct3D 11 (native)",
+#endif
+        };
+        static const int kValues[] = { 0, 1,
+#if defined(PS2X_HAVE_PGS)
+            2,
+#endif
+#if defined(_WIN32)
+            3,
+#endif
+        };
+        const int nRenderers = (int)(sizeof(kValues) / sizeof(kValues[0]));
+        int cur = 0;
+        for (int i = 0; i < nRenderers; ++i) if (kValues[i] == m_settings.renderer) { cur = i; break; }
         ImGui::TextUnformatted("Renderer");
         ImGui::SameLine(180.0f);
         ImGui::SetNextItemWidth(260.0f);
-        if (ImGui::Combo("##renderer", &r, kRenderers, nRenderers))
+        if (ImGui::Combo("##renderer", &cur, kLabels, nRenderers))
         {
-            m_settings.renderer = r;
-            m_settings.gpuRenderer = (r != Settings::kRendererSoftware);
+            m_settings.renderer = kValues[cur];
+            m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);
             m_dirty = true;
         }
     }

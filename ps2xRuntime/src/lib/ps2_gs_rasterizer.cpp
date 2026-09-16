@@ -3637,19 +3637,28 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
             {
                 std::vector<uint8_t> rep; int rw = 0, rh = 0, rfmt = 0;
                 const bool found = ps2tex::loadReplacement(id, texKey, rep, rw, rh, rfmt);   // [texpackasync]
-                {   // [texrepdiag] PS2X_TEXREPDIAG=1: every lookup, unthrottled, with the
-                    // palette we hashed -- so a draw that resolves to the WRONG CLUT
-                    // variant is visible as a name mismatch rather than guessed at.
-                    static const bool s_d = [](){ const char *v = std::getenv("PS2X_TEXREPDIAG"); return v && v[0] && v[0] != '0'; }();
-                    if (s_d)
+                {   // [texrepdiag] PS2X_TEXREPDIAG=1: log the MISSES only (bounded). A character
+                    // whose hair is replaced but body is not shows up here as the body texture's
+                    // hash pair/tbp0/PSM -- the format or CLUT we are not matching to the pack.
+                    static const bool s_d = [](){ const char *v = std::getenv("PS2X_TEXREPDIAG"); return !(v && v[0] == '0'); }();
+                    if (s_d && !found)
                     {
-                        const uint32_t *cl = pal ? clut : nullptr;
-                        std::fprintf(stderr, "[texrepdiag] %s %s tbp0=%u psm=%u %dx%d clut[0..3]=%08x %08x %08x %08x clutKey=%llx\n",
-                                     found ? "HIT " : "MISS", id.name().c_str(), tex0.tbp0, tex0.psm, subW, texH,
-                                     cl ? cl[0] : 0u, cl ? cl[1] : 0u, cl ? cl[2] : 0u, cl ? cl[3] : 0u,
-                                     (unsigned long long)clutKey);
+                        static int s_miss = 0;
+                        if (s_miss < 300)
+                        {
+                            const uint32_t *cl = pal ? clut : nullptr;
+                            std::fprintf(stderr, "[texrepdiag] MISS %s tbp0=%u tbw=%u psm=%u %ux%u clut4=%08x %08x %08x %08x clutKey=%llx\n",
+                                         id.name().c_str(), tex0.tbp0, tex0.tbw, tex0.psm, 1u << tex0.tw, 1u << tex0.th,
+                                         cl ? cl[0] : 0u, cl ? cl[1] : 0u, cl ? cl[2] : 0u, cl ? cl[3] : 0u,
+                                         (unsigned long long)clutKey);
+                        }
+                        else if (s_miss == 300)
+                            std::fprintf(stderr, "[texrepdiag] ... (miss list truncated)\n");
+                        ++s_miss;
                     }
                 }
+                ps2tex::megaLookup(id, texKey, tex0.tbp0, tex0.tbw, tex0.psm, tex0.tw, tex0.th, found,
+                                   rgba.data(), subW, texH, rep.data(), rw, rh, rfmt);   // [texmega]
                 if (found)
                 {
                     // The UV path can only express an INTEGER, UNIFORM upscale
@@ -4983,10 +4992,10 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
         // REGION_* wrap modes whose window params (MINU/MAXU/MINV/MAXV) we currently drop?
         {
             static const bool s_rr = [](){ const char *v = std::getenv("PS2X_REGIONREC"); return v && v[0] && v[0] != '0'; }();
-            // Log REGION-mode draws on ANY texture (window params are currently dropped by
-            // the GPU DrawCmd — the 2026-07-30 window-decode experiment was reverted after
-            // it caused 2D-screen flashing; the only in-fight user is the FB-copy 512x448).
-            if (s_rr && tme && (wms >= 2u || wmt >= 2u))
+            // [regionrec] also log a specific tbp (PS2X_REGIONTBP=<tbp>) regardless of its wrap
+            // mode, so a plain REPEAT/CLAMP draw like the pause-popup corner can be inspected.
+            static const uint32_t s_rtbp = [](){ const char *v = std::getenv("PS2X_REGIONTBP"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 0xFFFFFFFFu; }();
+            if (s_rr && tme && (wms >= 2u || wmt >= 2u || ctx.tex0.tbp0 == s_rtbp))
             {
                 static std::atomic<uint32_t> s_rn{0};
                 const uint32_t n = s_rn.fetch_add(1);

@@ -116,17 +116,35 @@ VideoTab::VideoTab(QWidget *parent)
 
     // RENDERER
     root->addWidget(sectionLabel(QStringLiteral("RENDERER")));
-    QStringList renderers = {
-        QStringLiteral("OpenGL"),
-        QStringLiteral("Software (CPU)"),
-        QStringLiteral("paraLLEl-GS (Vulkan)")};
-    const int curRenderer = std::min(std::max(s.renderer(), 0), 2);
+    QStringList renderers;
+    QList<int> rendererValues;
+#if defined(_WIN32)
+    // [d3d11] Windows: paraLLEl-GS is retired and native Direct3D 11 is the default present.
+    renderers = { QStringLiteral("OpenGL"),
+                  QStringLiteral("Software (CPU)"),
+                  QStringLiteral("Direct3D 11") };
+    rendererValues = { SettingsManager::kRendererOpenGL,
+                       SettingsManager::kRendererSoftware,
+                       SettingsManager::kRendererD3D11 };
+#else
+    renderers = { QStringLiteral("OpenGL"),
+                  QStringLiteral("Software (CPU)"),
+                  QStringLiteral("paraLLEl-GS (Vulkan)") };
+    rendererValues = { SettingsManager::kRendererOpenGL,
+                       SettingsManager::kRendererSoftware,
+                       SettingsManager::kRendererParallelGS };
+#endif
+    int curRenderer = 0;
+    for (int i = 0; i < rendererValues.size(); ++i)
+        if (rendererValues[i] == s.renderer()) { curRenderer = i; break; }
     root->addWidget(comboRow(QStringLiteral("Renderer"), &m_renderer, renderers, curRenderer));
+    for (int i = 0; i < rendererValues.size(); ++i)
+        m_renderer->setItemData(i, rendererValues[i]);
 #ifdef _WIN32
     root->addWidget(hintRow(QStringLiteral(
-        "paraLLEl-GS runs on the bundled Mesa lavapipe (software Vulkan) on Windows; "
-        "if it fails, the game falls back to OpenGL. See logs/vulkan-fallback.log. "
-        "Set PS2X_VK_NATIVE=1 to use the system Vulkan driver.")));
+        "Direct3D 11 is the default present on Windows (the game frame is shown through a "
+        "native D3D11 swap chain). OpenGL keeps the raylib presenter; Software uses the CPU "
+        "rasterizer.")));
 #else
     root->addWidget(hintRow(QStringLiteral("paraLLEl-GS is the default backend. Falls back to OpenGL if Vulkan is unavailable.")));
 #endif
@@ -220,8 +238,8 @@ VideoTab::VideoTab(QWidget *parent)
     outer->addWidget(scroll);
 
     // Live write-through into SettingsManager (Save persists to INI).
-    connect(m_renderer, &QComboBox::currentIndexChanged, this, [](int v) {
-        SettingsManager::instance().setRenderer(v);
+    connect(m_renderer, &QComboBox::currentIndexChanged, this, [this](int) {
+        SettingsManager::instance().setRenderer(m_renderer->currentData().toInt());
     });
     connect(m_outline, &QCheckBox::toggled, this, &VideoTab::onOutline);
     connect(m_ink, &QSlider::valueChanged, this, [this](int v) {

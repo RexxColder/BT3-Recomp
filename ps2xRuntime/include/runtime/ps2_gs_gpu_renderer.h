@@ -437,6 +437,16 @@ public:
     // (0 = nothing yet). fbWidth/fbHeight = the PS2 display size.
     unsigned int renderAndGetTextureId(int fbWidth, int fbHeight);
     bool debugSavePresent(const char *path);   // offline replay harness
+    // [d3d11] Copy the presented texture (the same one debugSavePresent exports) into CPU
+    // RGBA (bottom-up). Lets the native D3D11 present show the frame while the GS still
+    // renders through GL -- a bridge until the GS replay itself is ported.
+    bool copyPresentPixels(std::vector<unsigned char> &outRgba, int &w, int &h);
+    // [d3d11] When PS2X_D3D11_GS=1 the GS renders into a native D3D render target; the present
+    // binds this SRV directly (no readback). Returns nullptr on the GL/readback path.
+    void *d3dPresentSRV() const;
+    unsigned d3dPresentWidth() const;
+    unsigned d3dPresentHeight() const;
+    bool d3dDumpPresent(const char *path);   // [diag] write the native present texture to a PNG
     // Display region derived from the command scissors (the software latch that
     // normally reports this doesn't run in GPU mode). Valid after renderAndGetTextureId.
     int displayWidth() const { return m_dispW; }
