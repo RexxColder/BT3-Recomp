@@ -11,7 +11,7 @@
 #endif
 
 #include "imgui.h"
-#include "rlImGui.h"
+#include "gfx/ps2x_ui.h"   // UiSetup/Begin/End: rlImGui (GL) or imgui_impl_dx11 (PS2X_D3D11)
 #include "raylib.h"
 
 #include "runtime/ps2_toml.h"
@@ -367,7 +367,7 @@ void PS2SettingsOverlay::initialize()
             std::fprintf(stderr, "[overlay] Russo One font not found at %s, falling back to default font\n",
                         fontPath.string().c_str());
     }
-    rlImGuiSetup(true);
+    ps2x::gfx::UiSetup();
     // The rlImGui version used here has no rlImGuiSetLoadFontsCallback() hook, so load
     // the Capsule HUD fonts directly after setup — ImGui rebuilds the atlas lazily on
     // the first frame.
@@ -411,7 +411,7 @@ void PS2SettingsOverlay::shutdown()
     // ini untouched so launcher-authored settings survive a play session.
     if (!(m_settings == m_settingsAtBoot) || !std::filesystem::exists(m_configPath))
         saveSettings();
-    rlImGuiShutdown();
+    ps2x::gfx::UiShutdown();
     m_initialized = false;
 }
 
@@ -1057,7 +1057,7 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
     const bool wasVisible = m_visible;
     try
     {
-        rlImGuiBegin();
+        ps2x::gfx::UiBegin();
 
         pushDbzTheme();
         DbzThemeScope dbzTheme;   // pops all 40 style colours on scope exit
@@ -1213,7 +1213,7 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
         // Never let an overlay rendering fault kill the whole game.
         m_visible = false;
     }
-    rlImGuiEnd();
+    ps2x::gfx::UiEnd();
 }
 
 void PS2SettingsOverlay::drawAudioTab()

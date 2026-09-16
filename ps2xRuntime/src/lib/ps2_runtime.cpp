@@ -21,6 +21,30 @@
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_gpu_renderer.h"
 
+#if defined(_WIN32)
+// [d3d11] Native video device. Present path only for now (PS2X_D3D11=1): the GS still
+// renders through the existing GL renderer until it is ported (P3); this swaps the final
+// presentation from raylib's GL swap chain to a D3D11 one on raylib's own HWND.
+#include "gfx/d3d11/D3D11Device.h"
+#include "gfx/d3d11/D3D11Gfx.h"
+#include "gfx/d3d11/gs_shader_hlsl.h"
+#include "gfx/video_state.h"
+#include "gfx/ps2x_ui.h"
+namespace
+{
+    ps2x::gfx::D3D11Device g_ps2xD3D11;
+    bool g_ps2xD3D11Mode = false;   // PS2X_D3D11=1 and the device came up
+
+    // [d3d11] Present bridge: the GS still renders through GL, so the D3D11 present reads the
+    // presented texture back to CPU and blits it. Replaced by the native GS port (P3.3).
+    ps2x::gfx::Renderer g_d3dBlit;
+    ps2x::gfx::Shader   g_d3dBlitShader;
+    ps2x::gfx::Texture  g_d3dPresent;
+    bool g_d3dBlitInit = false;
+    std::vector<unsigned char> g_d3dPresentPx;
+}
+#endif
+
 #if defined(__linux__)
 #include "runtime/pad_evdev_linux.h"
 #include <pthread.h>
@@ -1263,6 +1287,22 @@ bool PS2Runtime::initialize(const char *title)
         }
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+#endif
+#if defined(_WIN32)
+        {   // [d3d11] PS2X_D3D11=1: present through a native D3D11 swap chain on raylib's HWND.
+            // raylib keeps the window, input and audio; only the video present is native.
+            const char *d3dv = std::getenv("PS2X_D3D11");
+            if (d3dv && d3dv[0] && d3dv[0] != '0')
+            {
+                g_ps2xD3D11Mode = g_ps2xD3D11.Init(GetWindowHandle(),
+                                                   static_cast<uint32_t>(GetScreenWidth()),
+                                                   static_cast<uint32_t>(GetScreenHeight()));
+                if (!g_ps2xD3D11Mode)
+                    std::fprintf(stderr, "[d3d11] init failed; staying on the raylib GL presenter\n");
+                else
+                    ps2x::gfx::SetVideoDevice(&g_ps2xD3D11);   // overlay uses imgui_impl_dx11
+            }
+        }
 #endif
         SetTargetFPS(60);
         {   // [texreplace] Index replacements at STARTUP rather than lazily on the first texture
@@ -4910,6 +4950,86 @@ void PS2Runtime::run()
           if (gpuMode) ps2GpuRenderer().serviceBlockingBarriers();   // [barblock]
           extern double g_fpSbb; g_fpSbb += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t).count(); }
         const auto _tBegin = std::chrono::steady_clock::now();
+#if defined(_WIN32)
+        if (g_ps2xD3D11Mode)
+        {   // [d3d11] Native video frame. The GS replay already ran (renderAndGetTextureId
+            // above); present through the D3D11 swap chain instead of raylib's GL one, so
+            // there is no BeginDrawing/EndDrawing and no GL swap to fight the D3D11 present.
+            // Input still updates through PollInputEvents. Until the GS renderer is ported
+            // (P3) this shows a flat clear.
+            if (IsWindowResized())
+                g_ps2xD3D11.Resize(static_cast<uint32_t>(GetScreenWidth()),
+                                   static_cast<uint32_t>(GetScreenHeight()));
+            PollInputEvents();
+            static const bool s_uiTest = [](){ const char *v = std::getenv("PS2X_UI_TEST"); return v && v[0] && v[0] != '0'; }();
+            const ps2x::gfx::Color d3dClear = s_uiTest
+                ? ps2x::gfx::Color{0.85f, 0.85f, 0.90f, 1.0f}   // bright, so the dark ImGui shows
+                : ps2x::gfx::Color{0.06f, 0.07f, 0.10f, 1.0f};
+            g_ps2xD3D11.BeginFrame(d3dClear);
+            // TODO(P3.3): replace this bridge with the native GS replay.
+            if (!g_d3dBlitInit)
+            {
+                g_d3dBlitInit = g_d3dBlit.Init(g_ps2xD3D11) &&
+                    g_d3dBlitShader.Compile(g_ps2xD3D11, ps2x::gfx::kBlitVertexShaderHlsl,
+                                            ps2x::gfx::kBlitFragmentShaderHlsl);
+            }
+            if (g_d3dBlitInit)
+            {
+                int pw = 0, ph = 0;
+                if (ps2GpuRenderer().copyPresentPixels(g_d3dPresentPx, pw, ph) && pw > 0 && ph > 0)
+                {
+                    static int s_dbg = 0;
+                    if (s_dbg < 6)
+                    {
+                        ++s_dbg;
+                        unsigned mx = 0;
+                        for (size_t i = 0; i + 3 < g_d3dPresentPx.size(); i += 4)
+                            mx = std::max(mx, (unsigned)std::max(g_d3dPresentPx[i], std::max(g_d3dPresentPx[i+1], g_d3dPresentPx[i+2])));
+                        std::fprintf(stderr, "[d3d11 bridge] present %dx%d maxRGB=%u blitInit=%d\n", pw, ph, mx, (int)g_d3dBlitInit);
+                    }
+                    if (!g_d3dPresent.Valid() || g_d3dPresent.Width() != (uint32_t)pw ||
+                        g_d3dPresent.Height() != (uint32_t)ph)
+                        g_d3dPresent.Create(g_ps2xD3D11, (uint32_t)pw, (uint32_t)ph,
+                                            ps2x::gfx::Format::RGBA8, nullptr);
+                    g_d3dPresent.Update(g_ps2xD3D11, g_d3dPresentPx.data());
+                    g_d3dPresent.SetSampler(g_ps2xD3D11, ps2x::gfx::Filter::Point, ps2x::gfx::Wrap::Clamp);
+
+                    // Letterbox the source into the window (aspect preserved) and flip V
+                    // (the readback is bottom-up).
+                    const float W = (float)g_ps2xD3D11.Width(), H = (float)g_ps2xD3D11.Height();
+                    const float s = std::min(W / (float)pw, H / (float)ph);
+                    const float dw = pw * s, dh = ph * s;
+                    const float x0 = (W - dw) * 0.5f, y0 = (H - dh) * 0.5f, x1 = x0 + dw, y1 = y0 + dh;
+                    auto ndcX = [&](float x) { return 2.0f * x / W - 1.0f; };
+                    auto ndcY = [&](float y) { return 1.0f - 2.0f * y / H; };
+                    auto mk = [](float x, float y, float u, float v) {
+                        ps2x::gfx::Vertex vx{};
+                        vx.x = x; vx.y = y; vx.u = u; vx.v = v;
+                        vx.r = vx.g = vx.b = vx.a = 255; vx.q = 1.0f; vx.z = 0.0f;
+                        return vx;
+                    };
+                    g_d3dBlit.SetShader(&g_d3dBlitShader);
+                    g_d3dBlit.SetTexture(&g_d3dPresent);
+                    ps2x::gfx::BlendDesc opaque; opaque.enable = false;
+                    g_d3dBlit.SetBlend(opaque);
+                    g_d3dBlit.DrawQuad(
+                        mk(ndcX(x0), ndcY(y0), 0.0f, 1.0f),
+                        mk(ndcX(x1), ndcY(y0), 1.0f, 1.0f),
+                        mk(ndcX(x1), ndcY(y1), 1.0f, 0.0f),
+                        mk(ndcX(x0), ndcY(y1), 0.0f, 0.0f));
+                }
+            }
+            if (s_uiTest)
+            {   // [d3d11 uitest] minimal ImGui draw to prove imgui_impl_dx11 renders.
+                ps2x::gfx::UiDrawTestWindow();
+            }
+            else if (m_debugUiInitialized && m_debugUiDrawCallback)
+                m_debugUiDrawCallback(*this, m_debugUiUserData);   // overlay via imgui_impl_dx11
+            g_ps2xD3D11.EndFrame();
+        }
+        else
+        {
+#endif
         BeginDrawing();
         {   // [presentstate] pre-render chunks and barrier services run GL work between presents and
             // leave the GS emulation state behind (blend off / GS blend factors, scissor, colour mask,
@@ -5142,6 +5262,9 @@ void PS2Runtime::run()
                 }
             }
         }
+#if defined(_WIN32)
+        }   // end !g_ps2xD3D11Mode (raylib GL present path)
+#endif
         {   // [ftspike] PS2X_FTSPIKE=1: PER-FRAME time spikes. The [fps] line is a ~1s average;
             // a 29.9 mean can hide 50-80 ms hitch frames that FEEL like dips ("the dips are
             // noticable" with min-28.8 logs). Tracks inter-present deltas: per second prints

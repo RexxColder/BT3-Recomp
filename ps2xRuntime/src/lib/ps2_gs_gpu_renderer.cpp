@@ -19276,3 +19276,32 @@ bool GsGpuRenderer::debugSavePresent(const char *path)
     UnloadImage(im);
     return ok;
 }
+
+bool GsGpuRenderer::copyPresentPixels(std::vector<unsigned char> &outRgba, int &w, int &h)
+{
+    if (g_lastOutId == 0)
+        return false;
+    Texture2D t{};
+    t.id = g_lastOutId;
+    int tw = 0, th = 0;
+    glBindTexture(0x0DE1 /*GL_TEXTURE_2D*/, g_lastOutId);
+    glGetTexLevelParameteriv(0x0DE1, 0, 0x1000 /*GL_TEXTURE_WIDTH*/, &tw);
+    glGetTexLevelParameteriv(0x0DE1, 0, 0x1001 /*GL_TEXTURE_HEIGHT*/, &th);
+    glBindTexture(0x0DE1, 0);
+    t.width = tw > 0 ? tw : (m_presentTexW > 0 ? m_presentTexW : 512);
+    t.height = th > 0 ? th : (m_presentTexH > 0 ? m_presentTexH : 448);
+    t.mipmaps = 1;
+    t.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    Image im = LoadImageFromTexture(t);   // bottom-up, as GL stores it
+    if (!im.data || im.width <= 0 || im.height <= 0)
+    {
+        if (im.data) UnloadImage(im);
+        return false;
+    }
+    w = im.width;
+    h = im.height;
+    outRgba.assign((size_t)w * (size_t)h * 4u, 255);
+    std::memcpy(outRgba.data(), im.data, (size_t)w * (size_t)h * 4u);
+    UnloadImage(im);
+    return true;
+}

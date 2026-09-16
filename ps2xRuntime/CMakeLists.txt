@@ -155,6 +155,14 @@ else()
     )
     target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
 
+    # [d3d11] ImGui's Direct3D 11 backend, so the overlay can render through the native
+    # video path instead of rlImGui/rlgl when PS2X_D3D11=1 is active.
+    if(WIN32)
+        target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_dx11.cpp")
+        target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}/backends")
+        target_link_libraries(imgui PUBLIC d3d11 dxgi)
+    endif()
+
     FetchContent_Declare(
         rlImGui
         GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
@@ -174,6 +182,24 @@ else()
     )
     target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
     target_link_libraries(rlImGui PUBLIC raylib imgui)
+endif()
+
+# [d3d11 probe] Native Direct3D 11 video on raylib's HWND, buildable on its own so the
+# P1 milestone (device + swap chain + present, raylib keeping window/input/audio) can be
+# validated without compiling the full runner. See tools/d3d11_probe/main.cpp.
+if(WIN32 AND NOT PS2X_IS_VITA)
+    add_executable(ps2xD3D11Probe
+        tools/d3d11_probe/main.cpp
+        src/gfx/d3d11/D3D11Device.cpp
+        src/gfx/d3d11/D3D11Gfx.cpp
+    )
+    target_include_directories(ps2xD3D11Probe PRIVATE src)
+    target_link_libraries(ps2xD3D11Probe PRIVATE raylib d3d11 dxgi d3dcompiler dxguid)
+    if(MSVC)
+        target_compile_options(ps2xD3D11Probe PRIVATE /W4)
+    else()
+        target_compile_options(ps2xD3D11Probe PRIVATE -Wall -Wextra)
+    endif()
 endif()
 
 add_library(ps2_host_backend INTERFACE)
@@ -555,9 +581,19 @@ endif()
 target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
+    ${CMAKE_CURRENT_SOURCE_DIR}/src          # gfx/... (D3D11 device etc.)
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg)
+
+# [d3d11] Native Direct3D 11 video device (device + DXGI swap chain), Windows-only.
+# d3dcompiler is linked now so the P3 shader port can compile HLSL at runtime.
+if(WIN32)
+    target_sources(ps2_runtime PRIVATE
+        src/gfx/d3d11/D3D11Device.cpp
+        src/gfx/d3d11/D3D11Gfx.cpp)
+    target_link_libraries(ps2_runtime PUBLIC d3d11 dxgi d3dcompiler dxguid)
+endif()
 
 # [pgs] optional paraLLEl-GS backend (Vulkan compute GS, LGPLv3+): built in when the checkout is present.
 # ps2xRuntime/third_party/parallel-gs is a git-ignored symlink/checkout of https://github.com/Arntzen-Software/parallel-gs
@@ -670,7 +706,13 @@ target_link_libraries(ps2EntryRunner
 if(NOT PS2X_IS_VITA)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_settings_overlay.cpp
+        src/gfx/ps2x_ui.cpp          # overlay backend bridge (rlImGui or imgui_impl_dx11)
     )
+    if(WIN32)
+        target_sources(ps2EntryRunner PRIVATE
+            src/gfx/d3d11/ui_d3d11.cpp   # imgui_impl_dx11 backend (needs windows.h)
+        )
+    endif()
     target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
     # gamemode: request CPU governor / IO priority optimisations at startup
     # (auto-release on exit; harmless no-op if the daemon isn't running).
