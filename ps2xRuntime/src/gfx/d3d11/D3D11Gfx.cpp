@@ -42,7 +42,7 @@ namespace ps2x::gfx
     Texture::Texture() : m_impl(std::make_unique<Impl>()) {}
     Texture::~Texture() { Destroy(); }
 
-    bool Texture::Create(D3D11Device &dev, uint32_t w, uint32_t h, Format fmt, const void *pixels)
+    bool Texture::Create(D3D11Device &dev, uint32_t w, uint32_t h, Format fmt, const void *pixels, bool renderTarget)
     {
         Impl &t = *m_impl;
         t.device = static_cast<ID3D11Device *>(dev.NativeDevice());
@@ -54,7 +54,7 @@ namespace ps2x::gfx
         td.Format = dxgiFormat(fmt);
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | (renderTarget ? D3D11_BIND_RENDER_TARGET : 0);
 
         D3D11_SUBRESOURCE_DATA sd = {};
         sd.pSysMem = pixels;
@@ -130,7 +130,7 @@ namespace ps2x::gfx
     bool RenderTarget::Create(D3D11Device &dev, uint32_t w, uint32_t h, bool depth)
     {
         Impl &r = *m_impl;
-        if (!r.color.Create(dev, w, h, Format::RGBA8, nullptr)) return false;
+        if (!r.color.Create(dev, w, h, Format::RGBA8, nullptr, /*renderTarget=*/true)) return false;
         r.w = w; r.h = h;
         ID3D11Device *d = static_cast<ID3D11Device *>(dev.NativeDevice());
         HRESULT hr = d->CreateRenderTargetView(static_cast<ID3D11Texture2D *>(r.color.NativeTexture()),
@@ -544,7 +544,7 @@ namespace ps2x::gfx
     struct Texture::Impl {};
     Texture::Texture() : m_impl(std::make_unique<Impl>()) {}
     Texture::~Texture() = default;
-    bool Texture::Create(D3D11Device &, uint32_t, uint32_t, Format, const void *) { return false; }
+    bool Texture::Create(D3D11Device &, uint32_t, uint32_t, Format, const void *, bool) { return false; }
     void Texture::Destroy() {}
     void Texture::Update(D3D11Device &, const void *, uint32_t) {}
     void Texture::SetSampler(D3D11Device &, Filter, Wrap) {}

@@ -31,6 +31,22 @@
 #include "rlgl.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"   // [crtcdisp] GSRegisters (the CRTC registers are memory-mapped)
+
+#if defined(_WIN32)
+// [d3d11] Native GS backend scaffolding. The shader HLSL port and the gfx layer exist; the
+// replay is being moved onto them so the present stops copying the frame through the CPU.
+#include "gfx/d3d11/D3D11Gfx.h"
+#include "gfx/d3d11/gs_shader_hlsl.h"
+#include "gfx/video_state.h"
+#include <unordered_map>
+namespace
+{
+    ps2x::gfx::Renderer g_d3dGsR;
+    ps2x::gfx::Shader   g_d3dGsSh;
+    bool g_d3dGsInit = false;
+    std::unordered_map<uint64_t, ps2x::gfx::Texture *> g_d3dGsTex;   // texKey -> D3D texture
+}
+#endif
 extern "C" void glFinish(void);   // [unloadmode] drain experiment
 extern "C" void glFlush(void);    // [preflush]
 extern "C" void ps2xRecPoolDrain();   // [recpool] ps2_gs_rasterizer.cpp: merge every posted record job (worker thread). File scope, outside

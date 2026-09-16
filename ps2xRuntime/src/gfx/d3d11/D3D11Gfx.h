@@ -32,7 +32,7 @@ namespace ps2x::gfx
         Texture &operator=(const Texture &) = delete;
 
         bool Create(D3D11Device &dev, uint32_t w, uint32_t h, Format fmt = Format::RGBA8,
-                    const void *pixels = nullptr);
+                    const void *pixels = nullptr, bool renderTarget = false);
         void Destroy();
         // Upload the whole surface (RGBA8: 4 bytes/px, R8: 1 byte/px).
         void Update(D3D11Device &dev, const void *pixels, uint32_t pitchBytes = 0);
