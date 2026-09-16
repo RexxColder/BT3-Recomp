@@ -5177,6 +5177,11 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
         // this state machine has to be reset per session, the armed gate flag included -- a gate
         // left armed from a failed attempt fires on the NEXT connect before the duel module is up.
         static uint64_t s_pulseStart = 0;
+        // [netjump] Headless rig: PS2X_NET_JUMP>0 also arms auto-jump so the state sync WAITS for the
+        // character-select jump to settle (syncStep gates on ps2NetAutoJump). Without it the host would
+        // publish at the menu and the two sides' post-sync jump timing could drift. The host owns the
+        // choice; it rides bit 7 of timeLimit to the joiner, so setting it here (player 1) covers both.
+        if (s_env > 0 && ps2NetSyncIsHost() && !ps2NetAutoJump()) ps2NetSetAutoJump(true);
         if (s_session != ps2NetSession())
         { s_session = ps2NetSession(); s_step = 0; s_waitUntil = 0; s_pulseStart = 0; g_netJumpState.store(1, std::memory_order_relaxed);
           g_netJumpSession.store(s_session, std::memory_order_relaxed);
