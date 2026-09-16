@@ -550,7 +550,13 @@ namespace
         ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
         if (!f.d3dRt) f.d3dRt = new ps2x::gfx::RenderTarget();
         if (f.d3dRt->Width() != (uint32_t)w || f.d3dRt->Height() != (uint32_t)h || !f.d3dRt->NativeRTV())
-            f.d3dRt->Create(*dev, (uint32_t)w, (uint32_t)h, false);
+        {
+            if (f.d3dRt->Create(*dev, (uint32_t)w, (uint32_t)h, false))
+            {   // clear once: after this the game's own clear draws maintain the contents
+                f.d3dRt->Bind(*dev);
+                f.d3dRt->Clear(*dev, 0, 0, 0, 1);
+            }
+        }
         if (f.rt.texture.id != 0) g_d3dRtByGlTex[f.rt.texture.id] = &f.d3dRt->Color();
     }
     inline ps2x::gfx::Texture *d3dFboTexForGl(unsigned glTexId)
@@ -1358,9 +1364,11 @@ namespace
         ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
         auto dit = g_fbos.find(curRealFbp);
         if (dit == g_fbos.end() || !dit->second.d3dRt) return false;
-        if (dit->second.d3dGen != frameGen)
-        { dit->second.d3dRt->Bind(*dev); dit->second.d3dRt->Clear(*dev, 0, 0, 0, 1); dit->second.d3dGen = frameGen; }
-        else dit->second.d3dRt->Bind(*dev);
+        // Bind only. The GL path does NOT clear the FBO per frame -- it accumulates and the game's
+        // own clear draws (big opaque quads) clear it -- so clearing here diverged from GL and
+        // produced the alternating-brightness flicker.
+        dit->second.d3dRt->Bind(*dev);
+        (void)frameGen;
         rtW = (int)dit->second.d3dRt->Width(); rtH = (int)dit->second.d3dRt->Height();
         d3dGsMirrorUniforms();
         d3dGsMirrorState(rtH, rtH);
@@ -17463,22 +17471,9 @@ if (done.size() < 14 && !done.count(c.texKey))
 #if defined(_WIN32)
             if (d3dGsOn() && d3dGsEnsure())
             {
-                ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
-                auto dit = g_fbos.find(curRealFbp);
-                ps2x::gfx::RenderTarget *dest = (dit != g_fbos.end()) ? dit->second.d3dRt : nullptr;
-                if (dest)
+                int rtW = 0, rtH = 0;
+                if (d3dGsPrepDest(curRealFbp, frameGen, rtW, rtH))
                 {
-                    if (dit->second.d3dGen != frameGen)
-                    {
-                        dest->Bind(*dev);
-                        dest->Clear(*dev, 0, 0, 0, 1);
-                        dit->second.d3dGen = frameGen;
-                    }
-                    else dest->Bind(*dev);
-                    const int rtW = (int)dest->Width(), rtH = (int)dest->Height();
-                    d3dGsMirrorUniforms();
-                    d3dGsMirrorState(rtH, rtH);
-                    d3dGsSetMvp(rtW, rtH);
                     g_d3dGsSh.SetVec4("colDiffuse", c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, c.a / 255.0f);
                     g_d3dGsR.SetShader(&g_d3dGsSh);
                     ps2x::gfx::Texture *dt = d3dFboTexForGl(tex.id);
@@ -17972,16 +17967,9 @@ if (done.size() < 14 && !done.count(c.texKey))
 #if defined(_WIN32)
                         if (d3dGsOn() && d3dGsEnsure())
                         {
-                            ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
-                            auto dit = g_fbos.find(curRealFbp);
-                            ps2x::gfx::RenderTarget *dest = (dit != g_fbos.end()) ? dit->second.d3dRt : nullptr;
-                            if (dest)
+                            int rtW = 0, rtH = 0;
+                            if (d3dGsPrepDest(curRealFbp, frameGen, rtW, rtH))
                             {
-                                if (dit->second.d3dGen != frameGen)
-                                { dest->Bind(*dev); dest->Clear(*dev, 0, 0, 0, 1); dit->second.d3dGen = frameGen; }
-                                else dest->Bind(*dev);
-                                const int rtW = (int)dest->Width(), rtH = (int)dest->Height();
-                                d3dGsMirrorUniforms(); d3dGsMirrorState(rtH, rtH); d3dGsSetMvp(rtW, rtH);
                                 g_d3dGsSh.SetVec4("colDiffuse", 1, 1, 1, 1);
                                 g_d3dGsR.SetShader(&g_d3dGsSh);
                                 ps2x::gfx::Texture *dt = d3dFboTexForGl(tex.id);
