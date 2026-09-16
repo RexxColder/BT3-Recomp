@@ -1057,7 +1057,7 @@ namespace ps2_stubs
             uint32_t raw = getRegU32(ctx, 4);
             std::memcpy(&in, &raw, sizeof(in));
         }
-        const float out = std::atan(in);
+        const float out = ps2xDetAtanf(in);   // [detmath] host std::atan diverges 1 ULP Windows vs Linux -> netplay desync
         if (ctx)
         {
             ctx->f[0] = out;
