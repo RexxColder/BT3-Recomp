@@ -205,8 +205,17 @@ namespace
         { g_altglSrc.AdoptGL(g_altglDev, tex.id, (uint32_t)tex.width, (uint32_t)tex.height); g_altglSrcId = tex.id; }
         g_altglSrc.SetSamplerUV(g_altglDev, bilinear ? ps2x::gfx::gl::Filter::Linear : ps2x::gfx::gl::Filter::Point,
                                 ps2x::gfx::gl::Wrap::Clamp, ps2x::gfx::gl::Wrap::Clamp);
-        const float u0 = src.x / (float)tex.width,  u1 = (src.x + src.width) / (float)tex.width;
-        const float v0 = src.y / (float)tex.height, v1 = (src.y + src.height) / (float)tex.height;
+        // Mirror raylib's DrawTexturePro texcoord maths exactly (including the negative-height
+        // flip used by the GPU present): the flip moves source.y up instead of negating V, which
+        // is what keeps V inside [0,1]. Getting this wrong samples outside the texture -> black.
+        const float texW = (float)tex.width, texH = (float)tex.height;
+        const bool flipX = src.width < 0.0f;
+        const float srcW = flipX ? -src.width : src.width;
+        float srcY = src.y;
+        if (src.height < 0.0f) srcY -= src.height;
+        const float uA = src.x / texW, uB = (src.x + srcW) / texW;
+        const float u0 = flipX ? uB : uA, u1 = flipX ? uA : uB;
+        const float vTop = srcY / texH, vBottom = (srcY + src.height) / texH;
         const float x0 = dst.x, y0 = dst.y, x1 = dst.x + dst.width, y1 = dst.y + dst.height;
         const float m[16] = { 2.0f / W, 0, 0, 0, 0, -2.0f / H, 0, 0, 0, 0, 1, 0, -1, 1, 0, 1 };
         auto V = [](float x, float y, float u, float v) {
@@ -221,7 +230,7 @@ namespace
         g_altglR.SetDepth(false, false, 0x0203);
         ps2xgl::glDisable(ps2xgl::GL_CULL_FACE);   // raylib's rlgl leaves culling on
         g_altglBlit.SetMat4("mvp", m);
-        g_altglR.DrawQuad(V(x0, y0, u0, v0), V(x1, y0, u1, v0), V(x1, y1, u1, v1), V(x0, y1, u0, v1));
+        g_altglR.DrawQuad(V(x0, y0, u0, vTop), V(x1, y0, u1, vTop), V(x1, y1, u1, vBottom), V(x0, y1, u0, vBottom));
         return true;
     }
 }
