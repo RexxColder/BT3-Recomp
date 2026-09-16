@@ -12,6 +12,8 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #include <link.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 #if defined(PS2X_HAVE_LIBUNWIND)
 #define UNW_LOCAL_ONLY
@@ -2880,7 +2882,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         constexpr uint64_t kNestedFairnessInterval = 256u;
         ++g_cadBranchesSinceTick;   // [tickbusy]
         if (ps2xSchedTraceOn() && ((s_nestedFairness + 1u) & 31u) == 0u)   // diagnostic: who makes the non-main dispatches
-            std::fprintf(stderr, "[schedtrace] NF tid=%d nf=%llu target=0x%x src=0x%x main=%d\n", g_schedTid, (unsigned long long)(s_nestedFairness + 1u), targetPc, sourcePc, (int)(ctx == &m_cpuContext));
+            std::fprintf(stderr, "[schedtrace] NF tid=%d nf=%llu target=0x%x src=0x%x main=%d ostid=%ld\n", g_schedTid, (unsigned long long)(s_nestedFairness + 1u), targetPc, sourcePc, (int)(ctx == &m_cpuContext), (long)syscall(SYS_gettid));
         if ((++s_nestedFairness % kNestedFairnessInterval) == 0u)
         {
             if (m_fibersEnabled && g_schedIsGuest && !g_schedTickDue && g_cadBranchesSinceTick >= g_tickBranches && ps2xFrameStepOn())
@@ -5705,6 +5707,7 @@ struct Ps2xRollback
         static std::vector<std::pair<uint64_t, std::vector<uint8_t>>> s_traceA;
         static bool s_traceReported = false;
         static uint64_t s_target = 0, s_next = 0, s_hashA = 0, s_hashAgp = 0;
+        static std::vector<uint8_t> s_ramSnap; static uint64_t s_hashSnap = 0;   // [restorecheck] RAM as snapshotted
         static std::vector<uint8_t> s_ramA;   // RAM after the first run, for the byte diff that names what the snapshot misses
         static std::chrono::steady_clock::time_point s_tA, s_tB;
         static uint64_t s_wpNs0[WP_COUNT] = {};   // [waitprof] wait-site ns at the start of the re-run
@@ -5728,6 +5731,7 @@ struct Ps2xRollback
             s_sim = ps2xSimSnapCapture(&rt, rdram);
             s_fib = captureFibers(rt);
             s_target = frame + s_k; s_phase = RunA; s_tA = std::chrono::steady_clock::now();
+            s_hashSnap = ps2xRamHash(rdram, 0u, 0u); s_ramSnap.assign(rdram, rdram + 32u * 1024u * 1024u);
             std::fprintf(stderr, "[rollbacktest] #%u snapshot at frame %llu (fiber stacks %zu bytes), running %llu frames\n",
                          s_n, (unsigned long long)frame, s_fib->stackBytes, (unsigned long long)s_k);
             return;
@@ -5774,6 +5778,20 @@ struct Ps2xRollback
                 s_ramA.assign(rdram, rdram + 32u * 1024u * 1024u);
                 okS = ps2xSimSnapRestore(s_sim, &rt, rdram);
                 okF = restoreFibers(rt, *s_fib);
+                {   // [restorecheck] the restored RAM must equal the RAM as it was when the snapshot was taken
+                    const uint64_t hR = ps2xRamHash(rdram, 0u, 0u);
+                    std::fprintf(stderr, "[rollbacktest] restore fidelity: %s\n", hR == s_hashSnap ? "MATCH" : "DIFFER");
+                    if (hR != s_hashSnap && s_ramSnap.size() == 32u * 1024u * 1024u) ps2xPrintRamDiff(s_ramSnap.data(), rdram, "[restorediff]", 20u);
+                    // PS2X_ROLLBACK_PEEK=<hex addr>: the 64 bytes there as snapshotted / after the A run / after the B run
+                    static const uint32_t s_peek = [](){ const char *v = std::getenv("PS2X_ROLLBACK_PEEK"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 16) : 0u; }();
+                    if (s_peek && s_ramSnap.size() == 32u * 1024u * 1024u && s_ramA.size() == 32u * 1024u * 1024u)
+                    {
+                        const uint32_t a = s_peek & 0x1FFFFFFFu;
+                        std::string ls, la; char b[4];
+                        for (uint32_t i = 0; i < 64u && a + i < 32u * 1024u * 1024u; ++i) { std::snprintf(b, sizeof b, "%02x", s_ramSnap[a + i]); ls += b; std::snprintf(b, sizeof b, "%02x", s_ramA[a + i]); la += b; if ((i & 15u) == 15u) { ls += ' '; la += ' '; } }
+                        std::fprintf(stderr, "[peek] 0x%x snapshot: %s\n[peek] 0x%x after A : %s\n", a, ls.c_str(), a, la.c_str());
+                    }
+                }
             }
             std::fprintf(stderr, "[rollbacktest] #%u frame %llu hashA=%016llx (%.1f ms for %llu frames); restore sim=%d fibers=%d -> back at frame %llu\n",
                          s_n, (unsigned long long)frame, (unsigned long long)s_hashA, msA, (unsigned long long)s_k, (int)okS, (int)okF,
@@ -5795,6 +5813,8 @@ struct Ps2xRollback
             const double msB = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s_tB).count();
             const uint64_t hashB = ps2xRamHash(rdram, 0u, 0u);
             const uint64_t hashBgp = ps2xRamHash(rdram, 0x2c0000u, 0x300000u);
+            {   static const uint32_t s_peek = [](){ const char *v = std::getenv("PS2X_ROLLBACK_PEEK"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 16) : 0u; }();
+                if (s_peek) { const uint32_t a = s_peek & 0x1FFFFFFFu; std::string lb; char b[4]; for (uint32_t i = 0; i < 64u; ++i) { std::snprintf(b, sizeof b, "%02x", rdram[a + i]); lb += b; if ((i & 15u) == 15u) lb += ' '; } std::fprintf(stderr, "[peek] 0x%x after B : %s\n", a, lb.c_str()); } }
             std::fprintf(stderr, "[rollbacktest] #%u frame %llu hashB=%016llx (%.1f ms) -> %s (minus the stream window: %s)\n",
                          s_n, (unsigned long long)frame, (unsigned long long)hashB, msB, hashB == s_hashA ? "MATCH" : "DIFFER",
                          hashBgp == s_hashAgp ? "MATCH" : "DIFFER");

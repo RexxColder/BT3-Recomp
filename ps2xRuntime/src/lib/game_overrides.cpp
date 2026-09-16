@@ -681,13 +681,17 @@ namespace
             std::fprintf(stderr, "[bt3cdtick] %s: pump skipped %u polls in a row -- reentrancy "
                                  "guard stuck? state byte cannot advance\n", site, s_skips);
     }
+    extern "C" int ps2xSchedTraceOn();   // [schedtrace] ps2_runtime.cpp
+    extern "C" int ps2xSchedTid();
     void bt3CdReadStatePoll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00270dd0
     {
         const uint32_t handle = getRegU32(ctx, 4); // a0 = read handle
         Bt3CdTickGuard tickGuard;
         bt3NoteCdTickSkipped(!tickGuard.engaged, "cdReadStatePoll");
+        if (ps2xSchedTraceOn() && !tickGuard.engaged) std::fprintf(stderr, "[schedtrace] PUMP cdpoll-skipped(guard) tid=%d\n", ps2xSchedTid());
         if (tickGuard.engaged && handle != 0u && runtime->hasFunction(0x0028a3b0u))
         {
+            if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] PUMP cdpoll tid=%d handle=0x%x\n", ps2xSchedTid(), handle);
             R5900Context tctx = *ctx;          // inherit gp/sp
             setReturnU32(&tctx, 0u);            // (harmless)
             tctx.r[31] = _mm_setzero_si128();   // ra = 0 => run until return
@@ -5763,6 +5767,7 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
                 static const uint32_t s_pumpN = [](){ const char *v = std::getenv("PS2X_CDPUMP_N"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 1u; }();
                 for (uint32_t pn = 0; pn < s_pumpN; ++pn)
                 {
+                    if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] PUMP framekick tid=%d\n", ps2xSchedTid());
                     R5900Context tctx = *ctx;           // inherit gp/sp
                     tctx.r[31] = _mm_setzero_si128();   // ra = 0 => run until return
                     tctx.pc = 0x0028a3b0u;              // CD file-server tick

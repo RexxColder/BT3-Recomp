@@ -276,6 +276,8 @@ namespace ps2_syscalls
                                             << std::endl);
         }
 
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] SignalSema-state sid=%d count=%d->%d waiters=%d woke=%d\n", sid, beforeCount, afterCount, sema->waiters, (int)wokeWaiter);
+
         setReturnS32(ctx, ret);
         if (wokeWaiter)
         {
@@ -291,7 +293,7 @@ namespace ps2_syscalls
 
     void WaitSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] WaitSema sid=%d by=%d\n", (int)getRegU32(ctx, 4), g_currentThreadId);
+        if (ps2xSchedTraceOn()) { auto sm = lookupSemaInfo((int)getRegU32(ctx, 4)); std::fprintf(stderr, "[schedtrace] WaitSema sid=%d by=%d count=%d waiters=%d\n", (int)getRegU32(ctx, 4), g_currentThreadId, sm ? sm->count : -1, sm ? sm->waiters : -1); }
         int sid = static_cast<int>(getRegU32(ctx, 4));
         auto sema = lookupSemaInfo(sid);
         if (!sema)

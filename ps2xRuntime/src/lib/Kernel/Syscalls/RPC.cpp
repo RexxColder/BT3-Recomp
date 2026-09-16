@@ -3,6 +3,7 @@
 
 extern std::atomic<uint32_t> g_ps2WatchLo;
 extern std::atomic<uint32_t> g_ps2WatchHi;
+extern "C" int ps2xSchedTraceOn();
 
 namespace ps2_syscalls
 {
@@ -90,6 +91,7 @@ namespace ps2_syscalls
                 return false;
             }
             std::memcpy(ptr, &value, sizeof(value));
+            ps2TraceGuestRangeWrite(rdram, addr, (uint32_t)sizeof(value), "rpcwrite", nullptr);   // [awatch] RPC replies are host-side stores
             return true;
         }
 
@@ -101,6 +103,7 @@ namespace ps2_syscalls
                 return false;
             }
             std::memcpy(ptr, &value, sizeof(value));
+            ps2TraceGuestRangeWrite(rdram, addr, (uint32_t)sizeof(value), "rpcwrite", nullptr);   // [awatch] RPC replies are host-side stores
             return true;
         }
 
@@ -124,6 +127,7 @@ namespace ps2_syscalls
                 return false;
             }
             std::memcpy(ptr, &value, sizeof(value));
+            ps2TraceGuestRangeWrite(rdram, addr, (uint32_t)sizeof(value), "rpcwrite", nullptr);   // [awatch] RPC replies are host-side stores
             return true;
         }
 
@@ -1841,6 +1845,7 @@ namespace ps2_syscalls
                 return false;
             }
             std::memcpy(ptr, &value, sizeof(value));
+            ps2TraceGuestRangeWrite(rdram, addr, (uint32_t)sizeof(value), "rpcwrite", nullptr);   // [awatch] RPC replies are host-side stores
             return true;
         };
 
@@ -2780,6 +2785,7 @@ namespace ps2_syscalls
             return;
         }
         setReturnS32(ctx, it->second.busy ? 1 : 0);
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] CheckStatRpc client=0x%x busy=%d\n", clientPtr, it->second.busy ? 1 : 0);
     }
 
     void SifSetRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
