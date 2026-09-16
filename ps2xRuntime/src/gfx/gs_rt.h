@@ -13,4 +13,9 @@ namespace ps2x::gfx
     RenderTexture2D GsRtCreate(int w, int h, bool depth = true);
     // Free the gfx::gl resources behind the handle and zero it.
     void GsRtUnload(RenderTexture2D &rt);
+    // Bind/restore the target for drawing (replaces BeginTextureMode/EndTextureMode). They
+    // replicate raylib's recipe exactly, including the rlgl framebuffer size and the ortho
+    // projection installed for the target size, and they flush the pending rlgl batch first.
+    void GsRtBegin(const RenderTexture2D &rt);
+    void GsRtEnd();
 }

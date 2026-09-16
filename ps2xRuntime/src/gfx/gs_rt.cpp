@@ -3,6 +3,9 @@
 #include "gfx/gl_context.h"
 #include "gfx/gl/GlGfx.h"
 
+#include "raylib.h"
+#include "rlgl.h"   // A1: submit is still rlgl, so Begin/End mirror raylib's framebuffer+ortho recipe
+
 #include <cstdio>
 #include <memory>
 #include <unordered_map>
@@ -48,5 +51,37 @@ namespace ps2x::gfx
             s_targets.erase(it);
         }
         rt = RenderTexture2D{};
+    }
+
+    void GsRtBegin(const RenderTexture2D &rt)
+    {
+        // Mirrors raylib's BeginTextureMode (rcore.c:1079): flush the batch, bind the FBO, set the
+        // viewport AND the rlgl framebuffer size, then install an orthographic projection matching
+        // the TARGET size and reset the modelview. Omitting the projection is what broke the first
+        // blanket conversion: every draw into the FBO used the window's projection instead.
+        const int w = rt.texture.width > 0 ? rt.texture.width : 1;
+        const int h = rt.texture.height > 0 ? rt.texture.height : 1;
+        rlDrawRenderBatchActive();
+        rlEnableFramebuffer(rt.id);
+        rlViewport(0, 0, w, h);
+        rlSetFramebufferWidth(w);
+        rlSetFramebufferHeight(h);
+        rlMatrixMode(RL_PROJECTION);
+        rlLoadIdentity();
+        rlOrtho(0, w, h, 0, 0.0f, 1.0f);
+        rlMatrixMode(RL_MODELVIEW);
+        rlLoadIdentity();
+    }
+
+    void GsRtEnd()
+    {
+        // Mirrors raylib's EndTextureMode (rcore.c:1110): restore the viewport to the render size
+        // and reset the modelview. raylib does NOT restore the projection here (BeginDrawing does
+        // it at frame start), so we match that.
+        rlDrawRenderBatchActive();
+        rlDisableFramebuffer();
+        rlViewport(0, 0, GetRenderWidth(), GetRenderHeight());
+        rlMatrixMode(RL_MODELVIEW);
+        rlLoadIdentity();
     }
 }
