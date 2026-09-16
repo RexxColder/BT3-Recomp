@@ -3230,6 +3230,25 @@ namespace
     extern "C" void ps2xGuestSleepMs(unsigned ms);   // [fibers] parks the guest fiber, not the host thread
     extern "C" void ps2xSpinPump(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // [freezedump] Netplay diagnostic: when a guest thread spins inside the char-select LZ decompressor
+        // FUN_00263278 (0x263278..0x263478) during a connected session, dump EE RAM once after it has clearly
+        // hung (200 spin ticks). The decompressor is a direct compiled call, so no replaceFunction hook sees
+        // it -- but the scheduler re-dispatches it here on every spin. The saved arg (compressed source ptr)
+        // is s0 at [sp+0x300]; the dump lets us read the input the joiner is choking on. On PS2X_NET_DUMPDIR.
+        {
+            static const char *s_dir = std::getenv("PS2X_NET_DUMPDIR");
+            if (s_dir && s_dir[0] && rdram && ctx && ctx->pc >= 0x263278u && ctx->pc < 0x263478u && ps2NetActive())
+            {
+                static std::atomic<uint32_t> s_n{0};
+                if (s_n.fetch_add(1u) == 200u)
+                {
+                    const uint32_t sp = getRegU32(ctx, 29);
+                    char path[512]; std::snprintf(path, sizeof path, "%s/freeze_%llu_p%d.bin", s_dir, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), ps2NetLocalPlayer());
+                    if (std::FILE *f = std::fopen(path, "wb")) { std::fwrite(rdram, 1, PS2_RAM_SIZE, f); std::fclose(f);
+                        std::fprintf(stderr, "[freezedump] pc=0x%x sp=0x%x -> %s\n", ctx->pc, sp, path); }
+                }
+            }
+        }
         static const bool s_on = [](){ const char *v = std::getenv("PS2X_SPINPUMP"); return !(v && v[0] == '0'); }();
         if (!s_on || !runtime || !runtime->hasFunction(0x0028a3b0u)) return;
         {
