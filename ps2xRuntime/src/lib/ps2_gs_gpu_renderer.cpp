@@ -19326,27 +19326,82 @@ bool GsGpuRenderer::copyPresentPixels(std::vector<unsigned char> &outRgba, int &
 {
     if (g_lastOutId == 0)
         return false;
-    Texture2D t{};
-    t.id = g_lastOutId;
+
     int tw = 0, th = 0;
     glBindTexture(0x0DE1 /*GL_TEXTURE_2D*/, g_lastOutId);
     glGetTexLevelParameteriv(0x0DE1, 0, 0x1000 /*GL_TEXTURE_WIDTH*/, &tw);
     glGetTexLevelParameteriv(0x0DE1, 0, 0x1001 /*GL_TEXTURE_HEIGHT*/, &th);
     glBindTexture(0x0DE1, 0);
-    t.width = tw > 0 ? tw : (m_presentTexW > 0 ? m_presentTexW : 512);
-    t.height = th > 0 ? th : (m_presentTexH > 0 ? m_presentTexH : 448);
-    t.mipmaps = 1;
-    t.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-    Image im = LoadImageFromTexture(t);   // bottom-up, as GL stores it
-    if (!im.data || im.width <= 0 || im.height <= 0)
-    {
-        if (im.data) UnloadImage(im);
+    w = tw > 0 ? tw : (m_presentTexW > 0 ? m_presentTexW : 512);
+    h = th > 0 ? th : (m_presentTexH > 0 ? m_presentTexH : 448);
+
+    // [d3d11] Asynchronous readback: glReadPixels into a PBO (returns immediately) and map the
+    // PBO issued LAST frame. One frame of latency, but no per-frame GPU->CPU stall (the old
+    // LoadImageFromTexture path synced every frame and halved the fps).
+    typedef void (*PFN_GenFB)(int, unsigned *);
+    typedef void (*PFN_BindFB)(unsigned, unsigned);
+    typedef void (*PFN_FBTex)(unsigned, unsigned, unsigned, unsigned, int);
+    typedef void (*PFN_GenBuf)(int, unsigned *);
+    typedef void (*PFN_BindBuf)(unsigned, unsigned);
+    typedef void (*PFN_BufData)(unsigned, ptrdiff_t, const void *, unsigned);
+    typedef void (*PFN_ReadPix)(int, int, int, int, unsigned, unsigned, void *);
+    typedef void *(*PFN_Map)(unsigned, ptrdiff_t, ptrdiff_t, unsigned);
+    typedef unsigned char (*PFN_Unmap)(unsigned);
+    static PFN_GenFB  pGenFB  = reinterpret_cast<PFN_GenFB>(ps2xGlProc("glGenFramebuffers"));
+    static PFN_BindFB pBindFB = reinterpret_cast<PFN_BindFB>(ps2xGlProc("glBindFramebuffer"));
+    static PFN_FBTex  pFBTex  = reinterpret_cast<PFN_FBTex>(ps2xGlProc("glFramebufferTexture2D"));
+    static PFN_GenBuf pGenBuf = reinterpret_cast<PFN_GenBuf>(ps2xGlProc("glGenBuffers"));
+    static PFN_BindBuf pBindBuf = reinterpret_cast<PFN_BindBuf>(ps2xGlProc("glBindBuffer"));
+    static PFN_BufData pBufData = reinterpret_cast<PFN_BufData>(ps2xGlProc("glBufferData"));
+    static PFN_ReadPix pRead   = reinterpret_cast<PFN_ReadPix>(ps2xGlProc("glReadPixels"));
+    static PFN_Map    pMap     = reinterpret_cast<PFN_Map>(ps2xGlProc("glMapBufferRange"));
+    static PFN_Unmap  pUnmap   = reinterpret_cast<PFN_Unmap>(ps2xGlProc("glUnmapBuffer"));
+    if (!pGenFB || !pBindFB || !pFBTex || !pGenBuf || !pBindBuf || !pBufData || !pRead || !pMap || !pUnmap)
         return false;
+
+    static unsigned sFbo = 0, sPbo[2] = {0, 0};
+    static int sW = 0, sH = 0, sCur = 0;
+    static bool sPending = false;
+    const ptrdiff_t bytes = (ptrdiff_t)w * (ptrdiff_t)h * 4;
+
+    if (sW != w || sH != h)
+    {
+        if (!sFbo) pGenFB(1, &sFbo);
+        if (!sPbo[0]) pGenBuf(2, sPbo);
+        for (int i = 0; i < 2; ++i)
+        {
+            pBindBuf(0x88EB /*GL_PIXEL_PACK_BUFFER*/, sPbo[i]);
+            pBufData(0x88EB, bytes, nullptr, 0x88E1 /*GL_STREAM_READ*/);
+        }
+        pBindBuf(0x88EB, 0);
+        sW = w; sH = h; sPending = false;
     }
-    w = im.width;
-    h = im.height;
-    outRgba.assign((size_t)w * (size_t)h * 4u, 255);
-    std::memcpy(outRgba.data(), im.data, (size_t)w * (size_t)h * 4u);
-    UnloadImage(im);
-    return true;
+
+    // Attach the current present texture so glReadPixels reads it.
+    pBindFB(0x8D40 /*GL_FRAMEBUFFER*/, sFbo);
+    pFBTex(0x8D40, 0x8CE0 /*GL_COLOR_ATTACHMENT0*/, 0x0DE1, g_lastOutId, 0);
+
+    bool filled = false;
+    if (sPending)
+    {
+        pBindBuf(0x88EB, sPbo[sCur ^ 1]);
+        void *m = pMap(0x88EB, 0, bytes, 0x0001 /*GL_MAP_READ_BIT*/);
+        if (m)
+        {
+            outRgba.assign((size_t)bytes, 255);
+            std::memcpy(outRgba.data(), m, (size_t)bytes);
+            pUnmap(0x88EB);
+            filled = true;
+        }
+        pBindBuf(0x88EB, 0);
+    }
+
+    pBindBuf(0x88EB, sPbo[sCur]);
+    pRead(0, 0, w, h, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, nullptr);
+    pBindBuf(0x88EB, 0);
+    pBindFB(0x8D40, 0);
+
+    sCur ^= 1;
+    sPending = true;
+    return filled;
 }
