@@ -541,16 +541,23 @@ namespace
         if (ps2NetActive())
         {
             const uint32_t frame = static_cast<uint32_t>(g_bt3FrameCount.load(std::memory_order_relaxed));
-            // [freezerecover] TEST hook (PS2X_NET_FREEZE_TEST=<game frame>): a synced joiner forces ONE
-            // recovery there, with no real freeze, to validate the re-sync path in loopback. Off by default.
+            // [freezerecover] TEST hook: PS2X_NET_FREEZE_TEST=<N> forces ONE recovery on the joiner N game
+            // frames AFTER the state sync completes (relative, so it does not depend on the run-varying sync
+            // frame), with NO real freeze, to validate the re-sync path. 0/unset = off.
             {
-                static const uint32_t s_ftf = [](){ const char *v = std::getenv("PS2X_NET_FREEZE_TEST"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
+                static const uint32_t s_ftN = [](){ const char *v = std::getenv("PS2X_NET_FREEZE_TEST"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u; }();
+                static std::atomic<uint32_t> s_ftSync{0};
                 static std::atomic<bool> s_ftDone{false};
-                if (s_ftf && !ps2NetSyncIsHost() && !ps2NetSyncPending() && frame >= s_ftf && !s_ftDone.exchange(true))
+                if (s_ftN && !ps2NetSyncIsHost() && !ps2NetSyncPending())
                 {
-                    std::fprintf(stderr, "[freezerecover] TEST: forcing a recovery at frame %u\n", frame);
-                    ps2xNetFreezeRecoverBegin();
-                    ps2xGuestSleepMs(5000u);
+                    uint32_t sf = s_ftSync.load(std::memory_order_relaxed);
+                    if (sf == 0u) { sf = frame ? frame : 1u; s_ftSync.store(sf, std::memory_order_relaxed); }
+                    if (frame >= sf + s_ftN && !s_ftDone.exchange(true))
+                    {
+                        std::fprintf(stderr, "[freezerecover] TEST: forcing a recovery at frame %u (%u after sync)\n", frame, s_ftN);
+                        ps2xNetFreezeRecoverBegin();
+                        ps2xGuestSleepMs(5000u);
+                    }
                 }
             }
             const int pl = static_cast<int>(socket & 3u) + 1;          // socket 0/1 -> player 1/2
