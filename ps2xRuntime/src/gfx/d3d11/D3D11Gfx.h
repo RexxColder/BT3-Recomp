@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace ps2x::gfx
 {
@@ -40,6 +41,7 @@ namespace ps2x::gfx
         // owning it, so it can be bound by the Renderer (present/blit path).
         void AdoptSRV(D3D11Device &dev, void *srv, uint32_t w, uint32_t h);
         void SetSampler(D3D11Device &dev, Filter filter, Wrap wrap);
+        void SetSamplerUV(D3D11Device &dev, Filter filter, Wrap wrapU, Wrap wrapV);
 
         bool Valid() const;
         uint32_t Width() const;
@@ -148,6 +150,7 @@ namespace ps2x::gfx
         // Per-draw state (applies to the next Draw*).
         void SetShader(Shader *shader);
         void SetTexture(Texture *texture);
+        void SetTexture1(Texture *texture);   // [d3d11] t1: the 256x1 CLUT (uPal) of an indexed draw
         void SetBlend(const BlendDesc &blend);
         void SetScissor(const int rect[4]);   // x,y,w,h; nullptr/int[4]{0,0,0,0} = off
         void SetColorMask(bool r, bool g, bool b, bool a);
@@ -164,4 +167,7 @@ namespace ps2x::gfx
     private:
         std::unique_ptr<Impl> m_impl;
     };
+
+    // [diag] Copy a texture to a CPU buffer (RGBA8, top-down). Used by the native GS dump.
+    bool ReadbackRGBA(D3D11Device &dev, Texture &tex, std::vector<uint8_t> &out);
 }

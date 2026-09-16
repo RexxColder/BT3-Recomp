@@ -37,6 +37,7 @@ namespace ps2x::gfx
         Format fmt = Format::RGBA8;
         Filter filter = Filter::Point;
         Wrap wrap = Wrap::Clamp;
+        uint8_t wrapUV = 0;   // [d3d11] bit0 = U repeat, bit1 = V repeat (per-axis GS wrap)
     };
 
     Texture::Texture() : m_impl(std::make_unique<Impl>()) {}
@@ -116,12 +117,55 @@ namespace ps2x::gfx
         d->CreateSamplerState(&sd, t.sampler.GetAddressOf());
     }
 
+    void Texture::SetSamplerUV(D3D11Device &dev, Filter filter, Wrap wrapU, Wrap wrapV)
+    {
+        Impl &t = *m_impl;
+        if (t.sampler && t.filter == filter && t.wrapUV == ((wrapU == Wrap::Repeat ? 1 : 0) | (wrapV == Wrap::Repeat ? 2 : 0)))
+            return;   // [d3d11] cached: the GS path changes wrap per draw (REPEAT tiles vs CLAMP)
+        t.filter = filter;
+        t.wrapUV = (wrapU == Wrap::Repeat ? 1 : 0) | (wrapV == Wrap::Repeat ? 2 : 0);
+        ID3D11Device *d = static_cast<ID3D11Device *>(dev.NativeDevice());
+        if (!d) return;
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter = (filter == Filter::Point) ? D3D11_FILTER_MIN_MAG_MIP_POINT : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = (wrapU == Wrap::Repeat) ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressV = (wrapV == Wrap::Repeat) ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressW = sd.AddressU;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MinLOD = 0; sd.MaxLOD = D3D11_FLOAT32_MAX;
+        t.sampler.Reset();
+        d->CreateSamplerState(&sd, t.sampler.GetAddressOf());
+    }
+
     bool Texture::Valid() const { return m_impl->tex != nullptr; }
     uint32_t Texture::Width() const { return m_impl->w; }
     uint32_t Texture::Height() const { return m_impl->h; }
     void *Texture::NativeTexture() const { return m_impl->tex.Get(); }
     void *Texture::NativeSRV() const { return m_impl->srv.Get(); }
     void *Texture::NativeSampler() const { return m_impl->sampler.Get(); }
+
+    bool ReadbackRGBA(D3D11Device &dev, Texture &tex, std::vector<uint8_t> &out)
+    {
+        ID3D11Device *d = static_cast<ID3D11Device *>(dev.NativeDevice());
+        ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(dev.NativeContext());
+        auto *src = static_cast<ID3D11Texture2D *>(tex.NativeTexture());
+        if (!d || !ctx || !src) return false;
+        D3D11_TEXTURE2D_DESC sd = {};
+        src->GetDesc(&sd);
+        D3D11_TEXTURE2D_DESC st = sd;
+        st.Usage = D3D11_USAGE_STAGING; st.BindFlags = 0; st.CPUAccessFlags = D3D11_CPU_ACCESS_READ; st.MiscFlags = 0;
+        ComPtr<ID3D11Texture2D> stage;
+        if (FAILED(d->CreateTexture2D(&st, nullptr, stage.GetAddressOf()))) return false;
+        ctx->CopyResource(stage.Get(), src);
+        D3D11_MAPPED_SUBRESOURCE m = {};
+        if (FAILED(ctx->Map(stage.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+        const uint32_t w = tex.Width(), h = tex.Height();
+        out.assign((size_t)w * h * 4u, 0);
+        for (uint32_t y = 0; y < h; ++y)
+            std::memcpy(&out[(size_t)y * w * 4u], (const uint8_t *)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4u);
+        ctx->Unmap(stage.Get(), 0);
+        return true;
+    }
 
     // ------------------------------------------------------------- RenderTarget
     struct RenderTarget::Impl
@@ -346,6 +390,7 @@ namespace ps2x::gfx
         Texture                     white;      // 1x1 fallback for untextured draws
         Shader                     *shader = nullptr;
         Texture                    *texture = nullptr;
+        Texture                    *texture1 = nullptr;   // [d3d11] t1 CLUT (uPal)
         BlendDesc                   blend;
         int                         scissor[4] = {0, 0, 0, 0};
         bool                        colorMask[4] = {true, true, true, true};
@@ -416,6 +461,7 @@ namespace ps2x::gfx
 
     void Renderer::SetShader(Shader *s) { m_impl->shader = s; }
     void Renderer::SetTexture(Texture *t) { m_impl->texture = t; }
+    void Renderer::SetTexture1(Texture *t) { m_impl->texture1 = t; }
     void Renderer::SetBlend(const BlendDesc &b) { m_impl->blend = b; }
     void Renderer::SetScissor(const int rect[4])
     {
@@ -502,6 +548,13 @@ namespace ps2x::gfx
         ID3D11SamplerState *smp = static_cast<ID3D11SamplerState *>(t->NativeSampler());
         ctx->PSSetShaderResources(0, 1, &srv);
         ctx->PSSetSamplers(0, 1, &smp);
+        // [d3d11] t1/s1 = the CLUT for an indexed (uPal) draw. Always bind something so a stale
+        // palette from a previous draw can never be sampled.
+        Texture *t1 = r.texture1 ? r.texture1 : &r.white;
+        ID3D11ShaderResourceView *srv1 = static_cast<ID3D11ShaderResourceView *>(t1->NativeSRV());
+        ID3D11SamplerState *smp1 = static_cast<ID3D11SamplerState *>(t1->NativeSampler());
+        ctx->PSSetShaderResources(1, 1, &srv1);
+        ctx->PSSetSamplers(1, 1, &smp1);
     }
 
     static void drawVerts(Renderer::Impl &r, const Vertex *v, UINT n, D3D11_PRIMITIVE_TOPOLOGY topo)
@@ -599,6 +652,7 @@ namespace ps2x::gfx
     void Renderer::Destroy() {}
     void Renderer::SetShader(Shader *) {}
     void Renderer::SetTexture(Texture *) {}
+    void Renderer::SetTexture1(Texture *) {}
     void Renderer::SetBlend(const BlendDesc &) {}
     void Renderer::SetScissor(const int *) {}
     void Renderer::SetColorMask(bool, bool, bool, bool) {}

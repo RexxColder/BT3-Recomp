@@ -4961,6 +4961,22 @@ void PS2Runtime::run()
                 g_ps2xD3D11.Resize(static_cast<uint32_t>(GetScreenWidth()),
                                    static_cast<uint32_t>(GetScreenHeight()));
             PollInputEvents();
+            {   // [diag] PS2X_D3DDUMP=1: write the native present texture to a PNG a few frames in.
+                static int s_dumpN = 0;
+                static const char *s_dumpEnv = std::getenv("PS2X_D3DDUMP");
+                if (s_dumpEnv && s_dumpEnv[0] && s_dumpEnv[0] != '0')
+                {
+                    const int n = ++s_dumpN;
+                    if ((n % 600) == 0 && n <= 7200)
+                    {
+                        char p[256];
+                        std::snprintf(p, sizeof p, "C:\\Users\\Rexx\\AppData\\Local\\Temp\\opencode\\present_%d.png", n);
+                        const bool ok = ps2GpuRenderer().d3dDumpPresent(p);
+                        std::fprintf(stderr, "[d3ddump] frame %d -> %s (%dx%d) ok=%d\n", n, p,
+                                     ps2GpuRenderer().d3dPresentWidth(), ps2GpuRenderer().d3dPresentHeight(), (int)ok);
+                    }
+                }
+            }
             static const bool s_uiTest = [](){ const char *v = std::getenv("PS2X_UI_TEST"); return v && v[0] && v[0] != '0'; }();
             const ps2x::gfx::Color d3dClear = s_uiTest
                 ? ps2x::gfx::Color{0.85f, 0.85f, 0.90f, 1.0f}   // bright, so the dark ImGui shows
@@ -4975,7 +4991,45 @@ void PS2Runtime::run()
             }
             if (g_d3dBlitInit)
             {
-                void *nativeSrv = ps2GpuRenderer().d3dPresentSRV();
+                // [fmvoverride] D3D path for the opening movie: consume a frame, upload it and
+                // draw it full-window; while it shows, skip the GS present (same as the GL path).
+                bool d3dFmvDrew = false;
+                {
+                    extern std::atomic<uint32_t> g_ps2MovieActive;
+                    ps2x_fmv::FmvOverrideFrame of{};
+                    if (ps2x_fmv::tick(g_ps2MovieActive.load(std::memory_order_relaxed) != 0u, of))
+                    {
+                        static ps2x::gfx::Texture s_fmvTex;
+                        static int s_tw = 0, s_th = 0;
+                        static uint64_t s_gen = ~0ull;
+                        if (!s_fmvTex.Valid() || of.w != s_tw || of.h != s_th)
+                        {
+                            s_fmvTex.Create(g_ps2xD3D11, (uint32_t)of.w, (uint32_t)of.h,
+                                            ps2x::gfx::Format::RGBA8, nullptr);
+                            s_fmvTex.SetSampler(g_ps2xD3D11, ps2x::gfx::Filter::Linear, ps2x::gfx::Wrap::Clamp);
+                            s_tw = of.w; s_th = of.h; s_gen = ~0ull;
+                        }
+                        if (of.gen != s_gen) { s_fmvTex.Update(g_ps2xD3D11, of.rgba); s_gen = of.gen; }
+                        const float W = (float)g_ps2xD3D11.Width(), H = (float)g_ps2xD3D11.Height();
+                        float dw, dh;
+                        if (PS2SettingsOverlay::isWidescreen() || wsTrigActive()) { dw = W; dh = H; }
+                        else { const float s = std::min(W / (float)of.w, H / (float)of.h); dw = of.w * s; dh = of.h * s; }
+                        const float x0 = (W - dw) * 0.5f, y0 = (H - dh) * 0.5f, x1 = x0 + dw, y1 = y0 + dh;
+                        auto ndcX = [&](float x) { return 2.0f * x / W - 1.0f; };
+                        auto ndcY = [&](float y) { return 1.0f - 2.0f * y / H; };
+                        auto mkf = [](float x, float y, float u, float v) {
+                            ps2x::gfx::Vertex vx{}; vx.x = x; vx.y = y; vx.u = u; vx.v = v;
+                            vx.r = vx.g = vx.b = vx.a = 255; vx.q = 1.0f; vx.z = 0.0f; return vx; };
+                        g_d3dBlit.SetShader(&g_d3dBlitShader);
+                        g_d3dBlit.SetTexture(&s_fmvTex);
+                        ps2x::gfx::BlendDesc ab;   // alpha
+                        g_d3dBlit.SetBlend(ab);
+                        g_d3dBlit.DrawQuad(mkf(ndcX(x0), ndcY(y0), 0, 0), mkf(ndcX(x1), ndcY(y0), 1, 0),
+                                           mkf(ndcX(x1), ndcY(y1), 1, 1), mkf(ndcX(x0), ndcY(y1), 0, 1));
+                        d3dFmvDrew = true;
+                    }
+                }
+                void *nativeSrv = d3dFmvDrew ? nullptr : ps2GpuRenderer().d3dPresentSRV();
                 if (nativeSrv)
                 {   // [d3d11 gs] the GS rendered natively into a D3D render target: bind its SRV.
                     const uint32_t rw = ps2GpuRenderer().d3dPresentWidth();

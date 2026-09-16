@@ -446,6 +446,7 @@ public:
     void *d3dPresentSRV() const;
     unsigned d3dPresentWidth() const;
     unsigned d3dPresentHeight() const;
+    bool d3dDumpPresent(const char *path);   // [diag] write the native present texture to a PNG
     // Display region derived from the command scissors (the software latch that
     // normally reports this doesn't run in GPU mode). Valid after renderAndGetTextureId.
     int displayWidth() const { return m_dispW; }
