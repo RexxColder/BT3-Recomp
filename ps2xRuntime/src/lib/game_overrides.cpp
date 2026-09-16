@@ -5014,6 +5014,30 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
     //   RA notes: 0x6af7a0 versus mode (0 = 1vCPU, 1 = 1v2, 2 = CPUvCPU)
     //             0x6af7a4 battle type (0 = Single, 1 = Team)
     //             0x6af1ac current mode
+    // [matchdump] PS2X_NET_MATCHDUMP=1 (+PS2X_NET_DUMPDIR): during a netplay character-select, dump full EE
+    // RAM every 15 game frames (g_bt3FrameCount, which both machines advance in lockstep after the state
+    // sync) to matchdump_<frame>_p<player>.bin, keeping the last 8. Both machines dump the SAME frame
+    // numbers, so a pair (host p1, joiner p2) at the same frame just before the freeze can be diffed to
+    // find the exact word that diverged and drives the wrong-asset load. Off unless the env is set.
+    static void bt3MatchDump(uint8_t *rdram)
+    {
+        static const char *s_dir = [](){ const char *m = std::getenv("PS2X_NET_MATCHDUMP");
+                                          return (m && m[0] && m[0] != '0') ? std::getenv("PS2X_NET_DUMPDIR") : nullptr; }();
+        if (!s_dir || !s_dir[0] || !rdram || !ps2NetActive()) return;
+        uint32_t bt3State = 0xffffffffu, sp0 = 0u;
+        if (const uint8_t *p = getConstMemPtr(rdram, 0x2ff10cu)) std::memcpy(&sp0, p, 4);
+        if (sp0) { if (const uint8_t *p = getConstMemPtr(rdram, (sp0 & 0x1FFFFFFFu) + 0x18u)) std::memcpy(&bt3State, p, 4); }
+        if (bt3State != 0x27u) return;
+        const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+        static uint64_t s_last = ~0ull;
+        if (fr == s_last || (fr % 15u) != 0u) return;   // once per frame, every 15th frame
+        s_last = fr;
+        const int pl = ps2NetLocalPlayer();
+        char path[512]; std::snprintf(path, sizeof path, "%s/matchdump_%llu_p%d.bin", s_dir, (unsigned long long)fr, pl);
+        if (std::FILE *f = std::fopen(path, "wb")) { std::fwrite(rdram, 1, PS2_RAM_SIZE, f); std::fclose(f);
+            std::fprintf(stderr, "[matchdump] frame %llu -> %s\n", (unsigned long long)fr, path); }
+        if (fr >= 120u) { char old[512]; std::snprintf(old, sizeof old, "%s/matchdump_%llu_p%d.bin", s_dir, (unsigned long long)(fr - 120u), pl); std::remove(old); }
+    }
     static void bt3MemWatch(uint8_t *rdram)
     {
         static std::vector<uint32_t> s_addrs = [](){
@@ -5570,6 +5594,7 @@ extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
         bt3MatchScan(rdram);         // [matchwatch] level 2
         bt3MemWatch(rdram);          // [memwatch]
         bt3MemBlock(rdram);          // [memblock]
+        bt3MatchDump(rdram);         // [matchdump] no-op unless PS2X_NET_MATCHDUMP=1
         bt3DumpKey(rdram);           // [dumpkey]
         bt3NetJumpCharSelect(rdram, ctx, runtime); // [netjump]
         {   // [netplay] no-op unless PS2X_NET / PS2X_NET_LISTEN is set. PS2X_NET_CONNECT_FRAME=<n> (rig) holds the
