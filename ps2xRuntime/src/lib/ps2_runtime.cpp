@@ -4546,7 +4546,7 @@ void PS2Runtime::schedYield(int tid)
             {   // only when something could have woken a blocked fiber (see g_schedSignalGen), or every 64 yields
                 const uint64_t gen = g_schedSignalGen.load(std::memory_order_relaxed);
                 const bool skip = gen == g_schedSeenGen && (++g_schedSinceProbe & 63u) != 0u;
-                if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] yield tid=%d gen=%llu seen=%llu since=%u nf=%llu tick=%llu -> %s\n", tid, (unsigned long long)gen, (unsigned long long)g_schedSeenGen, g_schedSinceProbe, (unsigned long long)g_cadNestedFairness, (unsigned long long)g_cadTickCounter, skip ? "continue" : "probe");
+                if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] yield tid=%d pc=0x%x gen=%llu seen=%llu since=%u nf=%llu tick=%llu -> %s\n", tid, g_schedLastPc, (unsigned long long)gen, (unsigned long long)g_schedSeenGen, g_schedSinceProbe, (unsigned long long)g_cadNestedFairness, (unsigned long long)g_cadTickCounter, skip ? "continue" : "probe");
                 if (skip) return;
                 g_schedSeenGen = gen; g_schedSinceProbe = 0;
             }
@@ -4630,8 +4630,23 @@ void PS2Runtime::yieldGuestExecutionAfterWake()
 bool PS2Runtime::shouldPreemptGuestExecution()
 {
     uint32_t &s_backEdgeYieldCounter = g_cadBackEdge;   // [rollback] cadence counter (file scope)
-    const uint32_t waiterCount = m_guestExecutionWaiters.load(std::memory_order_acquire);
-    const uint32_t yieldInterval = (waiterCount != 0u) ? 64u : 100u;
+    // [rollback] Determinism: in frame-stepped / fiber mode the preemption cadence MUST be a pure
+    // function of guest back-edges executed, never of host-thread lock contention. waiterCount is a
+    // count of REAL host threads (render, audio callback, DMA drain) blocked on the guest lock; it
+    // flips 0<->1 with host scheduling, so keying the interval off it made preemption host-paced ->
+    // the main/sound thread interleaving (and thus the cadence counters nf/tick/gen) diverged
+    // between two machines -> char-select decompressed the wrong asset -> freeze. Fix the interval
+    // so the same guest instruction stream always preempts at the same points.
+    uint32_t yieldInterval;
+    if (ps2xFrameStepOn())
+    {
+        yieldInterval = 100u;
+    }
+    else
+    {
+        const uint32_t waiterCount = m_guestExecutionWaiters.load(std::memory_order_acquire);
+        yieldInterval = (waiterCount != 0u) ? 64u : 100u;
+    }
     if (++s_backEdgeYieldCounter < yieldInterval)
     {
         return false;
