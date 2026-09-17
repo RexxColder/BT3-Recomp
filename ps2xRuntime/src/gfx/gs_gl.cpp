@@ -1,8 +1,10 @@
 #include "gfx/gs_gl.h"
 
 #include "gfx/gl_context.h"
+#include "gfx/gl/GlApi.h"
 #include "gfx/gl/GlGfx.h"
 #include "gfx/gl/gl_gs_shader_glsl.h"
+#include "gfx/gs_rt.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +33,37 @@ namespace ps2x::gfx
             gl::Texture *raw = t.get();
             g_tex[glId] = std::move(t);
             return raw;
+        }
+
+        // [gsgl framing] The framing installed at the last flush, i.e. what the pending geometry was
+        // built for. Re-derived from the GL state, NOT from whoever last called GsGlBeginTarget:
+        // the replay rebinds FBOs directly (the 58 rlEnableFramebuffer sites) and GsRtBegin frames
+        // with the PHYSICAL size + scale 1, so trusting the last BeginTarget is what left the picture
+        // zoomed/cropped. GsRtInfo gives the LOGICAL size our emitters actually draw in.
+        unsigned g_fbFramed = 0;
+        float g_lwFramed = 0.0f, g_lhFramed = 0.0f;
+
+        void GsGlSetFraming(float lw, float lh)
+        {
+            if (lw <= 0.0f || lh <= 0.0f) return;
+            const float m[16] = { 2.0f / lw, 0, 0, 0, 0, -2.0f / lh, 0, 0, 0, 0, 1, 0, -1, 1, 0, 1 };
+            g_main.SetMat4("mvp", m);
+        }
+
+        void GsGlReframeIfNeeded()
+        {
+            ps2xgl::GLint fbo = 0, vp[4] = { 0, 0, 0, 0 };
+            ps2xgl::glGetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &fbo);
+            ps2xgl::glGetIntegerv(0x0BA2 /*GL_VIEWPORT*/, vp);
+            float lw = (float)vp[2], lh = (float)vp[3];   // not ours -> rlgl frames in the FBO's pixels
+            GsRtDesc d;
+            if (GsRtInfo((unsigned)fbo, d)) { lw = (float)d.logicalW; lh = (float)d.logicalH; }
+            if (lw <= 0.0f || lh <= 0.0f) return;
+            if ((unsigned)fbo == g_fbFramed && lw == g_lwFramed && lh == g_lhFramed) return;
+            g_fbFramed = (unsigned)fbo; g_lwFramed = lw; g_lhFramed = lh;
+            GsGlSetFraming(lw, lh);
+            static int n = 0;
+            if (n < 40) { ++n; std::fprintf(stderr, "[gsgl] reframe fb=%u logical=%.0fx%.0f\n", (unsigned)fbo, lw, lh); }
         }
     }
 
@@ -83,13 +116,12 @@ namespace ps2x::gfx
                                             (float)h / (renderScale > 0.01f ? renderScale : 1.0f)); }
         }
         gl::Renderer &r = gl::RendererRef();
-        // rlgl's MVP is modelview * projection, where modelview carries rlScalef(N,N,1) and the
-        // projection is the FBO ortho (0..w, h..0). Our Renderer takes a single ortho, so we fold
-        // the scale in: the emitters draw in LOGICAL coordinates (physical / N).
-        const float sc = (renderScale > 0.01f) ? renderScale : 1.0f;
-        const float lw = (float)w / sc, lh = (float)h / sc;
-        const float m[16] = { 2.0f / lw, 0, 0, 0, 0, -2.0f / lh, 0, 0, 0, 0, 1, 0, -1, 1, 0, 1 };
-        g_main.SetMat4("mvp", m);
+        // Do NOT install a framing here: the target may be rebound later without telling us (the raw
+        // rlEnableFramebuffer sites) and this call comes in two flavours -- the real one from beginFbp
+        // (w,h,scale) and GsRtBegin's (physical size, scale 1). Just invalidate so GsGlFlush re-derives
+        // from the ACTUAL framebuffer + the render-target contract.
+        g_fbFramed = 0; g_lwFramed = g_lhFramed = 0.0f;
+        (void)renderScale;
         r.SetShader(&g_main);
     }
 
@@ -101,7 +133,12 @@ namespace ps2x::gfx
         (void)screenW; (void)screenH;
     }
 
-    void GsGlFlush() { if (g_ok) gl::RendererRef().Flush(); }
+    void GsGlFlush()
+    {
+        if (!g_ok) return;
+        GsGlReframeIfNeeded();   // [gsgl framing] the batch is submitted into whatever is bound NOW
+        gl::RendererRef().Flush();
+    }
 
     void GsGlBlend(bool enable, uint32_t srcRGB, uint32_t dstRGB, uint32_t srcA, uint32_t dstA,
                    uint32_t eqRGB, uint32_t eqA, const float blendColor[4])
