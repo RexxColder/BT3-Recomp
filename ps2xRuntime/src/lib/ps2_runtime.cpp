@@ -1463,12 +1463,12 @@ bool PS2Runtime::initialize(const char *title)
         }
 #if defined(_WIN32)
         // [altGL] Bring the shared gfx::gl context up BEFORE the GS renderer creates any render
-        // target: GsRtCreate needs it, and the renderer runs long before the first present.
+        // target: GsRtCreate goes through gfx::gl on EVERY renderer (the GS still renders via GL
+        // even when the present is D3D11), so the context must exist regardless of the present.
         if (AltGlEnabled()) AltGlInit();
-        else if (ps2x::gfx::GsGlEnabled())   // [gsgl] the replay backend needs the context too
-            ps2x::gfx::gl::EnsureContext(GetWindowHandle(),
-                                         [](const char *n) { return (void *)wglGetProcAddress(n); },
-                                         (uint32_t)GetScreenWidth(), (uint32_t)GetScreenHeight());
+        else ps2x::gfx::gl::EnsureContext(GetWindowHandle(),
+                                          [](const char *n) { return (void *)wglGetProcAddress(n); },
+                                          (uint32_t)GetScreenWidth(), (uint32_t)GetScreenHeight());
 #endif
         // [hostio] audio and gamepads go through the host layers (SDL2 by default, raylib on
         // PS2X_HOSTAUDIO=raylib / PS2X_HOSTPAD=raylib); the window and keyboard stay raylib's.
