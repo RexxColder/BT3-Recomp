@@ -94,6 +94,7 @@ namespace ps2x::gfx { namespace gl
         void SetVec2(const char *name, float x, float y);
         void SetVec3(const char *name, float x, float y, float z);
         void SetVec4(const char *name, float x, float y, float z, float w);
+        void SetIVec4(const char *name, int x, int y, int z, int w);
         void SetInt(const char *name, int v);
         void SetMat4(const char *name, const float m[16]); // column-major (GL convention)
         bool Valid() const;
@@ -148,6 +149,18 @@ namespace ps2x::gfx { namespace gl
         void DrawQuad(const Vertex &v0, const Vertex &v1, const Vertex &v2, const Vertex &v3);
         void DrawTriangle(const Vertex &v0, const Vertex &v1, const Vertex &v2);
         void BindBackBuffer(GlDevice &dev);
+
+        // [batcher] Buffered submission mirroring rlgl's render batch: geometry is accumulated and
+        // drawn as ONE glDrawArrays per (state, texture, shader) group. State setters auto-flush
+        // first, so a state change can never retroactively affect queued geometry -- the same
+        // invariant the GS replay maintains with its explicit flushBatch() calls.
+        void BeginBatch();               // start buffering (Draw* stop being immediate)
+        void Flush();                    // draw queued geometry now (no-op when empty)
+        void BatchQuad(const Vertex &v0, const Vertex &v1, const Vertex &v2, const Vertex &v3);
+        void BatchTriangle(const Vertex &v0, const Vertex &v1, const Vertex &v2);
+        bool Batching() const;
+        uint64_t DrawCalls() const;      // glDrawArrays issued through this renderer
+        uint64_t Flushes() const;        // non-empty batched flushes
 
     public:
         struct Impl;

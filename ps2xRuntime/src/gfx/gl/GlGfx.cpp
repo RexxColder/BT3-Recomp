@@ -9,6 +9,11 @@
 
 using namespace ps2xgl;   // GL scalar types + tokens used unqualified in this implementation
 
+// [batcher] counters mirroring raylib's g_rlglDrawCalls / g_rlglBatchFlushes so the runtime's
+// [fps] line (glcalls/sec, glflush/sec) keeps working once the replay is submitted through gfx::gl.
+extern "C" unsigned long long g_ps2xGlDrawCalls = 0;
+extern "C" unsigned long long g_ps2xGlFlushes = 0;
+
 namespace ps2x::gfx { namespace gl
 {
     namespace
@@ -273,6 +278,7 @@ namespace ps2x::gfx { namespace gl
     void Shader::SetVec2(const char *n, float x, float y) { ensureCurrent(m_impl->prog); const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform2f(l, x, y); }
     void Shader::SetVec3(const char *n, float x, float y, float z) { ensureCurrent(m_impl->prog); const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform3f(l, x, y, z); }
     void Shader::SetVec4(const char *n, float x, float y, float z, float w) { ensureCurrent(m_impl->prog); const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform4f(l, x, y, z, w); }
+    void Shader::SetIVec4(const char *n, int x, int y, int z, int w) { ensureCurrent(m_impl->prog); const int l = m_impl->location(n); if (l >= 0) { const GLint v[4] = {x, y, z, w}; ps2xgl::glUniform4iv(l, 1, v); } }
     void Shader::SetInt(const char *n, int v) { ensureCurrent(m_impl->prog); const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniform1i(l, v); }
     void Shader::SetMat4(const char *n, const float m[16]) { ensureCurrent(m_impl->prog); const int l = m_impl->location(n); if (l >= 0) ps2xgl::glUniformMatrix4fv(l, 1, ps2xgl::GL_FALSE, m); }
     bool Shader::Valid() const { return m_impl->prog != 0; }
@@ -292,6 +298,11 @@ namespace ps2x::gfx { namespace gl
         bool colorMask[4] = {true, true, true, true};
         bool depthTest = false, depthWrite = false;
         uint32_t depthFunc = 0x0203;   // GL_LEQUAL
+        // [batcher] see Renderer::BeginBatch
+        std::vector<Vertex> pending;
+        bool batched = false;
+        uint64_t drawCalls = 0, flushes = 0;
+        void flushPending();
     };
 
     Renderer::Renderer() : m_impl(std::make_unique<Impl>()) {}
@@ -330,19 +341,22 @@ namespace ps2x::gfx { namespace gl
         r.vbo = r.vao = r.white = 0; r.vcap = 0; r.dev = nullptr;
     }
 
-    void Renderer::SetShader(Shader *s) { m_impl->shader = s; }
-    void Renderer::SetTexture(Texture *t) { m_impl->texture = t; }
-    void Renderer::SetTexture1(Texture *t) { m_impl->texture1 = t; }
-    void Renderer::SetBlend(const BlendDesc &b) { m_impl->blend = b; }
+    void Renderer::SetShader(Shader *s) { if (m_impl->batched && !m_impl->pending.empty()) m_impl->flushPending(); m_impl->shader = s; }
+    void Renderer::SetTexture(Texture *t) { if (m_impl->batched && !m_impl->pending.empty()) m_impl->flushPending(); m_impl->texture = t; }
+    void Renderer::SetTexture1(Texture *t) { if (m_impl->batched && !m_impl->pending.empty()) m_impl->flushPending(); m_impl->texture1 = t; }
+    void Renderer::SetBlend(const BlendDesc &b) { if (m_impl->batched && !m_impl->pending.empty()) m_impl->flushPending(); m_impl->blend = b; }
     void Renderer::SetScissor(const int rect[4])
     {
+        if (m_impl->batched && !m_impl->pending.empty()) m_impl->flushPending();
         if (!rect) { m_impl->scissor[0] = m_impl->scissor[2] = 0; return; }
         std::memcpy(m_impl->scissor, rect, sizeof(m_impl->scissor));
     }
     void Renderer::SetColorMask(bool r, bool g, bool b, bool a)
-    { m_impl->colorMask[0] = r; m_impl->colorMask[1] = g; m_impl->colorMask[2] = b; m_impl->colorMask[3] = a; }
+    { if (m_impl->batched && !m_impl->pending.empty()) m_impl->flushPending();
+      m_impl->colorMask[0] = r; m_impl->colorMask[1] = g; m_impl->colorMask[2] = b; m_impl->colorMask[3] = a; }
     void Renderer::SetDepth(bool test, bool write, uint32_t func)
-    { m_impl->depthTest = test; m_impl->depthWrite = write; m_impl->depthFunc = func; }
+    { if (m_impl->batched && !m_impl->pending.empty()) m_impl->flushPending();
+      m_impl->depthTest = test; m_impl->depthWrite = write; m_impl->depthFunc = func; }
 
     void Renderer::BindBackBuffer(GlDevice &dev)
     {
@@ -412,19 +426,55 @@ namespace ps2x::gfx { namespace gl
         applyState(r);
         bindTextures(r);
         ps2xgl::glDrawArrays(ps2xgl::GL_TRIANGLES, 0, (int)n);
+        ++r.drawCalls;
+        ++g_ps2xGlDrawCalls;
     }
 
     void Renderer::DrawQuad(const Vertex &a, const Vertex &b, const Vertex &c, const Vertex &d)
     {
+        if (m_impl->batched) { BatchQuad(a, b, c, d); return; }
         const Vertex v[6] = {a, b, c, a, c, d};
         drawVerts(*m_impl, v, 6);
     }
 
     void Renderer::DrawTriangle(const Vertex &a, const Vertex &b, const Vertex &c)
     {
+        if (m_impl->batched) { BatchTriangle(a, b, c); return; }
         const Vertex v[3] = {a, b, c};
         drawVerts(*m_impl, v, 3);
     }
+
+    // ------------------------------------------------------------------ batcher
+    void Renderer::Impl::flushPending()
+    {
+        if (pending.empty()) return;
+        drawVerts(*this, pending.data(), pending.size());
+        pending.clear();
+        ++flushes; ++g_ps2xGlFlushes;
+    }
+
+    void Renderer::BeginBatch() { m_impl->batched = true; m_impl->pending.clear(); }
+
+    void Renderer::Flush() { if (m_impl->batched) m_impl->flushPending(); }
+
+    void Renderer::BatchQuad(const Vertex &a, const Vertex &b, const Vertex &c, const Vertex &d)
+    {
+        if (!m_impl->batched) { DrawQuad(a, b, c, d); return; }
+        std::vector<Vertex> &p = m_impl->pending;
+        p.push_back(a); p.push_back(b); p.push_back(c);
+        p.push_back(a); p.push_back(c); p.push_back(d);   // same index pattern as DrawQuad
+    }
+
+    void Renderer::BatchTriangle(const Vertex &a, const Vertex &b, const Vertex &c)
+    {
+        if (!m_impl->batched) { DrawTriangle(a, b, c); return; }
+        std::vector<Vertex> &p = m_impl->pending;
+        p.push_back(a); p.push_back(b); p.push_back(c);
+    }
+
+    bool Renderer::Batching() const { return m_impl->batched; }
+    uint64_t Renderer::DrawCalls() const { return m_impl->drawCalls; }
+    uint64_t Renderer::Flushes() const { return m_impl->flushes; }
 
     bool ReadbackRGBA(GlDevice &dev, Texture &tex, std::vector<uint8_t> &out)
     {

@@ -154,6 +154,7 @@ namespace ps2xgl
     X(void,   Uniform2f, (GLint,GLfloat,GLfloat)) \
     X(void,   Uniform3f, (GLint,GLfloat,GLfloat,GLfloat)) \
     X(void,   Uniform4f, (GLint,GLfloat,GLfloat,GLfloat,GLfloat)) \
+    X(void,   Uniform4iv, (GLint,GLsizei,const GLint*)) \
     X(void,   UniformMatrix4fv, (GLint,GLsizei,GLboolean,const GLfloat*)) \
     X(void,   BindFragDataLocationIndexed, (GLuint,GLuint,GLuint,const GLchar*))
 

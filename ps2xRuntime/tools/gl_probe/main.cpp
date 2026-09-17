@@ -77,7 +77,7 @@ int main()
         auto P = [&](float px, float py, float u, float v) {
             gl::Vertex t{}; t.x = px; t.y = py; t.u = u; t.v = v;
             t.r = c.r; t.g = c.g; t.b = c.b; t.a = 255; t.q = 1.0f; t.z = 0.0f; return t; };
-        gfx.DrawQuad(P(x, y, 0, 0), P(x + rw, y, 1, 0), P(x + rw, y + rh, 1, 1), P(x, y + rh, 0, 1));
+        gfx.BatchQuad(P(x, y, 0, 0), P(x + rw, y, 1, 0), P(x + rw, y + rh, 1, 1), P(x, y + rh, 0, 1));
     };
 
     const Rgb checker[4][2] = {
@@ -113,6 +113,7 @@ int main()
         gfx.SetColorMask(true, true, true, true);
         gfx.SetDepth(false, false, 0x0203);
 
+        gfx.BeginBatch();   // [batcher] whole calibration pattern through the buffered path
         if (pattern < 3)   // NxM checkerboard covering the window
         {
             const int cols = 8, rows = 6;
@@ -129,6 +130,7 @@ int main()
             rect(0,       h - bh,  bw, bh, kBlue);
             rect(w - bw,  h - bh,  bw, bh, kWhite);
         }
+        gfx.Flush();
 
         if (pattern != loggedPattern)
         {
