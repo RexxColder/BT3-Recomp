@@ -105,6 +105,11 @@ namespace ps2x::gfx
     {
         Texture2D t{};
         if (!gl::ContextReady() || !img.data || img.width <= 0 || img.height <= 0) return t;
+        // Compressed sources (DXT/BC) must NOT go through our RGBA8 upload: ImageFormat refuses to
+        // convert compressed input, so copy.data would hold BC bytes while we upload w*h*4 of them
+        // -- a buffer overrun that crashes inside the GL driver (observed: atio6axx.dll). Hand
+        // those to raylib, which routes them to glCompressedTexImage2D.
+        if (img.format >= PIXELFORMAT_COMPRESSED_DXT1_RGB) return LoadTextureFromImage(img);
         // Copy first: callers pass borrowed pixel data (see the gaPal site) and raylib's
         // LoadTextureFromImage never mutates the source, so neither do we.
         Image copy = ImageCopy(img);

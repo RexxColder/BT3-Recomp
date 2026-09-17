@@ -26,6 +26,20 @@ Chosen order is therefore **replay first, platform last**.
 works on Windows and Linux. raylib's `LoadImage` stays until stage A4, where it is implemented
 and disconnected.
 
+## Observed issues worth tracking (with PS2X_ALTGL=1 + PS2X_UIGL=1)
+
+- **Crash in the main menu with the texture pack ON** (`texture_pack=true`): access violation
+  inside the AMD GL driver (`atio6axx.dll`). Root cause found: `GsTexCreateFromImage` uploaded
+  RGBA8 from any image, but for a COMPRESSED source (DDS/BC) `ImageFormat` refuses to convert, so
+  it read `w*h*4` bytes out of a much smaller BC buffer -> buffer overrun in the driver. Fixed by
+  routing compressed sources to raylib's `LoadTextureFromImage` (glCompressedTexImage2D).
+- **Injected MP4 (FMV override) does not run on the splash screens.** The override is served from
+  `ps2x_fmv` and drawn with raylib textures (`LoadTextureFromImage`/`UpdateTexture`/
+  `DrawTexturePro`) -- stage D. Needs its own investigation (it is independent of the present).
+- **Texture replacements were not visibly applied on the splash screens** (the pack did index
+  18,704 replacements and log hits). Could be the same compressed-upload hazard, VRAM pressure, or
+  the splash simply not being a matched replacement; re-check with the crash fix in place.
+
 ## Isolated problem: the gfx::gl replay backend (A3.2b, opt-in)
 
 `PS2X_GSBACKEND=gl` routes the main triangle emitter through `gfx::gl` and is **NOT stable yet**;
