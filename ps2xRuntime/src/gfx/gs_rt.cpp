@@ -2,6 +2,7 @@
 
 #include "gfx/gl_context.h"
 #include "gfx/gl/GlGfx.h"
+#include "gfx/gs_gl.h"
 
 #include "raylib.h"
 #include "rlgl.h"   // A1: submit is still rlgl, so Begin/End mirror raylib's framebuffer+ortho recipe
@@ -71,6 +72,7 @@ namespace ps2x::gfx
         rlOrtho(0, w, h, 0, 0.0f, 1.0f);
         rlMatrixMode(RL_MODELVIEW);
         rlLoadIdentity();
+        ps2x::gfx::GsGlBeginTarget(w, h, 1.0f);   // [gsgl] same target framing for the gfx::gl path
     }
 
     void GsRtEnd()
