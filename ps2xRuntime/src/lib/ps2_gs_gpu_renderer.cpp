@@ -42,6 +42,8 @@
 #include "gfx/d3d11/gs_shader_hlsl.h"
 #include "gfx/video_state.h"
 #include <unordered_map>
+
+#include "gfx/gl/gsrl_redirect.h"   // [R1] the replay submits through the vendored rlgl copy
 namespace
 {
     ps2x::gfx::Renderer g_d3dGsR;

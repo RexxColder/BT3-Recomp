@@ -9,6 +9,8 @@
 #include "raylib.h"
 #include "rlgl.h"   // A1: submit is still rlgl, so Begin/End mirror raylib's framebuffer+ortho recipe
 
+#include "gfx/gl/gsrl_redirect.h"   // [R1] route the replay's rl* target/matrix calls to the vendored rlgl
+
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
