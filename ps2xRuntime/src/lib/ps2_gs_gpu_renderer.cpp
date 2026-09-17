@@ -31,6 +31,7 @@
 #include "rlgl.h"
 #include "gfx/gs_rt.h"
 #include "gfx/gs_gl.h"
+#include "gfx/image_io.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"   // [crtcdisp] GSRegisters (the CRTC registers are memory-mapped)
 
@@ -1360,6 +1361,14 @@ namespace
             else if (u[i].ncomp == 2) g_d3dGsSh.SetVec2(n, v[0], v[1]);
             else g_d3dGsSh.SetVec4(n, v[0], v[1], v[2], v[3]);
         }
+    }
+    // [A4] PNG dump through our own loader (replaces LoadImageFromTexture+ExportImage+UnloadImage).
+    static bool ps2xGfxDumpTexPng(const Texture2D &t, const char *path)
+    {
+        if (!t.id || t.width <= 0 || t.height <= 0 || !path) return false;
+        std::vector<uint8_t> px;
+        if (!ps2x::gfx::GsReadTextureRGBA8(t.id, t.width, t.height, px)) return false;
+        return ps2x::gfx::GsWritePngRGBA8(path, px.data(), t.width, t.height);
     }
     static void d3dGsMirrorState(int rtW, int rtH)
     {
@@ -5611,7 +5620,7 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
             {
                 done[lastStage] = true; flushBatch(__LINE__);
                 char nm[96]; std::snprintf(nm, sizeof nm, "/home/z3/Desktop/bt3/work/ga_stage%d.png", lastStage);
-                Image vi = LoadImageFromTexture(g_gaViewTex[g_gaCur].texture); ExportImage(vi, nm); UnloadImage(vi);
+                ps2xGfxDumpTexPng(g_gaViewTex[g_gaCur].texture, nm);
                 std::fprintf(stderr, "[gpualias] stage-boundary dump: %s\n", nm);
             }
             if (stage == 3) { static int n3 = 0; if (n3++ < 3) std::fprintf(stderr, "[gpualias] stage3 xoff=%d su0=%.2f dx0=%.2f\n", xoff, c.su0, c.dx0); }
@@ -13771,12 +13780,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         dumped = true;
                         flushBatch(__LINE__);
-                        Image vi = LoadImageFromTexture(g_gaViewTex[g_gaCur].texture);
-                        ExportImage(vi, "/home/z3/Desktop/bt3/work/ga_view.png"); UnloadImage(vi);
+                        ps2xGfxDumpTexPng(g_gaViewTex[g_gaCur].texture, "/home/z3/Desktop/bt3/work/ga_view.png");
                         auto sit2 = g_fbos.find(224u);
                         if (sit2 != g_fbos.end() && sit2->second.rt.texture.id != 0)
-                        { Image mi = LoadImageFromTexture(sit2->second.rt.texture);
-                          ExportImage(mi, "/home/z3/Desktop/bt3/work/ga_f224.png"); UnloadImage(mi); }
+                        { ps2xGfxDumpTexPng(sit2->second.rt.texture, "/home/z3/Desktop/bt3/work/ga_f224.png"); }
                         std::fprintf(stderr, "[gpualias] dumped ga_view.png + ga_f224.png\n");
                     }
                 }
@@ -15898,7 +15905,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (s_gd2 && !d2 && !c.srcIndexed && c.srcTbp0 == 336u * 32u && (c.srcPsm == 0x02u || c.srcPsm == 0x0Au) && ++n2 == 99)
             {
                 d2 = true; flushBatch(__LINE__);
-                if (tex.id != 0) { Image ti = LoadImageFromTexture(tex); ExportImage(ti, "/home/z3/Desktop/bt3/work/ga_ctl_tex.png"); UnloadImage(ti); }
+                if (tex.id != 0) { ps2xGfxDumpTexPng(tex, "/home/z3/Desktop/bt3/work/ga_ctl_tex.png"); }
                 std::fprintf(stderr, "[gpualias] dumped consumer-bound texture (id=%u %dx%d fromFbo=%d)\n", tex.id, tex.width, tex.height, fromFbo ? 1 : 0);
             }
         }
