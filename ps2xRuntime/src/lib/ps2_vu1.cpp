@@ -3546,6 +3546,17 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
 // [xgkick-native] the XGKICK service routine (packet walk + GIF submission, with its probes), lifted out of execLower
 // so the recompiled programs call it directly instead of going through jitSlowLower -> execLower's decode switch (the
 // only "interpreter fallback" the fight census showed: 149k kicks/s = 0.29% of VU1 pairs, all this one word).
+// [nopskip] A 32-byte packet that is one GIF tag (NLOOP=1, EOP=1, PACKED, NREG=1) whose only register is NOP
+// changes nothing on the GS. BT3's terrain program (1627a6cb) kicks one before EVERY strip: 170k such packets/s
+// in a splitscreen fight, each a submit + arena copy + stage-2 item + backend call. Dropped at the kick; the
+// [gifcmp]/[vu1cap] gates above still see the bytes, so verification is unchanged. PS2X_NOPSKIP=0 restores.
+static bool ps2xNopPacket(const uint8_t *p, uint32_t bytes)
+{
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_NOPSKIP"); return !(v && v[0] == '0'); }();
+    if (!s_on || bytes != 32u) return false;
+    uint64_t lo, hi; std::memcpy(&lo, p, 8); std::memcpy(&hi, p + 8, 8);
+    return (lo & 0x7FFFu) == 1u && (lo & (1ull << 15)) && ((lo >> 58) & 3u) == 0u && ((lo >> 60) & 0xFu) == 1u && (hi & 0xFu) == 0xFu;
+}
 void VU1Interpreter::xgkickImpl(uint32_t viS, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory)
 {
     // [gifcmp] m_dryKick no longer returns here: the reference run must WALK the packet so its
@@ -4284,7 +4295,7 @@ void VU1Interpreter::xgkickImpl(uint32_t viS, uint8_t *vuData, uint32_t dataSize
             const uint64_t t0k = read64Wrap(addr);
             kickBatchNote(vuData, dataSize, g_curStartPc, (uint32_t)(t0k & 0x7FFFu));
         }
-        if (!m_dryKick)
+        if (!m_dryKick && !ps2xNopPacket(vuData + addr, totalBytes))   // [nopskip]
         {
             if (memory)
                 memory->submitGifPacket(GifPathId::Path1, vuData + addr, totalBytes);
@@ -4302,7 +4313,7 @@ void VU1Interpreter::xgkickImpl(uint32_t viS, uint8_t *vuData, uint32_t dataSize
 
         gifCmpFold(wrappedPacket.data(), totalBytes);   // [gifcmp]
         vu1CapPacket(wrappedPacket.data(), totalBytes);  // [vu1cap]
-        if (!m_dryKick)
+        if (!m_dryKick && !ps2xNopPacket(wrappedPacket.data(), totalBytes))   // [nopskip]
         {
             if (memory)
                 memory->submitGifPacket(GifPathId::Path1, wrappedPacket.data(), totalBytes);

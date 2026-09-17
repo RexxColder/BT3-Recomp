@@ -307,6 +307,7 @@ struct State
         RgbaW uv[8]; int uvN = 0;   // [pgsink] UV writes since the last kick (the edge-detect shift rewrite)
         uint64_t lastRgbaq = 0x3f80000080808080ull;   // last RGBAQ value seen (A+D / REGLIST form), for register restores
         uint64_t inkDropped = 0, inkScaled = 0, inkShifted = 0, shadowDropped = 0, dofDropped = 0, maskNeutralized = 0, bloomEdits = 0, bloomRestores = 0;
+        uint64_t path1Acted = 0, otherActed = 0, path1Skipped = 0;   // [wshudpath] packets the pass changed, PATH1 (VU1) vs the rest; PATH1 exempted
     } wshud;
     std::vector<uint8_t> wsBuf;   // [pgswshud] rebuilt packet when quads are subdivided at layout breakpoints
     uint32_t ssaa = 1;                     // super-sampling factor the backend was created with (1/2/4/8/16)
@@ -1663,9 +1664,28 @@ bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
     State &s = st();
     std::lock_guard<std::mutex> lk(s.mtx);
     if (!initLocked(s)) return false;
-    const auto t0 = std::chrono::steady_clock::now();
+    // [pgstime] the per-packet clock pair was 6% of the GS thread (clock_gettime, 470k calls/s); it only feeds
+    // the xferMs stat and the slow-call sketch, so it runs with PS2X_EEPROF / PS2X_PGS_TIMING and stays off otherwise.
+    static const bool s_time = [](){ const char *a = std::getenv("PS2X_PGS_TIMING"); const char *b = std::getenv("PS2X_EEPROF");
+                                     return (a && a[0] && a[0] != '0') || (b && b[0] && b[0] != '0'); }();
+    const auto t0 = s_time ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (g_packFlushReq.exchange(0)) { s.iface.invalidate_all_cached_textures(); std::fprintf(stderr, "[pgs] texture replacement %s: cached textures dropped\n", g_packOn.load() ? "ON" : "OFF"); }   // [pgslive]
-    if (exclusive()) applyPseudoRegsLocked(s, data, size);
+    // [tagshape] A packet that is ONE PACKED tag with no A+D register among its NREG slots cannot carry a
+    // privileged pseudo-register write, a TEX0/SCISSOR/PRIM A+D the HUD mapper keys on, or an image: it is pure
+    // vertex data (every kernel strip: ST/RGBAQ/XYZF2). Decided from the 16-byte tag, so the two byte-walks
+    // below are skipped for it exactly, not heuristically.
+    bool pureVerts = false;
+    {
+        uint64_t lo, hi; std::memcpy(&lo, data, 8); std::memcpy(&hi, data + 8, 8);
+        const uint32_t nloop = uint32_t(lo & 0x7FFFu), flg = uint32_t((lo >> 58) & 3u);
+        uint32_t nreg = uint32_t((lo >> 60) & 0xFu); if (nreg == 0) nreg = 16;
+        if (flg == 0u && nloop > 0u && size == 16u + size_t(nloop) * nreg * 16u)
+        {
+            pureVerts = true;
+            for (uint32_t r = 0; r < nreg; r++) if (((hi >> (4u * r)) & 0xFu) == 0xEu) { pureVerts = false; break; }
+        }
+    }
+    if (exclusive() && !pureVerts) applyPseudoRegsLocked(s, data, size);
     {   // [pgswshud] widescreen HUD squeeze (PS2X_PGS_WSHUD=0 disables): rewrite HUD vertex X before the backend parses
         static const bool s_wshud = [](){ const char *v = std::getenv("PS2X_PGS_WSHUD"); return !(v && v[0] == '0'); }();
         static const bool s_inkShiftEnvOn = [](){ const char *v = std::getenv("PS2X_PGS_INKSHIFT"); return v && v[0] && std::atof(v) > 0.0; }();
@@ -1673,12 +1693,27 @@ bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
                           || !GsGpuRenderer::shadowsEnabled() || !GsGpuRenderer::dofBlurEnabled();   // [pgsink] [pgsfx]
         // [vpdrop] force the pass on for PS2X_VPKEEP: with inv==1.0 and stock ink/fx this gate is
         // otherwise CLOSED (and self-latching -- wshud.active is only set from inside the pass).
-        if ((s_wshud && (g_ps2xWsHudInv < 0.999f || s.wshud.active || inkWork)) || ps2xVpKeep())
+        // [wshudpath] PATH1 pure-vertex packets (the VU1 kernels' strips: no A+D, no sprites, no scissor/TEX0 writes) are
+        // exempt from the walk: measured over a splitscreen fight the pass changed 0 of them and 11,714 others
+        // (`acted:` in the stats line keeps counting, so a future PATH1 action would show). The walk was 11% of the
+        // GS thread at ~3.5M kernel vertices/s. PS2X_PGS_WSHUD_ALL=1 walks everything again.
+        static const bool s_wsAll = envOn("PS2X_PGS_WSHUD_ALL");
+        const bool wsExempt = !s_wsAll && pathId == 1u && pureVerts;
+        if (wsExempt) s.wshud.path1Skipped++;
+        if (!wsExempt && ((s_wshud && (g_ps2xWsHudInv < 0.999f || s.wshud.active || inkWork)) || ps2xVpKeep()))
         {
+            // [wshudpath] does the HUD/ink/fx pass ever ACT on a PATH1 (VU1 kernel) packet? Counted per pass so the
+            // answer is measured before that path is exempted from the walk (it is 11% of the GS thread).
+            const State::WsHud &h0 = s.wshud;
+            const uint64_t before = h0.mappedVerts + h0.hudPrims + h0.scissorsMapped + h0.splitPrims + h0.inkDropped + h0.inkScaled + h0.inkShifted
+                                  + h0.shadowDropped + h0.dofDropped + h0.maskNeutralized + h0.bloomEdits + h0.bloomRestores;
             const uint8_t *xdata = data; size_t xsize = size;
             if (wsHudSubdivideLocked(s, data, size, s.wshud.lastInv)) { xdata = s.wsBuf.data(); xsize = s.wsBuf.size(); }
             wsHudRewriteLocked(s, const_cast<uint8_t *>(xdata), xsize);   // the packet buffer is the arbiter's copy (or our rebuilt one)
             data = xdata; size = xsize;
+            const uint64_t after = h0.mappedVerts + h0.hudPrims + h0.scissorsMapped + h0.splitPrims + h0.inkDropped + h0.inkScaled + h0.inkShifted
+                                 + h0.shadowDropped + h0.dofDropped + h0.maskNeutralized + h0.bloomEdits + h0.bloomRestores;
+            if (after != before) { if (pathId == 1u) s.wshud.path1Acted++; else s.wshud.otherActed++; }
         }
     }
     s.iface.gif_transfer(pathId - 1u, data, size);
@@ -1707,7 +1742,7 @@ bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
             }
         }
     }
-    const double dtMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double dtMs = s_time ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() : 0.0;   // [pgstime]
     s.xferMs += dtMs;
     if (dtMs > 0.5)
     {   // [pgs-slow] remember the slowest calls with a sketch of their first GIF tag
@@ -1836,7 +1871,7 @@ void onSwap()
         std::fprintf(stderr, "[pgs] cpu gif_transfer %.1f ms/s (%.2f ms/swap) | priv writes/s:", s.xferMs / dt, s.swaps ? s.xferMs / s.swaps : 0.0);
         for (int k = 0; k < 0x20; k++) if (s.privHist[k]) { std::fprintf(stderr, " %02x=%.0f", k << 4, s.privHist[k] / dt); s.privHist[k] = 0; }
         std::fprintf(stderr, " pseudo=%.0f", s.pseudoSeen / dt); s.pseudoSeen = 0;
-        std::fprintf(stderr, " | wshud: inv %.3f (present %.3f) active %d prims/s %.0f verts/s %.0f", s.wshud.lastInv, g_ps2xWsHudInv, s.wshud.active ? 1 : 0, s.wshud.hudPrims / dt, s.wshud.mappedVerts / dt); std::fprintf(stderr, " scissors/s %.0f splits/s %.0f | ink: outline %d strength %d%% width %d%% dropped/s %.0f scaled/s %.0f shifted/s %.0f | fx: shadows %d dof %d dropped/s %.0f/%.0f masks/s %.0f bloom/s %.0f restores/s %.0f", s.wshud.scissorsMapped / dt, s.wshud.splitPrims / dt, GsGpuRenderer::outlineEnabled() ? 1 : 0, GsGpuRenderer::inkStrengthPct(), g_inkWidthPct.load(), s.wshud.inkDropped / dt, s.wshud.inkScaled / dt, s.wshud.inkShifted / dt, GsGpuRenderer::shadowsEnabled() ? 1 : 0, GsGpuRenderer::dofBlurEnabled() ? 1 : 0, s.wshud.shadowDropped / dt, s.wshud.dofDropped / dt, s.wshud.maskNeutralized / dt, s.wshud.bloomEdits / dt, s.wshud.bloomRestores / dt); s.wshud.bloomEdits = s.wshud.bloomRestores = 0; s.wshud.hudPrims = s.wshud.mappedVerts = s.wshud.scissorsMapped = s.wshud.splitPrims = s.wshud.inkDropped = s.wshud.inkScaled = s.wshud.inkShifted = s.wshud.shadowDropped = s.wshud.dofDropped = s.wshud.maskNeutralized = 0;
+        std::fprintf(stderr, " | wshud: inv %.3f (present %.3f) active %d prims/s %.0f verts/s %.0f", s.wshud.lastInv, g_ps2xWsHudInv, s.wshud.active ? 1 : 0, s.wshud.hudPrims / dt, s.wshud.mappedVerts / dt); std::fprintf(stderr, " scissors/s %.0f splits/s %.0f | ink: outline %d strength %d%% width %d%% dropped/s %.0f scaled/s %.0f shifted/s %.0f | fx: shadows %d dof %d dropped/s %.0f/%.0f masks/s %.0f bloom/s %.0f restores/s %.0f", s.wshud.scissorsMapped / dt, s.wshud.splitPrims / dt, GsGpuRenderer::outlineEnabled() ? 1 : 0, GsGpuRenderer::inkStrengthPct(), g_inkWidthPct.load(), s.wshud.inkDropped / dt, s.wshud.inkScaled / dt, s.wshud.inkShifted / dt, GsGpuRenderer::shadowsEnabled() ? 1 : 0, GsGpuRenderer::dofBlurEnabled() ? 1 : 0, s.wshud.shadowDropped / dt, s.wshud.dofDropped / dt, s.wshud.maskNeutralized / dt, s.wshud.bloomEdits / dt, s.wshud.bloomRestores / dt); std::fprintf(stderr, " | acted: path1 %llu other %llu (path1 exempt %llu)", (unsigned long long)s.wshud.path1Acted, (unsigned long long)s.wshud.otherActed, (unsigned long long)s.wshud.path1Skipped); s.wshud.path1Acted = s.wshud.otherActed = s.wshud.path1Skipped = 0; s.wshud.bloomEdits = s.wshud.bloomRestores = 0; s.wshud.hudPrims = s.wshud.mappedVerts = s.wshud.scissorsMapped = s.wshud.splitPrims = s.wshud.inkDropped = s.wshud.inkScaled = s.wshud.inkShifted = s.wshud.shadowDropped = s.wshud.dofDropped = s.wshud.maskNeutralized = 0;
         if (packMode()) { std::fprintf(stderr, " | pack: hits %llu misses %llu skipped %llu rtstale %llu gate %llu cached %zu", (unsigned long long)s.replacer.hits, (unsigned long long)s.replacer.misses, (unsigned long long)s.replacer.skipped, (unsigned long long)s.replacer.rtstale, (unsigned long long)s.replacer.gateSkips, s.replacer.cache.size()); s.replacer.hits = s.replacer.misses = s.replacer.skipped = s.replacer.rtstale = s.replacer.gateSkips = 0; }
         {   // per swap: paraLLEl-GS render passes / copies / palette updates / primitives (consume_flush_stats)
             const double sw = s.swaps ? double(s.swaps) : 1.0;
