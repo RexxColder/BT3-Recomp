@@ -9,6 +9,8 @@
 // into this backend at the same points it calls flushBatch(), so the batcher's auto-flush-on-state
 // preserves the frame's strict ordering.
 
+#include "gfx/gs_emit.h"
+
 #include <cstdint>
 
 namespace ps2x::gfx
@@ -44,4 +46,7 @@ namespace ps2x::gfx
     void GsGlSet4f(const char *name, float x, float y, float z, float w);
     void GsGlSet1i(const char *name, int v);
     void GsGlSet4i(const char *name, int x, int y, int z, int w);
+
+    // Vertex emitter bound to the batcher (gs_emit.h contract).
+    GsEmit &GsGlEmit();
 }

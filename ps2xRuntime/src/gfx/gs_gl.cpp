@@ -16,6 +16,7 @@ namespace ps2x::gfx
     {
         bool g_tried = false, g_ok = false;
         gl::Shader g_main;                     // the GS replay shader
+        GsEmit g_emit;                         // bound to the batcher at init
         std::unordered_map<unsigned, std::unique_ptr<gl::Texture>> g_tex;   // adopted GL names
 
         // Wrap a raw GL texture name in a gfx::gl::Texture (adopted: we never own/delete it).
@@ -58,6 +59,7 @@ namespace ps2x::gfx
         g_main.SetInt("texture0", 0);
         g_main.SetInt("uPal", 1);
         gl::RendererRef().BeginBatch();
+        g_emit.Bind(gl::RendererRef());
         std::fprintf(stderr, "[gsgl] backend active (gfx::gl batcher)\n");
         return true;
     }
@@ -130,4 +132,5 @@ namespace ps2x::gfx
     void GsGlSet4f(const char *n, float x, float y, float z, float w) { if (g_ok) g_main.SetVec4(n, x, y, z, w); }
     void GsGlSet1i(const char *n, int v) { if (g_ok) g_main.SetInt(n, v); }
     void GsGlSet4i(const char *n, int x, int y, int z, int w) { if (g_ok) g_main.SetIVec4(n, x, y, z, w); }
+    GsEmit &GsGlEmit() { return g_emit; }
 }

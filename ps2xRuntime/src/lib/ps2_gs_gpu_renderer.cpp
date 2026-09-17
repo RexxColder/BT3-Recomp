@@ -1392,6 +1392,33 @@ namespace
         const float m[16] = {2.0f / W, 0, 0, 0,  0, -2.0f / H, 0, 0,  0, 0, 1, 0,  -1, 1, 0, 1};
         g_d3dGsSh.SetMat4("mvp", m);
     }
+    // [gsgl A3.2b] Mirror the main shader's current uniforms into the gfx::gl copy (same trick as
+    // d3dGsMirrorUniforms): read them back from the raylib program and push them by NAME into our
+    // program. Cheap enough for an A/B and avoids mirroring ~20 individual SetShaderValue sites.
+    static void gsGlMirrorUniforms()
+    {
+        struct U { const char *n; int ncomp; };
+        static const U u[] = {
+            {"colDiffuse",4},{"uBright",1},{"uSubScale",1},{"uUViz",1},{"uIdxMode",1},
+            {"uIdxScale",1},{"uFboOne",1},{"uTcc",1},{"uASplit",1},{"uTexa",4},
+            {"uABl128",1},{"uTfx",1},{"uProjClip",1},{"uAScale",1},{"uAlphaFix",2},
+            {"uAtst",1},{"uAref",1},{"uFba",1},{"uForceA",1},{"uZTex",1},{"uZScale",1},
+            {"uPerspQ",1},{"uRegion",4},
+        };
+        static const int N = (int)(sizeof(u) / sizeof(u[0]));
+        static int loc[N];
+        static bool locInit = false;
+        if (!locInit) { for (int i = 0; i < N; ++i) loc[i] = GetShaderLocation(g_shader, u[i].n); locInit = true; }
+        for (int i = 0; i < N; ++i)
+        {
+            if (loc[i] < 0) continue;
+            float v[4] = {0, 0, 0, 0};
+            glGetUniformfv(g_shader.id, loc[i], v);
+            if (u[i].ncomp == 1) ps2x::gfx::GsGlSet1f(u[i].n, v[0]);
+            else if (u[i].ncomp == 2) ps2x::gfx::GsGlSet2f(u[i].n, v[0], v[1]);
+            else ps2x::gfx::GsGlSet4f(u[i].n, v[0], v[1], v[2], v[3]);
+        }
+    }
     // Bind the dest fbp's native RT (clear once per frameGen), mirror the uniforms/state and set
     // the MVP. Returns false when there is no native RT for the current draw target.
     static bool d3dGsPrepDest(uint32_t curRealFbp, uint32_t frameGen, int &rtW, int &rtH)
@@ -18387,7 +18414,13 @@ if (done.size() < 14 && !done.count(c.texKey))
             }
 #endif
             ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-            rlBegin(RL_QUADS);
+            const bool gsgl = ps2x::gfx::GsGlActive();   // [gsgl A3.2b] submit this command through gfx::gl
+            auto EMIT_C = [&](int r, int g, int b, int a) { if (gsgl) ps2x::gfx::GsGlEmit().Color4ub((unsigned char)r, (unsigned char)g, (unsigned char)b, (unsigned char)a); else rlColor4ub((unsigned char)r, (unsigned char)g, (unsigned char)b, (unsigned char)a); };
+            auto EMIT_UV = [&](float u, float v) { if (gsgl) ps2x::gfx::GsGlEmit().TexCoord2f(u, v); else rlTexCoord2f(u, v); };
+            auto EMIT_N = [&](float q) { if (gsgl) ps2x::gfx::GsGlEmit().Q(q); else rlNormal3f(q, 0.0f, 1.0f); };
+            auto EMIT_V2 = [&](float x, float y) { if (gsgl) ps2x::gfx::GsGlEmit().Vertex2f(x, y); else rlVertex2f(x, y); };
+            auto EMIT_V3 = [&](float x, float y, float z) { if (gsgl) ps2x::gfx::GsGlEmit().Vertex3f(x, y, z); else rlVertex3f(x, y, z); };
+            if (gsgl) { ps2x::gfx::GsGlTexture(tex.id); gsGlMirrorUniforms(); ps2x::gfx::GsGlEmit().Begin(ps2x::gfx::GsEmit::Quads); } else rlBegin(RL_QUADS);
             const int quad[4] = {0, 1, 2, 2};
             // PS2X_TRIWHITE: diagnostic â€” draw triangles with WHITE vertex color, exposing the raw
             // texture sample (separates color-modulation bugs from UV/sampling bugs).
@@ -18395,18 +18428,18 @@ if (done.size() < 14 && !done.count(c.texKey))
             for (int k = 0; k < 4; ++k)
             {
                 const int i = quad[k];
-                if (s_triWhite) rlColor4ub(255, 255, 255, 255);
-                else rlColor4ub(TV[i].r, TV[i].g, TV[i].b, TV[i].a);
+                if (s_triWhite) EMIT_C(255, 255, 255, 255);
+                else EMIT_C(TV[i].r, TV[i].g, TV[i].b, TV[i].a);
                 // PS2X_TRIUVGRID: force screen-derived UVs. If textures appear smeared across the
                 // scene, GL sampling works and the recorded UV values are the bug; if still flat,
                 // the batch texcoord path itself is broken.
                 static const bool s_uvGrid = [](){ const char *v = std::getenv("PS2X_TRIUVGRID"); return v && v[0] && v[0] != '0'; }();
                 if (s_uvGrid)
                 {
-                    rlTexCoord2f(TV[i].x / 512.0f, TV[i].y / 448.0f);
-                    rlNormal3f(0.0f, 0.0f, 1.0f);
-                    if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
-                    else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
+                    EMIT_UV(TV[i].x / 512.0f, TV[i].y / 448.0f);
+                    EMIT_N(0.0f);
+                    if (depthOn) EMIT_V3(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                    else EMIT_V2(TV[i].x + offX, TV[i].y + offY);
                     { PS2X_GATE_HIT(); continue; }
                 }
                 // PS2X_RAMPU=<u>: force a CONSTANT u on the cel/ramp class (tbp 15680), which
@@ -18417,10 +18450,10 @@ if (done.size() < 14 && !done.count(c.texKey))
                                                    return v && v[0] ? (float)std::atof(v) : -1.0f; }();
                 if (s_rampU >= 0.0f && c.srcTbp0 == 15680u)
                 {
-                    rlTexCoord2f(s_rampU, vflip ? 1.0f - TV[i].v : TV[i].v);
-                    rlNormal3f(0.0f, 0.0f, 1.0f);
-                    if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
-                    else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
+                    EMIT_UV(s_rampU, vflip ? 1.0f - TV[i].v : TV[i].v);
+                    EMIT_N(0.0f);
+                    if (depthOn) EMIT_V3(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                    else EMIT_V2(TV[i].x + offX, TV[i].y + offY);
                     { PS2X_GATE_HIT(); continue; }
                 }
                 // PS2X_SSUV=<tbp>: force SCREEN-SPACE UVs for one source class. The fbp502
@@ -18433,17 +18466,17 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (s_ssuv >= 0 && (int)c.srcTbp0 == (unsigned)s_ssuv)
                 {
                     const float su = TV[i].x / 512.0f, sv = TV[i].y / 448.0f;
-                    rlTexCoord2f(su, vflip ? 1.0f - sv : sv);
-                    rlNormal3f(0.0f, 0.0f, 1.0f);
-                    if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
-                    else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
+                    EMIT_UV(su, vflip ? 1.0f - sv : sv);
+                    EMIT_N(0.0f);
+                    if (depthOn) EMIT_V3(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                    else EMIT_V2(TV[i].x + offX, TV[i].y + offY);
                     { PS2X_GATE_HIT(); continue; }
                 }
                 if (fromFbo && s_atlas && srcSlot) {
                     // remap source-normalized UV into the atlas slot (V flipped for bottom-up GL)
                     float au = ((float)srcSlot->x + TV[i].u * (float)srcSlot->w) / (float)g_atlasW;
                     float av = 1.0f - ((float)srcSlot->y + TV[i].v * (float)srcSlot->h) / (float)g_atlasH;
-                    rlTexCoord2f(au, av);
+                    EMIT_UV(au, av);
                 } else
                 {
                     float uu = TV[i].u, vv = TV[i].v; const float q = TV[i].q;
@@ -18454,17 +18487,17 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if ((q != 1.0f || s_fbouv2 || g_curDecalCmd == &c) && fromFbo && c.srcTexW > 0 && c.srcTexH > 0 && tex.width > 0 && tex.height > 0
                         && (tex.width != c.srcTexW || tex.height != c.srcTexH))
                     { uu *= (float)c.srcTexW / (float)tex.width; vv *= (float)c.srcTexH / (float)tex.height; }
-                    if (q != 1.0f) rlTexCoord2f(uu, vflip ? (q - vv) : vv);
-                    else rlTexCoord2f(uu, vflip ? 1.0f - vv : vv);
+                    if (q != 1.0f) EMIT_UV(uu, vflip ? (q - vv) : vv);
+                    else EMIT_UV(uu, vflip ? 1.0f - vv : vv);
                 }
                 if (g_dbgDecalCmd == &c && i == 0) { static int n4 = 0; if (n4++ < 6) { auto fit3 = g_fbos.find(336u); if (fit3 != g_fbos.end()) { int prevFb = 0, att = -1, attType = -1; glGetIntegerv(0x8CA6, &prevFb); glBindFramebuffer(0x8D40, fit3->second.rt.id); glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD1, &att); glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD0, &attType); glBindFramebuffer(0x8D40, (unsigned)prevFb); std::fprintf(stderr, "[decaldbg]   ATTACH fbp336 fbo=%u colour attachment name=%d type=0x%x | decal samples tex.id=%u (rt.texture.id=%u)\n", fit3->second.rt.id, att, attType, tex.id, fit3->second.rt.texture.id); } } }
                 if (g_dbgDecalCmd == &c && i == 0) { static int n2 = 0; float gt[4] = {-9,-9,-9,-9}, gf = -9, gp = -9, gc = -9, gi = -9, gx = -9, ga = -9, gr = -9, gz = -9, gzs = -9; if (g_locZTex >= 0) glGetUniformfv(g_shader.id, g_locZTex, &gz); { int lz = GetShaderLocation(g_shader, "uZScale"); if (lz >= 0) glGetUniformfv(g_shader.id, lz, &gzs); } if (g_locTexa >= 0) glGetUniformfv(g_shader.id, g_locTexa, gt); if (g_locTcc >= 0) glGetUniformfv(g_shader.id, g_locTcc, &gc); if (g_locIdxMode >= 0) glGetUniformfv(g_shader.id, g_locIdxMode, &gi); if (g_locTfx >= 0) glGetUniformfv(g_shader.id, g_locTfx, &gx); if (g_locAtst >= 0) glGetUniformfv(g_shader.id, g_locAtst, &ga); if (g_locAref >= 0) glGetUniformfv(g_shader.id, g_locAref, &gr); if (g_locFboOne >= 0) glGetUniformfv(g_shader.id, g_locFboOne, &gf); if (g_locPerspQ >= 0) glGetUniformfv(g_shader.id, g_locPerspQ, &gp); if (n2++ < 6000) std::fprintf(stderr, "[decaldbg]   EMIT generic tri: chunk=%d curFbp=%u vflip=%d fromFbo=%d tex.id=%u %dx%d src=%dx%d u/v/q v0=(%.3f,%.3f,%.4f) uRegion=(%.4f,%.4f,%.4f,%.0f) | GL uTexa=(%.2f,%.2f,%.2f,%.2f) cache=(%.2f,%.2f,%.2f,%.2f) uFboOne=%.1f uPerspQ=%.1f uTcc=%.1f uIdxMode=%.1f uTfx=%.1f uAtst=%.1f uAref=%.2f uZTex=%.1f uZScale=%.3f\n", (int)m_chunkMode, curFbp, (int)vflip, (int)fromFbo, tex.id, tex.width, tex.height, (int)c.srcTexW, (int)c.srcTexH, TV[0].u, TV[0].v, TV[0].q, g_curReg[0], g_curReg[1], g_curReg[2], g_curReg[3], gt[0], gt[1], gt[2], gt[3], g_curTexa[0], g_curTexa[1], g_curTexa[2], g_curTexa[3], gf, gp, gc, gi, gx, ga, gr, gz, gzs); }
-                rlNormal3f(TV[i].q, 0.0f, 1.0f);   // .x carries the GS q (PS2X_PERSPQ)
+                EMIT_N(TV[i].q);   // .x carries the GS q (PS2X_PERSPQ)
                 // ortho maps window_depth = -z, so pass -z to store the intended depth.
-                if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
-                else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
+                if (depthOn) EMIT_V3(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                else EMIT_V2(TV[i].x + offX, TV[i].y + offY);
             }
-            rlEnd();
+            if (gsgl) ps2x::gfx::GsGlEmit().End(); else rlEnd();
             }   // [glhoist] end of the per-triangle emit
             {   // [decalbatch] consecutive shadow-decal pieces share every GL state and the same FBO texture: keep the
                 // texture bound so rlgl accumulates them in ONE draw entry (one glDrawArrays per run of pieces instead of
