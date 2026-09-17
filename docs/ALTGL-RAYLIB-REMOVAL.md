@@ -40,6 +40,26 @@ and disconnected.
   18,704 replacements and log hits). Could be the same compressed-upload hazard, VRAM pressure, or
   the splash simply not being a matched replacement; re-check with the crash fix in place.
 
+- **Injected MP4 (FMV override) shows BLACK while its AUDIO is replaced correctly.**
+  What is already known / done:
+  - The decoder side is fine: the log shows `[fmvoverride] VIDEO INIT -> injecting ...mp4`,
+    `decoding 2880x2156, dur=93.88s, codec=av1` and the ADX track is the pack's (audio OK).
+  - The override replaces the game's `ZS3USOP.PSS`; the shipped setup uses a **black PSS with the
+    MP4 composited on top**, so the MP4 draw is what is missing.
+  - Stage **B** now draws the video through `gfx/video_overlay` (VideoBlit interface + GL
+    implementation over the shared gfx::gl context and the existing blit shader), i.e. without
+    raylib, in the GL path only. **The video is still black through that path too.**
+  - Remaining hypotheses, in order:
+    1. **Decode throughput**: a 2880x2156 AV1 software decode may not keep up, leaving frames
+       empty/black (audio is a separate path and unaffected). Test with a 1080p H.264 MP4, or a
+       lower resolution, before touching more GL code.
+    2. The blend/tint: `of.alpha` (fade) or the alpha blend killing the quad -- the previous raylib
+       path and the new Gfx path both blend with SRC_ALPHA.
+    3. Ordering: the video quad is drawn before the present; with `fmvDrew` the GS present is
+       skipped, so if the quad fails nothing repaints the frame.
+  - Next: run with a 1080p H.264 clip (and/or log the decoded frame's maxRGB) to split decode vs
+    draw, then, if it is the draw, add the D3D11 VideoBlit and compare.
+
 ## Isolated problem: the gfx::gl replay backend (A3.2b, opt-in)
 
 `PS2X_GSBACKEND=gl` routes the main triangle emitter through `gfx::gl` and is **NOT stable yet**;
