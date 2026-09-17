@@ -674,6 +674,7 @@ target_sources(ps2_runtime PRIVATE
     src/gfx/gl/GlApi.cpp
     src/gfx/gl/GlDevice.cpp
     src/gfx/gl/GlGfx.cpp
+    src/gfx/gl/gsrl_vendor.cpp   # [R1] vendored rlgl subset (own state cache/batcher for the replay)
     src/gfx/gl_context.cpp
     src/gfx/gs_resources.cpp
     src/gfx/gs_rt.cpp
