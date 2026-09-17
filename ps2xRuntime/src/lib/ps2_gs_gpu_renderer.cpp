@@ -18420,7 +18420,7 @@ if (done.size() < 14 && !done.count(c.texKey))
             auto EMIT_N = [&](float q) { if (gsgl) ps2x::gfx::GsGlEmit().Q(q); else rlNormal3f(q, 0.0f, 1.0f); };
             auto EMIT_V2 = [&](float x, float y) { if (gsgl) ps2x::gfx::GsGlEmit().Vertex2f(x, y); else rlVertex2f(x, y); };
             auto EMIT_V3 = [&](float x, float y, float z) { if (gsgl) ps2x::gfx::GsGlEmit().Vertex3f(x, y, z); else rlVertex3f(x, y, z); };
-            if (gsgl) { ps2x::gfx::GsGlTexture(tex.id); gsGlMirrorUniforms(); ps2x::gfx::GsGlEmit().Begin(ps2x::gfx::GsEmit::Quads); } else rlBegin(RL_QUADS);
+            if (gsgl) { rlDrawRenderBatchActive(); ps2x::gfx::GsGlTexture(tex.id); gsGlMirrorUniforms(); ps2x::gfx::GsGlEmit().Begin(ps2x::gfx::GsEmit::Quads); } else rlBegin(RL_QUADS);
             const int quad[4] = {0, 1, 2, 2};
             // PS2X_TRIWHITE: diagnostic â€” draw triangles with WHITE vertex color, exposing the raw
             // texture sample (separates color-modulation bugs from UV/sampling bugs).
