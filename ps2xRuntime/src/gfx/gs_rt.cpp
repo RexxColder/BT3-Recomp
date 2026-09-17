@@ -62,6 +62,7 @@ namespace ps2x::gfx
         // blanket conversion: every draw into the FBO used the window's projection instead.
         const int w = rt.texture.width > 0 ? rt.texture.width : 1;
         const int h = rt.texture.height > 0 ? rt.texture.height : 1;
+        ps2x::gfx::GsGlFlush();   // [gsgl] drain our batch into the CURRENT target before rebinding
         rlDrawRenderBatchActive();
         rlEnableFramebuffer(rt.id);
         rlViewport(0, 0, w, h);
@@ -80,6 +81,7 @@ namespace ps2x::gfx
         // Mirrors raylib's EndTextureMode (rcore.c:1110): restore the viewport to the render size
         // and reset the modelview. raylib does NOT restore the projection here (BeginDrawing does
         // it at frame start), so we match that.
+        ps2x::gfx::GsGlFlush();   // [gsgl] our batch targets this FBO: drain before unbinding it
         rlDrawRenderBatchActive();
         rlDisableFramebuffer();
         rlViewport(0, 0, GetRenderWidth(), GetRenderHeight());
