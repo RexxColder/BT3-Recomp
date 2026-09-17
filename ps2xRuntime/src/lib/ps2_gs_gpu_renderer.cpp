@@ -1848,7 +1848,7 @@ namespace {
             uint8_t *p = &px[((size_t)y * N + x) * 4]; p[0] = p[1] = p[2] = 0; p[3] = (uint8_t)(a * 255.0f);
         }
         Image im{px.data(), N, N, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
-        g_blobTex = LoadTextureFromImage(im);
+        g_blobTex = ps2x::gfx::GsTexCreateFromImage(im);
         SetTextureFilter(g_blobTex, TEXTURE_FILTER_BILINEAR);
     }
 }
@@ -4337,9 +4337,9 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
     static Texture2D s_tex{}; static int s_tw = 0, s_th = 0;
     if (s_tex.id == 0 || s_tw != w || s_th != h)
     {
-        if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); UnloadTexture(s_tex); }
+        if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); ps2x::gfx::GsUnloadTexture(s_tex); }
         Image im = GenImageColor(w, h, BLANK);
-        s_tex = LoadTextureFromImage(im); UnloadImage(im);
+        s_tex = ps2x::gfx::GsTexCreateFromImage(im); UnloadImage(im);
         s_tw = w; s_th = h;
     }
     UpdateTexture(s_tex, px.data());
@@ -4967,7 +4967,7 @@ static Texture2D palTextureFor(uint64_t key)
         ImageDrawPixel(&im, i, 0, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF),
                                         (unsigned char)((v >> 16) & 0xFF), (unsigned char)aUp});
     }
-    Texture2D t = LoadTextureFromImage(im);
+    Texture2D t = ps2x::gfx::GsTexCreateFromImage(im);
     UnloadImage(im);
     SetTextureFilter(t, TEXTURE_FILTER_POINT);   // a LUT must never interpolate between entries
     rlTextureParameters(t.id, RL_TEXTURE_WRAP_S, RL_TEXTURE_WRAP_CLAMP);
@@ -5493,7 +5493,7 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
                 {
                     Image im{}; im.data = g_gaClutData; im.width = 256; im.height = 1; im.mipmaps = 1;
                     im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-                    gaPal = LoadTextureFromImage(im);   // uploads a copy; do NOT UnloadImage (borrowed data)
+                    gaPal = ps2x::gfx::GsTexCreateFromImage(im);   // uploads a copy; do NOT UnloadImage (borrowed data)
                     SetTextureFilter(gaPal, TEXTURE_FILTER_POINT);
                 }
                 else UpdateTexture(gaPal, g_gaClutData);
@@ -7267,7 +7267,7 @@ void GsGpuRenderer::ensureGl(int w, int h)
     if (!g_whiteInit)
     {
         Image wi = GenImageColor(1, 1, WHITE);
-        g_white = LoadTextureFromImage(wi);
+        g_white = ps2x::gfx::GsTexCreateFromImage(wi);
         UnloadImage(wi);
         g_whiteInit = true;
     }
@@ -7561,7 +7561,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         {   // [unloadmode] PS2X_UNLOADMODE: 1 delete (default), 0 leak (never delete), 2 flush the batch + glFinish before deleting
             static const int s_um = [](){ const char *v = std::getenv("PS2X_UNLOADMODE"); return v ? std::atoi(v) : 1; }();
             if (s_um == 2 && !g_pendingUnload.empty()) { flushBatch(__LINE__); glFlush(); }   // [fencesync] UnloadTexture is driver-refcounted while in use; a full glFinish drain served no purpose
-            if (s_um != 0) for (Texture2D &t : g_pendingUnload) { g_deletedIds.insert(t.id); ps2xForgetTexId(t.id); forgetTexProps(t.id); UnloadTexture(t); }
+            if (s_um != 0) for (Texture2D &t : g_pendingUnload) { g_deletedIds.insert(t.id); ps2xForgetTexId(t.id); forgetTexProps(t.id); ps2x::gfx::GsUnloadTexture(t); }
         }
         g_pendingUnload.clear();
     }
@@ -8064,12 +8064,12 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     auto g = g_glTex.find(k);
                     if (g != g_glTex.end())
                     {
-                        if (s_noPool) { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); UnloadTexture(g->second); }
+                        if (s_noPool) { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); ps2x::gfx::GsUnloadTexture(g->second); }
                         else
                         {
                             auto &pool = g_texPool[texPoolKey(g->second.width, g->second.height)];
                             if (poolableTex(g->second) && pool.size() < 8) pool.push_back(g->second);   // [texreplace] never pool compressed
-                            else { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); UnloadTexture(g->second); }
+                            else { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); ps2x::gfx::GsUnloadTexture(g->second); }
                         }
                         g_glTex.erase(g);
                     }
@@ -8160,7 +8160,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 {   // [filtercache] the GL id may be reused by the next allocation: drop its filter-state entry
                     ps2xForgetTexId(glIt->second.id);
                     forgetTexProps(glIt->second.id);   // [texprops] the id is about to be reissued
-                    UnloadTexture(glIt->second);
+                    ps2x::gfx::GsUnloadTexture(glIt->second);
                 }
                 Image img{};
                 img.data = u.rgba.data();
@@ -8187,7 +8187,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 }
                 else
                 {
-                    t = LoadTextureFromImage(img);
+                    t = ps2x::gfx::GsTexCreateFromImage(img);
                 ps2xForgetTexId(t.id);   // [filtercache] a recycled GL id must not inherit the previous object's filter state
                 // [texreplace] Register the replacement's upscale so the UV math treats su/sv as
                 // LOGICAL texels: the draw path computes u = su / (tw / rsTexScale), so without
@@ -8279,7 +8279,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             if (it == m_texCache.end())
             {   // entry reclaimed/evicted meanwhile: drop the GL object we just made
                 auto g = g_glTex.find(u.key);
-                if (g != g_glTex.end()) { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); UnloadTexture(g->second); g_glTex.erase(g); }
+                if (g != g_glTex.end()) { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); ps2x::gfx::GsUnloadTexture(g->second); g_glTex.erase(g); }
             }
             else if (!it->second.needsUpload && it->second.rgba.empty())
                 it->second.rgba.swap(u.rgba);   // no newer decode arrived: restore the bytes
@@ -10711,9 +10711,9 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         static Texture2D s_tex{}; static int s_tw = 0, s_th = 0;
                         if (s_tex.id == 0 || s_tw != ow || s_th != oh)
                         {
-                            if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); UnloadTexture(s_tex); }
+                            if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); ps2x::gfx::GsUnloadTexture(s_tex); }
                             Image im = GenImageColor(ow, oh, BLANK);
-                            s_tex = LoadTextureFromImage(im); UnloadImage(im);
+                            s_tex = ps2x::gfx::GsTexCreateFromImage(im); UnloadImage(im);
                             s_tw = ow; s_th = oh;
                         }
                         UpdateTexture(s_tex, px.data());

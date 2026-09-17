@@ -84,4 +84,48 @@ namespace ps2x::gfx
         rlMatrixMode(RL_MODELVIEW);
         rlLoadIdentity();
     }
+
+    // ------------------------------------------------------------------------------ textures
+    namespace { std::unordered_map<unsigned, gl::Texture *> s_textures; }
+
+    Texture2D GsTexCreateFromImage(const Image &img, bool linear)
+    {
+        Texture2D t{};
+        if (!gl::ContextReady() || !img.data || img.width <= 0 || img.height <= 0) return t;
+        // Copy first: callers pass borrowed pixel data (see the gaPal site) and raylib's
+        // LoadTextureFromImage never mutates the source, so neither do we.
+        Image copy = ImageCopy(img);
+        if (copy.format != PIXELFORMAT_UNCOMPRESSED_R8G8B8A8) ImageFormat(&copy, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+        auto *tex = new gl::Texture();
+        if (tex->Create(gl::Device(), (uint32_t)copy.width, (uint32_t)copy.height, gl::Format::RGBA8, copy.data))
+        {
+            tex->SetSampler(gl::Device(), linear ? gl::Filter::Linear : gl::Filter::Point, gl::Wrap::Clamp);
+            t.id = tex->GLTexture();
+            t.width = copy.width;
+            t.height = copy.height;
+            t.mipmaps = 1;
+            t.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            s_textures[t.id] = tex;
+        }
+        else
+        {
+            std::fprintf(stderr, "[altgl] GsTexCreateFromImage(%dx%d) failed\n", copy.width, copy.height);
+            delete tex;
+        }
+        UnloadImage(copy);
+        return t;
+    }
+
+    void GsUnloadTexture(Texture2D t)
+    {
+        auto it = s_textures.find(t.id);
+        if (it != s_textures.end())
+        {
+            it->second->Destroy();
+            delete it->second;
+            s_textures.erase(it);
+            return;
+        }
+        if (t.id != 0) UnloadTexture(t);   // raylib-owned (font atlas, FMV, ...)
+    }
 }
