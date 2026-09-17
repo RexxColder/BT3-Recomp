@@ -479,7 +479,8 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp
     src/lib/ps2_host_audio.cpp   # [hostio] audio device: SDL2 mixer or raylib/miniaudio
-    src/lib/ps2_host_pad.cpp     # [hostio] gamepads: SDL2 gamecontroller or raylib/GLFW
+src/lib/ps2_host_window.cpp  # [B] native HWND from raylib's window handle (SDL returns the SDL_Window*)
+    src/lib/ps2_host_pad.cpp     # [hostio] gamepads: SDL2 gamecontroller (default) or raylib's own API
     src/lib/ps2_gs_gpu.cpp
     src/lib/ps2_gs_gpu_renderer.cpp
     src/lib/ps2_win_timer.cpp

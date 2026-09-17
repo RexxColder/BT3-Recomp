@@ -1,5 +1,6 @@
 #include "runtime/ps2_host_pad.h"
 #include "ps2_host_backend.h"
+#include "ps2_host_window.h"   // [B] native (HWND) window handle for the D3D11 swap chain
 
 #if defined(__linux__)
 #include "runtime/pad_evdev_linux.h"

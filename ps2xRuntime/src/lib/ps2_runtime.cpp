@@ -16,6 +16,7 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #include <libunwind.h>
 #include <cxxabi.h>
 #endif
+#include "ps2_host_window.h"   // [B] native window handle (SDL returns SDL_Window*, not the HWND)
 #include "runtime/ps2_texreplace.h"   // [texreplace]
 #include "runtime/ps2_fmv_override.h"  // [fmvoverride]
 #include <filesystem>
@@ -1483,7 +1484,10 @@ bool PS2Runtime::initialize(const char *title)
             const bool wantD3D = !(d3dv && d3dv[0] == '0');
             if (wantD3D)
             {
-                g_ps2xD3D11Mode = g_ps2xD3D11.Init(GetWindowHandle(),
+                // [B] GetWindowHandle() returns the SDL_Window* on the SDL platform (it used to be the
+                // HWND under GLFW), so the native handle must be resolved through SDL or the swap chain
+                // is created on a bogus HWND.
+                g_ps2xD3D11Mode = g_ps2xD3D11.Init(ps2xNativeWindowHandle(GetWindowHandle()),
                                                    static_cast<uint32_t>(GetScreenWidth()),
                                                    static_cast<uint32_t>(GetScreenHeight()));
                 if (!g_ps2xD3D11Mode)

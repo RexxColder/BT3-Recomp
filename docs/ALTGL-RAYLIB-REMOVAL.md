@@ -111,6 +111,19 @@ What that retired:
   own sampleable-depth targets, so the default config (PS2X_DOFMASK=2) no longer builds FBOs with
   raylib. `image_io`, `video_overlay` and the altGL present stay as they are.
 
+Two traps this move created, both fixed and worth remembering:
+
+- **`GetWindowHandle()` changed meaning**: the GLFW platform returned the HWND, the SDL platform
+  returns the `SDL_Window*`. Anything that hands the handle to the OS must resolve it first --
+  `ps2xNativeWindowHandle()` in `src/lib/ps2_host_window.{h,cpp}` does that through
+  `SDL_GetWindowWMInfo`, and the D3D11 device is created with it. (Its own TU on purpose:
+  `SDL_syswm.h` pulls in `<windows.h>`, whose `Rectangle` clashes with raylib's.)
+- **`fps60_sites.txt` was only staged next to the build's exe**, never into the deploy, so
+  `[fps60] CANNOT ENABLE: ... not found` left the 60-fps/halfstep mode silently inert with
+  `fps60 = true` in settings. The file now also ships in the deploy (`games/bt3/fps60_sites.txt` is
+  the repo copy) and `[fps60] ON (step 1 + pacing table)` confirms 92 float sites halved.
+
+
 ## Stages (each keeps the game rendering and is A/B-able)
 
 Flag: `PS2X_GSBACKEND=gl` selects the gfx::gl replay backend; default stays rlgl until a stage is
