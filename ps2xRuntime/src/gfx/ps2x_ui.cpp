@@ -67,11 +67,20 @@ namespace ps2x::gfx
             io.AddKeyEvent(static_cast<ImGuiKey>(ImGuiKey_0 + k), IsKeyDown(KEY_ZERO + k) != 0);
     }
 
-    // [C] PS2X_UIGL=1 draws the overlay with imgui_impl_opengl3 (its own GL loader + its own font
-    // atlas texture) instead of rlImGui/rlgl, so the overlay stops depending on raylib's batcher.
-    // Input is fed by us (feedImGuiInput), the same way the D3D11 backend already does.
+    // [C] The overlay uses imgui_impl_opengl3 (its own GL loader + font atlas) instead of
+    // rlImGui/rlgl when the GL path is ours (PS2X_ALTGL=1). PS2X_UIGL overrides the choice:
+    //   1  -> always GL overlay        0 -> always rlImGui
+    //   unset -> GL overlay iff PS2X_ALTGL=1
     static bool UiGlEnabled()
-    { static const bool s = [](){ const char *v = std::getenv("PS2X_UIGL"); return v && v[0] && v[0] != '0'; }(); return s; }
+    {
+        static const int s = [](){
+            const char *v = std::getenv("PS2X_UIGL");
+            if (v && v[0]) return (v[0] != '0') ? 1 : -1;
+            const char *a = std::getenv("PS2X_ALTGL");
+            return (a && a[0] && a[0] != '0') ? 1 : 0;
+        }();
+        return s > 0;
+    }
 
     void UiSetup()
     {
