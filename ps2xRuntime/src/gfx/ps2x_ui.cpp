@@ -78,7 +78,16 @@ namespace ps2x::gfx
         if (NativeVideo())
             UiD3D11Init(*VideoDevice());
         else if (UiGlEnabled())
-            ImGui_ImplOpenGL3_Init("#version 330");
+        {
+            // imgui_impl_opengl3 does NOT create the ImGui context (rlImGuiSetup used to do it
+            // for us), and ImGui::NewFrame on a null context is what crashed the runner.
+            ImGui::CreateContext();
+            ImGuiIO &io = ImGui::GetIO();
+            io.DisplaySize = ImVec2((float)GetScreenWidth(), (float)GetScreenHeight());
+            io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+            const bool ok = ImGui_ImplOpenGL3_Init("#version 330");
+            std::fprintf(stderr, "[uigl] imgui_impl_opengl3 init=%d (context created)\n", (int)ok);
+        }
         else
             rlImGuiSetup(true);
     }
