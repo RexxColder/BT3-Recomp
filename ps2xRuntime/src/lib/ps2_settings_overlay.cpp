@@ -1280,29 +1280,10 @@ void PS2SettingsOverlay::drawVideoTab()
     ImGui::TextDisabled("Takes full effect after restart.");
     if (toggleSwitch("Cel Outline", &m_settings.outline))
         m_dirty = true;
-    {   // [texreplace] Only offer the switch when a pack is actually indexed -- PS2X_TEXREPLACE
-        // points at the directory, and with no pack the toggle would do nothing and read as broken.
-        const bool havePack = ps2tex::replacementsEnabled();
-        if (!havePack) ImGui::BeginDisabled();
-        if (toggleSwitch("Texture Replacement", &m_settings.texPack))
-        {   // Applies LIVE: setTexPack flushes the texture cache so everything re-decodes.
-            GsGpuRenderer::setTexPack(m_settings.texPack);
-            ps2x_pgs::setPackEnabled(m_settings.texPack);   // [pgslive] backend: hook gated + cached textures dropped
-            m_dirty = true;
-        }
-        if (!havePack)
-        {
-            ImGui::EndDisabled();
-            ImGui::TextDisabled("Set PS2X_TEXREPLACE=<dir> to enable.");
-        }
-    }
-    if (toggleSwitch("60 FPS (experimental)", &m_settings.fps60))
-    {   // [fps60] step 1 + the pacing table; the runtime applies it between fights, never mid-fight
-        ps2Set60Fps(m_settings.fps60, nullptr);
-        m_dirty = true;
-    }
     if (m_settings.outline)
-    {   // [inkstrength] how hard the outline darkener subtracts. 199% is the exact GS
+    {   // the ink controls belong to the outline: shown under it, only while it is on
+        ImGui::Indent(12.0f);
+        // [inkstrength] how hard the outline darkener subtracts. 199% is the exact GS
         // strength (it divides Ad by 128 where GL divides by 255); 100% is the old,
         // washed-out line. Applies live -- it is a single shader uniform.
         ImGui::Text("Ink Strength");
@@ -1343,6 +1324,28 @@ void PS2SettingsOverlay::drawVideoTab()
                 ImGui::TextDisabled("Exact on light backgrounds; darker scenes tint toward it (paraLLEl-GS only).");
             }
         }
+        ImGui::Unindent(12.0f);
+    }
+    {   // [texreplace] Only offer the switch when a pack is actually indexed -- PS2X_TEXREPLACE
+        // points at the directory, and with no pack the toggle would do nothing and read as broken.
+        const bool havePack = ps2tex::replacementsEnabled();
+        if (!havePack) ImGui::BeginDisabled();
+        if (toggleSwitch("Texture Replacement", &m_settings.texPack))
+        {   // Applies LIVE: setTexPack flushes the texture cache so everything re-decodes.
+            GsGpuRenderer::setTexPack(m_settings.texPack);
+            ps2x_pgs::setPackEnabled(m_settings.texPack);   // [pgslive] backend: hook gated + cached textures dropped
+            m_dirty = true;
+        }
+        if (!havePack)
+        {
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Set PS2X_TEXREPLACE=<dir> to enable.");
+        }
+    }
+    if (toggleSwitch("60 FPS (experimental)", &m_settings.fps60))
+    {   // [fps60] step 1 + the pacing table; the runtime applies it between fights, never mid-fight
+        ps2Set60Fps(m_settings.fps60, nullptr);
+        m_dirty = true;
     }
     if (toggleSwitch("Character Shadows", &m_settings.shadows))
         m_dirty = true;
@@ -1392,11 +1395,6 @@ void PS2SettingsOverlay::drawVideoTab()
     if (toggleSwitch("Fullscreen", &m_settings.fullscreen))
     {
         ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
-        // [builtin-res] the internal render scale follows the resolution: 720p=1x,
-        // 1080p=2x, 1440p+=3x. Derive it from the current screen in fullscreen.
-        const int h = GetScreenHeight();
-        m_settings.renderScale = ps2xRenderScaleForHeight(h);
-        if (!envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive]
         m_dirty = true;
     }
     if (toggleSwitch("Widescreen (true FOV)", &m_settings.widescreen))
@@ -1429,6 +1427,24 @@ void PS2SettingsOverlay::drawVideoTab()
             ImGui::TextDisabled("note: in stretched layouts the damage flash can briefly show at both bar ends");
     }
 
+    {   // [rscale] Internal resolution, its own setting again (2026-09-17): it used to be derived from the
+        // window size (720p=1x, 1080p=2x, 1440p+=3x), so a 1080p window could never render at 1x or 4x.
+        // paraLLEl-GS re-creates the backend live at 1/4/8/16 samples per pixel; OpenGL applies on restart.
+        static const char *kScales[] = {"Native (1x)", "2x", "3x", "4x"};
+        int rsIdx = std::clamp(m_settings.renderScale, 1, 4) - 1;
+        ImGui::TextUnformatted("Internal Resolution");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        if (ImGui::Combo("##renderscale", &rsIdx, kScales, 4))
+        {
+            m_settings.renderScale = rsIdx + 1;
+            ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive] (the combo outranks a launcher SSAA once touched)
+            m_dirty = true;
+        }
+        if (m_settings.renderer == 2)
+            ImGui::TextDisabled("paraLLEl-GS: 1x / 2x / 3x / 4x = 1 / 4 / 8 / 16 samples per pixel, applies live.");
+        else if (m_settings.renderScale != GsGpuRenderer::renderScale())
+            ImGui::TextDisabled("(applies on restart)");
+    }
     // Window-size presets. The projection FOV follows the window aspect (see [truews]
     // in ps2_runtime.cpp), so wider windows genuinely show more stage.
     {
@@ -1457,10 +1473,6 @@ void PS2SettingsOverlay::drawVideoTab()
                     SetWindowSize(kRes[i][0], kRes[i][1]);
                     m_settings.windowW = kRes[i][0];
                     m_settings.windowH = kRes[i][1];
-                    // [builtin-res] the internal render scale is built into the resolution:
-                    // 720p=1x, 1080p=2x, 1440p+=3x. paraLLEl-GS replays live at the new SSAA.
-                    m_settings.renderScale = ps2xRenderScaleForHeight(kRes[i][1]);
-                    if (!envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive]
                     m_dirty = true;
                 }
             }
