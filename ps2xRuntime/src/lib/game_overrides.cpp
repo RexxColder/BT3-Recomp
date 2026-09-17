@@ -3980,6 +3980,21 @@ namespace
         if (s_step > 0 && getRegU32(ctx, 4) == 2u && (s_always || ps2HalfStepFightActive())) ctx->r[4] = _mm_set_epi64x(0, (int64_t)s_step);   // $a0 = step
         if (g_orig102060) g_orig102060(rdram, ctx, runtime);
     }
+    // [fps60 predict] FUN_001de8a8(obj, out, ..., f12 = own speed/frame, f13, f14 = reach frames, f15 = N frames):
+    // the slam-dive setup (state 0x30, FUN_001f3668) aims at "opponent position + opponent velocity/frame * N".
+    // At 60 fps the per-frame velocity is halved by the pacing table while N is a frame count the game never
+    // scales, so the aim point fell short (the teleport slam missed a sliding victim). Double N in 60 fps mode.
+    PS2Runtime::RecompiledFunction g_orig1de8a8 = nullptr;
+    void bt3PredictAhead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<uint32_t> s_n{0}; const uint32_t n = s_n.fetch_add(1u);
+        const bool on = ps2VStepActive() && ps2HalfStepFightActive();
+        if (n < 8u)
+            std::fprintf(stderr, "[fps60] predict f12=%g f13=%g f14=%g f15=%g %s frame=%llu\n", ctx->f[12], ctx->f[13], ctx->f[14], ctx->f[15],
+                         on ? "(N doubled)" : "", (unsigned long long)g_bt3FrameCount.load());
+        if (on) ctx->f[15] *= 2.0f;
+        if (g_orig1de8a8) g_orig1de8a8(rdram, ctx, runtime);
+    }
     // [vstepprobe] func_264D98(a0): the frame wait. Print a0, the per-frame vblank counter [gp-0x5148] at entry,
     // and the vsync ticks elapsed inside the call, for the first calls and then every 300th.
     PS2Runtime::RecompiledFunction g_orig264d98 = nullptr;
@@ -6339,6 +6354,8 @@ namespace
             std::fprintf(stderr, "[clipguard] armed (0x121d48 %s, 0x11f548 %s)\n", g_orig121d48 ? "ok" : "MISSING", g_orig11f548 ? "ok" : "MISSING");
             g_orig264d98 = runtime.lookupFunction(0x00264d98u);
             if (g_orig264d98) runtime.replaceFunction(0x00264d98u, &bt3WaitProbe);   // [vstepprobe]
+            g_orig1de8a8 = runtime.lookupFunction(0x001de8a8u);   // [fps60 predict]
+            if (g_orig1de8a8) runtime.replaceFunction(0x001de8a8u, &bt3PredictAhead);
             if (g_orig115950) runtime.replaceFunction(0x00115950u, &bt3LogicRate);
             std::fprintf(stderr, "[vstep] step override armed (0x102060 %s, 0x115950 %s)\n", g_orig102060 ? "ok" : "MISSING", g_orig115950 ? "ok" : "MISSING");
         }

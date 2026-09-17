@@ -499,6 +499,8 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
             std::fprintf(stderr, "[halfstep-mod] d pc=0x%06x addr=0x%x armed=%d first-tick %d -> stored %d frame=%u\n", pc, a, o, n, doubled, frame);
         return (uint32_t)doubled;
     }
+    // [ucount] 'u' run position since the first store after a gap (bit 31 = the decision taken for this frame)
+    if (k == 2 && firstAfterGap) e.val = 0u;
     // an address this site did not touch on the previous frame (or never): a one-shot event, land it unmodified
     if (firstAfterGap) { g_hsOneShot.fetch_add(1, std::memory_order_relaxed); return value; }
     if (k == 1)
@@ -518,9 +520,21 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
             std::fprintf(stderr, "[halfstep-mod] f pc=0x%06x addr=0x%x old=%g new=%g stored=%g frame=%u\n", pc, a, fo, fn, h, frame);
         return bits;
     }
-    // integer counter: keep the old value on odd render frames -- unless the site runs at half rate already ([uparity])
+    // integer counter: keep the old value on alternate render frames -- unless the site runs at half rate already ([uparity])
     if (e.halfRate) { g_hsOneShot.fetch_add(1, std::memory_order_relaxed); return value; }
-    const bool skip = (frame & 1u) != 0u;
+    // [ucount] The skip pattern is phased from the sequence's own start, not from the absolute frame parity: the
+    // first store after a gap lands (a one-shot increment must not be lost), then the next TWO consecutive-frame
+    // stores are skipped, then every other one. A count to N therefore takes exactly 2N frames for N >= 2
+    // (values 1,1,1,2,2,3,3,4 over 8 frames); with absolute parity it took 2N-1 or 2N-2 depending on the frame the
+    // state started on, which cut the slam's 4-step rise to 7 or 6 frames. Stores within one frame share the decision.
+    bool skip;
+    if (last == frame) skip = (e.val & 0x80000000u) != 0u;
+    else
+    {
+        const uint32_t run = (e.val == 0xFFFFFFFFu) ? 1u : ((e.val & 0x7FFFFFFFu) + 1u);
+        skip = (run == 1u) || ((run & 1u) == 0u);
+        e.val = (run & 0x7FFFFFFFu) | (skip ? 0x80000000u : 0u);
+    }
     if (logOk(pc))
         std::fprintf(stderr, "[halfstep-mod] i pc=0x%06x addr=0x%x old=%d new=%d %s frame=%u\n", pc, a, sext(old, size), sext(value, size), skip ? "SKIPPED" : "passed", frame);
     if (skip) { g_hsIntSkip.fetch_add(1, std::memory_order_relaxed); return old; }
