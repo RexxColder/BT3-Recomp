@@ -75,8 +75,12 @@ namespace ps2x::gfx
     {
         if (!g_ok || w <= 0 || h <= 0) return;
         gl::Renderer &r = gl::RendererRef();
-        const float fw = (float)w * renderScale, fh = (float)h * renderScale;
-        const float m[16] = { 2.0f / fw, 0, 0, 0, 0, -2.0f / fh, 0, 0, 0, 0, 1, 0, -1, 1, 0, 1 };
+        // rlgl's MVP is modelview * projection, where modelview carries rlScalef(N,N,1) and the
+        // projection is the FBO ortho (0..w, h..0). Our Renderer takes a single ortho, so we fold
+        // the scale in: the emitters draw in LOGICAL coordinates (physical / N).
+        const float sc = (renderScale > 0.01f) ? renderScale : 1.0f;
+        const float lw = (float)w / sc, lh = (float)h / sc;
+        const float m[16] = { 2.0f / lw, 0, 0, 0, 0, -2.0f / lh, 0, 0, 0, 0, 1, 0, -1, 1, 0, 1 };
         g_main.SetMat4("mvp", m);
         r.SetShader(&g_main);
     }

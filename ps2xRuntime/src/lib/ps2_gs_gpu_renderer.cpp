@@ -8911,6 +8911,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     if (write) { extern unsigned long g_dbgDepthWriteDraws; ++g_dbgDepthWriteDraws; } }
         else rlDisableDepthTest();
         if (write) rlEnableDepthMask(); else rlDisableDepthMask();
+        ps2x::gfx::GsGlDepth(test, write, glDepthFuncFor(func));   // [gsgl] mirror when PS2X_GSBACKEND=gl
         curDepthTest = wantTest; curDepthFunc = wantFunc; curDepthWrite = wantWrite;
     };
     // GS FRAME.FBMSK -> glColorMask (byte granularity: a channel is disabled only when its
@@ -8929,6 +8930,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (flushCensusOn()) ++g_maskTrans[((unsigned)(curMask & 0xFFFF) << 16) | (unsigned)(want & 0xFFFF)];
         if (!cmdFlushed) { flushBatch(__LINE__); cmdFlushed = true; }   // [flushcoalesce]
         glColorMask((want & 1) ? 1 : 0, (want & 2) ? 1 : 0, (want & 4) ? 1 : 0, (want & 8) ? 1 : 0);
+        ps2x::gfx::GsGlColorMask((want & 1) != 0, (want & 2) != 0, (want & 4) != 0, (want & 8) != 0);   // [gsgl]
         curMask = want;
     };
     auto endMode = [&]() { if (inMode) { flushBatch(__LINE__);
@@ -8936,6 +8938,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // never depth-tested; the next depth-using draw re-enables via applyDepth().
         if (depthOn && curDepthTest != 0) { rlDisableDepthTest(); rlEnableDepthMask(); curDepthTest = 0; curDepthFunc = -1; curDepthWrite = 1; }
         if (curMask != 15) { glColorMask(1, 1, 1, 1); curMask = 15; } // full mask for blits/present
+        { ps2x::gfx::GsGlDepth(false, true, 0x0207 /*GL_ALWAYS*/);   // [gsgl] mirror the boundary state
+          ps2x::gfx::GsGlColorMask(true, true, true, true);
+          ps2x::gfx::GsGlScissor(nullptr); }
         rlDisableScissorTest(); EndBlendMode(); EndShaderMode(); ps2x::gfx::GsRtEnd(); inMode = false; curRealFbp = 0xFFFFFFFFu; } };
     auto fboSizeFor = [&](uint32_t fbp, int &w, int &h) {
         // PS2X_VIEWSIZE=1: size a split view by its OWN stride + vertical extent. Correct on
