@@ -677,7 +677,9 @@ target_sources(ps2_runtime PRIVATE
     src/gfx/gl_context.cpp
     src/gfx/gs_resources.cpp
     src/gfx/gs_rt.cpp
-    src/gfx/gs_gl.cpp)
+    src/gfx/gs_gl.cpp
+    src/gfx/image_io.cpp)
+target_include_directories(ps2_runtime PRIVATE "${raylib_SOURCE_DIR}/src/external")   # [A4] stb_image(_write)
 if(WIN32)
     target_link_libraries(ps2_runtime PUBLIC opengl32)
 else()
