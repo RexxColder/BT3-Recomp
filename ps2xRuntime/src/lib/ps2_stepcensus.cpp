@@ -85,6 +85,10 @@ static uint32_t g_addrWatchList[6] = {0}; static int g_addrWatchCnt = 0;
 // attributed to the pc of the last branch -- several distinct stores share one site id and cannot be told apart by
 // pc. An address rule targets one guest slot exactly.
 static uint32_t g_hsAddr[16] = {0}; static char g_hsAddrKind[16] = {0}; static int g_hsAddrN = 0; static int g_hsAddrLog = 0;
+// [hclip] "0x1c4550 h 1": the seconds-timed clip setter FUN_001c4520 serves every clip; halving all of them broke
+// the teleport slam (its event-track query read the half-speed clip). The optional third token restricts the 'h'
+// rule to stores whose animation block carries that clip slot id ([component+0xC], the block being component+0xB40).
+static std::unordered_map<uint32_t, uint32_t> g_hsHClip;
 static uint32_t g_awTrigAddr = 0; static float g_awTrigDelta = 0.f; static uint32_t g_awTrigAddr2 = 0;
 static void parseTrig()
 {
@@ -404,7 +408,21 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
             }
             // [addrkind] '@addr u': a per-fighter up-counter whose increment shares its site id with stores that must
             // not be paced (the state-age counter fighter+0x964 at 0x1e23ac). Pace it by address instead.
-            if (g_hsAddrKind[i] == 'u') { kForce = 2; break; }
+            if (g_hsAddrKind[i] == 'u' || g_hsAddrKind[i] == 'a')
+            {   // only a +1 increment is paced; an assignment to the same field (a sub-phase index) lands as is
+                const uint32_t o = readOld(rdram, aa, size);
+                const uint32_t mask = size == 1 ? 0xFFu : size == 2 ? 0xFFFFu : 0xFFFFFFFFu;
+                if (((o + 1u) & mask) != (value & mask)) return value;
+                if (g_hsAddrKind[i] == 'a')
+                {   // 'a' = the fighter's state-age counter (fighter+0x964) with the IDLE state (0xB) exempt. TESTED AND
+                    // NOT USABLE (2026-09-18): even with idle exempt the transformation locks after the flash -- the
+                    // handlers fire `age == N` events, and a paced counter shows each value for two frames. Kept as
+                    // the record of what was tried; the age stays unpaced (idle taunt and hit reactions run 2x).
+                    uint32_t st = 0; if (const uint8_t *q = rdram + ((aa - 0x964u + 0x948u) & 0x1FFFFFFFu)) std::memcpy(&st, q, 4);
+                    if (st == 0xBu) return value;
+                }
+                kForce = 2; break;
+            }
             return value;
         }
     }
@@ -425,7 +443,21 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
         if (size != 4) return value;
         float f; std::memcpy(&f, &value, 4);
         if (!std::isfinite(f) || std::fabs(f) > 1e6f) return value;
-        f *= 0.5f; uint32_t bits; std::memcpy(&bits, &f, 4); g_hsFloat.fetch_add(1, std::memory_order_relaxed); return bits;
+        if (auto it = g_hsHClip.find(pc); it != g_hsHClip.end())
+        {   // [hclip]
+            uint32_t clip = 0xFFFFFFFFu; const uint32_t comp = a - 0xB40u - 0x140u;
+            if (comp + 16u < 32u * 1024u * 1024u) std::memcpy(&clip, rdram + comp + 0xC, 4);
+            if (clip != it->second) return value;
+        }
+        f *= 0.5f; uint32_t bits; std::memcpy(&bits, &f, 4); g_hsFloat.fetch_add(1, std::memory_order_relaxed);
+        {   // the anim block is at component+0xB40 and the speed at +0x140 of it: log the clip id [component+0xC]
+            static uint16_t *s_hLog = [](){ return new uint16_t[(kEnd - kBase) >> 2](); }();
+            static const uint32_t s_hFrom = [](){ const char *v = std::getenv("PS2X_HSLOG_FROM"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 10) : 0u; }();
+            uint16_t &n = s_hLog[(pc - kBase) >> 2];
+            if (frame >= s_hFrom && n < 120u) { ++n; uint32_t clip = 0; const uint32_t comp = a - 0xB40u - 0x140u; if (comp + 16u < 32u * 1024u * 1024u) std::memcpy(&clip, rdram + comp + 0xC, 4);
+                std::fprintf(stderr, "[halfstep-mod] h pc=0x%06x addr=0x%x value=%g -> %g clip=%u frame=%u\n", pc, a, f * 2.0f, f, clip, frame); }
+        }
+        return bits;
     }
     if (k == 6)
     {   // 'D': a frame-count DURATION written next to a countdown we double ('d'). The game derives progress as
@@ -644,7 +676,9 @@ void ps2HalfStepEnable(const char *sitesPath)
             kind = 0;
         }
         if (std::sscanf(line, "%x:%x %c", &pc, &ra, &kind) == 3) { if (pc >= kBase && pc < kEnd && kind == 'f') { g_hsVec.insert(((uint64_t)pc << 32) | ra); ++nv; } continue; }
-        if (std::sscanf(line, "%x %c", &pc, &kind) != 2 || pc < kBase || pc >= kEnd) continue;
+        unsigned clip = 0xFFFFFFFFu;
+        if (std::sscanf(line, "%x %c %u", &pc, &kind, &clip) < 2 || pc < kBase || pc >= kEnd) continue;
+        if (kind == 'h' && clip != 0xFFFFFFFFu) g_hsHClip[pc] = clip;   // [hclip] halve only when the clip slot id matches
         if (kind == 'f') { g_hs[(pc - kBase) >> 2] = 1; ++nf; }
         else if (kind == 'i' || kind == 'u') { g_hs[(pc - kBase) >> 2] = 2; ++ni; }
         else if (kind == 'd') { g_hs[(pc - kBase) >> 2] = 3; ++nd; }
