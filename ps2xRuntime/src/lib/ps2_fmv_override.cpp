@@ -142,6 +142,20 @@ namespace
             if (fmt->duration > 0) g_duration = (double)fmt->duration / (double)AV_TIME_BASE;
             std::fprintf(stderr, "[fmvoverride] decoding %dx%d, dur=%.2fs, codec=%s\n",
                          cc->width, cc->height, g_duration, avcodec_get_name(st->codecpar->codec_id));
+            // [fmvguard] Warn loudly when the clip is very unlikely to decode in software in this
+            // process: AV1 has no hwaccel here, and >1440p software decode rarely keeps up. A wrong
+            // clip otherwise just shows as a silent black movie.
+            {
+                const char *cn = avcodec_get_name(st->codecpar->codec_id);
+                const bool av1 = (st->codecpar->codec_id == AV_CODEC_ID_AV1) ||
+                                 (cn && std::strstr(cn, "av1") != nullptr);
+                const bool huge = (cc->width > 2560 || cc->height > 1440);
+                if (av1 || huge)
+                    std::fprintf(stderr, "[fmvguard] WARNING: %s%s%s -> software decode may produce NO frames "
+                                         "(black video). Use H.264 High 8-bit yuv420p at <=2560x1440, 30fps, CRF 16.\n",
+                                 av1 ? "AV1 has no hardware decode on this platform" : "",
+                                 (av1 && huge) ? " and " : "", huge ? "resolution is above 2560x1440" : "");
+            }
         }
 
         SwsContext *sws = nullptr;
@@ -320,6 +334,15 @@ bool tick(bool movieActive, FmvOverrideFrame &out)
     }
     g_cv.notify_all();
 
+    {   // [fmvguard] session active but still no frame after a few seconds -> say so once.
+        static bool s_warned = false;
+        if (!s_warned && g_current.rgba.empty() && el > 3.0)
+        {
+            s_warned = true;
+            std::fprintf(stderr, "[fmvguard] no video frames after %.1fs -- the clip is not decoding "
+                                 "(black movie). Check the codec/resolution.\n", el);
+        }
+    }
     // [fade] melt to black over the last PS2X_FMV_FADE seconds of the video.
     static const double s_fade = [](){
         const char *v = std::getenv("PS2X_FMV_FADE");
