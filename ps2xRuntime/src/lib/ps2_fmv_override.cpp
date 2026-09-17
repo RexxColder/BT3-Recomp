@@ -281,25 +281,7 @@ namespace
 
     void stopSession()
     {
-    const double el0 = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
-    // [videoclk] Native-anchored clock (see the globals): native frames drive the timeline while
-    // the game's own movie advances; wall time covers a stalled capture.
-    {
-        const auto now = std::chrono::steady_clock::now();
-        const uint64_t nf = g_fmvCapGen;
-        const double dt = std::chrono::duration<double>(now - g_clockLast).count();
-        g_clockLast = now;
-        if (nf != g_clockNative) { g_clockNative = nf; g_clockT = (double)nf / g_fps; }
-        else g_clockT += (dt > 0.0 && dt < 0.5) ? dt : 0.0;
-        static auto s_lastLog = now;
-        if (std::chrono::duration<double>(now - s_lastLog).count() >= 5.0)
-        {
-            s_lastLog = now;
-            std::fprintf(stderr, "[videoclk] native=%llu t=%.2fs wall=%.2fs drift=%.3fs fps=%.3f\n",
-                         (unsigned long long)nf, g_clockT, el0, g_clockT - el0, g_fps);
-        }
-    }
-    const double el = g_clockT;
+        const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
         std::fprintf(stderr, "[fmvoverride] VIDEO END at %.2fs (poked=%d) -> stopping injection\n",
                      el, g_skipPoked ? 1 : 0);
         {
@@ -351,7 +333,25 @@ bool tick(bool movieActive, FmvOverrideFrame &out)
     if (!g_started && !g_halted) startSession();
     if (!g_started) return false;
 
-    const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+    // [videoclk] Native-anchored clock: native frames drive the timeline while the game's own movie
+    // advances (exact sync with playback and its skip); wall time covers a stalled native capture.
+    const double el0 = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t nf = g_fmvCapGen;
+        const double dt = std::chrono::duration<double>(now - g_clockLast).count();
+        g_clockLast = now;
+        if (nf != g_clockNative) { g_clockNative = nf; g_clockT = (double)nf / g_fps; }
+        else g_clockT += (dt > 0.0 && dt < 0.5) ? dt : 0.0;
+        static auto s_lastLog = now;
+        if (std::chrono::duration<double>(now - s_lastLog).count() >= 5.0)
+        {
+            s_lastLog = now;
+            std::fprintf(stderr, "[videoclk] native=%llu t=%.2fs wall=%.2fs drift=%.3fs fps=%.3f\n",
+                         (unsigned long long)nf, g_clockT, el0, g_clockT - el0, g_fps);
+        }
+    }
+    const double el = g_clockT;
     // [avoffset] shift the video timeline to line it up with the game's native ADX. Positive
     // ADVANCES the video (presents later frames sooner); negative delays it.
     static const double s_avoff = [](){ const char *v = std::getenv("PS2X_FMV_AVOFFSET"); return v ? std::atof(v) : 0.6; }();
