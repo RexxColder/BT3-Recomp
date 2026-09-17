@@ -91,6 +91,8 @@ namespace ps2x::gfx
         g_main.Bind(gl::Device());
         g_main.SetInt("texture0", 0);
         g_main.SetInt("uPal", 1);
+        // [R1] rlgl's own objects, so the replay submit can run on the vendored copy (see GsRlInit).
+        GsRlInit();
         gl::RendererRef().BeginBatch();
         g_emit.Bind(gl::RendererRef());
         std::fprintf(stderr, "[gsgl] backend active (gfx::gl batcher)\n");

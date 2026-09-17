@@ -19,6 +19,9 @@ namespace ps2x::gfx
     bool GsGlInit();        // ensure context + compile shader; false -> stay on rlgl
     bool GsGlActive();      // enabled AND initialised
 
+    // [R1] Bring up the vendored rlgl copy (its own state cache/batcher) used by the replay submit.
+    bool GsRlInit();
+
     void GsGlShutdown();
 
     // Draw-target framing: installs the same ortho as GsRtBegin (top-left origin, w x h scaled) and
