@@ -16,6 +16,7 @@ namespace ps2x::gfx
     // Write tightly packed RGBA8 as a PNG. Returns false on failure.
     bool GsWritePngRGBA8(const char *path, const uint8_t *rgba, int w, int h);
 
-    // Read back a GL texture (RGBA8, top-down) into `out`. Needs a current GL context.
+    // Read back a GL texture (RGBA8, raw bottom-up like raylib's LoadImageFromTexture) into
+    // `out`. Needs a current GL context.
     bool GsReadTextureRGBA8(unsigned glTexture, int w, int h, std::vector<uint8_t> &out);
 }

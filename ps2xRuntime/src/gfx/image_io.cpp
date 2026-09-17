@@ -64,10 +64,9 @@ namespace ps2x::gfx
         ps2xgl::glReadPixels(0, 0, w, h, ps2xgl::GL_RGBA, ps2xgl::GL_UNSIGNED_BYTE, tmp.data());
         ps2xgl::glBindFramebuffer(ps2xgl::GL_FRAMEBUFFER, 0);
         ps2xgl::glDeleteFramebuffers(1, &fbo);
-        // GL is bottom-up; hand back top-down like raylib's LoadImageFromTexture.
-        out.resize(tmp.size());
-        for (int y = 0; y < h; ++y)
-            std::memcpy(&out[(size_t)y * w * 4u], &tmp[(size_t)(h - 1 - y) * w * 4u], (size_t)w * 4u);
+        // NOTE: deliberately NOT flipped -- raylib's LoadImageFromTexture (rlReadTexturePixels)
+        // returns the raw bottom-up GL data, and the callers already flip when they need to.
+        out.swap(tmp);
         return true;
     }
 }
