@@ -168,6 +168,7 @@ float g_ps2xWsSrcW = 512.0f;
 #include "gfx/gl/gl_shader_glsl.h"
 #include "gfx/gl_context.h"
 #include "gfx/gs_gl.h"
+#include "gfx/video_overlay.h"
 extern "C" __declspec(dllimport) void *__stdcall wglGetProcAddress(const char *);
 namespace
 {
@@ -6933,7 +6934,20 @@ void PS2Runtime::run()
             ps2x_fmv::FmvOverrideFrame of{};
             if (ps2x_fmv::tick(g_ps2MovieActive.load(std::memory_order_relaxed) != 0u, of))
             {
-                static Texture2D s_fmvTex{};
+#if defined(_WIN32)
+                // [B] AltGL path: draw the injected video through gfx::gl instead of raylib.
+                if (AltGlEnabled() && ps2x::gfx::gl::ContextReady())
+                {
+                    static ps2x::gfx::VideoBlit *s_vb = nullptr;
+                    if (!s_vb) s_vb = ps2x::gfx::CreateGlVideoBlit();
+                    ps2x::gfx::VideoFrame vf{of.rgba, of.w, of.h, of.gen, of.alpha};
+                    if (ps2x::gfx::VideoOverlayDraw(s_vb, vf, (int)screenWidth, (int)screenHeight,
+                                                    PS2SettingsOverlay::isWidescreen() || wsTrigActive()))
+                        fmvDrew = true;
+                }
+                else
+#endif
+                {                static Texture2D s_fmvTex{};
                 static int s_tw = 0, s_th = 0;
                 static uint64_t s_gen = ~0ull;
                 if (of.w != s_tw || of.h != s_th)
@@ -6963,6 +6977,7 @@ void PS2Runtime::run()
                 const Color ftint{255, 255, 255, (unsigned char)(of.alpha * 255.0f + 0.5f)};
                 DrawTexturePro(s_fmvTex, fsrc, fdst, Vector2{0.0f, 0.0f}, 0.0f, ftint);
                 fmvDrew = true;
+                }   // end raylib FMV path
             }
         }
         // Blend-free present: the GPU FBO's alpha channel now carries GS dest-alpha (the
