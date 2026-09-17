@@ -383,6 +383,7 @@ namespace
 uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint32_t value, const R5900Context *ctx)
 {
     if (!g_hs || !ctx || ctx != g_hsCtx.load(std::memory_order_relaxed)) return value;
+    uint8_t kForce = 0;   // [addrkind] an address rule of kind 'u' runs the ordinary up-counter logic below, whatever the pc
     if (g_hsAddrN)
     {
         const uint32_t aa = guestAddr & 0x1FFFFFFFu;
@@ -401,12 +402,15 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
                     return (uint32_t)(v * 2);
                 }
             }
+            // [addrkind] '@addr u': a per-fighter up-counter whose increment shares its site id with stores that must
+            // not be paced (the state-age counter fighter+0x964 at 0x1e23ac). Pace it by address instead.
+            if (g_hsAddrKind[i] == 'u') { kForce = 2; break; }
             return value;
         }
     }
     const uint32_t pc = ctx->pc;
     if (pc < kBase || pc >= kEnd) return value;
-    const uint8_t k = g_hs[(pc - kBase) >> 2];
+    const uint8_t k = kForce ? kForce : g_hs[(pc - kBase) >> 2];
     if (!k) return value;
     const uint32_t a = guestAddr & 0x1FFFFFFFu;
     if (a + size > 32u * 1024u * 1024u) return value;
