@@ -1362,6 +1362,52 @@ namespace
             else g_d3dGsSh.SetVec4(n, v[0], v[1], v[2], v[3]);
         }
     }
+    // [A4] Local stand-in for raylib's Image on the readback path: same surface the diagnostic
+    // code uses (.data/.width/.height/.format) but backed by our own GL readback + PNG writer, so
+    // LoadImageFromTexture/ExportImage/UnloadImage/ImageFlipVertical/GetImageColor leave the replay.
+    struct GsReadImage
+    {
+        std::vector<unsigned char> buf;
+        unsigned char *data = nullptr;
+        int width = 0, height = 0, format = 4 /*PIXELFORMAT_UNCOMPRESSED_R8G8B8A8*/;
+    };
+    static bool gsReadImageFromTexture(const Texture2D &t, GsReadImage &out)
+    {
+        out.buf.clear(); out.data = nullptr; out.width = out.height = 0;
+        if (!t.id || t.width <= 0 || t.height <= 0) return false;
+        if (!ps2x::gfx::GsReadTextureRGBA8(t.id, t.width, t.height, out.buf)) return false;
+        out.data = out.buf.data(); out.width = t.width; out.height = t.height;
+        return true;
+    }
+    static void gsFlipVertical(GsReadImage &im)
+    {
+        if (!im.data || im.width <= 0 || im.height <= 0) return;
+        const size_t row = (size_t)im.width * 4u;
+        std::vector<unsigned char> tmp(row);
+        for (int y = 0; y < im.height / 2; ++y)
+        {
+            unsigned char *a = im.data + (size_t)y * row;
+            unsigned char *b = im.data + (size_t)(im.height - 1 - y) * row;
+            std::memcpy(tmp.data(), a, row); std::memcpy(a, b, row); std::memcpy(b, tmp.data(), row);
+        }
+    }
+    static bool gsExportImage(const GsReadImage &im, const char *path)
+    { return im.data ? ps2x::gfx::GsWritePngRGBA8(path, im.data, im.width, im.height) : false; }
+    static void gsUnloadImage(GsReadImage &im) { im.buf.clear(); im.data = nullptr; im.width = im.height = 0; }
+    // Overloads for CPU-side raylib Images (GenImageColor etc.) that the same call sites also use;
+    // those stay on raylib until the A4.3 CPU-image pass.
+    static bool gsExportImage(const Image &im, const char *path) { return ExportImage(im, path); }
+    static void gsUnloadImage(Image &im) { UnloadImage(im); }
+    static void gsFlipVertical(Image &im) { ImageFlipVertical(&im); }
+    static Color gsImageColor(const Image &im, int x, int y) { return GetImageColor(im, x, y); }
+    static Color gsImageColor(const GsReadImage &im, int x, int y)
+    {
+        Color c{0, 0, 0, 0};
+        if (im.data && x >= 0 && y >= 0 && x < im.width && y < im.height)
+        { const unsigned char *p = im.data + ((size_t)y * im.width + x) * 4u; c.r = p[0]; c.g = p[1]; c.b = p[2]; c.a = p[3]; }
+        return c;
+    }
+
     // [A4] PNG dump through our own loader (replaces LoadImageFromTexture+[flip]+ExportImage+UnloadImage).
     static bool ps2xGfxDumpTexPng(const Texture2D &t, const char *path, bool flip = false)
     {
@@ -3074,11 +3120,11 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
                 g_gaViewTex[g_gaCur].texture.id != 0)
             {
                 flushBatch(__LINE__);
-                Image vi = LoadImageFromTexture(g_gaViewTex[g_gaCur].texture);
+                GsReadImage vi; gsReadImageFromTexture(g_gaViewTex[g_gaCur].texture, vi);
                 if (vi.data)
                 {
                     ps2xWritebackToVramMasked(336u, 8u, 0x02u, 512, 448, (const uint32_t *)vi.data, 0u);
-                    UnloadImage(vi);
+                    gsUnloadImage(vi);
                     static int n = 0;
                     if (n++ < 4) std::fprintf(stderr, "[gpualias] view->VRAM writeback (CT16-reader flush of f336)\n");
                 }
@@ -4388,7 +4434,7 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
     {
         if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); ps2x::gfx::GsUnloadTexture(s_tex); }
         Image im = GenImageColor(w, h, BLANK);
-        s_tex = ps2x::gfx::GsTexCreateFromImage(im); UnloadImage(im);
+        s_tex = ps2x::gfx::GsTexCreateFromImage(im); gsUnloadImage(im);
         s_tw = w; s_th = h;
     }
     UpdateTexture(s_tex, px.data());
@@ -4570,14 +4616,14 @@ double ps2xF224AlphaMean()
     auto it = g_fbos.find(224u);
     if (it == g_fbos.end() || it->second.rt.texture.id == 0) return -1.0;
     flushBatch(__LINE__);
-    Image img = LoadImageFromTexture(it->second.rt.texture);
+    GsReadImage img; gsReadImageFromTexture(it->second.rt.texture, img);
     const unsigned char *p = (const unsigned char *)img.data;
     double sum = 0.0; unsigned long n = 0;
     if (p && img.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
         for (int y = 0; y < img.height; y += 8)
             for (int x = 0; x < img.width; x += 8)
             { sum += p[((size_t)y * img.width + x) * 4 + 3]; ++n; }
-    UnloadImage(img);
+    gsUnloadImage(img);
     return n ? sum / (double)n : -1.0;
 }
 static void ps2xDbgCol0(const char *tag, int idx)
@@ -5017,7 +5063,7 @@ static Texture2D palTextureFor(uint64_t key)
                                         (unsigned char)((v >> 16) & 0xFF), (unsigned char)aUp});
     }
     Texture2D t = ps2x::gfx::GsTexCreateFromImage(im);
-    UnloadImage(im);
+    gsUnloadImage(im);
     SetTextureFilter(t, TEXTURE_FILTER_POINT);   // a LUT must never interpolate between entries
     rlTextureParameters(t.id, RL_TEXTURE_WRAP_S, RL_TEXTURE_WRAP_CLAMP);
     if (s_cache.size() > 256) s_cache.clear();
@@ -5596,22 +5642,22 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
             int uA = -9, uP = -9; glGetUniformiv(sh.id, locSrcA, &uA); glGetUniformiv(sh.id, locPal, &uP);
             std::fprintf(stderr, "[gpualias] samplers after set: uSrcA=%d uPal=%d (want 9/10) srcA.id=%u pal.id=%u palw=%d palh=%d\n",
                          uA, uP, srcA.id, pal.id, pal.width, pal.height);
-            Image pi = LoadImageFromTexture(pal);
+            GsReadImage pi; gsReadImageFromTexture(pal, pi);
             {   // body-region index histogram of the actual source
-                Image si = LoadImageFromTexture(srcA);
+                GsReadImage si; gsReadImageFromTexture(srcA, si);
                 int hist[256] = {0};
                 for (int y = 700; y < 1000 && y < si.height; y += 3)
                     for (int x = 150; x < 400 && x < si.width; x += 3)
-                    { Color pc2 = GetImageColor(si, x, y); ++hist[pc2.a]; }
-                UnloadImage(si);
+                    { Color pc2 = gsImageColor(si, x, y); ++hist[pc2.a]; }
+                gsUnloadImage(si);
                 std::fprintf(stderr, "[gpualias] f224 alpha hist (rows 700-1000):");
                 for (int i2 = 0; i2 < 256; ++i2) if (hist[i2] > 40) std::fprintf(stderr, " %d:%d", i2, hist[i2]);
                 std::fprintf(stderr, "\n");
             }
             for (int ix = 0; ix < 256; ix += (ix < 16 ? 1 : 16))
-            { Color pc = GetImageColor(pi, ix % (pi.width > 0 ? pi.width : 1), ix / (pi.width > 0 ? pi.width : 1));
+            { Color pc = gsImageColor(pi, ix % (pi.width > 0 ? pi.width : 1), ix / (pi.width > 0 ? pi.width : 1));
               std::fprintf(stderr, "[gpualias] clut[%d] = %u,%u,%u,%u\n", ix, pc.r, pc.g, pc.b, pc.a); }
-            UnloadImage(pi);
+            gsUnloadImage(pi);
         }
     }
     DrawTexturePro(g_gaViewTex[g_gaCur].texture, Rectangle{0.0f, 0.0f, 512.0f, 448.0f},
@@ -7317,7 +7363,7 @@ void GsGpuRenderer::ensureGl(int w, int h)
     {
         Image wi = GenImageColor(1, 1, WHITE);
         g_white = ps2x::gfx::GsTexCreateFromImage(wi);
-        UnloadImage(wi);
+        gsUnloadImage(wi);
         g_whiteInit = true;
     }
     if (!g_shaderInit)
@@ -8288,7 +8334,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                         for (size_t vp = 3; vp < vis.size(); vp += 4) vis[vp] = 255u;
                         Image vimg = img;
                         vimg.data = vis.data();
-                        ExportImage(vimg, path);
+                        gsExportImage(vimg, path);
                     }
                 }
             }
@@ -8304,13 +8350,13 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     double cpuSum = 0; size_t cn = 0;
                     for (size_t i = 0; i + 2 < u.rgba.size(); i += 64) { cpuSum += u.rgba[i] + u.rgba[i+1] + u.rgba[i+2]; ++cn; }
                     const double cpuMean = cn ? cpuSum / (cn * 3.0) : 0.0;
-                    Image gi = LoadImageFromTexture(g_glTex[u.key]);
+                    GsReadImage gi; gsReadImageFromTexture(g_glTex[u.key], gi);
                     double glSum = 0; size_t gn = 0;
                     const uint8_t *gp = static_cast<const uint8_t *>(gi.data);
                     const size_t gbytes = static_cast<size_t>(gi.width) * gi.height * 4u;
                     if (gp) for (size_t i = 0; i + 2 < gbytes; i += 64) { glSum += gp[i] + gp[i+1] + gp[i+2]; ++gn; }
                     const double glMean = gn ? glSum / (gn * 3.0) : -1.0;
-                    UnloadImage(gi);
+                    gsUnloadImage(gi);
                     std::fprintf(stderr, "[gltexchk] key=%llu %dx%d CPUmean=%.1f GLmean=%.1f%s\n",
                                  (unsigned long long)u.key, u.w, u.h, cpuMean, glMean,
                                  (cpuMean > 8.0 && glMean >= 0.0 && glMean < 2.0) ? "  <== GL BLACK, CPU has content!" : "");
@@ -10503,11 +10549,11 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         { const uint32_t v = buf[(size_t)y * w + x]; const unsigned char a = v >> 24;
                           ImageDrawPixel(&ia, x, y, Color{a, a, a, 255});
                           ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255}); }
-                        ImageFlipVertical(&ia); ImageFlipVertical(&ic);
+                        gsFlipVertical(ia); gsFlipVertical(ic);
                         char pa[200], pc[200];
                         std::snprintf(pa, sizeof pa, "/home/z3/Desktop/bt3/work/shots/dof_%s_alpha_fbp%u.png", tag, fbp);
                         std::snprintf(pc, sizeof pc, "/home/z3/Desktop/bt3/work/shots/dof_%s_rgb_fbp%u.png", tag, fbp);
-                        ExportImage(ia, pa); ExportImage(ic, pc); UnloadImage(ia); UnloadImage(ic);
+                        gsExportImage(ia, pa); gsExportImage(ic, pc); gsUnloadImage(ia); gsUnloadImage(ic);
                     }
                 };
                 if (!c.isTriangle && c.destFbp == 336u && c.srcTbp0 && (sf == 0u || sf == 112u) && g_publishGen != s_lastGen)
@@ -10770,7 +10816,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         {
                             if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); ps2x::gfx::GsUnloadTexture(s_tex); }
                             Image im = GenImageColor(ow, oh, BLANK);
-                            s_tex = ps2x::gfx::GsTexCreateFromImage(im); UnloadImage(im);
+                            s_tex = ps2x::gfx::GsTexCreateFromImage(im); gsUnloadImage(im);
                             s_tw = ow; s_th = oh;
                         }
                         UpdateTexture(s_tex, px.data());
@@ -11711,10 +11757,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         auto hit = g_fbos.find(336u);
                         if (hit != g_fbos.end() && hit->second.rt.texture.id != 0)
                         {
-                            Image im = LoadImageFromTexture(hit->second.rt.texture);
-                            ImageFlipVertical(&im);
+                            GsReadImage im; gsReadImageFromTexture(hit->second.rt.texture, im);
+                            gsFlipVertical(im);
                             char p[160]; std::snprintf(p, sizeof(p), "/home/z3/Desktop/bt3/work/hop336_%02d_ci%zu.png", s_snapN, ci);
-                            ExportImage(im, p); UnloadImage(im);
+                            gsExportImage(im, p); gsUnloadImage(im);
                             std::fprintf(stderr, "[hop336] snap %d at ci=%zu (leaving 336)\n", s_snapN, ci);
                         }
                         ++s_snapN;
@@ -11732,10 +11778,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                             {
                                 auto it2 = g_fbos.find(sfd);
                                 if (it2 == g_fbos.end() || it2->second.rt.texture.id == 0) continue;
-                                Image im = LoadImageFromTexture(it2->second.rt.texture);
-                                ImageFlipVertical(&im);
+                                GsReadImage im; gsReadImageFromTexture(it2->second.rt.texture, im);
+                                gsFlipVertical(im);
                                 char p[160]; std::snprintf(p, sizeof(p), "/home/z3/Desktop/bt3/work/hop336_srcfbp%u.png", sfd);
-                                ExportImage(im, p); UnloadImage(im);
+                                gsExportImage(im, p); gsUnloadImage(im);
                                 std::fprintf(stderr, "[hop336] src snapshot %s (%dx%d)\n", p, it2->second.w, it2->second.h);
                             }
                         }
@@ -12810,8 +12856,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     char p1[384], p2[384];
                     std::snprintf(p1, sizeof p1, "%s/tex_%d_%dx%d_rgb.png", s_tdd, (int)c.srcTbp0, tw, th);
                     std::snprintf(p2, sizeof p2, "%s/tex_%d_%dx%d_a.png", s_tdd, (int)c.srcTbp0, tw, th);
-                    ExportImage(ic, p1); ExportImage(ia, p2);
-                    UnloadImage(ic); UnloadImage(ia);
+                    gsExportImage(ic, p1); gsExportImage(ia, p2);
+                    gsUnloadImage(ic); gsUnloadImage(ia);
                     std::fprintf(stderr, "[texdump] tbp=%d %dx%d psm=%u tcc=%u -> %s (alpha!=0 %.1f%%)\n",
                                  (int)c.srcTbp0, tw, th, (unsigned)c.srcPsm, (unsigned)c.tcc, p1,
                                  100.0 * anz / ((double)tw * th));
@@ -12935,10 +12981,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                         { const unsigned char a = (unsigned char)((buf[(size_t)y*w+x] >> 24) & 0xFF);
                           ImageDrawPixel(&ia, x, y, Color{a,a,a,255}); }
-                        ImageFlipVertical(&ia);
+                        gsFlipVertical(ia);
                         char pth[160];
                         std::snprintf(pth, sizeof pth, "/home/z3/Desktop/bt3/work/shots/scenealpha_fbp%u.png", sfbp);
-                        ExportImage(ia, pth); UnloadImage(ia);
+                        gsExportImage(ia, pth); gsUnloadImage(ia);
                     }
                     if (g_fbos.count(224u)) { rlEnableFramebuffer(g_fbos[224u].rt.id); }
                 }
@@ -12986,9 +13032,9 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                         { const unsigned char a = (unsigned char)((buf[(size_t)y*w+x] >> 24) & 0xFF);
                           ImageDrawPixel(&ia, x, y, Color{a,a,a,255}); }
-                        ImageFlipVertical(&ia);
-                        ExportImage(ia, "/home/z3/Desktop/bt3/work/shots/maskafter_fbp224.png");
-                        UnloadImage(ia);
+                        gsFlipVertical(ia);
+                        gsExportImage(ia, "/home/z3/Desktop/bt3/work/shots/maskafter_fbp224.png");
+                        gsUnloadImage(ia);
                     }
                 }
             }
@@ -13074,9 +13120,9 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                             { const uint32_t v = buf[(size_t)y*w+x];
                               ImageDrawPixel(&im2, x, y, Color{(unsigned char)(v & 0xFF),
                                   (unsigned char)((v>>8)&0xFF), (unsigned char)((v>>16)&0xFF), 255}); }
-                            ImageFlipVertical(&im2);
-                            ExportImage(im2, "/home/z3/Desktop/bt3/work/shots/blur_write14.png");
-                            UnloadImage(im2);
+                            gsFlipVertical(im2);
+                            gsExportImage(im2, "/home/z3/Desktop/bt3/work/shots/blur_write14.png");
+                            gsUnloadImage(im2);
                         }
                         std::fprintf(stderr, "[blurseq] write #%d into fbp502 (src=%u): character-orange texels %lu/%d\n",
                                      n, c.srcTbp0, orange, w * h);
@@ -13111,9 +13157,9 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         { const uint32_t v = buf[(size_t)y*w+x];
                           ImageDrawPixel(&im, x, y, Color{(unsigned char)(v & 0xFF),
                               (unsigned char)((v>>8)&0xFF), (unsigned char)((v>>16)&0xFF), 255}); }
-                        ImageFlipVertical(&im);
-                        ExportImage(im, "/home/z3/Desktop/bt3/work/shots/scene_at_blur.png");
-                        UnloadImage(im);
+                        gsFlipVertical(im);
+                        gsExportImage(im, "/home/z3/Desktop/bt3/work/shots/scene_at_blur.png");
+                        gsUnloadImage(im);
                         std::fprintf(stderr, "[sceneat] blur reads fbp%u; dumped it %dx%d\n", sf2, w, h);
                     }
                 }
@@ -13147,9 +13193,9 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         { const uint32_t v = buf[(size_t)y*w+x];
                           ImageDrawPixel(&im, x, y, Color{(unsigned char)(v & 0xFF),
                               (unsigned char)((v>>8)&0xFF), (unsigned char)((v>>16)&0xFF), 255}); }
-                        ImageFlipVertical(&im);
-                        ExportImage(im, "/home/z3/Desktop/bt3/work/shots/blur_at_sample.png");
-                        UnloadImage(im);
+                        gsFlipVertical(im);
+                        gsExportImage(im, "/home/z3/Desktop/bt3/work/shots/blur_at_sample.png");
+                        gsUnloadImage(im);
                         extern unsigned long g_wr502, g_wr368, g_wr336;
                         std::fprintf(stderr, "[blurat] dumped fbp502 %dx%d at the first 16064 sample"
                                      " | writes so far this run: fbp336=%lu fbp368=%lu fbp502=%lu\n",
@@ -13217,11 +13263,11 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                             for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                             { const unsigned char a = (unsigned char)((buf[(size_t)y*w+x] >> 24) & 0xFF);
                               ImageDrawPixel(&ia, x, y, Color{a,a,a,255}); }
-                            ImageFlipVertical(&ia);
+                            gsFlipVertical(ia);
                             char pth[160];
                             std::snprintf(pth, sizeof pth,
                                           "/home/z3/Desktop/bt3/work/shots/maskmoment_fbp%u_%d.png", sf, done);
-                            ExportImage(ia, pth); UnloadImage(ia);
+                            gsExportImage(ia, pth); gsUnloadImage(ia);
                         }
                         std::fprintf(stderr, "[maskmoment] #%d scene fbp%u %dx%d  alpha!=0 %.1f%%  buckets:",
                                      done, sf, w, h, 100.0 * nz / tot);
@@ -13444,7 +13490,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                 std::snprintf(pth, sizeof pth,
                                               "/home/z3/Desktop/bt3/work/shots/outlinesrc%d_%dx%d.png",
                                               dumped, ti->second.w, ti->second.h);
-                                ExportImage(im, pth); UnloadImage(im);
+                                gsExportImage(im, pth); gsUnloadImage(im);
                                 std::fprintf(stderr, "[blob] dumped source #%d %dx%d -> %s\n",
                                              dumped, ti->second.w, ti->second.h, pth);
                                 ++dumped;
@@ -14751,7 +14797,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     { const unsigned char av = px3[((size_t)(h3 - 1 - y) * w3 + x) * 4 + 3];
                       ImageDrawPixel(&im3, x, y, Color{av, av, av, 255}); }
                     char nm3[128]; std::snprintf(nm3, sizeof nm3, "/home/z3/Desktop/bt3/work/dofmask_geo_f%u_%d.png", c.destFbp, ++s_pp);
-                    ExportImage(im3, nm3); UnloadImage(im3);
+                    gsExportImage(im3, nm3); gsUnloadImage(im3);
                     std::fprintf(stderr, "[dofad3] wrote %s\n", nm3);
                 }
             }
@@ -16148,7 +16194,7 @@ if (done.size() < 6 && !done.count(c.texKey))
                             {
 done.insert(c.texKey);
                                 flushBatch(__LINE__);
-                                Image im = LoadImageFromTexture(tex);
+                                GsReadImage im; gsReadImageFromTexture(tex, im);
                                 if (im.data && im.width >= 16)
                                 {
                                     const unsigned char *px = (const unsigned char *)im.data;
@@ -16171,7 +16217,7 @@ done.insert(c.texKey);
                                         int l = (q[0]+q[1]+q[2])/3; if (l > mx) mx = l; }
                                       std::fprintf(stderr, "%d\n", mx); }
                                 }
-                                UnloadImage(im);
+                                gsUnloadImage(im);
                             }
                         }
                     }
@@ -16216,7 +16262,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             {
                                 done.insert(c.texKey);
                                 flushBatch(__LINE__);
-                                Image im = LoadImageFromTexture(tex);
+                                GsReadImage im; gsReadImageFromTexture(tex, im);
                                 if (im.data)
                                 {
                                     const unsigned char *px = (const unsigned char *)im.data;
@@ -16232,7 +16278,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                         std::fprintf(stderr, " %u=%.1f%%", t2[i6].second, 100.0*(double)t2[i6].first/(double)n);
                                     std::fprintf(stderr, "\n");
                                 }
-                                UnloadImage(im);
+                                gsUnloadImage(im);
                             }
                         }
                     }
@@ -16323,7 +16369,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                     // and what alpha does the bound texture actually hold?
                                     if (tex.id != 0 && tex.id != g_white.id)
                                     {
-                                        Image im2 = LoadImageFromTexture(tex);
+                                        GsReadImage im2; gsReadImageFromTexture(tex, im2);
                                         if (im2.data)
                                         {
                                             const unsigned char *q2 = (const unsigned char *)im2.data;
@@ -16339,7 +16385,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                                 std::fprintf(stderr, " %u=%.1f%%", t4[i8].second, 100.0*(double)t4[i8].first/(double)nn);
                                             std::fprintf(stderr, "\n");
                                         }
-                                        UnloadImage(im2);
+                                        gsUnloadImage(im2);
                                     }
                                 }
                             }
@@ -16671,9 +16717,9 @@ if (done.size() < 14 && !done.count(c.texKey))
                 static std::unordered_set<uint64_t> s_done;
                 if (s_done.size() < 12 && !s_done.count(c.texKey) && tex.id != g_white.id) {
                     s_done.insert(c.texKey);
-                    Image im = LoadImageFromTexture(tex);
+                    GsReadImage im; gsReadImageFromTexture(tex, im);
                     char p[160]; std::snprintf(p, sizeof(p), "/home/z3/Desktop/bt3/work/dtex_src%u_%llu.png", c.srcTbp0, (unsigned long long)c.texKey);
-                    ExportImage(im, p); UnloadImage(im);
+                    gsExportImage(im, p); gsUnloadImage(im);
                     std::fprintf(stderr, "[dtex] exported %s (%dx%d)\n", p, tex.width, tex.height);
                 }
             }
@@ -16977,7 +17023,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         unsigned long mag = 0; for (uint32_t v : buf) { const unsigned r = v & 0xFF, g = (v >> 8) & 0xFF, b = (v >> 16) & 0xFF; if (r > 150 && b > 150 && g < 80) ++mag; }
                         Image ic = GenImageColor(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) { const uint32_t v = buf[(size_t)y * w + x]; ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255}); }
-                        ImageFlipVertical(&ic); char pc[200]; std::snprintf(pc, sizeof pc, "/home/z3/Desktop/bt3/work/shots/decal_after_fbp%u.png", s_afterDest); ExportImage(ic, pc); UnloadImage(ic);
+                        gsFlipVertical(ic); char pc[200]; std::snprintf(pc, sizeof pc, "/home/z3/Desktop/bt3/work/shots/decal_after_fbp%u.png", s_afterDest); gsExportImage(ic, pc); gsUnloadImage(ic);
                         std::fprintf(stderr, "[decaldump] after decal batch: dest fbp%u %dx%d magenta px %lu | next cmd: tri=%d spr=%d xfer=%d dest=%u srcPsm=%u srcTbp0=%u fbmsk=%08x vA=%u\n", s_afterDest, w, h, mag, (int)c.isTriangle, (int)(!c.isTriangle && !c.isTransfer), (int)c.isTransfer, c.destFbp, (unsigned)c.srcPsm, c.srcTbp0, c.fbmsk, (unsigned)(c.isTriangle ? c.tri[0].a : c.a));
                     }
                 }
@@ -17010,8 +17056,8 @@ if (done.size() < 14 && !done.count(c.texKey))
                                 ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255});
                                 const unsigned char a = v >> 24; ImageDrawPixel(&ia, x, y, Color{a, a, a, 255});
                             }
-                            char pb[200]; std::snprintf(pb, sizeof pb, "/home/z3/Desktop/bt3/work/shots/decal_rgb_fbp336_b%d.png", s_batch); ExportImage(ic, pb); ExportImage(ia, "/home/z3/Desktop/bt3/work/shots/decal_alpha_fbp336.png");
-                            UnloadImage(ic); UnloadImage(ia);
+                            char pb[200]; std::snprintf(pb, sizeof pb, "/home/z3/Desktop/bt3/work/shots/decal_rgb_fbp336_b%d.png", s_batch); gsExportImage(ic, pb); gsExportImage(ia, "/home/z3/Desktop/bt3/work/shots/decal_alpha_fbp336.png");
+                            gsUnloadImage(ic); gsUnloadImage(ia);
                             std::fprintf(stderr, "[decaldump] gen %u batch %d fbp336 %dx%d: 256x256 region nonzero RGB %lu px, nonzero A %lu px | piece xy (%.0f,%.0f) dest=%u\n", g_publishGen, s_batch, w, h, nz, nzA, c.tri[0].x, c.tri[0].y, c.destFbp);
                         }
                     }
@@ -19254,9 +19300,9 @@ if (done.size() < 14 && !done.count(c.texKey))
             {
                 static int s_sn = 0;
                 if (s_sn < 24) {
-                    Image img = LoadImageFromTexture(g_atlas.texture); ImageFlipVertical(&img);
+                    GsReadImage img; gsReadImageFromTexture(g_atlas.texture, img); gsFlipVertical(img);
                     char p[160]; std::snprintf(p, sizeof(p), "/home/z3/Desktop/bt3/work/seq_%02d.png", s_sn++);
-                    ExportImage(img, p); UnloadImage(img);
+                    gsExportImage(img, p); gsUnloadImage(img);
                     std::fprintf(stderr, "[atlasseq] %s f=%d displayFbp=%u cmds=%zu\n", p, s_fn, displayFbp, cmds.size());
                 }
             }
@@ -19366,7 +19412,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     auto fit = g_fbos.find((uint32_t)v);
                     if (fit == g_fbos.end() || fit->second.rt.texture.id == 0)
                     { std::fprintf(stderr, " f%lu=none", v); continue; }
-                    Image img = LoadImageFromTexture(fit->second.rt.texture);
+                    GsReadImage img; gsReadImageFromTexture(fit->second.rt.texture, img);
                     const unsigned char *px0 = (const unsigned char *)img.data;
                     unsigned long n = 0, nz = 0, na = 0; double sl = 0, sa = 0;
                     if (px0 && img.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
@@ -19410,15 +19456,15 @@ if (done.size() < 14 && !done.count(c.texKey))
                             for (size_t i = 0; i < (size_t)img.width * img.height; ++i)
                             { const unsigned char al8 = px0[i * 4 + 3];
                               dp[i*4+0] = dp[i*4+1] = dp[i*4+2] = al8; dp[i*4+3] = 255; }
-                            ImageFlipVertical(&a);
+                            gsFlipVertical(a);
                             char pth[256];
                             std::snprintf(pth, sizeof pth, "%s/alpha_f%lu_%04d.png", s_dd, v, s_tick);
-                            ExportImage(a, pth);
+                            gsExportImage(a, pth);
                             RL_FREE(a.data);
                         }
                         if (v == 224u) ++s_tick;
                     }
-                    UnloadImage(img);
+                    gsUnloadImage(img);
                 }
                 std::fprintf(stderr, "\n");
             }
@@ -19468,9 +19514,9 @@ if (done.size() < 14 && !done.count(c.texKey))
                 pt.height = th > 0 ? th : (m_presentTexH > 0 ? m_presentTexH : 448);
             }
             pt.mipmaps = 1; pt.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-            Image im = LoadImageFromTexture(pt);
+            GsReadImage im; gsReadImageFromTexture(pt, im);
             char p[128]; std::snprintf(p, sizeof(p), "/home/z3/Desktop/bt3/work/present_%02d.png", s_pn++);
-            ExportImage(im, p); UnloadImage(im);
+            gsExportImage(im, p); gsUnloadImage(im);
             std::fprintf(stderr, "[presentdump] %s outId=%u %dx%d srcXY=(%d,%d) dispWH=(%d,%d)\n",
                          p, outId, m_presentTexW, m_presentTexH, m_presentSrcX, m_presentSrcY, m_dispW, m_dispH);
         }
@@ -19492,9 +19538,9 @@ if (done.size() < 14 && !done.count(c.texKey))
         {
             Texture2D pt{}; pt.id = outId; pt.width = m_presentTexW; pt.height = m_presentTexH;
             pt.mipmaps = 1; pt.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-            Image pim = LoadImageFromTexture(pt);
+            GsReadImage pim; gsReadImageFromTexture(pt, pim);
             char pp[160]; std::snprintf(pp, sizeof(pp), "/home/z3/Desktop/bt3/work/forensic_g%u_present.png", frameGen);
-            ExportImage(pim, pp); UnloadImage(pim);
+            gsExportImage(pim, pp); gsUnloadImage(pim);
             std::fprintf(stderr, "[forensic] gen=%u cmds=%zu displayFbp=%u outId=%u hint=%u destAreas:", frameGen, cmds.size(), displayFbp, outId, m_hintDisplayFbp);
             for (auto &kv : destArea) std::fprintf(stderr, " f%u=%.0f%s", kv.first, kv.second, sourceFbps.count(kv.first) ? "(RT)" : "");
             std::fprintf(stderr, "\n");
@@ -19856,12 +19902,12 @@ if (done.size() < 14 && !done.count(c.texKey))
                                 ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF),
                                     (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255});
                             }
-                        ImageFlipVertical(&ia); ImageFlipVertical(&ic);
+                        gsFlipVertical(ia); gsFlipVertical(ic);
                         char pa[192], pc[192];
                         std::snprintf(pa, sizeof pa, "/home/z3/Desktop/bt3/work/shots/alpha_fbp%u.png", fbp);
                         std::snprintf(pc, sizeof pc, "/home/z3/Desktop/bt3/work/shots/rgb_fbp%u.png", fbp);
-                        ExportImage(ia, pa); ExportImage(ic, pc);
-                        UnloadImage(ia); UnloadImage(ic);
+                        gsExportImage(ia, pa); gsExportImage(ic, pc);
+                        gsUnloadImage(ia); gsUnloadImage(ic);
                         std::fprintf(stderr, "[alphadump] wrote alpha_fbp%u.png / rgb_fbp%u.png\n", fbp, fbp);
                     }
                 }
@@ -19906,14 +19952,14 @@ bool GsGpuRenderer::debugSavePresent(const char *path)
     }
     t.mipmaps = 1;
     t.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-    Image im = LoadImageFromTexture(t);
-    ImageFlipVertical(&im); // FBO textures are bottom-up
+    GsReadImage im; gsReadImageFromTexture(t, im);
+    gsFlipVertical(im); // FBO textures are bottom-up
     // Junk GS alpha makes the PNG look transparent -- force opaque for inspection.
     if (im.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 && im.data)
         for (int i = 0; i < im.width * im.height; ++i)
             ((unsigned char *)im.data)[i * 4 + 3] = 255;
-    const bool ok = ExportImage(im, path);
-    UnloadImage(im);
+    const bool ok = gsExportImage(im, path);
+    gsUnloadImage(im);
     return ok;
 }
 
@@ -20064,7 +20110,7 @@ bool GsGpuRenderer::d3dDumpPresent(const char *path)
     if (!ps2x::gfx::ReadbackRGBA(*dev, *t, buf)) return false;
     Image img(static_cast<void *>(buf.data()), (int)t->Width(), (int)t->Height(), 1,
               PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
-    return ExportImage(img, path);
+    return gsExportImage(img, path);
 #else
     (void)path; return false;
 #endif
