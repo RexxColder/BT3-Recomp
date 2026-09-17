@@ -4,6 +4,7 @@
 
 #define XXH_INLINE_ALL
 #include "thirdparty/xxhash.h"
+#include "gfx/image_io.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -210,6 +211,18 @@ namespace
     // (stb_image) -- safe on any thread, which is what the async worker relies on.
     bool decodeFile(const std::string &path, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt)
     {
+        // [A4.2] PNG/JPG/BMP/... decode with our own stb loader (thread-safe, no raylib state).
+        // DDS stays on raylib on purpose: raylib keeps BC data COMPRESSED (glCompressedTexImage2D),
+        // and stb cannot hand us compressed bytes -- decompressing the pack's 18,700 DXT5 files to
+        // RGBA8 would multiply its VRAM footprint. Fall back to raylib for anything stb cannot read.
+        const bool isDds = path.size() >= 4 &&
+            (path.compare(path.size() - 4, 4, ".dds") == 0 || path.compare(path.size() - 4, 4, ".DDS") == 0);
+        if (!isDds)
+        {
+            int lw = 0, lh = 0;
+            if (ps2x::gfx::GsDecodeImageRGBA8(path.c_str(), rgba, lw, lh) && lw > 0 && lh > 0)
+            { w = lw; h = lh; fmt = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8; return true; }
+        }
         Image img = LoadImage(path.c_str());
         if (img.data == nullptr || img.width <= 0 || img.height <= 0) { UnloadImage(img); return false; }
 
