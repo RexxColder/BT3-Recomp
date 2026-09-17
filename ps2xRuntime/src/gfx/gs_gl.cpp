@@ -68,7 +68,16 @@ namespace ps2x::gfx
     }
 
     bool GsGlEnabled()
-    { static const bool s = [](){ const char *v = std::getenv("PS2X_GSBACKEND"); return v && v[0] && v[0] != '0' && (v[0] == 'g' || v[0] == 'G'); }(); return s; }
+    {
+#if !defined(PS2X_USE_GSRL)
+        // [R1] dormant: the replay submits through the VENDORED raylib rlgl (original names), so this
+        // renamed-copy backend must stay off even if PS2X_GSBACKEND is set.
+        return false;
+#else
+        static const bool s = [](){ const char *v = std::getenv("PS2X_GSBACKEND"); return v && v[0] && v[0] != '0' && (v[0] == 'g' || v[0] == 'G'); }();
+        return s;
+#endif
+    }
 
     bool GsGlInit()
     {

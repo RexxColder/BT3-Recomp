@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.20)
 
 project(PS2Runtime VERSION 0.1.0 LANGUAGES CXX)
 
+# [R1] DORMANT experiment: route the GS replay through the renamed vendored rlgl copy (gsrl) instead of
+# the vendored raylib rlgl. OFF by default -- with raylib vendored 1:1 the replay already submits through
+# rlgl that lives in our tree, with a single GL state owner. Kept for A/B comparison.
+option(PS2X_USE_GSRL "Route the GS replay through the renamed gsrl copy (experiment)" OFF)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -66,69 +71,43 @@ else()
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
 
-    FetchContent_Declare(
-        raylib
-        GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
-        GIT_TAG "5.5" # we will migrate to 4.2.0 later, trust me it will be better
-        GIT_PROGRESS TRUE
-        # Without this, a fresh clone pulls raylib's whole history: 60794 objects, ~350 MiB, for
-        # a pinned tag we only ever build one revision of. Depth 1 fetches a fraction of that.
-        GIT_SHALLOW TRUE
-        # [ps2x raylib patch] batch multi-buffering (4 buffers), no per-flush texture/VAO/program unbinds,
-        # draw-call/flush counters + flush timer read by the fps line. Applied once at populate time;
-        # the reverse --check makes a re-populate of an already-patched source a no-op.
-        # NOTE: keep "--check" WITHOUT "--quiet": Ubuntu 22.04 ships git 2.34, where the
-        # combination exits 129 (usage error), so a patched source would fall through to the
-        # forward apply and fail. Verify with `git apply --reverse --check`.
-        # [ps2x raylib patch] NO PATCH_COMMAND here on purpose: it needed a shell (`git apply ... || git apply ...`),
-        # and the populate sub-build runs it WITHOUT one on Windows (MSBuild), where it exited -1 and failed the
-        # configure (2026-09-11). The self-heal block after FetchContent_MakeAvailable does the same work through
-        # CMake -- reverse-check, restore if an older patch is applied, forward-apply, fail loudly -- on every
-        # configure and on every platform, so the patch step here is redundant as well as broken.
-    )
-    FetchContent_MakeAvailable(raylib)
+    # [vendor] raylib is VENDORED 1:1 at third_party/raylib (see VENDORED.md): no FetchContent, no
+    # patch step (the copy already carries patches/raylib-5.5-ps2x.patch, and its config.h already has
+    # MAX_GAMEPADS=16) and no network at configure time. The target keeps the name `raylib` so every
+    # existing target_link_libraries(... raylib) and ${raylib_SOURCE_DIR} use keeps working.
+    set(raylib_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/raylib")
 
-    # [ps2x raylib patch] the PATCH_COMMAND above only runs when FetchContent populates the source. A build
-    # directory populated earlier either has no patch or an OLDER version of it, and a newer patch does not
-    # apply on top of an older one (2026-09-08: the vertex-ring patch failed to configure on every existing
-    # Windows build directory). Self-heal: if the current patch is neither applied nor applicable, restore
-    # the pristine 5.5 sources (git checkout -- .) and apply it fresh. Idempotent on every configure.
-    if(EXISTS "${raylib_SOURCE_DIR}/src/rlgl.h")
-        set(_rl_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch")
-        execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --reverse --check "${_rl_patch}"
-                        RESULT_VARIABLE _rl_patched OUTPUT_QUIET ERROR_QUIET)
-        if(NOT _rl_patched EQUAL 0)
-            execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --check --ignore-whitespace "${_rl_patch}"
-                            RESULT_VARIABLE _rl_applicable OUTPUT_QUIET ERROR_QUIET)
-            if(NOT _rl_applicable EQUAL 0)
-                message(STATUS "raylib ps2x patch: a previous patch version is applied in ${raylib_SOURCE_DIR}; restoring the pristine sources")
-                execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" checkout -- . RESULT_VARIABLE _rl_reset)
-                if(NOT _rl_reset EQUAL 0)
-                    message(FATAL_ERROR "raylib ps2x patch: could not restore ${raylib_SOURCE_DIR} (git checkout -- . failed); delete build/_deps/raylib-* and reconfigure")
-                endif()
-            endif()
-            execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --ignore-whitespace "${_rl_patch}"
-                            RESULT_VARIABLE _rl_apply)
-            if(NOT _rl_apply EQUAL 0)
-                message(FATAL_ERROR "raylib ps2x patch failed to apply to ${raylib_SOURCE_DIR}; delete build/_deps/raylib-* and reconfigure")
-            endif()
-            message(STATUS "raylib ps2x patch applied to ${raylib_SOURCE_DIR}")
-        endif()
-    endif()
+    # Only what the runtime uses: rcore.c also carries rlgl's implementation (upstream 5.5 layout).
+    # rtext.c (fonts: DrawText/TextFormat/GetFontDefault, used by the overlay/UI) and raudio.c (the
+    # PS2X_HOSTAUDIO=raylib fallback) are needed as well; rmodels.c is the only module left out.
+    add_library(raylib STATIC
+        "${raylib_SOURCE_DIR}/src/rcore.c"
+        "${raylib_SOURCE_DIR}/src/rshapes.c"
+        "${raylib_SOURCE_DIR}/src/rtextures.c"
+        "${raylib_SOURCE_DIR}/src/rtext.c"
+        "${raylib_SOURCE_DIR}/src/raudio.c"
+        "${raylib_SOURCE_DIR}/src/utils.c")
+    target_include_directories(raylib PUBLIC
+        "${raylib_SOURCE_DIR}/src"
+        "${raylib_SOURCE_DIR}/src/external"
+        "${raylib_SOURCE_DIR}/src/external/glfw/include")
+    target_compile_definitions(raylib PUBLIC PLATFORM_DESKTOP GRAPHICS_API_OPENGL_33)
 
-    # raylib defaults to MAX_GAMEPADS=4, and on Linux those four slots are not necessarily
-    # controllers: udev sets ID_INPUT_JOYSTICK=1 on plenty of things that are not, notably
-    # keyboards exposing System Control / Consumer Control HID pages. The patch above sets 16;
-    # this rewrite is the belt to that brace for a source tree the patch did not touch.
-    # NOTE: a -DMAX_GAMEPADS=16 compile definition does NOT work. rcore.c includes raylib's
-    # own config.h (whenever EXTERNAL_CONFIG_FLAGS is undefined, which is our case) and that
-    # header redefines MAX_GAMEPADS unconditionally, so it silently wins -- and -w hides the
-    # macro-redefinition warning that would have said so. Patch the fetched header instead.
-    if(EXISTS "${raylib_SOURCE_DIR}/src/config.h")
-        file(READ "${raylib_SOURCE_DIR}/src/config.h" _rl_cfg)
-        string(REGEX REPLACE "#define[ \t]+MAX_GAMEPADS[ \t]+4"
-                             "#define MAX_GAMEPADS                   16" _rl_cfg "${_rl_cfg}")
-        file(WRITE "${raylib_SOURCE_DIR}/src/config.h" "${_rl_cfg}")
+    # GLFW ships inside the vendored tree: build it exactly like upstream raylib does (object library,
+    # no docs/tests/examples/install) and fold its objects into the raylib target.
+    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+    set(GLFW_LIBRARY_TYPE "OBJECT" CACHE STRING "" FORCE)
+    add_subdirectory("${raylib_SOURCE_DIR}/src/external/glfw" "${CMAKE_BINARY_DIR}/vendored-glfw")
+    target_sources(raylib PRIVATE $<TARGET_OBJECTS:glfw>)
+
+    if(WIN32)
+        target_link_libraries(raylib PUBLIC opengl32 winmm)
+    else()
+        find_package(OpenGL REQUIRED)
+        target_link_libraries(raylib PUBLIC OpenGL::GL ${CMAKE_DL_LIBS} pthread m)
     endif()
 
 
@@ -682,6 +661,10 @@ target_sources(ps2_runtime PRIVATE
     src/gfx/gs_gl.cpp
     src/gfx/image_io.cpp
     src/gfx/video_overlay.cpp)
+if(PS2X_USE_GSRL)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_USE_GSRL=1)
+    message(STATUS "[gsrl] experiment ON: the replay submits through the renamed vendored rlgl copy")
+endif()
 target_include_directories(ps2_runtime PRIVATE "${raylib_SOURCE_DIR}/src/external")   # [A4] stb_image(_write)
 if(WIN32)
     target_link_libraries(ps2_runtime PUBLIC opengl32)

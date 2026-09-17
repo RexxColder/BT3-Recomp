@@ -10,6 +10,11 @@
 
 #include "gfx/gl/gsrl.h"
 
+// [R1] DORMANT by default: with raylib vendored 1:1 the replay submits through the vendored rlgl with
+// its original names, which is one single GL state owner (no mirroring, no dual batches). Build with
+// -DPS2X_USE_GSRL=1 (CMake option PS2X_USE_GSRL) to route it through the renamed copy instead, for A/B.
+#if defined(PS2X_USE_GSRL)
+
 #define rlBegin                  gsrlBegin
 #define rlEnd                    gsrlEnd
 #define rlVertex2f               gsrlVertex2f
@@ -47,3 +52,6 @@
 #define rlSetFramebufferHeight   ps2x::gfx::gsrl::SetFramebufferHeight
 #define rlEnableFramebuffer      ps2x::gfx::gsrl::EnableFramebuffer
 #define rlDisableFramebuffer     ps2x::gfx::gsrl::DisableFramebuffer
+
+#endif   // PS2X_USE_GSRL
+
