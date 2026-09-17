@@ -20,7 +20,7 @@ image** — this repository contains no game code, assets, or media.
 - ~16 GB RAM and ~10 GB free disk for the build.
 - Linux packages: `cmake`, GCC or Clang with C++20, `python3`, `rsync`,
   `bsdtar` (libarchive) or `7z`, pkg-config, the FFmpeg development libraries,
-  and the X11/OpenGL development headers (raylib builds from source).
+  and the X11/OpenGL development headers (raylib is vendored in-tree and builds with the runtime).
 
   Debian/Ubuntu:
   ```sh

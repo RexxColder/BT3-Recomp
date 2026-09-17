@@ -89,6 +89,28 @@ Planned alternatives (to pick when we resume):
 2. Match rlgl's Z mapping (`z_ndc = 2z - 1`).
 3. Only then re-enable batching (flushing on every framebuffer bind).
 
+## Resolution (2026-09-17): raylib is vendored in-tree, GLFW is gone
+
+The endgame changed: instead of re-implementing rlgl/raylib piece by piece (A2/A3/A4/D), **raylib's
+source tree was vendored 1:1** into `ps2xRuntime/third_party/raylib/` and compiled by our own target
+(`VENDORED.md` documents the provenance: upstream 5.5, commit c1ab645, zlib, with
+`patches/raylib-5.5-ps2x.patch` already applied). raylib is no longer a dependency: no FetchContent,
+no patch step, no network. The vendored copy IS our code, and the replay keeps submitting through
+rlgl -- one single GL state owner, which is what the whole A3.2b saga was fighting for.
+
+What that retired:
+
+- **The renamed `gsrl` copy is dormant** behind `-DPS2X_USE_GSRL` (OFF). It is kept for A/B only.
+- **The hand-rolled `gfx::gl` batcher / `reframe`** was the wrong lever: re-implementations of rlgl
+  kept disagreeing with rlgl's cache (garbled overlay, 2x projection, title black bands, present in
+  the corner) and, once two live rlgl stacks coexisted, the AMD driver took an access violation.
+- **GLFW is gone** (phase B for the platform): raylib is built with `PLATFORM_DESKTOP_SDL`, so the
+  window/input/GL context come from the SDL2 we already fetch for gamepad/audio; `external/glfw/` was
+  pruned from the vendored tree and the pad fallback's GLFW side channel was replaced by raylib's API.
+- **A1.1 is complete** (`461ab6c`): the render-target contract (`GsRtInfo`/`GsRtSetLogical`) plus our
+  own sampleable-depth targets, so the default config (PS2X_DOFMASK=2) no longer builds FBOs with
+  raylib. `image_io`, `video_overlay` and the altGL present stay as they are.
+
 ## Stages (each keeps the game rendering and is A/B-able)
 
 Flag: `PS2X_GSBACKEND=gl` selects the gfx::gl replay backend; default stays rlgl until a stage is
@@ -97,14 +119,14 @@ verified.
 | Stage | Scope | Status |
 |-------|-------|--------|
 | A1 base | shared `gfx::gl` context (`gl_context`) + `GsTexture`/`GsRenderTarget` resources | done (`2b5b565`, `5a3c4dd`) |
-| A1.1 | convert the replay's render-target/texture call sites (`LoadRenderTexture` 24, `Begin/EndTextureMode` 22/21, `UpdateTexture` 11, `SetTextureFilter` 18, `DrawTexturePro` 12) to `GsRenderTarget`/`GsTexture` | in progress |
-| A2 | shaders: `LoadShader` / `BeginShaderMode` / `SetShaderValue*` (81) → `gfx::gl::Shader` by name | pending |
-| A3 | immediate-mode submit: `rlBegin/End` (13) + `rlVertex*` (58) + `rlTexCoord2f` (49) + `rlColor4ub` (16) + `rlSetTexture` (25) → `gfx::gl::Renderer` **with own batching** (the rlgl `vbring` patch is a perf feature; batching is not optional) | pending |
-| A4 | CPU/text: `LoadImageFromTexture`/`ExportImage`/`LoadImage` → own loader; `DrawText`/font | pending |
-| B | platform: SDL2 window + GL 3.3 core + swap + input + timing; delete `InitWindow` and every `CORE.Window`-dependent call | pending |
-| C | overlay: `imgui_impl_opengl3` + `imgui_impl_sdl2` (drop rlImGui) | pending |
-| D | FMV / utilities → `gfx::gl` + own file IO | pending |
-| E | remove `raylib` from `CMakeLists.txt` (and the `vbring` patch) | pending |
+| A1.1 | convert the replay's render-target/texture call sites (`LoadRenderTexture` 24, `Begin/EndTextureMode` 22/21, `UpdateTexture` 11, `SetTextureFilter` 18, `DrawTexturePro` 12) to `GsRenderTarget`/`GsTexture` | **done** (`a13f104`, `cf27b1d`, `9a1ab09`, `461ab6c`) |
+| A2 | shaders: `LoadShader` / `BeginShaderMode` / `SetShaderValue*` (81) → `gfx::gl::Shader` by name | moot: rlgl (vendored) is ours |
+| A3 | immediate-mode submit: `rlBegin/End` (13) + `rlVertex*` (58) + `rlTexCoord2f` (49) + `rlColor4ub` (16) + `rlSetTexture` (25) → `gfx::gl::Renderer` **with own batching** | moot: the vendored rlgl IS the submitter |
+| A4 | CPU/text: `LoadImageFromTexture`/`ExportImage`/`LoadImage` → own loader; `DrawText`/font | partial (`019eda7`, `7e5188a`, `132b23b`, `7de75f6`, `a23551b`) + vendored rtext |
+| B | platform: SDL2 window + GL 3.3 core + swap + input + timing; delete `InitWindow` and every `CORE.Window`-dependent call | **done for the platform** (raylib runs on `PLATFORM_DESKTOP_SDL`, GLFW removed); a fully raylib-free window is still open |
+| C | overlay: `imgui_impl_opengl3` + `imgui_impl_sdl2` (drop rlImGui) | GL backend done (default with `PS2X_ALTGL=1`); SDL2 backend pending |
+| D | FMV / utilities → `gfx::gl` + own file IO | FMV override done (`8d993f4`, `4d2ba17`, `4058802`, `1df14ce`) |
+| E | remove `raylib` from `CMakeLists.txt` (and the `vbring` patch) | **done differently**: raylib is a local target over the vendored 1:1 tree (`a10cbcd`) |
 
 ## Guardrails learned this session
 

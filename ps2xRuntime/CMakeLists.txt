@@ -89,19 +89,11 @@ else()
         "${raylib_SOURCE_DIR}/src/utils.c")
     target_include_directories(raylib PUBLIC
         "${raylib_SOURCE_DIR}/src"
-        "${raylib_SOURCE_DIR}/src/external"
-        "${raylib_SOURCE_DIR}/src/external/glfw/include")
-    target_compile_definitions(raylib PUBLIC PLATFORM_DESKTOP GRAPHICS_API_OPENGL_33)
-
-    # GLFW ships inside the vendored tree: build it exactly like upstream raylib does (object library,
-    # no docs/tests/examples/install) and fold its objects into the raylib target.
-    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
-    set(GLFW_LIBRARY_TYPE "OBJECT" CACHE STRING "" FORCE)
-    add_subdirectory("${raylib_SOURCE_DIR}/src/external/glfw" "${CMAKE_BINARY_DIR}/vendored-glfw")
-    target_sources(raylib PRIVATE $<TARGET_OBJECTS:glfw>)
+        "${raylib_SOURCE_DIR}/src/external")
+    # [B] The window/input/GL-context come from SDL2 (platforms/rcore_desktop_sdl.c), not GLFW: GLFW is
+    # gone from the build entirely. SDL2 is fetched and built further down for hostio; the window uses
+    # the same static build (linked after that block, see PS2X_SDL2_TARGET).
+    target_compile_definitions(raylib PUBLIC PLATFORM_DESKTOP_SDL GRAPHICS_API_OPENGL_33)
 
     if(WIN32)
         target_link_libraries(raylib PUBLIC opengl32 winmm)
@@ -199,6 +191,14 @@ else()
     else()
         message(STATUS "[hostio] SDL2 gamepad/audio backend: OFF (raylib only)")
     endif()
+endif()
+
+# [B] The vendored raylib takes its window/input/GL context from SDL2 (PLATFORM_DESKTOP_SDL), so the
+# platform needs SDL2 linked here -- after the fetch above, whose target name depends on how SDL2 was
+# built. raylib is linked against the same SDL2 the hostio backend uses.
+if(TARGET raylib AND DEFINED PS2X_SDL2_TARGET)
+    target_link_libraries(raylib PUBLIC ${PS2X_SDL2_TARGET})
+    message(STATUS "[B] raylib window backend: SDL2 (${PS2X_SDL2_TARGET})")
 endif()
 
 # [d3d11 probe] Native Direct3D 11 video on raylib's HWND, buildable on its own so the

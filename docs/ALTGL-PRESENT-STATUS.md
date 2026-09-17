@@ -1,5 +1,11 @@
 # altGL — standalone OpenGL layer and frame present (F3a)
 
+> **Status update (2026-09-17)**: raylib is now **vendored 1:1** in
+> `ps2xRuntime/third_party/raylib/` and compiled by a local target, so it is no longer a dependency;
+> the window/input/GL context come from **SDL2** (`PLATFORM_DESKTOP_SDL`, GLFW removed) and the
+> renamed `gsrl` copy is **dormant** (`-DPS2X_USE_GSRL`, OFF). The authoritative write-up is
+> `docs/ALTGL-RAYLIB-REMOVAL.md` (see "Resolution").
+
 Branch: `OpenGL-Test`. The goal is to replace raylib with our own OpenGL layer
 (`ps2x::gfx::gl`, mirroring `ps2x::gfx::d3d11`) so the GS renderer can be backend-agnostic.
 This document covers the first production slice: presenting the game frame through `gfx::gl`.

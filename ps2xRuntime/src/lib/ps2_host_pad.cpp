@@ -53,24 +53,15 @@ namespace ps2x_pad
         }
 
         // ---- raylib backend ---------------------------------------------------------------
-        // Everything raylib's own gamepad API gives us, plus the GLFW side channel for the two
-        // things it gets wrong: the joystick name (raylib's copy overflows its buffer) and
-        // "is this slot actually a controller" (raylib reports MAX_GAMEPAD_AXIS for every slot).
-#if !defined(PLATFORM_VITA)
-        extern "C" int glfwJoystickIsGamepad(int jid);
-        extern "C" const float *glfwGetJoystickAxes(int jid, int *count);
-        extern "C" const unsigned char *glfwGetJoystickButtons(int jid, int *count);
-        extern "C" const char *glfwGetJoystickName(int jid);
-#endif
-
+        // raylib's own gamepad API only. The GLFW side channel this used to read (joystick name and
+        // "is this slot actually a controller") is gone with the GLFW platform: raylib now takes its
+        // window/input from SDL2, which is also the default pad backend here.
         namespace rl
         {
             void init()
             {
 #if !defined(PLATFORM_VITA)
-                // Mappings in GLFW's button numbering (they would be WRONG for SDL, which counts
-                // buttons differently): the 8BitDo Ultimate is missing from GLFW's database, and
-                // the xone-driven Xbox pad counts from BTN_MISC (b48..).
+                // Mappings raylib/GLFW-style for the Linux evdev naming (unchanged).
                 SetGamepadMappings(
                     "03000000c82d00000631000014010000,8BitDo Ultimate Wireless,platform:Linux,"
                     "a:b0,b:b1,x:b2,y:b3,back:b6,start:b7,guide:b8,leftstick:b9,rightstick:b10,"
@@ -94,38 +85,14 @@ namespace ps2x_pad
                 static const bool s_all = envFlag("PS2X_PAD_ALLDEV");
                 if (s_all) // escape hatch if this ever rejects a legitimate pad
                     return true;
-                if (glfwJoystickIsGamepad(g))
-                    return true;
-                // Axes alone are not enough: a DualSense also publishes separate "Motion Sensors"
-                // and "Touchpad" joysticks that report 6 axes each. Buttons separate them -- those
-                // have 0 and 4, a real pad has 15-17, and the mislabelled keyboards have 1-2 axes.
-                int nAxes = 0, nButtons = 0;
-                glfwGetJoystickAxes(g, &nAxes);
-                glfwGetJoystickButtons(g, &nButtons);
-                return nAxes >= 4 && nButtons >= 8;
+                // Enough axes to be a pad rather than a mislabelled keyboard or a sensor node.
+                return GetGamepadAxisCount(g) >= 4;
 #endif
             }
 
-            const char *name(int g)
-            {
-#if !defined(PLATFORM_VITA)
-                if (IsGamepadAvailable(g))
-                    if (const char *n = glfwGetJoystickName(g))
-                        return n;
-#endif
-                return GetGamepadName(g);
-            }
+            const char *name(int g) { return GetGamepadName(g); }
 
-            int buttonCount(int g)
-            {
-#if !defined(PLATFORM_VITA)
-                int n = 0;
-                if (IsGamepadAvailable(g)) glfwGetJoystickButtons(g, &n);
-                return n;
-#else
-                return IsGamepadAvailable(g) ? 16 : 0;
-#endif
-            }
+            int buttonCount(int g) { return IsGamepadAvailable(g) ? 16 : 0; }   // raylib exposes no count
         } // namespace rl
 
         // ---- SDL2 backend -----------------------------------------------------------------

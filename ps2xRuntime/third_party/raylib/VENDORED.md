@@ -15,8 +15,21 @@ library (FetchContent, patch step and library target are gone from CMake).
 ## What is compiled
 
 `src/rcore.c` (it also contains rlgl's implementation, as in upstream 5.5 — `rlgl.c` does not exist
-in 5.5), `src/rshapes.c`, `src/rtextures.c`, `src/utils.c`. Nothing else — `rmodels.c`, `raudio.c`
-and `rtext.c` are unused by the runtime and are compiled out.
+in 5.5), `src/rshapes.c`, `src/rtextures.c`, `src/rtext.c`, `src/raudio.c` and `src/utils.c`.
+`rmodels.c` is the only module left out (unused).
 
-The files are kept byte-for-byte identical to upstream: any local special-case would live in our own
-code, never in this copy.
+## Local changes to this copy
+
+- **None in the code.** It is byte-for-byte upstream + the ps2x patch.
+
+## Pruned after the SDL2 switch (2026-09-17)
+
+The window/input/GL-context now come from SDL2 (`PLATFORM_DESKTOP_SDL`), so GLFW is not built and
+`src/external/glfw/` was deleted (2.86 MB). Also deleted, all unused by the compiled modules:
+`external/glad_gles2.h`, `external/m3d.h`, `external/par_shapes.h`, `external/cgltf.h`,
+`external/tinyobj_loader_c.h`, `external/vox_loader.h`, `external/RGFW.h`.
+
+`external/stb_perlin.h` was pruned by mistake and restored: `rtextures.c` includes it (noise
+textures). The authoritative keep-list is the set of `#include "external/..."` lines in the five
+compiled `.c` files.
+
