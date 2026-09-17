@@ -1566,7 +1566,18 @@ void bt3NoteSeBankHeader(uint32_t dst, const uint8_t *data, uint32_t size)
             // Anything else is a per-character bank (56 in every bank seen, but a character with
             // a different count must still land in 4 then 5 rather than be dropped).
             why = "per-character";
-            if (g_sePerChar < kSeSlots)
+            // [sebankaddr] A TRANSFORMATION re-uploads the fighter's voice bank mid-fight to the SAME
+            // header address its original bank used (SSJ Goku's bank at 0x129880 = base Goku's slot 4;
+            // seen 2026-09-17 in every replay). The group counter cannot know that and filed it as a
+            // third per-character bank -> slot 5 -> the OPPONENT spoke with P1's transformed voice.
+            // Within a fight the header address IS the identity of a per-character bank: reuse that slot.
+            slot = kSeSlots;
+            for (uint32_t k = 4u; k < kSeSlots; ++k)
+                if (!g_seSlot[k].hdr.empty() && g_seSlot[k].addr == dst) { slot = k; why = "per-character, same address = same fighter"; break; }
+            if (slot < kSeSlots)
+            {
+            }
+            else if (g_sePerChar < kSeSlots)
             {
                 slot = g_sePerChar++;   // 4, then 5
             }
