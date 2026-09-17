@@ -18499,7 +18499,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (depthOn) EMIT_V3(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
                 else EMIT_V2(TV[i].x + offX, TV[i].y + offY);
             }
-            if (gsgl) ps2x::gfx::GsGlEmit().End(); else rlEnd();
+            if (gsgl) { ps2x::gfx::GsGlEmit().End(); ps2x::gfx::GsGlFlush(); } else rlEnd();
             }   // [glhoist] end of the per-triangle emit
             {   // [decalbatch] consecutive shadow-decal pieces share every GL state and the same FBO texture: keep the
                 // texture bound so rlgl accumulates them in ONE draw entry (one glDrawArrays per run of pieces instead of
