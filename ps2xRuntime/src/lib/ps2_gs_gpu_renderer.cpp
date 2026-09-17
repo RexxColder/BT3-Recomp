@@ -30,6 +30,7 @@
 #include "raylib.h"
 #include "rlgl.h"
 #include "gfx/gs_rt.h"
+#include "gfx/gs_gl.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"   // [crtcdisp] GSRegisters (the CRTC registers are memory-mapped)
 
@@ -651,6 +652,7 @@ namespace
             }
         }
         rlDrawRenderBatchActive();
+        ps2x::gfx::GsGlFlush();   // [gsgl] flush our batcher too when PS2X_GSBACKEND=gl
     }
     struct FlushCensusDump
     {
@@ -7292,6 +7294,7 @@ void GsGpuRenderer::ensureGl(int w, int h)
             "  gl_Position = mvp * vec4(vertexPosition, 1.0);\n"
             "}\n";
         g_shader = LoadShaderFromMemory(kVertShader, kFragShader); // PS2-modulate FS
+        ps2x::gfx::GsGlInit();   // [gsgl] PS2X_GSBACKEND=gl: bring up the gfx::gl submit backend
         // Overbright factor: PS2 MODULATE is texel*vc/128, so the default is 255/128 (vertex
         // colors are passed at 0..255). PS2X_BRIGHT overrides it (diagnostic + brightness knob).
         float bright = 255.0f / 128.0f;
