@@ -1365,12 +1365,9 @@ namespace
     // [A4] Local stand-in for raylib's Image on the readback path: same surface the diagnostic
     // code uses (.data/.width/.height/.format) but backed by our own GL readback + PNG writer, so
     // LoadImageFromTexture/ExportImage/UnloadImage/ImageFlipVertical/GetImageColor leave the replay.
-    struct GsReadImage
-    {
-        std::vector<unsigned char> buf;
-        unsigned char *data = nullptr;
-        int width = 0, height = 0, format = 4 /*PIXELFORMAT_UNCOMPRESSED_R8G8B8A8*/;
-    };
+    // [A4.3] Same type backs the procedural CPU images (GsImageMake/GsImageSetPx) and the GL
+    // readbacks, so one set of helpers serves both.
+    using GsReadImage = ps2x::gfx::GsImage;
     static bool gsReadImageFromTexture(const Texture2D &t, GsReadImage &out)
     {
         out.buf.clear(); out.data = nullptr; out.width = out.height = 0;
@@ -4433,7 +4430,7 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
     if (s_tex.id == 0 || s_tw != w || s_th != h)
     {
         if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); ps2x::gfx::GsUnloadTexture(s_tex); }
-        Image im = GenImageColor(w, h, BLANK);
+        GsReadImage im = ps2x::gfx::GsImageMake(w, h, BLANK);
         s_tex = ps2x::gfx::GsTexCreateFromImage(im); gsUnloadImage(im);
         s_tw = w; s_th = h;
     }
@@ -5043,7 +5040,7 @@ static Texture2D palTextureFor(uint64_t key)
         if (p == g_clutPalettes.end()) return Texture2D{};
         pal = p->second;
     }
-    Image im = GenImageColor(256, 1, BLANK);
+    GsReadImage im = ps2x::gfx::GsImageMake(256, 1, BLANK);
     for (int i = 0; i < 256; ++i)
     {
         const uint32_t v = pal[i];
@@ -5059,7 +5056,7 @@ static Texture2D palTextureFor(uint64_t key)
         static const bool s_palRescale = [](){ const char *v2 = std::getenv("PS2X_PALRESCALE"); return v2 && v2[0] && v2[0] != '0'; }();
         const uint32_t aRaw = (v >> 24) & 0xFFu;
         const uint32_t aUp = s_palRescale ? std::min(aRaw * 255u / 128u, 255u) : aRaw;
-        ImageDrawPixel(&im, i, 0, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF),
+        ps2x::gfx::GsImageSetPx(im, i, 0, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF),
                                         (unsigned char)((v >> 16) & 0xFF), (unsigned char)aUp});
     }
     Texture2D t = ps2x::gfx::GsTexCreateFromImage(im);
@@ -7361,7 +7358,7 @@ void GsGpuRenderer::ensureGl(int w, int h)
     m_fboH = h;
     if (!g_whiteInit)
     {
-        Image wi = GenImageColor(1, 1, WHITE);
+        GsReadImage wi = ps2x::gfx::GsImageMake(1, 1, WHITE);
         g_white = ps2x::gfx::GsTexCreateFromImage(wi);
         gsUnloadImage(wi);
         g_whiteInit = true;
@@ -10544,11 +10541,11 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     std::fprintf(stderr, "\n");
                     if (true)
                     {
-                        Image ia = GenImageColor(w, h, BLACK), ic = GenImageColor(w, h, BLACK);
+                        GsReadImage ia = ps2x::gfx::GsImageMake(w, h, BLACK), ic = ps2x::gfx::GsImageMake(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                         { const uint32_t v = buf[(size_t)y * w + x]; const unsigned char a = v >> 24;
-                          ImageDrawPixel(&ia, x, y, Color{a, a, a, 255});
-                          ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255}); }
+                          ps2x::gfx::GsImageSetPx(ia, x, y, Color{a, a, a, 255});
+                          ps2x::gfx::GsImageSetPx(ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255}); }
                         gsFlipVertical(ia); gsFlipVertical(ic);
                         char pa[200], pc[200];
                         std::snprintf(pa, sizeof pa, "/home/z3/Desktop/bt3/work/shots/dof_%s_alpha_fbp%u.png", tag, fbp);
@@ -10815,7 +10812,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         if (s_tex.id == 0 || s_tw != ow || s_th != oh)
                         {
                             if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); ps2x::gfx::GsUnloadTexture(s_tex); }
-                            Image im = GenImageColor(ow, oh, BLANK);
+                            GsReadImage im = ps2x::gfx::GsImageMake(ow, oh, BLANK);
                             s_tex = ps2x::gfx::GsTexCreateFromImage(im); gsUnloadImage(im);
                             s_tw = ow; s_th = oh;
                         }
@@ -12844,13 +12841,13 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 {
                     s_tdDone.insert((int)c.srcTbp0);
                     const int tw = ti->second.w, th = ti->second.h;
-                    Image ic = GenImageColor(tw, th, BLACK), ia = GenImageColor(tw, th, BLACK);
+                    GsReadImage ic = ps2x::gfx::GsImageMake(tw, th, BLACK), ia = ps2x::gfx::GsImageMake(tw, th, BLACK);
                     unsigned long anz = 0; std::map<unsigned, unsigned long> ah;
                     for (int y = 0; y < th; ++y) for (int x = 0; x < tw; ++x)
                     {
                         const uint8_t *px = &ti->second.rgba[((size_t)y * tw + x) * 4];
-                        ImageDrawPixel(&ic, x, y, Color{px[0], px[1], px[2], 255});
-                        ImageDrawPixel(&ia, x, y, Color{px[3], px[3], px[3], 255});
+                        ps2x::gfx::GsImageSetPx(ic, x, y, Color{px[0], px[1], px[2], 255});
+                        ps2x::gfx::GsImageSetPx(ia, x, y, Color{px[3], px[3], px[3], 255});
                         if (px[3]) ++anz; ++ah[px[3] / 32];
                     }
                     char p1[384], p2[384];
@@ -12977,10 +12974,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                      sfbp, w, h, s_sa, nz, buf.size(), 100.0 * nz / (double)buf.size());
                         for (auto &kv : hist) std::fprintf(stderr, " %u:%lu", kv.first * 32, kv.second);
                         std::fprintf(stderr, "\n");
-                        Image ia = GenImageColor(w, h, BLACK);
+                        GsReadImage ia = ps2x::gfx::GsImageMake(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                         { const unsigned char a = (unsigned char)((buf[(size_t)y*w+x] >> 24) & 0xFF);
-                          ImageDrawPixel(&ia, x, y, Color{a,a,a,255}); }
+                          ps2x::gfx::GsImageSetPx(ia, x, y, Color{a,a,a,255}); }
                         gsFlipVertical(ia);
                         char pth[160];
                         std::snprintf(pth, sizeof pth, "/home/z3/Desktop/bt3/work/shots/scenealpha_fbp%u.png", sfbp);
@@ -13028,10 +13025,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         std::fprintf(stderr, "[maskafter] fbp224 alpha right after %d mask draws  buckets:", s_ma);
                         for (auto &kv : hist) std::fprintf(stderr, " %u:%lu", kv.first * 32, kv.second);
                         std::fprintf(stderr, "  (distinct buckets=%zu)\n", hist.size());
-                        Image ia = GenImageColor(w, h, BLACK);
+                        GsReadImage ia = ps2x::gfx::GsImageMake(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                         { const unsigned char a = (unsigned char)((buf[(size_t)y*w+x] >> 24) & 0xFF);
-                          ImageDrawPixel(&ia, x, y, Color{a,a,a,255}); }
+                          ps2x::gfx::GsImageSetPx(ia, x, y, Color{a,a,a,255}); }
                         gsFlipVertical(ia);
                         gsExportImage(ia, "/home/z3/Desktop/bt3/work/shots/maskafter_fbp224.png");
                         gsUnloadImage(ia);
@@ -13115,10 +13112,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         if (n == 14)
                         {   // dump the IMAGE too -- a colour threshold can disagree with the eye,
                             // and this probe and [blurat] currently contradict each other.
-                            Image im2 = GenImageColor(w, h, BLACK);
+                            GsReadImage im2 = ps2x::gfx::GsImageMake(w, h, BLACK);
                             for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                             { const uint32_t v = buf[(size_t)y*w+x];
-                              ImageDrawPixel(&im2, x, y, Color{(unsigned char)(v & 0xFF),
+                              ps2x::gfx::GsImageSetPx(im2, x, y, Color{(unsigned char)(v & 0xFF),
                                   (unsigned char)((v>>8)&0xFF), (unsigned char)((v>>16)&0xFF), 255}); }
                             gsFlipVertical(im2);
                             gsExportImage(im2, "/home/z3/Desktop/bt3/work/shots/blur_write14.png");
@@ -13152,10 +13149,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                         rlDisableFramebuffer();
-                        Image im = GenImageColor(w, h, BLACK);
+                        GsReadImage im = ps2x::gfx::GsImageMake(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                         { const uint32_t v = buf[(size_t)y*w+x];
-                          ImageDrawPixel(&im, x, y, Color{(unsigned char)(v & 0xFF),
+                          ps2x::gfx::GsImageSetPx(im, x, y, Color{(unsigned char)(v & 0xFF),
                               (unsigned char)((v>>8)&0xFF), (unsigned char)((v>>16)&0xFF), 255}); }
                         gsFlipVertical(im);
                         gsExportImage(im, "/home/z3/Desktop/bt3/work/shots/scene_at_blur.png");
@@ -13188,10 +13185,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                         rlDisableFramebuffer();
-                        Image im = GenImageColor(w, h, BLACK);
+                        GsReadImage im = ps2x::gfx::GsImageMake(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                         { const uint32_t v = buf[(size_t)y*w+x];
-                          ImageDrawPixel(&im, x, y, Color{(unsigned char)(v & 0xFF),
+                          ps2x::gfx::GsImageSetPx(im, x, y, Color{(unsigned char)(v & 0xFF),
                               (unsigned char)((v>>8)&0xFF), (unsigned char)((v>>16)&0xFF), 255}); }
                         gsFlipVertical(im);
                         gsExportImage(im, "/home/z3/Desktop/bt3/work/shots/blur_at_sample.png");
@@ -13259,10 +13256,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         { const unsigned a = (buf[(size_t)y*w+x] >> 24) & 0xFF; ++tot; if (a) ++nz; ++hist[a/32]; }
                         {   // dump the alpha channel so it can be LOOKED at -- a coverage
                             // percentage cannot say WHICH parts of the scene carry the mask.
-                            Image ia = GenImageColor(w, h, BLACK);
+                            GsReadImage ia = ps2x::gfx::GsImageMake(w, h, BLACK);
                             for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                             { const unsigned char a = (unsigned char)((buf[(size_t)y*w+x] >> 24) & 0xFF);
-                              ImageDrawPixel(&ia, x, y, Color{a,a,a,255}); }
+                              ps2x::gfx::GsImageSetPx(ia, x, y, Color{a,a,a,255}); }
                             gsFlipVertical(ia);
                             char pth[160];
                             std::snprintf(pth, sizeof pth,
@@ -13479,12 +13476,12 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                             if (ti != m_texCache.end() && ti->second.w > 0 && ti->second.h > 0
                                 && ti->second.rgba.size() >= (size_t)ti->second.w * ti->second.h * 4)
                             {
-                                Image im = GenImageColor(ti->second.w, ti->second.h, BLACK);
+                                GsReadImage im = ps2x::gfx::GsImageMake(ti->second.w, ti->second.h, BLACK);
                                 for (int y = 0; y < ti->second.h; ++y)
                                     for (int x = 0; x < ti->second.w; ++x)
                                     {
                                         const uint8_t *px = &ti->second.rgba[((size_t)y * ti->second.w + x) * 4];
-                                        ImageDrawPixel(&im, x, y, Color{px[0], px[1], px[2], 255});
+                                        ps2x::gfx::GsImageSetPx(im, x, y, Color{px[0], px[1], px[2], 255});
                                     }
                                 char pth[192];
                                 std::snprintf(pth, sizeof pth,
@@ -14792,10 +14789,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     glBindFramebuffer(0x8D40u, f3->second.rt.id);
                     glReadPixels(0, 0, w3, h3, 0x1908, 0x1401, px3.data());
                     glBindFramebuffer(0x8D40u, (unsigned)pf3);
-                    Image im3 = GenImageColor(w3, h3, BLACK);
+                    GsReadImage im3 = ps2x::gfx::GsImageMake(w3, h3, BLACK);
                     for (int y = 0; y < h3; ++y) for (int x = 0; x < w3; ++x)
                     { const unsigned char av = px3[((size_t)(h3 - 1 - y) * w3 + x) * 4 + 3];
-                      ImageDrawPixel(&im3, x, y, Color{av, av, av, 255}); }
+                      ps2x::gfx::GsImageSetPx(im3, x, y, Color{av, av, av, 255}); }
                     char nm3[128]; std::snprintf(nm3, sizeof nm3, "/home/z3/Desktop/bt3/work/dofmask_geo_f%u_%d.png", c.destFbp, ++s_pp);
                     gsExportImage(im3, nm3); gsUnloadImage(im3);
                     std::fprintf(stderr, "[dofad3] wrote %s\n", nm3);
@@ -17021,8 +17018,8 @@ if (done.size() < 14 && !done.count(c.texKey))
                         rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         unsigned long mag = 0; for (uint32_t v : buf) { const unsigned r = v & 0xFF, g = (v >> 8) & 0xFF, b = (v >> 16) & 0xFF; if (r > 150 && b > 150 && g < 80) ++mag; }
-                        Image ic = GenImageColor(w, h, BLACK);
-                        for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) { const uint32_t v = buf[(size_t)y * w + x]; ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255}); }
+                        GsReadImage ic = ps2x::gfx::GsImageMake(w, h, BLACK);
+                        for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) { const uint32_t v = buf[(size_t)y * w + x]; ps2x::gfx::GsImageSetPx(ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255}); }
                         gsFlipVertical(ic); char pc[200]; std::snprintf(pc, sizeof pc, "/home/z3/Desktop/bt3/work/shots/decal_after_fbp%u.png", s_afterDest); gsExportImage(ic, pc); gsUnloadImage(ic);
                         std::fprintf(stderr, "[decaldump] after decal batch: dest fbp%u %dx%d magenta px %lu | next cmd: tri=%d spr=%d xfer=%d dest=%u srcPsm=%u srcTbp0=%u fbmsk=%08x vA=%u\n", s_afterDest, w, h, mag, (int)c.isTriangle, (int)(!c.isTriangle && !c.isTransfer), (int)c.isTransfer, c.destFbp, (unsigned)c.srcPsm, c.srcTbp0, c.fbmsk, (unsigned)(c.isTriangle ? c.tri[0].a : c.a));
                     }
@@ -17048,13 +17045,13 @@ if (done.size() < 14 && !done.count(c.texKey))
                             glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                             curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                             unsigned long nz = 0, nzA = 0; const int cw = std::min(w, 256), chh = std::min(h, 256);
-                            Image ic = GenImageColor(cw, chh, BLACK), ia = GenImageColor(cw, chh, BLACK);
+                            GsReadImage ic = ps2x::gfx::GsImageMake(cw, chh, BLACK), ia = ps2x::gfx::GsImageMake(cw, chh, BLACK);
                             for (int y = 0; y < chh; ++y) for (int x = 0; x < cw; ++x)
                             {   // FBO rows are bottom-up: region row y is FBO row (h-1-y)
                                 const uint32_t v = buf[(size_t)(h - 1 - y) * w + x];
                                 if (v & 0x00FFFFFFu) ++nz; if (v >> 24) ++nzA;
-                                ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255});
-                                const unsigned char a = v >> 24; ImageDrawPixel(&ia, x, y, Color{a, a, a, 255});
+                                ps2x::gfx::GsImageSetPx(ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255});
+                                const unsigned char a = v >> 24; ps2x::gfx::GsImageSetPx(ia, x, y, Color{a, a, a, 255});
                             }
                             char pb[200]; std::snprintf(pb, sizeof pb, "/home/z3/Desktop/bt3/work/shots/decal_rgb_fbp336_b%d.png", s_batch); gsExportImage(ic, pb); gsExportImage(ia, "/home/z3/Desktop/bt3/work/shots/decal_alpha_fbp336.png");
                             gsUnloadImage(ic); gsUnloadImage(ia);
@@ -19891,15 +19888,15 @@ if (done.size() < 14 && !done.count(c.texKey))
                         std::fprintf(stderr, "[alphadump] fbp224 FBO absent -- not an arena frame, skipping dump\n");
                     if (s_dmp && (inFight || std::getenv("PS2X_DUMPANY")) && (++seen[fbp] % (std::getenv("PS2X_DUMPANY") ? 1 : 4)) == 0)
                     {
-                        Image ia = GenImageColor(w, h, BLACK);
-                        Image ic = GenImageColor(w, h, BLACK);
+                        GsReadImage ia = ps2x::gfx::GsImageMake(w, h, BLACK);
+                        GsReadImage ic = ps2x::gfx::GsImageMake(w, h, BLACK);
                         for (int y = 0; y < h; ++y)
                             for (int x = 0; x < w; ++x)
                             {
                                 const uint32_t v = buf[(size_t)y * w + x];
                                 const unsigned char a = (v >> 24) & 0xFF;
-                                ImageDrawPixel(&ia, x, y, Color{a, a, a, 255});
-                                ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF),
+                                ps2x::gfx::GsImageSetPx(ia, x, y, Color{a, a, a, 255});
+                                ps2x::gfx::GsImageSetPx(ic, x, y, Color{(unsigned char)(v & 0xFF),
                                     (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255});
                             }
                         gsFlipVertical(ia); gsFlipVertical(ic);

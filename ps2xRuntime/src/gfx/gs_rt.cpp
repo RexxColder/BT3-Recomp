@@ -3,6 +3,7 @@
 #include "gfx/gl_context.h"
 #include "gfx/gl/GlGfx.h"
 #include "gfx/gs_gl.h"
+#include "gfx/image_io.h"
 
 #include "raylib.h"
 #include "rlgl.h"   // A1: submit is still rlgl, so Begin/End mirror raylib's framebuffer+ortho recipe
@@ -134,6 +135,22 @@ namespace ps2x::gfx
         return t;
     }
 
+    // [A4.3] Upload a CPU-only GsImage (built by GsImageMake/GsImageSetPx) as an RGBA8 texture.
+    Texture2D GsTexCreateFromImage(const GsImage &img, bool linear)
+    {
+        Texture2D t{};
+        if (!gl::ContextReady() || !GsImageValid(img)) return t;
+        auto *tex = new gl::Texture();
+        if (tex->Create(gl::Device(), (uint32_t)img.width, (uint32_t)img.height, gl::Format::RGBA8, img.data))
+        {
+            tex->SetSampler(gl::Device(), linear ? gl::Filter::Linear : gl::Filter::Point, gl::Wrap::Clamp);
+            t.id = tex->GLTexture(); t.width = img.width; t.height = img.height;
+            t.mipmaps = 1; t.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            s_textures[t.id] = tex;
+        }
+        else { std::fprintf(stderr, "[altgl] GsTexCreateFromImage(GsImage %dx%d) failed\n", img.width, img.height); delete tex; }
+        return t;
+    }
     void GsUnloadTexture(Texture2D t)
     {
         auto it = s_textures.find(t.id);

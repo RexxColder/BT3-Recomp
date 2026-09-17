@@ -11,8 +11,30 @@
 #include <cstdio>
 #include <cstring>
 
+#include "raylib.h"   // only for the Color struct's fields
+
 namespace ps2x::gfx
 {
+    GsImage GsImageMake(int w, int h, const Color &c)
+    {
+        GsImage im;
+        if (w <= 0 || h <= 0) return im;
+        im.buf.assign((size_t)w * (size_t)h * 4u, 0);
+        for (size_t i = 0; i < im.buf.size(); i += 4)
+        { im.buf[i] = c.r; im.buf[i + 1] = c.g; im.buf[i + 2] = c.b; im.buf[i + 3] = c.a; }
+        im.data = im.buf.data(); im.width = w; im.height = h;
+        return im;
+    }
+
+    void GsImageSetPx(GsImage &im, int x, int y, const Color &c)
+    {
+        if (!im.data || x < 0 || y < 0 || x >= im.width || y >= im.height) return;
+        unsigned char *p = im.data + ((size_t)y * im.width + x) * 4u;
+        p[0] = c.r; p[1] = c.g; p[2] = c.b; p[3] = c.a;
+    }
+
+    bool GsImageValid(const GsImage &im) { return im.data != nullptr && im.width > 0 && im.height > 0; }
+
     bool GsDecodeImageRGBA8(const char *path, std::vector<uint8_t> &rgba, int &w, int &h)
     {
         FILE *f = std::fopen(path, "rb");

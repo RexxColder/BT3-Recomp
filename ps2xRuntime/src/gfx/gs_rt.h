@@ -22,6 +22,9 @@ namespace ps2x::gfx
     // A1.1b (textures): create a gfx::gl texture from an Image (copied + converted to RGBA8, so
     // borrowed pixel data is never touched) and return a raylib-shaped Texture2D handle.
     Texture2D GsTexCreateFromImage(const Image &img, bool linear = false);
+    // [A4.3] Same, for a CPU image built by our own helpers (GsImageMake/GsImageSetPx).
+    struct GsImage;
+    Texture2D GsTexCreateFromImage(const GsImage &img, bool linear = false);
     // Free a texture: our gfx::gl ones if tracked, otherwise raylib's own (font atlas, FMV...).
     void GsUnloadTexture(Texture2D t);
 }
