@@ -90,19 +90,32 @@ namespace ps2x::gfx
         return new GlVideoBlit();
     }
 
-    bool VideoOverlayDraw(VideoBlit *blit, const VideoFrame &f, int screenW, int screenH, bool stretch)
+    bool VideoOverlayPrepare(VideoBlit *blit, const VideoFrame &f)
     {
         if (!blit || !f.rgba || f.w <= 0 || f.h <= 0) return false;
         if (!blit->Ensure(f.w, f.h)) return false;
         blit->UploadFrame(f.rgba, f.gen);
+        return true;
+    }
+
+    void VideoOverlayDrawOnTop(VideoBlit *blit, int screenW, int screenH, int frameW, int frameH,
+                               float alpha, bool stretch)
+    {
+        if (!blit || frameW <= 0 || frameH <= 0) return;
         // Letterbox (preserve aspect) unless the caller stretched the window (widescreen).
         const float sw = (float)screenW, sh = (float)screenH;
         float dw, dh;
         if (stretch) { dw = sw; dh = sh; }
-        else { const float sc = std::min(sw / (float)f.w, sh / (float)f.h); dw = (float)f.w * sc; dh = (float)f.h * sc; }
+        else { const float sc = std::min(sw / (float)frameW, sh / (float)frameH); dw = (float)frameW * sc; dh = (float)frameH * sc; }
         const float x0 = (sw - dw) * 0.5f, y0 = (sh - dh) * 0.5f;
         if (auto *glBlit = dynamic_cast<GlVideoBlit *>(blit)) glBlit->SetScreen(screenW, screenH);
-        blit->Draw(x0, y0, x0 + dw, y0 + dh, f.alpha);
+        blit->Draw(x0, y0, x0 + dw, y0 + dh, alpha);
+    }
+
+    bool VideoOverlayDraw(VideoBlit *blit, const VideoFrame &f, int screenW, int screenH, bool stretch)
+    {
+        if (!VideoOverlayPrepare(blit, f)) return false;
+        VideoOverlayDrawOnTop(blit, screenW, screenH, f.w, f.h, f.alpha, stretch);
         return true;
     }
 }

@@ -6929,21 +6929,46 @@ void PS2Runtime::run()
         // native resolution. Drawn with raylib's default alpha blend; aspect = the source's (4:3)
         // or full-window when widescreen is active. The GS present blit is skipped while showing it.
         bool fmvDrew = false;
+#if defined(_WIN32)
+        // [B] Injected-video state for the AltGL path: prepared here, drawn ON TOP of the GS frame
+        // later in the present block (the injection must sit above the game's (black) FMV).
+        static ps2x::gfx::VideoBlit *s_fmvVb = nullptr;
+        static int s_fmvW = 0, s_fmvH = 0;
+        static float s_fmvAlpha = 1.0f;
+        static bool s_fmvOnTop = false;
+#endif
         {
             extern std::atomic<uint32_t> g_ps2MovieActive;   // [movsync]
             ps2x_fmv::FmvOverrideFrame of{};
             if (ps2x_fmv::tick(g_ps2MovieActive.load(std::memory_order_relaxed) != 0u, of))
             {
+                {   // [fmvdiag] decode vs draw: is the decoded frame carrying pixels?
+                    static int s_dbg = 0;
+                    if (s_dbg < 12)
+                    {
+                        ++s_dbg;
+                        unsigned int mx = 0;
+                        size_t nz = 0;
+                        const size_t n = (size_t)of.w * (size_t)of.h * 4u;
+                        if (of.rgba && n)
+                            for (size_t i = 0; i + 2 < n; i += 4u)
+                            {
+                                const unsigned m = (unsigned)std::max(of.rgba[i], (uint8_t)std::max(of.rgba[i + 1], of.rgba[i + 2]));
+                                if (m > mx) mx = m;
+                                if (m) ++nz;
+                            }
+                        std::fprintf(stderr, "[fmvdiag] %dx%d gen=%llu alpha=%.3f maxRGB=%u nz=%zu/%zu ptr=%p\n",
+                                     of.w, of.h, (unsigned long long)of.gen, of.alpha, mx, nz, n / 4u, (const void *)of.rgba);
+                    }
+                }
 #if defined(_WIN32)
-                // [B] AltGL path: draw the injected video through gfx::gl instead of raylib.
+                // [B] AltGL path: PREPARE the video now, draw it ON TOP of the GS frame below.
                 if (AltGlEnabled() && ps2x::gfx::gl::ContextReady())
                 {
-                    static ps2x::gfx::VideoBlit *s_vb = nullptr;
-                    if (!s_vb) s_vb = ps2x::gfx::CreateGlVideoBlit();
+                    if (!s_fmvVb) s_fmvVb = ps2x::gfx::CreateGlVideoBlit();
                     ps2x::gfx::VideoFrame vf{of.rgba, of.w, of.h, of.gen, of.alpha};
-                    if (ps2x::gfx::VideoOverlayDraw(s_vb, vf, (int)screenWidth, (int)screenHeight,
-                                                    PS2SettingsOverlay::isWidescreen() || wsTrigActive()))
-                        fmvDrew = true;
+                    if (ps2x::gfx::VideoOverlayPrepare(s_fmvVb, vf))
+                    { s_fmvW = of.w; s_fmvH = of.h; s_fmvAlpha = of.alpha; s_fmvOnTop = true; }
                 }
                 else
 #endif
@@ -7013,6 +7038,15 @@ void PS2Runtime::run()
             DrawTexturePro(presentTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         EndBlendMode();
         }
+#if defined(_WIN32)
+        // [B] Draw the injected video ON TOP of the frame we just presented.
+        if (s_fmvOnTop)
+        {
+            s_fmvOnTop = false;
+            ps2x::gfx::VideoOverlayDrawOnTop(s_fmvVb, (int)screenWidth, (int)screenHeight, s_fmvW, s_fmvH,
+                                             s_fmvAlpha, PS2SettingsOverlay::isWidescreen() || wsTrigActive());
+        }
+#endif
         { extern double g_fpBlit; g_fpBlit += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tBlit).count(); }
         {   // [presentlog] PS2X_PRESENTLOG=1: print every CHANGE of the present geometry (a 60 Hz alternation shows as a
             // stream of transitions; a static picture shows two lines total).

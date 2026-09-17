@@ -37,8 +37,13 @@ namespace ps2x::gfx
     // GL context is up.
     VideoBlit *CreateGlVideoBlit();
 
-    // Facade used by the runtime: draws one video frame with the given backend, or returns false
-    // when there is nothing to draw / no backend. Does nothing else (the caller keeps its own
-    // frame-generation cache).
+    // Facade used by the runtime.
+    //   Prepare(): upload the frame (no draw) so the caller can draw it LATER, on top of the
+    //     frame the game already presented (the injected video must sit above the (black) FMV).
+    //   DrawOnTop(): draw the last prepared frame over the window.
+    //   Draw(): Prepare + Draw in one call (kept for callers that draw immediately).
+    bool VideoOverlayPrepare(VideoBlit *blit, const VideoFrame &f);
+    void VideoOverlayDrawOnTop(VideoBlit *blit, int screenW, int screenH, int frameW, int frameH,
+                               float alpha, bool stretch);
     bool VideoOverlayDraw(VideoBlit *blit, const VideoFrame &f, int screenW, int screenH, bool stretch = false);
 }
