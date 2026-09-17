@@ -9169,6 +9169,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         curRealFbp = rf;
         ps2x::gfx::GsRtBegin(f.rt);
         if (f.scale > 1) rlScalef((float)f.scale, (float)f.scale, 1.0f);   // [rscale] native coords -> Nx pixels
+        ps2x::gfx::GsGlBeginTarget(f.rt.texture.width, f.rt.texture.height, (float)f.scale);   // [gsgl] match the modelview scale
         ++g_glEnterSeq[rf];   // [rtsnap]
         g_lastRenderedFboTex = f.rt.texture.id;   // [texbarrier] sampling this texture later needs a barrier
         if (g_lastSampledFboTex != 0 && g_lastSampledFboTex == f.rt.texture.id)
@@ -9178,8 +9179,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             if (s_hz == "barrier") { flushBatch(__LINE__); glBindTexture(0x0DE1, 0); ps2xTextureBarrier(); }
             else if (s_hz == "finish") { flushBatch(__LINE__); glFinish(); }
             else if (s_hz == "read") { flushBatch(__LINE__); uint32_t px = 0; glReadPixels(0, 0, 1, 1, 0x1908, 0x1401, &px); }
-            else if (s_hz == "rebind") { flushBatch(__LINE__); ps2x::gfx::GsRtEnd(); ps2x::gfx::GsRtBegin(f.rt);
-                                          if (f.scale > 1) rlScalef((float)f.scale, (float)f.scale, 1.0f); }
+        else if (s_hz == "rebind") { flushBatch(__LINE__); ps2x::gfx::GsRtEnd(); ps2x::gfx::GsRtBegin(f.rt);
+            if (f.scale > 1) rlScalef((float)f.scale, (float)f.scale, 1.0f);
+            ps2x::gfx::GsGlBeginTarget(f.rt.texture.width, f.rt.texture.height, (float)f.scale); }
         }
         // PS2X_FBO_CHECK: is this FBO actually complete? An incomplete big FBO would corrupt all
         // subsequent GL draws (the fbp224/336 poison). Logged once per fbp.
