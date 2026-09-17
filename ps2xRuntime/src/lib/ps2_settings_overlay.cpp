@@ -1981,9 +1981,10 @@ void PS2SettingsOverlay::drawNetplayTab()
                       bt == 2 ? " / " : "", (bt == 2 && dp >= 0 && dp < 3) ? dn[dp] : "",
                       (tl >= 0 && tl < 5) ? tn[tl] : "?"); }
         if (ps2NetAutoJump()) ImGui::TextUnformatted("Will jump to character select on connect.");
+        // [rollback] not shipped: the connected view says nothing about it unless a developer turned it on
+        // through the environment (then the line is true and worth seeing).
         if (ps2NetRollbackWindow()) ImGui::Text("Rollback window: %u frames%s", ps2NetRollbackWindow(),
                                                 ps2NetSyncPending() ? "   |   state sync in progress..." : (ps2NetSyncOn() ? "   |   state synced" : ""));
-        else ImGui::TextUnformatted("Lockstep (no rollback)");
         ImGui::Separator();
         if (ImGui::Button("Disconnect"))
             ps2NetDisconnect("overlay");
@@ -2000,22 +2001,13 @@ void PS2SettingsOverlay::drawNetplayTab()
     static int  s_time = 3;
     static int  s_dp = 0;          // DP Battle budget: 0 = 10 DP, 1 = 15, 2 = 20
     static bool s_jump = true;
-    static int  s_rollback = ps2NetRollbackSetting();   // [rollback] env default, 0 = lockstep
-    static bool s_sync = ps2NetSyncSetting();            // [statesync]
-    const bool syncLive = s_sync && s_rollback > 0;
+    // [rollback] The rollback window and state-sync controls are hidden until rollback ships (2026-09-17):
+    // netplay is lockstep. The environment defaults (PS2X_NETROLLBACK / state sync) still reach the
+    // connect calls below, so developers can keep testing without the UI advertising it.
+    static int  s_rollback = ps2NetRollbackSetting();
+    static bool s_sync = ps2NetSyncSetting();
     ImGui::Checkbox("Go to character select once connected", &s_jump);
-    if (syncLive) ImGui::TextDisabled("The HOST's choice applies to both. Both sides jump, then the host's state is synced into the joiner.");
-    else          ImGui::TextDisabled("The HOST's choice applies to both; the menus are hidden while it happens.");
-    ImGui::Separator();
-    ImGui::SliderInt("Rollback window (frames)", &s_rollback, 0, 30);
-    ImGui::TextDisabled("0 = lockstep (every frame waits for the peer's input). 4-8 = rollback: a missing input is");
-    ImGui::TextDisabled("predicted and the game rewinds when the real one differs. Needs PS2X_FIBERS=1.");
-    if (s_rollback > 0)
-    {
-        ImGui::Checkbox("Sync game state on connect", &s_sync);
-        ImGui::TextDisabled("The host sends its game state (40 MB) to the joiner, so both play the same match from");
-        ImGui::TextDisabled("wherever the host is. Connect while both are on the same screen (title or main menu).");
-    }
+    ImGui::TextDisabled("The HOST's choice applies to both; the menus are hidden while it happens.");
     ImGui::Separator();
     // Only Join uses the address: hosting binds the port and learns the peer from its first
     // packet, which is why only one side needs a reachable port.
