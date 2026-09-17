@@ -154,6 +154,10 @@ else()
         "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
     )
     target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
+    # [altGL] ImGui's OpenGL3 backend, so the overlay can render through gfx::gl / raw GL instead
+    # of rlImGui/rlgl (PS2X_UIGL=1). It brings its own GL loader, so it does not need rlgl.
+    target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp")
+    target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}/backends")
 
     # [d3d11] ImGui's Direct3D 11 backend, so the overlay can render through the native
     # video path instead of rlImGui/rlgl when PS2X_D3D11=1 is active.

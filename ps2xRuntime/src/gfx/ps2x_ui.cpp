@@ -4,10 +4,13 @@
 #include "gfx/d3d11/ui_d3d11.h"
 
 #include "raylib.h"
+#include "rlgl.h"
 #include "imgui.h"
 #include "rlImGui.h"
+#include "imgui_impl_opengl3.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace ps2x::gfx
 {
@@ -64,10 +67,18 @@ namespace ps2x::gfx
             io.AddKeyEvent(static_cast<ImGuiKey>(ImGuiKey_0 + k), IsKeyDown(KEY_ZERO + k) != 0);
     }
 
+    // [C] PS2X_UIGL=1 draws the overlay with imgui_impl_opengl3 (its own GL loader + its own font
+    // atlas texture) instead of rlImGui/rlgl, so the overlay stops depending on raylib's batcher.
+    // Input is fed by us (feedImGuiInput), the same way the D3D11 backend already does.
+    static bool UiGlEnabled()
+    { static const bool s = [](){ const char *v = std::getenv("PS2X_UIGL"); return v && v[0] && v[0] != '0'; }(); return s; }
+
     void UiSetup()
     {
         if (NativeVideo())
             UiD3D11Init(*VideoDevice());
+        else if (UiGlEnabled())
+            ImGui_ImplOpenGL3_Init("#version 330");
         else
             rlImGuiSetup(true);
     }
@@ -80,6 +91,12 @@ namespace ps2x::gfx
             feedImGuiInput();
             ImGui::NewFrame();
         }
+        else if (UiGlEnabled())
+        {
+            feedImGuiInput();
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui::NewFrame();
+        }
         else
         {
             rlImGuiBegin();
@@ -90,6 +107,21 @@ namespace ps2x::gfx
     {
         if (NativeVideo())
             UiD3D11Render();   // ImGui::Render() + ImGui_ImplDX11_RenderDrawData()
+        else if (UiGlEnabled())
+        {
+            // rlgl is still alive: flush the batch so our raw-GL overlay draws on top of it, then
+            // hand the state back through rlgl's own API (rlgl caches blend/program/texture and
+            // only re-applies what it thinks changed -- the same trap as the present).
+            rlDrawRenderBatchActive();
+            ImGui::Render();
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            rlEnableColorBlend();
+            rlSetBlendMode(RL_BLEND_ALPHA);
+            rlActiveTextureSlot(0);
+            rlDisableTexture();
+            rlDisableShader();
+            rlDrawRenderBatchActive();
+        }
         else
             rlImGuiEnd();
     }
@@ -98,6 +130,8 @@ namespace ps2x::gfx
     {
         if (NativeVideo())
             UiD3D11Shutdown();
+        else if (UiGlEnabled())
+            ImGui_ImplOpenGL3_Shutdown();
         else
             rlImGuiShutdown();
     }
@@ -110,6 +144,12 @@ namespace ps2x::gfx
         ImGui::End();
         if (NativeVideo())
             UiD3D11Render();   // ImGui::Render() + ImGui_ImplDX11_RenderDrawData()
+        else if (UiGlEnabled())
+        {
+            rlDrawRenderBatchActive();
+            ImGui::Render();
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        }
         else
             rlImGuiEnd();
         ImDrawData *dd = ImGui::GetDrawData();
