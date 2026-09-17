@@ -1133,16 +1133,14 @@ namespace
                                                       return v && v[0] && v[0] != '0'; }();   // [dofmask] the mask pass needs the sampleable depth ATTACHMENT (zTexBind stays ZTEX-gated)
             if (s_zTex || s_dofMaskAttach)
             {
-                RenderTexture2D t{};
-                t.id = rlLoadFramebuffer();
+                // [gsrt] Same semantics as the raylib branch this replaces, but on OUR targets: the
+                // colour FBO comes from gfx::gl and the SAMPLABLE depth texture is ours too, so the
+                // DEFAULT config (PS2X_DOFMASK=2) no longer needs raylib render targets. This is what
+                // made A1.1a cover only a subset of the FBOs.
+                RenderTexture2D t = ps2x::gfx::GsRtCreate(wA, hA, /*depth renderbuffer*/ false);
                 if (t.id != 0)
                 {
-                    rlEnableFramebuffer(t.id);
-                    t.texture.id = rlLoadTexture(nullptr, wA, hA, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1);
                     ps2xForgetTexId(t.texture.id);   // [filtercache]
-                    t.texture.width = wA; t.texture.height = hA; t.texture.mipmaps = 1;
-                    t.texture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-                    rlFramebufferAttach(t.id, t.texture.id, RL_ATTACHMENT_COLOR_CHANNEL0, RL_ATTACHMENT_TEXTURE2D, 0);
                     // false => a real depth TEXTURE, which can be sampled later. SHARED across
                     // FBOs so fbp0 and fbp112 see the same Z, as they do on hardware.
                     // The Z buffer is the SCENE's size and belongs only to the scene buffers.
@@ -1166,19 +1164,7 @@ namespace
                         // writeback recovers the raw integers.
                         static const bool s_d32f = [](){ const char *v = std::getenv("PS2X_D32F");
                                                          return v && v[0] && v[0] != '0'; }();   // opt-in: default-path parity for plain configs
-                        if (s_d32f)
-                        {
-                            unsigned int dt = 0;
-                            glGenTextures(1, &dt);
-                            glBindTexture(0x0DE1u /*GL_TEXTURE_2D*/, dt);
-                            glTexImage2D(0x0DE1u, 0, 0x8CAC /*GL_DEPTH_COMPONENT32F*/, dw, dh, 0,
-                                         0x1902u /*GL_DEPTH_COMPONENT*/, 0x1406u /*GL_FLOAT*/, nullptr);
-                            glTexParameteri(0x0DE1u, 0x2801u /*MIN_FILTER*/, 0x2600 /*NEAREST*/);
-                            glTexParameteri(0x0DE1u, 0x2800u /*MAG_FILTER*/, 0x2600);
-                            g_sharedDepthTex = dt;
-                        }
-                        else
-                            g_sharedDepthTex = rlLoadTextureDepth(dw, dh, false);
+                        g_sharedDepthTex = ps2x::gfx::GsRtCreateDepthTexture(dw, dh, s_d32f);
                         g_sharedDepthW = dw; g_sharedDepthH = dh;
                         std::fprintf(stderr, "[ztex] shared depth texture %u (%dx%d) fmt=%s\n", g_sharedDepthTex, dw, dh, s_d32f ? "D32F" : "D24");
                         for (uint32_t sfbp : {0u, 112u})
@@ -1186,8 +1172,7 @@ namespace
                             auto oit = g_fbos.find(sfbp);
                             if (oit != g_fbos.end() && oit->second.rt.id != 0 && oit->second.depthTex != 0)
                             {
-                                rlFramebufferAttach(oit->second.rt.id, g_sharedDepthTex,
-                                                    RL_ATTACHMENT_DEPTH, RL_ATTACHMENT_TEXTURE2D, 0);
+                                ps2x::gfx::GsRtAttachDepth(oit->second.rt.id, g_sharedDepthTex, dw, dh);
                                 oit->second.depthTex = g_sharedDepthTex;
                                 oit->second.rt.depth.id = g_sharedDepthTex;
                             }
@@ -1197,10 +1182,8 @@ namespace
                     {
                         t.depth.id = g_sharedDepthTex;
                         t.depth.width = g_sharedDepthW; t.depth.height = g_sharedDepthH; t.depth.mipmaps = 1;
-                        rlFramebufferAttach(t.id, t.depth.id, RL_ATTACHMENT_DEPTH, RL_ATTACHMENT_TEXTURE2D, 0);
+                        ps2x::gfx::GsRtAttachDepth(t.id, g_sharedDepthTex, g_sharedDepthW, g_sharedDepthH);
                     }
-                    rlActiveDrawBuffers(1);
-                    rlDisableFramebuffer();
                     f.depthTex = t.depth.id;
                 }
                 f.rt = t;
@@ -1227,6 +1210,7 @@ namespace
             else
                 f.rt = ps2x::gfx::GsRtCreate(wA, hA);
             f.w = w; f.h = h; f.scale = rsA;
+            ps2x::gfx::GsRtSetLogical(f.rt.id, w, h);   // [gsrt] emitter-space size for the framing contract
 #if defined(_WIN32)
             d3dFboEnsure(f, wA, hA);   // [d3d11] keep a native RT in step with the GL FBO
 #endif

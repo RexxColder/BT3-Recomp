@@ -66,6 +66,11 @@ namespace ps2x::gfx { namespace gl
         uint32_t Height() const;
         Texture &Color();
         unsigned GLFramebuffer() const;                    // GLuint
+        // [gsrt] Attach an EXTERNALLY owned depth TEXTURE (not a renderbuffer) as GL_DEPTH_ATTACHMENT.
+        // The GS needs a *sampleable* depth buffer (PS2X_ZTEX reads Z, PS2X_DOFMASK's mask pass needs
+        // the attachment), and it is shared by the scene FBOs, so the texture is created and owned
+        // outside (see GsRtCreateDepthTexture / GsRtAttachDepth).
+        void AttachDepthTexture(unsigned glDepthTex, uint32_t w, uint32_t h);
 
     public:
         struct Impl;

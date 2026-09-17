@@ -1,6 +1,7 @@
 #include "gfx/gs_rt.h"
 
 #include "gfx/gl_context.h"
+#include "gfx/gl/GlApi.h"
 #include "gfx/gl/GlGfx.h"
 #include "gfx/gs_gl.h"
 #include "gfx/image_io.h"
@@ -9,8 +10,10 @@
 #include "rlgl.h"   // A1: submit is still rlgl, so Begin/End mirror raylib's framebuffer+ortho recipe
 
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <unordered_map>
+#include <utility>
 
 namespace ps2x::gfx
 {
@@ -18,6 +21,8 @@ namespace ps2x::gfx
     {
         // FBO name -> owned gfx::gl render target. Keyed by the FBO id we publish in the handle.
         std::unordered_map<unsigned, std::unique_ptr<gl::RenderTarget>> s_targets;
+        // [gsrt] The published contract for each of our targets (see GsRtInfo in the header).
+        std::unordered_map<unsigned, GsRtDesc> s_desc;
     }
 
     RenderTexture2D GsRtCreate(int w, int h, bool depth)
@@ -41,7 +46,68 @@ namespace ps2x::gfx
         rt.texture.mipmaps = 1;
         rt.texture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
         s_targets[rt.id] = std::move(target);
+        // [gsrt] Publish the contract. Logical size defaults to the physical size and is corrected by
+        // GsRtSetLogical() the moment the caller knows the emitter-space size (w, h) vs the scaled one.
+        GsRtDesc d;
+        d.physW = w; d.physH = h; d.logicalW = w; d.logicalH = h; d.texId = rt.texture.id;
+        s_desc[rt.id] = d;
         return rt;
+    }
+
+    bool GsRtInfo(unsigned fboId, GsRtDesc &out)
+    {
+        auto it = s_desc.find(fboId);
+        if (it == s_desc.end()) return false;
+        out = it->second;
+        return true;
+    }
+
+    void GsRtSetLogical(unsigned fboId, int logicalW, int logicalH)
+    {
+        auto it = s_desc.find(fboId);
+        if (it == s_desc.end() || logicalW <= 0 || logicalH <= 0) return;
+        it->second.logicalW = logicalW;
+        it->second.logicalH = logicalH;
+        if (std::getenv("PS2X_GSRTLOG"))
+            std::fprintf(stderr, "[gsrt] fb=%u phys=%dx%d logical=%dx%d tex=%u\n", fboId,
+                         it->second.physW, it->second.physH, logicalW, logicalH, it->second.texId);
+    }
+
+    bool GsRtIsOurs(unsigned fboId) { return s_desc.find(fboId) != s_desc.end(); }
+
+    // [gsrt] Depth textures we hand out are owned here (never by raylib). They are shared and only
+    // rebuilt when the scene grows, so a small table is all we need to keep them alive.
+    namespace { std::unordered_map<unsigned, std::pair<int, int>> s_depthTexs; }
+
+    unsigned GsRtCreateDepthTexture(int w, int h, bool asFloat)
+    {
+        if (!gl::ContextReady() || w <= 0 || h <= 0) return 0;
+        unsigned id = 0;
+        ps2xgl::glGenTextures(1, &id);
+        if (!id) return 0;
+        ps2xgl::glBindTexture(ps2xgl::GL_TEXTURE_2D, id);
+        // Internal format MUST be a depth format; passing RGBA here (as a colour helper would) makes
+        // the attachment silently unusable for sampling. 0x8CAC = GL_DEPTH_COMPONENT32F (PS2X_D32F).
+        ps2xgl::glTexImage2D(ps2xgl::GL_TEXTURE_2D, 0,
+                             asFloat ? 0x8CAC : (int)ps2xgl::GL_DEPTH_COMPONENT24,
+                             w, h, 0, ps2xgl::GL_DEPTH_COMPONENT,
+                             asFloat ? ps2xgl::GL_FLOAT : ps2xgl::GL_UNSIGNED_INT, nullptr);
+        ps2xgl::glTexParameteri(ps2xgl::GL_TEXTURE_2D, 0x2801 /*MIN_FILTER*/, ps2xgl::GL_NEAREST);
+        ps2xgl::glTexParameteri(ps2xgl::GL_TEXTURE_2D, 0x2800 /*MAG_FILTER*/, ps2xgl::GL_NEAREST);
+        ps2xgl::glBindTexture(ps2xgl::GL_TEXTURE_2D, 0);
+        s_depthTexs[id] = {w, h};
+        if (std::getenv("PS2X_GSRTLOG"))
+            std::fprintf(stderr, "[gsrt] depth tex=%u %dx%d fmt=%s\n", id, w, h, asFloat ? "D32F" : "D24");
+        return id;
+    }
+
+    void GsRtAttachDepth(unsigned fboId, unsigned depthTex, int w, int h)
+    {
+        auto it = s_targets.find(fboId);
+        if (it == s_targets.end() || !depthTex) return;
+        it->second->AttachDepthTexture(depthTex, (uint32_t)w, (uint32_t)h);
+        auto d = s_desc.find(fboId);
+        if (d != s_desc.end()) d->second.depthTex = depthTex;
     }
 
     void GsRtUnload(RenderTexture2D &rt)
@@ -52,6 +118,7 @@ namespace ps2x::gfx
             it->second->Destroy();
             s_targets.erase(it);
         }
+        s_desc.erase(rt.id);
         rt = RenderTexture2D{};
     }
 

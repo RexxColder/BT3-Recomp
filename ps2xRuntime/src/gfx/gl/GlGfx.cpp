@@ -166,6 +166,21 @@ namespace ps2x::gfx { namespace gl
         r.dev = nullptr; r.w = r.h = 0;
     }
 
+    // [gsrt] Attach an externally owned depth TEXTURE as the depth attachment (see the header).
+    void RenderTarget::AttachDepthTexture(unsigned glDepthTex, uint32_t w, uint32_t h)
+    {
+        Impl &r = *m_impl;
+        if (!r.fbo || !glDepthTex) return;
+        (void)w; (void)h;
+        ps2xgl::glBindFramebuffer(ps2xgl::GL_FRAMEBUFFER, r.fbo);
+        ps2xgl::glFramebufferTexture2D(ps2xgl::GL_FRAMEBUFFER, ps2xgl::GL_DEPTH_ATTACHMENT,
+                                       ps2xgl::GL_TEXTURE_2D, glDepthTex, 0);
+        const GLenum st = ps2xgl::glCheckFramebufferStatus(ps2xgl::GL_FRAMEBUFFER);
+        ps2xgl::glBindFramebuffer(ps2xgl::GL_FRAMEBUFFER, 0);
+        if (st != ps2xgl::GL_FRAMEBUFFER_COMPLETE)
+            std::fprintf(stderr, "[gsrt] depth attach to fbo %u incomplete (0x%x)\n", r.fbo, (unsigned)st);
+    }
+
     void RenderTarget::Bind(GlDevice &dev)
     {
         Impl &r = *m_impl;
