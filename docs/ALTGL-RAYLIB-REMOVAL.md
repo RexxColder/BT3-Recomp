@@ -26,6 +26,35 @@ Chosen order is therefore **replay first, platform last**.
 works on Windows and Linux. raylib's `LoadImage` stays until stage A4, where it is implemented
 and disconnected.
 
+## Isolated problem: the gfx::gl replay backend (A3.2b, opt-in)
+
+`PS2X_GSBACKEND=gl` routes the main triangle emitter through `gfx::gl` and is **NOT stable yet**;
+the default rlgl path is unaffected (every entry point no-ops unless the env var is set).
+
+Symptom: the frame alternates between correct, zoomed/cropped and fully black, at any
+`render_scale`.
+
+What is already understood (with evidence):
+- **Fixed**: the rlImGui overlay appearing ~2x offset after boot. `GsRtEnd` restored only the
+  viewport; raylib's `EndTextureMode` calls `SetupViewport` (rcore.c:3537), which ALSO restores the
+  window **orthographic projection** (`rlOrtho(0,render.w,render.h,0,0,1)`) and the modelview.
+  Commit `14fdb72`.
+- **X/Y transform is equivalent**: rlgl's MVP is `rlScalef(N) x ortho(0,physW,physH,0,0,1)`, giving
+  `x_ndc = 2N.x/physW - 1`; our folded ortho over `physW/N` gives the same. So the zoom/crop does
+  not come from the formula but from **using the wrong target's framing at draw time**.
+- **Prime suspect**: the replay binds framebuffers with **raw `rlEnableFramebuffer` (58 sites)**
+  that never go through `GsRtBegin`, so our `mvp` stays that of the PREVIOUS target -> wrong scale
+  and offset for those draws.
+- **Z differs** (inert while depth is off): rlgl maps `z_ndc = -2z - 1`; ours maps `z_ndc = -z`.
+- Diagnostic: `[gsgl] target WxH scale=N -> logical ...` (first 60 framings) shows each FBO bound
+  both with the `GsRtBegin` default (scale 1) and with `beginFbp`'s real scale.
+
+Planned alternatives (to pick when we resume):
+1. Re-derive the framing at draw time from `GL_DRAW_FRAMEBUFFER_BINDING` + `GL_VIEWPORT` + the FBO
+   size map, so it no longer depends on where the FBO was bound.
+2. Match rlgl's Z mapping (`z_ndc = 2z - 1`).
+3. Only then re-enable batching (flushing on every framebuffer bind).
+
 ## Stages (each keeps the game rendering and is A/B-able)
 
 Flag: `PS2X_GSBACKEND=gl` selects the gfx::gl replay backend; default stays rlgl until a stage is
