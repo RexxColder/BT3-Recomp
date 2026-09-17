@@ -1362,12 +1362,23 @@ namespace
             else g_d3dGsSh.SetVec4(n, v[0], v[1], v[2], v[3]);
         }
     }
-    // [A4] PNG dump through our own loader (replaces LoadImageFromTexture+ExportImage+UnloadImage).
-    static bool ps2xGfxDumpTexPng(const Texture2D &t, const char *path)
+    // [A4] PNG dump through our own loader (replaces LoadImageFromTexture+[flip]+ExportImage+UnloadImage).
+    static bool ps2xGfxDumpTexPng(const Texture2D &t, const char *path, bool flip = false)
     {
         if (!t.id || t.width <= 0 || t.height <= 0 || !path) return false;
         std::vector<uint8_t> px;
         if (!ps2x::gfx::GsReadTextureRGBA8(t.id, t.width, t.height, px)) return false;
+        if (flip)
+        {
+            const size_t row = (size_t)t.width * 4u;
+            std::vector<uint8_t> tmp(row);
+            for (int y = 0; y < t.height / 2; ++y)
+            {
+                uint8_t *a = &px[(size_t)y * row];
+                uint8_t *b = &px[(size_t)(t.height - 1 - y) * row];
+                std::memcpy(tmp.data(), a, row); std::memcpy(a, b, row); std::memcpy(b, tmp.data(), row);
+            }
+        }
         return ps2x::gfx::GsWritePngRGBA8(path, px.data(), t.width, t.height);
     }
     static void d3dGsMirrorState(int rtW, int rtH)
@@ -17239,10 +17250,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                     auto fd = g_fbos.find((uint32_t)s_sw2);
                                     if (fd != g_fbos.end() && fd->second.rt.texture.id != 0)
                                     {
-                                        Image im = LoadImageFromTexture(fd->second.rt.texture);
-                                        ImageFlipVertical(&im);
-                                        ExportImage(im, "/home/z3/Desktop/bt3/work/ours_fbp336_midframe.png");
-                                        UnloadImage(im);
+                                        ps2xGfxDumpTexPng(fd->second.rt.texture, "/home/z3/Desktop/bt3/work/ours_fbp336_midframe.png", true);
                                         std::fprintf(stderr, "[sprwrite] mid-frame fbp%d dumped\n", s_sw2);
                                     }
                                 }
@@ -19285,20 +19293,14 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if (kv.second.rt.texture.id == 0) continue;
                     char path[160];
                     std::snprintf(path, sizeof(path), "/home/z3/Desktop/bt3/work/gpu_all_fbp%u.png", kv.first);
-                    Image img = LoadImageFromTexture(kv.second.rt.texture);
-                    ImageFlipVertical(&img);
-                    ExportImage(img, path);
-                    UnloadImage(img);
+                    ps2xGfxDumpTexPng(kv.second.rt.texture, path, true);
                     std::fprintf(stderr, "  [fbp-dump] fbp%u %dx%d\n", kv.first, kv.second.w, kv.second.h);
                 }
                 // Atlas mode: g_fbos is empty; dump the ONE atlas texture + log every slot rect so we
                 // can see which slot holds the fight, the HUD, and whether present crops the right one.
                 if (s_atlas && g_atlas.texture.id != 0)
                 {
-                    Image img = LoadImageFromTexture(g_atlas.texture);
-                    ImageFlipVertical(&img);
-                    ExportImage(img, "/home/z3/Desktop/bt3/work/gpu_atlas.png");
-                    UnloadImage(img);
+                    ps2xGfxDumpTexPng(g_atlas.texture, "/home/z3/Desktop/bt3/work/gpu_atlas.png", true);
                     std::fprintf(stderr, "  [atlas-dump] %dx%d displayFbp=%u presentSrc=(%d,%d) slots:", g_atlasW, g_atlasH, displayFbp, m_presentSrcX, m_presentSrcY);
                     for (auto &kv : g_atlasSlots) std::fprintf(stderr, " fbp%u=(%d,%d,%d,%d)", kv.first, kv.second.x, kv.second.y, kv.second.w, kv.second.h);
                     std::fprintf(stderr, "\n");
