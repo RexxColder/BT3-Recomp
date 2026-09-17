@@ -78,13 +78,22 @@ namespace ps2x::gfx
 
     void GsRtEnd()
     {
-        // Mirrors raylib's EndTextureMode (rcore.c:1110): restore the viewport to the render size
-        // and reset the modelview. raylib does NOT restore the projection here (BeginDrawing does
-        // it at frame start), so we match that.
+        // Replicates raylib's EndTextureMode (rcore.c:1110), which calls SetupViewport()
+        // (rcore.c:3537). SetupViewport does THREE things, not one:
+        //   rlViewport(window render size)  +  rlOrtho(window render size)  +  modelview identity.
+        // Restoring ONLY the viewport (as this used to) left rlgl's PROJECTION at the last FBO's
+        // ortho, so every later raylib draw (the rlImGui overlay, the present blit) was projected
+        // for a 512x448 / Nx FBO instead of the window -- the overlay appeared ~2x offset and the
+        // present landed off-screen on alternate frames (the black flicker).
         ps2x::gfx::GsGlFlush();   // [gsgl] our batch targets this FBO: drain before unbinding it
         rlDrawRenderBatchActive();
         rlDisableFramebuffer();
-        rlViewport(0, 0, GetRenderWidth(), GetRenderHeight());
+        const int rw = GetRenderWidth() > 0 ? GetRenderWidth() : 1;
+        const int rh = GetRenderHeight() > 0 ? GetRenderHeight() : 1;
+        rlViewport(0, 0, rw, rh);
+        rlMatrixMode(RL_PROJECTION);
+        rlLoadIdentity();
+        rlOrtho(0, rw, rh, 0, 0.0f, 1.0f);      // restore the WINDOW projection (was missing)
         rlMatrixMode(RL_MODELVIEW);
         rlLoadIdentity();
     }
