@@ -76,6 +76,12 @@ namespace ps2x::gfx
     void GsGlBeginTarget(int w, int h, float renderScale)
     {
         if (!g_ok || w <= 0 || h <= 0) return;
+        {   // [gsgl diag] the sequence of target framings: which FBO size + scale the emitters get.
+            static int n = 0;
+            if (n < 60) { ++n; std::fprintf(stderr, "[gsgl] target %dx%d scale=%.2f -> logical %.0fx%.0f\n",
+                                            w, h, renderScale, (float)w / (renderScale > 0.01f ? renderScale : 1.0f),
+                                            (float)h / (renderScale > 0.01f ? renderScale : 1.0f)); }
+        }
         gl::Renderer &r = gl::RendererRef();
         // rlgl's MVP is modelview * projection, where modelview carries rlScalef(N,N,1) and the
         // projection is the FBO ortho (0..w, h..0). Our Renderer takes a single ortho, so we fold
