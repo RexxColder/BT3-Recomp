@@ -28,6 +28,7 @@ extern "C"
 #include <vector>
 
 extern std::atomic<uint32_t> g_ps2ForceSkipFrames;   // [skipforce] defined in ps2_gs_gpu.cpp
+extern uint64_t g_fmvCapGen;                          // [fmvcapture] ps2_gs_gpu.cpp: native captured frames
 extern "C" const char *ps2xExeDirC();                 // main.cpp: resolved executable dir (honors PS2X_EXEDIR)
 
 namespace ps2x_fmv
@@ -53,8 +54,15 @@ namespace
     bool g_halted = false;   // [fmvoverride] stopped this session (safety/end): don't re-inject
     std::string g_path;
     double g_duration = 0.0;
+    double g_fps = 30000.0 / 1001.0;   // [videoclk] source frame rate (native-progress clock unit)
     double g_aspect = 4.0 / 3.0;
     std::chrono::steady_clock::time_point g_start;
+    // [videoclk] Native-anchored clock: while the game's own movie advances, the injected video is
+    // driven by the native frame counter (one source frame per native frame -> exact sync with the
+    // game's playback and its skip). If the native capture stalls, it free-runs on wall time.
+    uint64_t g_clockNative = 0;        // last g_fmvCapGen seen
+    double g_clockT = 0.0;             // presentation time (seconds) in the video timeline
+    std::chrono::steady_clock::time_point g_clockLast;
 
     Frame g_current;            // owned by the present (tick) thread only
     uint64_t g_gen = 0;
@@ -140,6 +148,11 @@ namespace
             std::lock_guard<std::mutex> lk(g_mx);
             if (cc->width > 0 && cc->height > 0) g_aspect = (double)cc->width / (double)cc->height;
             if (fmt->duration > 0) g_duration = (double)fmt->duration / (double)AV_TIME_BASE;
+            if (st->avg_frame_rate.num > 0 && st->avg_frame_rate.den > 0)
+                g_fps = (double)st->avg_frame_rate.num / (double)st->avg_frame_rate.den;
+            else if (st->r_frame_rate.num > 0 && st->r_frame_rate.den > 0)
+                g_fps = (double)st->r_frame_rate.num / (double)st->r_frame_rate.den;
+            if (g_fps < 1.0 || g_fps > 240.0) g_fps = 30000.0 / 1001.0;
             std::fprintf(stderr, "[fmvoverride] decoding %dx%d, dur=%.2fs, codec=%s\n",
                          cc->width, cc->height, g_duration, avcodec_get_name(st->codecpar->codec_id));
             // [fmvguard] Warn loudly when the clip is very unlikely to decode in software in this
@@ -190,6 +203,12 @@ namespace
             while (true)
             {
                 int rr = avcodec_receive_frame(cc, frm);
+                {   // [fmvdec] why no frames: the ffmpeg codes (EAGAIN = need more input).
+                    static int s_n = 0, s_fr = 0;
+                    if (rr == 0) ++s_fr;
+                    if (s_n < 30)
+                    { ++s_n; std::fprintf(stderr, "[fmvdec] recv=%d frames=%d readDone=%d\n", rr, s_fr, (int)readDone); }
+                }
                 if (rr == AVERROR(EAGAIN) || rr == AVERROR_EOF) break;
                 if (rr < 0) break;
                 gotFrame = true;
@@ -246,6 +265,9 @@ namespace
         g_aspect = 4.0 / 3.0;
         g_path = videoPath();
         g_start = std::chrono::steady_clock::now();
+        g_clockNative = (g_fmvCapGen > 0) ? (g_fmvCapGen - 1) : 0;   // force a fresh sync on first tick
+        g_clockT = 0.0;
+        g_clockLast = g_start;
         g_started = true;
         g_run.store(true, std::memory_order_relaxed);
         if (g_thread.joinable()) g_thread.join();
@@ -259,7 +281,25 @@ namespace
 
     void stopSession()
     {
-        const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+    const double el0 = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+    // [videoclk] Native-anchored clock (see the globals): native frames drive the timeline while
+    // the game's own movie advances; wall time covers a stalled capture.
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t nf = g_fmvCapGen;
+        const double dt = std::chrono::duration<double>(now - g_clockLast).count();
+        g_clockLast = now;
+        if (nf != g_clockNative) { g_clockNative = nf; g_clockT = (double)nf / g_fps; }
+        else g_clockT += (dt > 0.0 && dt < 0.5) ? dt : 0.0;
+        static auto s_lastLog = now;
+        if (std::chrono::duration<double>(now - s_lastLog).count() >= 5.0)
+        {
+            s_lastLog = now;
+            std::fprintf(stderr, "[videoclk] native=%llu t=%.2fs wall=%.2fs drift=%.3fs fps=%.3f\n",
+                         (unsigned long long)nf, g_clockT, el0, g_clockT - el0, g_fps);
+        }
+    }
+    const double el = g_clockT;
         std::fprintf(stderr, "[fmvoverride] VIDEO END at %.2fs (poked=%d) -> stopping injection\n",
                      el, g_skipPoked ? 1 : 0);
         {
