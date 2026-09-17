@@ -467,9 +467,11 @@ void PS2SettingsOverlay::toggleVisible()
     m_visible = !m_visible;
     ps2_stubs::PadConfig::setInputSuspended(m_visible);
     if (m_visible)
-    {
-        saveSettings();
         resetCaptureState();
+    else
+    {   // [noapply] closing = save (settings + per-action bindings)
+        saveSettings();
+        ps2_stubs::PadConfig::instance().save();
     }
 }
 
@@ -1036,15 +1038,13 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
         m_prevToggleCombo = comboDown;
     }
 
-    // Apply GPU/audio settings on change
+    // [noapply] Every change applies in full the moment it is made (this used to apply only volume /
+    // renderer / glow here and leave the rest to an Apply button, so some switches worked instantly and
+    // others waited). Settings are written to the ini when the overlay closes and at shutdown; the
+    // startup-only items (renderer, glow fix, OpenGL render scale) say so next to their controls.
     if (m_dirty)
     {
-        PS2AudioBackend::setMasterVolume(m_settings.masterVolume);
-        PS2AudioBackend::setMusicVolume(m_settings.musicVolume);
-        PS2AudioBackend::setSfxVolume(m_settings.sfxVolume);
-        m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);   // [renderer]
-        GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
-        GsGpuRenderer::setGlow(m_settings.glow);
+        applySettings();
         m_dirty = false;
     }
 
@@ -1196,22 +1196,7 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
                 ImGui::TextUnformatted(hint);
             }
 
-            ImGui::SameLine(ImGui::GetWindowWidth() - 170);
-            {
-                ScopedStyleColor c0(ImGuiCol_Button, dbz(0.15f, 0.30f, 0.55f));
-                ScopedStyleColor c1(ImGuiCol_ButtonHovered, dbz(0.20f, 0.40f, 0.70f));
-                ScopedStyleColor c2(ImGuiCol_ButtonActive, dbz(0.18f, 0.35f, 0.60f));
-                if (ImGui::Button("Apply", ImVec2(64, 0)))
-                    applySettings();
-            }
-            ImGui::SameLine();
-            {
-                ScopedStyleColor c0(ImGuiCol_Button, dbz(0.45f, 0.12f, 0.10f));
-                ScopedStyleColor c1(ImGuiCol_ButtonHovered, dbz(0.60f, 0.16f, 0.12f));
-                ScopedStyleColor c2(ImGuiCol_ButtonActive, dbz(0.50f, 0.14f, 0.11f));
-                if (ImGui::Button("Close", ImVec2(64, 0)))
-                    m_visible = false;
-            }
+            // [noapply] no Apply / Close buttons: changes apply as they are made, the hotkey closes and saves
         }
 
         // Bindings / Overlay-settings sub-window (opened from the Controllers tab).
@@ -1693,38 +1678,16 @@ void PS2SettingsOverlay::drawControllersTab()
     sectionHeader("GAMEPAD TEST");
     drawGamepadTestArea(curBtnDown, curAxis);
 
-    // --- Apply / Save / Reload buttons ---
+    // --- Reload (re-scan devices) ---
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-
-    const float totalW = 100.0f * 3 + 12 * 2;
-    ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x / 2.0f - totalW / 2.0f);
-
+    ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x / 2.0f - 50.0f);
     ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.30f, 0.30f, 0.36f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.40f, 0.40f, 0.46f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, dbz(0.35f, 0.35f, 0.40f));
-    if (ImGui::Button("Reload", ImVec2(100, 30)))
+    if (ImGui::Button("Reload devices", ImVec2(100, 30)))
         resetCaptureState();
-    ImGui::PopStyleColor(3);
-
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.15f, 0.30f, 0.55f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.20f, 0.40f, 0.70f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, dbz(0.18f, 0.35f, 0.60f));
-    if (ImGui::Button("Apply", ImVec2(100, 30)))
-        applySettings();
-    ImGui::PopStyleColor(3);
-
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.15f, 0.45f, 0.25f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.20f, 0.55f, 0.32f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, dbz(0.18f, 0.50f, 0.28f));
-    if (ImGui::Button("Save", ImVec2(100, 30)))
-    {
-        applySettings();
-        saveSettings();
-    }
     ImGui::PopStyleColor(3);
 
     ImGui::Spacing();
@@ -1945,23 +1908,14 @@ void PS2SettingsOverlay::drawBindingsPopup()
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(1.00f, 0.62f, 0.10f, 0.18f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, dbz(1.00f, 0.62f, 0.10f, 0.30f));
         if (ImGui::Button("Close", ImVec2(100, 30)))
+        {   // [noapply] closing the popup saves: settings + per-action bindings (pad.conf), so bindings
+            // edited here survive a restart and reach the Qt launcher's Bindings tab.
             m_showBindingsPopup = false;
-        ImGui::PopStyleColor(3);
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button, accent(0.85f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, accent());
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, gold());
-        ImGui::PushStyleColor(ImGuiCol_Text, dbz(0.05f, 0.03f, 0.01f));
-        if (ImGui::Button("Save", ImVec2(100, 30)))
-        {
             applySettings();
             saveSettings();
-            // [launcher] persist per-action bindings too (pad.conf), not just the
-            // overlay-side cfg: bindings edited here must survive a restart and be
-            // visible to the Qt launcher's Bindings tab.
             ps2_stubs::PadConfig::instance().save();
         }
-        ImGui::PopStyleColor(4);
+        ImGui::PopStyleColor(3);
 
         ImGui::EndPopup();
     }
