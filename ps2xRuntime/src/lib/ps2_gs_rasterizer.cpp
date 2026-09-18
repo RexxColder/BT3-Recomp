@@ -3672,8 +3672,7 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                     // is a visible bug.
                     int useScale = (subW > 0 && rw % subW == 0) ? rw / subW : 0;
                     const int sY = (texH > 0 && rh % texH == 0) ? rh / texH : 0;
-                    if (useScale <= 0 || useScale != sY)
-                    {
+                    if (useScale <= 0 || useScale != sY)                    {
                         static std::atomic<unsigned long> s_bad{0};
                         if (s_bad.fetch_add(1) < 5)
                             std::fprintf(stderr, "[texreplace] SKIP %s: %dx%d is not a "
@@ -3715,32 +3714,18 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                     // there is no decoder here. For a compressed one, keep the game's own
                     // texture: a native-resolution gauge is right, an upscaled one that
                     // breaks the health bar is not.
-                    bool usable = true;
                     if (gateAlpha && rfmt != 0)
-                    {   // [texreplace] The gate alpha must be rewritten byte by byte, but this payload
-                        // is compressed (a DDS). Decompress JUST this one -- character-select icons and
-                        // other rare gate-alpha art -- instead of leaving the game's texture in place,
-                        // which is what kept a handful of icons un-replaced.
-                        std::vector<uint8_t> dec; int dw = 0, dh = 0;
-                        bool ok = ps2tex::loadReplacementRgba(id, dec, dw, dh) && dw > 0 && dh > 0;
-                        if (ok)
-                        {
-                            const int nX = (subW > 0 && dw % subW == 0) ? dw / subW : 0;
-                            const int nY = (texH > 0 && dh % texH == 0) ? dh / texH : 0;
-                            if (nX > 0 && nX == nY) { rep = std::move(dec); rw = dw; rh = dh; rfmt = 0; useScale = nX; }
-                            else ok = false;
-                        }
-                        if (!ok)
-                        {
-                            static std::atomic<unsigned long> s_skip{0};
-                            if (s_skip.fetch_add(1) < 5)
-                                std::fprintf(stderr, "[texreplace] SKIP %s: alpha is a DATE gate and the "
-                                             "replacement could not be decompressed -- keeping the native decode\n",
-                                             id.name().c_str());
-                            usable = false;
-                        }
+                    {   // [texreplace] A BC payload cannot have its alpha rewritten byte by byte, so the
+                        // DATE-gate correction is impossible: keep the game's own texture (a native
+                        // gauge is right; an upscaled one that breaks the gate is not).
+                        // Decompressing these was tried and REVERTED: the art is a 16x pack upscale and
+                        // the zoomed character-select highlight then sampled garbage.
+                        static std::atomic<unsigned long> s_skip{0};
+                        if (s_skip.fetch_add(1) < 5)
+                            std::fprintf(stderr, "[texreplace] SKIP %s: alpha is a DATE gate and the "
+                                         "replacement is compressed (fmt %d) -- keeping the native decode\n",
+                                         id.name().c_str(), rfmt);
                     }
-                    if (!usable) { /* keep the native decode */ }
                     else {
                     if (gateAlpha)
                         for (size_t i = 3; i < rep.size(); i += 4)
