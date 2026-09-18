@@ -87,9 +87,11 @@ else()
         "${bt3gl_SOURCE_DIR}/src/rtext.c"
         "${bt3gl_SOURCE_DIR}/src/raudio.c"
         "${bt3gl_SOURCE_DIR}/src/utils.c")
-    target_include_directories(bt3gl PUBLIC
-        "${bt3gl_SOURCE_DIR}/src"
-        "${bt3gl_SOURCE_DIR}/src/external")
+    # ONLY src: the vendor's own includes are relative ("external/glad.h", "external/stb_image.h", ...)
+    # so they resolve on their own. Putting src/external on the include path makes the Windows-only
+    # external/dirent.h SHADOW the real <dirent.h> (angle includes search -I/-isystem dirs first) and the
+    # Linux build dies on its '#include <io.h>'. ps2_runtime adds that dir separately, for stb.
+    target_include_directories(bt3gl PUBLIC "${bt3gl_SOURCE_DIR}/src")
     # [B] The window/input/GL-context come from SDL2 (platforms/rcore_desktop_sdl.c), not GLFW: GLFW is
     # gone from the build entirely. SDL2 is fetched and built further down for hostio; the window uses
     # the same static build (linked after that block, see PS2X_SDL2_TARGET).
