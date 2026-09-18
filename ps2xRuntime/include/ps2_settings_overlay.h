@@ -18,16 +18,15 @@ public:
         float musicVolume = 1.0f;
         float sfxVolume = 1.0f;
         bool gpuRenderer = true;
-        // [renderer] 0 = OpenGL (our GS renderer), 1 = software rasterizer, 2 = paraLLEl-GS (Vulkan compute; only when
-        // the backend is built in), 3 = Direct3D 11 (native Windows present; retired PGS). gpuRenderer stays in sync
+        // [renderer] 0 = OpenGL (New: our own gfx::gl present), 1 = software rasterizer, 2 = paraLLEl-GS
+        // (Vulkan compute; only when the backend is built in), 3 = Direct3D 11 (native Windows present;
+        // RETIRED for now -- kept only so old settings can be migrated). gpuRenderer stays in sync
         // (renderer != 1) for the code that still reads it.
         static constexpr int kRendererOpenGL = 0, kRendererSoftware = 1, kRendererParallelGS = 2, kRendererD3D11 = 3;
-#if defined(_WIN32)
-        static constexpr int kRendererDefault = 3;   // [d3d11] native D3D11 is the default on Windows
-#elif defined(PS2X_HAVE_PGS)
-        static constexpr int kRendererDefault = 2;
+#if defined(PS2X_HAVE_PGS)
+        static constexpr int kRendererDefault = 2;   // [pgs] Vulkan compute backend
 #else
-        static constexpr int kRendererDefault = 0;
+        static constexpr int kRendererDefault = 0;   // [opengl-new] our own present
 #endif
         int renderer = kRendererDefault;
         bool glow = true;

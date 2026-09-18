@@ -65,10 +65,10 @@ public:
 
     void setRenderer(int v) { m_renderer = v; }
     void setGpuRenderer(bool v) { m_renderer = (v != false) ?
-#if defined(_WIN32)
-        kRendererD3D11 :
-#else
+#if defined(PS2X_HAVE_PGS)
         kRendererParallelGS :
+#else
+        kRendererOpenGL :
 #endif
         kRendererSoftware; }
     void setGlow(bool v) { m_glow = v; }
@@ -124,7 +124,7 @@ private:
     QString m_dir;
     float m_master = 1.0f, m_music = 1.0f, m_sfx = 1.0f;
 #if defined(_WIN32)
-    int m_renderer = kRendererD3D11;   // [d3d11] native D3D11 present is the Windows default
+    int m_renderer = kRendererOpenGL;   // [opengl-new] our own GL present (D3D11 retired for now)
 #else
     int m_renderer = kRendererParallelGS;
 #endif

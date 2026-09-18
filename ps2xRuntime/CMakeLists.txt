@@ -199,6 +199,11 @@ endif()
 if(TARGET bt3gl AND DEFINED PS2X_SDL2_TARGET)
     target_link_libraries(bt3gl PUBLIC ${PS2X_SDL2_TARGET})
     message(STATUS "[B] bt3gl (vendored raylib) window backend: SDL2 (${PS2X_SDL2_TARGET})")
+else()
+    # The window/input/GL context come from SDL2 now (PLATFORM_DESKTOP_SDL), so there is no fallback:
+    # fail here with a clear message instead of a wall of undefined SDL_* symbols at link time.
+    message(FATAL_ERROR
+        "The runtime window backend is SDL2 (PLATFORM_DESKTOP_SDL). Configure with PS2X_HOST_SDL2=ON.")
 endif()
 
 # [d3d11 probe] Native Direct3D 11 video on raylib's HWND, buildable on its own so the
@@ -704,12 +709,8 @@ if (APPLE AND NOT PS2X_FORCE_PGS)
     set(PS2X_DISABLE_PGS ON)
     set(PS2X_PGS_SKIP_REASON "not supported on macOS (Granite needs clock_nanosleep)")
 endif()
-# [d3d11] Windows uses the native D3D11 renderer; paraLLEl-GS is retired here so it can neither
-# be built nor compete with the new path. PS2X_FORCE_PGS=ON opts back in for A/B work.
-if (WIN32 AND NOT PS2X_FORCE_PGS)
-    set(PS2X_DISABLE_PGS ON)
-    set(PS2X_PGS_SKIP_REASON "retired on Windows (native D3D11 renderer)")
-endif()
+# [pgs] paraLLEl-GS is available on Windows again: D3D11 is retired for now, so the Vulkan compute
+# backend is a first-class renderer option here once more (macOS is still excluded above).
 # [pgs submodule] Fetch it ourselves rather than requiring every clone to remember
 # --recursive. Without this a plain `git clone` + build produces a runner with NO
 # paraLLEl-GS renderer and only a STATUS line to say so, which is easy to miss and

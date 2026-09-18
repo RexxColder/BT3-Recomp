@@ -118,36 +118,24 @@ VideoTab::VideoTab(QWidget *parent)
     root->addWidget(sectionLabel(QStringLiteral("RENDERER")));
     QStringList renderers;
     QList<int> rendererValues;
-#if defined(_WIN32)
-    // [d3d11] Windows: paraLLEl-GS is retired and native Direct3D 11 is the default present.
-    renderers = { QStringLiteral("OpenGL (New)"),
-                  QStringLiteral("Software (CPU)"),
-                  QStringLiteral("Direct3D 11") };
-    rendererValues = { SettingsManager::kRendererOpenGL,
-                       SettingsManager::kRendererSoftware,
-                       SettingsManager::kRendererD3D11 };
-#else
+    // [pgs] D3D11 is retired for now, so paraLLEl-GS is back in the list on every platform that can
+    // build it (Windows included).
     renderers = { QStringLiteral("OpenGL (New)"),
                   QStringLiteral("Software (CPU)"),
                   QStringLiteral("paraLLEl-GS (Vulkan)") };
     rendererValues = { SettingsManager::kRendererOpenGL,
                        SettingsManager::kRendererSoftware,
                        SettingsManager::kRendererParallelGS };
-#endif
     int curRenderer = 0;
     for (int i = 0; i < rendererValues.size(); ++i)
         if (rendererValues[i] == s.renderer()) { curRenderer = i; break; }
     root->addWidget(comboRow(QStringLiteral("Renderer"), &m_renderer, renderers, curRenderer));
     for (int i = 0; i < rendererValues.size(); ++i)
         m_renderer->setItemData(i, rendererValues[i]);
-#ifdef _WIN32
     root->addWidget(hintRow(QStringLiteral(
-        "Direct3D 11 is the default present on Windows (the game frame is shown through a "
-        "native D3D11 swap chain). OpenGL (New) presents through our own GL layer; Software uses "
-        "the CPU rasterizer.")));
-#else
-    root->addWidget(hintRow(QStringLiteral("paraLLEl-GS is the default backend. Falls back to OpenGL if Vulkan is unavailable.")));
-#endif
+        "paraLLEl-GS is the default backend (Vulkan compute; falls back to OpenGL (New) if Vulkan is "
+        "unavailable). OpenGL (New) presents through our own GL layer; Software uses the CPU "
+        "rasterizer.")));
     root->addWidget(toggleRow(QStringLiteral("Cel Outline"), &m_outline, s.outline()));
     m_inkRow = sliderPair(QStringLiteral("Ink Strength"), &m_ink, &m_inkVal, 100, 260,
                           s.inkStrength(), "%d %%");

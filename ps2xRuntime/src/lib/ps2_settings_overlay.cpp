@@ -504,16 +504,14 @@ void PS2SettingsOverlay::loadSettings()
     m_settings.sfxVolume = std::clamp((float)doc.getD("audio.sfx_volume", m_settings.sfxVolume), 0.0f, 1.0f);
 
     {
-        int r = nameToRenderer(doc.getS("video.renderer", rendererName(m_settings.renderer)), m_settings.renderer);
+            int r = nameToRenderer(doc.getS("video.renderer", rendererName(m_settings.renderer)), m_settings.renderer);
 #if !defined(PS2X_HAVE_PGS)
-        if (r == Settings::kRendererParallelGS) r = Settings::kRendererOpenGL;
+            if (r == Settings::kRendererParallelGS) r = Settings::kRendererOpenGL;
 #endif
-#if defined(_WIN32)
-        if (r == Settings::kRendererParallelGS) r = Settings::kRendererD3D11;   // [d3d11] retired on Windows
-#else
-        if (r == Settings::kRendererD3D11) r = Settings::kRendererOpenGL;       // [d3d11] Windows-only
-#endif
-        if (r >= 0 && r <= 3) { m_settings.renderer = r; m_sawRendererKey = true; }
+            // [d3d11] Direct3D 11 is retired for now: an old settings file that picks it falls back to
+            // the new OpenGL present. paraLLEl-GS is a normal option on every platform again.
+            if (r == Settings::kRendererD3D11) r = Settings::kRendererOpenGL;
+            if (r >= 0 && r <= 3) { m_settings.renderer = r; m_sawRendererKey = true; }
     }
     if (!envUserSet("PS2X_GLOW")) m_settings.glow = doc.getB("video.glow", m_settings.glow);
     if (!envUserSet("PS2X_GLOWFIX")) m_settings.glowFix = doc.getB("video.glowfix", m_settings.glowFix);
@@ -585,13 +583,8 @@ static void setEnvDefault(const char *name, const char *value)
 static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
 {
 #if defined(_WIN32)
-    // [d3d11] renderer 3 = native Direct3D 11 present (Windows). PGS retired in that mode.
-    if (renderer == 3)
-    {
-        setEnvDefault("PS2X_D3D11", "1");
-        setEnvDefault("PS2X_PGS", "0");
-        return;
-    }
+    // [d3d11] The D3D11 present is retired for now: nothing selects it any more, and the flag is
+    // forced off so a stale PS2X_D3D11 in the environment cannot bring back the old path.
     setEnvDefault("PS2X_D3D11", "0");
 #endif
     // [opengl-new] renderer 0 is the NEW OpenGL present (gfx::gl / altGL). The old raylib GL present
@@ -1308,16 +1301,10 @@ void PS2SettingsOverlay::drawVideoTab()
 #if defined(PS2X_HAVE_PGS)
             "paraLLEl-GS (Vulkan compute)",
 #endif
-#if defined(_WIN32)
-            "Direct3D 11 (native)",
-#endif
         };
         static const int kValues[] = { 0, 1,
 #if defined(PS2X_HAVE_PGS)
             2,
-#endif
-#if defined(_WIN32)
-            3,
 #endif
         };
         const int nRenderers = (int)(sizeof(kValues) / sizeof(kValues[0]));
