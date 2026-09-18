@@ -58,6 +58,15 @@ bool UiSdlInit(void *sdlWindow, void *glContext)
 #endif
 }
 
+void *UiSdlCurrentGlContext()
+{
+#if defined(PS2X_HAVE_SDL2)
+    return SDL_GL_GetCurrentContext();
+#else
+    return nullptr;
+#endif
+}
+
 void UiSdlNewFrame()
 {
 #if defined(PS2X_HAVE_SDL2)

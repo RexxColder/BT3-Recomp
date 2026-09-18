@@ -5,8 +5,8 @@
 
 #include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 #include "imgui.h"
-#include "rlImGui.h"
 #include "imgui_impl_opengl3.h"
+#include "runtime/ui_sdl.h"   // [C] ImGui platform backend on SDL2 (replaces rlImGui)
 
 #include <cstdio>
 #include <cstdlib>
@@ -66,38 +66,38 @@ namespace ps2x::gfx
             io.AddKeyEvent(static_cast<ImGuiKey>(ImGuiKey_0 + k), bt3IsKeyDown(BT3_KEY_ZERO + k) != 0);
     }
 
-    // [C] The overlay uses imgui_impl_opengl3 (its own GL loader + font atlas) instead of
-    // rlImGui/rlgl when the GL path is ours (PS2X_ALTGL=1). PS2X_UIGL overrides the choice:
-    //   1  -> always GL overlay        0 -> always rlImGui
-    //   unset -> GL overlay iff PS2X_ALTGL=1
-    static bool UiGlEnabled()
+    // [C] The overlay is ImGui over OUR backends: imgui_impl_sdl2 for the platform/input and
+    // imgui_impl_opengl3 (or imgui_impl_dx11) to draw. rlImGui is gone, so the overlay no longer draws
+    // through rlgl either. PS2X_UIGL is kept only as an escape hatch back to the raylib-fed input
+    // (1 = force the SDL2 platform backend, 0 = force the raylib feeder).
+    // [C] true once the SDL2 platform backend owns the input. When it fails (no SDL window, no SDL2
+    // build) the overlay keeps the raylib-fed inputs, which is what it did before.
+    static bool UiSdlInputActive()
     {
-        static const int s = [](){
-            const char *v = std::getenv("PS2X_UIGL");
-            if (v && v[0]) return (v[0] != '0') ? 1 : -1;
-            const char *a = std::getenv("PS2X_ALTGL");
-            return (a && a[0] && a[0] != '0') ? 1 : 0;
+        static const bool s = [](){
+            const char *v = std::getenv("PS2X_UISDL");
+            if (v && v[0] == '0') return false;
+            return UiSdlInit(bt3GetWindowHandle(), UiSdlCurrentGlContext());
         }();
-        return s > 0;
+        return s;
     }
 
     void UiSetup()
     {
         if (NativeVideo())
             UiD3D11Init(*VideoDevice());
-        else if (UiGlEnabled())
+        else
         {
-            // imgui_impl_opengl3 does NOT create the ImGui context (rlImGuiSetup used to do it
-            // for us), and ImGui::NewFrame on a null context is what crashed the runner.
+            // The GL overlay needs its own ImGui context (imgui_impl_opengl3 does not create one, and
+            // ImGui::NewFrame on a null context is what crashed the runner).
             ImGui::CreateContext();
             ImGuiIO &io = ImGui::GetIO();
             io.DisplaySize = ImVec2((float)bt3GetScreenWidth(), (float)bt3GetScreenHeight());
             io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
             const bool ok = ImGui_ImplOpenGL3_Init("#version 330");
             std::fprintf(stderr, "[uigl] imgui_impl_opengl3 init=%d (context created)\n", (int)ok);
+            UiSdlInputActive();
         }
-        else
-            rlImGuiSetup(true);
     }
 
     void UiBegin()
@@ -108,15 +108,11 @@ namespace ps2x::gfx
             feedImGuiInput();
             ImGui::NewFrame();
         }
-        else if (UiGlEnabled())
-        {
-            feedImGuiInput();
-            ImGui_ImplOpenGL3_NewFrame();
-            ImGui::NewFrame();
-        }
         else
         {
-            rlImGuiBegin();
+            if (UiSdlInputActive()) UiSdlNewFrame(); else feedImGuiInput();
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui::NewFrame();
         }
     }
 
@@ -124,7 +120,7 @@ namespace ps2x::gfx
     {
         if (NativeVideo())
             UiD3D11Render();   // ImGui::Render() + ImGui_ImplDX11_RenderDrawData()
-        else if (UiGlEnabled())
+        else
         {
             // rlgl is still alive: flush the batch so our raw-GL overlay draws on top of it, then
             // hand the state back through rlgl's own API (rlgl caches blend/program/texture and
@@ -139,18 +135,17 @@ namespace ps2x::gfx
             bt3rlDisableShader();
             bt3rlDrawRenderBatchActive();
         }
-        else
-            rlImGuiEnd();
     }
 
     void UiShutdown()
     {
         if (NativeVideo())
             UiD3D11Shutdown();
-        else if (UiGlEnabled())
-            ImGui_ImplOpenGL3_Shutdown();
         else
-            rlImGuiShutdown();
+        {
+            UiSdlShutdown();
+            ImGui_ImplOpenGL3_Shutdown();
+        }
     }
 
     void UiDrawTestWindow()
@@ -161,14 +156,12 @@ namespace ps2x::gfx
         ImGui::End();
         if (NativeVideo())
             UiD3D11Render();   // ImGui::Render() + ImGui_ImplDX11_RenderDrawData()
-        else if (UiGlEnabled())
+        else
         {
             bt3rlDrawRenderBatchActive();
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         }
-        else
-            rlImGuiEnd();
         ImDrawData *dd = ImGui::GetDrawData();
         static int n = 0;
         if (n++ < 3)

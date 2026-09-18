@@ -148,25 +148,9 @@ else()
         target_link_libraries(imgui PUBLIC d3d11 dxgi)
     endif()
 
-    FetchContent_Declare(
-        rlImGui
-        GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
-        GIT_TAG "Raylib_5_5"
-        GIT_SHALLOW TRUE
-    )
-    FetchContent_GetProperties(rlImGui)
-
-    if(NOT rlimgui_POPULATED)
-        FetchContent_Populate(rlImGui)
-    endif()
-
-    set(PS2X_RLIMGUI_SOURCE_DIR "${rlimgui_SOURCE_DIR}")
-
-    add_library(rlImGui STATIC
-        "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
-    )
-    target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
-    target_link_libraries(rlImGui PUBLIC bt3gl imgui)
+    # [C] rlImGui is GONE: the overlay is ImGui over our own backends (imgui_impl_sdl2 for the platform
+    # and imgui_impl_opengl3 / imgui_impl_dx11 to draw), so raylib's ecosystem is no longer a build
+    # dependency. See src/lib/ui_sdl.cpp for the event-watch trick that keeps raylib's input working.
 
     # [hostio] SDL2 for gamepads and audio output (the window and keyboard stay raylib's). Built
     # static from source so every platform gets the same version; PS2X_HOSTPAD=raylib /
@@ -833,7 +817,7 @@ if(NOT PS2X_IS_VITA)
             src/gfx/d3d11/ui_d3d11.cpp   # imgui_impl_dx11 backend (needs windows.h)
         )
     endif()
-    target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
+    target_link_libraries(ps2EntryRunner PRIVATE imgui)
     # gamemode: request CPU governor / IO priority optimisations at startup
     # (auto-release on exit; harmless no-op if the daemon isn't running).
     find_library(GAMEMODE_LIB NAMES libgamemodeauto.so gamemodeauto NAMES_PER_DIR)

@@ -12,4 +12,8 @@
 
 bool UiSdlInit(void *sdlWindow, void *glContext);
 void UiSdlNewFrame();
+
+// The GL context raylib created and made current (resolved inside the SDL translation unit, so callers
+// do not need SDL headers). Pass it to UiSdlInit.
+void *UiSdlCurrentGlContext();
 void UiSdlShutdown();
