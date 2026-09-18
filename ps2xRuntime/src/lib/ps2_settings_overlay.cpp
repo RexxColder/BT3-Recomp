@@ -1346,6 +1346,40 @@ void PS2SettingsOverlay::drawVideoTab()
         static const char *const kRes[] = {"1024 x 768", "1280 x 720", "1360 x 768", "1366 x 768", "1440 x 900",
                                            "1600 x 900", "1920 x 1080", "2560 x 1440", "3440 x 1440", "3840 x 2160"};
         if (ImGui::Button("Display settings...", ImVec2(200.0f, 0.0f))) ImGui::OpenPopup("Display settings");
+        // [advanced] The filtering options live in this popup so the tab stays short (the rest of the
+        // effects follow the same pattern). Apply = live where the runtime has a hook; Save = + persist
+        // (m_dirty, written when the overlay closes); Reset = back to the values it opened with; Close =
+        // discard.
+        ImGui::SameLine();
+        if (ImGui::Button("Advanced settings...", ImVec2(200.0f, 0.0f))) ImGui::OpenPopup("Advanced settings");
+        static bool *const kAdvB[] = {
+            &m_settings.bilinear, &m_settings.forceBilinear, &m_settings.halfTexel,
+            &m_settings.skipPost, &m_settings.skipStaleVram,
+        };
+        static const char *const kAdvN[] = {
+            "Bilinear Filter", "Force Filtering (smooth terrain)", "Half-texel",
+            "Skip post pass", "Skip stale VRAM",
+        };
+        static bool sAdvOpen = false, sB[5];
+        if (ImGui::BeginPopupModal("Advanced settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            if (!sAdvOpen)
+            {
+                for (int i = 0; i < 5; ++i) sB[i] = *kAdvB[i];
+                sAdvOpen = true;
+            }
+            for (int i = 0; i < 5; ++i) ImGui::Checkbox(kAdvN[i], kAdvB[i]);
+            auto applyLive = [&]() { ps2x_pgs::setForceBilinear(m_settings.forceBilinear); };
+            if (ImGui::Button("Reset")) { for (int i = 0; i < 5; ++i) *kAdvB[i] = sB[i]; applyLive(); }
+            ImGui::SameLine();
+            if (ImGui::Button("Close")) { sAdvOpen = false; ImGui::CloseCurrentPopup(); }
+            ImGui::SameLine(0.0f, 24.0f);
+            if (ImGui::Button("Apply")) { applyLive(); m_dirty = true; }
+            ImGui::SameLine();
+            if (ImGui::Button("Save")) { applyLive(); m_dirty = true; sAdvOpen = false; ImGui::CloseCurrentPopup(); }
+            ImGui::EndPopup();
+        }
+
 
         static bool eInit = false;
         static int eMode = 0, eMon = 0, eScale = 1, eRes = 0;
@@ -1546,20 +1580,6 @@ void PS2SettingsOverlay::drawVideoTab()
         else if (was) ImGui::TextDisabled("Character/attack bloom. Off = the pre-fix look.");
     }
 
-    sectionHeader("FILTERING");
-    if (toggleSwitch("Bilinear Filter", &m_settings.bilinear))
-        m_dirty = true;
-    {   // PCSX2-style forced filtering: smooth even textures the game point-samples
-        // (far-terrain tiles -- the pixelated mountains at high internal resolution).
-        extern void ps2xSetForceBilinear(bool);
-        if (toggleSwitch("Force Filtering (smooth terrain)", &m_settings.forceBilinear))
-        {
-            ps2xSetForceBilinear(m_settings.forceBilinear);
-            m_dirty = true;
-        }
-    }
-
-    // Display
     sectionHeader("DISPLAY");
     if (toggleSwitch("Fullscreen", &m_settings.fullscreen))
     {
