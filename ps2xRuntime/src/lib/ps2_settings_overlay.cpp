@@ -1346,12 +1346,12 @@ void PS2SettingsOverlay::drawVideoTab()
         static const char *const kRes[] = {"1024 x 768", "1280 x 720", "1360 x 768", "1366 x 768", "1440 x 900",
                                            "1600 x 900", "1920 x 1080", "2560 x 1440", "3440 x 1440", "3840 x 2160"};
         if (ImGui::Button("Display settings...", ImVec2(200.0f, 0.0f))) ImGui::OpenPopup("Display settings");
-        // [advanced] The filtering options live in this popup so the tab stays short (the rest of the
+        // [visualfx] The effect toggles (renderer + filtering) live in this popup so the tab stays short (the rest of the
         // effects follow the same pattern). Apply = live where the runtime has a hook; Save = + persist
         // (m_dirty, written when the overlay closes); Reset = back to the values it opened with; Close =
         // discard.
         ImGui::SameLine();
-        if (ImGui::Button("Advanced settings...", ImVec2(200.0f, 0.0f))) ImGui::OpenPopup("Advanced settings");
+        if (ImGui::Button("Visual Effects...", ImVec2(200.0f, 0.0f))) ImGui::OpenPopup("Visual Effects");
         static bool *const kAdvB[] = {
             &m_settings.bilinear, &m_settings.forceBilinear, &m_settings.halfTexel,
             &m_settings.skipPost, &m_settings.skipStaleVram,
@@ -1361,7 +1361,7 @@ void PS2SettingsOverlay::drawVideoTab()
             "Skip post pass", "Skip stale VRAM",
         };
         static bool sAdvOpen = false, sB[5];
-        if (ImGui::BeginPopupModal("Advanced settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        if (ImGui::BeginPopupModal("Visual Effects", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         {
             if (!sAdvOpen)
             {
@@ -1369,6 +1369,105 @@ void PS2SettingsOverlay::drawVideoTab()
                 sAdvOpen = true;
             }
             for (int i = 0; i < 5; ++i) ImGui::Checkbox(kAdvN[i], kAdvB[i]);
+        if (toggleSwitch("Cel Outline", &m_settings.outline))
+            m_dirty = true;
+        if (m_settings.outline)
+        {   // the ink controls belong to the outline: shown under it, only while it is on
+            ImGui::Indent(12.0f);
+            // [inkstrength] how hard the outline darkener subtracts. 199% is the exact GS
+            // strength (it divides Ad by 128 where GL divides by 255); 100% is the old,
+            // washed-out line. Applies live -- it is a single shader uniform.
+            ImGui::Text("Ink Strength");
+            ImGui::SameLine(120);
+            ImGui::SetNextItemWidth(220);
+            if (ImGui::SliderInt("##inkstrength", &m_settings.inkStrength, 100, 400, "%d %%",
+                                 ImGuiSliderFlags_AlwaysClamp))
+            {
+                GsGpuRenderer::setInkStrengthPct(m_settings.inkStrength);   // live preview
+                m_dirty = true;
+            }
+            ImGui::TextDisabled("199%% matches the console line. Higher = darker ink.");
+            if (m_settings.renderer == 2)
+            {   // [pgsink] paraLLEl-GS: the stroke width is the outline chain's edge-detect shift, rewritten in the stream
+                ImGui::Text("Ink Width");
+                ImGui::SameLine(120);
+                ImGui::SetNextItemWidth(220);
+                if (ImGui::SliderInt("##inkwidth", &m_settings.inkWidth, 25, 100, "%d %%", ImGuiSliderFlags_AlwaysClamp))
+                {
+                    ps2x_pgs::setInkWidthPct(m_settings.inkWidth);   // live
+                    m_dirty = true;
+                }
+                ImGui::TextDisabled("100%% = the console's one-pixel stroke; lower = thinner (paraLLEl-GS only).");
+                {   // [pgsink] the darkener subtracts its colour from the scene, so the picker sets the complement it keeps
+                    float rgb[3] = { ((m_settings.inkColor >> 16) & 0xFFu) / 255.0f, ((m_settings.inkColor >> 8) & 0xFFu) / 255.0f, (m_settings.inkColor & 0xFFu) / 255.0f };
+                    ImGui::Text("Ink Color");
+                    ImGui::SameLine(120);
+                    ImGui::SetNextItemWidth(220);
+                    if (ImGui::ColorEdit3("##inkcolor", rgb, ImGuiColorEditFlags_NoPicker | ImGuiColorEditFlags_NoAlpha | ImGuiColorEditFlags_DisplayRGB | ImGuiColorEditFlags_Uint8))
+                    {
+                        auto b = [](float f) { return static_cast<unsigned>(std::clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f); };
+                        m_settings.inkColor = (b(rgb[0]) << 16) | (b(rgb[1]) << 8) | b(rgb[2]);
+                        ps2x_pgs::setInkColor(m_settings.inkColor);   // live
+                        m_dirty = true;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Black")) { m_settings.inkColor = 0; ps2x_pgs::setInkColor(0); m_dirty = true; }
+                    ImGui::TextDisabled("Exact on light backgrounds; darker scenes tint toward it (paraLLEl-GS only).");
+                }
+            }
+            ImGui::Unindent(12.0f);
+        }
+        {   // [texreplace] Only offer the switch when a pack is actually indexed -- PS2X_TEXREPLACE
+            // points at the directory, and with no pack the toggle would do nothing and read as broken.
+            const bool havePack = ps2tex::replacementsEnabled();
+            if (!havePack) ImGui::BeginDisabled();
+            if (toggleSwitch("Texture Replacement", &m_settings.texPack))
+            {   // Applies LIVE: setTexPack flushes the texture cache so everything re-decodes.
+                GsGpuRenderer::setTexPack(m_settings.texPack);
+                ps2x_pgs::setPackEnabled(m_settings.texPack);   // [pgslive] backend: hook gated + cached textures dropped
+                m_dirty = true;
+            }
+            if (!havePack)
+            {
+                ImGui::EndDisabled();
+                ImGui::TextDisabled("Set PS2X_TEXREPLACE=<dir> to enable.");
+            }
+        }
+        if (toggleSwitch("60 FPS (experimental)", &m_settings.fps60))
+        {   // [fps60] step 1 + the pacing table; the runtime applies it between fights, never mid-fight
+            ps2Set60Fps(m_settings.fps60, nullptr);
+            m_dirty = true;
+        }
+        if (toggleSwitch("Character Shadows", &m_settings.shadows))
+            m_dirty = true;
+        if (toggleSwitch("Depth-of-Field Blur", &m_settings.dofBlur))
+            m_dirty = true;
+        if (m_settings.dofBlur)
+        {
+            ImGui::Text("Blur Reach");
+            ImGui::SameLine(120);
+            ImGui::SetNextItemWidth(220);
+            int reach = m_settings.dofZFar / 1000;   // present in "k" units for a readable slider
+            if (ImGui::SliderInt("##dofreach", &reach, 50, 400, "%d k", ImGuiSliderFlags_AlwaysClamp))
+            {
+                m_settings.dofZFar = reach * 1000;
+                m_dirty = true;
+            }
+            if (m_settings.renderer == 2) ImGui::TextDisabled("paraLLEl-GS: off keeps the aura glow (the game blurs through the same pass,\nso a soft halo stays around a charging aura); reach is OpenGL-only.");
+            ImGui::TextDisabled("Lower = blur reaches nearer to the camera. 200k matches the console look.");
+        }
+        // (Glow / Skip Post / Half-Texel / Skip Stale VRAM toggles removed: replay A/B
+        //  measured them at 0.000 frame diff in fights -- their draw classes are
+        //  superseded by the current serving pipeline. Env vars still work for devs.)
+        {   // [glowfix] BT3's bloom/glow chain -- the Kaioken aura and every attack glow.
+            const bool was = m_settings.glowFix;
+            if (toggleSwitch("Glow (Kaioken aura)", &m_settings.glowFix))
+                m_dirty = true;
+            if (m_settings.glowFix != GsGpuRenderer::glowFixEnabled())
+                ImGui::TextDisabled("(applies on restart)");
+            else if (was) ImGui::TextDisabled("Character/attack bloom. Off = the pre-fix look.");
+        }
+    
             auto applyLive = [&]() { ps2x_pgs::setForceBilinear(m_settings.forceBilinear); };
             if (ImGui::Button("Reset")) { for (int i = 0; i < 5; ++i) *kAdvB[i] = sB[i]; applyLive(); }
             ImGui::SameLine();
@@ -1425,6 +1524,36 @@ void PS2SettingsOverlay::drawVideoTab()
             ImGui::RadioButton("Windowed (resizable)", &eMode, 0); ImGui::SameLine();
             ImGui::RadioButton("Borderless", &eMode, 1);           ImGui::SameLine();
             ImGui::RadioButton("Fullscreen", &eMode, 2);
+        if (toggleSwitch("Widescreen (true FOV)", &m_settings.widescreen))
+        {
+            s_widescreen = m_settings.widescreen;
+            m_dirty = true;
+        }
+        if (m_settings.widescreen)
+        {   // widescreen HUD layout: where the corrected-proportion HUD sits on the wide frame
+            static const char *kHudLayouts[] = {"Centered (4:3 block)", "Edge-pinned (wide)", "Custom (sliders)"};
+            ImGui::TextUnformatted("HUD Layout");
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+            int hl = m_settings.hudLayout;
+            if (ImGui::Combo("##hudlayout", &hl, kHudLayouts, 3))
+            {
+                m_settings.hudLayout = hl;
+                pushHudLayout(m_settings);
+                m_dirty = true;
+            }
+            if (m_settings.hudLayout == 2)
+            {
+                bool ch = false;
+                ch |= ImGui::SliderInt("Left cluster", &m_settings.hudOffL, -120, 120, "%d px");
+                ch |= ImGui::SliderInt("Timer", &m_settings.hudOffC, -120, 120, "%d px");
+                ch |= ImGui::SliderInt("Right cluster", &m_settings.hudOffR, -120, 120, "%d px");
+                if (ch) { pushHudLayout(m_settings); m_dirty = true; }
+                ImGui::TextDisabled("offsets from the edge-pinned layout; bars auto-stretch");
+            }
+            if (m_settings.hudLayout != 0)
+                ImGui::TextDisabled("note: in stretched layouts the damage flash can briefly show at both bar ends");
+        }
+    
             auto applyLive = [&]()
             {
                 bt3SetWindowSize(kW[eRes], kH[eRes]);
@@ -1481,198 +1610,6 @@ void PS2SettingsOverlay::drawVideoTab()
         }
     }
     ImGui::TextDisabled("Takes full effect after restart.");
-    if (toggleSwitch("Cel Outline", &m_settings.outline))
-        m_dirty = true;
-    if (m_settings.outline)
-    {   // the ink controls belong to the outline: shown under it, only while it is on
-        ImGui::Indent(12.0f);
-        // [inkstrength] how hard the outline darkener subtracts. 199% is the exact GS
-        // strength (it divides Ad by 128 where GL divides by 255); 100% is the old,
-        // washed-out line. Applies live -- it is a single shader uniform.
-        ImGui::Text("Ink Strength");
-        ImGui::SameLine(120);
-        ImGui::SetNextItemWidth(220);
-        if (ImGui::SliderInt("##inkstrength", &m_settings.inkStrength, 100, 400, "%d %%",
-                             ImGuiSliderFlags_AlwaysClamp))
-        {
-            GsGpuRenderer::setInkStrengthPct(m_settings.inkStrength);   // live preview
-            m_dirty = true;
-        }
-        ImGui::TextDisabled("199%% matches the console line. Higher = darker ink.");
-        if (m_settings.renderer == 2)
-        {   // [pgsink] paraLLEl-GS: the stroke width is the outline chain's edge-detect shift, rewritten in the stream
-            ImGui::Text("Ink Width");
-            ImGui::SameLine(120);
-            ImGui::SetNextItemWidth(220);
-            if (ImGui::SliderInt("##inkwidth", &m_settings.inkWidth, 25, 100, "%d %%", ImGuiSliderFlags_AlwaysClamp))
-            {
-                ps2x_pgs::setInkWidthPct(m_settings.inkWidth);   // live
-                m_dirty = true;
-            }
-            ImGui::TextDisabled("100%% = the console's one-pixel stroke; lower = thinner (paraLLEl-GS only).");
-            {   // [pgsink] the darkener subtracts its colour from the scene, so the picker sets the complement it keeps
-                float rgb[3] = { ((m_settings.inkColor >> 16) & 0xFFu) / 255.0f, ((m_settings.inkColor >> 8) & 0xFFu) / 255.0f, (m_settings.inkColor & 0xFFu) / 255.0f };
-                ImGui::Text("Ink Color");
-                ImGui::SameLine(120);
-                ImGui::SetNextItemWidth(220);
-                if (ImGui::ColorEdit3("##inkcolor", rgb, ImGuiColorEditFlags_NoPicker | ImGuiColorEditFlags_NoAlpha | ImGuiColorEditFlags_DisplayRGB | ImGuiColorEditFlags_Uint8))
-                {
-                    auto b = [](float f) { return static_cast<unsigned>(std::clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f); };
-                    m_settings.inkColor = (b(rgb[0]) << 16) | (b(rgb[1]) << 8) | b(rgb[2]);
-                    ps2x_pgs::setInkColor(m_settings.inkColor);   // live
-                    m_dirty = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Black")) { m_settings.inkColor = 0; ps2x_pgs::setInkColor(0); m_dirty = true; }
-                ImGui::TextDisabled("Exact on light backgrounds; darker scenes tint toward it (paraLLEl-GS only).");
-            }
-        }
-        ImGui::Unindent(12.0f);
-    }
-    {   // [texreplace] Only offer the switch when a pack is actually indexed -- PS2X_TEXREPLACE
-        // points at the directory, and with no pack the toggle would do nothing and read as broken.
-        const bool havePack = ps2tex::replacementsEnabled();
-        if (!havePack) ImGui::BeginDisabled();
-        if (toggleSwitch("Texture Replacement", &m_settings.texPack))
-        {   // Applies LIVE: setTexPack flushes the texture cache so everything re-decodes.
-            GsGpuRenderer::setTexPack(m_settings.texPack);
-            ps2x_pgs::setPackEnabled(m_settings.texPack);   // [pgslive] backend: hook gated + cached textures dropped
-            m_dirty = true;
-        }
-        if (!havePack)
-        {
-            ImGui::EndDisabled();
-            ImGui::TextDisabled("Set PS2X_TEXREPLACE=<dir> to enable.");
-        }
-    }
-    if (toggleSwitch("60 FPS (experimental)", &m_settings.fps60))
-    {   // [fps60] step 1 + the pacing table; the runtime applies it between fights, never mid-fight
-        ps2Set60Fps(m_settings.fps60, nullptr);
-        m_dirty = true;
-    }
-    if (toggleSwitch("Character Shadows", &m_settings.shadows))
-        m_dirty = true;
-    if (toggleSwitch("Depth-of-Field Blur", &m_settings.dofBlur))
-        m_dirty = true;
-    if (m_settings.dofBlur)
-    {
-        ImGui::Text("Blur Reach");
-        ImGui::SameLine(120);
-        ImGui::SetNextItemWidth(220);
-        int reach = m_settings.dofZFar / 1000;   // present in "k" units for a readable slider
-        if (ImGui::SliderInt("##dofreach", &reach, 50, 400, "%d k", ImGuiSliderFlags_AlwaysClamp))
-        {
-            m_settings.dofZFar = reach * 1000;
-            m_dirty = true;
-        }
-        if (m_settings.renderer == 2) ImGui::TextDisabled("paraLLEl-GS: off keeps the aura glow (the game blurs through the same pass,\nso a soft halo stays around a charging aura); reach is OpenGL-only.");
-        ImGui::TextDisabled("Lower = blur reaches nearer to the camera. 200k matches the console look.");
-    }
-    // (Glow / Skip Post / Half-Texel / Skip Stale VRAM toggles removed: replay A/B
-    //  measured them at 0.000 frame diff in fights -- their draw classes are
-    //  superseded by the current serving pipeline. Env vars still work for devs.)
-    {   // [glowfix] BT3's bloom/glow chain -- the Kaioken aura and every attack glow.
-        const bool was = m_settings.glowFix;
-        if (toggleSwitch("Glow (Kaioken aura)", &m_settings.glowFix))
-            m_dirty = true;
-        if (m_settings.glowFix != GsGpuRenderer::glowFixEnabled())
-            ImGui::TextDisabled("(applies on restart)");
-        else if (was) ImGui::TextDisabled("Character/attack bloom. Off = the pre-fix look.");
-    }
-
-    sectionHeader("DISPLAY");
-    if (toggleSwitch("Fullscreen", &m_settings.fullscreen))
-    {
-        ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
-        // The [builtin-res] block that derived the render scale from the screen height on this toggle
-        // is gone on purpose: upstream turned the render scale into its own setting again (see the
-        // [rscale] block below), because deriving it meant a 1080p window could never render at 1x or 4x.
-        m_dirty = true;
-    }
-    if (toggleSwitch("Widescreen (true FOV)", &m_settings.widescreen))
-    {
-        s_widescreen = m_settings.widescreen;
-        m_dirty = true;
-    }
-    if (m_settings.widescreen)
-    {   // widescreen HUD layout: where the corrected-proportion HUD sits on the wide frame
-        static const char *kHudLayouts[] = {"Centered (4:3 block)", "Edge-pinned (wide)", "Custom (sliders)"};
-        ImGui::TextUnformatted("HUD Layout");
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-        int hl = m_settings.hudLayout;
-        if (ImGui::Combo("##hudlayout", &hl, kHudLayouts, 3))
-        {
-            m_settings.hudLayout = hl;
-            pushHudLayout(m_settings);
-            m_dirty = true;
-        }
-        if (m_settings.hudLayout == 2)
-        {
-            bool ch = false;
-            ch |= ImGui::SliderInt("Left cluster", &m_settings.hudOffL, -120, 120, "%d px");
-            ch |= ImGui::SliderInt("Timer", &m_settings.hudOffC, -120, 120, "%d px");
-            ch |= ImGui::SliderInt("Right cluster", &m_settings.hudOffR, -120, 120, "%d px");
-            if (ch) { pushHudLayout(m_settings); m_dirty = true; }
-            ImGui::TextDisabled("offsets from the edge-pinned layout; bars auto-stretch");
-        }
-        if (m_settings.hudLayout != 0)
-            ImGui::TextDisabled("note: in stretched layouts the damage flash can briefly show at both bar ends");
-    }
-
-    {   // [rscale] Internal resolution, its own setting again (2026-09-17): it used to be derived from the
-        // window size (720p=1x, 1080p=2x, 1440p+=3x), so a 1080p window could never render at 1x or 4x.
-        // paraLLEl-GS re-creates the backend live at 1/4/8/16 samples per pixel; OpenGL applies on restart.
-        static const char *kScales[] = {"Native (1x)", "2x", "3x", "4x"};
-        int rsIdx = std::clamp(m_settings.renderScale, 1, 4) - 1;
-        ImGui::TextUnformatted("Internal Resolution");
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-        if (ImGui::Combo("##renderscale", &rsIdx, kScales, 4))
-        {
-            m_settings.renderScale = rsIdx + 1;
-            ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive] (the combo outranks a launcher SSAA once touched)
-            m_dirty = true;
-        }
-        if (m_settings.renderer == 2)
-            ImGui::TextDisabled("paraLLEl-GS: 1x / 2x / 3x / 4x = 1 / 4 / 8 / 16 samples per pixel, applies live.");
-        else if (m_settings.renderScale != GsGpuRenderer::renderScale())
-            ImGui::TextDisabled("(applies on restart)");
-    }
-    // Window-size presets. The projection FOV follows the window aspect (see [truews]
-    // in ps2_runtime.cpp), so wider windows genuinely show more stage.
-    {
-        static const int kRes[][2] = {{1024, 768}, {1280, 720}, {1360, 768},
-                                      {1366, 768}, {1440, 900}, {1600, 900},
-                                      {1920, 1080}, {2560, 1440}, {3440, 1440}, {3840, 2160}};
-        static const char *kResNames[] = {"1024 x 768 (4:3)", "1280 x 720", "1360 x 768",
-                                          "1366 x 768", "1440 x 900", "1600 x 900",
-                                          "1920 x 1080", "2560 x 1440", "3440 x 1440 (ultrawide)",
-                                          "3840 x 2160 (4K)"};
-        constexpr int kResCount = 10;
-        int cur = -1;
-        const int w = bt3GetScreenWidth(), h = bt3GetScreenHeight();
-        for (int i = 0; i < kResCount; ++i)
-            if (kRes[i][0] == w && kRes[i][1] == h) { cur = i; break; }
-        char curLabel[32];
-        std::snprintf(curLabel, sizeof(curLabel), "%d x %d", w, h);
-        ImGui::TextUnformatted("Window Size");
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-        if (ImGui::BeginCombo("##winsize", cur >= 0 ? kResNames[cur] : curLabel))
-        {
-            for (int i = 0; i < kResCount; ++i)
-            {
-                if (ImGui::Selectable(kResNames[i], i == cur) && i != cur && !bt3IsWindowFullscreen())
-                {
-                    bt3SetWindowSize(kRes[i][0], kRes[i][1]);
-                    m_settings.windowW = kRes[i][0];
-                    m_settings.windowH = kRes[i][1];
-                    m_dirty = true;
-                }
-            }
-            ImGui::EndCombo();
-        }
-        if (bt3IsWindowFullscreen())
-            ImGui::TextDisabled("(windowed mode only)");
-    }
 }
 
 void PS2SettingsOverlay::drawControllersTab()
