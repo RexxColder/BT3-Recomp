@@ -132,6 +132,17 @@ foreach ($f in $sources) {
             $new = "#include `"gfx/bt3gl_api.h`"   // [B] bt3* API bridge`n" + $new
         }
     }
+    # A file that included both raylib.h and rlgl.h ends up with the bridge twice (or more, in generated
+    # chunks): keep the first one only.
+    $lines = $new -split "`n"
+    $keep = New-Object System.Collections.ArrayList
+    $seenBridge = $false
+    foreach ($l in $lines) {
+        if ($l -match '#include "gfx/bt3gl_api\.h"') {
+            if (-not $seenBridge) { [void]$keep.Add($l); $seenBridge = $true }
+        } else { [void]$keep.Add($l) }
+    }
+    $new = ($keep -join "`n")
     if ($new -ne $text) {
         if ($Apply) { Set-Content -Path $f.FullName -Value $new -NoNewline }
         $rewritten++
