@@ -242,8 +242,13 @@ namespace
         auto V = [](float x, float y, float u, float v) {
             ps2x::gfx::gl::Vertex p{}; p.x = x; p.y = y; p.u = u; p.v = v;
             p.r = p.g = p.b = p.a = 255; p.q = 1.0f; p.z = 0.0f; return p; };
-        g_altglBlit.SetMat4("mvp", m);
         r.SetShader(&g_altglBlit);
+        // [altglfix] Bind BEFORE setting the matrix. SetMat4 trusts gfx::gl's "current program"
+        // cache, which rlgl's own glUseProgram calls make stale: from the second frame on the
+        // upload skipped glUseProgram, went to whatever program rlgl had bound, and the blit kept
+        // the FIRST frame's window size (a resize / F11 then mis-scaled the picture).
+        g_altglBlit.Bind(dev);
+        g_altglBlit.SetMat4("mvp", m);
         r.SetTexture(&g_altglSrc);
         ps2x::gfx::gl::BlendDesc opaque; opaque.enable = false;
         r.SetBlend(opaque);
@@ -251,7 +256,13 @@ namespace
         r.SetColorMask(true, true, true, true);
         r.SetDepth(false, false, 0x0203);
         ps2xgl::glDisable(ps2xgl::GL_CULL_FACE);   // raylib's rlgl leaves culling on
+        // [altglfix] SetDepth(write=false) turns glDepthMask off and nothing turned it back on: the
+        // GS renderer's per-frame glClear(GL_DEPTH_BUFFER_BIT) honours the mask, so the next frame's
+        // first depth clear silently did nothing. Hand the mask back as we found it.
+        ps2xgl::GLboolean hadDepthMask = 1;
+        ps2xgl::glGetBooleanv(ps2xgl::GL_DEPTH_WRITEMASK, &hadDepthMask);
         r.DrawQuad(V(x0, y0, u0, vTop), V(x1, y0, u1, vTop), V(x1, y1, u1, vBottom), V(x0, y1, u0, vBottom));
+        ps2xgl::glDepthMask(hadDepthMask);
         // [altGL] Hand the GL state back through RAYLIB'S OWN rlgl API. Our direct draws changed
         // GL (blend disabled, our program/texture/VAO bound) but rlgl's cached state still says
         // "alpha blend on, rlgl's program/texture bound" and therefore re-applies NOTHING. The

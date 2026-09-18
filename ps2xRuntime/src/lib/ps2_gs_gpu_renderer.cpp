@@ -9270,10 +9270,15 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (depthOn && wantDepthClear)
         {
             flushBatch(__LINE__);
+            // [altglfix] glClear honours glDepthMask: a mask left off by the previous frame's last
+            // draw (or by the present) made this clear a no-op and kept last frame's Z.
+            unsigned char hadDepthMask = 1; glGetBooleanv(0x0B72 /*GL_DEPTH_WRITEMASK*/, &hadDepthMask);
+            glDepthMask(1);
             glClearDepth(0.0);
             glClear(GL_DEPTH_BUFFER_BIT);
             { extern unsigned long g_dbgDepthClears; ++g_dbgDepthClears; }
             glClearDepth(1.0); // restore raylib's default clear-depth
+            glDepthMask(hadDepthMask);
         }
         bt3BeginShaderMode(g_shader);      // PS2 Ã·128 modulate (overbright-capable)
         ps2xResetIdxMode();             // [idxrt] present must never sample through the palette
