@@ -6,7 +6,7 @@
 //
 // Keys:  R/G/B/W set the clear color, SPACE toggles vsync, ESC quits.
 
-#include "raylib.h"
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 
 #include "gfx/d3d11/D3D11Device.h"
 #include "gfx/d3d11/D3D11Gfx.h"
@@ -22,26 +22,26 @@ static const char *kVS =
     "cbuffer CB:register(b0){ float4 uTint; }\n"
     "VSOut VSMain(VSIn i){ VSOut o; o.pos=float4(i.pos,0,1); o.uv=i.uv; o.col=i.col; return o; }\n";
 static const char *kPS =
-    "Texture2D tex:register(t0); SamplerState smp:register(s0);\n"
+    "bt3Texture2D tex:register(t0); SamplerState smp:register(s0);\n"
     "struct VSOut { float4 pos:SV_POSITION; float2 uv:TEXCOORD; float4 col:COLOR; };\n"
     "cbuffer CB:register(b0){ float4 uTint; }\n"
     "float4 PSMain(VSOut i):SV_Target{ return tex.Sample(smp,i.uv) * i.col * uTint; }\n";
 
 int main()
 {
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-    InitWindow(1280, 720, "PS2X - D3D11 probe");
-    if (!IsWindowReady())
+    bt3SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+    bt3InitWindow(1280, 720, "PS2X - D3D11 probe");
+    if (!bt3IsWindowReady())
     {
         std::fprintf(stderr, "[probe] raylib window failed\n");
         return 1;
     }
 
     ps2x::gfx::D3D11Device dev;
-    if (!dev.Init(GetWindowHandle(), (uint32_t)GetScreenWidth(), (uint32_t)GetScreenHeight()))
+    if (!dev.Init(GetWindowHandle(), (uint32_t)bt3GetScreenWidth(), (uint32_t)bt3GetScreenHeight()))
     {
         std::fprintf(stderr, "[probe] D3D11 init failed\n");
-        CloseWindow();
+        bt3CloseWindow();
         return 2;
     }
 
@@ -52,7 +52,7 @@ int main()
     {
         std::fprintf(stderr, "[probe] gfx layer init failed\n");
         dev.Shutdown();
-        CloseWindow();
+        bt3CloseWindow();
         return 3;
     }
 
@@ -82,17 +82,17 @@ int main()
     double fpsAccum = 0.0;
     int fpsFrames = 0;
 
-    while (running && !WindowShouldClose())
+    while (running && !bt3WindowShouldClose())
     {
-        PollInputEvents();
-        if (IsKeyPressed(KEY_ESCAPE)) running = false;
-        if (IsKeyPressed(KEY_R)) clear = {0.70f, 0.10f, 0.12f, 1.0f};
-        if (IsKeyPressed(KEY_G)) clear = {0.10f, 0.65f, 0.20f, 1.0f};
-        if (IsKeyPressed(KEY_B)) clear = {0.12f, 0.25f, 0.75f, 1.0f};
-        if (IsKeyPressed(KEY_W)) clear = {0.90f, 0.90f, 0.90f, 1.0f};
-        if (IsKeyPressed(KEY_SPACE)) { vsync = !vsync; dev.SetVSync(vsync); }
-        if (IsWindowResized())
-            dev.Resize((uint32_t)GetScreenWidth(), (uint32_t)GetScreenHeight());
+        bt3PollInputEvents();
+        if (bt3IsKeyPressed(BT3_KEY_ESCAPE)) running = false;
+        if (bt3IsKeyPressed(BT3_KEY_R)) clear = {0.70f, 0.10f, 0.12f, 1.0f};
+        if (bt3IsKeyPressed(BT3_KEY_G)) clear = {0.10f, 0.65f, 0.20f, 1.0f};
+        if (bt3IsKeyPressed(BT3_KEY_B)) clear = {0.12f, 0.25f, 0.75f, 1.0f};
+        if (bt3IsKeyPressed(BT3_KEY_W)) clear = {0.90f, 0.90f, 0.90f, 1.0f};
+        if (bt3IsKeyPressed(BT3_KEY_SPACE)) { vsync = !vsync; dev.SetVSync(vsync); }
+        if (bt3IsWindowResized())
+            dev.Resize((uint32_t)bt3GetScreenWidth(), (uint32_t)bt3GetScreenHeight());
 
         dev.BeginFrame(clear);
         {
@@ -116,7 +116,7 @@ int main()
 
         const auto now = std::chrono::steady_clock::now();
         const double elapsed = std::chrono::duration<double>(now - frameStart).count();
-        if (elapsed < 1.0 / 60.0) WaitTime(1.0 / 60.0 - elapsed);
+        if (elapsed < 1.0 / 60.0) bt3WaitTime(1.0 / 60.0 - elapsed);
         frameStart = std::chrono::steady_clock::now();
         fpsAccum += elapsed;
         ++fpsFrames;
@@ -125,7 +125,7 @@ int main()
             char title[128];
             std::snprintf(title, sizeof(title), "PS2X - D3D11 probe | %.1f fps | %ux%u | vsync %s",
                           fpsFrames / fpsAccum, dev.Width(), dev.Height(), vsync ? "on" : "off");
-            SetWindowTitle(title);
+            bt3SetWindowTitle(title);
             fpsAccum = 0.0;
             fpsFrames = 0;
         }
@@ -135,7 +135,7 @@ int main()
     shader.Destroy();
     gfx.Destroy();
     dev.Shutdown();
-    CloseWindow();
+    bt3CloseWindow();
     std::fprintf(stderr, "[probe] clean exit\n");
     return 0;
 }

@@ -21,7 +21,7 @@
 #include <chrono>
 #include <map>
 #include <algorithm>
-#include "raylib.h"
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 extern "C" const char *ps2xExeDirC();   // [mergefix] main.cpp
 
 namespace ps2tex
@@ -207,7 +207,7 @@ bool replacementsEnabled()
 
 namespace
 {
-    // Decode one replacement file to an upload-ready blob. raylib's LoadImage is pure CPU
+    // Decode one replacement file to an upload-ready blob. raylib's bt3LoadImage is pure CPU
     // (stb_image) -- safe on any thread, which is what the async worker relies on.
     bool decodeFile(const std::string &path, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt)
     {
@@ -221,23 +221,23 @@ namespace
         {
             int lw = 0, lh = 0;
             if (ps2x::gfx::GsDecodeImageRGBA8(path.c_str(), rgba, lw, lh) && lw > 0 && lh > 0)
-            { w = lw; h = lh; fmt = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8; return true; }
+            { w = lw; h = lh; fmt = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8; return true; }
         }
-        Image img = LoadImage(path.c_str());
-        if (img.data == nullptr || img.width <= 0 || img.height <= 0) { UnloadImage(img); return false; }
+        bt3Image img = bt3LoadImage(path.c_str());
+        if (img.data == nullptr || img.width <= 0 || img.height <= 0) { bt3UnloadImage(img); return false; }
 
-        // KEEP a compressed DDS compressed. ImageFormat() silently REFUSES to convert compressed
-        // input (rtextures.c only converts when both formats are < PIXELFORMAT_COMPRESSED_DXT1_RGB),
+        // KEEP a compressed DDS compressed. bt3ImageFormat() silently REFUSES to convert compressed
+        // input (rtextures.c only converts when both formats are < BT3_PIXELFORMAT_COMPRESSED_DXT1_RGB),
         // so calling it on BC data would no-op and we would then copy compressed bytes as if they
         // were RGBA8 -- garbage textures with no error. Pass the format through instead and let
         // rlLoadTexture route it to glCompressedTexImage2D.
-        const bool isCompressed = (img.format >= PIXELFORMAT_COMPRESSED_DXT1_RGB);
-        if (!isCompressed) ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+        const bool isCompressed = (img.format >= BT3_PIXELFORMAT_COMPRESSED_DXT1_RGB);
+        if (!isCompressed) bt3ImageFormat(&img, BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
         w = img.width; h = img.height; fmt = img.format;
-        const int bytes = GetPixelDataSize(w, h, img.format);
-        if (bytes <= 0) { UnloadImage(img); return false; }
+        const int bytes = bt3GetPixelDataSize(w, h, img.format);
+        if (bytes <= 0) { bt3UnloadImage(img); return false; }
         rgba.assign((const uint8_t *)img.data, (const uint8_t *)img.data + (size_t)bytes);
-        UnloadImage(img);
+        bt3UnloadImage(img);
         return true;
     }
 
@@ -401,9 +401,9 @@ namespace
     void megaPng(const std::string &name, const uint8_t *rgba, int w, int h)
     {
         if (!rgba || w <= 0 || h <= 0 || s_megaPng >= 800u) return;
-        Image img(static_cast<void *>(const_cast<uint8_t *>(rgba)), w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+        bt3Image img(static_cast<void *>(const_cast<uint8_t *>(rgba)), w, h, 1, BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
         const std::string p = s_megaDir + "/" + name + ".png";
-        if (ExportImage(img, p.c_str())) ++s_megaPng;
+        if (bt3ExportImage(img, p.c_str())) ++s_megaPng;
     }
 
     void megaFinalizeLocked()

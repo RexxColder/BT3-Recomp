@@ -23,7 +23,7 @@ extern "C" const char *glfwGetJoystickName(int jid);
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "imgui.h"
 #include "rlImGui.h"
-#include "raylib.h"
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 #endif
 
 #include <algorithm>
@@ -709,7 +709,7 @@ namespace
         {
             char buf[256]{};
             std::snprintf(buf, sizeof(buf), "pc=0x%08X ra=0x%08X sp=0x%08X gp=0x%08X", pc, ra, sp, gp);
-            ImGui::SetClipboardText(buf);
+            ImGui::bt3SetClipboardText(buf);
         }
 
         ImGui::TextDisabled("full context snapshot is best-effort while guest is running");
@@ -1524,7 +1524,7 @@ namespace
                 break;
             case PadDeviceKind::Gamepad:
                 preview = "Gamepad " + std::to_string(dev.gamepad);
-                if (dev.gamepad >= 0 && IsGamepadAvailable(dev.gamepad))
+                if (dev.gamepad >= 0 && bt3IsGamepadAvailable(dev.gamepad))
                 {
                     const char *nm = glfwGetJoystickName(dev.gamepad);
                     preview += " (" + std::string(nm ? nm : "?") + ")";
@@ -1562,13 +1562,13 @@ namespace
                 }
                 ImGui::EndCombo();
             }
-            if (dev.kind == PadDeviceKind::Gamepad && (dev.gamepad < 0 || !IsGamepadAvailable(dev.gamepad)))
+            if (dev.kind == PadDeviceKind::Gamepad && (dev.gamepad < 0 || !bt3IsGamepadAvailable(dev.gamepad)))
             {
                 ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "Assigned gamepad is not connected.");
             }
 #if defined(__linux__)
             if (nativeAvailable && dev.kind == PadDeviceKind::Gamepad && dev.gamepad >= 0 &&
-                IsGamepadAvailable(dev.gamepad) && native.matchesName(GetGamepadName(dev.gamepad)))
+                bt3IsGamepadAvailable(dev.gamepad) && native.matchesName(GetGamepadName(dev.gamepad)))
             {
                 ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f),
                                    "Native evdev reader active: %s (%s)",
@@ -1633,13 +1633,13 @@ namespace
         if (captureAction >= 0 && captureAction < static_cast<int>(PadAction::Count))
         {
             PadBind bind;
-            // NOTE: GetKeyPressed() is unusable here — rlImGui drains raylib's key queue
+            // NOTE: bt3GetKeyPressed() is unusable here — rlImGui drains raylib's key queue
             // every frame to feed ImGui, so it always returned 0 ("pressing a key does
-            // nothing" while binding). IsKeyPressed() is state-based and unaffected.
+            // nothing" while binding). bt3IsKeyPressed() is state-based and unaffected.
             int pressedKey = 0;
             for (int k = 32; k <= 348 && pressedKey == 0; ++k)
             {
-                if (IsKeyPressed(k))
+                if (bt3IsKeyPressed(k))
                 {
                     pressedKey = k;
                 }
@@ -1654,7 +1654,7 @@ namespace
                 int scanCount = 0;
                 if (dev.kind == PadDeviceKind::Gamepad)
                 {
-                    if (IsGamepadAvailable(dev.gamepad))
+                    if (bt3IsGamepadAvailable(dev.gamepad))
                     {
                         scan[scanCount++] = dev.gamepad;
                     }
@@ -1663,7 +1663,7 @@ namespace
                 {
                     for (int g = 0; g < 8; ++g)
                     {
-                        if (IsGamepadAvailable(g))
+                        if (bt3IsGamepadAvailable(g))
                         {
                             scan[scanCount++] = g;
                         }
@@ -1674,7 +1674,7 @@ namespace
                     const int g = scan[i];
                     for (int b = 0; b < 32; ++b)
                     {
-                        if (IsGamepadButtonPressed(g, b))
+                        if (bt3IsGamepadButtonPressed(g, b))
                         {
                             bind = PadBind{PadBindKind::Button, b, 1.0f, 0.15f};
                             if (dev.kind == PadDeviceKind::None)
@@ -1705,10 +1705,10 @@ namespace
 #endif
                     if (bind.kind == PadBindKind::None)
                     {
-                        const int axisCount = GetGamepadAxisCount(g);
+                        const int axisCount = bt3GetGamepadAxisCount(g);
                         for (int ax = 0; ax < axisCount; ++ax)
                         {
-                            const float v = GetGamepadAxisMovement(g, ax);
+                            const float v = bt3GetGamepadAxisMovement(g, ax);
                             if (std::fabs(v) > 0.5f)
                             {
                                 bind = PadBind{PadBindKind::Axis, ax, v > 0.0f ? 1.0f : -1.0f, 0.15f};
@@ -1920,7 +1920,7 @@ namespace
             if (writeGsDebugDump(dumpPath, regs, gs, history, s_gsHistoryCurrentFrameOnly, s_gsHistoryDrawsOnly, latestFrame, s_lastGsDumpError))
             {
                 s_lastGsDumpPath = dumpPath.string();
-                ImGui::SetClipboardText(s_lastGsDumpPath.c_str());
+                ImGui::bt3SetClipboardText(s_lastGsDumpPath.c_str());
             }
             else
             {
@@ -2398,7 +2398,7 @@ namespace
                 }
             }
             const std::string text = out.str();
-            ImGui::SetClipboardText(text.c_str());
+            ImGui::bt3SetClipboardText(text.c_str());
         }
         ImGui::SameLine();
         if (ImGui::Button("Dump logs TXT"))
@@ -2408,7 +2408,7 @@ namespace
             if (writeRuntimeLogDump(dumpPath, entries, &s_logFilter, s_lastLogDumpError))
             {
                 s_lastLogDumpPath = dumpPath.string();
-                ImGui::SetClipboardText(s_lastLogDumpPath.c_str());
+                ImGui::bt3SetClipboardText(s_lastLogDumpPath.c_str());
             }
             else
             {
@@ -2510,7 +2510,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
-    if (IsKeyPressed(KEY_F1))
+    if (bt3IsKeyPressed(BT3_KEY_F1))
     {
         toggleVisible();
     }

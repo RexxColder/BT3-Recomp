@@ -80,7 +80,7 @@ namespace
 #include "Kernel/Stubs/CD.h"   // [fmvoverride] ps2_stubs::overrideCdFile
 #include "ps2_host_backend.h"
 #include "ps2_settings_overlay.h"
-#include "raylib.h" // window icon (deploy assets/icon.png)
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge // window icon (deploy assets/icon.png)
 // [wstrig] rig lever: PS2X_WSTRIG=<path> forces widescreen ON while <path> exists, so a
 // drive can boot with the calibrated 4:3 screen-matching and flip to true widescreen at
 // fight time (touch the file + resize the window). Checked once a second.
@@ -89,7 +89,7 @@ static bool wsTrigActive()
     static const char *s_p = std::getenv("PS2X_WSTRIG");
     if (!s_p || !s_p[0]) return false;
     static double s_last = -1.0; static bool s_on = false;
-    const double now = GetTime();
+    const double now = bt3GetTime();
     if (now - s_last > 1.0) { s_last = now; s_on = std::filesystem::exists(s_p); }
     return s_on;
 }
@@ -103,7 +103,7 @@ static bool wsLever(const char *env, double &last, bool &on)
 {
     const char *p = std::getenv(env);
     if (!p || !p[0]) return false;
-    const double now = GetTime();
+    const double now = bt3GetTime();
     if (now - last > 1.0) { last = now; on = std::filesystem::exists(p); }
     return on;
 }
@@ -121,7 +121,7 @@ static float wsKnobFile(const char *env, double &last, float &cache)
 {
     const char *p = std::getenv(env);
     if (!p || !p[0]) return -1.0f;
-    const double now = GetTime();
+    const double now = bt3GetTime();
     if (now - last > 1.0)
     {
         last = now; cache = -1.0f;
@@ -157,11 +157,11 @@ float g_ps2xWsHudInv = 1.0f;
 // VISIBLE content width (~493 in fights), not FRAME.FBW (640) -- scaling the breakpoints
 // by FBW shoved the center window into a bridge zone and stretched the timer plaque.
 float g_ps2xWsSrcW = 512.0f;
-#include "rlgl.h" // rlSetBlendFactorsSeparate for the blend-free present blit
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge // bt3rlSetBlendFactorsSeparate for the blend-free present blit
 
 #if defined(_WIN32)
 // [altGL] Opt-in present through the standalone GL layer (PS2X_ALTGL=1): the game frame is drawn
-// with gfx::gl instead of raylib's DrawTexturePro. The GS still renders through rlgl for now;
+// with gfx::gl instead of raylib's bt3DrawTexturePro. The GS still renders through rlgl for now;
 // only the final blit moves. Borrows raylib's window/context during the transition (tools/gl_probe).
 #include "gfx/gl/GlDevice.h"
 #include "gfx/gl/GlGfx.h"
@@ -187,7 +187,7 @@ namespace
         // Shared, process-wide gfx::gl context (also used by the GS backend from A1 on).
         g_altglOk = ps2x::gfx::gl::EnsureContext(GetWindowHandle(),
                                                  [](const char *n) { return (void *)wglGetProcAddress(n); },
-                                                 (uint32_t)GetScreenWidth(), (uint32_t)GetScreenHeight())
+                                                 (uint32_t)bt3GetScreenWidth(), (uint32_t)bt3GetScreenHeight())
                  && g_altglBlit.Compile(ps2x::gfx::gl::Device(), ps2x::gfx::gl::kGlBlitVertexShader,
                                         ps2x::gfx::gl::kGlBlitFragmentShader);
         std::fprintf(stderr, "[altgl] present init %s (GL %s)\n", g_altglOk ? "ok" : "FAILED",
@@ -196,18 +196,18 @@ namespace
     }
 
     // Returns true when gfx::gl drew the frame (the caller then skips the raylib present).
-    bool AltGlPresent(Texture2D &tex, const Rectangle &src, const Rectangle &dst, bool bilinear)
+    bool AltGlPresent(bt3Texture2D &tex, const bt3Rectangle &src, const bt3Rectangle &dst, bool bilinear)
     {
         if (!AltGlEnabled() || !tex.id || !AltGlInit()) return false;
         ps2x::gfx::gl::GlDevice &dev = ps2x::gfx::gl::Device();
         ps2x::gfx::gl::Renderer &r = ps2x::gfx::gl::RendererRef();
-        const float W = (float)GetScreenWidth(), H = (float)GetScreenHeight();
+        const float W = (float)bt3GetScreenWidth(), H = (float)bt3GetScreenHeight();
         if (g_altglSrcId != tex.id || g_altglSrc.Width() != (uint32_t)tex.width ||
             g_altglSrc.Height() != (uint32_t)tex.height)
         { g_altglSrc.AdoptGL(dev, tex.id, (uint32_t)tex.width, (uint32_t)tex.height); g_altglSrcId = tex.id; }
         g_altglSrc.SetSamplerUV(dev, bilinear ? ps2x::gfx::gl::Filter::Linear : ps2x::gfx::gl::Filter::Point,
                                 ps2x::gfx::gl::Wrap::Clamp, ps2x::gfx::gl::Wrap::Clamp);
-        // Mirror raylib's DrawTexturePro texcoord maths exactly (including the negative-height
+        // Mirror raylib's bt3DrawTexturePro texcoord maths exactly (including the negative-height
         // flip used by the GPU present): the flip moves source.y up instead of negating V, which
         // is what keeps V inside [0,1]. Getting this wrong samples outside the texture -> black.
         const float texW = (float)tex.width, texH = (float)tex.height;
@@ -238,17 +238,17 @@ namespace
         // "alpha blend on, rlgl's program/texture bound" and therefore re-applies NOTHING. The
         // overlay (rlImGui) is drawn by rlgl right after and then renders with blending OFF, so
         // every glyph quad becomes an opaque block of the text colour (the "garbled" overlay).
-        rlEnableColorBlend();
-        rlSetBlendMode(RL_BLEND_ALPHA);
-        rlActiveTextureSlot(0);
-        rlDisableTexture();
-        rlDisableShader();
-        rlDrawRenderBatchActive();
+        bt3rlEnableColorBlend();
+        bt3rlSetBlendMode(BT3RL_BLEND_ALPHA);
+        bt3rlActiveTextureSlot(0);
+        bt3rlDisableTexture();
+        bt3rlDisableShader();
+        bt3rlDrawRenderBatchActive();
         return true;
     }
 }
 #else
-namespace { bool AltGlPresent(Texture2D &, const Rectangle &, const Rectangle &, bool) { return false; } }
+namespace { bool AltGlPresent(bt3Texture2D &, const bt3Rectangle &, const bt3Rectangle &, bool) { return false; } }
 #endif
 
 namespace ps2_syscalls { bool bt3WakeThreadByEntry(uint32_t entry); }
@@ -1031,7 +1031,7 @@ PS2Runtime::GuestExecutionReleaseScope::~GuestExecutionReleaseScope()
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+static void UploadFrame(bt3Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -1096,9 +1096,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
-        UpdateTexture(tex, blank.data);
-        UnloadImage(blank);
+        bt3Image blank = bt3GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        bt3UpdateTexture(tex, blank.data);
+        bt3UnloadImage(blank);
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
         s_lastWidth = outWidth;
@@ -1139,12 +1139,12 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         static int s_sc = 0; ++s_sc;
         if (s_sd && (s_sc % 90) == 45 && !s_scratch.empty() && width != 0u && height != 0u)
         {
-            Image im{}; im.data = s_scratch.data(); im.width = static_cast<int>(width);
+            bt3Image im{}; im.data = s_scratch.data(); im.width = static_cast<int>(width);
             im.height = static_cast<int>(height); im.mipmaps = 1;
-            im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            im.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
             char p[160];
             std::snprintf(p, sizeof(p), "/home/z3/Desktop/bt3/work/sw_present_%d_fbp%u.png", s_sc, displayFbp);
-            ExportImage(im, p);
+            bt3ExportImage(im, p);
             std::fprintf(stderr, "[sw-dump] %s %ux%u displayFbp=%u sourceFbp=%u\n", p, width, height, displayFbp, sourceFbp);
         }
     }
@@ -1170,7 +1170,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
     }
 
-    UpdateTexture(tex, s_uploadBuffer.data());
+    bt3UpdateTexture(tex, s_uploadBuffer.data());
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
@@ -1305,9 +1305,9 @@ PS2Runtime::~PS2Runtime()
             m_debugUiInitialized = false;
         }
 
-        if (IsWindowReady())
+        if (bt3IsWindowReady())
         {
-            CloseWindow();
+            bt3CloseWindow();
         }
 
         m_loadedModules.clear();
@@ -1404,25 +1404,25 @@ bool PS2Runtime::initialize(const char *title)
         }
 
 #if defined(PLATFORM_VITA)
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+        bt3InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
         {   // [vsync] PS2X_VSYNC=1: enable vsync (GPU waits for v-blank -> idles -> lower temp).
             const char *v = std::getenv("PS2X_VSYNC");
-            if (v && v[0] && v[0] != '0') SetConfigFlags(FLAG_VSYNC_HINT);
+            if (v && v[0] && v[0] != '0') bt3SetConfigFlags(FLAG_VSYNC_HINT);
         }
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+        bt3SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         int hostWinW = HOST_WINDOW_WIDTH, hostWinH = HOST_WINDOW_HEIGHT;
         if (const char *w = std::getenv("PS2X_WINDOW_W")) { const int v = std::atoi(w); if (v > 0) hostWinW = v; }
         if (const char *h = std::getenv("PS2X_WINDOW_H")) { const int v = std::atoi(h); if (v > 0) hostWinH = v; }
-        InitWindow(hostWinW, hostWinH, title);
+        bt3InitWindow(hostWinW, hostWinH, title);
         {   // [monitor] PS2X_MONITOR=<index>: move the window to that monitor (0 = primary).
             const char *mon = std::getenv("PS2X_MONITOR");
-            if (mon && mon[0]) { const int idx = std::atoi(mon); if (idx >= 0 && idx < GetMonitorCount()) SetWindowMonitor(idx); }
+            if (mon && mon[0]) { const int idx = std::atoi(mon); if (idx >= 0 && idx < bt3GetMonitorCount()) bt3SetWindowMonitor(idx); }
         }
         // [icon] Carry the launcher's icon onto the runner window. Same asset
         // convention as the overlay font (<exeDir>/assets/icon.png); exeDir is
         // PS2X_EXEDIR (deploy root) else the executable's own directory.
-        // raylib's SetWindowIcon must be called on a live (hidden) window.
+        // raylib's bt3SetWindowIcon must be called on a live (hidden) window.
         {
             std::error_code ec;
             std::filesystem::path exeDir;
@@ -1447,7 +1447,7 @@ bool PS2Runtime::initialize(const char *title)
             }
             if (std::filesystem::is_regular_file(iconPath, ec) && !ec)
             {
-                Image icon = LoadImage(iconPath.string().c_str());
+                bt3Image icon = bt3LoadImage(iconPath.string().c_str());
                 if (icon.data != nullptr)
                 {
                     // The deploy art is huge (7k x 5k); X11's _NET_WM_ICON
@@ -1455,10 +1455,10 @@ bool PS2Runtime::initialize(const char *title)
                     // single request (BadLength). Downscale before setting.
                     const int target = 128;
                     if (icon.width > target || icon.height > target)
-                        ImageResize(&icon, target,
+                        bt3ImageResize(&icon, target,
                                     target * icon.height / icon.width);
-                    SetWindowIcon(icon);
-                    UnloadImage(icon);
+                    bt3SetWindowIcon(icon);
+                    bt3UnloadImage(icon);
                 }
             }
         }
@@ -1469,7 +1469,7 @@ bool PS2Runtime::initialize(const char *title)
         if (AltGlEnabled()) AltGlInit();
         else ps2x::gfx::gl::EnsureContext(GetWindowHandle(),
                                           [](const char *n) { return (void *)wglGetProcAddress(n); },
-                                          (uint32_t)GetScreenWidth(), (uint32_t)GetScreenHeight());
+                                          (uint32_t)bt3GetScreenWidth(), (uint32_t)bt3GetScreenHeight());
 #endif
         // [hostio] audio and gamepads go through the host layers (SDL2 by default, raylib on
         // PS2X_HOSTAUDIO=raylib / PS2X_HOSTPAD=raylib); the window and keyboard stay raylib's.
@@ -1488,8 +1488,8 @@ bool PS2Runtime::initialize(const char *title)
                 // HWND under GLFW), so the native handle must be resolved through SDL or the swap chain
                 // is created on a bogus HWND.
                 g_ps2xD3D11Mode = g_ps2xD3D11.Init(ps2xNativeWindowHandle(GetWindowHandle()),
-                                                   static_cast<uint32_t>(GetScreenWidth()),
-                                                   static_cast<uint32_t>(GetScreenHeight()));
+                                                   static_cast<uint32_t>(bt3GetScreenWidth()),
+                                                   static_cast<uint32_t>(bt3GetScreenHeight()));
                 if (!g_ps2xD3D11Mode)
                     std::fprintf(stderr, "[d3d11] init failed; staying on the raylib GL presenter\n");
                 else
@@ -1501,7 +1501,7 @@ bool PS2Runtime::initialize(const char *title)
             }
         }
 #endif
-        SetTargetFPS(60);
+        bt3SetTargetFPS(60);
         {   // [texreplace] Index replacements at STARTUP rather than lazily on the first texture
             // decode, so the overlay's Texture Replacement switch is correctly enabled/disabled
             // from the moment it opens and the "[texreplace] indexed N" line appears at boot.
@@ -1526,15 +1526,15 @@ bool PS2Runtime::initialize(const char *title)
             }
         }
         // [barblock] manual pacing: the present thread must service guest barriers every few
-        // hundred microseconds, which it cannot do while asleep inside EndDrawing's frame cap.
+        // hundred microseconds, which it cannot do while asleep inside bt3EndDrawing's frame cap.
         // PS2X_BARPACE=0 keeps raylib's frame cap (barrier latency then <= one frame) -- A/B for
         // whether the manual pacing itself disturbs the guest.
         static const bool s_barPace = [](){ const char *v = std::getenv("PS2X_BARPACE"); return !(v && v[0] == '0'); }();
-        if (GsGpuRenderer::blockingBarriersEnabled() && s_barPace) SetTargetFPS(0);
+        if (GsGpuRenderer::blockingBarriersEnabled() && s_barPace) bt3SetTargetFPS(0);
         // PS2X_TOPMOST=1: keep the game window above others — unattended (AFK) test runs
         // screenshot the whole desktop, and an occluded window can't be captured on Wayland.
         if (const char *tm = std::getenv("PS2X_TOPMOST"); tm && tm[0] && tm[0] != '0')
-            SetWindowState(FLAG_WINDOW_TOPMOST);
+            bt3SetWindowState(FLAG_WINDOW_TOPMOST);
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -5833,9 +5833,9 @@ void PS2Runtime::run()
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
     // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
-    UnloadImage(blank);
+    bt3Image blank = bt3GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+    bt3Texture2D frameTex = bt3LoadTextureFromImage(blank);
+    bt3UnloadImage(blank);
 
     g_activeThreads.store(1, std::memory_order_relaxed);
     std::atomic<bool> gameThreadFinished{false};
@@ -6447,7 +6447,7 @@ void PS2Runtime::run()
             float wsScale = 1.0f;
             if (PS2SettingsOverlay::isWidescreen() || wsTrigActive())
             {
-                const float wsA = (float)GetScreenWidth() / (float)std::max(1, GetScreenHeight());
+                const float wsA = (float)bt3GetScreenWidth() / (float)std::max(1, bt3GetScreenHeight());
                 wsScale = wsA / (4.0f / 3.0f);
                 if (wsScale < 1.0f) wsScale = 1.0f;
                 if (wsScale > 2.5f) wsScale = 2.5f;
@@ -6476,9 +6476,9 @@ void PS2Runtime::run()
                     static const bool s_lg = [](){ const char *v = std::getenv("PS2X_WSFOVLOG");
                                                    return v && v[0] && v[0] != '0'; }();
                     static double s_t = -1.0;
-                    if (s_lg && GetTime() - s_t > 1.0)
+                    if (s_lg && bt3GetTime() - s_t > 1.0)
                     {
-                        s_t = GetTime();
+                        s_t = bt3GetTime();
                         std::fprintf(stderr, "[wsfovlog] game=%.6f/%.3f orig=%.6f/%.3f scale=%.4f\n",
                                      *wp1, *wp2, s_wsOrig1, s_wsOrig2, wsScale);
                     }
@@ -6548,11 +6548,11 @@ void PS2Runtime::run()
             {
                 s_wsLast = wsScale;
                 std::fprintf(stderr, "[truews] scale=%.4f window=%dx%d orig=(%.4f, %.2f)\n",
-                             wsScale, GetScreenWidth(), GetScreenHeight(), s_wsOrig1, s_wsOrig2);
+                             wsScale, bt3GetScreenWidth(), bt3GetScreenHeight(), s_wsOrig1, s_wsOrig2);
             }
         }
 #endif
-        Texture2D presentTex = frameTex;
+        bt3Texture2D presentTex = frameTex;
         bool flipY = false;
         if (gpuMode)
         {
@@ -6568,7 +6568,7 @@ void PS2Runtime::run()
             presentTex.width = std::max(1, ps2GpuRenderer().presentTexWidth());
             presentTex.height = std::max(1, ps2GpuRenderer().presentTexHeight());
             presentTex.mipmaps = 1;
-            presentTex.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            presentTex.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
             flipY = true;
             int dw = ps2GpuRenderer().displayWidth();
             int dh = ps2GpuRenderer().displayHeight();
@@ -6581,10 +6581,10 @@ void PS2Runtime::run()
         {
             UploadFrame(frameTex, this, presentWidth, presentHeight);
         }
-        Texture2D *pgsTexPtr = nullptr;   // [pgsfit] set when the paraLLEl-GS scanout is what gets presented
+        bt3Texture2D *pgsTexPtr = nullptr;   // [pgsfit] set when the paraLLEl-GS scanout is what gets presented
         if (gpuMode && ps2x_pgs::enabled())
         {   // [pgs] the paraLLEl-GS scanout arrives as an RGBA8 buffer; upload it and present that instead
-            static Texture2D s_pgsTex{};
+            static bt3Texture2D s_pgsTex{};
             static uint32_t s_pw = 0, s_ph = 0;
             static std::vector<uint8_t> s_pgsBuf;
             uint32_t pw = 0, ph = 0;
@@ -6596,18 +6596,18 @@ void PS2Runtime::run()
                     static unsigned s_dumpN = 0;
                     if (s_dumpDir && s_dumpDir[0] && (s_dumpN++ % (unsigned)s_dumpEvery) == 0u)
                     {
-                        Image im{}; im.data = s_pgsBuf.data(); im.width = (int)pw; im.height = (int)ph; im.mipmaps = 1; im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                        bt3Image im{}; im.data = s_pgsBuf.data(); im.width = (int)pw; im.height = (int)ph; im.mipmaps = 1; im.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
                         char path[512]; std::snprintf(path, sizeof(path), "%s/pgs_%05u.png", s_dumpDir, s_dumpN - 1u);
-                        ExportImage(im, path);
+                        bt3ExportImage(im, path);
                     }
                 }
                 if (pw != s_pw || ph != s_ph)
                 {
-                    if (s_pgsTex.id) UnloadTexture(s_pgsTex);
-                    Image im{}; im.data = s_pgsBuf.data(); im.width = (int)pw; im.height = (int)ph; im.mipmaps = 1; im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-                    s_pgsTex = LoadTextureFromImage(im); s_pw = pw; s_ph = ph;
+                    if (s_pgsTex.id) bt3UnloadTexture(s_pgsTex);
+                    bt3Image im{}; im.data = s_pgsBuf.data(); im.width = (int)pw; im.height = (int)ph; im.mipmaps = 1; im.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                    s_pgsTex = bt3LoadTextureFromImage(im); s_pw = pw; s_ph = ph;
                 }
-                else UpdateTexture(s_pgsTex, s_pgsBuf.data());
+                else bt3UpdateTexture(s_pgsTex, s_pgsBuf.data());
             }
             if (s_pgsTex.id) { presentTex = s_pgsTex; flipY = false; presentWidth = s_pw; presentHeight = s_ph; pgsTexPtr = &s_pgsTex; }
         }
@@ -6624,13 +6624,13 @@ void PS2Runtime::run()
         if (g_ps2xD3D11Mode)
         {   // [d3d11] Native video frame. The GS replay already ran (renderAndGetTextureId
             // above); present through the D3D11 swap chain instead of raylib's GL one, so
-            // there is no BeginDrawing/EndDrawing and no GL swap to fight the D3D11 present.
-            // Input still updates through PollInputEvents. Until the GS renderer is ported
+            // there is no bt3BeginDrawing/bt3EndDrawing and no GL swap to fight the D3D11 present.
+            // Input still updates through bt3PollInputEvents. Until the GS renderer is ported
             // (P3) this shows a flat clear.
-            if (IsWindowResized())
-                g_ps2xD3D11.Resize(static_cast<uint32_t>(GetScreenWidth()),
-                                   static_cast<uint32_t>(GetScreenHeight()));
-            PollInputEvents();
+            if (bt3IsWindowResized())
+                g_ps2xD3D11.Resize(static_cast<uint32_t>(bt3GetScreenWidth()),
+                                   static_cast<uint32_t>(bt3GetScreenHeight()));
+            bt3PollInputEvents();
             {   // [diag] PS2X_D3DDUMP=1: write the native present texture to a PNG. PS2X_D3DDUMP=key
                 // dumps ONE frame when the user presses F9 (grab the exact moment to inspect), any
                 // other truthy value dumps periodically.
@@ -6640,7 +6640,7 @@ void PS2Runtime::run()
                 {
                     const bool keyMode = (std::strcmp(s_dumpEnv, "key") == 0);
                     const int n = ++s_dumpN;
-                    const bool fire = keyMode ? (IsKeyPressed(KEY_F9) || n == 1800) : ((n % 60) == 0 && n <= 36000);
+                    const bool fire = keyMode ? (bt3IsKeyPressed(BT3_KEY_F9) || n == 1800) : ((n % 60) == 0 && n <= 36000);
                     if (fire)
                     {
                         char p[256];
@@ -6653,9 +6653,9 @@ void PS2Runtime::run()
                             std::vector<uint8_t> buf;
                             if (ps2x::gfx::ReadbackRGBA(g_ps2xD3D11, g_d3dPresent, buf) && g_d3dPresent.Width() > 0)
                             {
-                                Image img(static_cast<void *>(buf.data()), (int)g_d3dPresent.Width(),
-                                          (int)g_d3dPresent.Height(), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
-                                ok = ExportImage(img, p);
+                                bt3Image img(static_cast<void *>(buf.data()), (int)g_d3dPresent.Width(),
+                                          (int)g_d3dPresent.Height(), 1, BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+                                ok = bt3ExportImage(img, p);
                             }
                         }
                         if (!ok) ok = ps2GpuRenderer().d3dDumpPresent(p);
@@ -6669,7 +6669,7 @@ void PS2Runtime::run()
                 // [texmega] ON by default so the Launcher (no env) can trigger it: press F9.
                 // PS2X_TEXMEGA=0 disables.
                 static const bool s_tm = [](){ const char *v = std::getenv("PS2X_TEXMEGA"); return !(v && v[0] == '0'); }();
-                if (s_tm && IsKeyPressed(KEY_F9))
+                if (s_tm && bt3IsKeyPressed(BT3_KEY_F9))
                 {
                     const char *xd = ps2xExeDirC();
                     const std::string d = std::string((xd && xd[0]) ? xd : ".") + "/logs/texmega";
@@ -6839,26 +6839,26 @@ void PS2Runtime::run()
         else
         {
 #endif
-        BeginDrawing();
+        bt3BeginDrawing();
         {   // [presentstate] pre-render chunks and barrier services run GL work between presents and
             // leave the GS emulation state behind (blend off / GS blend factors, scissor, colour mask,
             // custom shader, texture unit). The frame blit and the ImGui overlay assume raylib's
             // defaults: the overlay's glyph quads drawn with blending off are solid white rectangles.
-            rlDrawRenderBatchActive();
-            rlDisableScissorTest();
-            rlDisableDepthTest();
-            rlEnableColorBlend();
-            rlSetBlendMode(RL_BLEND_ALPHA);
-            rlColorMask(true, true, true, true);
-            rlActiveTextureSlot(0);
-            rlDisableShader();
+            bt3rlDrawRenderBatchActive();
+            bt3rlDisableScissorTest();
+            bt3rlDisableDepthTest();
+            bt3rlEnableColorBlend();
+            bt3rlSetBlendMode(BT3RL_BLEND_ALPHA);
+            bt3rlColorMask(true, true, true, true);
+            bt3rlActiveTextureSlot(0);
+            bt3rlDisableShader();
         }
-        ClearBackground(BLACK);
+        bt3ClearBackground(BLACK);
         { extern double g_fpBegin; g_fpBegin += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tBegin).count(); }
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
-        const float screenWidth = static_cast<float>(GetScreenWidth());
-        const float screenHeight = static_cast<float>(GetScreenHeight());
+        const float screenWidth = static_cast<float>(bt3GetScreenWidth());
+        const float screenHeight = static_cast<float>(bt3GetScreenHeight());
         const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
         float dstWidth = srcWidth * scale;
         float dstHeight = srcHeight * scale;
@@ -6923,8 +6923,8 @@ void PS2Runtime::run()
         const float inset = (s_pEdge && GsGpuRenderer::renderScale() > 1) ? 0.5f : 0.0f;
         const float srcW2 = srcWidth  - 2.0f * inset;
         const float srcH2 = srcHeight - 2.0f * inset;
-        const Rectangle srcRect{srcX + inset, srcY + inset, srcW2, flipY ? -srcH2 : srcH2};
-        const Rectangle dstRect{
+        const bt3Rectangle srcRect{srcX + inset, srcY + inset, srcW2, flipY ? -srcH2 : srcH2};
+        const bt3Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
@@ -6976,21 +6976,21 @@ void PS2Runtime::run()
                 }
                 else
 #endif
-                {                static Texture2D s_fmvTex{};
+                {                static bt3Texture2D s_fmvTex{};
                 static int s_tw = 0, s_th = 0;
                 static uint64_t s_gen = ~0ull;
                 if (of.w != s_tw || of.h != s_th)
                 {
-                    if (s_fmvTex.id != 0) UnloadTexture(s_fmvTex);
-                    Image im{};
+                    if (s_fmvTex.id != 0) bt3UnloadTexture(s_fmvTex);
+                    bt3Image im{};
                     im.data = const_cast<uint8_t *>(of.rgba);
                     im.width = of.w; im.height = of.h; im.mipmaps = 1;
-                    im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-                    s_fmvTex = LoadTextureFromImage(im);
-                    SetTextureFilter(s_fmvTex, TEXTURE_FILTER_BILINEAR);
+                    im.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                    s_fmvTex = bt3LoadTextureFromImage(im);
+                    bt3SetTextureFilter(s_fmvTex, TEXTURE_FILTER_BILINEAR);
                     s_tw = of.w; s_th = of.h; s_gen = ~0ull;
                 }
-                if (of.gen != s_gen) { UpdateTexture(s_fmvTex, of.rgba); s_gen = of.gen; }
+                if (of.gen != s_gen) { bt3UpdateTexture(s_fmvTex, of.rgba); s_gen = of.gen; }
                 float dw = 0.0f, dh = 0.0f;
                 if (PS2SettingsOverlay::isWidescreen() || wsTrigActive())
                 {
@@ -7001,10 +7001,10 @@ void PS2Runtime::run()
                     const float s = std::min(screenWidth / (float)of.w, screenHeight / (float)of.h);
                     dw = (float)of.w * s; dh = (float)of.h * s;
                 }
-                const Rectangle fsrc{0.0f, 0.0f, (float)of.w, (float)of.h};
-                const Rectangle fdst{(screenWidth - dw) * 0.5f, (screenHeight - dh) * 0.5f, dw, dh};
+                const bt3Rectangle fsrc{0.0f, 0.0f, (float)of.w, (float)of.h};
+                const bt3Rectangle fdst{(screenWidth - dw) * 0.5f, (screenHeight - dh) * 0.5f, dw, dh};
                 const Color ftint{255, 255, 255, (unsigned char)(of.alpha * 255.0f + 0.5f)};
-                DrawTexturePro(s_fmvTex, fsrc, fdst, Vector2{0.0f, 0.0f}, 0.0f, ftint);
+                bt3DrawTexturePro(s_fmvTex, fsrc, fdst, bt3Vector2{0.0f, 0.0f}, 0.0f, ftint);
                 fmvDrew = true;
                 }   // end raylib FMV path
             }
@@ -7014,8 +7014,8 @@ void PS2Runtime::run()
         // the final blit would punch the frame transparent to the clear color.
         const auto _tBlit = std::chrono::steady_clock::now();
         if (!fmvDrew) {
-        rlSetBlendFactorsSeparate(0x0001 /*GL_ONE*/, 0x0000 /*GL_ZERO*/, 0x0001, 0x0000, 0x8006 /*GL_FUNC_ADD*/, 0x8006);
-        BeginBlendMode(BLEND_CUSTOM_SEPARATE);
+        bt3rlSetBlendFactorsSeparate(0x0001 /*GL_ONE*/, 0x0000 /*GL_ZERO*/, 0x0001, 0x0000, 0x8006 /*GL_FUNC_ADD*/, 0x8006);
+        bt3BeginBlendMode(BT3_BLEND_CUSTOM_SEPARATE);
         // [rscale] present the scaled scene with LINEAR sampling: at render scale N the
         // texture is N x native, and any non-integer window ratio point-decimates --
         // ground shake at 720p windows, HUD shimmer at 1080p. The renderer re-applies
@@ -7029,18 +7029,18 @@ void PS2Runtime::run()
             static const bool s_mip = [](){ const char *v = std::getenv("PS2X_PGS_PRESENTMIP"); return !(v && v[0] == '0'); }();
             const float ratio = std::max(srcWidth / std::max(1.0f, dstWidth), srcHeight / std::max(1.0f, dstHeight));
             ps2x_pgs::setPresentSize(uint32_t(dstWidth + 0.5f), uint32_t(dstHeight + 0.5f));
-            if (s_mip && ratio > 1.5f) { GenTextureMipmaps(pgsTexPtr); SetTextureFilter(*pgsTexPtr, TEXTURE_FILTER_TRILINEAR); }
-            else if (ratio > 1.001f) SetTextureFilter(*pgsTexPtr, TEXTURE_FILTER_BILINEAR);
-            else SetTextureFilter(*pgsTexPtr, TEXTURE_FILTER_POINT);
+            if (s_mip && ratio > 1.5f) { bt3GenTextureMipmaps(pgsTexPtr); bt3SetTextureFilter(*pgsTexPtr, TEXTURE_FILTER_TRILINEAR); }
+            else if (ratio > 1.001f) bt3SetTextureFilter(*pgsTexPtr, TEXTURE_FILTER_BILINEAR);
+            else bt3SetTextureFilter(*pgsTexPtr, TEXTURE_FILTER_POINT);
         }
         else if (GsGpuRenderer::renderScale() > 1)
-            SetTextureFilter(presentTex, TEXTURE_FILTER_BILINEAR);
+            bt3SetTextureFilter(presentTex, TEXTURE_FILTER_BILINEAR);
         // ...and never let an edge sample wrap to the opposite side of the texture.
-        if (s_pEdge) SetTextureWrap(presentTex, TEXTURE_WRAP_CLAMP);
-        // [altGL] PS2X_ALTGL=1: draw the frame through gfx::gl instead of raylib's DrawTexturePro.
+        if (s_pEdge) bt3SetTextureWrap(presentTex, TEXTURE_WRAP_CLAMP);
+        // [altGL] PS2X_ALTGL=1: draw the frame through gfx::gl instead of raylib's bt3DrawTexturePro.
         if (!AltGlPresent(presentTex, srcRect, dstRect, pgsTexPtr ? true : GsGpuRenderer::renderScale() > 1))
-            DrawTexturePro(presentTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        EndBlendMode();
+            bt3DrawTexturePro(presentTex, srcRect, dstRect, bt3Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        bt3EndBlendMode();
         }
 #if defined(_WIN32)
         // [B] Draw the injected video ON TOP of the frame we just presented.
@@ -7087,15 +7087,15 @@ void PS2Runtime::run()
                         // moment shot.png appears otherwise has that new request deleted here and times out
                         // (the rig's poll loop lost every second capture and walked blind into Dragon Universe).
                         std::filesystem::remove(req, ec);
-                        Image im = LoadImageFromScreen();
+                        bt3Image im = bt3LoadImageFromScreen();
                         const std::string tmp = std::string(s_shotDir) + "/shot.tmp.png", dst = std::string(s_shotDir) + "/shot.png";
-                        ExportImage(im, tmp.c_str()); UnloadImage(im);
+                        bt3ExportImage(im, tmp.c_str()); bt3UnloadImage(im);
                         std::filesystem::rename(tmp, dst, ec);
                     }
                 }
             }
             const auto tP0 = std::chrono::steady_clock::now();
-            EndDrawing();
+            bt3EndDrawing();
             if (s_fp)
             {
                 const auto t1 = std::chrono::steady_clock::now();
@@ -7154,7 +7154,7 @@ void PS2Runtime::run()
         }
 
         // Drain any streaming PCM into the audio device. Must run on the render thread --
-        // raylib's AudioStream calls are not safe to make from the guest threads that
+        // raylib's bt3AudioStream calls are not safe to make from the guest threads that
         // produce the data (see PS2AudioBackend::onStreamPcm / serviceStreams).
         { const auto _t = std::chrono::steady_clock::now();
           audioBackend().serviceStreams();
@@ -7453,7 +7453,7 @@ void PS2Runtime::run()
             }
         }
 
-        if (WindowShouldClose())
+        if (bt3WindowShouldClose())
         {
             RUNTIME_LOG("[run] window close requested, breaking out of loop");
             requestStop();
@@ -7523,8 +7523,8 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    UnloadTexture(frameTex);
-    CloseWindow();
+    bt3UnloadTexture(frameTex);
+    bt3CloseWindow();
 
     const int remainingThreads = g_activeThreads.load(std::memory_order_relaxed);
     RUNTIME_LOG("[run] exiting loop, activeThreads=" << remainingThreads);

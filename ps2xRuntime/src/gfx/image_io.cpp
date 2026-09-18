@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstring>
 
-#include "raylib.h"   // only for the Color struct's fields
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge   // only for the Color struct's fields
 
 namespace ps2x::gfx
 {
@@ -86,7 +86,7 @@ namespace ps2x::gfx
         ps2xgl::glReadPixels(0, 0, w, h, ps2xgl::GL_RGBA, ps2xgl::GL_UNSIGNED_BYTE, tmp.data());
         ps2xgl::glBindFramebuffer(ps2xgl::GL_FRAMEBUFFER, 0);
         ps2xgl::glDeleteFramebuffers(1, &fbo);
-        // NOTE: deliberately NOT flipped -- raylib's LoadImageFromTexture (rlReadTexturePixels)
+        // NOTE: deliberately NOT flipped -- raylib's bt3LoadImageFromTexture (rlReadTexturePixels)
         // returns the raw bottom-up GL data, and the callers already flip when they need to.
         out.swap(tmp);
         return true;

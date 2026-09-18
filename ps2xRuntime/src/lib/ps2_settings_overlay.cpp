@@ -14,7 +14,7 @@
 
 #include "imgui.h"
 #include "gfx/ps2x_ui.h"   // UiSetup/Begin/End: rlImGui (GL) or imgui_impl_dx11 (PS2X_D3D11)
-#include "raylib.h"
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 
 #include "runtime/ps2_toml.h"
 
@@ -116,7 +116,7 @@ namespace
     bool allKeysReleased(const std::vector<int> &keys)
     {
         for (int k : keys)
-            if (IsKeyDown(k)) return false;
+            if (bt3IsKeyDown(k)) return false;
         return true;
     }
 }
@@ -247,7 +247,7 @@ namespace
     // Blinking alpha for "Press..." capture hints.
     float blinkAlpha()
     {
-        return 0.5f + 0.5f * std::sin(ImGui::GetTime() * 6.0f);
+        return 0.5f + 0.5f * std::sin(ImGui::bt3GetTime() * 6.0f);
     }
 
     // Section header helper: small uppercase accent text (Russo One, when loaded)
@@ -289,7 +289,7 @@ namespace
 
 bool PS2SettingsOverlay::s_widescreen = false;
 
-// [fsnative] Fullscreen at the MONITOR's resolution. raylib's ToggleFullscreen() keeps the window's current size as
+// [fsnative] Fullscreen at the MONITOR's resolution. raylib's bt3ToggleFullscreen() keeps the window's current size as
 // the video mode (1024x768 from the INI); on Wayland the compositor then stretches that 4:3 surface across the 16:9
 // panel while the game still sees a 4:3 screen -- neither the true-widescreen FOV patch nor the HUD squeeze engage
 // and the whole picture is stretched. Size the window to the monitor first; restore the saved size on the way out.
@@ -297,19 +297,19 @@ bool PS2SettingsOverlay::s_widescreen = false;
 static void ps2xSetFullscreen(bool on, int windowW, int windowH)
 {
     static const bool s_native = [](){ const char *v = std::getenv("PS2X_FSNATIVE"); return !(v && v[0] == '0'); }();
-    if (!s_native) { ToggleFullscreen(); return; }
+    if (!s_native) { bt3ToggleFullscreen(); return; }
     if (on)
     {
-        if (IsWindowFullscreen()) return;
-        const int m = GetCurrentMonitor();
-        const int mw = GetMonitorWidth(m), mh = GetMonitorHeight(m);
-        if (mw >= 320 && mh >= 240) SetWindowSize(mw, mh);
-        ToggleFullscreen();
+        if (bt3IsWindowFullscreen()) return;
+        const int m = bt3GetCurrentMonitor();
+        const int mw = bt3GetMonitorWidth(m), mh = bt3GetMonitorHeight(m);
+        if (mw >= 320 && mh >= 240) bt3SetWindowSize(mw, mh);
+        bt3ToggleFullscreen();
     }
     else
     {
-        if (IsWindowFullscreen()) ToggleFullscreen();
-        if (windowW >= 320 && windowH >= 240) SetWindowSize(windowW, windowH);
+        if (bt3IsWindowFullscreen()) bt3ToggleFullscreen();
+        if (windowW >= 320 && windowH >= 240) bt3SetWindowSize(windowW, windowH);
     }
 }
 // [wshudmap] live HUD-layout state, defined in ps2_gs_gpu_renderer.cpp
@@ -386,7 +386,7 @@ void PS2SettingsOverlay::initialize()
     // Apply the saved window size (before any fullscreen toggle, so it sizes the
     // windowed state the user returns to). 0 = keep the default host window.
     if (m_settings.windowW >= 320 && m_settings.windowH >= 240)
-        SetWindowSize(m_settings.windowW, m_settings.windowH);
+        bt3SetWindowSize(m_settings.windowW, m_settings.windowH);
     // Apply fullscreen on startup if the INI says so (or the default is true).
     if (m_settings.fullscreen)
         ps2xSetFullscreen(true, m_settings.windowW, m_settings.windowH);
@@ -1023,14 +1023,14 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
     {
         bool allDown = true;
         for (int k : m_settings.overlayKeys)
-            if (!IsKeyDown(k)) { allDown = false; break; }
+            if (!bt3IsKeyDown(k)) { allDown = false; break; }
         const int lastKey = m_settings.overlayKeys.back();
-        if (allDown && IsKeyPressed(lastKey))
+        if (allDown && bt3IsKeyPressed(lastKey))
             toggleVisible();
     }
 
     // --- F11: toggle fullscreen / windowed ---
-    if (IsKeyPressed(KEY_F11))
+    if (bt3IsKeyPressed(BT3_KEY_F11))
     {
         m_settings.fullscreen = !m_settings.fullscreen;
         ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
@@ -1282,9 +1282,9 @@ void PS2SettingsOverlay::drawAudioTab()
     ImGui::TextDisabled("Global output volume.");
 
     sectionHeader("MIXER");
-    volumeSlider("Music", &m_settings.musicVolume);
+    volumeSlider("bt3Music", &m_settings.musicVolume);
     volumeSlider("SFX", &m_settings.sfxVolume);
-    ImGui::TextDisabled("Music = BGM streams. SFX = voices, effects and one-shots.");
+    ImGui::TextDisabled("bt3Music = BGM streams. SFX = voices, effects and one-shots.");
 
     ImGui::Spacing();
 }
@@ -1442,7 +1442,7 @@ void PS2SettingsOverlay::drawVideoTab()
         ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
         // [builtin-res] the internal render scale follows the resolution: 720p=1x,
         // 1080p=2x, 1440p+=3x. Derive it from the current screen in fullscreen.
-        const int h = GetScreenHeight();
+        const int h = bt3GetScreenHeight();
         m_settings.renderScale = ps2xRenderScaleForHeight(h);
         if (!envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive]
         m_dirty = true;
@@ -1489,7 +1489,7 @@ void PS2SettingsOverlay::drawVideoTab()
                                           "3840 x 2160 (4K)"};
         constexpr int kResCount = 10;
         int cur = -1;
-        const int w = GetScreenWidth(), h = GetScreenHeight();
+        const int w = bt3GetScreenWidth(), h = bt3GetScreenHeight();
         for (int i = 0; i < kResCount; ++i)
             if (kRes[i][0] == w && kRes[i][1] == h) { cur = i; break; }
         char curLabel[32];
@@ -1500,9 +1500,9 @@ void PS2SettingsOverlay::drawVideoTab()
         {
             for (int i = 0; i < kResCount; ++i)
             {
-                if (ImGui::Selectable(kResNames[i], i == cur) && i != cur && !IsWindowFullscreen())
+                if (ImGui::Selectable(kResNames[i], i == cur) && i != cur && !bt3IsWindowFullscreen())
                 {
-                    SetWindowSize(kRes[i][0], kRes[i][1]);
+                    bt3SetWindowSize(kRes[i][0], kRes[i][1]);
                     m_settings.windowW = kRes[i][0];
                     m_settings.windowH = kRes[i][1];
                     // [builtin-res] the internal render scale is built into the resolution:
@@ -1514,7 +1514,7 @@ void PS2SettingsOverlay::drawVideoTab()
             }
             ImGui::EndCombo();
         }
-        if (IsWindowFullscreen())
+        if (bt3IsWindowFullscreen())
             ImGui::TextDisabled("(windowed mode only)");
     }
 }
@@ -1606,7 +1606,7 @@ void PS2SettingsOverlay::drawControllersTab()
                 for (int a = 0; a < 6 && !anyDown; ++a)
                     if (std::fabs(curAxis[a]) > 0.3f) anyDown = true;
                 for (int k = 32; k <= 348 && !anyDown; ++k)
-                    if (IsKeyDown(k)) anyDown = true;
+                    if (bt3IsKeyDown(k)) anyDown = true;
                 if (!anyDown)
                     m_captureWaitRelease = false;
             }
@@ -1617,7 +1617,7 @@ void PS2SettingsOverlay::drawControllersTab()
 
                 // 1. Keyboard
                 for (int k = 32; k <= 348 && bind.kind == ps2_stubs::PadBindKind::None; ++k)
-                    if (IsKeyPressed(k))
+                    if (bt3IsKeyPressed(k))
                     {
                         bind = ps2_stubs::PadBind{ps2_stubs::PadBindKind::Key, k, 1.0f, m_settings.deadzone};
                         capturedKey = k;
@@ -1663,7 +1663,7 @@ void PS2SettingsOverlay::drawControllersTab()
             {
                 // Keyboard: gather keys currently held.
                 for (int k = 32; k <= 348; ++k)
-                    if (IsKeyDown(k))
+                    if (bt3IsKeyDown(k))
                     {
                         bool present = false;
                         for (int x : m_capturedKeys) if (x == k) { present = true; break; }

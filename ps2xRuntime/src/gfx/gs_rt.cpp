@@ -6,8 +6,8 @@
 #include "gfx/gs_gl.h"
 #include "gfx/image_io.h"
 
-#include "raylib.h"
-#include "rlgl.h"   // A1: submit is still rlgl, so Begin/End mirror raylib's framebuffer+ortho recipe
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge   // A1: submit is still rlgl, so Begin/End mirror raylib's framebuffer+ortho recipe
 
 #include "gfx/gl/gsrl_redirect.h"   // [R1] route the replay's rl* target/matrix calls to the vendored rlgl
 
@@ -27,9 +27,9 @@ namespace ps2x::gfx
         std::unordered_map<unsigned, GsRtDesc> s_desc;
     }
 
-    RenderTexture2D GsRtCreate(int w, int h, bool depth)
+    bt3RenderTexture2D GsRtCreate(int w, int h, bool depth)
     {
-        RenderTexture2D rt{};
+        bt3RenderTexture2D rt{};
         if (!gl::ContextReady() || w <= 0 || h <= 0)
         {
             std::fprintf(stderr, "[altgl] GsRtCreate(%d,%d) ignored (context not ready)\n", w, h);
@@ -46,7 +46,7 @@ namespace ps2x::gfx
         rt.texture.width = w;
         rt.texture.height = h;
         rt.texture.mipmaps = 1;
-        rt.texture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        rt.texture.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
         s_targets[rt.id] = std::move(target);
         // [gsrt] Publish the contract. Logical size defaults to the physical size and is corrected by
         // GsRtSetLogical() the moment the caller knows the emitter-space size (w, h) vs the scaled one.
@@ -112,7 +112,7 @@ namespace ps2x::gfx
         if (d != s_desc.end()) d->second.depthTex = depthTex;
     }
 
-    void GsRtUnload(RenderTexture2D &rt)
+    void GsRtUnload(bt3RenderTexture2D &rt)
     {
         auto it = s_targets.find(rt.id);
         if (it != s_targets.end())
@@ -121,69 +121,69 @@ namespace ps2x::gfx
             s_targets.erase(it);
         }
         s_desc.erase(rt.id);
-        rt = RenderTexture2D{};
+        rt = bt3RenderTexture2D{};
     }
 
-    void GsRtBegin(const RenderTexture2D &rt)
+    void GsRtBegin(const bt3RenderTexture2D &rt)
     {
-        // Mirrors raylib's BeginTextureMode (rcore.c:1079): flush the batch, bind the FBO, set the
+        // Mirrors raylib's bt3BeginTextureMode (rcore.c:1079): flush the batch, bind the FBO, set the
         // viewport AND the rlgl framebuffer size, then install an orthographic projection matching
         // the TARGET size and reset the modelview. Omitting the projection is what broke the first
         // blanket conversion: every draw into the FBO used the window's projection instead.
         const int w = rt.texture.width > 0 ? rt.texture.width : 1;
         const int h = rt.texture.height > 0 ? rt.texture.height : 1;
         ps2x::gfx::GsGlFlush();   // [gsgl] drain our batch into the CURRENT target before rebinding
-        rlDrawRenderBatchActive();
-        rlEnableFramebuffer(rt.id);
-        rlViewport(0, 0, w, h);
-        rlSetFramebufferWidth(w);
-        rlSetFramebufferHeight(h);
-        rlMatrixMode(RL_PROJECTION);
-        rlLoadIdentity();
-        rlOrtho(0, w, h, 0, 0.0f, 1.0f);
-        rlMatrixMode(RL_MODELVIEW);
-        rlLoadIdentity();
+        bt3rlDrawRenderBatchActive();
+        bt3rlEnableFramebuffer(rt.id);
+        bt3rlViewport(0, 0, w, h);
+        bt3rlSetFramebufferWidth(w);
+        bt3rlSetFramebufferHeight(h);
+        bt3rlMatrixMode(BT3RL_PROJECTION);
+        bt3rlLoadIdentity();
+        bt3rlOrtho(0, w, h, 0, 0.0f, 1.0f);
+        bt3rlMatrixMode(BT3RL_MODELVIEW);
+        bt3rlLoadIdentity();
         ps2x::gfx::GsGlBeginTarget(w, h, 1.0f);   // [gsgl] same target framing for the gfx::gl path
     }
 
     void GsRtEnd()
     {
-        // Replicates raylib's EndTextureMode (rcore.c:1110), which calls SetupViewport()
+        // Replicates raylib's bt3EndTextureMode (rcore.c:1110), which calls SetupViewport()
         // (rcore.c:3537). SetupViewport does THREE things, not one:
-        //   rlViewport(window render size)  +  rlOrtho(window render size)  +  modelview identity.
+        //   bt3rlViewport(window render size)  +  bt3rlOrtho(window render size)  +  modelview identity.
         // Restoring ONLY the viewport (as this used to) left rlgl's PROJECTION at the last FBO's
         // ortho, so every later raylib draw (the rlImGui overlay, the present blit) was projected
         // for a 512x448 / Nx FBO instead of the window -- the overlay appeared ~2x offset and the
         // present landed off-screen on alternate frames (the black flicker).
         ps2x::gfx::GsGlFlush();   // [gsgl] our batch targets this FBO: drain before unbinding it
-        rlDrawRenderBatchActive();
-        rlDisableFramebuffer();
-        const int rw = GetRenderWidth() > 0 ? GetRenderWidth() : 1;
-        const int rh = GetRenderHeight() > 0 ? GetRenderHeight() : 1;
-        rlViewport(0, 0, rw, rh);
-        rlMatrixMode(RL_PROJECTION);
-        rlLoadIdentity();
-        rlOrtho(0, rw, rh, 0, 0.0f, 1.0f);      // restore the WINDOW projection (was missing)
-        rlMatrixMode(RL_MODELVIEW);
-        rlLoadIdentity();
+        bt3rlDrawRenderBatchActive();
+        bt3rlDisableFramebuffer();
+        const int rw = bt3GetRenderWidth() > 0 ? bt3GetRenderWidth() : 1;
+        const int rh = bt3GetRenderHeight() > 0 ? bt3GetRenderHeight() : 1;
+        bt3rlViewport(0, 0, rw, rh);
+        bt3rlMatrixMode(BT3RL_PROJECTION);
+        bt3rlLoadIdentity();
+        bt3rlOrtho(0, rw, rh, 0, 0.0f, 1.0f);      // restore the WINDOW projection (was missing)
+        bt3rlMatrixMode(BT3RL_MODELVIEW);
+        bt3rlLoadIdentity();
     }
 
     // ------------------------------------------------------------------------------ textures
     namespace { std::unordered_map<unsigned, gl::Texture *> s_textures; }
 
-    Texture2D GsTexCreateFromImage(const Image &img, bool linear)
+    bt3Texture2D GsTexCreateFromImage(const bt3Image &img, bool linear)
     {
-        Texture2D t{};
+        bt3Texture2D t{};
         if (!gl::ContextReady() || !img.data || img.width <= 0 || img.height <= 0) return t;
-        // Compressed sources (DXT/BC) must NOT go through our RGBA8 upload: ImageFormat refuses to
+        // Compressed sources (DXT/BC) must NOT go through our RGBA8 upload: bt3ImageFormat refuses to
         // convert compressed input, so copy.data would hold BC bytes while we upload w*h*4 of them
         // -- a buffer overrun that crashes inside the GL driver (observed: atio6axx.dll). Hand
         // those to raylib, which routes them to glCompressedTexImage2D.
-        if (img.format >= PIXELFORMAT_COMPRESSED_DXT1_RGB) return LoadTextureFromImage(img);
+        if (img.format >= BT3_PIXELFORMAT_COMPRESSED_DXT1_RGB) return bt3LoadTextureFromImage(img);
         // Copy first: callers pass borrowed pixel data (see the gaPal site) and raylib's
-        // LoadTextureFromImage never mutates the source, so neither do we.
-        Image copy = ImageCopy(img);
-        if (copy.format != PIXELFORMAT_UNCOMPRESSED_R8G8B8A8) ImageFormat(&copy, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+        // bt3LoadTextureFromImage never mutates the source, so neither do we.
+        bt3Image copy = bt3ImageCopy(img);
+        if (copy.format != BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8) bt3ImageFormat(&copy, BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
         auto *tex = new gl::Texture();
         if (tex->Create(gl::Device(), (uint32_t)copy.width, (uint32_t)copy.height, gl::Format::RGBA8, copy.data))
         {
@@ -192,7 +192,7 @@ namespace ps2x::gfx
             t.width = copy.width;
             t.height = copy.height;
             t.mipmaps = 1;
-            t.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            t.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
             s_textures[t.id] = tex;
         }
         else
@@ -200,27 +200,27 @@ namespace ps2x::gfx
             std::fprintf(stderr, "[altgl] GsTexCreateFromImage(%dx%d) failed\n", copy.width, copy.height);
             delete tex;
         }
-        UnloadImage(copy);
+        bt3UnloadImage(copy);
         return t;
     }
 
     // [A4.3] Upload a CPU-only GsImage (built by GsImageMake/GsImageSetPx) as an RGBA8 texture.
-    Texture2D GsTexCreateFromImage(const GsImage &img, bool linear)
+    bt3Texture2D GsTexCreateFromImage(const GsImage &img, bool linear)
     {
-        Texture2D t{};
+        bt3Texture2D t{};
         if (!gl::ContextReady() || !GsImageValid(img)) return t;
         auto *tex = new gl::Texture();
         if (tex->Create(gl::Device(), (uint32_t)img.width, (uint32_t)img.height, gl::Format::RGBA8, img.data))
         {
             tex->SetSampler(gl::Device(), linear ? gl::Filter::Linear : gl::Filter::Point, gl::Wrap::Clamp);
             t.id = tex->GLTexture(); t.width = img.width; t.height = img.height;
-            t.mipmaps = 1; t.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            t.mipmaps = 1; t.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
             s_textures[t.id] = tex;
         }
         else { std::fprintf(stderr, "[altgl] GsTexCreateFromImage(GsImage %dx%d) failed\n", img.width, img.height); delete tex; }
         return t;
     }
-    void GsUnloadTexture(Texture2D t)
+    void GsUnloadTexture(bt3Texture2D t)
     {
         auto it = s_textures.find(t.id);
         if (it != s_textures.end())
@@ -230,6 +230,6 @@ namespace ps2x::gfx
             s_textures.erase(it);
             return;
         }
-        if (t.id != 0) UnloadTexture(t);   // raylib-owned (font atlas, FMV, ...)
+        if (t.id != 0) bt3UnloadTexture(t);   // raylib-owned (font atlas, FMV, ...)
     }
 }

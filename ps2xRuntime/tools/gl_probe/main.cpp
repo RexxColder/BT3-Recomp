@@ -1,6 +1,6 @@
 // [altGL] Validation probe: proves the standalone GL layer (loader + gfx/gl + present) works.
 // During the transition it borrows raylib ONLY for the window and the GL context; every draw
-// goes through ps2x::gfx::gl. When the SDL2 platform lands, InitWindow/GetWindowHandle are
+// goes through ps2x::gfx::gl. When the SDL2 platform lands, bt3InitWindow/GetWindowHandle are
 // replaced by SDL_CreateWindow/SDL_GL_Context and nothing else here changes.
 //
 // It compiles the ported GS replay shader (gl_gs_shader_glsl.h) and draws a calibration
@@ -8,7 +8,7 @@
 //   0) kWhite/kBlack, 1) kRed/kBlue, 2) green/black checkerboards, 3) one colour per corner.
 // SPACE advances the pattern, ESC quits. The centre pixel of each pattern is logged.
 
-#include "raylib.h"
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 
 #include "gfx/gl/GlDevice.h"
 #include "gfx/gl/GlGfx.h"
@@ -27,7 +27,7 @@ static void *probeGetProc(const char *name) { return reinterpret_cast<void *>(wg
 static void *probeGetProc(const char *name) { return dlsym(RTLD_DEFAULT, name); }
 #endif
 
-static void probeSwap(void *) { SwapScreenBuffer(); }   // raylib's GL buffer swap (transition only)
+static void probeSwap(void *) { bt3SwapScreenBuffer(); }   // raylib's GL buffer swap (transition only)
 
 struct Rgb { unsigned char r, g, b; };
 static const Rgb kWhite{255,255,255}, kBlack{0,0,0}, kRed{255,0,0}, kGreen{0,255,0}, kBlue{0,0,255};
@@ -35,8 +35,8 @@ static const Rgb kWhite{255,255,255}, kBlack{0,0,0}, kRed{255,0,0}, kGreen{0,255
 int main()
 {
     const int W = 800, H = 600;
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-    InitWindow(W, H, "altGL probe");
+    bt3SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+    bt3InitWindow(W, H, "altGL probe");
 
     using namespace ps2x::gfx;
     using namespace ps2xgl;
@@ -49,7 +49,7 @@ int main()
     plat.swap = probeSwap;
 
     gl::GlDevice dev;
-    if (!dev.Init(plat, (uint32_t)GetScreenWidth(), (uint32_t)GetScreenHeight()))
+    if (!dev.Init(plat, (uint32_t)bt3GetScreenWidth(), (uint32_t)bt3GetScreenHeight()))
     { std::fprintf(stderr, "[glprobe] GlDevice init failed\n"); return 1; }
 
     gl::Renderer gfx;
@@ -88,17 +88,17 @@ int main()
     };
 
     int pattern = 0;
-    double nextSwitch = GetTime() + 3.0;
+    double nextSwitch = bt3GetTime() + 3.0;
     int loggedPattern = -1;
-    while (!WindowShouldClose())
+    while (!bt3WindowShouldClose())
     {
-        PollInputEvents();
+        bt3PollInputEvents();
 
-        const float w = (float)GetScreenWidth(), h = (float)GetScreenHeight();
+        const float w = (float)bt3GetScreenWidth(), h = (float)bt3GetScreenHeight();
         dev.Resize((uint32_t)w, (uint32_t)h);
 
-        if (IsKeyPressed(KEY_SPACE)) { pattern = (pattern + 1) % 4; nextSwitch = GetTime() + 6.0; }
-        if (GetTime() >= nextSwitch) { pattern = (pattern + 1) % 4; nextSwitch = GetTime() + 3.0; }
+        if (bt3IsKeyPressed(BT3_KEY_SPACE)) { pattern = (pattern + 1) % 4; nextSwitch = bt3GetTime() + 6.0; }
+        if (bt3GetTime() >= nextSwitch) { pattern = (pattern + 1) % 4; nextSwitch = bt3GetTime() + 3.0; }
 
         dev.BeginFrame(gl::Color{0.06f, 0.07f, 0.10f, 1.0f});
         glDisable(GL_CULL_FACE);   // raylib's rlgl leaves culling on
@@ -146,6 +146,6 @@ int main()
     }
 
     gs.Destroy(); gfx.Destroy(); dev.Shutdown();
-    CloseWindow();
+    bt3CloseWindow();
     return 0;
 }

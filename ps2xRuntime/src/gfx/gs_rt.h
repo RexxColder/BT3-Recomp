@@ -1,16 +1,16 @@
 #pragma once
 
 // [altGL] A1.1: the GS replay's render targets are created/owned by gfx::gl. raylib's
-// RenderTexture2D is kept ONLY as an id carrier (`id` = FBO, `texture.id` = colour attachment) so
-// the replay's rlEnableFramebuffer(id) / sampling sites keep working. raylib's RenderTexture2D
+// bt3RenderTexture2D is kept ONLY as an id carrier (`id` = FBO, `texture.id` = colour attachment) so
+// the replay's bt3rlEnableFramebuffer(id) / sampling sites keep working. raylib's bt3RenderTexture2D
 // creation (LoadRenderTexture) and destruction are no longer used.
 
-#include "raylib.h"
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 
 namespace ps2x::gfx
 {
     // Create a colour (RGBA8) + depth FBO via gfx::gl and return a raylib-shaped handle.
-    RenderTexture2D GsRtCreate(int w, int h, bool depth = true);
+    bt3RenderTexture2D GsRtCreate(int w, int h, bool depth = true);
     // [gsrt] Render-target contract: identity + sizes for the targets we own, so the replay framing
     // and every present consumer agree on ONE source of truth (physical vs logical size, colour
     // texture name). physW/H is what we allocated; logicalW/H is what the emitters draw in.
@@ -24,19 +24,19 @@ namespace ps2x::gfx
     unsigned GsRtCreateDepthTexture(int w, int h, bool asFloat);
     void GsRtAttachDepth(unsigned fboId, unsigned depthTex, int w, int h);
     // Free the gfx::gl resources behind the handle and zero it.
-    void GsRtUnload(RenderTexture2D &rt);
-    // Bind/restore the target for drawing (replaces BeginTextureMode/EndTextureMode). They
+    void GsRtUnload(bt3RenderTexture2D &rt);
+    // Bind/restore the target for drawing (replaces bt3BeginTextureMode/bt3EndTextureMode). They
     // replicate raylib's recipe exactly, including the rlgl framebuffer size and the ortho
     // projection installed for the target size, and they flush the pending rlgl batch first.
-    void GsRtBegin(const RenderTexture2D &rt);
+    void GsRtBegin(const bt3RenderTexture2D &rt);
     void GsRtEnd();
 
-    // A1.1b (textures): create a gfx::gl texture from an Image (copied + converted to RGBA8, so
-    // borrowed pixel data is never touched) and return a raylib-shaped Texture2D handle.
-    Texture2D GsTexCreateFromImage(const Image &img, bool linear = false);
+    // A1.1b (textures): create a gfx::gl texture from an bt3Image (copied + converted to RGBA8, so
+    // borrowed pixel data is never touched) and return a raylib-shaped bt3Texture2D handle.
+    bt3Texture2D GsTexCreateFromImage(const bt3Image &img, bool linear = false);
     // [A4.3] Same, for a CPU image built by our own helpers (GsImageMake/GsImageSetPx).
     struct GsImage;
-    Texture2D GsTexCreateFromImage(const GsImage &img, bool linear = false);
+    bt3Texture2D GsTexCreateFromImage(const GsImage &img, bool linear = false);
     // Free a texture: our gfx::gl ones if tracked, otherwise raylib's own (font atlas, FMV...).
-    void GsUnloadTexture(Texture2D t);
+    void GsUnloadTexture(bt3Texture2D t);
 }

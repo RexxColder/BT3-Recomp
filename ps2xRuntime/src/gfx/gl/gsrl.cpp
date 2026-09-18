@@ -2,7 +2,7 @@
 // AND to raylib's rlgl (which still submits the auxiliaries/overlay until A3.3).
 #include "gfx/gl/gsrl.h"
 
-#include "rlgl.h"
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 
 namespace
 {
@@ -45,13 +45,13 @@ namespace ps2x::gfx::gsrl
     {
         gsrlDrawRenderBatchActive();   // ours first: pending geometry belongs to the OLD target
         gsrlEnableFramebuffer(id);
-        ::rlEnableFramebuffer(id);
+        ::bt3rlEnableFramebuffer(id);
     }
 
     void DisableFramebuffer()
     {
         gsrlDrawRenderBatchActive();
         gsrlDisableFramebuffer();
-        ::rlDisableFramebuffer();
+        ::bt3rlDisableFramebuffer();
     }
 }

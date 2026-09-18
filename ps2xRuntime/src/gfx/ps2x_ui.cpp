@@ -3,8 +3,8 @@
 #include "gfx/video_state.h"
 #include "gfx/d3d11/ui_d3d11.h"
 
-#include "raylib.h"
-#include "rlgl.h"
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 #include "imgui.h"
 #include "rlImGui.h"
 #include "imgui_impl_opengl3.h"
@@ -24,47 +24,47 @@ namespace ps2x::gfx
         // and we do not use it). Without this ImGui keeps its default (-1,-1) and clips
         // every window to nothing. raylib owns the window, so read it from there; the
         // D3D11 back buffer matches the client size 1:1.
-        io.DisplaySize = ImVec2((float)GetScreenWidth(), (float)GetScreenHeight());
+        io.DisplaySize = ImVec2((float)bt3GetScreenWidth(), (float)bt3GetScreenHeight());
         io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
 
-        const Vector2 mp = GetMousePosition();
+        const bt3Vector2 mp = bt3GetMousePosition();
         io.AddMousePosEvent(mp.x, mp.y);
-        io.AddMouseButtonEvent(0, IsMouseButtonDown(MOUSE_BUTTON_LEFT));
-        io.AddMouseButtonEvent(1, IsMouseButtonDown(MOUSE_BUTTON_RIGHT));
-        io.AddMouseButtonEvent(2, IsMouseButtonDown(MOUSE_BUTTON_MIDDLE));
-        const Vector2 wheel = GetMouseWheelMoveV();
+        io.AddMouseButtonEvent(0, bt3IsMouseButtonDown(BT3_MOUSE_BUTTON_LEFT));
+        io.AddMouseButtonEvent(1, bt3IsMouseButtonDown(BT3_MOUSE_BUTTON_RIGHT));
+        io.AddMouseButtonEvent(2, bt3IsMouseButtonDown(BT3_MOUSE_BUTTON_MIDDLE));
+        const bt3Vector2 wheel = bt3GetMouseWheelMoveV();
         io.AddMouseWheelEvent(wheel.x, wheel.y);
 
         int c = 0;
-        while ((c = GetCharPressed()) > 0)
+        while ((c = bt3GetCharPressed()) > 0)
             io.AddInputCharacter(static_cast<unsigned>(c));
 
-        auto key = [&](int rl, ImGuiKey im) { io.AddKeyEvent(im, IsKeyDown(rl) != 0); };
-        key(KEY_ESCAPE, ImGuiKey_Escape);
-        key(KEY_ENTER, ImGuiKey_Enter);
-        key(KEY_TAB, ImGuiKey_Tab);
-        key(KEY_BACKSPACE, ImGuiKey_Backspace);
-        key(KEY_DELETE, ImGuiKey_Delete);
-        key(KEY_RIGHT, ImGuiKey_RightArrow);
-        key(KEY_LEFT, ImGuiKey_LeftArrow);
-        key(KEY_UP, ImGuiKey_UpArrow);
-        key(KEY_DOWN, ImGuiKey_DownArrow);
-        key(KEY_HOME, ImGuiKey_Home);
-        key(KEY_END, ImGuiKey_End);
-        key(KEY_PAGE_UP, ImGuiKey_PageUp);
-        key(KEY_PAGE_DOWN, ImGuiKey_PageDown);
-        key(KEY_LEFT_SHIFT, ImGuiKey_LeftShift);
-        key(KEY_RIGHT_SHIFT, ImGuiKey_RightShift);
-        key(KEY_LEFT_CONTROL, ImGuiKey_LeftCtrl);
-        key(KEY_RIGHT_CONTROL, ImGuiKey_RightCtrl);
-        key(KEY_LEFT_ALT, ImGuiKey_LeftAlt);
-        key(KEY_RIGHT_ALT, ImGuiKey_RightAlt);
-        // ImGuiKey_A..Z and ImGuiKey_0..9 are contiguous in ImGui; raylib's KEY_A..Z and
-        // KEY_ZERO..NINE are too.
+        auto key = [&](int rl, ImGuiKey im) { io.AddKeyEvent(im, bt3IsKeyDown(rl) != 0); };
+        key(BT3_KEY_ESCAPE, ImGuiKey_Escape);
+        key(BT3_KEY_ENTER, ImGuiKey_Enter);
+        key(BT3_KEY_TAB, ImGuiKey_Tab);
+        key(BT3_KEY_BACKSPACE, ImGuiKey_Backspace);
+        key(BT3_KEY_DELETE, ImGuiKey_Delete);
+        key(BT3_KEY_RIGHT, ImGuiKey_RightArrow);
+        key(BT3_KEY_LEFT, ImGuiKey_LeftArrow);
+        key(BT3_KEY_UP, ImGuiKey_UpArrow);
+        key(BT3_KEY_DOWN, ImGuiKey_DownArrow);
+        key(BT3_KEY_HOME, ImGuiKey_Home);
+        key(BT3_KEY_END, ImGuiKey_End);
+        key(BT3_KEY_PAGE_UP, ImGuiKey_PageUp);
+        key(BT3_KEY_PAGE_DOWN, ImGuiKey_PageDown);
+        key(BT3_KEY_LEFT_SHIFT, ImGuiKey_LeftShift);
+        key(BT3_KEY_RIGHT_SHIFT, ImGuiKey_RightShift);
+        key(BT3_KEY_LEFT_CONTROL, ImGuiKey_LeftCtrl);
+        key(BT3_KEY_RIGHT_CONTROL, ImGuiKey_RightCtrl);
+        key(BT3_KEY_LEFT_ALT, ImGuiKey_LeftAlt);
+        key(BT3_KEY_RIGHT_ALT, ImGuiKey_RightAlt);
+        // ImGuiKey_A..Z and ImGuiKey_0..9 are contiguous in ImGui; raylib's BT3_KEY_A..Z and
+        // BT3_KEY_ZERO..NINE are too.
         for (int k = 0; k < 26; ++k)
-            io.AddKeyEvent(static_cast<ImGuiKey>(ImGuiKey_A + k), IsKeyDown(KEY_A + k) != 0);
+            io.AddKeyEvent(static_cast<ImGuiKey>(ImGuiKey_A + k), bt3IsKeyDown(BT3_KEY_A + k) != 0);
         for (int k = 0; k < 10; ++k)
-            io.AddKeyEvent(static_cast<ImGuiKey>(ImGuiKey_0 + k), IsKeyDown(KEY_ZERO + k) != 0);
+            io.AddKeyEvent(static_cast<ImGuiKey>(ImGuiKey_0 + k), bt3IsKeyDown(BT3_KEY_ZERO + k) != 0);
     }
 
     // [C] The overlay uses imgui_impl_opengl3 (its own GL loader + font atlas) instead of
@@ -92,7 +92,7 @@ namespace ps2x::gfx
             // for us), and ImGui::NewFrame on a null context is what crashed the runner.
             ImGui::CreateContext();
             ImGuiIO &io = ImGui::GetIO();
-            io.DisplaySize = ImVec2((float)GetScreenWidth(), (float)GetScreenHeight());
+            io.DisplaySize = ImVec2((float)bt3GetScreenWidth(), (float)bt3GetScreenHeight());
             io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
             const bool ok = ImGui_ImplOpenGL3_Init("#version 330");
             std::fprintf(stderr, "[uigl] imgui_impl_opengl3 init=%d (context created)\n", (int)ok);
@@ -130,15 +130,15 @@ namespace ps2x::gfx
             // rlgl is still alive: flush the batch so our raw-GL overlay draws on top of it, then
             // hand the state back through rlgl's own API (rlgl caches blend/program/texture and
             // only re-applies what it thinks changed -- the same trap as the present).
-            rlDrawRenderBatchActive();
+            bt3rlDrawRenderBatchActive();
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-            rlEnableColorBlend();
-            rlSetBlendMode(RL_BLEND_ALPHA);
-            rlActiveTextureSlot(0);
-            rlDisableTexture();
-            rlDisableShader();
-            rlDrawRenderBatchActive();
+            bt3rlEnableColorBlend();
+            bt3rlSetBlendMode(BT3RL_BLEND_ALPHA);
+            bt3rlActiveTextureSlot(0);
+            bt3rlDisableTexture();
+            bt3rlDisableShader();
+            bt3rlDrawRenderBatchActive();
         }
         else
             rlImGuiEnd();
@@ -164,7 +164,7 @@ namespace ps2x::gfx
             UiD3D11Render();   // ImGui::Render() + ImGui_ImplDX11_RenderDrawData()
         else if (UiGlEnabled())
         {
-            rlDrawRenderBatchActive();
+            bt3rlDrawRenderBatchActive();
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         }

@@ -3,8 +3,8 @@
 #include "gfx/gl_context.h"
 #include "gfx/gl/GlGfx.h"
 
-#include "raylib.h"
-#include "rlgl.h"   // A1: the submit is still rlgl, so Begin/End flush its batch and bind the FBO
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge   // A1: the submit is still rlgl, so Begin/End flush its batch and bind the FBO
 
 namespace ps2x::gfx
 {
@@ -63,17 +63,17 @@ namespace ps2x::gfx
 
     void GsRenderTarget::Begin()
     {
-        // A1: raylib's BeginTextureMode also flushes the rlgl batch before switching targets.
-        rlDrawRenderBatchActive();
-        rlEnableFramebuffer(id);
-        rlViewport(0, 0, width, height);
+        // A1: raylib's bt3BeginTextureMode also flushes the rlgl batch before switching targets.
+        bt3rlDrawRenderBatchActive();
+        bt3rlEnableFramebuffer(id);
+        bt3rlViewport(0, 0, width, height);
     }
 
     void GsRenderTarget::End()
     {
-        rlDrawRenderBatchActive();
-        rlEnableFramebuffer(0);
-        rlViewport(0, 0, GetScreenWidth(), GetScreenHeight());
+        bt3rlDrawRenderBatchActive();
+        bt3rlEnableFramebuffer(0);
+        bt3rlViewport(0, 0, bt3GetScreenWidth(), bt3GetScreenHeight());
     }
 
     void GsRenderTarget::Unload()

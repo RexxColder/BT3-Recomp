@@ -4,8 +4,8 @@
 #include "gfx/gl/GlGfx.h"
 #include "gfx/gl/gl_shader_glsl.h"
 
-#include "raylib.h"
-#include "rlgl.h"   // re-assert rlgl's cached state after our raw-GL draw
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge   // re-assert rlgl's cached state after our raw-GL draw
 
 #include <algorithm>
 #include <cstdio>
@@ -50,7 +50,7 @@ namespace ps2x::gfx
                     gl::Vertex p{}; p.x = x; p.y = y; p.u = u; p.v = v;
                     p.r = p.g = p.b = 255; p.a = (uint8_t)(alpha * 255.0f + 0.5f); p.q = 1.0f; p.z = 0.0f; return p; };
                 r.Flush();                       // our batcher is immediate here; drain first
-                rlDrawRenderBatchActive();       // rlgl is deferred: don't let it land after us
+                bt3rlDrawRenderBatchActive();       // rlgl is deferred: don't let it land after us
                 m_shader.Bind(gl::Device());
                 m_shader.SetMat4("mvp", m);
                 r.SetShader(&m_shader);
@@ -63,12 +63,12 @@ namespace ps2x::gfx
                 r.DrawQuad(V(x0, y0, 0, 0), V(x1, y0, 1, 0), V(x1, y1, 1, 1), V(x0, y1, 0, 1));
                 r.Flush();
                 // Hand rlgl's cached state back (same trap as the present/overlay).
-                rlEnableColorBlend();
-                rlSetBlendMode(RL_BLEND_ALPHA);
-                rlActiveTextureSlot(0);
-                rlDisableTexture();
-                rlDisableShader();
-                rlDrawRenderBatchActive();
+                bt3rlEnableColorBlend();
+                bt3rlSetBlendMode(BT3RL_BLEND_ALPHA);
+                bt3rlActiveTextureSlot(0);
+                bt3rlDisableTexture();
+                bt3rlDisableShader();
+                bt3rlDrawRenderBatchActive();
             }
 
             void Release() override { m_tex.Destroy(); m_shader.Destroy(); m_ready = false; m_w = m_h = 0; }
