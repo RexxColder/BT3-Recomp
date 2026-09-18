@@ -594,6 +594,14 @@ static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
     }
     setEnvDefault("PS2X_D3D11", "0");
 #endif
+    // [opengl-new] renderer 0 is the NEW OpenGL present (gfx::gl / altGL). The old raylib GL present
+    // is gone, so this is the only OpenGL option the UI offers.
+    if (renderer == 0)
+    {
+        setEnvDefault("PS2X_ALTGL", "1");
+        setEnvDefault("PS2X_PGS", "0");
+        return;
+    }
 #if defined(PS2X_HAVE_PGS)
     if (renderer == 2)
     {
@@ -1296,7 +1304,7 @@ void PS2SettingsOverlay::drawVideoTab()
     // Renderer + Effects (flat, compact — no card borders)
     sectionHeader("RENDERER");
     {   // [renderer] backend dropdown
-        static const char *const kLabels[] = { "OpenGL", "Software rasterizer",
+        static const char *const kLabels[] = { "OpenGL (New)", "Software rasterizer",
 #if defined(PS2X_HAVE_PGS)
             "paraLLEl-GS (Vulkan compute)",
 #endif

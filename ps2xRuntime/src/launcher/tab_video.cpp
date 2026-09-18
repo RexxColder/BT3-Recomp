@@ -120,14 +120,14 @@ VideoTab::VideoTab(QWidget *parent)
     QList<int> rendererValues;
 #if defined(_WIN32)
     // [d3d11] Windows: paraLLEl-GS is retired and native Direct3D 11 is the default present.
-    renderers = { QStringLiteral("OpenGL"),
+    renderers = { QStringLiteral("OpenGL (New)"),
                   QStringLiteral("Software (CPU)"),
                   QStringLiteral("Direct3D 11") };
     rendererValues = { SettingsManager::kRendererOpenGL,
                        SettingsManager::kRendererSoftware,
                        SettingsManager::kRendererD3D11 };
 #else
-    renderers = { QStringLiteral("OpenGL"),
+    renderers = { QStringLiteral("OpenGL (New)"),
                   QStringLiteral("Software (CPU)"),
                   QStringLiteral("paraLLEl-GS (Vulkan)") };
     rendererValues = { SettingsManager::kRendererOpenGL,
@@ -143,8 +143,8 @@ VideoTab::VideoTab(QWidget *parent)
 #ifdef _WIN32
     root->addWidget(hintRow(QStringLiteral(
         "Direct3D 11 is the default present on Windows (the game frame is shown through a "
-        "native D3D11 swap chain). OpenGL keeps the raylib presenter; Software uses the CPU "
-        "rasterizer.")));
+        "native D3D11 swap chain). OpenGL (New) presents through our own GL layer; Software uses "
+        "the CPU rasterizer.")));
 #else
     root->addWidget(hintRow(QStringLiteral("paraLLEl-GS is the default backend. Falls back to OpenGL if Vulkan is unavailable.")));
 #endif
