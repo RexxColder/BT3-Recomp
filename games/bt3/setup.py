@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
-"""Build (+ optional deploy) Dragon Ball Z: Budokai Tenkaichi 3 (SLUS_216.78, USA).
+"""Build, deploy and package Dragon Ball Z: Budokai Tenkaichi 3 (SLUS_216.78, USA).
 
-    python3 games/bt3/setup.py <iso|elf> [--jobs N] [--deploy OUT] [--skip-setup]
+One script, four stages:
 
-Cross-platform (Linux primary; Windows and macOS experimental). The game's code is generated
-locally from YOUR copy of the game — this repository ships no game code or assets.
-Steps: extract/verify the build inputs, build the recompiler, generate the runner
-sources, generate the overlay module, apply patches, build the runner.
+    stage 1  detect    identify the platform, toolchain, package manager and build inputs
+    stage 2  deps      report and (interactively) install missing dependencies
+    stage 3  build     the original pipeline: extract, recompile, generate, patch, build the runner
+    stage 4  package   assemble the portable tree and produce the release artifact for this OS
 
-  --deploy OUT   after a successful build, copy the portable tree (settings,
-                 assets, fonts, and the runner) into OUT. On Windows the
-                 runtime DLLs are copied too. The Linux self-extracting launcher is
-                 created by build_and_deploy.sh, which calls this script with
-                 --deploy so the built runner ends up in place.
-  --skip-setup   skip steps 1-6 (ISO/ELF extraction, recompile, patches). Rebuild the
-                 runner from the already-generated sources and then deploy. Speeds up
-                 re-deploys when nothing in the pipeline changed.
+The game's code is generated locally from YOUR copy of the game -- this repository ships no game
+code or assets.
+
+    python3 games/bt3/setup.py <iso|elf> [--stage N] [-y] [--deploy OUT] [--package]
+
+Backwards-compatible flags kept for the release containers and scripts: --jobs, --skip-setup,
+--gen-only, --deploy. See --help and --list-stages.
 """
+from __future__ import annotations
+
 import argparse
 import hashlib
+import json
 import os
+import platform as _platform
 import shutil
 import stat
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Optional
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -33,15 +38,39 @@ ROOT = HERE.parent.parent
 BUILD = Path(os.environ.get("PS2X_BUILD_DIR") or str(ROOT / "build"))
 WORK = HERE / "work"
 ELF_SHA256 = "811188ba9b416500d921cd4d9514df0cbf42f3a41a99cf5aac5a3da37171bf99"
-IS_WINDOWS = os.name == "nt"
-IS_MACOS = sys.platform == "darwin"
 # Generated TUs are huge; high job counts can exhaust RAM (16 GB: keep <= 3).
 DEFAULT_JOBS = "3"
 
+# Pinned tool versions (stage 2 installs exactly these; keep in sync with the release containers).
+CMAKE_MIN = (3, 21)
+QT_VERSION = "6.5.3"
+QT_KIT_WINDOWS = "win64_msvc2022_64"
+MESA_LAVAPIPE_VERSION = "26.2.0"
+DEPS_7ZR_URL = "https://www.7-zip.org/a/7zr.exe"
 
-def die(msg: str) -> None:
+# Stage registry: name -> (number, callable). Order matters.
+STAGES: list[tuple[str, str]] = [
+    ("1", "detect  - platform, toolchain, package manager and build inputs"),
+    ("2", "deps    - report and install missing dependencies"),
+    ("3", "build   - extract, recompile, generate, patch, build the runner"),
+    ("4", "package - assemble the deploy tree and the release artifact"),
+]
+
+
+# ------------------------------------------------------------------------------------------------
+# Output helpers
+# ------------------------------------------------------------------------------------------------
+def die(msg: str, code: int = 1) -> "None":
     print(f"ERROR: {msg}", file=sys.stderr)
-    sys.exit(1)
+    sys.exit(code)
+
+
+def warn(msg: str) -> None:
+    print(f"WARNING: {msg}", file=sys.stderr)
+
+
+def step(msg: str) -> None:
+    print(f"\n== {msg}")
 
 
 def run(cmd, **kw) -> None:
@@ -49,19 +78,59 @@ def run(cmd, **kw) -> None:
     subprocess.run([str(c) for c in cmd], check=True, **kw)
 
 
-def find_extractor():
-    # bsdtar reads ISO9660 directly; Windows 10+ ships it as tar.exe.
-    for name in ("bsdtar", "tar"):
-        exe = shutil.which(name)
-        if exe:
-            return ("tar", exe)
-    for name in ("7z", "7za"):
-        exe = shutil.which(name)
-        if exe:
-            return ("7z", exe)
-    die("need bsdtar/tar (Windows 10+ ships tar.exe) or 7z to extract the ISO")
+def run_capture(cmd) -> str:
+    try:
+        r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
+        return (r.stdout or "") + (r.stderr or "")
+    except OSError:
+        return ""
 
 
+def has_tty() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:   # noqa: BLE001
+        return False
+
+
+def ask_yes_no(ctx: "Context", question: str, default: bool = True) -> bool:
+    """Interactive yes/no. -y answers yes, --non-interactive (or no TTY) answers the default."""
+    if ctx.args.yes:
+        print(f"{question} [auto-yes]")
+        return True
+    if not ctx.interactive:
+        print(f"{question} [non-interactive -> {'yes' if default else 'no'}]")
+        return default
+    suffix = "[Y/n]" if default else "[y/N]"
+    try:
+        ans = input(f"{question} {suffix} ").strip().lower()
+    except EOFError:
+        return default
+    if not ans:
+        return default
+    return ans in ("y", "yes", "s", "si", "sí")
+
+
+def ask_path(ctx: "Context", prompt: str, what: str) -> Optional[Path]:
+    """Interactive path prompt. Returns None in non-interactive mode (caller decides how to fail)."""
+    if not ctx.interactive or ctx.args.yes:
+        return None
+    try:
+        raw = input(f"{prompt} ").strip().strip('"').strip("'")
+    except EOFError:
+        return None
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if not p.exists():
+        print(f"  {what} not found: {p}")
+        return None
+    return p.resolve()
+
+
+# ------------------------------------------------------------------------------------------------
+# Filesystem helpers
+# ------------------------------------------------------------------------------------------------
 def make_writable(root: Path) -> None:
     # ISO9660 files extract read-only; the game opens some (e.g. BIN/DBZP.BIN) read-write.
     for p in root.rglob("*"):
@@ -96,95 +165,6 @@ def sync_tree(src: Path, dst: Path, exclude=()) -> None:
     print(f"synced {src} -> {dst} ({copied} updated, {len(src_names)} total)")
 
 
-def find_binary(name: str) -> Path:
-    exe = name + (".exe" if IS_WINDOWS else "")
-    hits = sorted(BUILD.rglob(exe))
-    if not hits:
-        die(f"{exe} not found under {BUILD} after build")
-    return hits[0]
-
-
-# Windows builds use the Clang toolset of the Visual Studio Build Tools ("C++ Clang Compiler for
-# Windows" + "MSBuild support for LLVM (clang-cl) toolset" in the installer): the static VU1
-# recompiler is computed-goto code and the runtime uses GCC/Clang builtins, which MSVC cannot
-# compile. PS2X_SETUP_TOOLSET overrides (e.g. "v143" to try plain MSVC).
-def cmake_configure_extra() -> list:
-    """-T only makes sense for the Visual Studio generator; a Ninja build directory (clang-cl via
-    -DCMAKE_CXX_COMPILER=clang-cl) must not get it, or the reconfigure fails."""
-    extra = ["-DCMAKE_BUILD_TYPE=Release"]   # explicit: a Windows Ninja/clang-cl configure came up Debug (/Od /RTC1 -MDd)
-    # ps2xStudio (the editor tool) fetches four git branches at configure time; a network hiccup there
-    # aborted a user's whole game build (imgui_colortextedit populate failed, 2026-09-08). The game does
-    # not need it: off unless PS2X_SETUP_STUDIO=1.
-    extra.append("-DPS2X_BUILD_STUDIO=" + ("ON" if os.environ.get("PS2X_SETUP_STUDIO") == "1" else "OFF"))
-    if IS_MACOS:
-        extra += ["-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++"]
-        # [pgs] paraLLEl-GS does not build on macOS: its Granite dependency's
-        # sleep_until_nsecs() falls back to clock_nanosleep/TIMER_ABSTIME for
-        # everything that is not _WIN32, and macOS has neither. CMake enables the
-        # backend whenever the submodule checkout exists, and setup.py fetches
-        # submodules, so without this a fresh macOS configure breaks the build.
-        # PS2X_SETUP_PGS=1 opts back in (needs MoltenVK and a patched Granite).
-        if os.environ.get("PS2X_SETUP_PGS") != "1":
-            extra.append("-DPS2X_DISABLE_PGS=ON")
-        if os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
-            extra.append("-DCMAKE_OSX_DEPLOYMENT_TARGET=" + os.environ["MACOSX_DEPLOYMENT_TARGET"])
-        if not (BUILD / "CMakeCache.txt").exists() and shutil.which("ninja"):
-            extra += ["-G", "Ninja"]
-    if not IS_WINDOWS:
-        return extra
-    cache = BUILD / "CMakeCache.txt"
-    if cache.exists():
-        gen = ""
-        for line in cache.read_text(errors="replace").splitlines():
-            if line.startswith("CMAKE_GENERATOR:"):
-                gen = line.split("=", 1)[1]
-                break
-        if "Visual Studio" not in gen:
-            return extra
-    # Fresh configure. Prefer Ninja + clang-cl when this is a Visual Studio developer prompt (ninja and
-    # clang-cl on PATH, VC environment loaded): Ninja compiles every file in parallel, whereas the default
-    # Visual Studio generator hands the runner project's ~1000 unity units to MSBuild, which without
-    # multi-processor compilation builds them one at a time (a 45-minute scratch build, 2026-09-08).
-    # PS2X_SETUP_GENERATOR=vs forces the Visual Studio generator.
-    dev_prompt = bool(os.environ.get("VCToolsInstallDir") or os.environ.get("INCLUDE"))
-    if (os.environ.get("PS2X_SETUP_GENERATOR", "ninja").lower() != "vs" and dev_prompt
-            and shutil.which("ninja") and shutil.which("clang-cl")):
-        return extra + ["-G", "Ninja", "-DCMAKE_C_COMPILER=clang-cl", "-DCMAKE_CXX_COMPILER=clang-cl"]
-    return extra + ["-T", os.environ.get("PS2X_SETUP_TOOLSET", "ClangCL")]
-
-
-def configured() -> bool:
-    """True when the build dir holds a COMPLETED configure: CMakeCache.txt alone is not enough --
-    a configure that failed half-way (a FetchContent download error) leaves the cache behind with no
-    project files, and `cmake --build` then dies with "MSB1009: Project file does not exist"."""
-    if not (BUILD / "CMakeCache.txt").exists():
-        return False
-    cache_text = (BUILD / "CMakeCache.txt").read_text(errors="replace")
-    if IS_MACOS and os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
-        desired = os.environ["MACOSX_DEPLOYMENT_TARGET"]
-        if not any(line.startswith("CMAKE_OSX_DEPLOYMENT_TARGET:") and line.endswith("=" + desired)
-                   for line in cache_text.splitlines()):
-            return False
-    if IS_MACOS:
-        # [pgs] A cache configured before the parallel-gs submodule was fetched
-        # has PS2X_DISABLE_PGS=OFF and no PGS targets; reusing it silently keeps
-        # the backend enabled on the next build and fails to compile Granite.
-        desired_pgs = "OFF" if os.environ.get("PS2X_SETUP_PGS") == "1" else "ON"
-        if not any(line.startswith("PS2X_DISABLE_PGS:") and line.endswith("=" + desired_pgs)
-                   for line in cache_text.splitlines()):
-            return False
-    if any((BUILD / f).exists() for f in ("build.ninja", "Makefile", "ALL_BUILD.vcxproj")):
-        return True
-    return any(BUILD.glob("*.sln"))
-
-
-def cmake_build(target: str, jobs: str) -> None:
-    cmd = ["cmake", "--build", BUILD, "--target", target, "-j", jobs]
-    if IS_WINDOWS:
-        cmd += ["--config", "Release"]  # multi-config generators (Visual Studio)
-    run(cmd)
-
-
 def copytree_overlay(src: Path, dst: Path) -> None:
     """copy_tree-like that overwrites instead of failing on existing dirs."""
     if src.is_dir():
@@ -196,21 +176,540 @@ def copytree_overlay(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+def find_extractor():
+    # bsdtar reads ISO9660 directly; Windows 10+ ships it as tar.exe.
+    for name in ("bsdtar", "tar"):
+        exe = shutil.which(name)
+        if exe:
+            return ("tar", exe)
+    for name in ("7z", "7za"):
+        exe = shutil.which(name)
+        if exe:
+            return ("7z", exe)
+    return (None, None)
+
+
+def find_binary(name: str) -> Path:
+    exe = name + (".exe" if os.name == "nt" else "")
+    hits = sorted(BUILD.rglob(exe))
+    if not hits:
+        die(f"{exe} not found under {BUILD} after build")
+    return hits[0]
+
+
+# ------------------------------------------------------------------------------------------------
+# Stage 1: platform + dependency detection
+# ------------------------------------------------------------------------------------------------
+def _cmake_version() -> Optional[tuple[int, int]]:
+    if not shutil.which("cmake"):
+        return None
+    txt = run_capture(["cmake", "--version"])
+    for line in txt.splitlines():
+        if line.lower().startswith("cmake version"):
+            parts = line.split("version", 1)[1].strip().split()[0].split(".")
+            try:
+                return (int(parts[0]), int(parts[1]))
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
+def _distro_name() -> str:
+    try:
+        txt = Path("/etc/os-release").read_text(errors="replace")
+    except OSError:
+        return ""
+    for line in txt.splitlines():
+        if line.startswith("ID="):
+            return line.split("=", 1)[1].strip().strip('"')
+    return ""
+
+
+def _detect_pkg_mgr() -> Optional[str]:
+    for name, probe in (
+        ("apt", "apt-get"), ("dnf", "dnf"), ("pacman", "pacman"), ("zypper", "zypper"),
+    ):
+        if shutil.which(probe):
+            return name
+    return None
+
+
+def _qt_prefix() -> Optional[Path]:
+    for env in ("QT_ROOT", "QTDIR", "CMAKE_PREFIX_PATH"):
+        v = os.environ.get(env)
+        if not v:
+            continue
+        for candidate in v.split(os.pathsep):
+            p = Path(candidate)
+            if (p / "lib" / "cmake" / "Qt6").is_dir() or (p / "bin" / "qmake6").exists():
+                return p
+    candidates = [
+        ROOT / "build" / "qt" / QT_VERSION / QT_KIT_WINDOWS,
+        Path.home() / "Qt" / QT_VERSION / QT_KIT_WINDOWS,
+    ]
+    # Any kit already unpacked under build/qt/<ver>/<kit> counts (the native scripts pinned
+    # msvc2019_64 historically; the release containers use msvc2022_64).
+    if (ROOT / "build" / "qt").is_dir():
+        candidates += sorted((ROOT / "build" / "qt").glob(f"*/{QT_KIT_WINDOWS}"))
+        candidates += sorted((ROOT / "build" / "qt").glob("*/*"))
+    if sys.platform == "darwin":
+        brew = shutil.which("brew")
+        if brew:
+            prefix = run_capture([brew, "--prefix", "qt"]).strip()
+            if prefix:
+                candidates.insert(0, Path(prefix))
+    for c in candidates:
+        if (c / "lib" / "cmake" / "Qt6").is_dir() or (c / "bin" / "qmake6").exists():
+            return c
+    for p in (Path("/usr/lib/cmake/Qt6"), Path("/usr/lib/x86_64-linux-gnu/cmake/Qt6")):
+        if p.is_dir():
+            return p.parent.parent
+    return None
+
+
+def _vswhere() -> Optional[str]:
+    on_path = shutil.which("vswhere")
+    if on_path:
+        return on_path
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")):
+        if not base:
+            continue
+        p = Path(base) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+        if p.exists():
+            return str(p)
+    return None
+
+
+def _msvc_toolset_present() -> bool:
+    """True when a VC toolset (and preferably clang-cl) is installed, even outside a dev prompt."""
+    if os.environ.get("VCToolsInstallDir"):
+        return True
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")):
+        if not base:
+            continue
+        for edition in ("BuildTools", "Community", "Professional", "Enterprise"):
+            vc = Path(base) / "Microsoft Visual Studio" / "2022" / edition / "VC" / "Auxiliary" / "Build"
+            if (vc / "vcvars64.bat").exists():
+                return True
+    return False
+
+
+
+@dataclass
+class PlatformInfo:
+    os: str                 # windows | linux | macos
+    arch: str
+    distro: str
+    pkg_mgr: Optional[str]
+    in_container: bool
+    interactive: bool
+    tools: dict = field(default_factory=dict)      # name -> description/path/None
+    qt_prefix: Optional[Path] = None
+    lavapipe_dir: Optional[Path] = None
+
+    @property
+    def is_windows(self) -> bool:
+        return self.os == "windows"
+
+    @property
+    def is_macos(self) -> bool:
+        return self.os == "macos"
+
+    def exe(self, name: str) -> str:
+        return name + ".exe" if self.is_windows else name
+
+    # --- toolchain -------------------------------------------------------------------------------
+    def vs_dev_prompt(self) -> bool:
+        """True when this shell has the MSVC environment loaded (vcvars) or clang-cl available."""
+        return bool(os.environ.get("VCToolsInstallDir") or os.environ.get("INCLUDE"))
+
+    def configure_extra(self, build_dir: Path) -> list:
+        """CMake flags for this platform. Mirrors the historical setup.py behaviour."""
+        extra = ["-DCMAKE_BUILD_TYPE=Release"]   # a Windows Ninja/clang-cl configure once came up Debug
+        # ps2xStudio (the editor tool) fetches four git branches at configure time; a network hiccup
+        # there aborted a user's whole game build. The game does not need it.
+        extra.append("-DPS2X_BUILD_STUDIO=" + ("ON" if os.environ.get("PS2X_SETUP_STUDIO") == "1" else "OFF"))
+        if self.is_macos:
+            extra += ["-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++"]
+            # paraLLEl-GS does not build on macOS (Granite's sleep_until_nsecs has no Darwin path).
+            if os.environ.get("PS2X_SETUP_PGS") != "1":
+                extra.append("-DPS2X_DISABLE_PGS=ON")
+            if os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
+                extra.append("-DCMAKE_OSX_DEPLOYMENT_TARGET=" + os.environ["MACOSX_DEPLOYMENT_TARGET"])
+            if not (build_dir / "CMakeCache.txt").exists() and shutil.which("ninja"):
+                extra += ["-G", "Ninja"]
+        if not self.is_windows:
+            return extra
+        cache = build_dir / "CMakeCache.txt"
+        if cache.exists():
+            gen = ""
+            for line in cache.read_text(errors="replace").splitlines():
+                if line.startswith("CMAKE_GENERATOR:"):
+                    gen = line.split("=", 1)[1]
+                    break
+            if "Visual Studio" not in gen:
+                return extra
+        # Prefer Ninja + clang-cl in a developer prompt: Ninja compiles every file in parallel,
+        # whereas the Visual Studio generator hands the runner's ~1000 unity units to MSBuild.
+        if (os.environ.get("PS2X_SETUP_GENERATOR", "ninja").lower() != "vs"
+                and self.vs_dev_prompt() and shutil.which("ninja") and shutil.which("clang-cl")):
+            return extra + ["-G", "Ninja", "-DCMAKE_C_COMPILER=clang-cl", "-DCMAKE_CXX_COMPILER=clang-cl"]
+        return extra + ["-T", os.environ.get("PS2X_SETUP_TOOLSET", "ClangCL")]
+
+
+def detect_platform() -> PlatformInfo:
+    if os.name == "nt":
+        osname = "windows"
+    elif sys.platform == "darwin":
+        osname = "macos"
+    else:
+        osname = "linux"
+    arch = _platform.machine().lower() or "unknown"
+    in_container = (not has_tty()) or Path("/.dockerenv").exists() or \
+        bool(os.environ.get("BT3_IN_CONTAINER"))
+    info = PlatformInfo(
+        os=osname,
+        arch=arch,
+        distro=_distro_name() if osname == "linux" else "",
+        pkg_mgr=_detect_pkg_mgr() if osname == "linux" else ("brew" if osname == "macos" else "winget"),
+        in_container=in_container,
+        interactive=has_tty() and not in_container,
+    )
+    cmv = _cmake_version()
+    info.tools["cmake"] = (f"{cmv[0]}.{cmv[1]}" if cmv else None)
+    info.tools["cmake_ok"] = "yes" if (cmv and cmv >= CMAKE_MIN) else "no"
+    for name in ("ninja", "git", "clang", "clang-cl", "clang++", "bsdtar", "7z", "pkg-config", "ccache", "mold"):
+        info.tools[name] = shutil.which(name)
+    info.qt_prefix = _qt_prefix()
+    info.tools["qt"] = str(info.qt_prefix) if info.qt_prefix else None
+    if osname == "windows":
+        info.tools["vswhere"] = _vswhere()
+        info.tools["msvc"] = "yes" if _msvc_toolset_present() else None
+        info.tools["vcvars"] = "loaded" if info.vs_dev_prompt() else None
+        for c in (ROOT / "build" / "mesa" / "x64", Path(os.environ.get("PS2X_MESA_DIR", "")) if os.environ.get("PS2X_MESA_DIR") else None):
+            if c and (c / "lavapipe" / "vulkan_lvp.dll").exists():
+                info.lavapipe_dir = c
+                break
+    return info
+
+
+def print_platform_report(info: PlatformInfo) -> None:
+    print(f"Platform : {info.os} ({info.arch})" + (f" distro={info.distro}" if info.distro else ""))
+    print(f"Package  : {info.pkg_mgr or 'not detected'}"
+          + ("  [container/non-interactive]" if info.in_container else ""))
+    print(f"Build dir: {BUILD}")
+    print(f"Work dir : {WORK}")
+    print("Tools:")
+    for name in ("cmake", "cmake_ok", "ninja", "git", "clang", "clang-cl", "bsdtar", "7z",
+                 "pkg-config", "ccache", "mold", "vswhere", "msvc", "vcvars", "qt"):
+        if name not in info.tools:
+            continue
+        value = info.tools[name]
+        mark = "OK " if value else "-- "
+        print(f"  {mark}{name:<11} {value or 'missing'}")
+
+
+def stage_detect(ctx: "Context") -> None:
+    step("stage 1: platform detection")
+    print_platform_report(ctx.platform)
+    if ctx.args.report == "json":
+        print(json.dumps({
+            "os": ctx.platform.os, "arch": ctx.platform.arch, "distro": ctx.platform.distro,
+            "pkg_mgr": ctx.platform.pkg_mgr, "in_container": ctx.platform.in_container,
+            "tools": {k: (str(v) if v is not None else None) for k, v in ctx.platform.tools.items()},
+        }, indent=2))
+
+
+# ------------------------------------------------------------------------------------------------
+# Stage 2: dependencies
+# ------------------------------------------------------------------------------------------------
+@dataclass
+class Dep:
+    name: str
+    check: Callable[[PlatformInfo], bool]
+    hint: str            # what to install (shown to the user)
+    install: Optional[Callable[["Context"], None]] = None   # filled in stage 2 execution
+
+
+def _have(name: str) -> Callable[[PlatformInfo], bool]:
+    return lambda info: bool(shutil.which(name))
+
+
+def deps_for(info: PlatformInfo) -> list[Dep]:
+    """The dependency list for this platform. Checks are real (versions/kits), not just PATH probes."""
+    if info.is_windows:
+        cmv = _cmake_version()
+        return [
+            Dep("Visual Studio Build Tools + ClangCL",
+                lambda i: i.tools.get("msvc") == "yes" or bool(i.tools.get("vswhere")),
+                f"winget install Microsoft.VisualStudio.2022.BuildTools (components: "
+                f"Microsoft.VisualStudio.Component.VC.Tools.x86.x64, "
+                f"Microsoft.VisualStudio.Component.VC.Llvm.Clang, "
+                f"Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset, "
+                f"Microsoft.VisualStudio.Component.Windows11SDK.22621)"),
+            Dep(f"CMake >= {CMAKE_MIN[0]}.{CMAKE_MIN[1]}", lambda i: bool(cmv and cmv >= CMAKE_MIN),
+                "winget install Kitware.CMake"),
+            Dep("Ninja", _have("ninja"), "winget install Ninja-build.Ninja"),
+            Dep("Python 3", _have("python"), "winget install Python.Python.3.12"),
+            Dep("aqtinstall (pip)", lambda i: bool(run_capture([sys.executable, "-m", "pip", "show", "aqtinstall"])),
+                "python -m pip install aqtinstall"),
+            Dep("pefile (pip)", lambda i: bool(run_capture([sys.executable, "-m", "pip", "show", "pefile"])),
+                "python -m pip install pefile"),
+            Dep(f"Qt {QT_VERSION} ({QT_KIT_WINDOWS})", lambda i: bool(i.qt_prefix),
+                f"aqt install-qt windows desktop {QT_VERSION} {QT_KIT_WINDOWS} --outputdir <qt>"),
+            Dep("Mesa lavapipe (Vulkan fallback)", lambda i: bool(i.lavapipe_dir),
+                f"download mesa-dist-win {MESA_LAVAPIPE_VERSION} and extract to build/mesa"),
+        ]
+    if info.is_macos:
+        return [
+            Dep("Xcode Command Line Tools", lambda i: bool(shutil.which("clang")), "xcode-select --install"),
+            Dep(f"CMake >= {CMAKE_MIN[0]}.{CMAKE_MIN[1]}", lambda i: bool(_cmake_version() and _cmake_version() >= CMAKE_MIN),
+                "brew install cmake"),
+            Dep("Ninja", _have("ninja"), "brew install ninja"),
+            Dep("pkg-config", _have("pkg-config"), "brew install pkg-config"),
+            Dep("FFmpeg", lambda i: bool(run_capture(["pkg-config", "--exists", "libavcodec"]) == "" and shutil.which("pkg-config")),
+                "brew install ffmpeg"),
+            Dep("Qt 6", lambda i: bool(i.qt_prefix), "brew install qt"),
+        ]
+    pkgs = "clang cmake ninja-build pkg-config git ccache mold libavcodec-dev libavformat-dev " \
+           "libavutil-dev libswresample-dev libswscale-dev libx11-dev libxrandr-dev libxi-dev " \
+           "libxcursor-dev libxinerama-dev libgl1-mesa-dev libglu1-mesa-dev qt6-base-dev " \
+           "libarchive-tools p7zip-full"
+    mgr = info.pkg_mgr or "apt"
+    if mgr == "pacman":
+        pkgs = "clang cmake ninja pkgconf git ccache mold ffmpeg libx11 libxrandr libxi libxcursor " \
+               "libxinerama mesa glu qt6-base libarchive p7zip"
+    elif mgr in ("dnf", "zypper"):
+        pkgs = "clang cmake ninja-build pkgconf-pkg-config git ccache mold ffmpeg-devel libX11-devel " \
+               "libXrandr-devel libXi-devel libXcursor-devel libXinerama-devel mesa-libGL-devel " \
+               "mesa-libGLU-devel qt6-qtbase-devel libarchive p7zip"
+    return [
+        Dep(f"build packages ({mgr})", lambda i: all(shutil.which(t) for t in ("clang", "cmake", "ninja", "pkg-config")),
+            f"{mgr} install {pkgs}"),
+        Dep("FFmpeg dev libs", lambda i: shutil.which("pkg-config") and
+            subprocess.run(["pkg-config", "--exists", "libavcodec"], capture_output=True).returncode == 0,
+            f"{mgr} install <ffmpeg-dev package>"),
+        Dep("Qt 6 (launcher)", lambda i: bool(i.qt_prefix), f"{mgr} install qt6-base-dev"),
+    ]
+
+
+def stage_deps(ctx: "Context") -> None:
+    step("stage 2: dependencies")
+    deps = deps_for(ctx.platform)
+    missing = [d for d in deps if not d.check(ctx.platform)]
+    for d in deps:
+        ok = d not in missing
+        print(f"  {'OK ' if ok else '-- '}{d.name}")
+    if not missing:
+        print("All dependencies present.")
+        return
+    print(f"\n{len(missing)} dependency(ies) missing:")
+    for d in missing:
+        print(f"  - {d.name}\n      install: {d.hint}")
+    if ctx.args.dry_run or ctx.args.no_deps:
+        print("(not installing: --dry-run/--no-deps)")
+        return
+    for d in missing:
+        if d.install is None:
+            # The installer for this dependency is not wired yet: fail loudly with the exact manual
+            # command instead of continuing into a half-provided build.
+            die(f"cannot install automatically yet: {d.name}\n  install manually: {d.hint}", 2)
+        if not ask_yes_no(ctx, f"Install {d.name} now?", default=True):
+            die(f"missing dependency: {d.name}\n  install manually: {d.hint}", 2)
+        d.install(ctx)
+
+
+# ------------------------------------------------------------------------------------------------
+# Stage 3: build pipeline
+# ------------------------------------------------------------------------------------------------
+def configured(build_dir: Path, info: PlatformInfo) -> bool:
+    """True when the build dir holds a COMPLETED configure. CMakeCache.txt alone is not enough:
+    a half-failed configure leaves the cache behind and `cmake --build` then dies."""
+    if not (build_dir / "CMakeCache.txt").exists():
+        return False
+    cache_text = (build_dir / "CMakeCache.txt").read_text(errors="replace")
+    if info.is_macos and os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
+        desired = os.environ["MACOSX_DEPLOYMENT_TARGET"]
+        if not any(line.startswith("CMAKE_OSX_DEPLOYMENT_TARGET:") and line.endswith("=" + desired)
+                   for line in cache_text.splitlines()):
+            return False
+    if info.is_macos:
+        desired_pgs = "OFF" if os.environ.get("PS2X_SETUP_PGS") == "1" else "ON"
+        if not any(line.startswith("PS2X_DISABLE_PGS:") and line.endswith("=" + desired_pgs)
+                   for line in cache_text.splitlines()):
+            return False
+    if any((build_dir / f).exists() for f in ("build.ninja", "Makefile", "ALL_BUILD.vcxproj")):
+        return True
+    return any(build_dir.glob("*.sln"))
+
+
+def cmake_configure(info: PlatformInfo, build_dir: Path) -> None:
+    run(["cmake", "-S", ROOT, "-B", build_dir] + info.configure_extra(build_dir))
+
+
+def cmake_build(info: PlatformInfo, build_dir: Path, target: str, jobs: str) -> None:
+    cmd = ["cmake", "--build", build_dir, "--target", target, "-j", jobs]
+    if info.is_windows:
+        cmd += ["--config", "Release"]   # multi-config generators
+    run(cmd)
+
+
+def extract_inputs(ctx: "Context") -> None:
+    """Step 1: obtain the two files source generation needs (the boot ELF and DBZP.BIN)."""
+    if ctx.args.skip_setup:
+        print("--skip-setup: reusing existing games/bt3/work/ and generated sources")
+        return
+    WORK.mkdir(parents=True, exist_ok=True)
+    src = ctx.src
+    if src.suffix.lower() == ".iso":
+        kind, exe = find_extractor()
+        if not exe:
+            die("need bsdtar/tar (Windows 10+ ships tar.exe) or 7z to extract the ISO")
+        members = ["SLUS_216.78", "BIN/DBZP.BIN"]
+        step(f"extracting {', '.join(members)} from the ISO with {exe}")
+        if kind == "tar":
+            run([exe, "-xf", src, "-C", WORK, *members])
+        else:
+            run([exe, "x", "-y", f"-o{WORK}", src, *members], stdout=subprocess.DEVNULL)
+        if not ctx.elf.is_file():
+            die("SLUS_216.78 not found in ISO (is this the USA release?)")
+        if not (WORK / "BIN" / "DBZP.BIN").is_file():
+            die("BIN/DBZP.BIN not found in ISO (is this the USA release?)")
+        make_writable(WORK)
+    else:
+        # A bare ELF build: the caller supplies SLUS_216.78 directly. BIN/DBZP.BIN still has to be
+        # present in WORK.
+        if WORK.exists():
+            make_writable(WORK)
+        shutil.copyfile(src, ctx.elf)
+        make_writable(WORK)
+        print("NOTE: you passed a bare ELF. The build also needs the ISO's")
+        print(f"      BIN/DBZP.BIN next to it in {WORK}.")
+
+
+def verify_elf(ctx: "Context") -> None:
+    if ctx.args.skip_setup:
+        return
+    got = sha256_of(ctx.elf)
+    if got != ELF_SHA256:
+        print(f"ERROR: ELF sha256 mismatch.\n  expected: {ELF_SHA256}\n  got:      {got}")
+        print("Only the USA release (SLUS-21678) is supported. Set PS2X_SETUP_FORCE=1 to continue anyway.")
+        if os.environ.get("PS2X_SETUP_FORCE") != "1":
+            sys.exit(1)
+
+
+def gen_vu1(ctx: "Context") -> None:
+    """Step 2b: the static VU1 recompiler input, cut from the ELF and translated to C++.
+    Runs with --skip-setup too: it takes seconds and a tree without the file still builds."""
+    step("generating VU1 programs from the ELF")
+    sys.path.insert(0, str(HERE))
+    from vu1_programs import generate as generate_vu1
+    generate_vu1(ctx.elf, ROOT / "ps2xRuntime", WORK / "vu1")
+
+
+def fetch_submodules() -> None:
+    """The paraLLEl-GS backend lives in a git submodule; CMake builds it only when present."""
+    if os.environ.get("PS2X_SETUP_NO_SUBMODULES") or not (ROOT / ".gitmodules").exists() or not shutil.which("git"):
+        return
+    try:
+        run(["git", "-C", ROOT, "submodule", "update", "--init", "--recursive"])
+    except Exception as e:   # noqa: BLE001
+        print(f"== submodule fetch failed ({e}); building without the paraLLEl-GS backend")
+
+
+def build_recompiler(ctx: "Context") -> Path:
+    step("building recompiler")
+    if not configured(BUILD, ctx.platform):
+        cmake_configure(ctx.platform, BUILD)
+    cmake_build(ctx.platform, BUILD, "ps2_recomp", str(os.cpu_count() or 4))
+    return find_binary("ps2_recomp")
+
+
+def generate_runner(ctx: "Context", recomp: Path) -> None:
+    """Step 4: deduplicate/split the function map and generate the runner sources."""
+    step("generating runner sources")
+    sys.path.insert(0, str(HERE))
+    from split_functions import split_csv
+    split = WORK / "functions_split.csv"
+    split_csv(ctx.elf, HERE / "functions.csv", split)
+    out = WORK / "output"
+    if out.exists():
+        shutil.rmtree(out)
+    cfg_text = (HERE / "config.toml.in").read_text()
+    cfg_text = (cfg_text.replace("@ELF@", ctx.elf.as_posix())
+                        .replace("@CSV@", split.as_posix())
+                        .replace("@OUT@", out.as_posix() + "/"))
+    (WORK / "config.toml").write_text(cfg_text)
+    run([recomp, WORK / "config.toml"])
+
+    # Step 5: post-generation patches + the overlay module from DBZP.BIN.
+    run([sys.executable, HERE / "apply_patches.py", out])
+    step("generating overlay sources from BIN/DBZP.BIN")
+    run([sys.executable, HERE / "gen_overlay.py",
+         "--recomp", recomp, "--dbzp", WORK / "BIN" / "DBZP.BIN",
+         "--work", WORK / "overlay", "--runtime", ROOT / "ps2xRuntime"])
+    run([sys.executable, HERE / "apply_overlay_patches.py", ROOT / "ps2xRuntime"])
+
+    # Step 6: install into the runtime tree.
+    step("installing runner sources")
+    rt = ROOT / "ps2xRuntime"
+    sync_tree(out, rt / "src" / "runner",
+              exclude=("ps2_recompiled_functions.h", "ps2_recompiled_stubs.h"))
+    for h in ("ps2_recompiled_functions.h", "ps2_recompiled_stubs.h"):
+        shutil.copyfile(out / h, rt / "include" / h)
+
+
+def build_runner(ctx: "Context", jobs: str) -> Path:
+    """Step 7: build the game. Reconfigure explicitly when the runner source SET changed: the
+    Visual Studio generator does not reliably re-glob within the same build invocation."""
+    rt = ROOT / "ps2xRuntime"
+    cache = BUILD / "CMakeCache.txt"
+    need_cfg = not configured(BUILD, ctx.platform)
+    if not need_cfg:
+        ct = cache.stat().st_mtime
+        for d in (rt / "src" / "runner", rt / "src" / "runner_overlay"):
+            if d.exists() and d.stat().st_mtime > ct:
+                need_cfg = True
+                break
+    if need_cfg:
+        cmake_configure(ctx.platform, BUILD)
+    step(f"building ps2EntryRunner (-j{jobs}, this takes a while)")
+    cmake_build(ctx.platform, BUILD, "ps2EntryRunner", jobs)
+    return find_binary("ps2EntryRunner")
+
+
+def stage_build(ctx: "Context") -> None:
+    step("stage 3: build")
+    if ctx.args.skip_setup:
+        if not (WORK / "SLUS_216.78").is_file():
+            die("--skip-setup requires an existing games/bt3/work/ (no SLUS_216.78 found)")
+    if not ctx.args.skip_setup:
+        extract_inputs(ctx)
+        verify_elf(ctx)
+    gen_vu1(ctx)
+    if not ctx.args.skip_setup:
+        fetch_submodules()
+        recomp = build_recompiler(ctx)
+        generate_runner(ctx, recomp)
+    if ctx.args.gen_only:
+        print("--gen-only: runner + overlay sources generated (skipping runner build)")
+        ctx.runner = None
+        return
+    ctx.runner = build_runner(ctx, ctx.jobs)
+
+
+# ------------------------------------------------------------------------------------------------
+# Stage 4: deploy (+ packaging, added in the packaging phase)
+# ------------------------------------------------------------------------------------------------
 def deploy_tree(runner: Path, out: Path) -> None:
     """Assemble the portable tree in OUT.
 
-    layout: OUT/savedata/ (settings.toml; existing user saves are preserved),
-    OUT/assets/ (fonts). No game data is deployed: the launcher's install wizard
-    extracts SLUS_216.78 + BIN/ DATA/ IRX/ SYSTEM.CNF from the user's own ISO
-    into OUT/data on first run.
-
-    Windows additionally copies the runtime DLLs next to the runner. The Linux
-    build_and_deploy.sh replaces `runner` with the self-extracting payload ELF.
+    layout: OUT/savedata/ (settings.toml; existing user saves are preserved), OUT/assets/ (fonts).
+    No game data is deployed: the launcher's install wizard extracts SLUS_216.78 + BIN/ DATA/ IRX/
+    SYSTEM.CNF from the user's own ISO into OUT/data on first run.
     """
-    print(f"== assembling deploy tree in {out}")
+    step(f"assembling deploy tree in {out}")
     out.mkdir(parents=True, exist_ok=True)
-
-    # settings: default settings.toml only if none deployed yet (user keeps their saves)
     save_dst = out / "savedata"
     save_dst.mkdir(parents=True, exist_ok=True)
     cfg_src = runner.parent / "settings.toml"
@@ -218,17 +717,11 @@ def deploy_tree(runner: Path, out: Path) -> None:
     if cfg_src.exists() and not cfg_dst.exists():
         shutil.copy2(cfg_src, cfg_dst)
         print(f"  copied default settings -> {cfg_dst}")
-
-    # fonts + overlay assets
     for a in ("assets",):
         src = runner.parent / a
         if src.exists():
             copytree_overlay(src, out / a)
-
-    # runtime DLLs (Windows) live next to the runner in the build dir; copy them
-    # too so the tree is self-contained. build_and_deploy.sh replaces the runner
-    # with the self-extracting payload ELF on Linux; here we always place it.
-    if IS_WINDOWS:
+    if os.name == "nt":
         for p in runner.parent.glob("*.dll"):
             shutil.copy2(p, out / p.name)
     shutil.copy2(runner, out / runner.name)
@@ -237,184 +730,150 @@ def deploy_tree(runner: Path, out: Path) -> None:
     print(f"Deploy tree ready: {out}")
 
 
-def main() -> None:
+def stage_package(ctx: "Context") -> None:
+    step("stage 4: deploy/package")
+    if ctx.runner is None:
+        die("no runner to deploy: run the build stage first (or drop --skip-setup/--gen-only misuse)")
+    if ctx.args.deploy:
+        deploy_tree(ctx.runner, Path(ctx.args.deploy).resolve())
+    if ctx.args.package:
+        die("--package is implemented in the packaging phase; use --deploy for now", 2)
+
+
+# ------------------------------------------------------------------------------------------------
+# CLI + stage runner
+# ------------------------------------------------------------------------------------------------
+@dataclass
+class Context:
+    args: argparse.Namespace
+    platform: PlatformInfo
+    interactive: bool
+    jobs: str
+    src: Optional[Path] = None
+    elf: Path = field(default_factory=lambda: WORK / "SLUS_216.78")
+    runner: Optional[Path] = None
+    run_mode: int = 1   # highest stage number requested
+
+
+def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Build (and optionally deploy) Dragon Ball Z: Budokai Tenkaichi 3.")
+        description="Build (deploy and package) Dragon Ball Z: Budokai Tenkaichi 3.")
     ap.add_argument("src", nargs="?", metavar="<iso|elf>",
                     help="BT3 USA ISO or bare SLUS_216.78 ELF (not needed with --skip-setup)")
     ap.add_argument("--jobs", default=DEFAULT_JOBS, metavar="N",
                     help=f"parallel jobs for the ps2EntryRunner build (default {DEFAULT_JOBS})")
+    ap.add_argument("--stage", metavar="N", help="run only this stage (1-4)")
+    ap.add_argument("--stages", metavar="A-B", help="run a stage range, e.g. 3-4")
+    ap.add_argument("--list-stages", action="store_true", help="print the stages and exit")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="stage 1 + a report of what would be done; no changes")
+    ap.add_argument("--report", choices=("text", "json"), default="text",
+                    help="format of the stage 1 report")
+    ap.add_argument("-y", "--yes", action="store_true", help="answer yes to every prompt")
+    ap.add_argument("--non-interactive", action="store_true", help="never prompt")
+    ap.add_argument("--install-deps", action="store_true", help="install missing dependencies")
+    ap.add_argument("--no-deps", action="store_true", help="never install dependencies")
+    ap.add_argument("--deps-only", action="store_true", help="stop after stage 2")
     ap.add_argument("--deploy", metavar="OUT",
-                    help="after the build, copy the playable tree into OUT")
+                    help="after the build, assemble the playable tree into OUT")
+    ap.add_argument("--package", action="store_true",
+                    help="also produce the release artifact for this OS (+ checksum)")
     ap.add_argument("--skip-setup", action="store_true",
                     help="skip ISO/recompile/patches; only rebuild the runner (+deploy)")
     ap.add_argument("--gen-only", action="store_true",
-                    help="stop after recompile/generation/patches (steps 1-6); skip building the runner")
-    args = ap.parse_args()
+                    help="stop after recompile/generation/patches; do not build the runner")
+    args = ap.parse_args(argv)
     if args.skip_setup and args.gen_only:
         die("--skip-setup and --gen-only are mutually exclusive")
+    if args.install_deps and args.no_deps:
+        die("--install-deps and --no-deps are mutually exclusive")
+    return args
 
-    jobs = str(args.jobs)
-    if args.skip_setup:
-        if not (WORK / "SLUS_216.78").is_file():
-            die("--skip-setup requires an existing games/bt3/work/ (no SLUS_216.78 found)")
-        src = None
-        elf = WORK / "SLUS_216.78"
-    else:
-        if not args.src:
-            ap.print_usage(sys.stderr)
-            die("missing the BT3 ISO or SLUS_216.78 ELF path")
-        src = Path(args.src).resolve()
-        if not src.exists():
-            die(f"{src} does not exist")
-        WORK.mkdir(parents=True, exist_ok=True)
-        elf = WORK / "SLUS_216.78"
 
-    # 1. Obtain the BUILD inputs. Source generation needs exactly two files from
-    #    the ISO: the boot ELF (SLUS_216.78 -> recompiled, and mined for VU1
-    #    microcode) and the gameplay overlay (BIN/DBZP.BIN -> recompiled into the
-    #    runner). The rest of the disc (DATA/, IRX/, the AFS containers) is never
-    #    read while building and is not extracted.
-    if not args.skip_setup and src.suffix.lower() == ".iso":
-        kind, exe = find_extractor()
-        members = ["SLUS_216.78", "BIN/DBZP.BIN"]
-        print(f"== extracting {', '.join(members)} from the ISO with {exe}")
-        if kind == "tar":
-            run([exe, "-xf", src, "-C", WORK, *members])
-        else:
-            run([exe, "x", "-y", f"-o{WORK}", src, *members], stdout=subprocess.DEVNULL)
-        if not elf.is_file():
-            die("SLUS_216.78 not found in ISO (is this the USA release?)")
-        if not (WORK / "BIN" / "DBZP.BIN").is_file():
-            die("BIN/DBZP.BIN not found in ISO (is this the USA release?)")
-        make_writable(WORK)
-    elif not args.skip_setup:
-        # A bare ELF build: the caller supplies SLUS_216.78 directly. BIN/DBZP.BIN
-        # (the overlay source) still has to be present in WORK.
-        if WORK.exists():
-            make_writable(WORK)
-        shutil.copyfile(src, elf)
-        make_writable(WORK)
-        print("NOTE: you passed a bare ELF. The build also needs the ISO's")
-        print(f"      BIN/DBZP.BIN next to it in {WORK}.")
+def wanted_stages(args: argparse.Namespace) -> set:
+    if args.deps_only:
+        return {"1", "2"}
+    if args.stage:
+        return {"1", args.stage}
+    if args.stages:
+        try:
+            a, b = args.stages.split("-", 1)
+            a, b = int(a), int(b)
+        except ValueError:
+            die(f"bad --stages value: {args.stages} (use A-B)")
+        if a > b:
+            a, b = b, a
+        return {str(n) for n in range(max(1, a), min(4, b) + 1)} | {"1"}
+    return {"1", "2", "3", "4"}
 
-    if args.skip_setup:
-        print("--skip-setup: reusing existing games/bt3/work/ and generated sources")
-    else:
-        # 2. Verify it is the expected USA ELF.
-        got = sha256_of(elf)
-        if got != ELF_SHA256:
-            print(f"ERROR: ELF sha256 mismatch.\n  expected: {ELF_SHA256}\n  got:      {got}")
-            print("Only the USA release (SLUS-21678) is supported. Set PS2X_SETUP_FORCE=1 to continue anyway.")
-            if os.environ.get("PS2X_SETUP_FORCE") != "1":
-                sys.exit(1)
 
-    # 2b. [vu1manifest] the static VU1 recompiler's input: the game's VU1 microprograms, cut out of the ELF by
-    #     games/bt3/vu1_programs.json (offsets + hashes only) and translated by ps2xRuntime/tools/gen_vu1.py into
-    #     ps2xRuntime/src/lib/vu1_jit_gen.inc (git-ignored, like the EE runner sources). Runs with --skip-setup
-    #     too: it takes seconds, and a tree without the file still builds (VU1 interpreter only).
-    print("== generating VU1 programs from the ELF")
-    sys.path.insert(0, str(HERE))
-    from vu1_programs import generate as generate_vu1
-    generate_vu1(elf, ROOT / "ps2xRuntime", WORK / "vu1")
+def resolve_source(ctx: "Context") -> None:
+    """Fill ctx.src (and prompt for it when interactive)."""
+    if ctx.args.skip_setup or ctx.args.dry_run:
+        if ctx.args.src:
+            ctx.src = Path(ctx.args.src).expanduser()
+        return
+    raw = ctx.args.src
+    if not raw and ctx.interactive:
+        p = ask_path(ctx, "BT3 USA ISO required. Paste the path (drag & drop works):", "file")
+        if p:
+            ctx.src = p
+    elif raw:
+        ctx.src = Path(raw).expanduser()
+    if ctx.src is None:
+        if ctx.interactive:
+            die("no ISO/ELF provided")
+        die("missing the BT3 ISO or SLUS_216.78 ELF path")
+    if not ctx.src.exists():
+        die(f"{ctx.src} does not exist")
 
-    # 3. Configure + build the recompiler. Configure only once: the globs use
-    #    CONFIGURE_DEPENDS, so later builds re-run cmake by themselves when the
-    #    source set changes — and an unnecessary reconfigure rewrites the MSVC
-    #    project files, which makes MSBuild rebuild everything from scratch.
-    if not args.skip_setup:
-        # [pgs] the paraLLEl-GS backend lives in a git submodule (ps2xRuntime/third_party/parallel-gs, with its own
-        # Granite submodule); CMake builds it in only when the checkout is present, so fetch it here. Harmless when
-        # the tree is not a git checkout or the submodule is already there. PS2X_SETUP_NO_SUBMODULES=1 skips it.
-        if not os.environ.get("PS2X_SETUP_NO_SUBMODULES") and (ROOT / ".gitmodules").exists() and shutil.which("git"):
-            try:
-                run(["git", "-C", ROOT, "submodule", "update", "--init", "--recursive"])
-            except Exception as e:   # noqa: BLE001
-                print(f"== submodule fetch failed ({e}); building without the paraLLEl-GS backend")
-        print("== building recompiler")
-        if not configured():
-            run(["cmake", "-S", ROOT, "-B", BUILD] + cmake_configure_extra())
-        cmake_build("ps2_recomp", str(os.cpu_count() or 4))
-        recomp = find_binary("ps2_recomp")
 
-        # 4. Generate the runner sources. The function map first gets its oversized
-        #    Ghidra-truncation rows deduplicated and split into compiler-friendly
-        #    chunks (see split_functions.py) — without this, single generated
-        #    functions reach ~100K lines and exhaust MSVC's heap.
-        print("== generating runner sources")
-        sys.path.insert(0, str(HERE))
-        from split_functions import split_csv
-        split = WORK / "functions_split.csv"
-        split_csv(elf, HERE / "functions.csv", split)
-        out = WORK / "output"
-        if out.exists():
-            shutil.rmtree(out)
-        cfg_text = (HERE / "config.toml.in").read_text()
-        cfg_text = (cfg_text.replace("@ELF@", elf.as_posix())
-                            .replace("@CSV@", split.as_posix())
-                            .replace("@OUT@", out.as_posix() + "/"))
-        (WORK / "config.toml").write_text(cfg_text)
-        run([recomp, WORK / "config.toml"])
-
-        # 5. Post-generation patches + the overlay module from DBZP.BIN.
-        run([sys.executable, HERE / "apply_patches.py", out])
-        print("== generating overlay sources from BIN/DBZP.BIN")
-        run([sys.executable, HERE / "gen_overlay.py",
-             "--recomp", recomp, "--dbzp", WORK / "BIN" / "DBZP.BIN",
-             "--work", WORK / "overlay", "--runtime", ROOT / "ps2xRuntime"])
-        run([sys.executable, HERE / "apply_overlay_patches.py", ROOT / "ps2xRuntime"])
-
-        # 6. Install into the runtime tree.
-        print("== installing runner sources")
-        rt = ROOT / "ps2xRuntime"
-        sync_tree(out, rt / "src" / "runner",
-                  exclude=("ps2_recompiled_functions.h", "ps2_recompiled_stubs.h"))
-        for h in ("ps2_recompiled_functions.h", "ps2_recompiled_stubs.h"):
-            shutil.copyfile(out / h, rt / "include" / h)
-
-    if args.gen_only:
-        print("--gen-only: runner + overlay sources generated (skipping runner build)")
+def main(argv=None) -> None:
+    args = parse_args(argv)
+    if args.list_stages:
+        for num, desc in STAGES:
+            print(f"  --stage {num}   {desc}")
         return
 
-    # 7. Build the game. CONFIGURE_DEPENDS re-globs on Makefile generators, but the
-    #    Visual Studio generator does not reliably pick up a changed source SET within
-    #    the same build invocation (fresh Windows builds linked without main/the
-    #    function tables). Reconfigure explicitly when the runner/overlay file set
-    #    changed since the last configure; content-only changes still skip it.
-    rt = ROOT / "ps2xRuntime"
-    cache = BUILD / "CMakeCache.txt"
-    need_cfg = not configured()
-    if not need_cfg:
-        ct = cache.stat().st_mtime
-        for d in (rt / "src" / "runner", rt / "src" / "runner_overlay"):
-            if d.exists() and d.stat().st_mtime > ct:
-                need_cfg = True
-                break
-    if need_cfg:
-        run(["cmake", "-S", ROOT, "-B", BUILD] + cmake_configure_extra())
-    print(f"== building ps2EntryRunner (-j{jobs}, this takes a while)")
-    cmake_build("ps2EntryRunner", jobs)
-    runner = find_binary("ps2EntryRunner")
+    info = detect_platform()
+    interactive = info.interactive and not args.non_interactive
+    ctx = Context(args=args, platform=info, interactive=interactive, jobs=str(args.jobs))
 
-    if args.deploy:
-        deploy_tree(runner, OUT := Path(args.deploy).resolve())
+    # --dry-run implies --no-deps and stops before stage 3.
+    if args.dry_run:
+        args.no_deps = True
+
+    stages = wanted_stages(args)
+    ctx.run_mode = max(int(s) for s in stages)
+
+    stage_detect(ctx)
+    if "2" in stages:
+        stage_deps(ctx)
+
+    if args.dry_run:
+        if "3" in stages:
+            print("\ndry-run: would build (stage 3) and deploy"
+                  + (" and package" if args.package else "") + ".")
         return
 
-    env_line = ("set PS2X_CD_IMAGE=<path to your BT3 ISO>& " if IS_WINDOWS else
-                'env PS2X_CD_IMAGE="<path to your BT3 ISO>" ')
-    print(f"""
-Done. Run with:
+    if "3" in stages and not args.deps_only:
+        resolve_source(ctx)
+        if ctx.src is not None and ctx.src.suffix.lower() != ".iso" and not args.skip_setup:
+            # bare ELF: keep the historical behaviour of copying it into WORK
+            pass
+        stage_build(ctx)
 
-  cd {runner.parent}
-  {env_line}\\
-      {runner} {elf}
-""" if not IS_WINDOWS else f"""
-Done. Run with (cmd.exe):
+    if "4" in stages and not args.deps_only:
+        if ctx.runner is None and args.deploy:
+            # --stage 4 (or --skip-setup) with an existing build: locate the runner.
+            ctx.runner = find_binary("ps2EntryRunner")
+        stage_package(ctx)
 
-  cd {runner.parent}
-  set PS2X_CD_IMAGE=<path to your BT3 ISO>
-  {runner} {elf}
-""")
+    if ctx.runner is not None and not args.deploy and not args.package:
+        env_line = ("set PS2X_CD_IMAGE=<path to your BT3 ISO>& " if info.is_windows else
+                    'env PS2X_CD_IMAGE="<path to your BT3 ISO>" ')
+        step("done")
+        print(f"Run with:\n\n  cd {ctx.runner.parent}\n  {env_line}\\\n      {ctx.runner} {ctx.elf}\n")
 
 
 if __name__ == "__main__":
