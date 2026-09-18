@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.20)
 
 project(PS2Runtime VERSION 0.1.0 LANGUAGES CXX)
 
+# [R1] DORMANT experiment: route the GS replay through the renamed vendored rlgl copy (gsrl) instead of
+# the vendored raylib rlgl. OFF by default -- with raylib vendored 1:1 the replay already submits through
+# rlgl that lives in our tree, with a single GL state owner. Kept for A/B comparison.
+option(PS2X_USE_GSRL "Route the GS replay through the renamed gsrl copy (experiment)" OFF)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -66,69 +71,37 @@ else()
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
 
-    FetchContent_Declare(
-        raylib
-        GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
-        GIT_TAG "5.5" # we will migrate to 4.2.0 later, trust me it will be better
-        GIT_PROGRESS TRUE
-        # Without this, a fresh clone pulls raylib's whole history: 60794 objects, ~350 MiB, for
-        # a pinned tag we only ever build one revision of. Depth 1 fetches a fraction of that.
-        GIT_SHALLOW TRUE
-        # [ps2x raylib patch] batch multi-buffering (4 buffers), no per-flush texture/VAO/program unbinds,
-        # draw-call/flush counters + flush timer read by the fps line. Applied once at populate time;
-        # the reverse --check makes a re-populate of an already-patched source a no-op.
-        # NOTE: keep "--check" WITHOUT "--quiet": Ubuntu 22.04 ships git 2.34, where the
-        # combination exits 129 (usage error), so a patched source would fall through to the
-        # forward apply and fail. Verify with `git apply --reverse --check`.
-        # [ps2x raylib patch] NO PATCH_COMMAND here on purpose: it needed a shell (`git apply ... || git apply ...`),
-        # and the populate sub-build runs it WITHOUT one on Windows (MSBuild), where it exited -1 and failed the
-        # configure (2026-09-11). The self-heal block after FetchContent_MakeAvailable does the same work through
-        # CMake -- reverse-check, restore if an older patch is applied, forward-apply, fail loudly -- on every
-        # configure and on every platform, so the patch step here is redundant as well as broken.
-    )
-    FetchContent_MakeAvailable(raylib)
+    # [vendor] raylib is VENDORED 1:1 at third_party/bt3gl (see VENDORED.md): no FetchContent, no
+    # patch step (the copy already carries patches/raylib-5.5-ps2x.patch, and its config.h already has
+    # MAX_GAMEPADS=16) and no network at configure time. The target is named `bt3gl` (our vendored raylib),
+    # so every link and ${bt3gl_SOURCE_DIR} use below is local and patch-free.
+    set(bt3gl_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bt3gl")
 
-    # [ps2x raylib patch] the PATCH_COMMAND above only runs when FetchContent populates the source. A build
-    # directory populated earlier either has no patch or an OLDER version of it, and a newer patch does not
-    # apply on top of an older one (2026-09-08: the vertex-ring patch failed to configure on every existing
-    # Windows build directory). Self-heal: if the current patch is neither applied nor applicable, restore
-    # the pristine 5.5 sources (git checkout -- .) and apply it fresh. Idempotent on every configure.
-    if(EXISTS "${raylib_SOURCE_DIR}/src/rlgl.h")
-        set(_rl_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch")
-        execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --reverse --check "${_rl_patch}"
-                        RESULT_VARIABLE _rl_patched OUTPUT_QUIET ERROR_QUIET)
-        if(NOT _rl_patched EQUAL 0)
-            execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --check --ignore-whitespace "${_rl_patch}"
-                            RESULT_VARIABLE _rl_applicable OUTPUT_QUIET ERROR_QUIET)
-            if(NOT _rl_applicable EQUAL 0)
-                message(STATUS "raylib ps2x patch: a previous patch version is applied in ${raylib_SOURCE_DIR}; restoring the pristine sources")
-                execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" checkout -- . RESULT_VARIABLE _rl_reset)
-                if(NOT _rl_reset EQUAL 0)
-                    message(FATAL_ERROR "raylib ps2x patch: could not restore ${raylib_SOURCE_DIR} (git checkout -- . failed); delete build/_deps/raylib-* and reconfigure")
-                endif()
-            endif()
-            execute_process(COMMAND git -C "${raylib_SOURCE_DIR}" apply --ignore-whitespace "${_rl_patch}"
-                            RESULT_VARIABLE _rl_apply)
-            if(NOT _rl_apply EQUAL 0)
-                message(FATAL_ERROR "raylib ps2x patch failed to apply to ${raylib_SOURCE_DIR}; delete build/_deps/raylib-* and reconfigure")
-            endif()
-            message(STATUS "raylib ps2x patch applied to ${raylib_SOURCE_DIR}")
-        endif()
-    endif()
+    # Only what the runtime uses: rcore.c also carries rlgl's implementation (upstream 5.5 layout).
+    # rtext.c (fonts: DrawText/TextFormat/GetFontDefault, used by the overlay/UI) and raudio.c (the
+    # PS2X_HOSTAUDIO=raylib fallback) are needed as well; rmodels.c is the only module left out.
+    add_library(bt3gl STATIC
+        "${bt3gl_SOURCE_DIR}/src/rcore.c"
+        "${bt3gl_SOURCE_DIR}/src/rshapes.c"
+        "${bt3gl_SOURCE_DIR}/src/rtextures.c"
+        "${bt3gl_SOURCE_DIR}/src/rtext.c"
+        "${bt3gl_SOURCE_DIR}/src/raudio.c"
+        "${bt3gl_SOURCE_DIR}/src/utils.c")
+    # ONLY src: the vendor's own includes are relative ("external/glad.h", "external/stb_image.h", ...)
+    # so they resolve on their own. Putting src/external on the include path makes the Windows-only
+    # external/dirent.h SHADOW the real <dirent.h> (angle includes search -I/-isystem dirs first) and the
+    # Linux build dies on its '#include <io.h>'. ps2_runtime adds that dir separately, for stb.
+    target_include_directories(bt3gl PUBLIC "${bt3gl_SOURCE_DIR}/src")
+    # [B] The window/input/GL-context come from SDL2 (platforms/rcore_desktop_sdl.c), not GLFW: GLFW is
+    # gone from the build entirely. SDL2 is fetched and built further down for hostio; the window uses
+    # the same static build (linked after that block, see PS2X_SDL2_TARGET).
+    target_compile_definitions(bt3gl PUBLIC PLATFORM_DESKTOP_SDL GRAPHICS_API_OPENGL_33)
 
-    # raylib defaults to MAX_GAMEPADS=4, and on Linux those four slots are not necessarily
-    # controllers: udev sets ID_INPUT_JOYSTICK=1 on plenty of things that are not, notably
-    # keyboards exposing System Control / Consumer Control HID pages. The patch above sets 16;
-    # this rewrite is the belt to that brace for a source tree the patch did not touch.
-    # NOTE: a -DMAX_GAMEPADS=16 compile definition does NOT work. rcore.c includes raylib's
-    # own config.h (whenever EXTERNAL_CONFIG_FLAGS is undefined, which is our case) and that
-    # header redefines MAX_GAMEPADS unconditionally, so it silently wins -- and -w hides the
-    # macro-redefinition warning that would have said so. Patch the fetched header instead.
-    if(EXISTS "${raylib_SOURCE_DIR}/src/config.h")
-        file(READ "${raylib_SOURCE_DIR}/src/config.h" _rl_cfg)
-        string(REGEX REPLACE "#define[ \t]+MAX_GAMEPADS[ \t]+4"
-                             "#define MAX_GAMEPADS                   16" _rl_cfg "${_rl_cfg}")
-        file(WRITE "${raylib_SOURCE_DIR}/src/config.h" "${_rl_cfg}")
+    if(WIN32)
+        target_link_libraries(bt3gl PUBLIC opengl32 winmm)
+    else()
+        find_package(OpenGL REQUIRED)
+        target_link_libraries(bt3gl PUBLIC OpenGL::GL ${CMAKE_DL_LIBS} pthread m)
     endif()
 
 
@@ -154,26 +127,43 @@ else()
         "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
     )
     target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
+    # [altGL] ImGui's OpenGL3 backend, so the overlay can render through gfx::gl / raw GL instead
+    # of rlImGui/rlgl (PS2X_UIGL=1). It brings its own GL loader, so it does not need rlgl.
+    target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp")
+    target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}/backends")
 
-    FetchContent_Declare(
-        rlImGui
-        GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
-        GIT_TAG "Raylib_5_5"
-        GIT_SHALLOW TRUE
-    )
-    FetchContent_GetProperties(rlImGui)
-
-    if(NOT rlimgui_POPULATED)
-        FetchContent_Populate(rlImGui)
+    # [d3d11] ImGui's Direct3D 11 backend, so the overlay can render through the native
+    # video path instead of rlImGui/rlgl when PS2X_D3D11=1 is active.
+    if(WIN32)
+        target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_dx11.cpp")
+        target_link_libraries(imgui PUBLIC d3d11 dxgi)
     endif()
 
-    set(PS2X_RLIMGUI_SOURCE_DIR "${rlimgui_SOURCE_DIR}")
+    # [C] ImGui's SDL2 PLATFORM backend: the overlay's window/input glue. It replaces rlImGui (raylib's
+    # ecosystem) while the renderers stay ours -- imgui_impl_opengl3 for gfx::gl and imgui_impl_dx11 for
+    # the native path. SDL event WATCHING (see ui_sdl.cpp) lets ImGui see every event without consuming
+    # it, so raylib keeps its own input. The SDL2 link is added after the SDL2 target exists, below.
+    # [linuxfix] This used to sit INSIDE if(WIN32) (Linux never got the backend) and ahead of the
+    # PS2X_HOST_SDL2 option() (a fresh configure saw it undefined): declare the option here.
+    option(PS2X_HOST_SDL2 "Use SDL2 for gamepad input and audio output" ON)
+    if(PS2X_HOST_SDL2)
+        target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp")
+        # [sdlprefetch] clang-cl: SDL_endian.h defines _m_prefetch, a builtin on current clang ("definition
+        # of builtin function"). Our files include SDL via ps2_host_sdl.h, which sets clang's guard first;
+        # imgui's SDL2 backend and bt3gl's SDL platform (rcore.c) include <SDL.h> directly, so force the
+        # same guard into those two. Out of the unity build so the force-include stays on that one file.
+        if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            set(_ps2x_sdl_prefetch_fix "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/ps2_sdl_prefetch_fix.h")
+            set_source_files_properties(
+                "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp"
+                "${bt3gl_SOURCE_DIR}/src/rcore.c"
+                PROPERTIES COMPILE_OPTIONS "/FI${_ps2x_sdl_prefetch_fix}" SKIP_UNITY_BUILD_INCLUSION ON)
+        endif()
+    endif()
 
-    add_library(rlImGui STATIC
-        "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
-    )
-    target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
-    target_link_libraries(rlImGui PUBLIC raylib imgui)
+    # [C] rlImGui is GONE: the overlay is ImGui over our own backends (imgui_impl_sdl2 for the platform
+    # and imgui_impl_opengl3 / imgui_impl_dx11 to draw), so raylib's ecosystem is no longer a build
+    # dependency. See src/lib/ui_sdl.cpp for the event-watch trick that keeps raylib's input working.
 
     # [hostio] SDL2 for gamepads and audio output (the window and keyboard stay raylib's). Built
     # static from source so every platform gets the same version; PS2X_HOSTPAD=raylib /
@@ -207,6 +197,65 @@ else()
         message(STATUS "[hostio] SDL2 gamepad/audio backend: ON (${PS2X_SDL2_TARGET})")
     else()
         message(STATUS "[hostio] SDL2 gamepad/audio backend: OFF (raylib only)")
+    endif()
+endif()
+
+# [B] The vendored raylib takes its window/input/GL context from SDL2 (PLATFORM_DESKTOP_SDL), so the
+# platform needs SDL2 linked here -- after the fetch above, whose target name depends on how SDL2 was
+# built. raylib is linked against the same SDL2 the hostio backend uses.
+if(TARGET bt3gl AND DEFINED PS2X_SDL2_TARGET)
+    target_link_libraries(bt3gl PUBLIC ${PS2X_SDL2_TARGET})
+    message(STATUS "[B] bt3gl (vendored raylib) window backend: SDL2 (${PS2X_SDL2_TARGET})")
+    # [C] imgui_impl_sdl2.cpp (the overlay's platform backend) needs SDL2's headers and symbols.
+    if(TARGET imgui)
+        target_link_libraries(imgui PUBLIC ${PS2X_SDL2_TARGET})
+    endif()
+else()
+    # The window/input/GL context come from SDL2 now (PLATFORM_DESKTOP_SDL), so there is no fallback:
+    # fail here with a clear message instead of a wall of undefined SDL_* symbols at link time.
+    message(FATAL_ERROR
+        "The runtime window backend is SDL2 (PLATFORM_DESKTOP_SDL). Configure with PS2X_HOST_SDL2=ON.")
+endif()
+
+# [d3d11 probe] Native Direct3D 11 video on raylib's HWND, buildable on its own so the
+# P1 milestone (device + swap chain + present, raylib keeping window/input/audio) can be
+# validated without compiling the full runner. See tools/d3d11_probe/main.cpp.
+if(WIN32 AND NOT PS2X_IS_VITA)
+    add_executable(ps2xD3D11Probe
+        tools/d3d11_probe/main.cpp
+        src/gfx/d3d11/D3D11Device.cpp
+        src/gfx/d3d11/D3D11Gfx.cpp
+    )
+    target_include_directories(ps2xD3D11Probe PRIVATE src)
+    target_link_libraries(ps2xD3D11Probe PRIVATE bt3gl d3d11 dxgi d3dcompiler dxguid)
+    if(MSVC)
+        target_compile_options(ps2xD3D11Probe PRIVATE /W4)
+    else()
+        target_compile_options(ps2xD3D11Probe PRIVATE -Wall -Wextra)
+    endif()
+endif()
+
+# [altGL probe] The standalone OpenGL render layer (loader + gfx/gl + present). Built on every
+# platform so the port can be validated in parallel with the raylib GL path and the D3D11 layer.
+# raylib is used ONLY for the window/context here (transition); see tools/gl_probe/main.cpp.
+if(NOT PS2X_IS_VITA)
+    add_executable(ps2xGlProbe
+        tools/gl_probe/main.cpp
+        src/gfx/gl/GlApi.cpp
+        src/gfx/gl/GlDevice.cpp
+        src/gfx/gl/GlGfx.cpp
+    )
+    target_include_directories(ps2xGlProbe PRIVATE src)
+    if(WIN32)
+        target_link_libraries(ps2xGlProbe PRIVATE bt3gl opengl32)
+    else()
+        find_package(OpenGL REQUIRED)
+        target_link_libraries(ps2xGlProbe PRIVATE bt3gl OpenGL::GL ${CMAKE_DL_LIBS})
+    endif()
+    if(MSVC)
+        target_compile_options(ps2xGlProbe PRIVATE /W4)
+    else()
+        target_compile_options(ps2xGlProbe PRIVATE -Wall -Wextra)
     endif()
 endif()
 
@@ -312,7 +361,7 @@ if(PS2X_IS_VITA)
         pthread
     )
 else()
-    target_link_libraries(ps2_host_backend INTERFACE raylib)
+    target_link_libraries(ps2_host_backend INTERFACE bt3gl)
 endif()
 
 if(WIN32)
@@ -446,7 +495,9 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp
     src/lib/ps2_host_audio.cpp   # [hostio] audio device: SDL2 mixer or raylib/miniaudio
-    src/lib/ps2_host_pad.cpp     # [hostio] gamepads: SDL2 gamecontroller or raylib/GLFW
+src/lib/ps2_host_window.cpp  # [B] native HWND from raylib's window handle (SDL returns the SDL_Window*)
+src/lib/ui_sdl.cpp          # [C] ImGui platform glue on SDL2 (replaces rlImGui)
+    src/lib/ps2_host_pad.cpp     # [hostio] gamepads: SDL2 gamecontroller (default) or raylib's own API
     src/lib/ps2_gs_gpu.cpp
     src/lib/ps2_gs_gpu_renderer.cpp
     src/lib/ps2_win_timer.cpp
@@ -601,9 +652,49 @@ endif()
 target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
+    ${CMAKE_CURRENT_SOURCE_DIR}/src          # gfx/... (D3D11 device etc.)
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg)
+
+# [d3d11] Native Direct3D 11 video device (device + DXGI swap chain), Windows-only.
+# d3dcompiler is linked now so the P3 shader port can compile HLSL at runtime.
+if(WIN32)
+    target_sources(ps2_runtime PRIVATE
+        src/gfx/d3d11/D3D11Device.cpp
+        src/gfx/d3d11/D3D11Gfx.cpp)
+    target_link_libraries(ps2_runtime PUBLIC d3d11 dxgi d3dcompiler dxguid)
+endif()
+
+# [altGL] Standalone OpenGL layer (own loader + gfx/gl). Opt-in present (PS2X_ALTGL=1) while the
+# renderer is migrated off raylib; coexists with the D3D11 device in the same TU.
+target_sources(ps2_runtime PRIVATE
+    src/gfx/gl/GlApi.cpp
+    src/gfx/gl/GlDevice.cpp
+    src/gfx/gl/GlGfx.cpp
+    src/gfx/gl/gsrl_vendor.cpp   # [R1] vendored rlgl subset (own state cache/batcher for the replay)
+    src/gfx/gl/gsrl.cpp          # [R1] mirroring wrappers (vendored + raylib stacks)
+    src/gfx/gl_context.cpp
+    src/gfx/gs_resources.cpp
+    src/gfx/gs_rt.cpp
+    src/gfx/gs_gl.cpp
+    src/gfx/image_io.cpp
+    src/gfx/video_overlay.cpp)
+if(PS2X_USE_GSRL)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_USE_GSRL=1)
+    message(STATUS "[gsrl] experiment ON: the replay submits through the renamed vendored rlgl copy")
+endif()
+# [A4] stb_image(_write) / glad come from bt3gl as "external/<name>.h" (bt3gl/src is on the path through
+# the bt3gl link). [linuxfix] Do NOT add bt3gl/src/external itself: its Windows dirent.h shim (<io.h>)
+# would shadow the system <dirent.h> in every runtime file (pad_evdev_linux.cpp).
+# [C] ui_sdl.cpp includes imgui_impl_sdl2.h: the backend headers come from the imgui target (PUBLIC).
+target_link_libraries(ps2_runtime PRIVATE imgui)
+if(WIN32)
+    target_link_libraries(ps2_runtime PUBLIC opengl32)
+else()
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(ps2_runtime PUBLIC OpenGL::GL ${CMAKE_DL_LIBS})
+endif()
 
 # [statesync] libunwind: the netplay state sync unwinds each parked guest fiber's host call chain into a
 # structural signature (the peer only adopts a state at a matching park). Optional: without it the
@@ -635,6 +726,8 @@ if (APPLE AND NOT PS2X_FORCE_PGS)
     set(PS2X_DISABLE_PGS ON)
     set(PS2X_PGS_SKIP_REASON "not supported on macOS (Granite needs clock_nanosleep)")
 endif()
+# [pgs] paraLLEl-GS is available on Windows again: D3D11 is retired for now, so the Vulkan compute
+# backend is a first-class renderer option here once more (macOS is still excluded above).
 # [pgs submodule] Fetch it ourselves rather than requiring every clone to remember
 # --recursive. Without this a plain `git clone` + build produces a runner with NO
 # paraLLEl-GS renderer and only a STATUS line to say so, which is easy to miss and
@@ -732,8 +825,14 @@ target_link_libraries(ps2EntryRunner
 if(NOT PS2X_IS_VITA)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_settings_overlay.cpp
+        src/gfx/ps2x_ui.cpp          # overlay backend bridge (rlImGui or imgui_impl_dx11)
     )
-    target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
+    if(WIN32)
+        target_sources(ps2EntryRunner PRIVATE
+            src/gfx/d3d11/ui_d3d11.cpp   # imgui_impl_dx11 backend (needs windows.h)
+        )
+    endif()
+    target_link_libraries(ps2EntryRunner PRIVATE imgui)
     # gamemode: request CPU governor / IO priority optimisations at startup
     # (auto-release on exit; harmless no-op if the daemon isn't running).
     find_library(GAMEMODE_LIB NAMES libgamemodeauto.so gamemodeauto NAMES_PER_DIR)
@@ -807,6 +906,8 @@ endif()
 # Work around WinAPI vs raylib symbol clash for CloseWindow on x64
 if(MSVC)
     target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
+    # [prof] emit a linker map so sampled RIPs can be resolved to function names.
+    target_link_options(ps2EntryRunner PRIVATE "/MAP:${CMAKE_BINARY_DIR}/ps2EntryRunner.map")
 endif()
 
 install(TARGETS ps2_runtime ps2EntryRunner

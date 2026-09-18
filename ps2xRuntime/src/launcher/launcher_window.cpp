@@ -253,6 +253,19 @@ void LauncherWindow::onPlayClicked()
         // at the deploy root -- where the launcher wrote them -- not data/.
         env.insert(QStringLiteral("PS2X_EXEDIR"), apppaths::userRoot());
         env.insert(QStringLiteral("PS2X_ASSETDIR"), apppaths::assets());
+        // [logfix] The runner has no console here, so it only writes logs/bt3.log when asked to
+        // (its own redirect is for a console stderr). Honour the Logging tab's level, and a
+        // PS2X_LOGFILE the user already exported.
+        if (SettingsManager::instance().logLevel() > 0 && !env.contains(QStringLiteral("PS2X_LOGFILE")))
+        {
+            const QString logsDir = QDir(apppaths::userRoot()).filePath(QStringLiteral("logs"));
+            QDir().mkpath(logsDir);
+            const QString logPath = QDir(logsDir).filePath(QStringLiteral("bt3.log"));
+            const QString prevPath = QDir(logsDir).filePath(QStringLiteral("bt3.prev.log"));
+            QFile::remove(prevPath);             // keep the previous run's log, as the runner did
+            QFile::rename(logPath, prevPath);
+            env.insert(QStringLiteral("PS2X_LOGFILE"), logPath);
+        }
 #ifdef _WIN32
         // [vulkan] Windows: paraLLEl-GS runs on the bundled Mesa lavapipe ICD by
         // default. The vendor Vulkan driver (AMD amdvlk64.dll) access-violates

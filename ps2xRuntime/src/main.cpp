@@ -636,8 +636,20 @@ int main(int argc, char *argv[])
             if (lvl >= 2) { enable("PS2X_FTSPIKE"); enable("PS2X_FIGHTPROBE"); enable("PS2X_REVEAL_HIDDEN_MENU_ENTRY"); }
             if (lvl >= 3) { enable("PS2X_FRAMEPROF"); enable("PS2X_CAMPROBE"); }
 
-            if (lvl > 0 && ps2xStderrIsTerminal())   // [mergefix] a captured stderr (rig run.log, a user's "> log 2>&1") keeps its lines
+            // [logfile] PS2X_LOGFILE=<path>: capture stderr to a file even when stderr is NOT a
+            // terminal (detached launcher / rig runs, where the game would otherwise log nothing).
+            // Plain redirection ("> log 2>&1") is not an option: it can hang the run.
+            if (const char *lf = std::getenv("PS2X_LOGFILE"))
             {
+                if (std::freopen(lf, "w", stderr))
+                    std::fprintf(stderr, "[logfile] stderr -> %s\n", lf);
+            }
+            else if (lvl > 0 && ps2xStderrIsTerminal())   // [mergefix] a captured stderr (rig run.log, a user's "> log 2>&1") keeps its lines
+            {
+                // [logfix] Only a CONSOLE stderr is moved to the file: a captured one (a pipe or a
+                // "> log 2>&1") already goes somewhere and used to end up empty. The launcher, which
+                // starts the runner without a console, asks for logs/bt3.log through PS2X_LOGFILE
+                // instead, so launcher runs still leave a log for reports (the [winlog] lines).
                 std::error_code ec;
                 const auto logsDir = exeDir / "logs";
                 std::filesystem::create_directories(logsDir, ec);

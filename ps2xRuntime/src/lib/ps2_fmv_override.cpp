@@ -19,6 +19,7 @@ extern "C"
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>   // [linuxfix] std::strstr
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -28,6 +29,7 @@ extern "C"
 #include <vector>
 
 extern std::atomic<uint32_t> g_ps2ForceSkipFrames;   // [skipforce] defined in ps2_gs_gpu.cpp
+extern uint64_t g_fmvCapGen;                          // [fmvcapture] ps2_gs_gpu.cpp: native captured frames
 extern "C" const char *ps2xExeDirC();                 // main.cpp: resolved executable dir (honors PS2X_EXEDIR)
 
 namespace ps2x_fmv
@@ -53,8 +55,19 @@ namespace
     bool g_halted = false;   // [fmvoverride] stopped this session (safety/end): don't re-inject
     std::string g_path;
     double g_duration = 0.0;
+    double g_fps = 30000.0 / 1001.0;   // [videoclk] source frame rate (native-progress clock unit)
     double g_aspect = 4.0 / 3.0;
     std::chrono::steady_clock::time_point g_start;
+    // [videoclk] Native-anchored clock: while the game's own movie advances, the injected video is
+    // driven by the native frame counter (one source frame per native frame -> exact sync with the
+    // game's playback and its skip). If the native capture stalls, it free-runs on wall time.
+    uint64_t g_clockNative = 0;        // last g_fmvCapGen seen
+    // [fmvfix] g_fmvCapGen counts captured movie frames since BOOT and is never reset, so the timeline
+    // must be relative to this movie: frames captured up to the end of the previous session belong
+    // to earlier movies (without this a second movie started its video that many seconds in).
+    uint64_t g_clockBase = 0;
+    double g_clockT = 0.0;             // presentation time (seconds) in the video timeline
+    std::chrono::steady_clock::time_point g_clockLast;
 
     Frame g_current;            // owned by the present (tick) thread only
     uint64_t g_gen = 0;
@@ -140,8 +153,27 @@ namespace
             std::lock_guard<std::mutex> lk(g_mx);
             if (cc->width > 0 && cc->height > 0) g_aspect = (double)cc->width / (double)cc->height;
             if (fmt->duration > 0) g_duration = (double)fmt->duration / (double)AV_TIME_BASE;
+            if (st->avg_frame_rate.num > 0 && st->avg_frame_rate.den > 0)
+                g_fps = (double)st->avg_frame_rate.num / (double)st->avg_frame_rate.den;
+            else if (st->r_frame_rate.num > 0 && st->r_frame_rate.den > 0)
+                g_fps = (double)st->r_frame_rate.num / (double)st->r_frame_rate.den;
+            if (g_fps < 1.0 || g_fps > 240.0) g_fps = 30000.0 / 1001.0;
             std::fprintf(stderr, "[fmvoverride] decoding %dx%d, dur=%.2fs, codec=%s\n",
                          cc->width, cc->height, g_duration, avcodec_get_name(st->codecpar->codec_id));
+            // [fmvguard] Warn loudly when the clip is very unlikely to decode in software in this
+            // process: AV1 has no hwaccel here, and >1440p software decode rarely keeps up. A wrong
+            // clip otherwise just shows as a silent black movie.
+            {
+                const char *cn = avcodec_get_name(st->codecpar->codec_id);
+                const bool av1 = (st->codecpar->codec_id == AV_CODEC_ID_AV1) ||
+                                 (cn && std::strstr(cn, "av1") != nullptr);
+                const bool huge = (cc->width > 2560 || cc->height > 1440);
+                if (av1 || huge)
+                    std::fprintf(stderr, "[fmvguard] WARNING: %s%s%s -> software decode may produce NO frames "
+                                         "(black video). Use H.264 High 8-bit yuv420p at <=2560x1440, 30fps, CRF 16.\n",
+                                 av1 ? "AV1 has no hardware decode on this platform" : "",
+                                 (av1 && huge) ? " and " : "", huge ? "resolution is above 2560x1440" : "");
+            }
         }
 
         SwsContext *sws = nullptr;
@@ -176,6 +208,12 @@ namespace
             while (true)
             {
                 int rr = avcodec_receive_frame(cc, frm);
+                {   // [fmvdec] why no frames: the ffmpeg codes (EAGAIN = need more input).
+                    static int s_n = 0, s_fr = 0;
+                    if (rr == 0) ++s_fr;
+                    if (s_n < 30)
+                    { ++s_n; std::fprintf(stderr, "[fmvdec] recv=%d frames=%d readDone=%d\n", rr, s_fr, (int)readDone); }
+                }
                 if (rr == AVERROR(EAGAIN) || rr == AVERROR_EOF) break;
                 if (rr < 0) break;
                 gotFrame = true;
@@ -232,6 +270,9 @@ namespace
         g_aspect = 4.0 / 3.0;
         g_path = videoPath();
         g_start = std::chrono::steady_clock::now();
+        g_clockNative = (g_fmvCapGen > 0) ? (g_fmvCapGen - 1) : 0;   // force a fresh sync on first tick
+        g_clockT = 0.0;
+        g_clockLast = g_start;
         g_started = true;
         g_run.store(true, std::memory_order_relaxed);
         if (g_thread.joinable()) g_thread.join();
@@ -259,6 +300,7 @@ namespace
         g_queue.clear();
         g_current = Frame{};
         g_eof = false;
+        g_clockBase = g_fmvCapGen;   // [fmvfix] the next movie's timeline starts after this one's frames
         // [fmvoverride] restore the user's Texture Replacement setting for menus/fights.
         if (ps2x_pgs::packMode()) ps2x_pgs::setPackEnabled(GsGpuRenderer::texPackEnabled());
     }
@@ -297,7 +339,25 @@ bool tick(bool movieActive, FmvOverrideFrame &out)
     if (!g_started && !g_halted) startSession();
     if (!g_started) return false;
 
-    const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+    // [videoclk] Native-anchored clock: native frames drive the timeline while the game's own movie
+    // advances (exact sync with playback and its skip); wall time covers a stalled native capture.
+    const double el0 = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t nf = g_fmvCapGen;
+        const double dt = std::chrono::duration<double>(now - g_clockLast).count();
+        g_clockLast = now;
+        if (nf != g_clockNative) { g_clockNative = nf; g_clockT = (double)(nf - g_clockBase) / g_fps; }
+        else g_clockT += (dt > 0.0 && dt < 0.5) ? dt : 0.0;
+        static auto s_lastLog = now;
+        if (std::chrono::duration<double>(now - s_lastLog).count() >= 5.0)
+        {
+            s_lastLog = now;
+            std::fprintf(stderr, "[videoclk] native=%llu t=%.2fs wall=%.2fs drift=%.3fs fps=%.3f\n",
+                         (unsigned long long)nf, g_clockT, el0, g_clockT - el0, g_fps);
+        }
+    }
+    const double el = g_clockT;
     // [avoffset] shift the video timeline to line it up with the game's native ADX. Positive
     // ADVANCES the video (presents later frames sooner); negative delays it.
     static const double s_avoff = [](){ const char *v = std::getenv("PS2X_FMV_AVOFFSET"); return v ? std::atof(v) : 0.6; }();
@@ -320,6 +380,15 @@ bool tick(bool movieActive, FmvOverrideFrame &out)
     }
     g_cv.notify_all();
 
+    {   // [fmvguard] session active but still no frame after a few seconds -> say so once.
+        static bool s_warned = false;
+        if (!s_warned && g_current.rgba.empty() && el > 3.0)
+        {
+            s_warned = true;
+            std::fprintf(stderr, "[fmvguard] no video frames after %.1fs -- the clip is not decoding "
+                                 "(black movie). Check the codec/resolution.\n", el);
+        }
+    }
     // [fade] melt to black over the last PS2X_FMV_FADE seconds of the video.
     static const double s_fade = [](){
         const char *v = std::getenv("PS2X_FMV_FADE");

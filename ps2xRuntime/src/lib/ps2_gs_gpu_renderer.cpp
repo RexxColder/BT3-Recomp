@@ -27,10 +27,56 @@
 #include <mutex>
 #include <string>
 
-#include "raylib.h"
-#include "rlgl.h"
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
+#include "gfx/gs_rt.h"
+#include "gfx/gs_gl.h"
+#include "gfx/image_io.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"   // [crtcdisp] GSRegisters (the CRTC registers are memory-mapped)
+
+#if defined(_WIN32)
+// [d3d11] Native GS backend scaffolding. The shader HLSL port and the gfx layer exist; the
+// replay is being moved onto them so the present stops copying the frame through the CPU.
+#include "gfx/d3d11/D3D11Gfx.h"
+#include "gfx/d3d11/gs_shader_hlsl.h"
+#include "gfx/video_state.h"
+#include <unordered_map>
+
+#include "gfx/gl/gsrl_redirect.h"   // [R1] the replay submits through the vendored rlgl copy
+namespace
+{
+    ps2x::gfx::Renderer g_d3dGsR;
+    ps2x::gfx::Shader   g_d3dGsSh;
+    bool g_d3dGsInit = false;
+    std::unordered_map<uint64_t, ps2x::gfx::Texture *> g_d3dGsTex;   // texKey -> D3D texture
+    ps2x::gfx::RenderTarget *g_d3dGsRt = nullptr;   // this frame's render target
+    ps2x::gfx::Texture *g_d3dPresentTex = nullptr;  // native texture of the fbp being presented
+    ps2x::gfx::RenderTarget *g_d3dLatchRt = nullptr; // [d3d11] completed-frame latch (native)
+    ps2x::gfx::Shader g_d3dLatchSh;                  // plain blit shader for the latch copy
+    bool g_d3dFmvPub = false;                        // [d3d11] this publish carries an FMV frame
+    ps2x::gfx::RenderTarget *g_d3dMovieRt = nullptr; // [d3d11] single stable RT for the movie
+    bool g_d3dMoviePresent = false;                  // [d3d11] a movie frame was drawn this publish
+    int g_d3dGsRtW = 0, g_d3dGsRtH = 0;
+    uint32_t g_d3dGsBegun = 0xFFFFFFFFu;            // frameGen the RT was last bound+cleared for
+    inline ps2x::gfx::Texture *d3dGsTexFor(uint64_t key)
+    {
+        auto it = g_d3dGsTex.find(key);
+        return it == g_d3dGsTex.end() ? nullptr : it->second;
+    }
+    inline void d3dGsFreeTex(uint64_t key)
+    {   // [d3d11] release the D3D mirror when the GL texture is evicted/unloaded (else it leaks).
+        auto it = g_d3dGsTex.find(key);
+        if (it != g_d3dGsTex.end()) { delete it->second; g_d3dGsTex.erase(it); }
+    }
+    // [d3d11] PS2X_D3D11_GS=1 switches the GS replay onto the native D3D path. Opt-in until it
+    // covers what the GL replay does; the readback bridge stays the default meanwhile.
+    bool d3dGsOn()
+    {
+        static const bool s = [](){ const char *v = std::getenv("PS2X_D3D11_GS"); return v && v[0] && v[0] != '0'; }();
+        return s && ps2x::gfx::NativeVideo();
+    }
+}
+#endif
 extern "C" void glFinish(void);   // [unloadmode] drain experiment
 extern "C" void glFlush(void);    // [preflush]
 extern "C" void ps2xRecPoolDrain();   // [recpool] ps2_gs_rasterizer.cpp: merge every posted record job (worker thread). File scope, outside
@@ -41,7 +87,7 @@ unsigned long g_uploadBlocks = 0;                 // GS VRAM blocks uploaded (64
 unsigned long g_saSeen = 0, g_saKilled = 0;       // [skipalpha] gate accounting
 unsigned long g_f224In = 0, g_f224Out = 0;        // [f224] mask-buffer draw accounting
 unsigned long g_celSetup = 0, g_celDrawn = 0;     // [cel] outline pass accounting
-std::vector<Texture2D> g_pendingUnload;           // freed OUTSIDE m_mtx, see the drain below
+std::vector<bt3Texture2D> g_pendingUnload;           // freed OUTSIDE m_mtx, see the drain below
 std::unordered_set<uint64_t> g_texRtSourced;      // keys that CANNOT be re-decoded (see eviction)
 std::unordered_set<uint64_t> g_texRtIndexed;      // ...of those, the INDEXED ones (writeback targets)
 struct FbpFmt { uint32_t fbw = 1, psm = 0; int maxX = 0, maxY = 0; uint32_t fbmsk = 0; };
@@ -72,11 +118,22 @@ unsigned long g_bbSkipped = 0;   // [barskip]
 static std::deque<BarBlockReq> g_bbQueue;
 static uint64_t g_bbPosted = 0, g_bbServed = 0;
 static std::atomic<bool> g_bbAbort{false};
-static const bool s_barBlockEnv = [](){ const char *v = std::getenv("PS2X_BARBLOCK"); return v && v[0] && v[0] != '0'; }();
+static const bool s_barBlockEnv = [](){ const char *v = std::getenv("PS2X_BARBLOCK");
+#if defined(_WIN32)
+    // [d3d11] The native D3D present does not need the synchronous barrier stack, and leaving it
+    // on penalises the guest whenever the GL thread is doing the (heavier) native replay work.
+    // A native-video run that has not opted in explicitly stays async. PS2X_BARBLOCK=1 forces it.
+    if (v && v[0] == '1') return true;
+    if (ps2x::gfx::NativeVideo()) return false;
+    return v && v[0] && v[0] != '0';
+#else
+    return v && v[0] && v[0] != '0';
+#endif
+}();
 static const bool s_barAlwaysAEnv = [](){ const char *v = std::getenv("PS2X_BARALWAYSA"); return v && v[0] && v[0] != '0'; }();
 // [livegl] The GL context is thread-bound. In the replay rig every barrier/bracket call comes
 // from the GL-owning thread; in LIVE mode they come from GUEST threads (drawPrimitive ->
-// barrierBeforeRead -> UpdateTexture segfaulted in libGLdispatch on fight load). Record the GL
+// barrierBeforeRead -> bt3UpdateTexture segfaulted in libGLdispatch on fight load). Record the GL
 // thread at init; off-thread callers ENQUEUE work instead of touching GL (one-frame-late VRAM,
 // which the chain already tolerates), and the present thread drains the queue each frame.
 static std::atomic<size_t> g_glTidHash{0};
@@ -95,7 +152,7 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c);   // [gpualias] mo
 // [wshudmap] live HUD-layout state (overlay-driven; -1 = fall back to the env config)
 std::atomic<int> g_wsHudLayout{-1};
 std::atomic<int> g_wsHudOffLQ{0}, g_wsHudOffCQ{0}, g_wsHudOffRQ{0};   // custom offsets x16
-static bool gaBuildReviewTex(const Texture2D &src, int srcH, int ta0, int ta1, int aem);   // [gpualias] mode 4: CT16 re-view + decode-exact TEXA alpha, per serving class
+static bool gaBuildReviewTex(const bt3Texture2D &src, int srcH, int ta0, int ta1, int aem);   // [gpualias] mode 4: CT16 re-view + decode-exact TEXA alpha, per serving class
 static bool g_gaViewReady = false;   // [gpualias] the view texture holds chain output
 static int g_gaCur = 0;              // [gpualias] ping-pong index
 extern "C" void glUseProgram(unsigned int program);
@@ -123,7 +180,7 @@ bool ps2xForceBilinear()
     return v != 0;
 }
 void ps2xSetForceBilinear(bool v) { g_forceBilinear.store(v ? 1 : 0, std::memory_order_relaxed); ps2x_pgs::setForceBilinear(v); /* [pgs] same knob on the backend */ }
-static RenderTexture2D g_gaViewTex[2];         // [gpualias] ping-pong CT16 view of the chain output
+static bt3RenderTexture2D g_gaViewTex[2];         // [gpualias] ping-pong CT16 view of the chain output
 uint32_t g_gaClutData[256];                    // [gpualias] SW-chain palette snapshot (guest writes)
 std::atomic<unsigned> g_gaClutSeq{0};
 static unsigned long g_gaExecCount = 0;       // [gpualias] chain passes executed (staleness tracking)
@@ -421,7 +478,7 @@ static inline void forceOpaqueAlphaSwizzle(unsigned int texId)
     glBindTexture(0x0DE1, 0);
 }
 
-// GS depth (Z-test) support, gated by PS2X_GPU_DEPTH. rlgl 5.0's rlEnableDepthTest() only
+// GS depth (Z-test) support, gated by PS2X_GPU_DEPTH. rlgl 5.0's bt3rlEnableDepthTest() only
 // calls glEnable(GL_DEPTH_TEST) and leaves the compare func at its init default (GL_LEQUAL);
 // there is no rlSetDepthFunc(). To honor GS ZTST (GREATER/GEQUAL against a depth buffer we
 // clear to 0.0 = far, so LARGER = NEARER wins) we call glDepthFunc / glClear / glClearDepth
@@ -501,8 +558,38 @@ namespace
     // depthTex: PS2X_ZTEX attaches depth as a sampleable TEXTURE (not a renderbuffer), because
     // BT3 READS the Z buffer as a texture -- fbp224 IS the depth buffer (ZBP=224 on every draw),
     // and the outline is an edge detect over it.
-    struct Fbo { RenderTexture2D rt{}; int w = 0, h = 0; unsigned int depthTex = 0; int lastDraw = -1; /* [slice] replay vsync of last use */
-                 int scale = 1; RenderTexture2D stag{}; unsigned stagSeq = 0; /* [rscale] physical = logical*scale; stag = 1x staging + freshness */ };
+    struct Fbo { bt3RenderTexture2D rt{}; int w = 0, h = 0; unsigned int depthTex = 0; int lastDraw = -1; /* [slice] replay vsync of last use */
+                 int scale = 1; bt3RenderTexture2D stag{}; unsigned stagSeq = 0; /* [rscale] physical = logical*scale; stag = 1x staging + freshness */
+#if defined(_WIN32)
+                 ps2x::gfx::RenderTarget *d3dRt = nullptr;   // [d3d11] parallel native RT for this fbp
+                 unsigned d3dGen = 0xFFFFFFFFu;              // frameGen the D3D RT was last cleared for
+#endif
+               };
+#if defined(_WIN32)
+    // [d3d11] GL texture id -> the D3D texture that mirrors it (FBO colour textures), so draws
+    // that sample a render target resolve to the native RT instead of the readback path.
+    std::unordered_map<unsigned, ps2x::gfx::Texture *> g_d3dRtByGlTex;
+    static void d3dFboEnsure(Fbo &f, int w, int h)
+    {
+        if (!d3dGsOn() || w <= 0 || h <= 0) return;
+        ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+        if (!f.d3dRt) f.d3dRt = new ps2x::gfx::RenderTarget();
+        if (f.d3dRt->Width() != (uint32_t)w || f.d3dRt->Height() != (uint32_t)h || !f.d3dRt->NativeRTV())
+        {
+            if (f.d3dRt->Create(*dev, (uint32_t)w, (uint32_t)h, false))
+            {   // clear once: after this the game's own clear draws maintain the contents
+                f.d3dRt->Bind(*dev);
+                f.d3dRt->Clear(*dev, 0, 0, 0, 1);
+            }
+        }
+        if (f.rt.texture.id != 0) g_d3dRtByGlTex[f.rt.texture.id] = &f.d3dRt->Color();
+    }
+    inline ps2x::gfx::Texture *d3dFboTexForGl(unsigned glTexId)
+    {
+        auto it = g_d3dRtByGlTex.find(glTexId);
+        return it == g_d3dRtByGlTex.end() ? nullptr : it->second;
+    }
+#endif
     // [bilinear] GS TEX1.MMAG per-draw filter. The GS filters magnified textures bilinearly
     // when MMAG is set (BT3 sets it on 99.4% of draws, with no mipmaps -- MXL is 0), so
     // forcing every texture to GL_NEAREST reads back blocky. It shows most where the game
@@ -566,7 +653,8 @@ namespace
                 }
             }
         }
-        rlDrawRenderBatchActive();
+        bt3rlDrawRenderBatchActive();
+        ps2x::gfx::GsGlFlush();   // [gsgl] flush our batcher too when PS2X_GSBACKEND=gl
     }
     struct FlushCensusDump
     {
@@ -595,7 +683,7 @@ namespace
         }
     };
     static FlushCensusDump g_flushCensusDump;
-    void ps2xApplyTexFilter(Texture2D &t, bool bilinear)
+    void ps2xApplyTexFilter(bt3Texture2D &t, bool bilinear)
     {
         const bool s_on = GsGpuRenderer::bilinearEnabled();   // [uitoggles]
         if (!s_on || t.id == 0) return;
@@ -617,7 +705,7 @@ namespace
             if (nMiss <= 20 || (nMiss % 500u) == 0u)
                 std::fprintf(stderr, "[filterchk] #%lu tex %u: cache says %s, GL says %s (%dx%d) -> corrected\n", nMiss, t.id, bilinear ? "bilinear" : "point", glBilinear ? "bilinear" : "point", t.width, t.height);
             flushBatch(__LINE__);
-            SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+            bt3SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
             g_texFilterState.set(t.id, bilinear ? 1u : 0u);
             return;
         }
@@ -627,7 +715,7 @@ namespace
         // (BARBLOCK's chunk pre-renders move the breaks -> the timer's left lobe alternated crisp/blurred).
         static const bool s_ff = [](){ const char *v = std::getenv("PS2X_FILTERFLUSH"); return !(v && v[0] == '0'); }();   // [filterflush] =0: old behaviour (A/B)
         if (s_ff) flushBatch(__LINE__);
-        SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+        bt3SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
         g_texFilterState.set(t.id, bilinear ? 1u : 0u);
     }
     // [flatfbo] g_fbos was an unordered_map looked up dozens of times per DrawCmd (std::_Hashtable was ~5% of the
@@ -686,10 +774,10 @@ namespace
     unsigned g_frontLatchGen = 0;   // bumped per capture; a latch that stops updating expires
 
     // ATLAS (PS2X_ATLAS): a single big FBO used as "VRAM" -- every PS2 fbp gets a fixed sub-rect.
-    // All rendering translates+scissors into its sub-rect; NO BeginTextureMode switching (which is
+    // All rendering translates+scissors into its sub-rect; NO bt3BeginTextureMode switching (which is
     // what corrupts GL on this driver). Composites sample sub-rects. Present the display sub-rect.
     struct AtlasSlot { int x = 0, y = 0, w = 0, h = 0; };
-    RenderTexture2D g_atlas{};
+    bt3RenderTexture2D g_atlas{};
     int g_atlasW = 0, g_atlasH = 0;
     std::unordered_map<uint32_t, AtlasSlot> g_atlasSlots;
     int g_atlasCurX = 0, g_atlasCurY = 0, g_atlasRowH = 0;
@@ -721,7 +809,7 @@ namespace
     uint32_t g_publishGen = 0;                    // bumped on each real swapFrame (GS thread)
     uint32_t g_lastRenderGen = 0xFFFFFFFFu;       // publish gen last rendered (present thread)
     unsigned int g_lastOutId = 0;                 // last presented texture id
-    std::unordered_map<uint64_t, Texture2D> g_glTex;
+    std::unordered_map<uint64_t, bt3Texture2D> g_glTex;
     // [texclobber] DETECTOR for the sync-relax corruption hypothesis: the worker running more than a frame ahead of the GL
     // thread re-uploads a texture a still-pending frame references, and that older frame's draws then sample the newer
     // texels. Every put stamps the cache entry with the generation of the frame being built; the upload carries it into
@@ -747,23 +835,23 @@ namespace
     std::unordered_map<uint64_t, bool> g_texAlphaBinary; // texKey -> alpha channel is ~binary (0/255): DATE emulation is exact only for these
     // Fade lag: palettes animate under distinct content-keys, so a fade mints a new texKey
     // every frame -> without eviction m_texCache/g_glTex leak an entry/frame and every new
-    // key pays a full LoadTextureFromImage (glGenTextures + glTexImage2D) alloc. Fix: LRU
+    // key pays a full bt3LoadTextureFromImage (glGenTextures + glTexImage2D) alloc. Fix: LRU
     // evict keys unused for a grace window, and recycle the freed GL objects through a pool
-    // keyed by (w,h) so a fade reuses one texture object (cheap UpdateTexture) each frame.
+    // keyed by (w,h) so a fade reuses one texture object (cheap bt3UpdateTexture) each frame.
     std::unordered_map<uint64_t, uint32_t> g_texLastUse;            // texKey -> present gen last referenced
     std::vector<uint64_t> g_superseded;   // [supersede] old version keys awaiting reclaim (guarded by m_mtx)
     std::unordered_set<uint64_t> g_reclaimed; unsigned long g_supReclaimed = 0, g_reDecodeReclaimed = 0;   // [supdiag]
     unsigned long g_hashMemoHit = 0, g_hashMemoCompute = 0, g_hashMemoChecked = 0, g_hashMemoMiss = 0;   // [hashmemo]
     std::unordered_set<unsigned> g_deletedIds; unsigned long g_idReuse = 0;   // [supdiag] GL ids we deleted; reuse counter
-    std::unordered_map<uint64_t, std::vector<Texture2D>> g_texPool; // (w<<32|h) -> free GL textures
+    std::unordered_map<uint64_t, std::vector<bt3Texture2D>> g_texPool; // (w<<32|h) -> free GL textures
     // [texreplace] The pool is keyed by SIZE ALONE, and every reuse path writes it with
-    // UpdateTexture (glTexSubImage2D) from a w*h*4 RGBA8 buffer. A compressed DDS replacement
+    // bt3UpdateTexture (glTexSubImage2D) from a w*h*4 RGBA8 buffer. A compressed DDS replacement
     // therefore must never enter it: retire a 1024x1024 DXT5 texture into the pool and the next
-    // ordinary 1024x1024 upload pops it, calls UpdateTexture on BC3 storage, and raylib refuses
+    // ordinary 1024x1024 upload pops it, calls bt3UpdateTexture on BC3 storage, and raylib refuses
     // it -- "Failed to update for current texture format (17)". The upload is silently dropped
     // and the draw keeps the previous replacement's pixels, which is the wrong-texture-on-some-
     // faces artifact (stage rocks: the faces that got a recycled object, not the ones that did not).
-    bool poolableTex(const Texture2D &t) { return t.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8; }
+    bool poolableTex(const bt3Texture2D &t) { return t.format == BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8; }
     uint32_t g_texUseGen = 0;
     inline uint64_t texPoolKey(int w, int h) { return (static_cast<uint64_t>(w) << 32) | static_cast<uint32_t>(h); }
 
@@ -865,22 +953,22 @@ namespace
     // behind at stripe boundaries); glFinish / glTextureBarrier do not help, a framebuffer blit does. So any
     // FBO-sourced sample reads a blit snapshot of the FBO, refreshed whenever the FBO was entered for rendering
     // since the last snapshot (g_glEnterSeq is bumped by beginFbp's real switch). PS2X_RTSNAP=0 disables.
-    std::unordered_map<uint32_t, RenderTexture2D> g_rtSnap; std::unordered_map<uint32_t, uint32_t> g_rtSnapSeq, g_glEnterSeq;
+    std::unordered_map<uint32_t, bt3RenderTexture2D> g_rtSnap; std::unordered_map<uint32_t, uint32_t> g_rtSnapSeq, g_glEnterSeq;
     unsigned long g_rtSnapBlits = 0;
     static bool rtSnapEnabled() { static const bool s = [](){ const char *v = std::getenv("PS2X_RTSNAP");
         if (v && v[0]) return v[0] != '0';
         return !ps2xGlowFix(); }(); return s; }   // [glowfix] default OFF: the snapshot is stale
-    static Texture2D rtSnapshotFor(uint32_t fbp, const Fbo &f)
+    static bt3Texture2D rtSnapshotFor(uint32_t fbp, const Fbo &f)
     {
-        RenderTexture2D &snap = g_rtSnap[fbp];
+        bt3RenderTexture2D &snap = g_rtSnap[fbp];
         const int w = f.w, h = f.h;
         if (w <= 0 || h <= 0 || f.rt.id == 0) return f.rt.texture;
         int prev = 0; glGetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &prev);
         if (snap.texture.id == 0 || snap.texture.width != w || snap.texture.height != h)
         {
-            if (snap.texture.id != 0) UnloadRenderTexture(snap);
+            if (snap.texture.id != 0) ps2x::gfx::GsRtUnload(snap);
             if (snap.texture.id != 0) ps2xForgetTexId(snap.texture.id);
-            snap = LoadRenderTexture(w, h); SetTextureFilter(snap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(snap.texture.id);
+            snap = ps2x::gfx::GsRtCreate(w, h); bt3SetTextureFilter(snap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(snap.texture.id);
             g_rtSnapSeq[fbp] = 0xFFFFFFFFu;
         }
         const uint32_t seq = g_glEnterSeq[fbp];
@@ -897,7 +985,7 @@ namespace
         return snap.texture;
     }
     // [rscale] internal render scale N (PS2X_RENDERSCALE, 1..4): the SCENE buffers
-    // (fbp0/112) allocate at N x native and draw through an rlScalef(N) modelview, so
+    // (fbp0/112) allocate at N x native and draw through an bt3rlScalef(N) modelview, so
     // every command keeps native coordinates. All pixel-as-data machinery (masks, ink,
     // writebacks) stays 1x; boundaries downsample.
     // [forcebilinear] PCSX2-style filter override: sample every texture bilinear even when
@@ -939,7 +1027,7 @@ namespace
     void forgetTexProps(unsigned id) { g_rsTexScale.erase(id); g_rsTexFbo.erase(id); g_texAlphaFix.erase(id); }
     // Rebind READ framebuffer to a 1x staging copy (area-downsampled) so logical-coordinate
     // glReadPixels reads stay exact for scaled FBOs.
-    const RenderTexture2D &rsDownsampled(const Fbo &f)
+    const bt3RenderTexture2D &rsDownsampled(const Fbo &f)
     {   // RAW-GL ONLY (callable inside raw passes): blit the physical FBO into the
         // pre-created 1x staging; restores the DRAW binding; no rlgl calls here.
         int prevDraw = 0; glGetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &prevDraw);
@@ -954,7 +1042,7 @@ namespace
     {
         if (f.scale <= 1) return;
         flushBatch(__LINE__);   // reader contexts are rlgl-safe; flush before raw binds
-        const RenderTexture2D &st = rsDownsampled(f);
+        const bt3RenderTexture2D &st = rsDownsampled(f);
         glBindFramebuffer(0x8CA8 /*READ*/, st.id);
     }
     Fbo &ensureFbo(uint32_t fbp, int w, int h)
@@ -1012,7 +1100,7 @@ namespace
                 if (hit && cf == fbp && cw && ch)
                 { w = (int)cw; h = (int)ch;
                   if (f.rt.texture.id != 0 && (f.w != (int)cw || f.h != (int)ch))
-                  { ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); f.rt = RenderTexture2D{}; f.w = f.h = 0; }
+                  { ps2xForgetRtTexId(f.rt.texture.id); ps2x::gfx::GsRtUnload(f.rt); f.rt = bt3RenderTexture2D{}; f.w = f.h = 0; }
                   if (f.rt.texture.id != 0) return f; }
             }
         }
@@ -1032,7 +1120,7 @@ namespace
         }
         if (f.w != w || f.h != h || f.rt.texture.id == 0)
         {
-            if (f.rt.texture.id != 0) { g_rsTexScale.erase(f.rt.texture.id); g_texAlphaFix.erase(f.rt.texture.id); ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); }
+            if (f.rt.texture.id != 0) { g_rsTexScale.erase(f.rt.texture.id); g_texAlphaFix.erase(f.rt.texture.id); ps2xForgetRtTexId(f.rt.texture.id); ps2x::gfx::GsRtUnload(f.rt); }
             const int rsA = rsScaledFbp(fbp) ? rsN() : 1;
             const int wA = w * rsA, hA = h * rsA;
             // PS2X_NODEPTH_RT: create COLOR-ONLY FBOs (no depth renderbuffer). raylib's
@@ -1046,16 +1134,14 @@ namespace
                                                       return v && v[0] && v[0] != '0'; }();   // [dofmask] the mask pass needs the sampleable depth ATTACHMENT (zTexBind stays ZTEX-gated)
             if (s_zTex || s_dofMaskAttach)
             {
-                RenderTexture2D t{};
-                t.id = rlLoadFramebuffer();
+                // [gsrt] Same semantics as the raylib branch this replaces, but on OUR targets: the
+                // colour FBO comes from gfx::gl and the SAMPLABLE depth texture is ours too, so the
+                // DEFAULT config (PS2X_DOFMASK=2) no longer needs raylib render targets. This is what
+                // made A1.1a cover only a subset of the FBOs.
+                bt3RenderTexture2D t = ps2x::gfx::GsRtCreate(wA, hA, /*depth renderbuffer*/ false);
                 if (t.id != 0)
                 {
-                    rlEnableFramebuffer(t.id);
-                    t.texture.id = rlLoadTexture(nullptr, wA, hA, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1);
                     ps2xForgetTexId(t.texture.id);   // [filtercache]
-                    t.texture.width = wA; t.texture.height = hA; t.texture.mipmaps = 1;
-                    t.texture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-                    rlFramebufferAttach(t.id, t.texture.id, RL_ATTACHMENT_COLOR_CHANNEL0, RL_ATTACHMENT_TEXTURE2D, 0);
                     // false => a real depth TEXTURE, which can be sampled later. SHARED across
                     // FBOs so fbp0 and fbp112 see the same Z, as they do on hardware.
                     // The Z buffer is the SCENE's size and belongs only to the scene buffers.
@@ -1079,19 +1165,7 @@ namespace
                         // writeback recovers the raw integers.
                         static const bool s_d32f = [](){ const char *v = std::getenv("PS2X_D32F");
                                                          return v && v[0] && v[0] != '0'; }();   // opt-in: default-path parity for plain configs
-                        if (s_d32f)
-                        {
-                            unsigned int dt = 0;
-                            glGenTextures(1, &dt);
-                            glBindTexture(0x0DE1u /*GL_TEXTURE_2D*/, dt);
-                            glTexImage2D(0x0DE1u, 0, 0x8CAC /*GL_DEPTH_COMPONENT32F*/, dw, dh, 0,
-                                         0x1902u /*GL_DEPTH_COMPONENT*/, 0x1406u /*GL_FLOAT*/, nullptr);
-                            glTexParameteri(0x0DE1u, 0x2801u /*MIN_FILTER*/, 0x2600 /*NEAREST*/);
-                            glTexParameteri(0x0DE1u, 0x2800u /*MAG_FILTER*/, 0x2600);
-                            g_sharedDepthTex = dt;
-                        }
-                        else
-                            g_sharedDepthTex = rlLoadTextureDepth(dw, dh, false);
+                        g_sharedDepthTex = ps2x::gfx::GsRtCreateDepthTexture(dw, dh, s_d32f);
                         g_sharedDepthW = dw; g_sharedDepthH = dh;
                         std::fprintf(stderr, "[ztex] shared depth texture %u (%dx%d) fmt=%s\n", g_sharedDepthTex, dw, dh, s_d32f ? "D32F" : "D24");
                         for (uint32_t sfbp : {0u, 112u})
@@ -1099,8 +1173,7 @@ namespace
                             auto oit = g_fbos.find(sfbp);
                             if (oit != g_fbos.end() && oit->second.rt.id != 0 && oit->second.depthTex != 0)
                             {
-                                rlFramebufferAttach(oit->second.rt.id, g_sharedDepthTex,
-                                                    RL_ATTACHMENT_DEPTH, RL_ATTACHMENT_TEXTURE2D, 0);
+                                ps2x::gfx::GsRtAttachDepth(oit->second.rt.id, g_sharedDepthTex, dw, dh);
                                 oit->second.depthTex = g_sharedDepthTex;
                                 oit->second.rt.depth.id = g_sharedDepthTex;
                             }
@@ -1110,36 +1183,38 @@ namespace
                     {
                         t.depth.id = g_sharedDepthTex;
                         t.depth.width = g_sharedDepthW; t.depth.height = g_sharedDepthH; t.depth.mipmaps = 1;
-                        rlFramebufferAttach(t.id, t.depth.id, RL_ATTACHMENT_DEPTH, RL_ATTACHMENT_TEXTURE2D, 0);
+                        ps2x::gfx::GsRtAttachDepth(t.id, g_sharedDepthTex, g_sharedDepthW, g_sharedDepthH);
                     }
-                    rlActiveDrawBuffers(1);
-                    rlDisableFramebuffer();
                     f.depthTex = t.depth.id;
                 }
                 f.rt = t;
             }
             else if (s_nodepth)
             {
-                RenderTexture2D t{};
+                bt3RenderTexture2D t{};
                 t.id = rlLoadFramebuffer();
                 if (t.id != 0)
                 {
-                    rlEnableFramebuffer(t.id);
-                    t.texture.id = rlLoadTexture(nullptr, wA, hA, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1);
+                    bt3rlEnableFramebuffer(t.id);
+                    t.texture.id = rlLoadTexture(nullptr, wA, hA, BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1);
                     ps2xForgetTexId(t.texture.id);   // [filtercache]
                     t.texture.width = wA; t.texture.height = hA; t.texture.mipmaps = 1;
-                    t.texture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                    t.texture.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
                     t.depth.id = 0; // no depth attachment
-                    rlFramebufferAttach(t.id, t.texture.id, RL_ATTACHMENT_COLOR_CHANNEL0, RL_ATTACHMENT_TEXTURE2D, 0);
-                    rlActiveDrawBuffers(1);
-                    rlDisableFramebuffer();
+                    bt3rlFramebufferAttach(t.id, t.texture.id, BT3RL_ATTACHMENT_COLOR_CHANNEL0, BT3RL_ATTACHMENT_TEXTURE2D, 0);
+                    bt3rlActiveDrawBuffers(1);
+                    bt3rlDisableFramebuffer();
                 }
                 
                 f.rt = t;
             }
             else
-                f.rt = LoadRenderTexture(wA, hA);
+                f.rt = ps2x::gfx::GsRtCreate(wA, hA);
             f.w = w; f.h = h; f.scale = rsA;
+            ps2x::gfx::GsRtSetLogical(f.rt.id, w, h);   // [gsrt] emitter-space size for the framing contract
+#if defined(_WIN32)
+            d3dFboEnsure(f, wA, hA);   // [d3d11] keep a native RT in step with the GL FBO
+#endif
             {   // [fboalloc] LoadRenderTexture CAN FAIL -- it returns id 0 and says nothing. At
                 // render scale N a target is N*N times the pixels and our FBOs are grow-only, so a
                 // page that is 1024x512 natively asks for 4096x2048 at 4x; enough of those, or one
@@ -1165,8 +1240,8 @@ namespace
             {
                 g_rsTexScale[f.rt.texture.id] = rsA;
                 g_rsTexFbo[f.rt.texture.id] = fbp;
-                if (f.stag.texture.id != 0) { ps2xForgetRtTexId(f.stag.texture.id); UnloadRenderTexture(f.stag); }
-                f.stag = LoadRenderTexture(w, h);
+                if (f.stag.texture.id != 0) { ps2xForgetRtTexId(f.stag.texture.id); ps2x::gfx::GsRtUnload(f.stag); }
+                f.stag = ps2x::gfx::GsRtCreate(w, h);
                 if (f.stag.texture.id == 0)
                 {
                     static int s_ns = 0;
@@ -1175,24 +1250,24 @@ namespace
                 }
                 else
                 {
-                    SetTextureFilter(f.stag.texture, TEXTURE_FILTER_POINT);
+                    bt3SetTextureFilter(f.stag.texture, TEXTURE_FILTER_POINT);
                     ps2xForgetTexId(f.stag.texture.id);
                 }
             }
-            SetTextureFilter(f.rt.texture, TEXTURE_FILTER_POINT);
+            bt3SetTextureFilter(f.rt.texture, TEXTURE_FILTER_POINT);
             // Clear ONCE on creation. PS2 framebuffers/render targets persist across
             // frames (the game clears explicitly by drawing); auto-clearing every frame
             // would wipe render targets the game rendered once and reuses (logo flicker).
-            BeginTextureMode(f.rt);
-            ClearBackground(Color{0, 0, 0, 255});
-            EndTextureMode();
+            ps2x::gfx::GsRtBegin(f.rt);
+            bt3ClearBackground(Color{0, 0, 0, 255});
+            ps2x::gfx::GsRtEnd();
         }
         return f;
     }
 
     bool g_forensicThisFrame = false; // PS2X_FORENSIC: capture this publish across all dump sites
     uint32_t g_rtsprTargetGen = 0; // PS2X_RTDUMP one-frame capture: which publish gen
-    Texture2D g_white{}; // 1x1 white for untextured flat quads
+    bt3Texture2D g_white{}; // 1x1 white for untextured flat quads
     bool g_whiteInit = false;
 
     Shader g_shader{};
@@ -1201,11 +1276,254 @@ namespace
     int g_locTcc = -1;                  // GS TEX0.TCC
     int g_locAlphaFix = -1;             // [texreplace] replacement alpha rescale + two-level snap
     AlphaFix g_curAlphaFix{1.0f, 0.0f}; // [texreplace] last value pushed to uAlphaFix
+#if defined(_WIN32)
+    // [d3d11] Native GS draw helpers (PS2X_D3D11_GS). The GL program stays the source of truth
+    // for the per-draw uniforms and for blend/scissor/colour-mask (read back with glGet*); we
+    // mirror them onto the D3D shader/state and rasterise through gfx:: instead of rlgl.
+    static bool d3dGsEnsure()
+    {
+        ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+        if (!dev) return false;
+        if (!g_d3dGsInit)
+        {
+            if (!g_d3dGsR.Init(*dev)) return false;
+            if (!g_d3dGsSh.Compile(*dev, ps2x::gfx::kGsVertexShaderHlsl,
+                                   ps2x::gfx::kGsFragmentShaderHlsl)) return false;
+            g_d3dGsInit = true;
+        }
+        return true;
+    }
+    static uint32_t d3dBlendFromGL(int gl)
+    {
+        switch (gl)
+        {
+            case 0x0000: return 1;   // GL_ZERO
+            case 0x0001: return 2;   // GL_ONE
+            case 0x0300: return 3;   // SRC_COLOR
+            case 0x0301: return 4;   // 1-SRC_COLOR
+            case 0x0302: return 5;   // SRC_ALPHA
+            case 0x0303: return 6;   // 1-SRC_ALPHA
+            case 0x0304: return 7;   // DST_ALPHA
+            case 0x0305: return 8;   // 1-DST_ALPHA
+            case 0x0306: return 9;   // DST_COLOR
+            case 0x0307: return 10;  // 1-DST_COLOR
+            case 0x0308: return 11;  // SRC_ALPHA_SAT
+            case 0x8589: return 16;  // SRC1_ALPHA
+            case 0x88FB: return 17;  // 1-SRC1_ALPHA
+            default:     return 2;
+        }
+    }
+    static uint32_t d3dBlendOpFromGL(int gl)
+    { return gl == 0x800A ? 2u : (gl == 0x800B ? 3u : 1u); }   // SUBTRACT / REV_SUBTRACT / ADD
+    static void d3dGsMirrorUniforms()
+    {
+        struct U { const char *n; int ncomp; };
+        static const U u[] = {
+            {"colDiffuse",4},{"uBright",1},{"uSubScale",1},{"uUViz",1},{"uIdxMode",1},
+            {"uIdxScale",1},{"uFboOne",1},{"uTcc",1},{"uASplit",1},{"uTexa",4},
+            {"uABl128",1},{"uTfx",1},{"uProjClip",1},{"uAScale",1},{"uAlphaFix",2},
+            {"uAtst",1},{"uAref",1},{"uFba",1},{"uForceA",1},{"uZTex",1},{"uZScale",1},
+            {"uPerspQ",1},{"uRegion",4},
+        };
+        static const int N = (int)(sizeof(u) / sizeof(u[0]));
+        // [perf] bt3GetShaderLocation is a string lookup in the driver; doing it for 23 names on
+        // every one of thousands of draws/frame saturated the GL thread (and, with BARBLOCK on,
+        // stalled the guest -> stuttering audio + half-rate frames). Cache the locations once.
+        static int loc[N];
+        static bool locInit = false;
+        if (!locInit)
+        {
+            for (int i = 0; i < N; ++i) loc[i] = bt3GetShaderLocation(g_shader, u[i].n);
+            locInit = true;
+        }
+        for (int i = 0; i < N; ++i)
+        {
+            if (loc[i] < 0) continue;
+            float v[4] = {0, 0, 0, 0};
+            glGetUniformfv(g_shader.id, loc[i], v);
+            const char *n = u[i].n;
+            if (u[i].ncomp == 1) g_d3dGsSh.SetFloat(n, v[0]);
+            else if (u[i].ncomp == 2) g_d3dGsSh.SetVec2(n, v[0], v[1]);
+            else g_d3dGsSh.SetVec4(n, v[0], v[1], v[2], v[3]);
+        }
+    }
+#endif   // _WIN32 [linuxfix] the image/readback helpers below are portable: used on every platform
+    // [A4] Local stand-in for raylib's bt3Image on the readback path: same surface the diagnostic
+    // code uses (.data/.width/.height/.format) but backed by our own GL readback + PNG writer, so
+    // bt3LoadImageFromTexture/bt3ExportImage/bt3UnloadImage/bt3ImageFlipVertical/bt3GetImageColor leave the replay.
+    // [A4.3] Same type backs the procedural CPU images (GsImageMake/GsImageSetPx) and the GL
+    // readbacks, so one set of helpers serves both.
+    using GsReadImage = ps2x::gfx::GsImage;
+    static bool gsReadImageFromTexture(const bt3Texture2D &t, GsReadImage &out)
+    {
+        out.buf.clear(); out.data = nullptr; out.width = out.height = 0;
+        if (!t.id || t.width <= 0 || t.height <= 0) return false;
+        if (!ps2x::gfx::GsReadTextureRGBA8(t.id, t.width, t.height, out.buf)) return false;
+        out.data = out.buf.data(); out.width = t.width; out.height = t.height;
+        return true;
+    }
+    static void gsFlipVertical(GsReadImage &im)
+    {
+        if (!im.data || im.width <= 0 || im.height <= 0) return;
+        const size_t row = (size_t)im.width * 4u;
+        std::vector<unsigned char> tmp(row);
+        for (int y = 0; y < im.height / 2; ++y)
+        {
+            unsigned char *a = im.data + (size_t)y * row;
+            unsigned char *b = im.data + (size_t)(im.height - 1 - y) * row;
+            std::memcpy(tmp.data(), a, row); std::memcpy(a, b, row); std::memcpy(b, tmp.data(), row);
+        }
+    }
+    static bool gsExportImage(const GsReadImage &im, const char *path)
+    { return im.data ? ps2x::gfx::GsWritePngRGBA8(path, im.data, im.width, im.height) : false; }
+    static void gsUnloadImage(GsReadImage &im) { im.buf.clear(); im.data = nullptr; im.width = im.height = 0; }
+    // Overloads for CPU-side raylib Images (bt3GenImageColor etc.) that the same call sites also use;
+    // those stay on raylib until the A4.3 CPU-image pass.
+    static bool gsExportImage(const bt3Image &im, const char *path) { return bt3ExportImage(im, path); }
+    static void gsUnloadImage(bt3Image &im) { bt3UnloadImage(im); }
+    static void gsFlipVertical(bt3Image &im) { bt3ImageFlipVertical(&im); }
+    static Color gsImageColor(const bt3Image &im, int x, int y) { return bt3GetImageColor(im, x, y); }
+    static Color gsImageColor(const GsReadImage &im, int x, int y)
+    {
+        Color c{0, 0, 0, 0};
+        if (im.data && x >= 0 && y >= 0 && x < im.width && y < im.height)
+        { const unsigned char *p = im.data + ((size_t)y * im.width + x) * 4u; c.r = p[0]; c.g = p[1]; c.b = p[2]; c.a = p[3]; }
+        return c;
+    }
+
+    // [A4] PNG dump through our own loader (replaces bt3LoadImageFromTexture+[flip]+bt3ExportImage+bt3UnloadImage).
+    static bool ps2xGfxDumpTexPng(const bt3Texture2D &t, const char *path, bool flip = false)
+    {
+        if (!t.id || t.width <= 0 || t.height <= 0 || !path) return false;
+        std::vector<uint8_t> px;
+        if (!ps2x::gfx::GsReadTextureRGBA8(t.id, t.width, t.height, px)) return false;
+        if (flip)
+        {
+            const size_t row = (size_t)t.width * 4u;
+            std::vector<uint8_t> tmp(row);
+            for (int y = 0; y < t.height / 2; ++y)
+            {
+                uint8_t *a = &px[(size_t)y * row];
+                uint8_t *b = &px[(size_t)(t.height - 1 - y) * row];
+                std::memcpy(tmp.data(), a, row); std::memcpy(a, b, row); std::memcpy(b, tmp.data(), row);
+            }
+        }
+        return ps2x::gfx::GsWritePngRGBA8(path, px.data(), t.width, t.height);
+    }
+#if defined(_WIN32)
+    static void d3dGsMirrorState(int rtW, int rtH)
+    {
+        ps2x::gfx::BlendDesc b;
+        b.enable = glIsEnabled(0x0BE2 /*GL_BLEND*/) != 0;
+        int f = 0;
+        glGetIntegerv(0x80C9, &f); b.srcRGB = d3dBlendFromGL(f);
+        glGetIntegerv(0x80C8, &f); b.dstRGB = d3dBlendFromGL(f);
+        glGetIntegerv(0x80CB, &f); b.srcA = d3dBlendFromGL(f);
+        glGetIntegerv(0x80CA, &f); b.dstA = d3dBlendFromGL(f);
+        glGetIntegerv(0x8009, &f); b.opRGB = d3dBlendOpFromGL(f);
+        glGetIntegerv(0x883D, &f); b.opA = d3dBlendOpFromGL(f);
+        g_d3dGsR.SetBlend(b);
+        unsigned char m[4] = {1, 1, 1, 1};
+        glGetBooleanv(0x0C23 /*GL_COLOR_WRITEMASK*/, m);
+        g_d3dGsR.SetColorMask(m[0] != 0, m[1] != 0, m[2] != 0, m[3] != 0);
+        if (glIsEnabled(0x0C11 /*GL_SCISSOR_TEST*/))
+        {
+            int box[4] = {0, 0, 0, 0};
+            glGetIntegerv(0x0C10 /*GL_SCISSOR_BOX*/, box);
+            const int y = rtH - (box[1] + box[3]);   // GL bottom-up -> D3D top-down
+            const int sc[4] = {box[0], y, box[2], box[3]};
+            g_d3dGsR.SetScissor(sc);
+        }
+        else g_d3dGsR.SetScissor(nullptr);
+    }
+    static void d3dGsSetMvp(int w, int h)
+    {
+        const float W = (float)(w > 0 ? w : 512), H = (float)(h > 0 ? h : 448);
+        const float m[16] = {2.0f / W, 0, 0, 0,  0, -2.0f / H, 0, 0,  0, 0, 1, 0,  -1, 1, 0, 1};
+        g_d3dGsSh.SetMat4("mvp", m);
+    }
+#endif   // _WIN32 [linuxfix] gsGlMirrorUniforms is plain GL: used on every platform
+    // [gsgl A3.2b] Mirror the main shader's current uniforms into the gfx::gl copy (same trick as
+    // d3dGsMirrorUniforms): read them back from the raylib program and push them by NAME into our
+    // program. Cheap enough for an A/B and avoids mirroring ~20 individual bt3SetShaderValue sites.
+    static void gsGlMirrorUniforms()
+    {
+        struct U { const char *n; int ncomp; };
+        static const U u[] = {
+            {"colDiffuse",4},{"uBright",1},{"uSubScale",1},{"uUViz",1},{"uIdxMode",1},
+            {"uIdxScale",1},{"uFboOne",1},{"uTcc",1},{"uASplit",1},{"uTexa",4},
+            {"uABl128",1},{"uTfx",1},{"uProjClip",1},{"uAScale",1},{"uAlphaFix",2},
+            {"uAtst",1},{"uAref",1},{"uFba",1},{"uForceA",1},{"uZTex",1},{"uZScale",1},
+            {"uPerspQ",1},{"uRegion",4},
+        };
+        static const int N = (int)(sizeof(u) / sizeof(u[0]));
+        static int loc[N];
+        static bool locInit = false;
+        if (!locInit) { for (int i = 0; i < N; ++i) loc[i] = bt3GetShaderLocation(g_shader, u[i].n); locInit = true; }
+        for (int i = 0; i < N; ++i)
+        {
+            if (loc[i] < 0) continue;
+            float v[4] = {0, 0, 0, 0};
+            glGetUniformfv(g_shader.id, loc[i], v);
+            if (u[i].ncomp == 1) ps2x::gfx::GsGlSet1f(u[i].n, v[0]);
+            else if (u[i].ncomp == 2) ps2x::gfx::GsGlSet2f(u[i].n, v[0], v[1]);
+            else ps2x::gfx::GsGlSet4f(u[i].n, v[0], v[1], v[2], v[3]);
+        }
+    }
+#if defined(_WIN32)
+    // Bind the dest fbp's native RT (clear once per frameGen), mirror the uniforms/state and set
+    // the MVP. Returns false when there is no native RT for the current draw target.
+    static bool d3dGsPrepDest(uint32_t curRealFbp, uint32_t frameGen, int &rtW, int &rtH)
+    {
+        ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+        auto dit = g_fbos.find(curRealFbp);
+        if (dit == g_fbos.end() || !dit->second.d3dRt) return false;
+        // Bind only. The GL path does NOT clear the FBO per frame -- it accumulates and the game's
+        // own clear draws (big opaque quads) clear it -- so clearing here diverged from GL and
+        // produced the alternating-brightness flicker.
+        dit->second.d3dRt->Bind(*dev);
+        (void)frameGen;
+        // [d3d11] the display buffers are fbp0/fbp112: keep the last one DRAWN as the present
+        // source, so the present never falls back to a stale/unmapped buffer.
+        if (curRealFbp == 0u || curRealFbp == 112u)
+            g_d3dPresentTex = &dit->second.d3dRt->Color();
+        rtW = (int)dit->second.d3dRt->Width(); rtH = (int)dit->second.d3dRt->Height();
+        d3dGsMirrorUniforms();
+        d3dGsMirrorState(rtH, rtH);
+        d3dGsSetMvp(rtW, rtH);
+        return true;
+    }
+    // [d3d11] GS CLAMP wrap per draw: the GL path calls bt3rlTextureParameters(REPEAT/CLAMP) per
+    // draw; without this our sampler stays Clamp, collapsing the stage/sky (REPEAT) to texel(0,0).
+    static void d3dGsSetWrap(ps2x::gfx::Texture *dt, const GsGpuRenderer::DrawCmd &c)
+    {
+        ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+        if (!dt || !dev) return;
+        dt->SetSamplerUV(*dev, c.bilinear ? ps2x::gfx::Filter::Linear : ps2x::gfx::Filter::Point,
+                         c.wrapU ? ps2x::gfx::Wrap::Clamp : ps2x::gfx::Wrap::Repeat,
+                         c.wrapV ? ps2x::gfx::Wrap::Clamp : ps2x::gfx::Wrap::Repeat);
+    }
+    static ps2x::gfx::Vertex d3dGsVtx(const GsGpuRenderer::Vtx &v, float offX, float offY, bool vflip, bool depthOn)
+    {
+        ps2x::gfx::Vertex o{};
+        o.x = v.x + offX; o.y = v.y + offY;
+        o.u = v.u; o.v = vflip ? 1.0f - v.v : v.v;
+        o.r = v.r; o.g = v.g; o.b = v.b; o.a = v.a;
+        o.q = v.q; o.z = depthOn ? -v.z : 0.0f;
+        return o;
+    }
+    static ps2x::gfx::Vertex d3dGsVtxXY(float x, float y, float u, float v, unsigned char r, unsigned char g, unsigned char b, unsigned char a, float q, float z)
+    {
+        ps2x::gfx::Vertex o{};
+        o.x = x; o.y = y; o.u = u; o.v = v; o.r = r; o.g = g; o.b = b; o.a = a; o.q = q; o.z = z;
+        return o;
+    }
+#endif
     // [texreplace] Push uAlphaFix for the texture about to be BOUND -- a pack replacement is
     // uploaded raw and still carries PS2 alpha (0x80 == opaque) while everything the GS decoder
     // produced was already expanded to 0..255 on the CPU, so the rescale is per-texture.
     //
-    // MUST be called BEFORE rlSetTexture, never after. rlDrawRenderBatchActive() ends by
+    // MUST be called BEFORE bt3rlSetTexture, never after. bt3rlDrawRenderBatchActive() ends by
     // resetting every batch draw to RLGL.State.defaultTextureId, so a flush issued after the
     // bind throws the binding away and the draw samples the 1x1 white default instead: black
     // characters and stray white triangles. Flushing here is correct -- the queued vertices
@@ -1218,7 +1536,7 @@ namespace
         const AlphaFix want = texAlphaFix(texId);
         if (want == g_curAlphaFix || g_locAlphaFix < 0) return;
         flushBatch(__LINE__);
-        SetShaderValue(g_shader, g_locAlphaFix, want.data(), SHADER_UNIFORM_VEC2);
+        bt3SetShaderValue(g_shader, g_locAlphaFix, want.data(), BT3_SHADER_UNIFORM_VEC2);
         g_curAlphaFix = want;
     }
     int g_locPal = -1;                  // 256x1 CLUT sampler for indexed RT reads
@@ -1239,7 +1557,7 @@ namespace
     int g_locABl128 = -1;   // [ablend128]
     const GsGpuRenderer::DrawCmd *g_curDecalCmd = nullptr;
     bool g_decalUViz = false; float g_decalUVizMode = 1.f;   // [decaldbg 6/7]
-    RenderTexture2D g_decalSnap = {0}; unsigned g_decalSnapSrcTex = 0;   // [decalsync 3] silhouette snapshot
+    bt3RenderTexture2D g_decalSnap = {0}; unsigned g_decalSnapSrcTex = 0;   // [decalsync 3] silhouette snapshot
     uint8_t g_lastWriter[512] = {0};   // [lastwriter] per VRAM page: 1 = guest upload, 2 = GL writeback (diag)
     uint8_t g_wbEver[512] = {0};       // [mxfold] page has EVER received a GL writeback / writeback stamp (FBO-fed page)
     float g_curReg[4] = {0.f, 0.f, 0.f, -1.f};   // [region] last uRegion value pushed   // [region] the shadow-decal command being drawn (loop top)               // PS2X_PERSPQ: per-pixel S/Q divide
@@ -1254,7 +1572,7 @@ namespace
     // it at the display stride: out(dx,dy) = fbo( off%srcW, off/srcW ), off = dy*dispW+dx.
     Shader g_strideShader{};
     bool g_strideInit = false;
-    RenderTexture2D g_presentRt{};
+    bt3RenderTexture2D g_presentRt{};
     int g_presentW = 0, g_presentH = 0;
     const char *kStrideShader =
         "#version 330\n"
@@ -1547,7 +1865,7 @@ namespace {
     uint32_t g_curGen = 0;                       // generation the commands being processed belong to (set per call / per list)
     BlobAcc &accFor(uint32_t gen) { BlobAcc &a = g_accByGen[gen]; while (g_accByGen.size() > 8) g_accByGen.erase(g_accByGen.begin()); return a; }
     std::vector<float> g_blobX, g_blobY, g_blobZ; // scratch copy of the accumulator being computed
-    Texture2D g_blobTex{};
+    bt3Texture2D g_blobTex{};
     bool g_blobDrawn = false;                    // once per frame; reset in blobFrameEnd()
     int g_terrainDraws = 0;                      // T8 stage-texture triangles seen this frame (the blob must come AFTER the terrain)
     uint32_t g_sceneFbp = 0xFFFFFFFFu;             // destFbp of this frame's terrain draws (the scene buffer)
@@ -1610,9 +1928,9 @@ namespace {
             float a = r >= 1.0f ? 0.0f : (1.0f - r); a = a * a * (3.0f - 2.0f * a);   // smoothstep falloff
             uint8_t *p = &px[((size_t)y * N + x) * 4]; p[0] = p[1] = p[2] = 0; p[3] = (uint8_t)(a * 255.0f);
         }
-        Image im{px.data(), N, N, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
-        g_blobTex = LoadTextureFromImage(im);
-        SetTextureFilter(g_blobTex, TEXTURE_FILTER_BILINEAR);
+        bt3Image im{px.data(), N, N, 1, BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+        g_blobTex = ps2x::gfx::GsTexCreateFromImage(im);
+        bt3SetTextureFilter(g_blobTex, TEXTURE_FILTER_BILINEAR);
     }
 }
 uint64_t GsGpuRenderer::resolveTextureVersion(uint64_t baseKey, uint32_t pageLo, uint32_t pageHi,
@@ -2325,7 +2643,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
         }
     }
     flushBatch(__LINE__);
-    rlEnableFramebuffer(it->second.rt.id);
+    bt3rlEnableFramebuffer(it->second.rt.id);
     rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
     const auto tRb0 = std::chrono::steady_clock::now();
     bool asyncDone = false;   // [asyncstage]
@@ -2370,7 +2688,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
                          fbp, rfbp, it->second.rt.id, it->second.rt.texture.id,
                          it->second.w, it->second.h, w, h);
     }
-    rlDisableFramebuffer();
+    bt3rlDisableFramebuffer();
     if (!rectUsed && !s_noflip)
     for (int y = 0; y < h / 2; ++y)   // glReadPixels is bottom-up; VRAM rows are top-down
         std::swap_ranges(px.begin() + (size_t)y * w, px.begin() + (size_t)(y + 1) * w,
@@ -2788,11 +3106,11 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
                 g_gaViewTex[g_gaCur].texture.id != 0)
             {
                 flushBatch(__LINE__);
-                Image vi = LoadImageFromTexture(g_gaViewTex[g_gaCur].texture);
+                GsReadImage vi; gsReadImageFromTexture(g_gaViewTex[g_gaCur].texture, vi);
                 if (vi.data)
                 {
                     ps2xWritebackToVramMasked(336u, 8u, 0x02u, 512, 448, (const uint32_t *)vi.data, 0u);
-                    UnloadImage(vi);
+                    gsUnloadImage(vi);
                     static int n = 0;
                     if (n++ < 4) std::fprintf(stderr, "[gpualias] view->VRAM writeback (CT16-reader flush of f336)\n");
                 }
@@ -3840,10 +4158,10 @@ void GsGpuRenderer::reportFboAlpha(uint32_t fbp, const char *when)
     const int w = std::min(512, it->second.w), h = std::min(448, it->second.h);
     std::vector<uint32_t> px((size_t)w * h, 0u);
     flushBatch(__LINE__);
-    rlEnableFramebuffer(it->second.rt.id);
+    bt3rlEnableFramebuffer(it->second.rt.id);
     rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
     glReadPixels(0, it->second.h - h, w, h, 0x1908, 0x1401, px.data());
-    rlDisableFramebuffer();
+    bt3rlDisableFramebuffer();
     unsigned hist[256] = {0};
     for (uint32_t v : px) ++hist[(v >> 24) & 0xFFu];
     int distinct = 0; unsigned top = 0; int topV = 0; double sum = 0;
@@ -3978,7 +4296,7 @@ void GsGpuRenderer::swOutlineEnd()
     {   // Compose the upload so that a FULL-PAGE OVERWRITE is already correct: start from the
         // FBO's own pixels and substitute VRAM only where the software pass actually wrote.
         //
-        // Selecting coverage at draw time does not work here. DrawTexturePro does not go
+        // Selecting coverage at draw time does not work here. bt3DrawTexturePro does not go
         // through our shader, so neither the alpha test nor pinned uniforms reach it, and the
         // blend state is inherited -- four different attempts at masking (alpha blend, explicit
         // factors, alpha-test discard, per-draw dirty arming) all produced BYTE-IDENTICAL
@@ -4013,10 +4331,10 @@ void GsGpuRenderer::swOutlineEnd()
         // The FBO as it stands right now -- everything recorded before this bracket, drawn.
         std::vector<uint32_t> fbo((size_t)w * h, 0u);
         flushBatch(__LINE__);
-        rlEnableFramebuffer(it->second.rt.id);
+        bt3rlEnableFramebuffer(it->second.rt.id);
         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
         glReadPixels(0, it->second.h - h, w, h, 0x1908, 0x1401, fbo.data());
-        rlDisableFramebuffer();
+        bt3rlDisableFramebuffer();
         for (int y = 0; y < h / 2; ++y)   // glReadPixels is bottom-up; VRAM rows are top-down
             std::swap_ranges(fbo.begin() + (size_t)y * w, fbo.begin() + (size_t)(y + 1) * w,
                              fbo.begin() + (size_t)(h - 1 - y) * w);
@@ -4097,35 +4415,35 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
     if (w <= 0 || h <= 0 || !c.vramSnap || c.vramSnap->size() != (size_t)w * h) return;
     const std::vector<uint32_t> &px = *c.vramSnap;
 
-    static Texture2D s_tex{}; static int s_tw = 0, s_th = 0;
+    static bt3Texture2D s_tex{}; static int s_tw = 0, s_th = 0;
     if (s_tex.id == 0 || s_tw != w || s_th != h)
     {
-        if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); UnloadTexture(s_tex); }
-        Image im = GenImageColor(w, h, BLANK);
-        s_tex = LoadTextureFromImage(im); UnloadImage(im);
+        if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); ps2x::gfx::GsUnloadTexture(s_tex); }
+        GsReadImage im = ps2x::gfx::GsImageMake(w, h, BLANK);
+        s_tex = ps2x::gfx::GsTexCreateFromImage(im); gsUnloadImage(im);
         s_tw = w; s_th = h;
     }
-    UpdateTexture(s_tex, px.data());
+    bt3UpdateTexture(s_tex, px.data());
 
     // The blit inherits whatever uniforms the previous draw left behind, so pin the ones it
     // needs -- a stale TCC=0 makes the quad paint solid vertex colour over the whole page.
     { const float one = 1.0f, zero = 0.0f;
-      if (g_locTcc >= 0)      SetShaderValue(g_shader, g_locTcc, &one, SHADER_UNIFORM_FLOAT);
-      if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; SetShaderValue(g_shader, g_locAlphaFix, d.data(), SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }   // [texreplace]
-      if (g_locIdxMode >= 0)  SetShaderValue(g_shader, g_locIdxMode, &zero, SHADER_UNIFORM_FLOAT);
-      if (g_locUViz >= 0)     SetShaderValue(g_shader, g_locUViz, &zero, SHADER_UNIFORM_FLOAT);
-      if (g_locSubScale >= 0) SetShaderValue(g_shader, g_locSubScale, &one, SHADER_UNIFORM_FLOAT);
-      if (g_locTfx >= 0)      SetShaderValue(g_shader, g_locTfx, &one, SHADER_UNIFORM_FLOAT);
+      if (g_locTcc >= 0)      bt3SetShaderValue(g_shader, g_locTcc, &one, BT3_SHADER_UNIFORM_FLOAT);
+      if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; bt3SetShaderValue(g_shader, g_locAlphaFix, d.data(), BT3_SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }   // [texreplace]
+      if (g_locIdxMode >= 0)  bt3SetShaderValue(g_shader, g_locIdxMode, &zero, BT3_SHADER_UNIFORM_FLOAT);
+      if (g_locUViz >= 0)     bt3SetShaderValue(g_shader, g_locUViz, &zero, BT3_SHADER_UNIFORM_FLOAT);
+      if (g_locSubScale >= 0) bt3SetShaderValue(g_shader, g_locSubScale, &one, BT3_SHADER_UNIFORM_FLOAT);
+      if (g_locTfx >= 0)      bt3SetShaderValue(g_shader, g_locTfx, &one, BT3_SHADER_UNIFORM_FLOAT);
       // Select the software-written pixels with the shader's own alpha TEST (GREATER than
       // 0.5) rather than with blending. Blend state is global and easy to inherit wrong -- and
       // it was: the mask carried correct coverage and correct dark values, yet the blit still
       // repainted the whole page with VRAM page-0 RGB, which BT3's CT16 alias passes have
       // legitimately polluted. A discard cannot be defeated by leftover blend factors.
-      if (g_locAtst >= 0)     { const float gt = 6.0f; SetShaderValue(g_shader, g_locAtst, &gt, SHADER_UNIFORM_FLOAT); }
-      if (g_locAref >= 0)     { const float half = 0.5f; SetShaderValue(g_shader, g_locAref, &half, SHADER_UNIFORM_FLOAT); }
+      if (g_locAtst >= 0)     { const float gt = 6.0f; bt3SetShaderValue(g_shader, g_locAtst, &gt, BT3_SHADER_UNIFORM_FLOAT); }
+      if (g_locAref >= 0)     { const float half = 0.5f; bt3SetShaderValue(g_shader, g_locAref, &half, BT3_SHADER_UNIFORM_FLOAT); }
       // uTexa.w < 1.5 makes the shader REPLACE the sampled alpha with uTexa.x, which would
       // wipe the coverage mask; 3.0 selects the pass-through branch that keeps t.a.
-      if (g_locTexa >= 0)     { const float t4[4] = {1,1,0,3}; SetShaderValue(g_shader, g_locTexa, t4, SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t4, sizeof t4); } }
+      if (g_locTexa >= 0)     { const float t4[4] = {1,1,0,3}; bt3SetShaderValue(g_shader, g_locTexa, t4, BT3_SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t4, sizeof t4); } }
 
     {   // PS2X_SWOCMP=1: does the snapshot still match the FBO at EXECUTION time? Everything
         // else is eliminated (placement verified 1:1 with corner markers, plus content,
@@ -4162,21 +4480,21 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
         }
     }
     flushBatch(__LINE__);
-    rlDisableScissorTest();
+    bt3rlDisableScissorTest();
     // Standard alpha blend: the snapshot's alpha is the software pass's own coverage mask, so
     // only the pixels it wrote replace the FBO. RGB only -- the scene's alpha byte is the mask
     // the outline/shadow composites read and must survive untouched.
-    rlDisableColorBlend();
+    bt3rlDisableColorBlend();
     // Draw with raylib's DEFAULT shader, not ours. Ours applies the PS2 MODULATE overbright
     // (uBright = 255/128, used whenever uTfx != 1), TEXA alpha replacement, indexed palette
     // lookup and the alpha test -- all driven by uniforms left over from the previous draw.
     // That is why five masking/blending attempts produced byte-identical output while removing
     // the blit changed the frame: the content was never wrong, the shader was re-colouring it.
-    EndShaderMode();
+    bt3EndShaderMode();
     glColorMask(1, 1, 1, 0);
-    DrawTexturePro(s_tex, Rectangle{0.0f, 0.0f, (float)w, (float)h},
-                   Rectangle{0.0f, 0.0f, (float)w, (float)h},
-                   Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+    bt3DrawTexturePro(s_tex, bt3Rectangle{0.0f, 0.0f, (float)w, (float)h},
+                   bt3Rectangle{0.0f, 0.0f, (float)w, (float)h},
+                   bt3Vector2{0.0f, 0.0f}, 0.0f, WHITE);
     flushBatch(__LINE__);
     {   // PS2X_SWOCMP=1: what did the DRAW itself do? Read the FBO back straight after and
         // compare with the pixels we handed it. With PS2X_SWOIDENT the upload IS the FBO, so
@@ -4217,9 +4535,9 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
         }
     }
     glColorMask(1, 1, 1, 1);
-    rlEnableColorBlend();
-    BeginShaderMode(g_shader);   // hand the draw loop its shader back
-    if (g_locAtst >= 0) { const float off3 = -1.0f; SetShaderValue(g_shader, g_locAtst, &off3, SHADER_UNIFORM_FLOAT); }
+    bt3rlEnableColorBlend();
+    bt3BeginShaderMode(g_shader);   // hand the draw loop its shader back
+    if (g_locAtst >= 0) { const float off3 = -1.0f; bt3SetShaderValue(g_shader, g_locAtst, &off3, BT3_SHADER_UNIFORM_FLOAT); }
 }
 
 void GsGpuRenderer::seedSceneAlphaForRebuild(uint32_t fbp)
@@ -4257,7 +4575,7 @@ std::vector<double> g_f224Bis; uint32_t g_f224BisGen = 0xFFFFFFFFu;
 double g_f224Before = -1.0; uint32_t g_f224Gen = 0xFFFFFFFFu; unsigned long g_f224Draws = 0;
 std::map<std::string, unsigned long> g_f224Writers;
 // [f224fine] CHEAP sampler: a 4-row strip of the mask page instead of a full texture
-// download (a 2048x1792 LoadImageFromTexture is ~14 MB and cannot be run hundreds of times
+// download (a 2048x1792 bt3LoadImageFromTexture is ~14 MB and cannot be run hundreds of times
 // per frame). The strip sits at 55%% of the height, which is where the silhouettes are.
 double ps2xStripAlphaOf(uint32_t fbp)
 {
@@ -4270,9 +4588,9 @@ double ps2xStripAlphaOf(uint32_t fbp)
     static std::vector<uint32_t> buf;
     buf.resize((size_t)w * 4);
     int prevFB = 0; glGetIntegerv(0x8CA6 /*FRAMEBUFFER_BINDING*/, &prevFB);
-    rlEnableFramebuffer(it->second.rt.id);
+    bt3rlEnableFramebuffer(it->second.rt.id);
     glReadPixels(0, y0, w, 4, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, buf.data());
-    if (prevFB) rlEnableFramebuffer((unsigned)prevFB); else rlDisableFramebuffer();
+    if (prevFB) bt3rlEnableFramebuffer((unsigned)prevFB); else bt3rlDisableFramebuffer();
     unsigned long sum = 0;
     for (uint32_t px : buf) sum += (px >> 24);
     return buf.empty() ? -1.0 : (double)sum / (double)buf.size();
@@ -4284,14 +4602,14 @@ double ps2xF224AlphaMean()
     auto it = g_fbos.find(224u);
     if (it == g_fbos.end() || it->second.rt.texture.id == 0) return -1.0;
     flushBatch(__LINE__);
-    Image img = LoadImageFromTexture(it->second.rt.texture);
+    GsReadImage img; gsReadImageFromTexture(it->second.rt.texture, img);
     const unsigned char *p = (const unsigned char *)img.data;
     double sum = 0.0; unsigned long n = 0;
-    if (p && img.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+    if (p && img.format == BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
         for (int y = 0; y < img.height; y += 8)
             for (int x = 0; x < img.width; x += 8)
             { sum += p[((size_t)y * img.width + x) * 4 + 3]; ++n; }
-    UnloadImage(img);
+    gsUnloadImage(img);
     return n ? sum / (double)n : -1.0;
 }
 static void ps2xDbgCol0(const char *tag, int idx)
@@ -4301,9 +4619,9 @@ static void ps2xDbgCol0(const char *tag, int idx)
     flushBatch(__LINE__);
     const int w = it->second.w, h = it->second.h; std::vector<uint32_t> b((size_t)w * h);
     int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
-    rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, b.data());
+    bt3rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, b.data());
     rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
-    if (prevFB) rlEnableFramebuffer((unsigned)prevFB);
+    if (prevFB) bt3rlEnableFramebuffer((unsigned)prevFB);
     unsigned long n = 0, sum = 0; for (int y = 0; y < 448 && y < h; ++y) for (int x = 0; x < 32 && x < w; ++x) { ++n; sum += b[(size_t)(h - 1 - y) * w + x] >> 24; }
     std::fprintf(stderr, "[segchk] %s #%d f224 col0 mean alpha: %.1f\n", tag, idx, n ? (double)sum / n : -1.0);
 }
@@ -4318,9 +4636,9 @@ void GsGpuRenderer::renderRange(int fbWidth, int fbHeight)
         flushBatch(__LINE__);
         const int w = it->second.w, h = it->second.h; std::vector<uint32_t> b((size_t)w * h);
         int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
-        rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, b.data());
+        bt3rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, b.data());
         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
-        if (prevFB) rlEnableFramebuffer((unsigned)prevFB); else rlDisableFramebuffer();
+        if (prevFB) bt3rlEnableFramebuffer((unsigned)prevFB); else bt3rlDisableFramebuffer();
         unsigned long n = 0, sum = 0; for (int y = 0; y < 448 && y < h; ++y) for (int x = 0; x < 32 && x < w; ++x) { ++n; sum += b[(size_t)(h - 1 - y) * w + x] >> 24; }
         return n ? (double)sum / n : -1.0; };
     const bool sckOn = s_sck && g_replayInWindow && sckN < 40;
@@ -4699,19 +5017,19 @@ void ps2xPublishClut(uint64_t key, const uint32_t *pal)
     g_clutPalettes.emplace(key, a);
 }
 
-static Texture2D palTextureFor(uint64_t key)
+static bt3Texture2D palTextureFor(uint64_t key)
 {
-    static std::unordered_map<uint64_t, Texture2D> s_cache;
+    static std::unordered_map<uint64_t, bt3Texture2D> s_cache;
     auto it = s_cache.find(key);
     if (it != s_cache.end()) return it->second;
     std::array<uint32_t, 256> pal{};
     {
         std::lock_guard<std::mutex> lk(g_clutMx);
         auto p = g_clutPalettes.find(key);
-        if (p == g_clutPalettes.end()) return Texture2D{};
+        if (p == g_clutPalettes.end()) return bt3Texture2D{};
         pal = p->second;
     }
-    Image im = GenImageColor(256, 1, BLANK);
+    GsReadImage im = ps2x::gfx::GsImageMake(256, 1, BLANK);
     for (int i = 0; i < 256; ++i)
     {
         const uint32_t v = pal[i];
@@ -4727,17 +5045,92 @@ static Texture2D palTextureFor(uint64_t key)
         static const bool s_palRescale = [](){ const char *v2 = std::getenv("PS2X_PALRESCALE"); return v2 && v2[0] && v2[0] != '0'; }();
         const uint32_t aRaw = (v >> 24) & 0xFFu;
         const uint32_t aUp = s_palRescale ? std::min(aRaw * 255u / 128u, 255u) : aRaw;
-        ImageDrawPixel(&im, i, 0, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF),
+        ps2x::gfx::GsImageSetPx(im, i, 0, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF),
                                         (unsigned char)((v >> 16) & 0xFF), (unsigned char)aUp});
     }
-    Texture2D t = LoadTextureFromImage(im);
-    UnloadImage(im);
-    SetTextureFilter(t, TEXTURE_FILTER_POINT);   // a LUT must never interpolate between entries
-    rlTextureParameters(t.id, RL_TEXTURE_WRAP_S, RL_TEXTURE_WRAP_CLAMP);
+    bt3Texture2D t = ps2x::gfx::GsTexCreateFromImage(im);
+    gsUnloadImage(im);
+    bt3SetTextureFilter(t, TEXTURE_FILTER_POINT);   // a LUT must never interpolate between entries
+    bt3rlTextureParameters(t.id, BT3RL_TEXTURE_WRAP_S, BT3RL_TEXTURE_WRAP_CLAMP);
     if (s_cache.size() > 256) s_cache.clear();
     s_cache[key] = t;
     return t;
 }
+
+#if defined(_WIN32)
+// [d3d11] Native mirror of palTextureFor: the 256x1 CLUT for an indexed (uPal) draw. The palette
+// array is 0xAABBGGRR (R in the low byte) = RGBA8888 in memory, so it uploads byte-for-byte.
+static std::unordered_map<uint64_t, ps2x::gfx::Texture *> g_d3dGsPal;
+static ps2x::gfx::Texture *d3dGsPalFor(uint64_t key)
+{
+    if (!key) return nullptr;
+    auto it = g_d3dGsPal.find(key);
+    if (it != g_d3dGsPal.end()) return it->second;
+    std::array<uint32_t, 256> pal{};
+    {
+        std::lock_guard<std::mutex> lk(g_clutMx);
+        auto p = g_clutPalettes.find(key);
+        if (p == g_clutPalettes.end()) return nullptr;
+        pal = p->second;
+    }
+    ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+    if (!dev) return nullptr;
+    auto *t = new ps2x::gfx::Texture();
+    if (!t->Create(*dev, 256, 1, ps2x::gfx::Format::RGBA8, pal.data())) { delete t; return nullptr; }
+    t->SetSamplerUV(*dev, ps2x::gfx::Filter::Point, ps2x::gfx::Wrap::Clamp, ps2x::gfx::Wrap::Clamp);
+    if (g_d3dGsPal.size() > 256) { for (auto &kv : g_d3dGsPal) delete kv.second; g_d3dGsPal.clear(); }
+    g_d3dGsPal[key] = t;
+    return t;
+}
+// [d3d11] Bind the CLUT for an indexed-RT draw (the GL path's bt3SetShaderValueTexture(uPal)+bind).
+static void d3dGsSetPal(const GsGpuRenderer::DrawCmd &c, bool idxRt)
+{
+    g_d3dGsR.SetTexture1(idxRt ? d3dGsPalFor(c.srcClutKey) : nullptr);
+}
+// [d3d11] isVramBlit: fold a software-rasterized VRAM page back into the D3D render target (the
+// native form of blitVramPageToBoundFbo). Uploads the snapshot and blits it RGB-only, no blend.
+static void d3dGsBlitVram(const GsGpuRenderer::DrawCmd &c)
+{
+    const int w = (int)c.dx1, h = (int)c.dy1;
+    if (w <= 0 || h <= 0 || !c.vramSnap || c.vramSnap->size() != (size_t)w * h) return;
+    ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+    if (!dev) return;
+    static ps2x::gfx::Texture *s_tex = nullptr; static int s_w = 0, s_h = 0;
+    if (!s_tex || s_w != w || s_h != h)
+    {
+        delete s_tex; s_tex = new ps2x::gfx::Texture();
+        if (!s_tex->Create(*dev, (uint32_t)w, (uint32_t)h, ps2x::gfx::Format::RGBA8, nullptr))
+        { delete s_tex; s_tex = nullptr; return; }
+        s_tex->SetSamplerUV(*dev, ps2x::gfx::Filter::Point, ps2x::gfx::Wrap::Clamp, ps2x::gfx::Wrap::Clamp);
+        s_w = w; s_h = h;
+    }
+    s_tex->Update(*dev, c.vramSnap->data());
+    int rtW = 0, rtH = 0;
+    if (!d3dGsPrepDest(c.destFbp, 0u, rtW, rtH)) return;
+    // Pass-through: DECAL (use the texel as-is), no alpha test, no palette, no MODULATE brighten.
+    g_d3dGsSh.SetVec4("colDiffuse", 1, 1, 1, 1);
+    g_d3dGsSh.SetFloat("uTfx", 1.0f);
+    g_d3dGsSh.SetFloat("uTcc", 1.0f);
+    g_d3dGsSh.SetFloat("uAtst", -1.0f);
+    g_d3dGsSh.SetFloat("uIdxMode", 0.0f);
+    g_d3dGsSh.SetVec2("uAlphaFix", 1.0f, 0.0f);
+    g_d3dGsSh.SetFloat("uBright", 1.0f);
+    g_d3dGsSh.SetFloat("uSubScale", 1.0f);
+    g_d3dGsSh.SetFloat("uFboOne", 0.0f);
+    g_d3dGsSh.SetVec4("uTexa", 1, 1, 0, 0);
+    g_d3dGsR.SetShader(&g_d3dGsSh);
+    g_d3dGsR.SetTexture(s_tex); g_d3dGsR.SetTexture1(nullptr);
+    ps2x::gfx::BlendDesc nb; nb.enable = false;
+    g_d3dGsR.SetBlend(nb);
+    g_d3dGsR.SetColorMask(true, true, true, false);   // RGB only: the scene alpha is the mask
+    g_d3dGsR.SetScissor(nullptr);
+    g_d3dGsR.SetDepth(false, false, 8 /* ALWAYS */);
+    auto v = [](float x, float y, float u, float vv) {
+        ps2x::gfx::Vertex o{}; o.x = x; o.y = y; o.u = u; o.v = vv;
+        o.r = o.g = o.b = o.a = 255; o.q = 1.0f; o.z = 0.0f; return o; };
+    g_d3dGsR.DrawQuad(v(0, 0, 0, 0), v(0, (float)h, 0, 1), v((float)w, (float)h, 1, 1), v((float)w, 0, 1, 0));
+}
+#endif
 
 static bool ps2xIdxHoOff()
 {   // PS2X_IDXHOOFF=1: exclude idxRt draws from the bilinear half-texel shift (see hoA/hoB).
@@ -4757,7 +5150,7 @@ static void ps2xResetIdxMode()
     if (s_en && g_locIdxMode >= 0 && g_curIdxMode != 0.0f)
     {
         const float z = 0.0f;
-        SetShaderValue(g_shader, g_locIdxMode, &z, SHADER_UNIFORM_FLOAT);
+        bt3SetShaderValue(g_shader, g_locIdxMode, &z, BT3_SHADER_UNIFORM_FLOAT);
         g_curIdxMode = 0.0f;
     }
 }
@@ -5163,7 +5556,7 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
     else if (c.fbmsk == 0xFFFFFF00u)       { stage = 2; m16 = 0xFF00; }
     else if (c.fbmsk == 0xFFFF00FFu)       { stage = 3; m16 = 0x00FF; xoff = (int)std::lround((double)c.su0 - (double)c.dx0); }
     else return false;
-    Texture2D srcA{}; Texture2D pal{}; int srcH = 448;
+    bt3Texture2D srcA{}; bt3Texture2D pal{}; int srcH = 448;
     if (stage != 0)
     {
         auto sit = g_fbos.find(224u);
@@ -5172,19 +5565,19 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
         {   // The SW chain's OWN palette (snapshotted at record time). palTextureFor's published
             // palette disagreed above index 15: only ~28% of the ink survived and the outer band
             // of the mask sprouted scribbles.
-            static Texture2D gaPal{}; static unsigned haveSeq = 0;
+            static bt3Texture2D gaPal{}; static unsigned haveSeq = 0;
             const unsigned seq = g_gaClutSeq.load();
             if (seq != 0 && (gaPal.id == 0 || seq != haveSeq))
             {
                 haveSeq = seq;
                 if (gaPal.id == 0)
                 {
-                    Image im{}; im.data = g_gaClutData; im.width = 256; im.height = 1; im.mipmaps = 1;
-                    im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-                    gaPal = LoadTextureFromImage(im);   // uploads a copy; do NOT UnloadImage (borrowed data)
-                    SetTextureFilter(gaPal, TEXTURE_FILTER_POINT);
+                    bt3Image im{}; im.data = g_gaClutData; im.width = 256; im.height = 1; im.mipmaps = 1;
+                    im.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                    gaPal = ps2x::gfx::GsTexCreateFromImage(im);   // uploads a copy; do NOT bt3UnloadImage (borrowed data)
+                    bt3SetTextureFilter(gaPal, TEXTURE_FILTER_POINT);
                 }
-                else UpdateTexture(gaPal, g_gaClutData);
+                else bt3UpdateTexture(gaPal, g_gaClutData);
                 static int n = 0;
                 if (n++ < 2) std::fprintf(stderr, "[gpualias] SW palette seq %u: [0]=%08x [1]=%08x [3]=%08x [16]=%08x [64]=%08x [128]=%08x [255]=%08x\n",
                                           seq, g_gaClutData[0], g_gaClutData[1], g_gaClutData[3], g_gaClutData[16], g_gaClutData[64], g_gaClutData[128], g_gaClutData[255]);
@@ -5198,66 +5591,66 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
     flushBatch(__LINE__);
     const int dst = 1 - g_gaCur;
     const int rect[4] = { (int)c.dx0, 0, (int)c.dx1, 448 };
-    BeginTextureMode(g_gaViewTex[dst]);
+    ps2x::gfx::GsRtBegin(g_gaViewTex[dst]);
     // State hygiene: the draw loop leaves per-draw GL state behind (glColorMask from FBMSK,
     // scissor, depth). Any of them silently blanks this pass. Neutralize; restore after.
     glColorMask(1, 1, 1, 1); glDisable(0x0B71u /*GL_DEPTH_TEST*/); glDepthMask(0); glDisable(0x0C11u /*GL_SCISSOR_TEST*/);
-    rlSetBlendFactors(1 /*GL_ONE*/, 0 /*GL_ZERO*/, 0x8006 /*GL_FUNC_ADD*/);
-    BeginBlendMode(BLEND_CUSTOM);
-    BeginShaderMode(sh);
-    SetShaderValue(sh, locStage, &stage, SHADER_UNIFORM_INT);
-    SetShaderValue(sh, locM16, &m16, SHADER_UNIFORM_INT);
-    SetShaderValue(sh, locXOff, &xoff, SHADER_UNIFORM_INT);
-    SetShaderValue(sh, locSrcFlip, &srcFlip, SHADER_UNIFORM_INT);
-    SetShaderValue(sh, locSrcH, &srcH, SHADER_UNIFORM_INT);
-    SetShaderValue(sh, locRect, rect, SHADER_UNIFORM_IVEC4);
-    SetShaderValue(sh, locDbg, &s_dbg, SHADER_UNIFORM_INT);
+    bt3rlSetBlendFactors(1 /*GL_ONE*/, 0 /*GL_ZERO*/, 0x8006 /*GL_FUNC_ADD*/);
+    bt3BeginBlendMode(BT3_BLEND_CUSTOM);
+    bt3BeginShaderMode(sh);
+    bt3SetShaderValue(sh, locStage, &stage, BT3_SHADER_UNIFORM_INT);
+    bt3SetShaderValue(sh, locM16, &m16, BT3_SHADER_UNIFORM_INT);
+    bt3SetShaderValue(sh, locXOff, &xoff, BT3_SHADER_UNIFORM_INT);
+    bt3SetShaderValue(sh, locSrcFlip, &srcFlip, BT3_SHADER_UNIFORM_INT);
+    bt3SetShaderValue(sh, locSrcH, &srcH, BT3_SHADER_UNIFORM_INT);
+    bt3SetShaderValue(sh, locRect, rect, BT3_SHADER_UNIFORM_IVEC4);
+    bt3SetShaderValue(sh, locDbg, &s_dbg, BT3_SHADER_UNIFORM_INT);
     {   // The mask page's FBO alpha stores GS bytes RESCALED x255/128 when the ALPHA128 pipeline
         // wrote it (sampled indices came back 1,5,9,13 = floor(gsByte*255/128) of 1,3,5,7).
         // Undo the rescale exactly the way the main shader's uIdxScale logic does.
         extern bool g_fbpAlphaIsGsByte[512];
         const float scl = (224u < 512u && g_fbpAlphaIsGsByte[224]) ? 255.0f : 128.0f;
-        SetShaderValue(sh, locIdxScl, &scl, SHADER_UNIFORM_FLOAT);
+        bt3SetShaderValue(sh, locIdxScl, &scl, BT3_SHADER_UNIFORM_FLOAT);
     }
     if (stage != 0)
-    {   // SetShaderValueTexture leaves the sampler at unit 0 (= texture0) in this stack -- see the
+    {   // bt3SetShaderValueTexture leaves the sampler at unit 0 (= texture0) in this stack -- see the
         // [idxpal] block below. Bind explicit high units (above raylib's 0..4) and point the
         // samplers at them by integer uniform, same fix as uPal there.
         static const int kSrcUnit = 9, kPalUnit = 10;
         glActiveTexture(0x84C0u + kSrcUnit); glBindTexture(0x0DE1u, srcA.id);
         glActiveTexture(0x84C0u + kPalUnit); glBindTexture(0x0DE1u, pal.id);
         glActiveTexture(0x84C0u);
-        SetShaderValue(sh, locSrcA, &kSrcUnit, SHADER_UNIFORM_INT);
-        SetShaderValue(sh, locPal, &kPalUnit, SHADER_UNIFORM_INT);
+        bt3SetShaderValue(sh, locSrcA, &kSrcUnit, BT3_SHADER_UNIFORM_INT);
+        bt3SetShaderValue(sh, locPal, &kPalUnit, BT3_SHADER_UNIFORM_INT);
         static int shown = 0;
         if (shown < 1)
         {   ++shown;
             int uA = -9, uP = -9; glGetUniformiv(sh.id, locSrcA, &uA); glGetUniformiv(sh.id, locPal, &uP);
             std::fprintf(stderr, "[gpualias] samplers after set: uSrcA=%d uPal=%d (want 9/10) srcA.id=%u pal.id=%u palw=%d palh=%d\n",
                          uA, uP, srcA.id, pal.id, pal.width, pal.height);
-            Image pi = LoadImageFromTexture(pal);
+            GsReadImage pi; gsReadImageFromTexture(pal, pi);
             {   // body-region index histogram of the actual source
-                Image si = LoadImageFromTexture(srcA);
+                GsReadImage si; gsReadImageFromTexture(srcA, si);
                 int hist[256] = {0};
                 for (int y = 700; y < 1000 && y < si.height; y += 3)
                     for (int x = 150; x < 400 && x < si.width; x += 3)
-                    { Color pc2 = GetImageColor(si, x, y); ++hist[pc2.a]; }
-                UnloadImage(si);
+                    { Color pc2 = gsImageColor(si, x, y); ++hist[pc2.a]; }
+                gsUnloadImage(si);
                 std::fprintf(stderr, "[gpualias] f224 alpha hist (rows 700-1000):");
                 for (int i2 = 0; i2 < 256; ++i2) if (hist[i2] > 40) std::fprintf(stderr, " %d:%d", i2, hist[i2]);
                 std::fprintf(stderr, "\n");
             }
             for (int ix = 0; ix < 256; ix += (ix < 16 ? 1 : 16))
-            { Color pc = GetImageColor(pi, ix % (pi.width > 0 ? pi.width : 1), ix / (pi.width > 0 ? pi.width : 1));
+            { Color pc = gsImageColor(pi, ix % (pi.width > 0 ? pi.width : 1), ix / (pi.width > 0 ? pi.width : 1));
               std::fprintf(stderr, "[gpualias] clut[%d] = %u,%u,%u,%u\n", ix, pc.r, pc.g, pc.b, pc.a); }
-            UnloadImage(pi);
+            gsUnloadImage(pi);
         }
     }
-    DrawTexturePro(g_gaViewTex[g_gaCur].texture, Rectangle{0.0f, 0.0f, 512.0f, 448.0f},
-                   Rectangle{0.0f, 0.0f, 512.0f, 448.0f}, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-    EndShaderMode();
-    EndBlendMode();
-    EndTextureMode();
+    bt3DrawTexturePro(g_gaViewTex[g_gaCur].texture, bt3Rectangle{0.0f, 0.0f, 512.0f, 448.0f},
+                   bt3Rectangle{0.0f, 0.0f, 512.0f, 448.0f}, bt3Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+    bt3EndShaderMode();
+    bt3EndBlendMode();
+    ps2x::gfx::GsRtEnd();
     glDepthMask(1); glEnable(0x0B71u); glEnable(0x0C11u);   // restore loop expectations
     g_gaCur = dst; g_gaViewReady = true; ++g_gaExecCount;
     {   // PS2X_GPUALIAS_DUMPSTAGE=1: export the view at each stage boundary, once per stage kind
@@ -5270,7 +5663,7 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
             {
                 done[lastStage] = true; flushBatch(__LINE__);
                 char nm[96]; std::snprintf(nm, sizeof nm, "/home/z3/Desktop/bt3/work/ga_stage%d.png", lastStage);
-                Image vi = LoadImageFromTexture(g_gaViewTex[g_gaCur].texture); ExportImage(vi, nm); UnloadImage(vi);
+                ps2xGfxDumpTexPng(g_gaViewTex[g_gaCur].texture, nm);
                 std::fprintf(stderr, "[gpualias] stage-boundary dump: %s\n", nm);
             }
             if (stage == 3) { static int n3 = 0; if (n3++ < 3) std::fprintf(stderr, "[gpualias] stage3 xoff=%d su0=%.2f dx0=%.2f\n", xoff, c.su0, c.dx0); }
@@ -5348,18 +5741,18 @@ static bool gaExecShaderInit()
             "  int o = (s16 & ~uM16) | (d16 & uM16);\n"
             "  finalColor = vec4(float((o & 31) << 3), float(((o >> 5) & 31) << 3), float(((o >> 10) & 31) << 3), float(((o >> 15) & 1) << 7)) / 255.0;\n"
             "}\n";
-        sh = LoadShaderFromMemory(vs, fs);
+        sh = bt3LoadShaderFromMemory(vs, fs);
         if (sh.id == 0) { bad = true; std::fprintf(stderr, "[gpualias] exec: shader FAILED to build\n"); return false; }
-        locStage = GetShaderLocation(sh, "uStage"); locM16 = GetShaderLocation(sh, "uM16");
-        locXOff = GetShaderLocation(sh, "uXOff"); locSrcFlip = GetShaderLocation(sh, "uSrcFlip");
-        locSrcH = GetShaderLocation(sh, "uSrcH"); locRect = GetShaderLocation(sh, "uRect");
-        locSrcA = GetShaderLocation(sh, "uSrcA"); locPal = GetShaderLocation(sh, "uPal");
-        locDbg = GetShaderLocation(sh, "uDbg");
-        locIdxScl = GetShaderLocation(sh, "uIdxScl");
-        g_gaViewTex[0] = LoadRenderTexture(512, 448); g_gaViewTex[1] = LoadRenderTexture(512, 448);
+        locStage = bt3GetShaderLocation(sh, "uStage"); locM16 = bt3GetShaderLocation(sh, "uM16");
+        locXOff = bt3GetShaderLocation(sh, "uXOff"); locSrcFlip = bt3GetShaderLocation(sh, "uSrcFlip");
+        locSrcH = bt3GetShaderLocation(sh, "uSrcH"); locRect = bt3GetShaderLocation(sh, "uRect");
+        locSrcA = bt3GetShaderLocation(sh, "uSrcA"); locPal = bt3GetShaderLocation(sh, "uPal");
+        locDbg = bt3GetShaderLocation(sh, "uDbg");
+        locIdxScl = bt3GetShaderLocation(sh, "uIdxScl");
+        g_gaViewTex[0] = ps2x::gfx::GsRtCreate(512, 448); g_gaViewTex[1] = ps2x::gfx::GsRtCreate(512, 448);
         if (g_gaViewTex[0].id == 0 || g_gaViewTex[1].id == 0) { bad = true; return false; }
-        SetTextureFilter(g_gaViewTex[0].texture, TEXTURE_FILTER_POINT);
-        SetTextureFilter(g_gaViewTex[1].texture, TEXTURE_FILTER_POINT);
+        bt3SetTextureFilter(g_gaViewTex[0].texture, TEXTURE_FILTER_POINT);
+        bt3SetTextureFilter(g_gaViewTex[1].texture, TEXTURE_FILTER_POINT);
         std::fprintf(stderr, "[gpualias] exec: shader + 2x512x448 view textures ready\n");
     }
     return !bad && sh.id != 0;
@@ -5370,9 +5763,9 @@ static bool gaExecShaderInit()
 // texture. Control's consumers decode VRAM = flush(FBO)-reinterpreted-as-CT16; this shader is
 // that reinterpretation done GPU-side, so serving it is control-equivalent BY CONSTRUCTION
 // while the barrier/flush/decode round-trip is skipped. Reuses the alias shader (uStage 9).
-static bool gaBuildReviewTex(const Texture2D &src, int srcH, int ta0, int ta1, int aem)
+static bool gaBuildReviewTex(const bt3Texture2D &src, int srcH, int ta0, int ta1, int aem)
 {
-    // RAW-GL pass: the raylib BeginTextureMode/BeginShaderMode version mutated rlgl's cached
+    // RAW-GL pass: the raylib bt3BeginTextureMode/bt3BeginShaderMode version mutated rlgl's cached
     // state (matrices, blend, current shader) 96x/frame mid-loop, and the neighboring draws --
     // including the rim/shading passes -- rendered wrong (the missing-outline saga). This
     // version touches ONLY raw GL, saves and restores every piece it changes, and draws via
@@ -5407,18 +5800,18 @@ static bool gaBuildReviewTex(const Texture2D &src, int srcH, int ta0, int ta1, i
             "  a8 = min((a8 * 255) / 128, 255);\n"
             "  finalColor = vec4(float((h & 31) << 3), float(((h >> 5) & 31) << 3), float(((h >> 10) & 31) << 3), float(a8)) / 255.0;\n"
             "}\n";
-        Shader sh2 = LoadShaderFromMemory(vs, fs);   // init-time rlgl use is harmless
+        Shader sh2 = bt3LoadShaderFromMemory(vs, fs);   // init-time rlgl use is harmless
         if (sh2.id == 0) { bad = true; std::fprintf(stderr, "[gpualias] raw review shader FAILED\n"); return false; }
         prog = sh2.id;
-        locSrc = GetShaderLocation(sh2, "uSrc"); locH = GetShaderLocation(sh2, "uH");
-        locFlip = GetShaderLocation(sh2, "uFlip"); locTexa = GetShaderLocation(sh2, "uTexa");
-        locDbgC = GetShaderLocation(sh2, "uDbgC");
+        locSrc = bt3GetShaderLocation(sh2, "uSrc"); locH = bt3GetShaderLocation(sh2, "uH");
+        locFlip = bt3GetShaderLocation(sh2, "uFlip"); locTexa = bt3GetShaderLocation(sh2, "uTexa");
+        locDbgC = bt3GetShaderLocation(sh2, "uDbgC");
         if (g_gaViewTex[0].id == 0)
         {
-            g_gaViewTex[0] = LoadRenderTexture(512, 448); g_gaViewTex[1] = LoadRenderTexture(512, 448);
+            g_gaViewTex[0] = ps2x::gfx::GsRtCreate(512, 448); g_gaViewTex[1] = ps2x::gfx::GsRtCreate(512, 448);
             if (g_gaViewTex[0].id == 0 || g_gaViewTex[1].id == 0) { bad = true; return false; }
-            SetTextureFilter(g_gaViewTex[0].texture, TEXTURE_FILTER_POINT);
-            SetTextureFilter(g_gaViewTex[1].texture, TEXTURE_FILTER_POINT);
+            bt3SetTextureFilter(g_gaViewTex[0].texture, TEXTURE_FILTER_POINT);
+            bt3SetTextureFilter(g_gaViewTex[1].texture, TEXTURE_FILTER_POINT);
         }
         std::fprintf(stderr, "[gpualias] raw review builder ready (prog %u)\n", prog);
     }
@@ -5511,7 +5904,7 @@ static bool gaBuildReviewTex(const Texture2D &src, int srcH, int ta0, int ta1, i
 // same ink -- while the f224 flush/decode round-trip (the 30->20 fps barrier cost) is skipped.
 // Raw-pass discipline cloned from gaBuildReviewTex (state save/restore, vertexless triangle,
 // NEAREST source, ps2xTextureBarrier after).
-static bool gaBuildP8hTwin(const Texture2D &src, int srcH, const Texture2D &pal, RenderTexture2D &dstRt)
+static bool gaBuildP8hTwin(const bt3Texture2D &src, int srcH, const bt3Texture2D &pal, bt3RenderTexture2D &dstRt)
 {
     static unsigned int prog = 0; static int locSrc = -1, locPal2 = -1, locH = -1, locScl = -1;
     static bool bad = false;
@@ -5537,11 +5930,11 @@ static bool gaBuildP8hTwin(const Texture2D &src, int srcH, const Texture2D &pal,
             "  C.a = min((C.a * 255) / 128, 255);\n"   // ALPHA128 upload rescale, same as the decode path
             "  finalColor = vec4(C) / 255.0;\n"
             "}\n";
-        Shader sh2 = LoadShaderFromMemory(vs, fs);
+        Shader sh2 = bt3LoadShaderFromMemory(vs, fs);
         if (sh2.id == 0) { bad = true; std::fprintf(stderr, "[p8twin] shader FAILED\n"); return false; }
         prog = sh2.id;
-        locSrc = GetShaderLocation(sh2, "uSrc"); locPal2 = GetShaderLocation(sh2, "uPal");
-        locH = GetShaderLocation(sh2, "uH"); locScl = GetShaderLocation(sh2, "uScl");
+        locSrc = bt3GetShaderLocation(sh2, "uSrc"); locPal2 = bt3GetShaderLocation(sh2, "uPal");
+        locH = bt3GetShaderLocation(sh2, "uH"); locScl = bt3GetShaderLocation(sh2, "uScl");
         std::fprintf(stderr, "[p8twin] builder ready (prog %u)\n", prog);
     }
     flushBatch(__LINE__);
@@ -5609,20 +6002,20 @@ static bool gaBuildP8hTwin(const Texture2D &src, int srcH, const Texture2D &pal,
     return true;
 }
 
-static Texture2D p8hTwinFor(uint64_t clutKey)
+static bt3Texture2D p8hTwinFor(uint64_t clutKey)
 {   // one twin per CLUT; rebuilt whenever f224's FBO entry-seq moves (mask changed).
-    static std::unordered_map<uint64_t, RenderTexture2D> s_tw;
+    static std::unordered_map<uint64_t, bt3RenderTexture2D> s_tw;
     static std::unordered_map<uint64_t, uint32_t> s_twSeq;
     auto fit = g_fbos.find(224u);
-    if (fit == g_fbos.end() || fit->second.rt.texture.id == 0) return Texture2D{};
-    Texture2D pal = palTextureFor(clutKey);
-    if (pal.id == 0) return Texture2D{};
-    RenderTexture2D &rt = s_tw[clutKey];
+    if (fit == g_fbos.end() || fit->second.rt.texture.id == 0) return bt3Texture2D{};
+    bt3Texture2D pal = palTextureFor(clutKey);
+    if (pal.id == 0) return bt3Texture2D{};
+    bt3RenderTexture2D &rt = s_tw[clutKey];
     if (rt.texture.id == 0)
     {
-        rt = LoadRenderTexture(512, 512);   // the readers declare srcTex 512x512
-        if (rt.texture.id == 0) return Texture2D{};
-        SetTextureFilter(rt.texture, TEXTURE_FILTER_POINT);
+        rt = ps2x::gfx::GsRtCreate(512, 512);   // the readers declare srcTex 512x512
+        if (rt.texture.id == 0) return bt3Texture2D{};
+        bt3SetTextureFilter(rt.texture, TEXTURE_FILTER_POINT);
         s_twSeq[clutKey] = 0xFFFFFFFFu;
         if (s_tw.size() <= 12)
             std::fprintf(stderr, "[p8twin] twin #%zu for clut %llx (tex %u)\n", s_tw.size(), (unsigned long long)clutKey, rt.texture.id);
@@ -5631,12 +6024,12 @@ static Texture2D p8hTwinFor(uint64_t clutKey)
     if (s_twSeq[clutKey] != seq)
     {
         if (!gaBuildP8hTwin(fit->second.scale > 1 ? rsDownsampled(fit->second).texture : fit->second.rt.texture,
-                            fit->second.h, pal, rt)) return Texture2D{};   // [rscale] the twin decodes pixels as data: 1x view
+                            fit->second.h, pal, rt)) return bt3Texture2D{};   // [rscale] the twin decodes pixels as data: 1x view
         s_twSeq[clutKey] = seq;
     }
     return rt.texture;
 }
-static Texture2D g_p8twinPick{};   // set by the serve arm's condition (else-if chain has no body-scope prelude)
+static bt3Texture2D g_p8twinPick{};   // set by the serve arm's condition (else-if chain has no body-scope prelude)
 
 // [dofmask] PS2X_DOFMASK=1: the PROPER kind1 -- BT3 builds its DoF far-field mask by writing
 // Z bits 14-15 into the scene's CT16-view alpha bits (32 CT16 column strips, high halves only =
@@ -5673,11 +6066,11 @@ static bool gaDofMaskPass(uint32_t destFbp)
             "  finalColor = vec4(0.0, 0.0, 0.0, w);\n"   // graded Ad for the bm-0x54 lerp; bit15 parity BANDED the ground (dofmask_geo) because BT3's far z sits below 32768
 
             "}\n";
-        Shader sh2 = LoadShaderFromMemory(vs, fs);
+        Shader sh2 = bt3LoadShaderFromMemory(vs, fs);
         if (sh2.id == 0) { bad = true; return false; }
         prog = sh2.id;
-        locC = GetShaderLocation(sh2, "uColor"); locD = GetShaderLocation(sh2, "uDepth");
-        locM = GetShaderLocation(sh2, "uZDiv");
+        locC = bt3GetShaderLocation(sh2, "uColor"); locD = bt3GetShaderLocation(sh2, "uDepth");
+        locM = bt3GetShaderLocation(sh2, "uZDiv");
         std::fprintf(stderr, "[dofmask] pass ready (prog %u, depthTex %u)\n", prog, g_sharedDepthTex);
     }
     flushBatch(__LINE__);
@@ -6954,9 +7347,9 @@ void GsGpuRenderer::ensureGl(int w, int h)
     m_fboH = h;
     if (!g_whiteInit)
     {
-        Image wi = GenImageColor(1, 1, WHITE);
-        g_white = LoadTextureFromImage(wi);
-        UnloadImage(wi);
+        GsReadImage wi = ps2x::gfx::GsImageMake(1, 1, WHITE);
+        g_white = ps2x::gfx::GsTexCreateFromImage(wi);
+        gsUnloadImage(wi);
         g_whiteInit = true;
     }
     if (!g_shaderInit)
@@ -6979,49 +7372,50 @@ void GsGpuRenderer::ensureGl(int w, int h)
             "  fragQ = vertexNormal.x;\n"
             "  gl_Position = mvp * vec4(vertexPosition, 1.0);\n"
             "}\n";
-        g_shader = LoadShaderFromMemory(kVertShader, kFragShader); // PS2-modulate FS
+        g_shader = bt3LoadShaderFromMemory(kVertShader, kFragShader); // PS2-modulate FS
+        ps2x::gfx::GsGlInit();   // [gsgl] PS2X_GSBACKEND=gl: bring up the gfx::gl submit backend
         // Overbright factor: PS2 MODULATE is texel*vc/128, so the default is 255/128 (vertex
         // colors are passed at 0..255). PS2X_BRIGHT overrides it (diagnostic + brightness knob).
         float bright = 255.0f / 128.0f;
         if (const char *v = std::getenv("PS2X_BRIGHT")) { float f = std::atof(v); if (f > 0.0f) bright = f; }
-        int loc = GetShaderLocation(g_shader, "uBright");
-        SetShaderValue(g_shader, loc, &bright, SHADER_UNIFORM_FLOAT);
+        int loc = bt3GetShaderLocation(g_shader, "uBright");
+        bt3SetShaderValue(g_shader, loc, &bright, BT3_SHADER_UNIFORM_FLOAT);
         // GS alpha-test uniforms: default OFF (-1). Per-cmd values set in the replay loop.
-        g_locAtst = GetShaderLocation(g_shader, "uAtst");
-        g_locAref = GetShaderLocation(g_shader, "uAref");
-        g_locTcc  = GetShaderLocation(g_shader, "uTcc");
-        g_locAlphaFix = GetShaderLocation(g_shader, "uAlphaFix");
-        { int l2 = GetShaderLocation(g_shader, "uASplit");
+        g_locAtst = bt3GetShaderLocation(g_shader, "uAtst");
+        g_locAref = bt3GetShaderLocation(g_shader, "uAref");
+        g_locTcc  = bt3GetShaderLocation(g_shader, "uTcc");
+        g_locAlphaFix = bt3GetShaderLocation(g_shader, "uAlphaFix");
+        { int l2 = bt3GetShaderLocation(g_shader, "uASplit");
           const float v2 = [](){ const char *v = std::getenv("PS2X_ASPLIT");
                                  return (v && v[0] && v[0] != '0') ? 1.0f : 0.0f; }();
-          if (l2 >= 0) SetShaderValue(g_shader, l2, &v2, SHADER_UNIFORM_FLOAT); }
-        g_locPal  = GetShaderLocation(g_shader, "uPal");
-        g_locIdxMode = GetShaderLocation(g_shader, "uIdxMode");
-        g_locFba = GetShaderLocation(g_shader, "uFba");
-        g_locIdxScale = GetShaderLocation(g_shader, "uIdxScale");
-        g_locFboOne = GetShaderLocation(g_shader, "uFboOne");
-        if (g_locFboOne >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locFboOne, &z, SHADER_UNIFORM_FLOAT); }
+          if (l2 >= 0) bt3SetShaderValue(g_shader, l2, &v2, BT3_SHADER_UNIFORM_FLOAT); }
+        g_locPal  = bt3GetShaderLocation(g_shader, "uPal");
+        g_locIdxMode = bt3GetShaderLocation(g_shader, "uIdxMode");
+        g_locFba = bt3GetShaderLocation(g_shader, "uFba");
+        g_locIdxScale = bt3GetShaderLocation(g_shader, "uIdxScale");
+        g_locFboOne = bt3GetShaderLocation(g_shader, "uFboOne");
+        if (g_locFboOne >= 0) { float z = 0.0f; bt3SetShaderValue(g_shader, g_locFboOne, &z, BT3_SHADER_UNIFORM_FLOAT); }
         if (g_locIdxScale >= 0)
         {   // PS2X_IDXSCALE: 128 (GS byte, correct) or 255 (the old raw-FBO reading).
             float sc = 128.0f;
             if (const char *v = std::getenv("PS2X_IDXSCALE")) { const float f = (float)std::atof(v); if (f > 0.0f) sc = f; }
-            SetShaderValue(g_shader, g_locIdxScale, &sc, SHADER_UNIFORM_FLOAT);
+            bt3SetShaderValue(g_shader, g_locIdxScale, &sc, BT3_SHADER_UNIFORM_FLOAT);
         }
-        if (g_locFba >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locFba, &z, SHADER_UNIFORM_FLOAT); }
-        if (g_locIdxMode >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locIdxMode, &z, SHADER_UNIFORM_FLOAT); }
-        g_locUViz = GetShaderLocation(g_shader, "uUViz");
-        if (g_locUViz >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locUViz, &z, SHADER_UNIFORM_FLOAT); }
-        g_locSubScale = GetShaderLocation(g_shader, "uSubScale");
-        if (g_locSubScale >= 0) { float one = 1.0f; SetShaderValue(g_shader, g_locSubScale, &one, SHADER_UNIFORM_FLOAT); }
-        g_locAScale = GetShaderLocation(g_shader, "uAScale");
-        g_locTexa = GetShaderLocation(g_shader, "uTexa");
-        g_locABl128 = GetShaderLocation(g_shader, "uABl128");
-        g_locTfx = GetShaderLocation(g_shader, "uTfx");
-        g_locProjClip = GetShaderLocation(g_shader, "uProjClip");
-        g_locPerspQ = GetShaderLocation(g_shader, "uPerspQ");
-        g_locRegion = GetShaderLocation(g_shader, "uRegion");
-        g_locZTex = GetShaderLocation(g_shader, "uZTex");
-        g_locZScale = GetShaderLocation(g_shader, "uZScale");
+        if (g_locFba >= 0) { float z = 0.0f; bt3SetShaderValue(g_shader, g_locFba, &z, BT3_SHADER_UNIFORM_FLOAT); }
+        if (g_locIdxMode >= 0) { float z = 0.0f; bt3SetShaderValue(g_shader, g_locIdxMode, &z, BT3_SHADER_UNIFORM_FLOAT); }
+        g_locUViz = bt3GetShaderLocation(g_shader, "uUViz");
+        if (g_locUViz >= 0) { float z = 0.0f; bt3SetShaderValue(g_shader, g_locUViz, &z, BT3_SHADER_UNIFORM_FLOAT); }
+        g_locSubScale = bt3GetShaderLocation(g_shader, "uSubScale");
+        if (g_locSubScale >= 0) { float one = 1.0f; bt3SetShaderValue(g_shader, g_locSubScale, &one, BT3_SHADER_UNIFORM_FLOAT); }
+        g_locAScale = bt3GetShaderLocation(g_shader, "uAScale");
+        g_locTexa = bt3GetShaderLocation(g_shader, "uTexa");
+        g_locABl128 = bt3GetShaderLocation(g_shader, "uABl128");
+        g_locTfx = bt3GetShaderLocation(g_shader, "uTfx");
+        g_locProjClip = bt3GetShaderLocation(g_shader, "uProjClip");
+        g_locPerspQ = bt3GetShaderLocation(g_shader, "uPerspQ");
+        g_locRegion = bt3GetShaderLocation(g_shader, "uRegion");
+        g_locZTex = bt3GetShaderLocation(g_shader, "uZTex");
+        g_locZScale = bt3GetShaderLocation(g_shader, "uZScale");
         // NOTE: NOT "PS2X_ZSCALE" -- that name is already the rasterizer's zNorm multiplier
         // (ps2_gs_rasterizer.cpp ~2259). Reusing it would silently change depth generation too.
         // DERIVED, not fitted: BT3's depth->alpha pass writes bits 14..31, so the alpha byte is
@@ -7031,16 +7425,16 @@ void GsGpuRenderer::ensureGl(int w, int h)
         // 1028.0, which is exactly the constant that was fitted to console's 6/7/8/11 values.
         // NOTE: uZScale is NOT set here -- at shader-init time the rasterizer has not published
         // zMax yet, so this would always bake in the 2^32 default. It is set per draw below.
-        if (g_locZTex >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locZTex, &z, SHADER_UNIFORM_FLOAT); }
-        g_locForceA = GetShaderLocation(g_shader, "uForceA");
+        if (g_locZTex >= 0) { float z = 0.0f; bt3SetShaderValue(g_shader, g_locZTex, &z, BT3_SHADER_UNIFORM_FLOAT); }
+        g_locForceA = bt3GetShaderLocation(g_shader, "uForceA");
         if (g_locForceA >= 0) { static const float fa = [](){ const char *v = std::getenv("PS2X_FORCEA");
                                                               return (v && v[0]) ? (float)std::atoi(v) : 0.0f; }();
-                                SetShaderValue(g_shader, g_locForceA, &fa, SHADER_UNIFORM_FLOAT); }
-        if (g_locPerspQ >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locPerspQ, &z, SHADER_UNIFORM_FLOAT); }
-        if (g_locProjClip >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locProjClip, &z, SHADER_UNIFORM_FLOAT); }
-        if (g_locTfx >= 0) { float z = 0.0f; SetShaderValue(g_shader, g_locTfx, &z, SHADER_UNIFORM_FLOAT); }
+                                bt3SetShaderValue(g_shader, g_locForceA, &fa, BT3_SHADER_UNIFORM_FLOAT); }
+        if (g_locPerspQ >= 0) { float z = 0.0f; bt3SetShaderValue(g_shader, g_locPerspQ, &z, BT3_SHADER_UNIFORM_FLOAT); }
+        if (g_locProjClip >= 0) { float z = 0.0f; bt3SetShaderValue(g_shader, g_locProjClip, &z, BT3_SHADER_UNIFORM_FLOAT); }
+        if (g_locTfx >= 0) { float z = 0.0f; bt3SetShaderValue(g_shader, g_locTfx, &z, BT3_SHADER_UNIFORM_FLOAT); }
         if (g_locTexa >= 0) { const float t0[4] = {1.0f, 1.0f, 0.0f, 0.0f};
-                              SetShaderValue(g_shader, g_locTexa, t0, SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t0, sizeof t0); }
+                              bt3SetShaderValue(g_shader, g_locTexa, t0, BT3_SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t0, sizeof t0); }
         if (g_locAScale >= 0)
         {
             // DEFAULT OFF. finalColor.a does double duty: GL uses it as the SOURCE ALPHA for RGB
@@ -7050,16 +7444,16 @@ void GsGpuRenderer::ensureGl(int w, int h)
             // alpha from glBlendColor/GL_CONSTANT_ALPHA while finalColor.a carries the byte.
             static const bool s_a128 = [](){ const char *v = std::getenv("PS2X_ALPHA128"); return v && v[0] && v[0] != '0'; }();
             float sc = s_a128 ? (128.0f / 255.0f) : 1.0f;
-            SetShaderValue(g_shader, g_locAScale, &sc, SHADER_UNIFORM_FLOAT);
+            bt3SetShaderValue(g_shader, g_locAScale, &sc, BT3_SHADER_UNIFORM_FLOAT);
         }
         // Guard: a failed shader compile leaves the location at -1, and pushing a uniform
         // to an invalid location segfaulted the game.
-        if (g_locTcc >= 0) { float one = 1.0f; SetShaderValue(g_shader, g_locTcc, &one, SHADER_UNIFORM_FLOAT); }
+        if (g_locTcc >= 0) { float one = 1.0f; bt3SetShaderValue(g_shader, g_locTcc, &one, BT3_SHADER_UNIFORM_FLOAT); }
         else std::fprintf(stderr, "[shader] WARNING uTcc not found -- TCC handling inactive\n");
-        if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; SetShaderValue(g_shader, g_locAlphaFix, d.data(), SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }
+        if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; bt3SetShaderValue(g_shader, g_locAlphaFix, d.data(), BT3_SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }
         float off = -1.0f, aref0 = 0.0f;
-        SetShaderValue(g_shader, g_locAtst, &off, SHADER_UNIFORM_FLOAT);
-        SetShaderValue(g_shader, g_locAref, &aref0, SHADER_UNIFORM_FLOAT);
+        bt3SetShaderValue(g_shader, g_locAtst, &off, BT3_SHADER_UNIFORM_FLOAT);
+        bt3SetShaderValue(g_shader, g_locAref, &aref0, BT3_SHADER_UNIFORM_FLOAT);
         std::fprintf(stderr, "[shader] g_shader id=%u uBrightLoc=%d bright=%.3f atstLoc=%d arefLoc=%d | uPal=%d uIdxMode=%d uIdxScale=%d uFba=%d uTexa=%d\n", g_shader.id, loc, bright, g_locAtst, g_locAref, g_locPal, g_locIdxMode, g_locIdxScale, g_locFba, g_locTexa);
         g_shaderInit = true;
     }
@@ -7075,12 +7469,12 @@ static void clrProbeCols(const char *tag, uint32_t gen)
     static const bool s_cp = [](){ const char *v = std::getenv("PS2X_CLRPROBE"); return v && v[0] && v[0] != '0'; }();
     if (!s_cp) return;
     static int s_n = 0; if (s_n++ > 300) return;
-    rlDrawRenderBatchActive();
+    bt3rlDrawRenderBatchActive();
     for (uint32_t fbp : {0u, 112u})
     {
         auto fit = g_fbos.find(fbp);
         if (fit == g_fbos.end() || fit->second.rt.texture.id == 0) continue;
-        const Texture2D &t = fit->second.rt.texture;
+        const bt3Texture2D &t = fit->second.rt.texture;
         const int sc = t.width >= 512 ? t.width / 512 : 1;
         unsigned char *px = (unsigned char *)rlReadTexturePixels(t.id, t.width, t.height, t.format);
         if (!px) continue;
@@ -7092,7 +7486,7 @@ static void clrProbeCols(const char *tag, uint32_t gen)
             std::fprintf(stderr, " %d:%u", yy, (unsigned)std::max(q[0], std::max(q[1], q[2])));
         }
         std::fprintf(stderr, "\n");
-        RL_FREE(px);
+        BT3RL_FREE(px);
     }
 }
 unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
@@ -7240,16 +7634,16 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     }
 
     // Deferred GL deletion. onVramUpload() takes m_mtx on the GUEST thread, so doing hundreds
-    // of UnloadTexture round-trips while holding it blocks the guest on every upload -- and a
+    // of bt3UnloadTexture round-trips while holding it blocks the guest on every upload -- and a
     // loading screen is nothing but uploads. BT3's loader polls a device-status halfword and
     // its gate closes if the timing slips (the known loading-stall class), so stalling the
     // guest there can hang the load. Collect handles under the lock, free them out here.
     {
-        extern std::vector<Texture2D> g_pendingUnload;
+        extern std::vector<bt3Texture2D> g_pendingUnload;
         {   // [unloadmode] PS2X_UNLOADMODE: 1 delete (default), 0 leak (never delete), 2 flush the batch + glFinish before deleting
             static const int s_um = [](){ const char *v = std::getenv("PS2X_UNLOADMODE"); return v ? std::atoi(v) : 1; }();
-            if (s_um == 2 && !g_pendingUnload.empty()) { flushBatch(__LINE__); glFlush(); }   // [fencesync] UnloadTexture is driver-refcounted while in use; a full glFinish drain served no purpose
-            if (s_um != 0) for (Texture2D &t : g_pendingUnload) { g_deletedIds.insert(t.id); ps2xForgetTexId(t.id); forgetTexProps(t.id); UnloadTexture(t); }
+            if (s_um == 2 && !g_pendingUnload.empty()) { flushBatch(__LINE__); glFlush(); }   // [fencesync] bt3UnloadTexture is driver-refcounted while in use; a full glFinish drain served no purpose
+            if (s_um != 0) for (bt3Texture2D &t : g_pendingUnload) { g_deletedIds.insert(t.id); ps2xForgetTexId(t.id); forgetTexProps(t.id); ps2x::gfx::GsUnloadTexture(t); }
         }
         g_pendingUnload.clear();
     }
@@ -7352,6 +7746,10 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             nLists = 1;
         }
         frameGen = g_publishGen;
+#if defined(_WIN32)
+        g_d3dFmvPub = false;   // reset per publish; set by the [fmvpresent] block below
+        g_d3dMoviePresent = false;
+#endif
         ragStat.phase(7);   // [ragstat] lambdas slot reused: list concat / m_ready
         g_curGen = (m_chunkMode || m_segMode || listGens.empty()) ? (g_publishGen + 1u) : listGens[0];   // [groundshadow] v10
         if (g_interpOn)
@@ -7373,7 +7771,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         static const bool s_reup = [](){ const char *v = std::getenv("PS2X_TEXREUP");
                                          return v && v[0] && v[0] != '0'; }();
         // [uploadout] Collect what needs uploading; the GL calls themselves run AFTER this lock
-        // block (see below). Holding m_mtx through glTexImage2D/UpdateTexture of several MB per
+        // block (see below). Holding m_mtx through glTexImage2D/bt3UpdateTexture of several MB per
         // frame blocked the guest's recordCmd/resolveTextureVersion/putTexture (~8% of the guest
         // thread as pthread_mutex time). The bytes are swapped out here and swapped back after the
         // upload; a putTexture that lands in between sets needsUpload again and wins.
@@ -7653,7 +8051,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                         // content by definition, and nothing recent can be caught by it.
                         if (last + s_deadGens < g_texUseGen) { dead.push_back(kv.first); freed += kv.second.rgba.size(); }
                     }
-                    extern std::vector<Texture2D> g_pendingUnload;
+                    extern std::vector<bt3Texture2D> g_pendingUnload;
                     for (uint64_t k : dead)
                     {
                         auto g = g_glTex.find(k);
@@ -7748,12 +8146,12 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     auto g = g_glTex.find(k);
                     if (g != g_glTex.end())
                     {
-                        if (s_noPool) { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); UnloadTexture(g->second); }
+                        if (s_noPool) { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); ps2x::gfx::GsUnloadTexture(g->second); }
                         else
                         {
                             auto &pool = g_texPool[texPoolKey(g->second.width, g->second.height)];
                             if (poolableTex(g->second) && pool.size() < 8) pool.push_back(g->second);   // [texreplace] never pool compressed
-                            else { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); UnloadTexture(g->second); }
+                            else { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); ps2x::gfx::GsUnloadTexture(g->second); }
                         }
                         g_glTex.erase(g);
                     }
@@ -7827,15 +8225,15 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             else                                             g_texAlphaFix.erase(id);
         };
         {
-            // [texreplace] UpdateTexture (glTexSubImage2D) and the size-keyed pool below both
+            // [texreplace] bt3UpdateTexture (glTexSubImage2D) and the size-keyed pool below both
             // assume an uncompressed RGBA8 payload, so a compressed replacement must always take
             // the fresh-allocation path -- rlLoadTexture routes it to glCompressedTexImage2D.
-            const bool compressed = (u.fmt != 0 && u.fmt != PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+            const bool compressed = (u.fmt != 0 && u.fmt != BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
             auto glIt = g_glTex.find(u.key);
             if (!compressed && glIt != g_glTex.end() && poolableTex(glIt->second)   // [texreplace] BC3 storage cannot take a glTexSubImage2D
                 && glIt->second.width == u.w && glIt->second.height == u.h)
             {
-                UpdateTexture(glIt->second, u.rgba.data());
+                bt3UpdateTexture(glIt->second, u.rgba.data());
                 stampTexProps(glIt->second.id, u);
             }
             else
@@ -7844,24 +8242,24 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 {   // [filtercache] the GL id may be reused by the next allocation: drop its filter-state entry
                     ps2xForgetTexId(glIt->second.id);
                     forgetTexProps(glIt->second.id);   // [texprops] the id is about to be reissued
-                    UnloadTexture(glIt->second);
+                    ps2x::gfx::GsUnloadTexture(glIt->second);
                 }
-                Image img{};
+                bt3Image img{};
                 img.data = u.rgba.data();
                 img.width = u.w;
                 img.height = u.h;
                 img.mipmaps = 1;
-                img.format = u.fmt ? u.fmt : PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;   // [texreplace]
+                img.format = u.fmt ? u.fmt : BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;   // [texreplace]
                 // Recycle a same-size GL texture from the pool (avoids a fresh glTexImage2D
                 // alloc every fade frame); else allocate one.
-                Texture2D t{};
+                bt3Texture2D t{};
                 static const bool s_poolOn = [](){ const char *v = std::getenv("PS2X_TEXPOOL"); return !(v && v[0] == '0'); }();   // [nopool] default ON again: the pool-off "fix" only dodged the [idreuse] bug
                 auto pit = (s_poolOn && !compressed) ? g_texPool.find(texPoolKey(u.w, u.h)) : g_texPool.end();
                 if (pit != g_texPool.end() && !pit->second.empty())
                 {
                     t = pit->second.back();
                     pit->second.pop_back();
-                    UpdateTexture(t, u.rgba.data());
+                    bt3UpdateTexture(t, u.rgba.data());
                     // [filtercache] a pooled object keeps whatever filter it last had, but the per-id
                     // cache may say otherwise -> ps2xApplyTexFilter skipped the real call and alternate
                     // frames rendered the same texture point- vs bilinear-sampled (menu/copyright
@@ -7871,7 +8269,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 }
                 else
                 {
-                    t = LoadTextureFromImage(img);
+                    t = ps2x::gfx::GsTexCreateFromImage(img);
                 ps2xForgetTexId(t.id);   // [filtercache] a recycled GL id must not inherit the previous object's filter state
                 // [texreplace] Register the replacement's upscale so the UV math treats su/sv as
                 // LOGICAL texels: the draw path computes u = su / (tw / rsTexScale), so without
@@ -7879,11 +8277,33 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 // sampled, magnified. Alpha range goes with it -- see stampTexProps.
                 stampTexProps(t.id, u);
                     if (g_deletedIds.count(t.id)) { ++g_idReuse; g_deletedIds.erase(t.id); }   // [supdiag]
-                    SetTextureFilter(t, TEXTURE_FILTER_POINT);
+                    bt3SetTextureFilter(t, TEXTURE_FILTER_POINT);
                     g_texFilterState.set(t.id, 0u);   // [filtercache] known state
-                    SetTextureWrap(t, TEXTURE_WRAP_CLAMP); // PS2 UI doesn't tile; stop edge repeat
+                    bt3SetTextureWrap(t, TEXTURE_WRAP_CLAMP); // PS2 UI doesn't tile; stop edge repeat
                 }
                 g_glTex[u.key] = t;
+#if defined(_WIN32)
+                if (d3dGsOn() && !compressed)
+                {   // [d3d11] parallel D3D copy so the native replay can bind it without a readback.
+                    ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+                    ps2x::gfx::Texture *dt = nullptr;
+                    auto dit = g_d3dGsTex.find(u.key);
+                    if (dit != g_d3dGsTex.end()) dt = dit->second;
+                    if (!dt || dt->Width() != (uint32_t)u.w || dt->Height() != (uint32_t)u.h)
+                    {
+                        delete dt;
+                        dt = new ps2x::gfx::Texture();
+                        if (!dt->Create(*dev, (uint32_t)u.w, (uint32_t)u.h, ps2x::gfx::Format::RGBA8, nullptr))
+                        { delete dt; dt = nullptr; }
+                        else g_d3dGsTex[u.key] = dt;
+                    }
+                    if (dt)
+                    {
+                        dt->Update(*dev, u.rgba.data());
+                        dt->SetSampler(*dev, ps2x::gfx::Filter::Point, ps2x::gfx::Wrap::Clamp);
+                    }
+                }
+#endif
                 // Diagnostic: export each decoded texture once so we can view it.
                 {
                     static const bool s_dx = [](){ const char *v = std::getenv("PS2X_GPU_DIAG"); return v && v[0] && v[0] != '0'; }();
@@ -7898,9 +8318,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                         // which made the dumps view as blank white. RGB is what matters here.
                         std::vector<uint8_t> vis(u.rgba);
                         for (size_t vp = 3; vp < vis.size(); vp += 4) vis[vp] = 255u;
-                        Image vimg = img;
+                        bt3Image vimg = img;
                         vimg.data = vis.data();
-                        ExportImage(vimg, path);
+                        gsExportImage(vimg, path);
                     }
                 }
             }
@@ -7916,13 +8336,13 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     double cpuSum = 0; size_t cn = 0;
                     for (size_t i = 0; i + 2 < u.rgba.size(); i += 64) { cpuSum += u.rgba[i] + u.rgba[i+1] + u.rgba[i+2]; ++cn; }
                     const double cpuMean = cn ? cpuSum / (cn * 3.0) : 0.0;
-                    Image gi = LoadImageFromTexture(g_glTex[u.key]);
+                    GsReadImage gi; gsReadImageFromTexture(g_glTex[u.key], gi);
                     double glSum = 0; size_t gn = 0;
                     const uint8_t *gp = static_cast<const uint8_t *>(gi.data);
                     const size_t gbytes = static_cast<size_t>(gi.width) * gi.height * 4u;
                     if (gp) for (size_t i = 0; i + 2 < gbytes; i += 64) { glSum += gp[i] + gp[i+1] + gp[i+2]; ++gn; }
                     const double glMean = gn ? glSum / (gn * 3.0) : -1.0;
-                    UnloadImage(gi);
+                    gsUnloadImage(gi);
                     std::fprintf(stderr, "[gltexchk] key=%llu %dx%d CPUmean=%.1f GLmean=%.1f%s\n",
                                  (unsigned long long)u.key, u.w, u.h, cpuMean, glMean,
                                  (cpuMean > 8.0 && glMean >= 0.0 && glMean < 2.0) ? "  <== GL BLACK, CPU has content!" : "");
@@ -7941,7 +8361,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             if (it == m_texCache.end())
             {   // entry reclaimed/evicted meanwhile: drop the GL object we just made
                 auto g = g_glTex.find(u.key);
-                if (g != g_glTex.end()) { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); UnloadTexture(g->second); g_glTex.erase(g); }
+                if (g != g_glTex.end()) { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); ps2x::gfx::GsUnloadTexture(g->second); g_glTex.erase(g); }
             }
             else if (!it->second.needsUpload && it->second.rgba.empty())
                 it->second.rgba.swap(u.rgba);   // no newer decode arrived: restore the bytes
@@ -7961,7 +8381,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     // PS2X_SUPERTRACE: F10 arms the guest-branch diff-trace (rig lives in ps2_runtime.cpp).
     {
         static const bool s_stOn = []() { const char *v = std::getenv("PS2X_SUPERTRACE"); return v && v[0] && v[0] != '0'; }();
-        if (s_stOn && IsKeyPressed(KEY_F10))
+        if (s_stOn && bt3IsKeyPressed(BT3_KEY_F10))
         {
             extern void ps2xSuperTraceArm();
             ps2xSuperTraceArm();
@@ -7980,7 +8400,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         g_forensicThisFrame = false;
         if (s_keyArm)
         {
-            if (IsKeyPressed(KEY_F9))
+            if (bt3IsKeyPressed(BT3_KEY_F9))
             {
                 s_startGen = frameGen; s_count = 0;
                 std::fprintf(stderr, "[forensic] F9 — armed at gen=%u\n", frameGen);
@@ -8464,7 +8884,12 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             // A publish carrying real game draws (cmds > 1) still uses the normal pick, so the
             // skip fade, which draws 16 fullscreen sprites per frame, composites as before.
             if (cmds.size() <= 1 && g_fbos.count(fmvFbp) && g_fbos[fmvFbp].rt.texture.id != 0)
+            {
                 displayFbp = fmvFbp;
+#if defined(_WIN32)
+                g_d3dFmvPub = true;   // [d3d11] present the live FMV buffer, not the latch
+#endif
+            }
             g_fmvDisplayHold.store(hold - 1u, std::memory_order_relaxed);
         }
     }
@@ -8522,12 +8947,12 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     uint32_t curRealFbp = 0xFFFFFFFFu; // PS2X_ONE_FBO: the actual bound FBO (all fbps share the display FBO)
     static const bool s_oneFbo = [](){ const char *v = std::getenv("PS2X_ONE_FBO"); return v && v[0] && v[0] != '0'; }();
     // PS2X_ATLAS: THE fix. One big FBO ("VRAM"), each fbp -> a fixed sub-rect; render offset+scissored
-    // into its slot with rlTranslatef (per-vertex CPU transform, so DrawTexturePro + triangles all move).
+    // into its slot with bt3rlTranslatef (per-vertex CPU transform, so bt3DrawTexturePro + triangles all move).
     // NEVER switch FBOs (the switch/bind of fbp224/336 is the corruptor -- size-independent, proven by
     // CAP_FBO still-black). Composites sample the source fbp's slot; present crops the display slot.
     int curSlotX = 0, curSlotY = 0, curSlotW = 0, curSlotH = 0; // active atlas slot (dest offset)
     // PS2X_MERGE_DISP (default ON): the game double-buffers the DISPLAY between two same-size buffers
-    // (e.g. fbp0 + fbp112, both 512x448). Binding the alternate buffer as its own FBO (BeginTextureMode
+    // (e.g. fbp0 + fbp112, both 512x448). Binding the alternate buffer as its own FBO (bt3BeginTextureMode
     // switch) corrupts subsequent GL draws -> gameplay black (proven: DISPLAY_ONLY/ONE_FBO both render).
     // So route every display-sized, non-sampled buffer into the ONE display FBO -> no switch, no poison.
     // Real render targets (fbp224 1024x1024, fbp336 1024x256, and any SAMPLED buffer) keep their own FBO.
@@ -8561,10 +8986,11 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         const int wantWrite = write ? 1 : 0;
         if (wantTest == curDepthTest && wantFunc == curDepthFunc && wantWrite == curDepthWrite) return;
         if (!cmdFlushed) { flushBatch(__LINE__); cmdFlushed = true; }   // [flushcoalesce]   // was: flush before changing GL depth state
-        if (test) { rlEnableDepthTest(); glDepthFunc(glDepthFuncFor(func));
+        if (test) { bt3rlEnableDepthTest(); glDepthFunc(glDepthFuncFor(func));
                     if (write) { extern unsigned long g_dbgDepthWriteDraws; ++g_dbgDepthWriteDraws; } }
-        else rlDisableDepthTest();
-        if (write) rlEnableDepthMask(); else rlDisableDepthMask();
+        else bt3rlDisableDepthTest();
+        if (write) bt3rlEnableDepthMask(); else bt3rlDisableDepthMask();
+        ps2x::gfx::GsGlDepth(test, write, glDepthFuncFor(func));   // [gsgl] mirror when PS2X_GSBACKEND=gl
         curDepthTest = wantTest; curDepthFunc = wantFunc; curDepthWrite = wantWrite;
     };
     // GS FRAME.FBMSK -> glColorMask (byte granularity: a channel is disabled only when its
@@ -8583,14 +9009,18 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (flushCensusOn()) ++g_maskTrans[((unsigned)(curMask & 0xFFFF) << 16) | (unsigned)(want & 0xFFFF)];
         if (!cmdFlushed) { flushBatch(__LINE__); cmdFlushed = true; }   // [flushcoalesce]
         glColorMask((want & 1) ? 1 : 0, (want & 2) ? 1 : 0, (want & 4) ? 1 : 0, (want & 8) ? 1 : 0);
+        ps2x::gfx::GsGlColorMask((want & 1) != 0, (want & 2) != 0, (want & 4) != 0, (want & 8) != 0);   // [gsgl]
         curMask = want;
     };
     auto endMode = [&]() { if (inMode) { flushBatch(__LINE__);
         // Leave depth OFF at FBO/mode boundaries so transfer blits and the present pass are
         // never depth-tested; the next depth-using draw re-enables via applyDepth().
-        if (depthOn && curDepthTest != 0) { rlDisableDepthTest(); rlEnableDepthMask(); curDepthTest = 0; curDepthFunc = -1; curDepthWrite = 1; }
+        if (depthOn && curDepthTest != 0) { bt3rlDisableDepthTest(); bt3rlEnableDepthMask(); curDepthTest = 0; curDepthFunc = -1; curDepthWrite = 1; }
         if (curMask != 15) { glColorMask(1, 1, 1, 1); curMask = 15; } // full mask for blits/present
-        rlDisableScissorTest(); EndBlendMode(); EndShaderMode(); EndTextureMode(); inMode = false; curRealFbp = 0xFFFFFFFFu; } };
+        { ps2x::gfx::GsGlDepth(false, true, 0x0207 /*GL_ALWAYS*/);   // [gsgl] mirror the boundary state
+          ps2x::gfx::GsGlColorMask(true, true, true, true);
+          ps2x::gfx::GsGlScissor(nullptr); }
+        bt3rlDisableScissorTest(); bt3EndBlendMode(); bt3EndShaderMode(); ps2x::gfx::GsRtEnd(); inMode = false; curRealFbp = 0xFFFFFFFFu; } };
     auto fboSizeFor = [&](uint32_t fbp, int &w, int &h) {
         // PS2X_VIEWSIZE=1: size a split view by its OWN stride + vertical extent. Correct on
         // paper (fbp336 -> 512x448, the relocated DoF view -> 256x256, vs 1024x512 / 512x448
@@ -8666,11 +9096,11 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     auto ensureAtlas = [&]() {
         if (g_atlas.texture.id == 0) {
             g_atlasW = 2048; g_atlasH = 2048;
-            g_atlas = LoadRenderTexture(g_atlasW, g_atlasH);
-            SetTextureFilter(g_atlas.texture, TEXTURE_FILTER_POINT);
-            BeginTextureMode(g_atlas); ClearBackground(Color{0, 0, 0, 255}); EndTextureMode();
+            g_atlas = ps2x::gfx::GsRtCreate(g_atlasW, g_atlasH);
+            bt3SetTextureFilter(g_atlas.texture, TEXTURE_FILTER_POINT);
+            ps2x::gfx::GsRtBegin(g_atlas); bt3ClearBackground(Color{0, 0, 0, 255}); ps2x::gfx::GsRtEnd();
             static int s_created = 0;
-            std::fprintf(stderr, "[atlas] CREATED #%d id=%u complete=%d\n", ++s_created, g_atlas.texture.id, rlFramebufferComplete(g_atlas.id));
+            std::fprintf(stderr, "[atlas] CREATED #%d id=%u complete=%d\n", ++s_created, g_atlas.texture.id, bt3rlFramebufferComplete(g_atlas.id));
         }
     };
     auto beginFbp = [&](uint32_t fbp) {
@@ -8698,9 +9128,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                         endMode();
                         static std::vector<uint32_t> px2;
                         px2.resize((size_t)w2 * h2);
-                        rlEnableFramebuffer(pit->second.rt.id);
+                        bt3rlEnableFramebuffer(pit->second.rt.id);
                         glReadPixels(0, 0, w2, h2, 0x1908, 0x1401, px2.data());
-                        rlDisableFramebuffer();
+                        bt3rlDisableFramebuffer();
                         for (int y = 0; y < h2 / 2; ++y)
                             std::swap_ranges(px2.begin() + (size_t)y * w2, px2.begin() + (size_t)(y + 1) * w2,
                                              px2.begin() + (size_t)(h2 - 1 - y) * w2);
@@ -8734,9 +9164,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 if (sit != g_fbos.end() && sit->second.rt.texture.id != 0)
                 {
                     endMode();
-                    BeginTextureMode(sit->second.rt);
-                    ClearBackground(Color{0, 0, 0, 0});
-                    EndTextureMode();
+                    ps2x::gfx::GsRtBegin(sit->second.rt);
+                    bt3ClearBackground(Color{0, 0, 0, 0});
+                    ps2x::gfx::GsRtEnd();
                     static int s_scn = 0;
                     static const bool s_scd = [](){ const char *v = std::getenv("PS2X_FBOSIZE"); return v && v[0] && v[0] != '0'; }();
                     if (s_scd && s_scn < 8) { ++s_scn;
@@ -8748,11 +9178,11 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             // Bind the ONE atlas FBO once; thereafter only move the per-vertex transform to fbp's slot.
             if (curRealFbp != kAtlasFbp) {
                 endMode(); ensureAtlas();
-                BeginTextureMode(g_atlas);
+                ps2x::gfx::GsRtBegin(g_atlas);
                 static const bool s_noshader = [](){ const char *v = std::getenv("PS2X_NOSHADER"); return v && v[0] && v[0] != '0'; }();
-                if (!s_noshader) { BeginShaderMode(g_shader); ps2xResetIdxMode(); }   // PS2 ÷128 modulate (same as the per-fbp path)
-                BeginBlendMode(BLEND_ALPHA);
-                rlDisableBackfaceCulling();  // GS triangles have arbitrary winding
+                if (!s_noshader) { bt3BeginShaderMode(g_shader); ps2xResetIdxMode(); }   // PS2 ÷128 modulate (same as the per-fbp path)
+                bt3BeginBlendMode(BT3_BLEND_ALPHA);
+                bt3rlDisableBackfaceCulling();  // GS triangles have arbitrary winding
                 inMode = true; curRealFbp = kAtlasFbp;
             }
             int w, h; fboSizeFor(fbp, w, h);
@@ -8789,8 +9219,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         int w, h; fboSizeFor(rf, w, h);
         Fbo &f = ensureFbo(rf, w, h);
         curRealFbp = rf;
-        BeginTextureMode(f.rt);
-        if (f.scale > 1) rlScalef((float)f.scale, (float)f.scale, 1.0f);   // [rscale] native coords -> Nx pixels
+        ps2x::gfx::GsRtBegin(f.rt);
+        if (f.scale > 1) bt3rlScalef((float)f.scale, (float)f.scale, 1.0f);   // [rscale] native coords -> Nx pixels
+        ps2x::gfx::GsGlBeginTarget(f.rt.texture.width, f.rt.texture.height, (float)f.scale);   // [gsgl] match the modelview scale
         ++g_glEnterSeq[rf];   // [rtsnap]
         g_lastRenderedFboTex = f.rt.texture.id;   // [texbarrier] sampling this texture later needs a barrier
         if (g_lastSampledFboTex != 0 && g_lastSampledFboTex == f.rt.texture.id)
@@ -8800,8 +9231,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             if (s_hz == "barrier") { flushBatch(__LINE__); glBindTexture(0x0DE1, 0); ps2xTextureBarrier(); }
             else if (s_hz == "finish") { flushBatch(__LINE__); glFinish(); }
             else if (s_hz == "read") { flushBatch(__LINE__); uint32_t px = 0; glReadPixels(0, 0, 1, 1, 0x1908, 0x1401, &px); }
-            else if (s_hz == "rebind") { flushBatch(__LINE__); EndTextureMode(); BeginTextureMode(f.rt);
-                                          if (f.scale > 1) rlScalef((float)f.scale, (float)f.scale, 1.0f); }
+        else if (s_hz == "rebind") { flushBatch(__LINE__); ps2x::gfx::GsRtEnd(); ps2x::gfx::GsRtBegin(f.rt);
+            if (f.scale > 1) bt3rlScalef((float)f.scale, (float)f.scale, 1.0f);
+            ps2x::gfx::GsGlBeginTarget(f.rt.texture.width, f.rt.texture.height, (float)f.scale); }
         }
         // PS2X_FBO_CHECK: is this FBO actually complete? An incomplete big FBO would corrupt all
         // subsequent GL draws (the fbp224/336 poison). Logged once per fbp.
@@ -8811,7 +9243,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             {
                 static std::unordered_map<uint32_t, bool> s_seen;
                 if (!s_seen[fbp]) { s_seen[fbp] = true;
-                    bool ok = rlFramebufferComplete(f.rt.id);
+                    bool ok = bt3rlFramebufferComplete(f.rt.id);
                     std::fprintf(stderr, "[fbochk] fbp=%u %dx%d rtId=%u texId=%u complete=%d\n",
                                  fbp, w, h, f.rt.id, f.rt.texture.id, ok ? 1 : 0); }
             }
@@ -8838,17 +9270,22 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (depthOn && wantDepthClear)
         {
             flushBatch(__LINE__);
+            // [altglfix] glClear honours glDepthMask: a mask left off by the previous frame's last
+            // draw (or by the present) made this clear a no-op and kept last frame's Z.
+            unsigned char hadDepthMask = 1; glGetBooleanv(0x0B72 /*GL_DEPTH_WRITEMASK*/, &hadDepthMask);
+            glDepthMask(1);
             glClearDepth(0.0);
             glClear(GL_DEPTH_BUFFER_BIT);
             { extern unsigned long g_dbgDepthClears; ++g_dbgDepthClears; }
             glClearDepth(1.0); // restore raylib's default clear-depth
+            glDepthMask(hadDepthMask);
         }
-        BeginShaderMode(g_shader);      // PS2 ÷128 modulate (overbright-capable)
+        bt3BeginShaderMode(g_shader);      // PS2 ÷128 modulate (overbright-capable)
         ps2xResetIdxMode();             // [idxrt] present must never sample through the palette
-        BeginBlendMode(BLEND_ALPHA);
-        rlDisableBackfaceCulling();     // GS triangles have arbitrary winding
+        bt3BeginBlendMode(BT3_BLEND_ALPHA);
+        bt3rlDisableBackfaceCulling();     // GS triangles have arbitrary winding
         inMode = true; curFbp = fbp; curSx = -0x40000000;
-        // EndTextureMode() may leave GL depth state as the last draw left it; force reapply.
+        // ps2x::gfx::GsRtEnd() may leave GL depth state as the last draw left it; force reapply.
         if (depthOn) { curDepthTest = -1; curDepthFunc = -1; curDepthWrite = -1; }
     };
     auto applyScissor = [&](int sx, int sy, int sw, int sh) {
@@ -8856,18 +9293,18 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         {
             if (!cmdFlushed) { flushBatch(__LINE__); cmdFlushed = true; }   // [flushcoalesce]
             curSx = sx; curSy = sy; curSw = sw; curSh = sh;
-            if (s_oneFbo) { rlDisableScissorTest(); return; } // ONE_FBO test: no scissor (content mashes)
+            if (s_oneFbo) { bt3rlDisableScissorTest(); return; } // ONE_FBO test: no scissor (content mashes)
             if (s_atlas) {
                 static const bool s_nosci = [](){ const char *v = std::getenv("PS2X_NOSCI"); return v && v[0] && v[0] != '0'; }();
-                if (s_nosci) { rlDisableScissorTest(); return; } // TEST: is the atlas scissor clipping game draws?
-                // Scissor is a RAW GL rect (NOT moved by rlTranslatef) -> offset by the slot manually,
+                if (s_nosci) { bt3rlDisableScissorTest(); return; } // TEST: is the atlas scissor clipping game draws?
+                // Scissor is a RAW GL rect (NOT moved by bt3rlTranslatef) -> offset by the slot manually,
                 // and always clip to the slot so a full/disabled GS scissor can't bleed into neighbours.
                 int lx0 = std::max(0, sx), ly0 = std::max(0, sy);
                 int lx1 = std::min(curSlotW, sx + sw), ly1 = std::min(curSlotH, sy + sh);
                 int aw = lx1 - lx0, ah = ly1 - ly0;
-                if (aw <= 0 || ah <= 0) { rlEnableScissorTest(); rlScissor(0, 0, 0, 0); return; }
+                if (aw <= 0 || ah <= 0) { bt3rlEnableScissorTest(); bt3rlScissor(0, 0, 0, 0); return; }
                 int ax = curSlotX + lx0, ay = curSlotY + ly0;
-                rlEnableScissorTest(); rlScissor(ax, g_atlasH - (ay + ah), aw, ah);
+                bt3rlEnableScissorTest(); bt3rlScissor(ax, g_atlasH - (ay + ah), aw, ah);
                 return;
             }
             // PS2X_NOSCI_RT=1: drop the scissor for non-scene destinations. fbp336 receives 96
@@ -8878,7 +9315,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 static const bool s_noSciRt = [](){ const char *v = std::getenv("PS2X_NOSCI_RT");
                                                     return v && v[0] && v[0] != '0'; }();
                 if (s_noSciRt && curRealFbp != 0u && curRealFbp != 112u)
-                { rlDisableScissorTest(); return; }
+                { bt3rlDisableScissorTest(); return; }
             }
             Fbo &f = g_fbos[curRealFbp]; // dimensions of the ACTUAL bound FBO (merged partner has no own entry)
             const bool full = (sx <= 0 && sy <= 0 && sw >= f.w && sh >= f.h);
@@ -8907,10 +9344,10 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                         if (gw > 0 && gw <= 16)                        // a divider, not a real gap in coverage
                         {
                             flushBatch(__LINE__);
-                            rlEnableScissorTest();
-                            rlScissor(gx * rsS, 0, gw * rsS, f.h * rsS);
-                            rlClearColor(0, 0, 0, 255);
-                            rlClearScreenBuffers();
+                            bt3rlEnableScissorTest();
+                            bt3rlScissor(gx * rsS, 0, gw * rsS, f.h * rsS);
+                            bt3rlClearColor(0, 0, 0, 255);
+                            bt3rlClearScreenBuffers();
                             static int sgn = 0;
                             if (++sgn <= 3)
                                 std::fprintf(stderr, "[splitgap] blanked x %d..%d on fbp%u\n", gx, gx + gw - 1, curRealFbp);
@@ -8919,12 +9356,12 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     }
                 }
             }
-            if (!full && sw > 0 && sh > 0) { rlEnableScissorTest(); rlScissor(sx * rsS, (f.h - (sy + sh)) * rsS, sw * rsS, sh * rsS); }
-            else rlDisableScissorTest();
+            if (!full && sw > 0 && sh > 0) { bt3rlEnableScissorTest(); bt3rlScissor(sx * rsS, (f.h - (sy + sh)) * rsS, sw * rsS, sh * rsS); }
+            else bt3rlDisableScissorTest();
         }
     };
     // Two consecutive triangles that form an axis-aligned rectangle -> collapse into one
-    // proper 4-corner RL_QUADS quad. The degenerate-RL_QUADS triangle path (0,1,2,2)
+    // proper 4-corner BT3RL_QUADS quad. The degenerate-BT3RL_QUADS triangle path (0,1,2,2)
     // loses thin 1-2px edge texels (the popup's ornate corner brackets); a real quad
     // rasterizes cleanly. Each corner carries its own UV, so PS2 U/V flips (mirrored
     // corner tiles) are preserved without relying on signed src rects.
@@ -8952,7 +9389,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     return true;
                 }
             return false; };
-        // RL_QUADS winding: TL, TR, BR, BL.
+        // BT3RL_QUADS winding: TL, TR, BR, BL.
         if (!corner(minX, minY, out[0]) || !corner(maxX, minY, out[1]) ||
             !corner(maxX, maxY, out[2]) || !corner(minX, maxY, out[3])) return false;
         // Reject sheared/rotated mappings (u must depend only on x, v only on y).
@@ -8971,9 +9408,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     {
         int dw, dh; fboSizeFor(displayFbp, dw, dh);
         Fbo &df = ensureFbo(displayFbp, dw, dh);
-        BeginTextureMode(df.rt);
-        ClearBackground(Color{0, 0, 0, 255});
-        EndTextureMode();
+        ps2x::gfx::GsRtBegin(df.rt);
+        bt3ClearBackground(Color{0, 0, 0, 255});
+        ps2x::gfx::GsRtEnd();
     }
 
     // READ-AFTER-WRITE FIX (default ON, disable with PS2X_NO_RAW_FIX): snapshot each BIG sampled
@@ -8993,16 +9430,16 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             Fbo &cp = g_fboCopy[sfbp];
             if (cp.w != cw || cp.h != ch || cp.rt.texture.id == 0)
             {
-                if (cp.rt.texture.id != 0) { ps2xForgetRtTexId(cp.rt.texture.id); UnloadRenderTexture(cp.rt); }
-                cp.rt = LoadRenderTexture(cw, ch); cp.w = cw; cp.h = ch;
-                SetTextureFilter(cp.rt.texture, TEXTURE_FILTER_POINT);
+                if (cp.rt.texture.id != 0) { ps2xForgetRtTexId(cp.rt.texture.id); ps2x::gfx::GsRtUnload(cp.rt); }
+                cp.rt = ps2x::gfx::GsRtCreate(cw, ch); cp.w = cw; cp.h = ch;
+                bt3SetTextureFilter(cp.rt.texture, TEXTURE_FILTER_POINT);
             }
-            BeginTextureMode(cp.rt);
+            ps2x::gfx::GsRtBegin(cp.rt);
             // src height negative -> straight (un-flipped) copy so cp matches rt's stored orientation.
-            DrawTexturePro(it->second.rt.texture,
-                           Rectangle{0, 0, (float)(cw * it->second.scale), -(float)(ch * it->second.scale)},   // [rscale] physical src
-                           Rectangle{0, 0, (float)cw, (float)ch}, Vector2{0, 0}, 0.0f, WHITE);
-            EndTextureMode();
+            bt3DrawTexturePro(it->second.rt.texture,
+                           bt3Rectangle{0, 0, (float)(cw * it->second.scale), -(float)(ch * it->second.scale)},   // [rscale] physical src
+                           bt3Rectangle{0, 0, (float)cw, (float)ch}, bt3Vector2{0, 0}, 0.0f, WHITE);
+            ps2x::gfx::GsRtEnd();
         }
     }
 
@@ -9019,9 +9456,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (s_dm)
         {
             static Fbo s_dummy;
-            if (s_dummy.rt.texture.id == 0) { s_dummy.rt = LoadRenderTexture(16, 16); s_dummy.w = 16; s_dummy.h = 16; }
-            BeginTextureMode(s_dummy.rt);
-            EndTextureMode(); // bind + unbind, NO fragment writes
+            if (s_dummy.rt.texture.id == 0) { s_dummy.rt = ps2x::gfx::GsRtCreate(16, 16); s_dummy.w = 16; s_dummy.h = 16; }
+            ps2x::gfx::GsRtBegin(s_dummy.rt);
+            ps2x::gfx::GsRtEnd(); // bind + unbind, NO fragment writes
         }
     }
     std::vector<DrawCmd> reorderBuf;
@@ -9044,7 +9481,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             for (const DrawCmd &c : cmds) if (!c.isTransfer && c.destFbp == displayFbp) reorderBuf.push_back(c);
         }
     }
-    // Per-primitive alpha-blend gate (GS PRIM.ABE). beginFbp() leaves BLEND_ALPHA enabled;
+    // Per-primitive alpha-blend gate (GS PRIM.ABE). beginFbp() leaves BT3_BLEND_ALPHA enabled;
     // opaque prims (abe=0) must draw with GL blending DISABLED, else blending an opaque prim
     // over the (black) buffer darkens the whole scene. Toggling GL_BLEND mid-batch requires
     // flushing the queued verts first. PS2X_NOABE forces the old always-blend behavior.
@@ -9175,7 +9612,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (!cmdFlushed) { flushBatch(__LINE__); cmdFlushed = true; }   // [flushcoalesce]
         if (want)
         {
-            rlEnableColorBlend();
+            bt3rlEnableColorBlend();
             // GS semantics: the ALPHA channel is never blended — the SOURCE alpha is WRITTEN
             // to the framebuffer (subject to FBMSK) no matter what the RGB blend does. GL's
             // single blend applies the RGB factors to alpha too, which broke every dest-alpha
@@ -9252,8 +9689,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 srcRGB = 0x0305; dstRGB = F_ONE; // DATE DATM=0 additive: Cs*(1-Ad) + Cd
             }
             // rlgl GOTCHA: re-selecting the SAME custom mode without cycling does not re-apply
-            // changed factors. Cycle through BLEND_ALPHA to force it.
-            rlSetBlendMode(RL_BLEND_ALPHA);
+            // changed factors. Cycle through BT3_BLEND_ALPHA to force it.
+            bt3rlSetBlendMode(BT3RL_BLEND_ALPHA);
             // GS FBA: the alpha channel stores the MSB-forced byte (done in the shader) while
             // the RGB factors must keep using the ORIGINAL As -- which dual-source blending
             // exposes as SRC1_ALPHA. Only the two As-reading factors need swapping.
@@ -9270,11 +9707,11 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 if (dstRGB == 0x0302) dstRGB = F_SRC1_A;
                 else if (dstRGB == 0x0303) dstRGB = F_1M_SRC1_A;
             }
-            rlSetBlendFactorsSeparate(srcRGB, dstRGB, F_ONE, F_ZERO, eqRGB, E_ADD);
-            rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
+            bt3rlSetBlendFactorsSeparate(srcRGB, dstRGB, F_ONE, F_ZERO, eqRGB, E_ADD);
+            bt3rlSetBlendMode(BT3RL_BLEND_CUSTOM_SEPARATE);
         }
         else
-            rlDisableColorBlend();
+            bt3rlDisableColorBlend();
         curBlendOn = want; curBlendEq = eq; curBlendFix = fixNow; curBlendFba = bc.fba ? 1 : 0;
     };
     // GS alpha test (TEST.ATE/ATST/AREF): shader-side discard for the AFAIL=0 KEEP case.
@@ -9314,8 +9751,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (atst == curAtst && (atst < 0.0f || aref == curAref))
             return;
         flushBatch(__LINE__); // flush verts queued under the previous test state
-        SetShaderValue(g_shader, g_locAtst, &atst, SHADER_UNIFORM_FLOAT);
-        SetShaderValue(g_shader, g_locAref, &aref, SHADER_UNIFORM_FLOAT);
+        bt3SetShaderValue(g_shader, g_locAtst, &atst, BT3_SHADER_UNIFORM_FLOAT);
+        bt3SetShaderValue(g_shader, g_locAref, &aref, BT3_SHADER_UNIFORM_FLOAT);
         curAtst = atst; curAref = aref;
     };
 
@@ -9327,7 +9764,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         const float want = (!s_tccOn || (tc.texKey != 0 && tc.tcc != 0)) ? 1.0f : 0.0f;
         if (want == curTcc || g_locTcc < 0) return;
         if (!cmdFlushed) { flushBatch(__LINE__); cmdFlushed = true; }   // [flushcoalesce]
-        SetShaderValue(g_shader, g_locTcc, &want, SHADER_UNIFORM_FLOAT);
+        bt3SetShaderValue(g_shader, g_locTcc, &want, BT3_SHADER_UNIFORM_FLOAT);
         curTcc = want;
     };
 
@@ -9406,19 +9843,19 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         const int LW = 512, LH = 512, ls = std::max(1, lit->second.scale);
         if (g_frontLatch.w != LW || g_frontLatch.h != LH || g_frontLatch.scale != ls || g_frontLatch.rt.texture.id == 0)
         {
-            if (g_frontLatch.rt.texture.id != 0) { ps2xForgetRtTexId(g_frontLatch.rt.texture.id); UnloadRenderTexture(g_frontLatch.rt); }
-            g_frontLatch.rt = LoadRenderTexture(LW * ls, LH * ls); g_frontLatch.w = LW; g_frontLatch.h = LH; g_frontLatch.scale = ls;
-            SetTextureFilter(g_frontLatch.rt.texture, TEXTURE_FILTER_POINT);
+            if (g_frontLatch.rt.texture.id != 0) { ps2xForgetRtTexId(g_frontLatch.rt.texture.id); ps2x::gfx::GsRtUnload(g_frontLatch.rt); }
+            g_frontLatch.rt = ps2x::gfx::GsRtCreate(LW * ls, LH * ls); g_frontLatch.w = LW; g_frontLatch.h = LH; g_frontLatch.scale = ls;
+            bt3SetTextureFilter(g_frontLatch.rt.texture, TEXTURE_FILTER_POINT);
         }
-        BeginTextureMode(g_frontLatch.rt);
+        ps2x::gfx::GsRtBegin(g_frontLatch.rt);
         // Blending OFF for the copy: the scene buffers' alpha is junk (opaque game draws
         // legitimately leave a~0), alpha-blending the copy would erase the frame.
-        rlDisableColorBlend();
-        DrawTexturePro(lit->second.rt.texture,
-                       Rectangle{0, 0, (float)(cw * lit->second.scale), -(float)(ch * lit->second.scale)},   // [rscale] physical src
-                       Rectangle{0, 0, (float)(cw * ls), (float)(ch * ls)}, Vector2{0, 0}, 0.0f, WHITE);
+        bt3rlDisableColorBlend();
+        bt3DrawTexturePro(lit->second.rt.texture,
+                       bt3Rectangle{0, 0, (float)(cw * lit->second.scale), -(float)(ch * lit->second.scale)},   // [rscale] physical src
+                       bt3Rectangle{0, 0, (float)(cw * ls), (float)(ch * ls)}, bt3Vector2{0, 0}, 0.0f, WHITE);
         flushBatch(__LINE__);
-        rlEnableColorBlend();
+        bt3rlEnableColorBlend();
         // Diag: dump the latch content itself (1st + 100th latch) + per-second count. If
         // the dump shows the fighters, present must too; if gray, the boundary is wrong.
         {
@@ -9448,9 +9885,46 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 s_lsec = 0; s_lt = psxNow();
             }
         }
-        EndTextureMode();
+        ps2x::gfx::GsRtEnd();
         g_frontLatchValid = true;
         ++g_frontLatchGen;
+
+#if defined(_WIN32)
+        // [d3d11] Native completed-frame latch: copy the just-finished scene RT into a stable
+        // native latch RT and present THAT. Without it the present can show a buffer that is
+        // still being redrawn -> the content flicker.
+        if (d3dGsOn() && d3dGsEnsure() && lit->second.d3dRt)
+        {
+            ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+            if (!g_d3dLatchRt) g_d3dLatchRt = new ps2x::gfx::RenderTarget();
+            if (g_d3dLatchRt->Width() != 512u || g_d3dLatchRt->Height() != 512u)
+                g_d3dLatchRt->Create(*dev, 512u, 512u, false);
+            if (!g_d3dLatchSh.Valid())
+                g_d3dLatchSh.Compile(*dev, ps2x::gfx::kBlitVertexShaderHlsl,
+                                     ps2x::gfx::kBlitFragmentShaderHlsl);
+            g_d3dLatchRt->Bind(*dev);
+            g_d3dLatchRt->Clear(*dev, 0, 0, 0, 1);
+            const float sw = (float)lit->second.d3dRt->Width(), sh = (float)lit->second.d3dRt->Height();
+            const float x1 = -1.0f + 2.0f * sw / 512.0f;
+            const float y1 = 1.0f - 2.0f * sh / 512.0f;
+            g_d3dGsR.SetShader(&g_d3dLatchSh);
+            g_d3dGsR.SetTexture(&lit->second.d3dRt->Color());
+            ps2x::gfx::BlendDesc opaque; opaque.enable = false; g_d3dGsR.SetBlend(opaque);
+            g_d3dGsR.SetScissor(nullptr);
+            g_d3dGsR.SetColorMask(true, true, true, true);
+            g_d3dGsR.SetDepth(false, false, 0);
+            auto mkl = [](float x, float y, float u, float v) {
+                ps2x::gfx::Vertex vx{};
+                vx.x = x; vx.y = y; vx.u = u; vx.v = v;
+                vx.r = vx.g = vx.b = vx.a = 255; vx.q = 1.0f; vx.z = 0.0f;
+                return vx;
+            };
+            g_d3dGsR.DrawQuad(mkl(-1, 1, 0, 0), mkl(x1, 1, 1, 0), mkl(x1, y1, 1, 1), mkl(-1, y1, 0, 1));
+            // [d3d11] On an FMV publish present the live movie buffer, not the latch (the latch
+            // would keep the previous movie frame -> the new/old alternation the GL path fixes).
+            if (!g_d3dFmvPub) g_d3dPresentTex = &g_d3dLatchRt->Color();
+        }
+#endif
 
         // FBO -> VRAM writeback, taken HERE because this is the only moment the scene buffer
         // provably holds a COMPLETED frame. Doing it at end of renderAndGetTextureId read a
@@ -9479,9 +9953,9 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 {
                     static std::vector<uint32_t> lpx;
                     lpx.resize((size_t)lw * lh);
-                    rlEnableFramebuffer(lit->second.rt.id);
+                    bt3rlEnableFramebuffer(lit->second.rt.id);
                     glReadPixels(0, 0, lw, lh, 0x1908, 0x1401, lpx.data());
-                    rlDisableFramebuffer();
+                    bt3rlDisableFramebuffer();
                     for (int y = 0; y < lh / 2; ++y)
                         std::swap_ranges(lpx.begin() + (size_t)y * lw, lpx.begin() + (size_t)(y + 1) * lw,
                                          lpx.begin() + (size_t)(lh - 1 - y) * lw);
@@ -9680,7 +10154,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
     // texture resolution, FBO bind, blend/depth/scissor/mask/uniform application, the whole gate chain --
     // reaches the same conclusion for all of them. Run it ONCE per batch and emit every triangle at the
     // generic emit site: ~55k body executions per frame become ~3k.
-    // ⚠ WHAT MAKES THIS LEGAL is that nothing in the body edits a triangle's VERTICES. Two things do, and
+    // âš  WHAT MAKES THIS LEGAL is that nothing in the body edits a triangle's VERTICES. Two things do, and
     // both are handled rather than assumed away -- the first attempt at this change assumed them away and
     // broke parity on every frame:
     //   [trihalf]  a half-texel UV bias on bilinear textured triangles, DEFAULT ON -- the emit loop below
@@ -9715,6 +10189,13 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 && (hc.destFbp == 0u || hc.destFbp == 112u)
                 && hc.tri[0].y <= 90.0f && hc.tri[1].y <= 90.0f && hc.tri[2].y <= 90.0f;
             if (g_hudTraceCur) ++g_hudTrace[0];
+        }
+        {   // [d3d11 fmvdbg] trace the movie publish commands and how they classify
+            static int s_mvn = 0; const DrawCmd &dc0 = DC[ci];
+            if ((dc0.texKey >> 16) == 0xF00Dull && std::getenv("PS2X_FMVDBG") && s_mvn++ < 24)
+                std::fprintf(stderr, "[fmvdbg] cmd ci=%zu tri=%d xfer=%d vblit=%d dest=%u texKey=%llx dx=(%.0f,%.0f) dy=(%.0f,%.0f) srcPsm=%u\n",
+                             ci, (int)dc0.isTriangle, (int)dc0.isTransfer, (int)dc0.isVramBlit, dc0.destFbp,
+                             (unsigned long long)dc0.texKey, dc0.dx0, dc0.dx1, dc0.dy0, dc0.dy1, (unsigned)dc0.srcPsm);
         }
         if (ps2xMcFadeOn())
         {   // [mcfade] reached the loop body
@@ -9848,25 +10329,25 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 dateSnapDone = true;
                 flushBatch(__LINE__);
                 const float bw = (g_ps2xWsSrcW >= 320.0f && g_ps2xWsSrcW <= 1024.0f) ? g_ps2xWsSrcW : 512.0f;
-                rlColorMask(false, false, false, true);
+                bt3rlColorMask(false, false, false, true);
                 // pass 1: dstA = clamp(dstA - 127/255)
-                rlSetBlendMode(RL_BLEND_ALPHA);
-                rlSetBlendFactorsSeparate(1 /*ONE*/, 1 /*ONE*/, 1 /*ONE*/, 1 /*ONE*/,
+                bt3rlSetBlendMode(BT3RL_BLEND_ALPHA);
+                bt3rlSetBlendFactorsSeparate(1 /*ONE*/, 1 /*ONE*/, 1 /*ONE*/, 1 /*ONE*/,
                                           0x8006 /*FUNC_ADD*/, 0x800B /*FUNC_REVERSE_SUBTRACT*/);
-                rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
-                DrawRectangle(0, 0, (int)bw + 2, 56, Color{0, 0, 0, 127});
+                bt3rlSetBlendMode(BT3RL_BLEND_CUSTOM_SEPARATE);
+                bt3DrawRectangle(0, 0, (int)bw + 2, 56, Color{0, 0, 0, 127});
                 flushBatch(__LINE__);
                 // passes 2..9: dstA = clamp(2*dstA)
-                rlSetBlendMode(RL_BLEND_ALPHA);
-                rlSetBlendFactorsSeparate(1, 1, 0x0304 /*DST_ALPHA*/, 1 /*ONE*/,
+                bt3rlSetBlendMode(BT3RL_BLEND_ALPHA);
+                bt3rlSetBlendFactorsSeparate(1, 1, 0x0304 /*DST_ALPHA*/, 1 /*ONE*/,
                                           0x8006, 0x8006);
-                rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
+                bt3rlSetBlendMode(BT3RL_BLEND_CUSTOM_SEPARATE);
                 for (int dp = 0; dp < 8; ++dp)
                 {
-                    DrawRectangle(0, 0, (int)bw + 2, 56, Color{0, 0, 0, 255});
+                    bt3DrawRectangle(0, 0, (int)bw + 2, 56, Color{0, 0, 0, 255});
                     flushBatch(__LINE__);
                 }
-                rlColorMask(true, true, true, true);
+                bt3rlColorMask(true, true, true, true);
                 curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;   // force blend reapply
                 static int s_dbn = 0;
                 if (s_dbn < 3) { ++s_dbn; std::fprintf(stderr, "[datebin] snapped HUD band alpha (w=%.0f)\n", bw); }
@@ -10041,7 +10522,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     flushBatch(__LINE__);
                     const int w = it->second.w, h = it->second.h;
                     std::vector<uint32_t> buf((size_t)w * h);
-                    rlEnableFramebuffer(it->second.rt.id);
+                    bt3rlEnableFramebuffer(it->second.rt.id);
                     rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                     glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                     curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;   // force a REAL re-bind before the next draw (probe bound another FBO)
@@ -10054,16 +10535,16 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     std::fprintf(stderr, "\n");
                     if (true)
                     {
-                        Image ia = GenImageColor(w, h, BLACK), ic = GenImageColor(w, h, BLACK);
+                        GsReadImage ia = ps2x::gfx::GsImageMake(w, h, BLACK), ic = ps2x::gfx::GsImageMake(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                         { const uint32_t v = buf[(size_t)y * w + x]; const unsigned char a = v >> 24;
-                          ImageDrawPixel(&ia, x, y, Color{a, a, a, 255});
-                          ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255}); }
-                        ImageFlipVertical(&ia); ImageFlipVertical(&ic);
+                          ps2x::gfx::GsImageSetPx(ia, x, y, Color{a, a, a, 255});
+                          ps2x::gfx::GsImageSetPx(ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255}); }
+                        gsFlipVertical(ia); gsFlipVertical(ic);
                         char pa[200], pc[200];
                         std::snprintf(pa, sizeof pa, "/home/z3/Desktop/bt3/work/shots/dof_%s_alpha_fbp%u.png", tag, fbp);
                         std::snprintf(pc, sizeof pc, "/home/z3/Desktop/bt3/work/shots/dof_%s_rgb_fbp%u.png", tag, fbp);
-                        ExportImage(ia, pa); ExportImage(ic, pc); UnloadImage(ia); UnloadImage(ic);
+                        gsExportImage(ia, pa); gsExportImage(ic, pc); gsUnloadImage(ia); gsUnloadImage(ic);
                     }
                 };
                 if (!c.isTriangle && c.destFbp == 336u && c.srcTbp0 && (sf == 0u || sf == 112u) && g_publishGen != s_lastGen)
@@ -10196,8 +10677,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         {   ++n3; flushBatch(__LINE__);
                             const int w3 = it3->second.w, h3 = it3->second.h; std::vector<uint32_t> b3((size_t)w3 * h3);
                             int prevFB3 = 0; glGetIntegerv(0x8CA6, &prevFB3);
-                            rlEnableFramebuffer(it3->second.rt.id); glReadPixels(0, 0, w3, h3, 0x1908, 0x1401, b3.data());
-                            if (prevFB3) rlEnableFramebuffer((unsigned)prevFB3);
+                            bt3rlEnableFramebuffer(it3->second.rt.id); glReadPixels(0, 0, w3, h3, 0x1908, 0x1401, b3.data());
+                            if (prevFB3) bt3rlEnableFramebuffer((unsigned)prevFB3);
                             unsigned long nn = 0, ss = 0; for (int y = 0; y < 448 && y < h3; ++y) for (int x = 0; x < 32 && x < w3; ++x) { ++nn; ss += b3[(size_t)(h3 - 1 - y) * w3 + x] >> 24; }
                             std::fprintf(stderr, "[segchk] loop-end #%d f224 col0 mean alpha: %.1f (DC=%zu)\n", n3, nn ? (double)ss / nn : -1.0, DC.size()); }
                     }
@@ -10230,7 +10711,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                 flushBatch(__LINE__);
                                 const int w = it->second.w, h = it->second.h;
                                 std::vector<uint32_t> buf((size_t)w * h);
-                                rlEnableFramebuffer(it->second.rt.id);
+                                bt3rlEnableFramebuffer(it->second.rt.id);
                                 rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                                 glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                                 char path[256];
@@ -10321,41 +10802,41 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                     o[3] = (uint8_t)std::min(255, s_ol);
                                 }
                             }
-                        static Texture2D s_tex{}; static int s_tw = 0, s_th = 0;
+                        static bt3Texture2D s_tex{}; static int s_tw = 0, s_th = 0;
                         if (s_tex.id == 0 || s_tw != ow || s_th != oh)
                         {
-                            if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); UnloadTexture(s_tex); }
-                            Image im = GenImageColor(ow, oh, BLANK);
-                            s_tex = LoadTextureFromImage(im); UnloadImage(im);
+                            if (s_tex.id != 0) { ps2xForgetRtTexId(s_tex.id); ps2x::gfx::GsUnloadTexture(s_tex); }
+                            GsReadImage im = ps2x::gfx::GsImageMake(ow, oh, BLANK);
+                            s_tex = ps2x::gfx::GsTexCreateFromImage(im); gsUnloadImage(im);
                             s_tw = ow; s_th = oh;
                         }
-                        UpdateTexture(s_tex, px.data());
+                        bt3UpdateTexture(s_tex, px.data());
                         // The overlay inherits the PREVIOUS draw's shader uniforms. If that draw had
                         // TCC=0 the shader replaces the texture alpha with the vertex alpha (1.0) and
                         // the quad paints solid black over the whole screen -- which is exactly what
                         // happened. Pin the uniforms this draw needs.
                         { const float one = 1.0f, zero = 0.0f;
-                          if (g_locTcc >= 0)      SetShaderValue(g_shader, g_locTcc, &one, SHADER_UNIFORM_FLOAT);
-                          if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; SetShaderValue(g_shader, g_locAlphaFix, d.data(), SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }   // [texreplace]
-                          if (g_locIdxMode >= 0)  SetShaderValue(g_shader, g_locIdxMode, &zero, SHADER_UNIFORM_FLOAT);
-                          if (g_locUViz >= 0)     SetShaderValue(g_shader, g_locUViz, &zero, SHADER_UNIFORM_FLOAT);
-                          if (g_locSubScale >= 0) SetShaderValue(g_shader, g_locSubScale, &one, SHADER_UNIFORM_FLOAT);
-                          if (g_locAtst >= 0)     { const float off2 = -1.0f; SetShaderValue(g_shader, g_locAtst, &off2, SHADER_UNIFORM_FLOAT); }
-                          if (g_locTexa >= 0)     { const float t4[4] = {0,0,0,0}; SetShaderValue(g_shader, g_locTexa, t4, SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t4, sizeof t4); } }   // [texacache] this reset used to leave the cache stale -> fighter B's decal lost its TEXA mode (the wedge)
+                          if (g_locTcc >= 0)      bt3SetShaderValue(g_shader, g_locTcc, &one, BT3_SHADER_UNIFORM_FLOAT);
+                          if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; bt3SetShaderValue(g_shader, g_locAlphaFix, d.data(), BT3_SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }   // [texreplace]
+                          if (g_locIdxMode >= 0)  bt3SetShaderValue(g_shader, g_locIdxMode, &zero, BT3_SHADER_UNIFORM_FLOAT);
+                          if (g_locUViz >= 0)     bt3SetShaderValue(g_shader, g_locUViz, &zero, BT3_SHADER_UNIFORM_FLOAT);
+                          if (g_locSubScale >= 0) bt3SetShaderValue(g_shader, g_locSubScale, &one, BT3_SHADER_UNIFORM_FLOAT);
+                          if (g_locAtst >= 0)     { const float off2 = -1.0f; bt3SetShaderValue(g_shader, g_locAtst, &off2, BT3_SHADER_UNIFORM_FLOAT); }
+                          if (g_locTexa >= 0)     { const float t4[4] = {0,0,0,0}; bt3SetShaderValue(g_shader, g_locTexa, t4, BT3_SHADER_UNIFORM_VEC4); std::memcpy(g_curTexa, t4, sizeof t4); } }   // [texacache] this reset used to leave the cache stale -> fighter B's decal lost its TEXA mode (the wedge)
                         applyDepth(false, 1u, false);
-                        rlSetBlendMode(RL_BLEND_ALPHA);
-                        rlSetTexture(s_tex.id);
+                        bt3rlSetBlendMode(BT3RL_BLEND_ALPHA);
+                        bt3rlSetTexture(s_tex.id);
                         ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                        rlBegin(RL_QUADS);
-                        rlColor4ub(255, 255, 255, 255); rlNormal3f(0.0f, 0.0f, 1.0f);
+                        bt3rlBegin(BT3RL_QUADS);
+                        bt3rlColor4ub(255, 255, 255, 255); bt3rlNormal3f(0.0f, 0.0f, 1.0f);
                         // offX/offY are per-draw (atlas slot) and not in scope here; the overlay
                         // is full-buffer in FBO space, so origin 0,0 is correct with atlas off.
-                        rlTexCoord2f(0.0f, 1.0f); rlVertex2f(0.0f, 0.0f);
-                        rlTexCoord2f(0.0f, 0.0f); rlVertex2f(0.0f, (float)oh);
-                        rlTexCoord2f(1.0f, 0.0f); rlVertex2f((float)ow, (float)oh);
-                        rlTexCoord2f(1.0f, 1.0f); rlVertex2f((float)ow, 0.0f);
-                        rlEnd();
-                        rlSetTexture(0);
+                        bt3rlTexCoord2f(0.0f, 1.0f); bt3rlVertex2f(0.0f, 0.0f);
+                        bt3rlTexCoord2f(0.0f, 0.0f); bt3rlVertex2f(0.0f, (float)oh);
+                        bt3rlTexCoord2f(1.0f, 0.0f); bt3rlVertex2f((float)ow, (float)oh);
+                        bt3rlTexCoord2f(1.0f, 1.0f); bt3rlVertex2f((float)ow, 0.0f);
+                        bt3rlEnd();
+                        bt3rlSetTexture(0);
                         flushBatch(__LINE__);
                     }
                 }
@@ -10384,7 +10865,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         const int zw = zf0->second.w, zh = zf0->second.h;
                         std::vector<float> zb((size_t)zw * zh, 0.0f);
                         // do NOT rebind: PS2X_ZPROBE reads real depth by using the framebuffer
-                        // that is already bound. An explicit rlEnableFramebuffer here returned an
+                        // that is already bound. An explicit bt3rlEnableFramebuffer here returned an
                         // all-zero buffer (twice), so read the currently bound target instead --
                         // the last fbp0 command just drew into it.
                         glReadPixels(0, 0, zw, zh, 0x1902, 0x1406, zb.data());
@@ -10542,9 +11023,9 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         buf.resize((size_t)fw * bh);
                         flushBatch(__LINE__);
                         int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
-                        rlEnableFramebuffer(fit->second.rt.id);
+                        bt3rlEnableFramebuffer(fit->second.rt.id);
                         glReadPixels(0, fh - bh, fw, bh, 0x1908, 0x1401, buf.data());
-                        if (prevFB) rlEnableFramebuffer((unsigned)prevFB); else rlDisableFramebuffer();
+                        if (prevFB) bt3rlEnableFramebuffer((unsigned)prevFB); else bt3rlDisableFramebuffer();
                         long n = 0;
                         for (uint32_t px : buf)
                         { const int r = px & 0xFF, g = (px >> 8) & 0xFF, b = (px >> 16) & 0xFF;
@@ -10604,9 +11085,9 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         auto grab = [&](std::vector<uint32_t> &dst) {
                             flushBatch(__LINE__);
                             int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
-                            rlEnableFramebuffer(fit->second.rt.id);
+                            bt3rlEnableFramebuffer(fit->second.rt.id);
                             glReadPixels(x0, fh - (y0 + h), w, h, 0x1908, 0x1401, dst.data());
-                            if (prevFB) rlEnableFramebuffer((unsigned)prevFB); else rlDisableFramebuffer();
+                            if (prevFB) bt3rlEnableFramebuffer((unsigned)prevFB); else bt3rlDisableFramebuffer();
                         };
                         grab(before);
                         extern std::vector<uint32_t> *g_hudPixAfter; extern int g_hudPixX, g_hudPixY, g_hudPixW, g_hudPixH;
@@ -10616,9 +11097,9 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         {
                             std::vector<uint32_t> now((size_t)pw * ph);
                             int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
-                            flushBatch(__LINE__); rlEnableFramebuffer(fit->second.rt.id);
+                            flushBatch(__LINE__); bt3rlEnableFramebuffer(fit->second.rt.id);
                             glReadPixels(px0, fh - (py0 + ph), pw, ph, 0x1908, 0x1401, now.data());
-                            if (prevFB) rlEnableFramebuffer((unsigned)prevFB); else rlDisableFramebuffer();
+                            if (prevFB) bt3rlEnableFramebuffer((unsigned)prevFB); else bt3rlDisableFramebuffer();
                             ++g_hudPixN;
                             if (now != s_prev) ++g_hudPixChanged;
                         }
@@ -10834,11 +11315,11 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         endMode();
                         curFbp = 0xFFFFFFFFu; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;
-                        BeginTextureMode(fit->second.rt);
+                        ps2x::gfx::GsRtBegin(fit->second.rt);
                         char bp[160];
                         std::snprintf(bp, sizeof bp, "/home/z3/Desktop/bt3/work/prog_%02d_f%u.ppm", step, fb);
                         dumpBoundFbo(bp, 512, fit->second.h);
-                        EndTextureMode();
+                        ps2x::gfx::GsRtEnd();
                     }
                 }
                 std::fprintf(stderr, "[progdump] step=%d ci=%zu/%zu\n", step, ci, DC.size());
@@ -10872,11 +11353,11 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         endMode();
                         curFbp = 0xFFFFFFFFu; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;
-                        BeginTextureMode(fit->second.rt);
+                        ps2x::gfx::GsRtBegin(fit->second.rt);
                         char bp[160];
                         std::snprintf(bp, sizeof bp, "/home/z3/Desktop/bt3/work/cut_%06zu_f%u.ppm", ci, fb);
                         dumpBoundFbo(bp, 512, fit->second.h);
-                        EndTextureMode();
+                        ps2x::gfx::GsRtEnd();
                     }
                 }
                 std::fprintf(stderr, "[drawcut] ci=%zu/%zu dumped\n", ci, DC.size());
@@ -10940,14 +11421,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 const uint32_t sceneKey = viewKey(sceneFbp, 0);
                 if (sceneKey != curFbp) { beginFbp(sceneKey); curBlendOn = -1; curBlendEq = -1; curBlendFix = -1; }
                 flushBatch(__LINE__);
-                rlSetShader(rlGetShaderIdDefault(), rlGetShaderLocsDefault());
-                rlSetBlendMode(BLEND_ALPHA);
+                bt3rlSetShader(rlGetShaderIdDefault(), rlGetShaderLocsDefault());
+                bt3rlSetBlendMode(BT3_BLEND_ALPHA);
                 glColorMask(1, 1, 1, 0);
-                if (depthOn) applyDepth(true, 2 /* GS ZTST GEQUAL */, false); else rlDisableDepthTest();
+                if (depthOn) applyDepth(true, 2 /* GS ZTST GEQUAL */, false); else bt3rlDisableDepthTest();
                 const bool dbg = groundShadowMode() == 2;
-                rlSetTexture(dbg ? g_white.id : g_blobTex.id);
+                bt3rlSetTexture(dbg ? g_white.id : g_blobTex.id);
                 ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                rlBegin(RL_QUADS);
+                bt3rlBegin(BT3RL_QUADS);
                 // [gshadowtune] env-tunable without a rebuild: width factor, height/width, alpha, vertical offset (fraction of h
                 // above the feet line), depth nudge factor (>1 = nearer than the contact patch)
                 static const float s_kw = [](){ const char *v = std::getenv("PS2X_GSHADOW_W"); return v && v[0] ? (float)std::atof(v) : 0.9f; }();
@@ -10961,17 +11442,17 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     const float x0 = b.cx - w * 0.5f, x1 = b.cx + w * 0.5f, y0 = b.feetY - h * s_kdy, y1 = y0 + h;
                     const float zq = std::min(1.0f, b.feetZ * s_kz + 0.0005f);   // slightly nearer than the contact patch
                     { static int nlog = 0; if (nlog++ < 8) std::fprintf(stderr, "[groundshadow] v8 draw cx=%.0f feet=%.0f w=%.0f z=%.4f fbo=%u ci=%zu/%zu\n", b.cx, b.feetY, b.w, zq, sceneFbp, ci, ciEnd); }
-                    if (dbg) rlColor4ub(255, 0, 255, 255); else rlColor4ub(0, 0, 0, (unsigned char)std::min(255, std::max(0, s_ka)));
-                    rlNormal3f(0.0f, 0.0f, 1.0f);
-                    rlTexCoord2f(0.0f, 0.0f); if (depthOn) rlVertex3f(x0, y0, -zq); else rlVertex2f(x0, y0);
-                    rlTexCoord2f(0.0f, 1.0f); if (depthOn) rlVertex3f(x0, y1, -zq); else rlVertex2f(x0, y1);
-                    rlTexCoord2f(1.0f, 1.0f); if (depthOn) rlVertex3f(x1, y1, -zq); else rlVertex2f(x1, y1);
-                    rlTexCoord2f(1.0f, 0.0f); if (depthOn) rlVertex3f(x1, y0, -zq); else rlVertex2f(x1, y0);
+                    if (dbg) bt3rlColor4ub(255, 0, 255, 255); else bt3rlColor4ub(0, 0, 0, (unsigned char)std::min(255, std::max(0, s_ka)));
+                    bt3rlNormal3f(0.0f, 0.0f, 1.0f);
+                    bt3rlTexCoord2f(0.0f, 0.0f); if (depthOn) bt3rlVertex3f(x0, y0, -zq); else bt3rlVertex2f(x0, y0);
+                    bt3rlTexCoord2f(0.0f, 1.0f); if (depthOn) bt3rlVertex3f(x0, y1, -zq); else bt3rlVertex2f(x0, y1);
+                    bt3rlTexCoord2f(1.0f, 1.0f); if (depthOn) bt3rlVertex3f(x1, y1, -zq); else bt3rlVertex2f(x1, y1);
+                    bt3rlTexCoord2f(1.0f, 0.0f); if (depthOn) bt3rlVertex3f(x1, y0, -zq); else bt3rlVertex2f(x1, y0);
                 }
-                rlEnd();
+                bt3rlEnd();
                 flushBatch(__LINE__);
-                rlSetTexture(0);
-                rlSetShader(g_shader.id, g_shader.locs);
+                bt3rlSetTexture(0);
+                bt3rlSetShader(g_shader.id, g_shader.locs);
                 curMask = -1; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1; curDepthTest = -1; curDepthFunc = -1; curDepthWrite = -1;
             }
         }
@@ -11026,11 +11507,11 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         endMode();
                         curFbp = 0xFFFFFFFFu; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;
-                        BeginTextureMode(fit->second.rt);
+                        ps2x::gfx::GsRtBegin(fit->second.rt);
                         char bp[160];
                         std::snprintf(bp, sizeof bp, "/home/z3/Desktop/bt3/work/probefb_L%zu_f0.ppm", li);
                         dumpBoundFbo(bp, 512, fit->second.h);
-                        EndTextureMode();
+                        ps2x::gfx::GsRtEnd();
                     }
                 }
             }
@@ -11058,7 +11539,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             { PS2X_GATE_HIT(); continue; }
         // PS2X_SKIP_RT_TRIS: bisect the corruptor -- skip TRIANGLE draws into render targets (the
         // collapsed 3D scene) but keep RT sprite composites. If overlays then survive, the
-        // triangle (RL_QUADS) path into RTs is what poisons subsequent draws.
+        // triangle (BT3RL_QUADS) path into RTs is what poisons subsequent draws.
         {
             static const bool s_srt = [](){ const char *v = std::getenv("PS2X_SKIP_RT_TRIS"); return v && v[0] && v[0] != '0'; }();
             if (s_srt && !c.isTransfer && c.isTriangle && c.destFbp != displayFbp)
@@ -11179,8 +11660,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (c.xDX + c.xW > dw) dw = c.xDX + c.xW;
                 if (c.xDY + c.xH > dh) dh = c.xDY + c.xH;
                 Fbo &dstF = ensureFbo(c.xDstFbp, dw, dh);
-                BeginTextureMode(dstF.rt);
-                if (dstF.scale > 1) rlScalef((float)dstF.scale, (float)dstF.scale, 1.0f);   // [rscale]
+                ps2x::gfx::GsRtBegin(dstF.rt);
+                if (dstF.scale > 1) bt3rlScalef((float)dstF.scale, (float)dstF.scale, 1.0f);   // [rscale]
                 // Both FBOs are bottom-up; negative src height flips to preserve orientation.
                 // Same partial-rect band selection as the sprite composites: source rows
                 // [xSY .. xSY+xH] live at texture rows [texH-xSY-xH .. texH-xSY], so anchor the
@@ -11190,13 +11671,13 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 // staging: sampling the 2x texture point-filtered at 1x rate DECIMATED the
                 // f336 strip copies -- flattened far terrain, dotted ink outlines, dead blur.
                 const bool xSrcScaled = sit->second.scale > 1;
-                const Texture2D &xtex = xSrcScaled ? rsDownsampled(sit->second).texture : sit->second.rt.texture;
+                const bt3Texture2D &xtex = xSrcScaled ? rsDownsampled(sit->second).texture : sit->second.rt.texture;
                 const float srcTexH = static_cast<float>(xtex.height);
-                Rectangle sr{static_cast<float>(c.xSX), srcTexH - static_cast<float>(c.xSY) - static_cast<float>(c.xH),
+                bt3Rectangle sr{static_cast<float>(c.xSX), srcTexH - static_cast<float>(c.xSY) - static_cast<float>(c.xH),
                              static_cast<float>(c.xW), -static_cast<float>(c.xH)};
-                Rectangle dr{static_cast<float>(c.xDX), static_cast<float>(c.xDY), static_cast<float>(c.xW), static_cast<float>(c.xH)};
-                DrawTexturePro(xtex, sr, dr, Vector2{0, 0}, 0.0f, WHITE);
-                EndTextureMode();
+                bt3Rectangle dr{static_cast<float>(c.xDX), static_cast<float>(c.xDY), static_cast<float>(c.xW), static_cast<float>(c.xH)};
+                bt3DrawTexturePro(xtex, sr, dr, bt3Vector2{0, 0}, 0.0f, WHITE);
+                ps2x::gfx::GsRtEnd();
             }
             curFbp = 0xFFFFFFFFu; // force rebind for the next draw
             { PS2X_GATE_HIT(); continue; }
@@ -11267,10 +11748,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         auto hit = g_fbos.find(336u);
                         if (hit != g_fbos.end() && hit->second.rt.texture.id != 0)
                         {
-                            Image im = LoadImageFromTexture(hit->second.rt.texture);
-                            ImageFlipVertical(&im);
+                            GsReadImage im; gsReadImageFromTexture(hit->second.rt.texture, im);
+                            gsFlipVertical(im);
                             char p[160]; std::snprintf(p, sizeof(p), "/home/z3/Desktop/bt3/work/hop336_%02d_ci%zu.png", s_snapN, ci);
-                            ExportImage(im, p); UnloadImage(im);
+                            gsExportImage(im, p); gsUnloadImage(im);
                             std::fprintf(stderr, "[hop336] snap %d at ci=%zu (leaving 336)\n", s_snapN, ci);
                         }
                         ++s_snapN;
@@ -11288,10 +11769,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                             {
                                 auto it2 = g_fbos.find(sfd);
                                 if (it2 == g_fbos.end() || it2->second.rt.texture.id == 0) continue;
-                                Image im = LoadImageFromTexture(it2->second.rt.texture);
-                                ImageFlipVertical(&im);
+                                GsReadImage im; gsReadImageFromTexture(it2->second.rt.texture, im);
+                                gsFlipVertical(im);
                                 char p[160]; std::snprintf(p, sizeof(p), "/home/z3/Desktop/bt3/work/hop336_srcfbp%u.png", sfd);
-                                ExportImage(im, p); UnloadImage(im);
+                                gsExportImage(im, p); gsUnloadImage(im);
                                 std::fprintf(stderr, "[hop336] src snapshot %s (%dx%d)\n", p, it2->second.w, it2->second.h);
                             }
                         }
@@ -11330,7 +11811,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         }
         {
             const uint32_t destKey = viewKey(c.destFbp, c.destPsm, (int)c.destFbw);
-            if (destKey != curFbp) { beginFbp(destKey); curBlendOn = -1; curBlendEq = -1; /* beginFbp re-enabled BLEND_ALPHA */ }
+            if (destKey != curFbp) { beginFbp(destKey); curBlendOn = -1; curBlendEq = -1; /* beginFbp re-enabled BT3_BLEND_ALPHA */ }
         }
         if (c.isVramBlit)
         {   {   // PS2X_SWOKEY=1: which FBO view does the injected command bind, and did that
@@ -11346,7 +11827,11 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // A run of software-rasterized draws just finished in VRAM; fold it back into this
             // page's FBO here, at its true position in the command order.
             applyDepth(false, 1u, false);
+#if defined(_WIN32)
+            if (!d3dGsOn() && c.swoDirty && c.vramSnap)
+#else
             if (c.swoDirty && c.vramSnap)
+#endif
             {   // [livegl] deferred swOutlineEnd compose: substitute the CURRENT FBO content
                 // for every pixel the software pass did NOT write, so the full-page overwrite
                 // below carries the right pixels (same compose swOutlineEnd does inline on the
@@ -11377,6 +11862,9 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         }
                 }
             }
+#if defined(_WIN32)
+            if (d3dGsOn() && d3dGsEnsure()) d3dGsBlitVram(c); else
+#endif
             blitVramPageToBoundFbo(c);
             {   // [blitw] PS2X_BLITW=<x>,<y>: arm the [darkw] sentinel on a character pixel
                 // right after the SWOUTLINE blit lands ([swodraw] proves it lands, ratio
@@ -11415,7 +11903,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // content and placement both verified identity). Invalidate so the next draw
             // re-applies. Same for the shader/blend/depth caches this path also touched.
             curMask = -1;
-            // ...and the SCISSOR. blitVramPageToBoundFbo calls rlDisableScissorTest() directly,
+            // ...and the SCISSOR. blitVramPageToBoundFbo calls bt3rlDisableScissorTest() directly,
             // while applyScissor early-returns whenever the rect is unchanged -- so the next
             // draw sharing that rect would keep rendering with NO scissor and paint outside its
             // bounds. That is the ground-quad artifact: not the blit's pixels (content and
@@ -11435,7 +11923,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (s_fa224 != 0.0f && g_locForceA >= 0)
             {
                 const float want = (!c.isTransfer && c.destFbp == 224u && c.texKey) ? s_fa224 : 0.0f;
-                if (want != curFA) { flushBatch(__LINE__); SetShaderValue(g_shader, g_locForceA, &want, SHADER_UNIFORM_FLOAT); curFA = want; }
+                if (want != curFA) { flushBatch(__LINE__); bt3SetShaderValue(g_shader, g_locForceA, &want, BT3_SHADER_UNIFORM_FLOAT); curFA = want; }
             }
         }
         {   // PS2X_PROJCLIP=1: clip the shadow-decal class to its projection. Identified as
@@ -11443,7 +11931,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             static const int s_pcMode = [](){ const char *v = std::getenv("PS2X_PROJCLIP"); return v && v[0] ? std::atoi(v) : 0; }();
             static const bool s_pc = s_pcMode != 0;
             static float curPC = -1.0f;
-            // ⚠ MUST require !srcUploaded. The TERRAIN also samples tbp=10752 at 256x256 with
+            // âš  MUST require !srcUploaded. The TERRAIN also samples tbp=10752 at 256x256 with
             // out-of-range UVs -- to TILE GRASS -- and clipping those destroyed the ground
             // (RMSE 22.59 -> 64.64). The shadow decal samples the RENDERED silhouette, terrain
             // samples the UPLOADED grass tile, and srcUploaded is exactly that distinction.
@@ -11464,7 +11952,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (!c.isTransfer && c.destFbp != 336u && c.srcTbp0 != 10752u) s_afterPass1 = false;
             const float want = (s_pc && decal) ? 1.0f : 0.0f;
             if (want != curPC && g_locProjClip >= 0)
-            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locProjClip, &want, SHADER_UNIFORM_FLOAT); curPC = want; }
+            { flushBatch(__LINE__); bt3SetShaderValue(g_shader, g_locProjClip, &want, BT3_SHADER_UNIFORM_FLOAT); curPC = want; }
         }
         {   // PS2X_TRIHALF (default ON): the GS addresses texel CORNERS, GL centres. We already
             // correct that for same-size FBO copies (the shipped blur fix) but never did for
@@ -11475,7 +11963,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // PS2X_TRIHALF=0 disables.
             // Magnitude scanned against console 2026-08-24: k=1 (this half texel) is the
             // full-frame optimum -- 0 -> 21.08, 1 -> 20.07, 1.5 -> 20.49, 2 -> 21.57, -1 -> 21.86.
-            // ⚠ [glhoist] THIS IS A PER-TRIANGLE VERTEX EDIT IN A PER-COMMAND BODY. Any code that shares
+            // âš  [glhoist] THIS IS A PER-TRIANGLE VERTEX EDIT IN A PER-COMMAND BODY. Any code that shares
             // one execution of this body across a batch's triangles (see the emit loop) must apply it to
             // every triangle itself -- triHalfApply() is that single source of truth. Sharing the body
             // without it shifts only the run's first triangle and leaves the rest sampling half a texel
@@ -11495,7 +11983,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     const float want = (c.abe && c.blendMode == 0x62 && c.srcTbp0 == 15680u) ? 1.0f : 0.0f;
                     static float cur = 0.0f;
                     if (want != cur)
-                    { flushBatch(__LINE__); SetShaderValue(g_shader, g_locUViz, &want, SHADER_UNIFORM_FLOAT); cur = want; }
+                    { flushBatch(__LINE__); bt3SetShaderValue(g_shader, g_locUViz, &want, BT3_SHADER_UNIFORM_FLOAT); cur = want; }
                 }
             }
             {   // PS2X_SUBSCALE applied ONLY to the 0x62 subtractive pass (magnitude A/B).
@@ -11506,14 +11994,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     const float want = (c.abe && c.blendMode == 0x62) ? s_ss : 1.0f;
                     static float cur = 1.0f;
                     if (want != cur)
-                    { flushBatch(__LINE__); SetShaderValue(g_shader, g_locSubScale, &want, SHADER_UNIFORM_FLOAT); cur = want; }
+                    { flushBatch(__LINE__); bt3SetShaderValue(g_shader, g_locSubScale, &want, BT3_SHADER_UNIFORM_FLOAT); cur = want; }
                 }
             }
             static const bool s_tfxOn = [](){ const char *v = std::getenv("PS2X_TFX"); return v && v[0] && v[0] != '0'; }();
             static float curTfx = -1.0f;
             const float want = (s_tfxOn && c.texKey != 0 && c.tfx == 1u) ? 1.0f : 0.0f;
             if (want != curTfx && g_locTfx >= 0)
-            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locTfx, &want, SHADER_UNIFORM_FLOAT); curTfx = want; }
+            { flushBatch(__LINE__); bt3SetShaderValue(g_shader, g_locTfx, &want, BT3_SHADER_UNIFORM_FLOAT); curTfx = want; }
         }
         {   // [f224] PS2X_F224=1: fbp224 (the MASK) reads as a pristine clear, yet chaindiag
             // counts 96 draws INTO it. Find where they die: count entry vs the emit.
@@ -12021,7 +12509,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 c.srcPsm == 0x00u && c.tcc == 0u && c.texKey != 0)
             {
                 flushBatch(__LINE__);
-                rlDisableColorBlend();
+                bt3rlDisableColorBlend();
                 curBlendOn = -1; curBlendEq = -1;
             }
         }
@@ -12037,7 +12525,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             {
                 flushBatch(__LINE__);
                 const float on = 1.0f;
-                SetShaderValue(g_shader, g_locUViz, &on, SHADER_UNIFORM_FLOAT);
+                bt3SetShaderValue(g_shader, g_locUViz, &on, BT3_SHADER_UNIFORM_FLOAT);
                 s_a44vizArmed = true;
             }
         }
@@ -12182,7 +12670,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             {
                 flushBatch(__LINE__);
                 const float two = 2.0f;
-                SetShaderValue(g_shader, g_locForceA, &two, SHADER_UNIFORM_FLOAT);
+                bt3SetShaderValue(g_shader, g_locForceA, &two, BT3_SHADER_UNIFORM_FLOAT);
                 s_mbtaArmed = true;
             }
         }
@@ -12326,43 +12814,45 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 { mm.tri[i].r = 255; mm.tri[i].g = 0; mm.tri[i].b = 255; mm.tri[i].a = 128; }
             }
         }
-        {   // [texdump] PS2X_TEXDUMP=<tbp>: dump the DECODED texture for that source, RGB and
-            // ALPHA separately. The scene's alpha channel is what feeds the whole mask/outline
-            // chain, and for a TCC=1 draw the alpha written to the frame comes straight from the
-            // texture -- so if a character page decodes with alpha 0 the chain can never start.
-            static const int s_td = [](){ const char *v = std::getenv("PS2X_TEXDUMP");
-                                          return v && v[0] ? std::atoi(v) : -1; }();
-            if (s_td >= 0 && (int)c.srcTbp0 == s_td && c.texKey)
+        {   // [texdump] PS2X_TEXDUMP=<tbp[,tbp...]>: dump the DECODED texture for those sources,
+            // RGB and ALPHA separately, once each. PS2X_TEXDUMP_DIR selects the output folder
+            // (default: cwd). Lets a candidate texture be pulled out of VRAM for identification.
+            static const std::vector<int> s_td = [](){ std::vector<int> v; const char *e = std::getenv("PS2X_TEXDUMP");
+                                                       if (e && e[0]) { std::string s(e); size_t p = 0;
+                                                           while (p <= s.size()) { const size_t q = s.find(',', p);
+                                                               const std::string t = s.substr(p, q == std::string::npos ? std::string::npos : q - p);
+                                                               if (!t.empty()) v.push_back(std::atoi(t.c_str()));
+                                                               if (q == std::string::npos) break; p = q + 1; } }
+                                                       return v; }();
+            static const char *s_tdd = [](){ const char *v = std::getenv("PS2X_TEXDUMP_DIR"); return (v && v[0]) ? v : "."; }();
+            static std::set<int> s_tdDone;
+            if (!s_td.empty() && c.texKey && !s_tdDone.count((int)c.srcTbp0)
+                && std::find(s_td.begin(), s_td.end(), (int)c.srcTbp0) != s_td.end())
             {
-                static int done = 0;
-                if (done < 1)
+                auto ti = m_texCache.find(c.texKey);
+                if (ti != m_texCache.end() && ti->second.w > 0 && ti->second.h > 0
+                    && ti->second.rgba.size() >= (size_t)ti->second.w * ti->second.h * 4)
                 {
-                    auto ti = m_texCache.find(c.texKey);
-                    if (ti != m_texCache.end() && ti->second.w > 0 && ti->second.h > 0
-                        && ti->second.rgba.size() >= (size_t)ti->second.w * ti->second.h * 4)
+                    s_tdDone.insert((int)c.srcTbp0);
+                    const int tw = ti->second.w, th = ti->second.h;
+                    GsReadImage ic = ps2x::gfx::GsImageMake(tw, th, BLACK), ia = ps2x::gfx::GsImageMake(tw, th, BLACK);
+                    unsigned long anz = 0; std::map<unsigned, unsigned long> ah;
+                    for (int y = 0; y < th; ++y) for (int x = 0; x < tw; ++x)
                     {
-                        done = 1;
-                        const int tw = ti->second.w, th = ti->second.h;
-                        Image ic = GenImageColor(tw, th, BLACK), ia = GenImageColor(tw, th, BLACK);
-                        unsigned long anz = 0; std::map<unsigned, unsigned long> ah;
-                        for (int y = 0; y < th; ++y) for (int x = 0; x < tw; ++x)
-                        {
-                            const uint8_t *px = &ti->second.rgba[((size_t)y * tw + x) * 4];
-                            ImageDrawPixel(&ic, x, y, Color{px[0], px[1], px[2], 255});
-                            ImageDrawPixel(&ia, x, y, Color{px[3], px[3], px[3], 255});
-                            if (px[3]) ++anz; ++ah[px[3] / 32];
-                        }
-                        char p1[176], p2[176];
-                        std::snprintf(p1, sizeof p1, "/home/z3/Desktop/bt3/work/shots/tex%d_rgb.png", s_td);
-                        std::snprintf(p2, sizeof p2, "/home/z3/Desktop/bt3/work/shots/tex%d_alpha.png", s_td);
-                        ExportImage(ic, p1); ExportImage(ia, p2);
-                        UnloadImage(ic); UnloadImage(ia);
-                        std::fprintf(stderr, "[texdump] tbp=%d %dx%d psm=%u tcc=%u  alpha!=0 %.1f%%  buckets:",
-                                     s_td, tw, th, (unsigned)c.srcPsm, (unsigned)c.tcc,
-                                     100.0 * anz / ((double)tw * th));
-                        for (auto &kv : ah) std::fprintf(stderr, " %u:%lu", kv.first * 32, kv.second);
-                        std::fprintf(stderr, "\n");
+                        const uint8_t *px = &ti->second.rgba[((size_t)y * tw + x) * 4];
+                        ps2x::gfx::GsImageSetPx(ic, x, y, Color{px[0], px[1], px[2], 255});
+                        ps2x::gfx::GsImageSetPx(ia, x, y, Color{px[3], px[3], px[3], 255});
+                        if (px[3]) ++anz; ++ah[px[3] / 32];
                     }
+                    char p1[384], p2[384];
+                    std::snprintf(p1, sizeof p1, "%s/tex_%d_%dx%d_rgb.png", s_tdd, (int)c.srcTbp0, tw, th);
+                    std::snprintf(p2, sizeof p2, "%s/tex_%d_%dx%d_a.png", s_tdd, (int)c.srcTbp0, tw, th);
+                    gsExportImage(ic, p1); gsExportImage(ia, p2);
+                    gsUnloadImage(ic); gsUnloadImage(ia);
+                    std::fprintf(stderr, "[texdump] tbp=%d %dx%d psm=%u tcc=%u -> %s (alpha!=0 %.1f%%)\n",
+                                 (int)c.srcTbp0, tw, th, (unsigned)c.srcPsm, (unsigned)c.tcc, p1,
+                                 100.0 * anz / ((double)tw * th));
+                    (void)ah;
                 }
             }
         }
@@ -12383,8 +12873,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     if (it0 != g_fbos.end() && it0->second.rt.texture.id != 0)
                     {
                         flushBatch(__LINE__);
-                        rlEnableFramebuffer(it0->second.rt.id);
-                        rlDisableScissorTest();               // glClear obeys the scissor; a leftover
+                        bt3rlEnableFramebuffer(it0->second.rt.id);
+                        bt3rlDisableScissorTest();               // glClear obeys the scissor; a leftover
                                                               // strip scissor clipped this to 1474 px
                         glColorMask(0, 0, 0, 1);              // alpha only -- leave the scene RGB alone
                         glClearColor(0.0f, 0.0f, 0.0f, 128.0f / 255.0f);
@@ -12393,14 +12883,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         const int w = std::min(it0->second.w, 512), h = std::min(it0->second.h, 448);
                         std::vector<uint32_t> buf((size_t)w * h);
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
-                        // Restore the draw target. rlDisableFramebuffer() binds framebuffer 0, which
+                        // Restore the draw target. bt3rlDisableFramebuffer() binds framebuffer 0, which
                         // would send the very draws this test measures to the screen instead of
                         // fbp224 -- the probe would then contaminate its own result.
                         {
                             auto it224 = g_fbos.find(224u);
                             if (it224 != g_fbos.end() && it224->second.rt.id != 0)
-                                rlEnableFramebuffer(it224->second.rt.id);
-                            else rlDisableFramebuffer();
+                                bt3rlEnableFramebuffer(it224->second.rt.id);
+                            else bt3rlDisableFramebuffer();
                         }
                         std::map<unsigned, unsigned long> hist;
                         for (auto v : buf) ++hist[(v >> 24) & 0xFF];
@@ -12431,10 +12921,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         const int w = it->second.w, h = it->second.h;
                         std::vector<uint32_t> buf((size_t)w * h);
-                        rlEnableFramebuffer(it->second.rt.id);
+                        bt3rlEnableFramebuffer(it->second.rt.id);
                         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
-                        rlDisableFramebuffer();
+                        bt3rlDisableFramebuffer();
                         std::map<unsigned, unsigned long> hist; unsigned long nz = 0;
                         for (auto v : buf) { const unsigned a = (v >> 24) & 0xFF; if (a) ++nz; ++hist[a / 32]; }
                         std::fprintf(stderr, "[scenealpha] fbp%u %dx%d after %d composite draws:"
@@ -12466,10 +12956,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         if (it == g_fbos.end() || it->second.rt.texture.id == 0) continue;
                         const int w = it->second.w, h = it->second.h;
                         std::vector<uint32_t> buf((size_t)w * h);
-                        rlEnableFramebuffer(it->second.rt.id);
+                        bt3rlEnableFramebuffer(it->second.rt.id);
                         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
-                        rlDisableFramebuffer();
+                        bt3rlDisableFramebuffer();
                         std::map<unsigned, unsigned long> hist;
                         unsigned long nz = 0;
                         for (auto v : buf) { const unsigned a = (v >> 24) & 0xFF;
@@ -12478,16 +12968,16 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                      sfbp, w, h, s_sa, nz, buf.size(), 100.0 * nz / (double)buf.size());
                         for (auto &kv : hist) std::fprintf(stderr, " %u:%lu", kv.first * 32, kv.second);
                         std::fprintf(stderr, "\n");
-                        Image ia = GenImageColor(w, h, BLACK);
+                        GsReadImage ia = ps2x::gfx::GsImageMake(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                         { const unsigned char a = (unsigned char)((buf[(size_t)y*w+x] >> 24) & 0xFF);
-                          ImageDrawPixel(&ia, x, y, Color{a,a,a,255}); }
-                        ImageFlipVertical(&ia);
+                          ps2x::gfx::GsImageSetPx(ia, x, y, Color{a,a,a,255}); }
+                        gsFlipVertical(ia);
                         char pth[160];
                         std::snprintf(pth, sizeof pth, "/home/z3/Desktop/bt3/work/shots/scenealpha_fbp%u.png", sfbp);
-                        ExportImage(ia, pth); UnloadImage(ia);
+                        gsExportImage(ia, pth); gsUnloadImage(ia);
                     }
-                    if (g_fbos.count(224u)) { rlEnableFramebuffer(g_fbos[224u].rt.id); }
+                    if (g_fbos.count(224u)) { bt3rlEnableFramebuffer(g_fbos[224u].rt.id); }
                 }
             }
         }
@@ -12512,10 +13002,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         // shows only the clear and reports a uniform buffer.
                         const int w = it->second.w, h = it->second.h;
                         std::vector<uint32_t> buf((size_t)w * h);
-                        rlEnableFramebuffer(it->second.rt.id);
+                        bt3rlEnableFramebuffer(it->second.rt.id);
                         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
-                        rlDisableFramebuffer();
+                        bt3rlDisableFramebuffer();
                         std::map<unsigned, unsigned long> hist;
                         for (auto v : buf) ++hist[((v >> 24) & 0xFF) / 32];
                         {   // and WHERE the non-clear texels are, if any
@@ -12529,13 +13019,13 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         std::fprintf(stderr, "[maskafter] fbp224 alpha right after %d mask draws  buckets:", s_ma);
                         for (auto &kv : hist) std::fprintf(stderr, " %u:%lu", kv.first * 32, kv.second);
                         std::fprintf(stderr, "  (distinct buckets=%zu)\n", hist.size());
-                        Image ia = GenImageColor(w, h, BLACK);
+                        GsReadImage ia = ps2x::gfx::GsImageMake(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                         { const unsigned char a = (unsigned char)((buf[(size_t)y*w+x] >> 24) & 0xFF);
-                          ImageDrawPixel(&ia, x, y, Color{a,a,a,255}); }
-                        ImageFlipVertical(&ia);
-                        ExportImage(ia, "/home/z3/Desktop/bt3/work/shots/maskafter_fbp224.png");
-                        UnloadImage(ia);
+                          ps2x::gfx::GsImageSetPx(ia, x, y, Color{a,a,a,255}); }
+                        gsFlipVertical(ia);
+                        gsExportImage(ia, "/home/z3/Desktop/bt3/work/shots/maskafter_fbp224.png");
+                        gsUnloadImage(ia);
                     }
                 }
             }
@@ -12605,10 +13095,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         const int w = it->second.w, h = it->second.h;
                         std::vector<uint32_t> buf((size_t)w * h);
-                        rlEnableFramebuffer(it->second.rt.id);
+                        bt3rlEnableFramebuffer(it->second.rt.id);
                         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
-                        rlDisableFramebuffer();
+                        bt3rlDisableFramebuffer();
                         unsigned long orange = 0;
                         for (auto v : buf)
                         { const int r = v & 0xFF, g2 = (v >> 8) & 0xFF, b = (v >> 16) & 0xFF;
@@ -12616,14 +13106,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         if (n == 14)
                         {   // dump the IMAGE too -- a colour threshold can disagree with the eye,
                             // and this probe and [blurat] currently contradict each other.
-                            Image im2 = GenImageColor(w, h, BLACK);
+                            GsReadImage im2 = ps2x::gfx::GsImageMake(w, h, BLACK);
                             for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                             { const uint32_t v = buf[(size_t)y*w+x];
-                              ImageDrawPixel(&im2, x, y, Color{(unsigned char)(v & 0xFF),
+                              ps2x::gfx::GsImageSetPx(im2, x, y, Color{(unsigned char)(v & 0xFF),
                                   (unsigned char)((v>>8)&0xFF), (unsigned char)((v>>16)&0xFF), 255}); }
-                            ImageFlipVertical(&im2);
-                            ExportImage(im2, "/home/z3/Desktop/bt3/work/shots/blur_write14.png");
-                            UnloadImage(im2);
+                            gsFlipVertical(im2);
+                            gsExportImage(im2, "/home/z3/Desktop/bt3/work/shots/blur_write14.png");
+                            gsUnloadImage(im2);
                         }
                         std::fprintf(stderr, "[blurseq] write #%d into fbp502 (src=%u): character-orange texels %lu/%d\n",
                                      n, c.srcTbp0, orange, w * h);
@@ -12649,18 +13139,18 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         const int w = std::min(it->second.w, 512), h = std::min(it->second.h, 448);
                         std::vector<uint32_t> buf((size_t)w * h);
-                        rlEnableFramebuffer(it->second.rt.id);
+                        bt3rlEnableFramebuffer(it->second.rt.id);
                         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
-                        rlDisableFramebuffer();
-                        Image im = GenImageColor(w, h, BLACK);
+                        bt3rlDisableFramebuffer();
+                        GsReadImage im = ps2x::gfx::GsImageMake(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                         { const uint32_t v = buf[(size_t)y*w+x];
-                          ImageDrawPixel(&im, x, y, Color{(unsigned char)(v & 0xFF),
+                          ps2x::gfx::GsImageSetPx(im, x, y, Color{(unsigned char)(v & 0xFF),
                               (unsigned char)((v>>8)&0xFF), (unsigned char)((v>>16)&0xFF), 255}); }
-                        ImageFlipVertical(&im);
-                        ExportImage(im, "/home/z3/Desktop/bt3/work/shots/scene_at_blur.png");
-                        UnloadImage(im);
+                        gsFlipVertical(im);
+                        gsExportImage(im, "/home/z3/Desktop/bt3/work/shots/scene_at_blur.png");
+                        gsUnloadImage(im);
                         std::fprintf(stderr, "[sceneat] blur reads fbp%u; dumped it %dx%d\n", sf2, w, h);
                     }
                 }
@@ -12685,18 +13175,18 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         const int w = it->second.w, h = it->second.h;
                         std::vector<uint32_t> buf((size_t)w * h);
-                        rlEnableFramebuffer(it->second.rt.id);
+                        bt3rlEnableFramebuffer(it->second.rt.id);
                         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
-                        rlDisableFramebuffer();
-                        Image im = GenImageColor(w, h, BLACK);
+                        bt3rlDisableFramebuffer();
+                        GsReadImage im = ps2x::gfx::GsImageMake(w, h, BLACK);
                         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                         { const uint32_t v = buf[(size_t)y*w+x];
-                          ImageDrawPixel(&im, x, y, Color{(unsigned char)(v & 0xFF),
+                          ps2x::gfx::GsImageSetPx(im, x, y, Color{(unsigned char)(v & 0xFF),
                               (unsigned char)((v>>8)&0xFF), (unsigned char)((v>>16)&0xFF), 255}); }
-                        ImageFlipVertical(&im);
-                        ExportImage(im, "/home/z3/Desktop/bt3/work/shots/blur_at_sample.png");
-                        UnloadImage(im);
+                        gsFlipVertical(im);
+                        gsExportImage(im, "/home/z3/Desktop/bt3/work/shots/blur_at_sample.png");
+                        gsUnloadImage(im);
                         extern unsigned long g_wr502, g_wr368, g_wr336;
                         std::fprintf(stderr, "[blurat] dumped fbp502 %dx%d at the first 16064 sample"
                                      " | writes so far this run: fbp336=%lu fbp368=%lu fbp502=%lu\n",
@@ -12751,24 +13241,24 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         const int w = std::min(it->second.w, 512), h = std::min(it->second.h, 448);
                         if (w <= 0 || h <= 0) continue;
                         std::vector<uint32_t> buf((size_t)w * h);
-                        rlEnableFramebuffer(it->second.rt.id);
+                        bt3rlEnableFramebuffer(it->second.rt.id);
                         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
-                        rlDisableFramebuffer();
+                        bt3rlDisableFramebuffer();
                         unsigned long nz = 0, tot = 0; std::map<unsigned, unsigned long> hist;
                         for (int y = 0; y < h; y += 2) for (int x = 0; x < w; x += 2)
                         { const unsigned a = (buf[(size_t)y*w+x] >> 24) & 0xFF; ++tot; if (a) ++nz; ++hist[a/32]; }
                         {   // dump the alpha channel so it can be LOOKED at -- a coverage
                             // percentage cannot say WHICH parts of the scene carry the mask.
-                            Image ia = GenImageColor(w, h, BLACK);
+                            GsReadImage ia = ps2x::gfx::GsImageMake(w, h, BLACK);
                             for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
                             { const unsigned char a = (unsigned char)((buf[(size_t)y*w+x] >> 24) & 0xFF);
-                              ImageDrawPixel(&ia, x, y, Color{a,a,a,255}); }
-                            ImageFlipVertical(&ia);
+                              ps2x::gfx::GsImageSetPx(ia, x, y, Color{a,a,a,255}); }
+                            gsFlipVertical(ia);
                             char pth[160];
                             std::snprintf(pth, sizeof pth,
                                           "/home/z3/Desktop/bt3/work/shots/maskmoment_fbp%u_%d.png", sf, done);
-                            ExportImage(ia, pth); UnloadImage(ia);
+                            gsExportImage(ia, pth); gsUnloadImage(ia);
                         }
                         std::fprintf(stderr, "[maskmoment] #%d scene fbp%u %dx%d  alpha!=0 %.1f%%  buckets:",
                                      done, sf, w, h, 100.0 * nz / tot);
@@ -12980,18 +13470,18 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                             if (ti != m_texCache.end() && ti->second.w > 0 && ti->second.h > 0
                                 && ti->second.rgba.size() >= (size_t)ti->second.w * ti->second.h * 4)
                             {
-                                Image im = GenImageColor(ti->second.w, ti->second.h, BLACK);
+                                GsReadImage im = ps2x::gfx::GsImageMake(ti->second.w, ti->second.h, BLACK);
                                 for (int y = 0; y < ti->second.h; ++y)
                                     for (int x = 0; x < ti->second.w; ++x)
                                     {
                                         const uint8_t *px = &ti->second.rgba[((size_t)y * ti->second.w + x) * 4];
-                                        ImageDrawPixel(&im, x, y, Color{px[0], px[1], px[2], 255});
+                                        ps2x::gfx::GsImageSetPx(im, x, y, Color{px[0], px[1], px[2], 255});
                                     }
                                 char pth[192];
                                 std::snprintf(pth, sizeof pth,
                                               "/home/z3/Desktop/bt3/work/shots/outlinesrc%d_%dx%d.png",
                                               dumped, ti->second.w, ti->second.h);
-                                ExportImage(im, pth); UnloadImage(im);
+                                gsExportImage(im, pth); gsUnloadImage(im);
                                 std::fprintf(stderr, "[blob] dumped source #%d %dx%d -> %s\n",
                                              dumped, ti->second.w, ti->second.h, pth);
                                 ++dumped;
@@ -13291,7 +13781,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         // Resolve the source: if the sampled texture aliases a render-target framebuffer,
         // sample that FBO (render-to-texture); else the decoded VRAM texture. FBO color
         // textures are bottom-up, so flag a V-flip.
-        Texture2D tex = g_white; bool vflip = false; bool fromFbo = false; bool gaServed = false;   // [gpualias] flip-served: skip every later texture override
+        bt3Texture2D tex = g_white; bool vflip = false; bool fromFbo = false; bool gaServed = false;   // [gpualias] flip-served: skip every later texture override
         {   // [gpualias] mode>=4: serve the CT16-view read of fbp336 (the edge-chain consumer) from the executor's view texture
             static const int s_gaC = [](){ const char *v = std::getenv("PS2X_GPUALIAS"); return v && v[0] ? std::atoi(v) : 0; }();
             // Page 336's CT16 view holds DIFFERENT content across the frame (HUD composite, DoF,
@@ -13338,12 +13828,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         dumped = true;
                         flushBatch(__LINE__);
-                        Image vi = LoadImageFromTexture(g_gaViewTex[g_gaCur].texture);
-                        ExportImage(vi, "/home/z3/Desktop/bt3/work/ga_view.png"); UnloadImage(vi);
+                        ps2xGfxDumpTexPng(g_gaViewTex[g_gaCur].texture, "/home/z3/Desktop/bt3/work/ga_view.png");
                         auto sit2 = g_fbos.find(224u);
                         if (sit2 != g_fbos.end() && sit2->second.rt.texture.id != 0)
-                        { Image mi = LoadImageFromTexture(sit2->second.rt.texture);
-                          ExportImage(mi, "/home/z3/Desktop/bt3/work/ga_f224.png"); UnloadImage(mi); }
+                        { ps2xGfxDumpTexPng(sit2->second.rt.texture, "/home/z3/Desktop/bt3/work/ga_f224.png"); }
                         std::fprintf(stderr, "[gpualias] dumped ga_view.png + ga_f224.png\n");
                     }
                 }
@@ -13502,10 +13990,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                             static std::vector<uint32_t> wpx;
                             wpx.resize((size_t)ww * wh);
                             flushBatch(__LINE__);
-                            rlEnableFramebuffer(wit->second.rt.id);
+                            bt3rlEnableFramebuffer(wit->second.rt.id);
                             rsBindReadDownsampled(wit->second);
                             glReadPixels(0, 0, ww, wh, 0x1908, 0x1401, wpx.data());
-                            rlDisableFramebuffer();
+                            bt3rlDisableFramebuffer();
                             ps2xWritebackToVram(wpg, wfbw, 0u /*PSMCT32 bytes*/, ww, wh, wpx.data());
                             g_wbDone.insert(wpg);
                             static int wn = 0;
@@ -13575,7 +14063,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     }
                     tex.id = zf->second.depthTex;
                     tex.width = zf->second.w; tex.height = zf->second.h;
-                    tex.mipmaps = 1; tex.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                    tex.mipmaps = 1; tex.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
                     vflip = true; fromFbo = true; zTexBind = true;
                     static int zn = 0;
                     if (++zn <= 2)
@@ -13628,15 +14116,15 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         && nit != g_fbos.end() && nit->second.rt.texture.id != 0)
                     {
                         flushBatch(__LINE__);
-                        BeginTextureMode(nit->second.rt);
-                        rlDisableScissorTest();
-                        rlDisableColorBlend();
-                        DrawTexturePro(git->second,
-                                       Rectangle{0.0f, 0.0f, (float)git->second.width, (float)git->second.height},
-                                       Rectangle{0.0f, 0.0f, (float)cw, (float)ch},
-                                       Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+                        ps2x::gfx::GsRtBegin(nit->second.rt);
+                        bt3rlDisableScissorTest();
+                        bt3rlDisableColorBlend();
+                        bt3DrawTexturePro(git->second,
+                                       bt3Rectangle{0.0f, 0.0f, (float)git->second.width, (float)git->second.height},
+                                       bt3Rectangle{0.0f, 0.0f, (float)cw, (float)ch},
+                                       bt3Vector2{0.0f, 0.0f}, 0.0f, WHITE);
                         flushBatch(__LINE__);
-                        EndTextureMode();
+                        ps2x::gfx::GsRtEnd();
                         curRealFbp = 0xFFFFFFFFu; inMode = false;
                         std::fprintf(stderr, "[seedfbo] seeded-at-create fbp%u (%dx%d) from decoded tex %u\n",
                                      sfKey, cw, ch, git->second.id);
@@ -14064,14 +14552,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         flushBatch(__LINE__);
                         const int fw9 = fit9->second.w, fh9 = fit9->second.h;
-                        BeginTextureMode(fit9->second.rt);
-                        rlDisableScissorTest();
-                        rlDisableColorBlend();
-                        DrawTexturePro(tex, Rectangle{0.0f, 0.0f, (float)tex.width, (float)tex.height},
-                                       Rectangle{0.0f, 0.0f, (float)fw9, (float)fh9},
-                                       Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+                        ps2x::gfx::GsRtBegin(fit9->second.rt);
+                        bt3rlDisableScissorTest();
+                        bt3rlDisableColorBlend();
+                        bt3DrawTexturePro(tex, bt3Rectangle{0.0f, 0.0f, (float)tex.width, (float)tex.height},
+                                       bt3Rectangle{0.0f, 0.0f, (float)fw9, (float)fh9},
+                                       bt3Vector2{0.0f, 0.0f}, 0.0f, WHITE);
                         flushBatch(__LINE__);
-                        EndTextureMode();
+                        ps2x::gfx::GsRtEnd();
                         std::fprintf(stderr, "[seedfbo] seeded fbp%u (%dx%d) from decoded VRAM tex %u (%dx%d)\n",
                                      sfKey, fw9, fh9, tex.id, tex.width, tex.height);
                         curRealFbp = 0xFFFFFFFFu;   // force a rebind: we changed the bound FBO
@@ -14104,7 +14592,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 auto dumpRgb = [&](uint32_t fbp, const char *tag) {
                     if (!g_fbos.count(fbp)) return; flushBatch(__LINE__); auto &fb = g_fbos[fbp]; if (!fb.rt.texture.id) return;
                     const int w = fb.w, h = fb.h; std::vector<uint32_t> buf((size_t)w * h); int pf = 0; glGetIntegerv(0x8CA6, &pf);
-                    rlEnableFramebuffer(fb.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); if (pf) rlEnableFramebuffer((unsigned)pf);
+                    bt3rlEnableFramebuffer(fb.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); if (pf) bt3rlEnableFramebuffer((unsigned)pf);
                     char pth[256]; std::snprintf(pth, sizeof pth, "%s/dark_%s.ppm", std::getenv("PS2X_GS_REPLAY_OUT") ? std::getenv("PS2X_GS_REPLAY_OUT") : ".", tag);
                     if (FILE *pf2 = std::fopen(pth, "wb")) { std::fprintf(pf2, "P6\n512 448\n255\n");
                         for (int y = 0; y < 448; ++y) for (int x = 0; x < 512; ++x) { const uint32_t v = (y < h && x < w) ? buf[(size_t)(h - 1 - y) * w + x] : 0u; const uint8_t rgb[3] = {(uint8_t)(v & 0xFF), (uint8_t)((v >> 8) & 0xFF), (uint8_t)((v >> 16) & 0xFF)}; std::fwrite(rgb, 1, 3, pf2); }
@@ -14161,7 +14649,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 {
                     const int w = fb.w, h = fb.h;
                     std::vector<uint32_t> buf((size_t)w * h);
-                    rlEnableFramebuffer(fb.rt.id);
+                    bt3rlEnableFramebuffer(fb.rt.id);
                     glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                     std::map<unsigned, unsigned long> hh; unsigned long n = 0;
                     for (int y = 0; y < h && y < 448; ++y) for (int x = 0; x < w && x < 512; ++x)
@@ -14195,7 +14683,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 auto &fb = g_fbos[224u];
                 const int w = fb.w, h = fb.h;
                 std::vector<uint32_t> buf((size_t)w * h);
-                rlEnableFramebuffer(fb.rt.id);
+                bt3rlEnableFramebuffer(fb.rt.id);
                 glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                 unsigned long nzWin = 0, nzCol = 0, nCol = 0, nzAll = 0, sumCol = 0; int bx0 = 1 << 30, by0 = 1 << 30, bx1 = -1, by1 = -1;
                 for (int y = 0; y < 448 && y < h; ++y) for (int x = 0; x < 512 && x < w; ++x)
@@ -14234,7 +14722,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     const char *names[] = {"uTcc","uTfx","uAtst","uAref","uTexa","uIdxMode","uIdxScale","uFboOne","uZTex","uForceA","uASplit","uAScale","uSubScale","uProjClip","uPerspQ","uFba","uBright","uUViz"};
                     std::string us;
                     for (const char *nm : names)
-                    {   int loc = GetShaderLocation(g_shader, nm); float v[4] = {0,0,0,0};
+                    {   int loc = bt3GetShaderLocation(g_shader, nm); float v[4] = {0,0,0,0};
                         if (loc >= 0) { glGetUniformfv(g_shader.id, loc, v);
                             char b[96]; std::snprintf(b, sizeof b, " %s=%.3g", nm, v[0]); us += b;
                             if (std::strcmp(nm, "uTexa") == 0) { std::snprintf(b, sizeof b, "(%.3g,%.3g,%.3g,%.3g)", v[0], v[1], v[2], v[3]); us += b; } }
@@ -14261,7 +14749,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                             for (int yy = std::max(0, v0); yy < std::min(tex.height, v1); ++yy) for (int xx = std::max(0, u0); xx < std::min(tex.width, u1); ++xx)
                             { const uint8_t a = g[((size_t)yy * tex.width + xx) * 4u + 3u]; ++gn; gsumA += a; if (a) ++gnz; }
                             std::fprintf(stderr, "[cmpwr]   GL texture %u sub-rect: alpha nonzero %lu/%lu mean %.1f (format %d)\n", tex.id, gnz, gn, gn ? (double)gsumA / gn : 0.0, tex.format);
-                            RL_FREE(raw);
+                            BT3RL_FREE(raw);
                         }
                     }
                 }
@@ -14295,12 +14783,12 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     glBindFramebuffer(0x8D40u, f3->second.rt.id);
                     glReadPixels(0, 0, w3, h3, 0x1908, 0x1401, px3.data());
                     glBindFramebuffer(0x8D40u, (unsigned)pf3);
-                    Image im3 = GenImageColor(w3, h3, BLACK);
+                    GsReadImage im3 = ps2x::gfx::GsImageMake(w3, h3, BLACK);
                     for (int y = 0; y < h3; ++y) for (int x = 0; x < w3; ++x)
                     { const unsigned char av = px3[((size_t)(h3 - 1 - y) * w3 + x) * 4 + 3];
-                      ImageDrawPixel(&im3, x, y, Color{av, av, av, 255}); }
+                      ps2x::gfx::GsImageSetPx(im3, x, y, Color{av, av, av, 255}); }
                     char nm3[128]; std::snprintf(nm3, sizeof nm3, "/home/z3/Desktop/bt3/work/dofmask_geo_f%u_%d.png", c.destFbp, ++s_pp);
-                    ExportImage(im3, nm3); UnloadImage(im3);
+                    gsExportImage(im3, nm3); gsUnloadImage(im3);
                     std::fprintf(stderr, "[dofad3] wrote %s\n", nm3);
                 }
             }
@@ -14340,7 +14828,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 {
                     const int w = fb.w, h = fb.h;
                     std::vector<uint32_t> buf((size_t)w * h);
-                    rlEnableFramebuffer(fb.rt.id);
+                    bt3rlEnableFramebuffer(fb.rt.id);
                     glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                     std::map<unsigned, unsigned long> hh; unsigned long n = 0;
                     // scene region only (first 512x448 in GS coords = top rows; FBO is vflipped)
@@ -14358,7 +14846,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         const int sw2 = sit->second.w, sh2 = sit->second.h;
                         std::vector<uint32_t> sb((size_t)sw2 * sh2);
-                        rlEnableFramebuffer(sit->second.rt.id);
+                        bt3rlEnableFramebuffer(sit->second.rt.id);
                         glReadPixels(0, 0, sw2, sh2, 0x1908, 0x1401, sb.data());
                         auto stat = [&](int x0, int y0, int x1, int y1, const char *nm) {
                             unsigned long n = 0, nz = 0; unsigned mx = 0; double sum = 0;
@@ -14387,7 +14875,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 std::vector<uint8_t> px((size_t)tw * th * 4u);
                 {   // rlgl readback (RGBA8 assumed for FBO/decoded textures)
                     void *raw = rlReadTexturePixels(tex.id, tw, th, tex.format);
-                    if (raw) { std::memcpy(px.data(), raw, std::min(px.size(), (size_t)tw * th * 4u)); RL_FREE(raw); }
+                    if (raw) { std::memcpy(px.data(), raw, std::min(px.size(), (size_t)tw * th * 4u)); BT3RL_FREE(raw); }
                 }
                 unsigned long n = 0, blk = 0, sr = 0, sg = 0, sb = 0; std::map<unsigned, unsigned long> ah;
                 std::map<uint32_t, unsigned long> rgbh;   // exact RGB triples
@@ -14897,8 +15385,8 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (s_wrapState.get(tex.id) != (int)want)
             {
                 flushBatch(__LINE__); // flush queued verts before changing texture params
-                rlTextureParameters(tex.id, RL_TEXTURE_WRAP_S, c.wrapU ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
-                rlTextureParameters(tex.id, RL_TEXTURE_WRAP_T, c.wrapV ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
+                bt3rlTextureParameters(tex.id, BT3RL_TEXTURE_WRAP_S, c.wrapU ? BT3RL_TEXTURE_WRAP_CLAMP : BT3RL_TEXTURE_WRAP_REPEAT);
+                bt3rlTextureParameters(tex.id, BT3RL_TEXTURE_WRAP_T, c.wrapV ? BT3RL_TEXTURE_WRAP_CLAMP : BT3RL_TEXTURE_WRAP_REPEAT);
                 s_wrapState.set(tex.id, want);
             }
         }
@@ -14931,7 +15419,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             const bool keepCt32Alpha = s_fo32 || ps2xGlowFix();   // [glowfix]
             const float want = (fromFbo && !idxRt && !(keepCt32Alpha && ct32src)) ? 1.0f : 0.0f;
             if (want != curFO && g_locFboOne >= 0)
-            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locFboOne, &want, SHADER_UNIFORM_FLOAT); curFO = want; }
+            { flushBatch(__LINE__); bt3SetShaderValue(g_shader, g_locFboOne, &want, BT3_SHADER_UNIFORM_FLOAT); curFO = want; }
         }
         {   // PS2X_ADGS=1: our framebuffer alpha stores the GS BYTE, but GL_DST_ALPHA divides it
             // by 255 where the GS divides Ad by 128 -- so EVERY dest-alpha blend runs at 128/255
@@ -14965,7 +15453,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (wantAdgs != curAdgs && g_locSubScale >= 0)
             {
                 flushBatch(__LINE__);
-                SetShaderValue(g_shader, g_locSubScale, &wantAdgs, SHADER_UNIFORM_FLOAT);
+                bt3SetShaderValue(g_shader, g_locSubScale, &wantAdgs, BT3_SHADER_UNIFORM_FLOAT);
                 curAdgs = wantAdgs;
             }
         }
@@ -14978,7 +15466,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
               if ((nT % 20000ul) == 0ul)
                   std::fprintf(stderr, "[fba] draws with FBA=1: %lu of %lu\n", nF, nT); }
             if (want != curF && g_locFba >= 0)
-            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locFba, &want, SHADER_UNIFORM_FLOAT); curF = want; }
+            { flushBatch(__LINE__); bt3SetShaderValue(g_shader, g_locFba, &want, BT3_SHADER_UNIFORM_FLOAT); curF = want; }
         }
         {   // Index scale follows the SOURCE page's provenance (see g_fbpAlphaIsGsByte).
             // PS2X_IDXSCALE overrides it for A/B; negative still means "bypass the palette".
@@ -14991,7 +15479,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                  : ((spg < 512u && g_fbpAlphaIsGsByte[spg]) ? 255.0f : 128.0f);
                 static float curS = -12345.0f;
                 if (want != curS)
-                { flushBatch(__LINE__); SetShaderValue(g_shader, g_locIdxScale, &want, SHADER_UNIFORM_FLOAT); curS = want; }
+                { flushBatch(__LINE__); bt3SetShaderValue(g_shader, g_locIdxScale, &want, BT3_SHADER_UNIFORM_FLOAT); curS = want; }
             }
             // Record what THIS draw leaves in the destination's alpha, for whoever reads it next.
             if (!c.isTransfer && c.destFbp < 512u && (c.fbmsk & 0xFF000000u) != 0xFF000000u)
@@ -15105,28 +15593,28 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         }
         {   // Indexed render-target sampling: hand the shader the CLUT and switch it to
             // "index comes from the sampled ALPHA". Both uniforms are guarded on a valid
-            // location -- SetShaderValue to -1 is a segfault, not a no-op.
+            // location -- bt3SetShaderValue to -1 is a segfault, not a no-op.
             const float want = idxRt ? 1.0f : 0.0f;
             if (want != g_curIdxMode && g_locIdxMode >= 0)
             {
                 flushBatch(__LINE__);          // the mode changes how texels are read
-                SetShaderValue(g_shader, g_locIdxMode, &want, SHADER_UNIFORM_FLOAT);
+                bt3SetShaderValue(g_shader, g_locIdxMode, &want, BT3_SHADER_UNIFORM_FLOAT);
                 g_curIdxMode = want;
             }
             if (idxRt && g_locPal >= 0)
             {
-                Texture2D pal = palTextureFor(c.srcClutKey);
+                bt3Texture2D pal = palTextureFor(c.srcClutKey);
                 { static unsigned long ok = 0, bad = 0;
                   if (pal.id) ++ok; else ++bad;
                   if (((ok + bad) % 64ul) == 1ul)
                   {
                       // Read the sampler uniform back. A sampler defaults to 0, and unit 0 IS
-                      // texture0 -- so if SetShaderValueTexture failed to assign a unit, uPal
+                      // texture0 -- so if bt3SetShaderValueTexture failed to assign a unit, uPal
                       // silently aliases the source texture and every lookup returns the wrong
                       // thing while every other symptom still looks healthy.
                       int unit = -999;
                       glGetUniformiv(g_shader.id, g_locPal, &unit);
-                      int t0 = -999, t0loc = GetShaderLocation(g_shader, "texture0");
+                      int t0 = -999, t0loc = bt3GetShaderLocation(g_shader, "texture0");
                       if (t0loc >= 0) glGetUniformiv(g_shader.id, t0loc, &t0);
                       std::fprintf(stderr, "[idxpal] palette found %lu, MISSING %lu (key=%llx)"
                                    " | uPal unit=%d  texture0 unit=%d  palTexId=%u  %s\n",
@@ -15136,7 +15624,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (pal.id != 0)
                 {
                     // Bind the LUT to an explicit high texture unit and point the sampler at it.
-                    // SetShaderValueTexture() left uPal at 0 -- and unit 0 is texture0, so the
+                    // bt3SetShaderValueTexture() left uPal at 0 -- and unit 0 is texture0, so the
                     // "palette lookup" was silently re-sampling the SOURCE FBO. Unit 8 is above
                     // the units raylib's batch binds/unbinds (0..4), so the binding survives to
                     // the draw.
@@ -15145,7 +15633,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     glActiveTexture(0x84C0u + kPalUnit);   // GL_TEXTURE0 + 8
                     glBindTexture(0x0DE1u, pal.id);
                     glActiveTexture(0x84C0u);              // leave unit 0 current for everything else
-                    SetShaderValue(g_shader, g_locPal, &kPalUnit, SHADER_UNIFORM_INT);
+                    bt3SetShaderValue(g_shader, g_locPal, &kPalUnit, BT3_SHADER_UNIFORM_INT);
                     {   // Read back AFTER the set -- reading before reports the previous draw's
                         // value and made the fix look like it had not applied.
                         static int shown = 0;
@@ -15153,7 +15641,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         {
                             ++shown;
                             int unit = -999, t0 = -999;
-                            const int t0loc = GetShaderLocation(g_shader, "texture0");
+                            const int t0loc = bt3GetShaderLocation(g_shader, "texture0");
                             glGetUniformiv(g_shader.id, g_locPal, &unit);
                             if (t0loc >= 0) glGetUniformiv(g_shader.id, t0loc, &t0);
                             std::fprintf(stderr, "[idxpal] AFTER set: uPal unit=%d texture0 unit=%d  %s\n",
@@ -15164,7 +15652,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 else if (g_locIdxMode >= 0 && g_curIdxMode != 0.0f)
                 {   // no palette published yet -> do not sample garbage, fall back to normal
                     float z = 0.0f; flushBatch(__LINE__);
-                    SetShaderValue(g_shader, g_locIdxMode, &z, SHADER_UNIFORM_FLOAT); g_curIdxMode = 0.0f;
+                    bt3SetShaderValue(g_shader, g_locIdxMode, &z, BT3_SHADER_UNIFORM_FLOAT); g_curIdxMode = 0.0f;
                 }
             }
         }
@@ -15465,7 +15953,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (s_gd2 && !d2 && !c.srcIndexed && c.srcTbp0 == 336u * 32u && (c.srcPsm == 0x02u || c.srcPsm == 0x0Au) && ++n2 == 99)
             {
                 d2 = true; flushBatch(__LINE__);
-                if (tex.id != 0) { Image ti = LoadImageFromTexture(tex); ExportImage(ti, "/home/z3/Desktop/bt3/work/ga_ctl_tex.png"); UnloadImage(ti); }
+                if (tex.id != 0) { ps2xGfxDumpTexPng(tex, "/home/z3/Desktop/bt3/work/ga_ctl_tex.png"); }
                 std::fprintf(stderr, "[gpualias] dumped consumer-bound texture (id=%u %dx%d fromFbo=%d)\n", tex.id, tex.width, tex.height, fromFbo ? 1 : 0);
             }
         }
@@ -15553,7 +16041,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         }
                         static float cur128 = -1.0f;
                         if (g_locABl128 >= 0 && want128 != cur128)
-                        { flushBatch(__LINE__); SetShaderValue(g_shader, g_locABl128, &want128, SHADER_UNIFORM_FLOAT); cur128 = want128; }
+                        { flushBatch(__LINE__); bt3SetShaderValue(g_shader, g_locABl128, &want128, BT3_SHADER_UNIFORM_FLOAT); cur128 = want128; }
                     }
                     const float mode = aofKeep ? 4.0f
                                      : (s_texaFbo && fromFbo && c.tcc && tex.id != 0
@@ -15606,7 +16094,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                 flushBatch(__LINE__);
                                 const int w = it->second.w, h = it->second.h;
                                 std::vector<uint32_t> buf((size_t)w * h);
-                                rlEnableFramebuffer(it->second.rt.id);
+                                bt3rlEnableFramebuffer(it->second.rt.id);
                                 rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                                 glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                                 char path[256];
@@ -15671,7 +16159,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                 flushBatch(__LINE__);
                                 const int w = it->second.w, h = it->second.h;
                                 std::vector<uint32_t> buf((size_t)w * h);
-                                rlEnableFramebuffer(it->second.rt.id);
+                                bt3rlEnableFramebuffer(it->second.rt.id);
                                 rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                                 glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                                 char path[256];
@@ -15697,7 +16185,7 @@ if (done.size() < 6 && !done.count(c.texKey))
                             {
 done.insert(c.texKey);
                                 flushBatch(__LINE__);
-                                Image im = LoadImageFromTexture(tex);
+                                GsReadImage im; gsReadImageFromTexture(tex, im);
                                 if (im.data && im.width >= 16)
                                 {
                                     const unsigned char *px = (const unsigned char *)im.data;
@@ -15720,7 +16208,7 @@ done.insert(c.texKey);
                                         int l = (q[0]+q[1]+q[2])/3; if (l > mx) mx = l; }
                                       std::fprintf(stderr, "%d\n", mx); }
                                 }
-                                UnloadImage(im);
+                                gsUnloadImage(im);
                             }
                         }
                     }
@@ -15728,7 +16216,7 @@ done.insert(c.texKey);
                         static float curPQ = -1.0f;
                         const float want = (c.isTriangle && c.tri[0].q != 1.0f) ? 1.0f : 0.0f;
                         if (g_locPerspQ >= 0 && want != curPQ)
-                        { flushBatch(__LINE__); SetShaderValue(g_shader, g_locPerspQ, &want, SHADER_UNIFORM_FLOAT); curPQ = want; }
+                        { flushBatch(__LINE__); bt3SetShaderValue(g_shader, g_locPerspQ, &want, BT3_SHADER_UNIFORM_FLOAT); curPQ = want; }
                     }
                     {   // [bilin] PS2X_BILINDBG=1: is the GS MMAG=1 bilinear flag actually
                         // reaching the character draws? Console sets MMAG=1 on every scene draw;
@@ -15765,7 +16253,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             {
                                 done.insert(c.texKey);
                                 flushBatch(__LINE__);
-                                Image im = LoadImageFromTexture(tex);
+                                GsReadImage im; gsReadImageFromTexture(tex, im);
                                 if (im.data)
                                 {
                                     const unsigned char *px = (const unsigned char *)im.data;
@@ -15781,7 +16269,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                         std::fprintf(stderr, " %u=%.1f%%", t2[i6].second, 100.0*(double)t2[i6].first/(double)n);
                                     std::fprintf(stderr, "\n");
                                 }
-                                UnloadImage(im);
+                                gsUnloadImage(im);
                             }
                         }
                     }
@@ -15808,7 +16296,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                 {
                                     const int w2 = it2->second.w, h2 = it2->second.h;
                                     std::vector<uint32_t> b2((size_t)w2 * h2);
-                                    rlEnableFramebuffer(it2->second.rt.id);
+                                    bt3rlEnableFramebuffer(it2->second.rt.id);
                                     glReadPixels(0, 0, w2, h2, 0x1908, 0x1401, b2.data());
                                     std::map<unsigned,size_t> h3; size_t nz = 0;
                                     for (auto v3 : b2) { unsigned av = (v3>>24)&0xFF; ++h3[av]; if (av > 16) ++nz; }
@@ -15851,7 +16339,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                 {
                                     const int w = it->second.w, h = it->second.h;
                                     std::vector<uint32_t> buf((size_t)w * h);
-                                    rlEnableFramebuffer(it->second.rt.id);
+                                    bt3rlEnableFramebuffer(it->second.rt.id);
                                     rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                                     glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                                     std::map<unsigned,size_t> hist;
@@ -15872,7 +16360,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                     // and what alpha does the bound texture actually hold?
                                     if (tex.id != 0 && tex.id != g_white.id)
                                     {
-                                        Image im2 = LoadImageFromTexture(tex);
+                                        GsReadImage im2; gsReadImageFromTexture(tex, im2);
                                         if (im2.data)
                                         {
                                             const unsigned char *q2 = (const unsigned char *)im2.data;
@@ -15888,7 +16376,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                                 std::fprintf(stderr, " %u=%.1f%%", t4[i8].second, 100.0*(double)t4[i8].first/(double)nn);
                                             std::fprintf(stderr, "\n");
                                         }
-                                        UnloadImage(im2);
+                                        gsUnloadImage(im2);
                                     }
                                 }
                             }
@@ -15924,7 +16412,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             const float zs = (ovr && ovr[0]) ? (float)std::atof(ovr)
                                                              : (float)(g_zwbZMax / (16384.0 * 255.0));
                             flushBatch(__LINE__);
-                            SetShaderValue(g_shader, g_locZScale, &zs, SHADER_UNIFORM_FLOAT);
+                            bt3SetShaderValue(g_shader, g_locZScale, &zs, BT3_SHADER_UNIFORM_FLOAT);
                             std::fprintf(stderr, "[zbyte] zMax=%.0f -> uZScale=%.4f%s\n", g_zwbZMax, zs,
                                          (ovr && ovr[0]) ? " (PS2X_ZBYTE override)" : " (derived)");
                         }
@@ -15932,7 +16420,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     {   static float curZT = -1.0f;
                         const float wantZ = zTexBind ? 1.0f : 0.0f;
                         if (g_locZTex >= 0 && wantZ != curZT)
-                        { flushBatch(__LINE__); SetShaderValue(g_shader, g_locZTex, &wantZ, SHADER_UNIFORM_FLOAT); curZT = wantZ; }
+                        { flushBatch(__LINE__); bt3SetShaderValue(g_shader, g_locZTex, &wantZ, BT3_SHADER_UNIFORM_FLOAT); curZT = wantZ; }
                     }
                     {   // [celu] PS2X_CELU=1: histogram the ramp coordinate the cel/outline pass
                         // (tbp 15680, bm 0x62) actually samples. A toon ramp should put most of
@@ -16040,7 +16528,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                            tv[2] != curTexa[2] || tv[3] != curTexa[3]))
                     {
                         flushBatch(__LINE__); // TEXA changes sampled alpha: flush pending verts
-                        SetShaderValue(g_shader, g_locTexa, tv, SHADER_UNIFORM_VEC4);
+                        bt3SetShaderValue(g_shader, g_locTexa, tv, BT3_SHADER_UNIFORM_VEC4);
                         curTexa[0] = tv[0]; curTexa[1] = tv[1]; curTexa[2] = tv[2]; curTexa[3] = tv[3];
                     }
                 }
@@ -16187,7 +16675,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if (first && fit != g_fbos.end() && fit->second.rt.texture.id != 0)
                     {   // what the FBO holds BEFORE this frame's first draw into it: column x=100, rows 130..330 step 20
                         flushBatch(__LINE__);
-                        const Texture2D &t = fit->second.rt.texture;
+                        const bt3Texture2D &t = fit->second.rt.texture;
                         const int sc = t.width >= 512 ? t.width / 512 : 1;
                         unsigned char *px = (unsigned char *)rlReadTexturePixels(t.id, t.width, t.height, t.format);
                         if (px)
@@ -16200,7 +16688,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                 std::fprintf(stderr, " %d:%u", yy, (unsigned)std::max(q[0], std::max(q[1], q[2])));
                             }
                             std::fprintf(stderr, "\n");
-                            RL_FREE(px);
+                            BT3RL_FREE(px);
                         }
                     }
                     std::fprintf(stderr, "[clrprobe] gen=%u ci=%zu/%zu %s dest=%u disp=%u real=%u curFbp=%u fbo=%u %dx%d sci=(%d,%d,%d,%d) cur=(%d,%d,%d,%d) off=(%.0f,%.0f) box=(%.0f,%.0f)-(%.0f,%.0f) abe=%d bm=%02x rgba=(%u,%u,%u,%u) fbmsk=%08x zte=%d ztst=%d tex=%llu white=%d\n",
@@ -16220,9 +16708,9 @@ if (done.size() < 14 && !done.count(c.texKey))
                 static std::unordered_set<uint64_t> s_done;
                 if (s_done.size() < 12 && !s_done.count(c.texKey) && tex.id != g_white.id) {
                     s_done.insert(c.texKey);
-                    Image im = LoadImageFromTexture(tex);
+                    GsReadImage im; gsReadImageFromTexture(tex, im);
                     char p[160]; std::snprintf(p, sizeof(p), "/home/z3/Desktop/bt3/work/dtex_src%u_%llu.png", c.srcTbp0, (unsigned long long)c.texKey);
-                    ExportImage(im, p); UnloadImage(im);
+                    gsExportImage(im, p); gsUnloadImage(im);
                     std::fprintf(stderr, "[dtex] exported %s (%dx%d)\n", p, tex.width, tex.height);
                 }
             }
@@ -16241,14 +16729,14 @@ if (done.size() < 14 && !done.count(c.texKey))
         if (s_mbtaArmed)
         {   flushBatch(__LINE__);
             const float off4 = 0.0f;
-            if (g_locForceA >= 0) SetShaderValue(g_shader, g_locForceA, &off4, SHADER_UNIFORM_FLOAT);
+            if (g_locForceA >= 0) bt3SetShaderValue(g_shader, g_locForceA, &off4, BT3_SHADER_UNIFORM_FLOAT);
             s_mbtaArmed = false;
         }
         if (s_a44vizArmed)
         {   // disarm from the PREVIOUS draw before this one is submitted
             flushBatch(__LINE__);
             const float off = 0.0f;
-            if (g_locUViz >= 0) SetShaderValue(g_shader, g_locUViz, &off, SHADER_UNIFORM_FLOAT);
+            if (g_locUViz >= 0) bt3SetShaderValue(g_shader, g_locUViz, &off, BT3_SHADER_UNIFORM_FLOAT);
             s_a44vizArmed = false;
         }
         applyScissor(c.sx, c.sy, c.sw, c.sh);
@@ -16314,7 +16802,7 @@ if (done.size() < 14 && !done.count(c.texKey))
             if (s_sd && !s_dd && isShadowDecal) const_cast<GsGpuRenderer::DrawCmd &>(c).dateEnable = false;
             {   // [decalsync] at the FIRST decal piece after a non-decal command: flush the pending silhouette-mesh batch while
                 // its FBO is still current, re-bind that FBO directly and force the destination to be entered through a fresh
-                // EndTextureMode/BeginTextureMode cycle. Without this the far fighter's decal sampled the buffer as it was
+                // bt3EndTextureMode/bt3BeginTextureMode cycle. Without this the far fighter's decal sampled the buffer as it was
                 // BEFORE its mesh (the live "wedge"); a glTextureBarrier/glFinish did not help, this bind cycle does
                 // (found as the effective ingredient of a readback probe). PS2X_DECALSYNC=0 disables.
                 static bool prevDecal = false;
@@ -16324,7 +16812,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     auto sit = g_fbos.find(tbp0ToFbp(c.srcTbp0));
                     if (sit != g_fbos.end() && sit->second.rt.texture.id != 0)
                     {
-                        flushBatch(__LINE__); rlEnableFramebuffer(sit->second.rt.id); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
+                        flushBatch(__LINE__); bt3rlEnableFramebuffer(sit->second.rt.id); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                         // PS2X_DECALSYNC=2: also drain the GPU + texture barrier after the rebind. =3: SNAPSHOT -- blit the
                         // silhouette FBO into a private texture (a blit is a hard sync point) and sample the decal from that.
                         static const int s_dsMode = [](){ const char *v = std::getenv("PS2X_DECALSYNC"); return v && v[0] ? std::atoi(v) : 3; }();   // default 3 (snapshot): measured band 41 -> 0 px, shadows byte-identical
@@ -16333,7 +16821,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         {
                             const int w = sit->second.w, h = sit->second.h;
                             if (g_decalSnap.texture.id == 0 || g_decalSnap.texture.width != w || g_decalSnap.texture.height != h)
-                            { if (g_decalSnap.texture.id) { ps2xForgetTexId(g_decalSnap.texture.id); UnloadRenderTexture(g_decalSnap); } g_decalSnap = LoadRenderTexture(w, h); SetTextureFilter(g_decalSnap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(g_decalSnap.texture.id); }
+                            { if (g_decalSnap.texture.id) { ps2xForgetTexId(g_decalSnap.texture.id); ps2x::gfx::GsRtUnload(g_decalSnap); } g_decalSnap = ps2x::gfx::GsRtCreate(w, h); bt3SetTextureFilter(g_decalSnap.texture, TEXTURE_FILTER_POINT); ps2xForgetTexId(g_decalSnap.texture.id); }
                             glBindFramebuffer(0x8CA8 /*READ*/, sit->second.rt.id); glBindFramebuffer(0x8CA9 /*DRAW*/, g_decalSnap.id);
                             glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, 0x4000 /*COLOR*/, 0x2600 /*NEAREST*/);
                             glBindFramebuffer(0x8D40 /*FRAMEBUFFER*/, 0);
@@ -16375,7 +16863,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                 auto it = g_fbos.find(336u);
                                 if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                                 {
-                                    flushBatch(__LINE__); rlEnableFramebuffer(it->second.rt.id);
+                                    flushBatch(__LINE__); bt3rlEnableFramebuffer(it->second.rt.id);
                                     if (s_cmode == 6) { uint32_t px1 = 0; glReadPixels(0, 0, 1, 1, 0x1908, 0x1401, &px1); }
                                     curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                                 }
@@ -16387,7 +16875,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                 {
                                     flushBatch(__LINE__);
                                     const int w = it->second.w, h = it->second.h; std::vector<uint32_t> buf((size_t)w * h);
-                                    rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
+                                    bt3rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                                     rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                                     unsigned long nz = 0; for (int y = 0; y < std::min(h, 256); ++y) for (int x = 0; x < std::min(w, 256); ++x) if (buf[(size_t)(h - 1 - y) * w + x] & 0x00FFFFFFu) ++nz;
                                     std::fprintf(stderr, "[f336census]   >> region before this %s run: %lu nonzero px (fbo id %u tex %u)\n", kind == 0 ? "tri" : kind == 1 ? "spr" : kind == 2 ? "DECAL" : "xfer", nz, it->second.rt.id, it->second.rt.texture.id);
@@ -16462,7 +16950,7 @@ if (done.size() < 14 && !done.count(c.texKey))
             if (!isShadowDecal && g_curReg[3] > 0.5f && g_locRegion >= 0)
             {   // [region] the clamp uniform persists across draws; disable it before any non-decal command (sprites never set it)
                 flushBatch(__LINE__); const float off[4] = {1.f, 0.f, 1.f, 0.f};
-                SetShaderValue(g_shader, g_locRegion, off, SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, off, sizeof off);
+                bt3SetShaderValue(g_shader, g_locRegion, off, BT3_SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, off, sizeof off);
                 // [decalend] the FIRST sprite after a decal batch was lost (the second fighter's 336 clear missed its first
                 // 32-px column -> 17 px of fighter A's silhouette survived -> fighter B's decal projected them = the sliver).
                 // A forced real FBO re-bind before that command (what the readback probes did by accident) fixes it.
@@ -16489,9 +16977,9 @@ if (done.size() < 14 && !done.count(c.texKey))
             }
             if (!isShadowDecal && g_decalUViz)
             {   // [decaldbg 6] the visualiser uniform persists too: turn it off before any non-decal command
-                static int loc = -2; if (loc == -2) loc = GetShaderLocation(g_shader, "uUViz");
+                static int loc = -2; if (loc == -2) loc = bt3GetShaderLocation(g_shader, "uUViz");
                 static bool on = false;
-                if (loc >= 0) { flushBatch(__LINE__); const float z = 0.f; SetShaderValue(g_shader, loc, &z, SHADER_UNIFORM_FLOAT); on = false; }
+                if (loc >= 0) { flushBatch(__LINE__); const float z = 0.f; bt3SetShaderValue(g_shader, loc, &z, BT3_SHADER_UNIFORM_FLOAT); on = false; }
             }
             {   // [decaldbg] PS2X_DECALDBG=1: draw the shadow-decal tiles UNTEXTURED (vertex colour, no alpha test) to see
                 // their screen coverage; =2: textured but alpha test off; =3: like 1 but depth test off too.
@@ -16521,12 +17009,12 @@ if (done.size() < 14 && !done.count(c.texKey))
                     {
                         flushBatch(__LINE__);
                         const int w = it->second.w, h = it->second.h; std::vector<uint32_t> buf((size_t)w * h);
-                        rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
+                        bt3rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                         unsigned long mag = 0; for (uint32_t v : buf) { const unsigned r = v & 0xFF, g = (v >> 8) & 0xFF, b = (v >> 16) & 0xFF; if (r > 150 && b > 150 && g < 80) ++mag; }
-                        Image ic = GenImageColor(w, h, BLACK);
-                        for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) { const uint32_t v = buf[(size_t)y * w + x]; ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255}); }
-                        ImageFlipVertical(&ic); char pc[200]; std::snprintf(pc, sizeof pc, "/home/z3/Desktop/bt3/work/shots/decal_after_fbp%u.png", s_afterDest); ExportImage(ic, pc); UnloadImage(ic);
+                        GsReadImage ic = ps2x::gfx::GsImageMake(w, h, BLACK);
+                        for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) { const uint32_t v = buf[(size_t)y * w + x]; ps2x::gfx::GsImageSetPx(ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255}); }
+                        gsFlipVertical(ic); char pc[200]; std::snprintf(pc, sizeof pc, "/home/z3/Desktop/bt3/work/shots/decal_after_fbp%u.png", s_afterDest); gsExportImage(ic, pc); gsUnloadImage(ic);
                         std::fprintf(stderr, "[decaldump] after decal batch: dest fbp%u %dx%d magenta px %lu | next cmd: tri=%d spr=%d xfer=%d dest=%u srcPsm=%u srcTbp0=%u fbmsk=%08x vA=%u\n", s_afterDest, w, h, mag, (int)c.isTriangle, (int)(!c.isTriangle && !c.isTransfer), (int)c.isTransfer, c.destFbp, (unsigned)c.srcPsm, c.srcTbp0, c.fbmsk, (unsigned)(c.isTriangle ? c.tri[0].a : c.a));
                     }
                 }
@@ -16546,21 +17034,21 @@ if (done.size() < 14 && !done.count(c.texKey))
                             flushBatch(__LINE__);
                             const int w = it->second.w, h = it->second.h;
                             std::vector<uint32_t> buf((size_t)w * h);
-                            rlEnableFramebuffer(it->second.rt.id);
+                            bt3rlEnableFramebuffer(it->second.rt.id);
                             rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                             glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
                             curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                             unsigned long nz = 0, nzA = 0; const int cw = std::min(w, 256), chh = std::min(h, 256);
-                            Image ic = GenImageColor(cw, chh, BLACK), ia = GenImageColor(cw, chh, BLACK);
+                            GsReadImage ic = ps2x::gfx::GsImageMake(cw, chh, BLACK), ia = ps2x::gfx::GsImageMake(cw, chh, BLACK);
                             for (int y = 0; y < chh; ++y) for (int x = 0; x < cw; ++x)
                             {   // FBO rows are bottom-up: region row y is FBO row (h-1-y)
                                 const uint32_t v = buf[(size_t)(h - 1 - y) * w + x];
                                 if (v & 0x00FFFFFFu) ++nz; if (v >> 24) ++nzA;
-                                ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255});
-                                const unsigned char a = v >> 24; ImageDrawPixel(&ia, x, y, Color{a, a, a, 255});
+                                ps2x::gfx::GsImageSetPx(ic, x, y, Color{(unsigned char)(v & 0xFF), (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255});
+                                const unsigned char a = v >> 24; ps2x::gfx::GsImageSetPx(ia, x, y, Color{a, a, a, 255});
                             }
-                            char pb[200]; std::snprintf(pb, sizeof pb, "/home/z3/Desktop/bt3/work/shots/decal_rgb_fbp336_b%d.png", s_batch); ExportImage(ic, pb); ExportImage(ia, "/home/z3/Desktop/bt3/work/shots/decal_alpha_fbp336.png");
-                            UnloadImage(ic); UnloadImage(ia);
+                            char pb[200]; std::snprintf(pb, sizeof pb, "/home/z3/Desktop/bt3/work/shots/decal_rgb_fbp336_b%d.png", s_batch); gsExportImage(ic, pb); gsExportImage(ia, "/home/z3/Desktop/bt3/work/shots/decal_alpha_fbp336.png");
+                            gsUnloadImage(ic); gsUnloadImage(ia);
                             std::fprintf(stderr, "[decaldump] gen %u batch %d fbp336 %dx%d: 256x256 region nonzero RGB %lu px, nonzero A %lu px | piece xy (%.0f,%.0f) dest=%u\n", g_publishGen, s_batch, w, h, nz, nzA, c.tri[0].x, c.tri[0].y, c.destFbp);
                         }
                     }
@@ -16626,21 +17114,21 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
-                    rlCheckRenderBatchLimit(4);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); bt3rlSetTexture(tex.id);
+                    bt3rlCheckRenderBatchLimit(4);
                     ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                    rlBegin(RL_QUADS);
+                    bt3rlBegin(BT3RL_QUADS);
                     for (int k = 0; k < 4; ++k)
                     {
-                        rlColor4ub(q[k].r, q[k].g, q[k].b, q[k].a);
-                        rlTexCoord2f(q[k].u, q[k].v);
-                        rlNormal3f(0.0f, 0.0f, 1.0f);
+                        bt3rlColor4ub(q[k].r, q[k].g, q[k].b, q[k].a);
+                        bt3rlTexCoord2f(q[k].u, q[k].v);
+                        bt3rlNormal3f(0.0f, 0.0f, 1.0f);
                         // ortho maps window_depth = -q[k].z, so pass -q[k].z to store q[k].z.
-                        if (depthOn) rlVertex3f(q[k].x + offX, q[k].y + offY, -q[k].z);
-                        else rlVertex2f(q[k].x + offX, q[k].y + offY);
+                        if (depthOn) bt3rlVertex3f(q[k].x + offX, q[k].y + offY, -q[k].z);
+                        else bt3rlVertex2f(q[k].x + offX, q[k].y + offY);
                     }
-                    rlEnd();
-                    rlSetTexture(0);
+                    bt3rlEnd();
+                    bt3rlSetTexture(0);
                     ++ci;
                     { PS2X_GATE_HIT(); continue; }
                 }
@@ -16799,10 +17287,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                     auto fd = g_fbos.find((uint32_t)s_sw2);
                                     if (fd != g_fbos.end() && fd->second.rt.texture.id != 0)
                                     {
-                                        Image im = LoadImageFromTexture(fd->second.rt.texture);
-                                        ImageFlipVertical(&im);
-                                        ExportImage(im, "/home/z3/Desktop/bt3/work/ours_fbp336_midframe.png");
-                                        UnloadImage(im);
+                                        ps2xGfxDumpTexPng(fd->second.rt.texture, "/home/z3/Desktop/bt3/work/ours_fbp336_midframe.png", true);
                                         std::fprintf(stderr, "[sprwrite] mid-frame fbp%d dumped\n", s_sw2);
                                     }
                                 }
@@ -16851,19 +17336,19 @@ if (done.size() < 14 && !done.count(c.texKey))
                     dqArmed = true;
                 }
             }
-            // Sprites are 2D UI overlays drawn via DrawTexturePro, which emits its own verts
+            // Sprites are 2D UI overlays drawn via bt3DrawTexturePro, which emits its own verts
             // at z=0 (window depth 0 = far) and can't carry per-vertex z. Force depth OFF so
             // sprites always paint in record (painter's) order over the 3D scene and never
             // corrupt the depth buffer. (GS UI sprites use ZTE=0 / ZTST=ALWAYS anyway.)
             // Sprites carry GS depth state too (the fight's big overlay/effect sprites z-test on
             // real GS!). Forcing depth OFF made them paint over the entire z-tested 3D scene ->
             // the "black fight, black characters" GPU bug. With GPU depth on, honor the sprite's
-            // depth state and draw via the manual quad path (DrawTexturePro can't carry z).
+            // depth state and draw via the manual quad path (bt3DrawTexturePro can't carry z).
             const bool sprDepth = depthOn && c.depthTest;
             if (sprDepth) depthForCmd(c);
             else applyDepth(false, 1u, false);
             // PS2X_SPR_MANUAL: draw sprites via manual rlgl (like the triangle path) instead of
-            // DrawTexturePro. Test whether DrawTexturePro is what corrupts big-FBO rendering.
+            // bt3DrawTexturePro. Test whether bt3DrawTexturePro is what corrupts big-FBO rendering.
             static const bool s_sm = [](){ const char *v = std::getenv("PS2X_SPR_MANUAL"); return v && v[0] && v[0] != '0'; }();
             if (s_sm || sprDepth)
             {
@@ -16990,35 +17475,65 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); bt3rlSetTexture(tex.id);
                 ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                rlBegin(RL_QUADS);
+#if defined(_WIN32)
+                if (d3dGsOn() && d3dGsEnsure())
+                {
+                    int rtW = 0, rtH = 0;
+                    if (d3dGsPrepDest(curRealFbp, frameGen, rtW, rtH))
+                    {
+                        g_d3dGsSh.SetVec4("colDiffuse", 1, 1, 1, 1);
+                        g_d3dGsR.SetShader(&g_d3dGsSh);
+            ps2x::gfx::Texture *dt = fromFbo ? d3dFboTexForGl(tex.id) : nullptr;
+            if (!dt) dt = d3dGsTexFor(c.texKey);
+                        { static int s_fb = 0; if (std::getenv("PS2X_TRIDBG") && fromFbo && s_fb < 40)
+                            { ++s_fb; std::fprintf(stderr, "[quadbg] fromFbo dest=%u texid=%u texKey=%llx dt=%d dtWH=%ux%u dx=(%.0f,%.0f)-(%.0f,%.0f) bm=%02x abe=%d\n",
+                                curRealFbp, tex.id, (unsigned long long)c.texKey, dt ? 1 : 0, dt ? dt->Width() : 0u, dt ? dt->Height() : 0u,
+                                c.dx0, c.dy0, c.dx1, c.dy1, (unsigned)c.blendMode, (int)c.abe); } }
+                        { static int s_mvn = 0; if ((c.texKey >> 16) == 0xF00Dull && std::getenv("PS2X_FMVDBG") && s_mvn++ < 16)
+                            std::fprintf(stderr, "[fmvdbg] quadA texKey=%llx dest=%u texFound=%d dx=(%.0f,%.0f) dy=(%.0f,%.0f)\n",
+                                         (unsigned long long)c.texKey, curRealFbp, dt ? 1 : 0, c.dx0, c.dx1, c.dy0, c.dy1); }
+                        g_d3dGsR.SetTexture(dt); d3dGsSetWrap(dt, c); d3dGsSetPal(c, idxRt);
+                        const float zz = sprDepth ? -(float)c.z : 0.0f;
+                        g_d3dGsR.DrawQuad(
+                            d3dGsVtxXY(c.dx0 + offX, c.dy0 + offY, u0, v0, c.r, c.g, c.b, c.a, 1.0f, zz),
+                            d3dGsVtxXY(c.dx0 + offX, c.dy1 + offY, u0, v1, c.r, c.g, c.b, c.a, 1.0f, zz),
+                            d3dGsVtxXY(c.dx1 + offX, c.dy1 + offY, u1, v1, c.r, c.g, c.b, c.a, 1.0f, zz),
+                            d3dGsVtxXY(c.dx1 + offX, c.dy0 + offY, u1, v0, c.r, c.g, c.b, c.a, 1.0f, zz));
+                    }
+                }
+                else
+#endif
+                {
+                bt3rlBegin(BT3RL_QUADS);
                 {   // [emitA] PS2X_CMPWR=1: the vertex alpha actually emitted for the mask composites
                     static const bool s_ea = [](){ const char *v = std::getenv("PS2X_CMPWR"); return v && v[0] && v[0] != '0'; }();
                     static int ean = 0;
                     if (s_ea && g_replayInWindow && ean < 40 && (c.destFbp == 224u || c.destFbp == 336u) && c.srcPsm == 27u && c.texKey)
-                    { ++ean; std::fprintf(stderr, "[emitA] dest=f%u #%d rlColor4ub(%u,%u,%u,%u) tex=%u bm=%02x fbmsk=%08x curRealFbp=%u\n", c.destFbp, ean, c.r, c.g, c.b, c.a, tex.id, (unsigned)c.blendMode, c.fbmsk, curRealFbp); }
+                    { ++ean; std::fprintf(stderr, "[emitA] dest=f%u #%d bt3rlColor4ub(%u,%u,%u,%u) tex=%u bm=%02x fbmsk=%08x curRealFbp=%u\n", c.destFbp, ean, c.r, c.g, c.b, c.a, tex.id, (unsigned)c.blendMode, c.fbmsk, curRealFbp); }
                 }
                 g_emitPath = "quadA";
-                rlColor4ub(c.r, c.g, c.b, c.a);
-                rlNormal3f(0.0f, 0.0f, 1.0f);
+                bt3rlColor4ub(c.r, c.g, c.b, c.a);
+                bt3rlNormal3f(0.0f, 0.0f, 1.0f);
                 if (sprDepth)
                 {
                     const float sz = -(float)c.z;
-                    rlTexCoord2f(u0, v0); rlVertex3f(c.dx0 + offX, c.dy0 + offY, sz);
-                    rlTexCoord2f(u0, v1); rlVertex3f(c.dx0 + offX, c.dy1 + offY, sz);
-                    rlTexCoord2f(u1, v1); rlVertex3f(c.dx1 + offX, c.dy1 + offY, sz);
-                    rlTexCoord2f(u1, v0); rlVertex3f(c.dx1 + offX, c.dy0 + offY, sz);
+                    bt3rlTexCoord2f(u0, v0); bt3rlVertex3f(c.dx0 + offX, c.dy0 + offY, sz);
+                    bt3rlTexCoord2f(u0, v1); bt3rlVertex3f(c.dx0 + offX, c.dy1 + offY, sz);
+                    bt3rlTexCoord2f(u1, v1); bt3rlVertex3f(c.dx1 + offX, c.dy1 + offY, sz);
+                    bt3rlTexCoord2f(u1, v0); bt3rlVertex3f(c.dx1 + offX, c.dy0 + offY, sz);
                 }
                 else
                 {
-                    rlTexCoord2f(u0, v0); rlVertex2f(c.dx0 + offX, c.dy0 + offY);
-                    rlTexCoord2f(u0, v1); rlVertex2f(c.dx0 + offX, c.dy1 + offY);
-                    rlTexCoord2f(u1, v1); rlVertex2f(c.dx1 + offX, c.dy1 + offY);
-                    rlTexCoord2f(u1, v0); rlVertex2f(c.dx1 + offX, c.dy0 + offY);
+                    bt3rlTexCoord2f(u0, v0); bt3rlVertex2f(c.dx0 + offX, c.dy0 + offY);
+                    bt3rlTexCoord2f(u0, v1); bt3rlVertex2f(c.dx0 + offX, c.dy1 + offY);
+                    bt3rlTexCoord2f(u1, v1); bt3rlVertex2f(c.dx1 + offX, c.dy1 + offY);
+                    bt3rlTexCoord2f(u1, v0); bt3rlVertex2f(c.dx1 + offX, c.dy0 + offY);
                 }
-                rlEnd();
-                rlSetTexture(0);
+                bt3rlEnd();
+                bt3rlSetTexture(0);
+                }
                 if (isolateDraw) flushBatch(__LINE__);   // and submit it before anything can change the uniforms
                 {   // [edgestage] PS2X_EDGESTAGE=1: dump the base f336 FBO when the edge generator moves from one
                     // stage to the next (DECAL -> R-sub -> G-sub -> stamps), classified by fbmsk; logs the fields too.
@@ -17038,7 +17553,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             static const char *names[4] = {"none", "decal", "rsub", "gsub"};
                             auto &fb3 = g_fbos[336u]; const int w3 = fb3.w, h3 = fb3.h;
                             std::vector<uint32_t> b3((size_t)w3 * h3); int pf = 0; glGetIntegerv(0x8CA6, &pf);
-                            rlEnableFramebuffer(fb3.rt.id); glReadPixels(0, 0, w3, h3, 0x1908, 0x1401, b3.data()); if (pf) rlEnableFramebuffer((unsigned)pf);
+                            bt3rlEnableFramebuffer(fb3.rt.id); glReadPixels(0, 0, w3, h3, 0x1908, 0x1401, b3.data()); if (pf) bt3rlEnableFramebuffer((unsigned)pf);
                             char pth[256]; std::snprintf(pth, sizeof pth, "%s/edge_%s.ppm", std::getenv("PS2X_GS_REPLAY_OUT") ? std::getenv("PS2X_GS_REPLAY_OUT") : ".", names[lastStage]);
                             if (FILE *f = std::fopen(pth, "wb")) { std::fprintf(f, "P6\n512 448\n255\n");
                                 for (int y = 0; y < 448; ++y) for (int x = 0; x < 512; ++x) { const uint32_t v = (y < h3 && x < w3) ? b3[(size_t)(h3 - 1 - y) * w3 + x] : 0u; const uint8_t rgb[3] = {(uint8_t)(v & 0xFF), (uint8_t)((v >> 8) & 0xFF), (uint8_t)((v >> 16) & 0xFF)}; std::fwrite(rgb, 1, 3, f); }
@@ -17058,7 +17573,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         auto &fb2 = g_fbos[s_ecKey]; const int w2 = fb2.w, h2 = fb2.h;
                         std::vector<uint32_t> buf2((size_t)w2 * h2);
                         int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
-                        rlEnableFramebuffer(fb2.rt.id); glReadPixels(0, 0, w2, h2, 0x1908, 0x1401, buf2.data());
+                        bt3rlEnableFramebuffer(fb2.rt.id); glReadPixels(0, 0, w2, h2, 0x1908, 0x1401, buf2.data());
                         unsigned long n2 = 0, sum2 = 0; const int x0 = (int)std::min(c.dx0, c.dx1), x1 = (int)std::max(c.dx0, c.dx1);
                         for (int y = 0; y < 448 && y < h2; ++y) for (int x = x0; x < x1 && x < w2; ++x) { ++n2; sum2 += buf2[(size_t)(h2 - 1 - y) * w2 + x] >> 24; }
                         unsigned long sumR = 0; for (int y = 0; y < 448 && y < h2; ++y) for (int x = x0; x < x1 && x < w2; ++x) sumR += buf2[(size_t)(h2 - 1 - y) * w2 + x] & 0xFF;
@@ -17069,8 +17584,8 @@ if (done.size() < 14 && !done.count(c.texKey))
             }
             else
             {
-            Rectangle src;
-            // FBO-sourced V band selection: BeginTextureMode's top-left ortho writes draw row y to
+            bt3Rectangle src;
+            // FBO-sourced V band selection: bt3BeginTextureMode's top-left ortho writes draw row y to
             // texture row (texH - y) of the bottom-up GL texture, so GS source rows [sv0..sv1] live
             // at texture rows [texH-sv1 .. texH-sv0]. raylib's negative-height rect {sv0, -(sv1-sv0)}
             // samples v in [sv0/texH .. sv1/texH] (source.y -= source.height, height stays negative)
@@ -17085,9 +17600,9 @@ if (done.size() < 14 && !done.count(c.texKey))
             if (fromFbo && s_atlas && srcSlot) // atlas composite: offset src into the source slot
             {
                 if (s_fsOld)
-                    src = Rectangle{srcSlot->x + c.su0, srcSlot->y + c.sv0, c.su1 - c.su0, -(c.sv1 - c.sv0)};
+                    src = bt3Rectangle{srcSlot->x + c.su0, srcSlot->y + c.sv0, c.su1 - c.su0, -(c.sv1 - c.sv0)};
                 else
-                    src = Rectangle{srcSlot->x + c.su0, (float)g_atlasH - ((float)srcSlot->y + std::max(c.sv0, c.sv1)),
+                    src = bt3Rectangle{srcSlot->x + c.su0, (float)g_atlasH - ((float)srcSlot->y + std::max(c.sv0, c.sv1)),
                                     c.su1 - c.su0, -(c.sv1 - c.sv0)};
             }
             else if (fromFbo) // su/sv are framebuffer pixels == FBO pixels
@@ -17107,16 +17622,16 @@ if (done.size() < 14 && !done.count(c.texKey))
                 const float hoB = (c.bilinear && sameSize && !(idxRt && ps2xIdxHoOff())) ? ps2xHalfTexel() : 0.0f;   // [idxrt] see hoA -- exclusion is opt-in (PS2X_IDXHOOFF=1)
                 const float sx0 = c.su0 - hoB, sx1 = c.su1 - hoB;
                 if (s_fsOld)
-                    src = Rectangle{sx0, c.sv0, sx1 - sx0, -(c.sv1 - c.sv0)};
+                    src = bt3Rectangle{sx0, c.sv0, sx1 - sx0, -(c.sv1 - c.sv0)};
                 else
-                    src = Rectangle{sx0, (float)tex.height / (float)rsTexScale(tex.id) - std::max(c.sv0, c.sv1) + hoB, sx1 - sx0, -(c.sv1 - c.sv0)};   // [rscale] logical space
+                    src = bt3Rectangle{sx0, (float)tex.height / (float)rsTexScale(tex.id) - std::max(c.sv0, c.sv1) + hoB, sx1 - sx0, -(c.sv1 - c.sv0)};   // [rscale] logical space
             }
             else if (c.texKey != 0)
-                src = Rectangle{c.su0, c.sv0, c.su1 - c.su0, c.sv1 - c.sv0};
+                src = bt3Rectangle{c.su0, c.sv0, c.su1 - c.su0, c.sv1 - c.sv0};
             else
-                src = Rectangle{0, 0, 1, 1};
+                src = bt3Rectangle{0, 0, 1, 1};
         if (c.destFbp == 224u && c.texKey != 0) g_f224Mark = 38;
-            const Rectangle dst{c.dx0 + offX, c.dy0 + offY, c.dx1 - c.dx0, c.dy1 - c.dy0};
+            const bt3Rectangle dst{c.dx0 + offX, c.dy0 + offY, c.dx1 - c.dx0, c.dy1 - c.dy0};
             {
                 static const bool s_hop = [](){ const char *v = std::getenv("PS2X_HOP336"); return v && v[0] && v[0] != '0'; }();
                 static int s_hn = 0;
@@ -17219,11 +17734,11 @@ if (done.size() < 14 && !done.count(c.texKey))
                                      dst.x, dst.y, dst.width, dst.height);
                 }
             }
-            {   // [emitB] PS2X_CMPWR=1: edge-generator / composite class going through the DrawTexturePro path
+            {   // [emitB] PS2X_CMPWR=1: edge-generator / composite class going through the bt3DrawTexturePro path
                 static const bool s_eb = [](){ const char *v = std::getenv("PS2X_CMPWR"); return v && v[0] && v[0] != '0'; }();
                 static int ebn = 0;
                 if (s_eb && g_replayInWindow && ebn < 8 && (c.destFbp == 336u || c.destFbp == 224u) && c.srcPsm == 27u && c.texKey)
-                { ++ebn; std::fprintf(stderr, "[emitB] dest=f%u srcPsm=%u bm=%02x fbmsk=%08x via DrawTexturePro tint=(%u,%u,%u,%u) tex=%u curRealFbp=%u src=(%.0f,%.0f %.0fx%.0f) dst=(%.0f,%.0f %.0fx%.0f)\n",
+                { ++ebn; std::fprintf(stderr, "[emitB] dest=f%u srcPsm=%u bm=%02x fbmsk=%08x via bt3DrawTexturePro tint=(%u,%u,%u,%u) tex=%u curRealFbp=%u src=(%.0f,%.0f %.0fx%.0f) dst=(%.0f,%.0f %.0fx%.0f)\n",
                                          c.destFbp, c.srcPsm, (unsigned)c.blendMode, c.fbmsk, c.r, c.g, c.b, c.a, tex.id, curRealFbp, src.x, src.y, src.width, src.height, dst.x, dst.y, dst.width, dst.height); }
             }
             g_emitPath = "drawTexProB";
@@ -17232,9 +17747,99 @@ if (done.size() < 14 && !done.count(c.texKey))
                 const int tsP = rsTexScale(tex.id);
                 if (tsP > 1) { src.x *= tsP; src.y *= tsP; src.width *= tsP; src.height *= tsP; }
             }
-            DrawTexturePro(tex, src, dst, Vector2{0, 0}, 0.0f, Color{c.r, c.g, c.b, c.a});
+#if defined(_WIN32)
+            if (d3dGsOn() && d3dGsEnsure())
+            {
+                ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+                const bool isMovie = (c.texKey >> 16) == 0xF00Dull;
+                int rtW = 0, rtH = 0;
+                ps2x::gfx::RenderTarget *destRt = nullptr;
+                if (isMovie)
+                {   // [d3d11] draw the movie into ONE stable RT (the movie is double-buffered 0/112;
+                    // presenting a fixed buffer removes the new/old alternation).
+                    if (!g_d3dMovieRt) g_d3dMovieRt = new ps2x::gfx::RenderTarget();
+                    if (g_d3dMovieRt->Width() != 512u || g_d3dMovieRt->Height() != 448u)
+                        g_d3dMovieRt->Create(*dev, 512u, 448u, false);
+                    destRt = g_d3dMovieRt;
+                    destRt->Bind(*dev);
+                    rtW = 512; rtH = 448;
+                    d3dGsMirrorUniforms();
+                    d3dGsSetMvp(rtW, rtH);
+                    // [d3d11] The movie quad is a full-frame opaque copy: force replace (blend
+                    // off, full colour mask, no scissor/mirror-scissor). The GS blend state on
+                    // this draw would otherwise leave the old frame showing through on
+                    // alternating publishes.
+                    ps2x::gfx::BlendDesc movieOpaque; movieOpaque.enable = false;
+                    g_d3dGsR.SetBlend(movieOpaque);
+                    g_d3dGsR.SetColorMask(true, true, true, true);
+                    g_d3dGsR.SetScissor(nullptr);
+                }
+                else if (d3dGsPrepDest(curRealFbp, frameGen, rtW, rtH))
+                {
+                    auto it2 = g_fbos.find(curRealFbp);
+                    destRt = (it2 != g_fbos.end()) ? it2->second.d3dRt : nullptr;
+                }
+                if (destRt)
+                {
+                    g_d3dGsSh.SetVec4("colDiffuse", c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, c.a / 255.0f);
+                    g_d3dGsR.SetShader(&g_d3dGsSh);
+                    ps2x::gfx::Texture *dt = fromFbo ? d3dFboTexForGl(tex.id) : nullptr;
+                    if (!dt) dt = d3dGsTexFor(c.texKey);   // null -> Renderer's white tex
+                    { static int s_mvn = 0; if (isMovie && std::getenv("PS2X_FMVDBG") && s_mvn++ < 20)
+                        std::fprintf(stderr, "[fmvdbg] movieDraw key=%llx dt=%d dtWH=%ux%u n=%d\n",
+                                     (unsigned long long)c.texKey, (int)(dt != nullptr),
+                                     dt ? dt->Width() : 0u, dt ? dt->Height() : 0u, s_mvn); }
+                    g_d3dGsR.SetTexture(dt); d3dGsSetWrap(dt, c); d3dGsSetPal(c, idxRt);
+                    const float tw = (float)(tex.width > 0 ? tex.width : 1), th = (float)(tex.height > 0 ? tex.height : 1);
+                    const float u0 = src.x / tw, v0 = src.y / th;
+                    const float u1 = (src.x + src.width) / tw, v1 = (src.y + src.height) / th;
+                    auto mkv = [](float x, float y, float u, float v) {
+                        ps2x::gfx::Vertex vx{};
+                        vx.x = x; vx.y = y; vx.u = u; vx.v = v;
+                        vx.r = vx.g = vx.b = vx.a = 255; vx.q = 1.0f; vx.z = 0.0f;
+                        return vx;
+                    };
+                    g_d3dGsR.DrawQuad(mkv(dst.x, dst.y, u0, v0),
+                                      mkv(dst.x + dst.width, dst.y, u1, v0),
+                                      mkv(dst.x + dst.width, dst.y + dst.height, u1, v1),
+                                      mkv(dst.x, dst.y + dst.height, u0, v1));
+                    if (isMovie) { g_d3dMoviePresent = true; g_d3dPresentTex = &g_d3dMovieRt->Color(); }
+                }
+            }
+            else
+#endif
+            {   // [forceflip] A sprite whose source rect is REVERSED (su1<su0 or sv1<sv0) is a
+                // MIRRORED copy -- BT3's popup frame draws one top-left corner tile 4 times with
+                // reversed UVs. Draw those with the UVs written PER VERTEX (u0/v0..u1/v1 in rect
+                // order) so the mirror is explicit and never depends on bt3DrawTexturePro's negative-
+                // rect handling. The 3 mirrored quadrants then show their borders (TR/BL/BR).
+                if (c.su1 < c.su0 || c.sv1 < c.sv0)
+                {
+                    flushBatch(__LINE__);
+                    const float twf = (float)(tex.width > 0 ? tex.width : 1);
+                    const float thf = (float)(tex.height > 0 ? tex.height : 1);
+                    const float nu0 = src.x / twf, nv0 = src.y / thf;
+                    const float nu1 = (src.x + src.width) / twf, nv1 = (src.y + src.height) / thf;
+                    bt3rlSetTexture(tex.id);
+                    bt3rlBegin(BT3RL_QUADS);
+                    bt3rlColor4ub(c.r, c.g, c.b, c.a);
+                    bt3rlNormal3f(0.0f, 0.0f, 1.0f);
+                    bt3rlTexCoord2f(nu0, nv0); bt3rlVertex2f(dst.x, dst.y);
+                    bt3rlTexCoord2f(nu0, nv1); bt3rlVertex2f(dst.x, dst.y + dst.height);
+                    bt3rlTexCoord2f(nu1, nv1); bt3rlVertex2f(dst.x + dst.width, dst.y + dst.height);
+                    bt3rlTexCoord2f(nu1, nv0); bt3rlVertex2f(dst.x + dst.width, dst.y);
+                    bt3rlEnd();
+                    bt3rlSetTexture(0);
+                    flushBatch(__LINE__);
+                    { static int ff = 0; if (std::getenv("PS2X_FORCEFLIPDBG") && ff++ < 12)
+                        std::fprintf(stderr, "[forceflip] tbp=%u su=%.1f..%.1f sv=%.1f..%.1f dst=(%.0f,%.0f)-(%.0f,%.0f) tex=%dx%d\n",
+                                     c.srcTbp0, c.su0, c.su1, c.sv0, c.sv1, dst.x, dst.y, dst.x + dst.width, dst.y + dst.height, tex.width, tex.height); }
+                }
+                else
+                bt3DrawTexturePro(tex, src, dst, bt3Vector2{0, 0}, 0.0f, Color{c.r, c.g, c.b, c.a});
+            }
             { static const bool s_sk3 = [](){ const char *v = std::getenv("PS2X_SEGCHK"); return v && v[0] && v[0] != '0'; }();
-              static int n5 = 0; if (s_sk3 && c.destFbp == 224u && c.texKey && n5 < 6) ps2xDbgCol0("after-DrawTexturePro", ++n5); }
+              static int n5 = 0; if (s_sk3 && c.destFbp == 224u && c.texKey && n5 < 6) ps2xDbgCol0("after-bt3DrawTexturePro", ++n5); }
             }
             { static const bool s_sk4 = [](){ const char *v = std::getenv("PS2X_SEGCHK"); return v && v[0] && v[0] != '0'; }();
               static int n6 = 0; if (s_sk4 && c.destFbp == 224u && c.texKey && n6 < 6) ps2xDbgCol0("after-emission-paths", ++n6); }
@@ -17330,7 +17935,7 @@ if (done.size() < 14 && !done.count(c.texKey))
         }
         else
         {
-            // Triangle -> degenerate RL_QUADS (0,1,2,2). RL_TRIANGLES doesn't sample in
+            // Triangle -> degenerate BT3RL_QUADS (0,1,2,2). BT3RL_TRIANGLES doesn't sample in
             // raylib's quad batch. FBO sources: flip V.
             // PS2X_NOBLACKTRI: diagnostic — skip triangles whose vertex colors are all near-black
             // (the cel-shading outline shells). Models turning colored = shells are winning the
@@ -17377,22 +17982,22 @@ if (done.size() < 14 && !done.count(c.texKey))
                     depthForCmd(c);
                     const uint64_t h = c.texKey * 2654435761ull;
                     const uint8_t hr = 64 + (uint8_t)(h & 0xBF), hg = 64 + (uint8_t)((h >> 8) & 0xBF), hb = 64 + (uint8_t)((h >> 16) & 0xBF);
-                    rlSetTexture(g_white.id);
-                    rlCheckRenderBatchLimit(4);
+                    bt3rlSetTexture(g_white.id);
+                    bt3rlCheckRenderBatchLimit(4);
                     ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                    rlBegin(RL_QUADS);
+                    bt3rlBegin(BT3RL_QUADS);
                     const int q2[4] = {0, 1, 2, 2};
                     for (int k = 0; k < 4; ++k)
                     {
                         const int i = q2[k];
-                        rlColor4ub(hr, hg, hb, 255);
-                        rlTexCoord2f(0.5f, 0.5f);
-                        rlNormal3f(0.0f, 0.0f, 1.0f);
-                        if (depthOn) rlVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
-                        else rlVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
+                        bt3rlColor4ub(hr, hg, hb, 255);
+                        bt3rlTexCoord2f(0.5f, 0.5f);
+                        bt3rlNormal3f(0.0f, 0.0f, 1.0f);
+                        if (depthOn) bt3rlVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
+                        else bt3rlVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
                     }
-                    rlEnd();
-                    rlSetTexture(0);
+                    bt3rlEnd();
+                    bt3rlSetTexture(0);
                     { PS2X_GATE_HIT(); continue; }
                 }
             }
@@ -17446,17 +18051,17 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
-                    rlCheckRenderBatchLimit(4);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); bt3rlSetTexture(tex.id);
+                    bt3rlCheckRenderBatchLimit(4);
                     ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                    rlBegin(RL_QUADS);
-                    rlColor4ub(255, 255, 255, 255);
-                    rlNormal3f(0.0f, 0.0f, 1.0f);
-                    rlTexCoord2f(0.0f, 0.0f); rlVertex2f(300.0f, 300.0f);
-                    rlTexCoord2f(0.0f, 1.0f); rlVertex2f(300.0f, 430.0f);
-                    rlTexCoord2f(1.0f, 1.0f); rlVertex2f(430.0f, 430.0f);
-                    rlTexCoord2f(1.0f, 0.0f); rlVertex2f(430.0f, 300.0f);
-                    rlEnd();
+                    bt3rlBegin(BT3RL_QUADS);
+                    bt3rlColor4ub(255, 255, 255, 255);
+                    bt3rlNormal3f(0.0f, 0.0f, 1.0f);
+                    bt3rlTexCoord2f(0.0f, 0.0f); bt3rlVertex2f(300.0f, 300.0f);
+                    bt3rlTexCoord2f(0.0f, 1.0f); bt3rlVertex2f(300.0f, 430.0f);
+                    bt3rlTexCoord2f(1.0f, 1.0f); bt3rlVertex2f(430.0f, 430.0f);
+                    bt3rlTexCoord2f(1.0f, 0.0f); bt3rlVertex2f(430.0f, 300.0f);
+                    bt3rlEnd();
                 }
             }
             // [dstinfo] PS2X_DSTINFO=<fbp>: count commands targeting that fbp that SURVIVE every
@@ -17697,15 +18302,39 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
-                        rlCheckRenderBatchLimit(4);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); bt3rlSetTexture(tex.id);
+                        bt3rlCheckRenderBatchLimit(4);
                         ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                        rlBegin(RL_QUADS);
+#if defined(_WIN32)
+                        if (d3dGsOn() && d3dGsEnsure())
+                        {
+                            int rtW = 0, rtH = 0;
+                            if (d3dGsPrepDest(curRealFbp, frameGen, rtW, rtH))
+                            {
+                                g_d3dGsSh.SetVec4("colDiffuse", 1, 1, 1, 1);
+                                g_d3dGsR.SetShader(&g_d3dGsSh);
+                                ps2x::gfx::Texture *dt = fromFbo ? d3dFboTexForGl(tex.id) : nullptr;
+                                if (!dt) dt = d3dGsTexFor(c.texKey);
+                                g_d3dGsR.SetTexture(dt); d3dGsSetWrap(dt, c); d3dGsSetPal(c, idxRt);
+                                auto mktri = [&](int i) {
+                                    ps2x::gfx::Vertex vx{};
+                                    vx.x = c.tri[i].x + offX; vx.y = c.tri[i].y + offY;
+                                    vx.u = c.tri[i].u; vx.v = vflip ? 1.0f - c.tri[i].v : c.tri[i].v;
+                                    vx.r = c.tri[i].r; vx.g = c.tri[i].g; vx.b = c.tri[i].b; vx.a = c.tri[i].a;
+                                    vx.q = c.tri[i].q; vx.z = depthOn ? -c.tri[i].z : 0.0f;
+                                    return vx; };
+                                g_d3dGsR.bt3DrawTriangle(mktri(0), mktri(1), mktri(2));
+                            }
+                        }
+                        else
+#endif
+                        {
+                        bt3rlBegin(BT3RL_QUADS);
                         const int qd[4] = {0, 1, 2, 2};
                         for (int k = 0; k < 4; ++k) {
                             const int i = qd[k];
-                            rlColor4ub(c.tri[i].r, c.tri[i].g, c.tri[i].b, c.tri[i].a);
-                            rlNormal3f(c.tri[i].q, 0.0f, 1.0f);
+                            bt3rlColor4ub(c.tri[i].r, c.tri[i].g, c.tri[i].b, c.tri[i].a);
+                            bt3rlNormal3f(c.tri[i].q, 0.0f, 1.0f);
                             {   // [fbouv] PS2X_FBOUV=1: the draw's UVs are normalized to the source
                                 // it DECLARED (srcTexW/H, e.g. the 256x256 silhouette buffer), but an
                                 // RT sampled from its FBO uses that FBO's own size (fbp336 = 1024x512
@@ -17720,15 +18349,16 @@ if (done.size() < 14 && !done.count(c.texKey))
                                     && tex.width > 0 && tex.height > 0
                                     && (tex.width != c.srcTexW || tex.height != c.srcTexH))
                                 { uu *= (float)c.srcTexW / (float)tex.width; vv *= (float)c.srcTexH / (float)tex.height; }
-                                rlTexCoord2f(uu, vflip ? 1.0f - vv : vv);
+                                bt3rlTexCoord2f(uu, vflip ? 1.0f - vv : vv);
                                 if (g_dbgDecalCmd == &c && i == 0) { static int n3 = 0; if (n3++ < 60) std::fprintf(stderr, "[decaldbg]   EMIT FBOUV-site tri: curFbp=%u fromFbo=%d idxRt=%d tex=%dx%d src=%dx%d rescaled=%d u/v=(%.3f,%.3f)\n", curFbp, (int)fromFbo, (int)idxRt, tex.width, tex.height, (int)c.srcTexW, (int)c.srcTexH, (int)(s_fbouv && fromFbo && !idxRt), uu, vv); }
                             }
-                            rlNormal3f(0.0f, 0.0f, 1.0f);
-                            if (depthOn) rlVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
-                            else rlVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
+                            bt3rlNormal3f(0.0f, 0.0f, 1.0f);
+                            if (depthOn) bt3rlVertex3f(c.tri[i].x + offX, c.tri[i].y + offY, -c.tri[i].z);
+                            else bt3rlVertex2f(c.tri[i].x + offX, c.tri[i].y + offY);
                         }
-                        rlEnd();
-                        rlSetTexture(0);
+                        bt3rlEnd();
+                        }
+                        bt3rlSetTexture(0);
                         flushBatch(__LINE__);
                         uint32_t px = 0;
                         // glReadPixels is BOTTOM-UP while our screen coords are top-down; reading
@@ -17761,11 +18391,11 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
-            rlCheckRenderBatchLimit(4);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); bt3rlSetTexture(tex.id);
+            bt3rlCheckRenderBatchLimit(4);
             {   // [region] declared/actual clamp for RT-sourced draws (see uRegion)
-                static int s_locUViz = -2; if (s_locUViz == -2) s_locUViz = GetShaderLocation(g_shader, "uUViz");
-                { const float v = (g_decalUViz && g_curDecalCmd == &c) ? g_decalUVizMode : 0.f; if (s_locUViz >= 0 && v > 0.5f) { flushBatch(__LINE__); SetShaderValue(g_shader, s_locUViz, &v, SHADER_UNIFORM_FLOAT); } }
+                static int s_locUViz = -2; if (s_locUViz == -2) s_locUViz = bt3GetShaderLocation(g_shader, "uUViz");
+                { const float v = (g_decalUViz && g_curDecalCmd == &c) ? g_decalUVizMode : 0.f; if (s_locUViz >= 0 && v > 0.5f) { flushBatch(__LINE__); bt3SetShaderValue(g_shader, s_locUViz, &v, BT3_SHADER_UNIFORM_FLOAT); } }
                         float reg[4] = {1.f, 0.f, 1.f, 0.f};
             if (g_curDecalCmd == &c && fromFbo && c.srcTexW > 0 && c.srcTexH > 0 && tex.width > 0 && tex.height > 0 && (tex.width != c.srcTexW || tex.height != c.srcTexH))
             {   // clamp INSIDE the declared region by half a texel: the texel just past the region is live FBO data
@@ -17774,7 +18404,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         const float hu = s_inset / (float)tex.width, hv = s_inset / (float)tex.height;
                         reg[0] = ku - hu; reg[1] = vflip ? 1.0f - kv + hv : hv; reg[2] = vflip ? 1.0f - hv : kv - hv; reg[3] = 1.f; }
             if (g_locRegion >= 0 && (reg[0] != g_curReg[0] || reg[1] != g_curReg[1] || reg[2] != g_curReg[2] || reg[3] != g_curReg[3]))
-            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locRegion, reg, SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, reg, sizeof reg); }
+            { flushBatch(__LINE__); bt3SetShaderValue(g_shader, g_locRegion, reg, BT3_SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, reg, sizeof reg); }
             }
             // [glhoist] one pass per triangle of the run (nEmit == 1 for an ordinary command). Everything
             // above ran ONCE; only the vertices differ, so only this loop repeats -- and it must redo every
@@ -17801,10 +18431,50 @@ if (done.size() < 14 && !done.count(c.texKey))
                     tbad = !std::isfinite(TV[i].x) || !std::isfinite(TV[i].y) ||
                            !std::isfinite(TV[i].u) || !std::isfinite(TV[i].v);
                 if (tbad) continue;
-                if (et > 0u) rlCheckRenderBatchLimit(4);   // et == 0 was checked above with the region setup
+                if (et > 0u) bt3rlCheckRenderBatchLimit(4);   // et == 0 was checked above with the region setup
             }
+#if defined(_WIN32)
+            if (d3dGsOn() && d3dGsEnsure())
+            {   // [d3d11] emit this triangle natively and skip the rlgl batch.
+                int rtW = 0, rtH = 0;
+                if (d3dGsPrepDest(curRealFbp, frameGen, rtW, rtH))
+                {
+                    g_d3dGsSh.SetVec4("colDiffuse", 1, 1, 1, 1);
+                    g_d3dGsR.SetShader(&g_d3dGsSh);
+                    ps2x::gfx::Texture *dt = fromFbo ? d3dFboTexForGl(tex.id) : nullptr;
+                    if (!dt) dt = d3dGsTexFor(c.texKey);
+                    g_d3dGsR.SetTexture(dt); d3dGsSetWrap(dt, c); d3dGsSetPal(c, idxRt);
+                    auto mkT = [&](int i) {
+                        ps2x::gfx::Vertex vx{};
+                        vx.x = TV[i].x + offX; vx.y = TV[i].y + offY;
+                        vx.u = TV[i].u; vx.v = vflip ? 1.0f - TV[i].v : TV[i].v;
+                        vx.r = TV[i].r; vx.g = TV[i].g; vx.b = TV[i].b; vx.a = TV[i].a;
+                        vx.q = TV[i].q; vx.z = depthOn ? -TV[i].z : 0.0f;
+                        return vx; };
+                    g_d3dGsR.bt3DrawTriangle(mkT(0), mkT(1), mkT(2));
+                    { static unsigned long s_total = 0; static auto s_lt = std::chrono::steady_clock::now(); ++s_total;
+                      static int s_big = 0;
+                      const unsigned dtw = dt ? dt->Width() : 0u;
+                      if (std::getenv("PS2X_TRIDBG") && s_big < 50 && (dt == nullptr || dtw >= 128u))
+                        std::fprintf(stderr, "[tridbg] TEX tri dest=%u fromFbo=%d dt=%d dtWH=%ux%u texKey=%llx bm=%02x abe=%d tcc=%d fba=%d xy=(%.0f,%.0f)(%.0f,%.0f)(%.0f,%.0f)\n",
+                                     curRealFbp, (int)fromFbo, (int)(dt != nullptr), dtw, dt ? dt->Height() : 0u,
+                                     (unsigned long long)c.texKey, (unsigned)c.blendMode, (int)c.abe, (int)c.tcc, (int)c.fba,
+                                     TV[0].x, TV[0].y, TV[1].x, TV[1].y, TV[2].x, TV[2].y), ++s_big;
+                      { const auto now = std::chrono::steady_clock::now();
+                        if (std::getenv("PS2X_TRIDBG") && std::chrono::duration<double>(now - s_lt).count() >= 2.0)
+                        { std::fprintf(stderr, "[tridbg] total tris drawn=%lu\n", s_total); s_lt = now; } } }
+                }
+                continue;
+            }
+#endif
             ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-            rlBegin(RL_QUADS);
+            const bool gsgl = ps2x::gfx::GsGlActive();   // [gsgl A3.2b] submit this command through gfx::gl
+            auto EMIT_C = [&](int r, int g, int b, int a) { if (gsgl) ps2x::gfx::GsGlEmit().Color4ub((unsigned char)r, (unsigned char)g, (unsigned char)b, (unsigned char)a); else bt3rlColor4ub((unsigned char)r, (unsigned char)g, (unsigned char)b, (unsigned char)a); };
+            auto EMIT_UV = [&](float u, float v) { if (gsgl) ps2x::gfx::GsGlEmit().TexCoord2f(u, v); else bt3rlTexCoord2f(u, v); };
+            auto EMIT_N = [&](float q) { if (gsgl) ps2x::gfx::GsGlEmit().Q(q); else bt3rlNormal3f(q, 0.0f, 1.0f); };
+            auto EMIT_V2 = [&](float x, float y) { if (gsgl) ps2x::gfx::GsGlEmit().Vertex2f(x, y); else bt3rlVertex2f(x, y); };
+            auto EMIT_V3 = [&](float x, float y, float z) { if (gsgl) ps2x::gfx::GsGlEmit().Vertex3f(x, y, z); else bt3rlVertex3f(x, y, z); };
+            if (gsgl) { bt3rlDrawRenderBatchActive(); ps2x::gfx::GsGlTexture(tex.id); gsGlMirrorUniforms(); ps2x::gfx::GsGlEmit().Begin(ps2x::gfx::GsEmit::Quads); } else bt3rlBegin(BT3RL_QUADS);
             const int quad[4] = {0, 1, 2, 2};
             // PS2X_TRIWHITE: diagnostic — draw triangles with WHITE vertex color, exposing the raw
             // texture sample (separates color-modulation bugs from UV/sampling bugs).
@@ -17812,18 +18482,18 @@ if (done.size() < 14 && !done.count(c.texKey))
             for (int k = 0; k < 4; ++k)
             {
                 const int i = quad[k];
-                if (s_triWhite) rlColor4ub(255, 255, 255, 255);
-                else rlColor4ub(TV[i].r, TV[i].g, TV[i].b, TV[i].a);
+                if (s_triWhite) EMIT_C(255, 255, 255, 255);
+                else EMIT_C(TV[i].r, TV[i].g, TV[i].b, TV[i].a);
                 // PS2X_TRIUVGRID: force screen-derived UVs. If textures appear smeared across the
                 // scene, GL sampling works and the recorded UV values are the bug; if still flat,
                 // the batch texcoord path itself is broken.
                 static const bool s_uvGrid = [](){ const char *v = std::getenv("PS2X_TRIUVGRID"); return v && v[0] && v[0] != '0'; }();
                 if (s_uvGrid)
                 {
-                    rlTexCoord2f(TV[i].x / 512.0f, TV[i].y / 448.0f);
-                    rlNormal3f(0.0f, 0.0f, 1.0f);
-                    if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
-                    else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
+                    EMIT_UV(TV[i].x / 512.0f, TV[i].y / 448.0f);
+                    EMIT_N(0.0f);
+                    if (depthOn) EMIT_V3(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                    else EMIT_V2(TV[i].x + offX, TV[i].y + offY);
                     { PS2X_GATE_HIT(); continue; }
                 }
                 // PS2X_RAMPU=<u>: force a CONSTANT u on the cel/ramp class (tbp 15680), which
@@ -17834,10 +18504,10 @@ if (done.size() < 14 && !done.count(c.texKey))
                                                    return v && v[0] ? (float)std::atof(v) : -1.0f; }();
                 if (s_rampU >= 0.0f && c.srcTbp0 == 15680u)
                 {
-                    rlTexCoord2f(s_rampU, vflip ? 1.0f - TV[i].v : TV[i].v);
-                    rlNormal3f(0.0f, 0.0f, 1.0f);
-                    if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
-                    else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
+                    EMIT_UV(s_rampU, vflip ? 1.0f - TV[i].v : TV[i].v);
+                    EMIT_N(0.0f);
+                    if (depthOn) EMIT_V3(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                    else EMIT_V2(TV[i].x + offX, TV[i].y + offY);
                     { PS2X_GATE_HIT(); continue; }
                 }
                 // PS2X_SSUV=<tbp>: force SCREEN-SPACE UVs for one source class. The fbp502
@@ -17850,17 +18520,17 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (s_ssuv >= 0 && (int)c.srcTbp0 == (unsigned)s_ssuv)
                 {
                     const float su = TV[i].x / 512.0f, sv = TV[i].y / 448.0f;
-                    rlTexCoord2f(su, vflip ? 1.0f - sv : sv);
-                    rlNormal3f(0.0f, 0.0f, 1.0f);
-                    if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
-                    else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
+                    EMIT_UV(su, vflip ? 1.0f - sv : sv);
+                    EMIT_N(0.0f);
+                    if (depthOn) EMIT_V3(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                    else EMIT_V2(TV[i].x + offX, TV[i].y + offY);
                     { PS2X_GATE_HIT(); continue; }
                 }
                 if (fromFbo && s_atlas && srcSlot) {
                     // remap source-normalized UV into the atlas slot (V flipped for bottom-up GL)
                     float au = ((float)srcSlot->x + TV[i].u * (float)srcSlot->w) / (float)g_atlasW;
                     float av = 1.0f - ((float)srcSlot->y + TV[i].v * (float)srcSlot->h) / (float)g_atlasH;
-                    rlTexCoord2f(au, av);
+                    EMIT_UV(au, av);
                 } else
                 {
                     float uu = TV[i].u, vv = TV[i].v; const float q = TV[i].q;
@@ -17871,17 +18541,17 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if ((q != 1.0f || s_fbouv2 || g_curDecalCmd == &c) && fromFbo && c.srcTexW > 0 && c.srcTexH > 0 && tex.width > 0 && tex.height > 0
                         && (tex.width != c.srcTexW || tex.height != c.srcTexH))
                     { uu *= (float)c.srcTexW / (float)tex.width; vv *= (float)c.srcTexH / (float)tex.height; }
-                    if (q != 1.0f) rlTexCoord2f(uu, vflip ? (q - vv) : vv);
-                    else rlTexCoord2f(uu, vflip ? 1.0f - vv : vv);
+                    if (q != 1.0f) EMIT_UV(uu, vflip ? (q - vv) : vv);
+                    else EMIT_UV(uu, vflip ? 1.0f - vv : vv);
                 }
                 if (g_dbgDecalCmd == &c && i == 0) { static int n4 = 0; if (n4++ < 6) { auto fit3 = g_fbos.find(336u); if (fit3 != g_fbos.end()) { int prevFb = 0, att = -1, attType = -1; glGetIntegerv(0x8CA6, &prevFb); glBindFramebuffer(0x8D40, fit3->second.rt.id); glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD1, &att); glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD0, &attType); glBindFramebuffer(0x8D40, (unsigned)prevFb); std::fprintf(stderr, "[decaldbg]   ATTACH fbp336 fbo=%u colour attachment name=%d type=0x%x | decal samples tex.id=%u (rt.texture.id=%u)\n", fit3->second.rt.id, att, attType, tex.id, fit3->second.rt.texture.id); } } }
-                if (g_dbgDecalCmd == &c && i == 0) { static int n2 = 0; float gt[4] = {-9,-9,-9,-9}, gf = -9, gp = -9, gc = -9, gi = -9, gx = -9, ga = -9, gr = -9, gz = -9, gzs = -9; if (g_locZTex >= 0) glGetUniformfv(g_shader.id, g_locZTex, &gz); { int lz = GetShaderLocation(g_shader, "uZScale"); if (lz >= 0) glGetUniformfv(g_shader.id, lz, &gzs); } if (g_locTexa >= 0) glGetUniformfv(g_shader.id, g_locTexa, gt); if (g_locTcc >= 0) glGetUniformfv(g_shader.id, g_locTcc, &gc); if (g_locIdxMode >= 0) glGetUniformfv(g_shader.id, g_locIdxMode, &gi); if (g_locTfx >= 0) glGetUniformfv(g_shader.id, g_locTfx, &gx); if (g_locAtst >= 0) glGetUniformfv(g_shader.id, g_locAtst, &ga); if (g_locAref >= 0) glGetUniformfv(g_shader.id, g_locAref, &gr); if (g_locFboOne >= 0) glGetUniformfv(g_shader.id, g_locFboOne, &gf); if (g_locPerspQ >= 0) glGetUniformfv(g_shader.id, g_locPerspQ, &gp); if (n2++ < 6000) std::fprintf(stderr, "[decaldbg]   EMIT generic tri: chunk=%d curFbp=%u vflip=%d fromFbo=%d tex.id=%u %dx%d src=%dx%d u/v/q v0=(%.3f,%.3f,%.4f) uRegion=(%.4f,%.4f,%.4f,%.0f) | GL uTexa=(%.2f,%.2f,%.2f,%.2f) cache=(%.2f,%.2f,%.2f,%.2f) uFboOne=%.1f uPerspQ=%.1f uTcc=%.1f uIdxMode=%.1f uTfx=%.1f uAtst=%.1f uAref=%.2f uZTex=%.1f uZScale=%.3f\n", (int)m_chunkMode, curFbp, (int)vflip, (int)fromFbo, tex.id, tex.width, tex.height, (int)c.srcTexW, (int)c.srcTexH, TV[0].u, TV[0].v, TV[0].q, g_curReg[0], g_curReg[1], g_curReg[2], g_curReg[3], gt[0], gt[1], gt[2], gt[3], g_curTexa[0], g_curTexa[1], g_curTexa[2], g_curTexa[3], gf, gp, gc, gi, gx, ga, gr, gz, gzs); }
-                rlNormal3f(TV[i].q, 0.0f, 1.0f);   // .x carries the GS q (PS2X_PERSPQ)
+                if (g_dbgDecalCmd == &c && i == 0) { static int n2 = 0; float gt[4] = {-9,-9,-9,-9}, gf = -9, gp = -9, gc = -9, gi = -9, gx = -9, ga = -9, gr = -9, gz = -9, gzs = -9; if (g_locZTex >= 0) glGetUniformfv(g_shader.id, g_locZTex, &gz); { int lz = bt3GetShaderLocation(g_shader, "uZScale"); if (lz >= 0) glGetUniformfv(g_shader.id, lz, &gzs); } if (g_locTexa >= 0) glGetUniformfv(g_shader.id, g_locTexa, gt); if (g_locTcc >= 0) glGetUniformfv(g_shader.id, g_locTcc, &gc); if (g_locIdxMode >= 0) glGetUniformfv(g_shader.id, g_locIdxMode, &gi); if (g_locTfx >= 0) glGetUniformfv(g_shader.id, g_locTfx, &gx); if (g_locAtst >= 0) glGetUniformfv(g_shader.id, g_locAtst, &ga); if (g_locAref >= 0) glGetUniformfv(g_shader.id, g_locAref, &gr); if (g_locFboOne >= 0) glGetUniformfv(g_shader.id, g_locFboOne, &gf); if (g_locPerspQ >= 0) glGetUniformfv(g_shader.id, g_locPerspQ, &gp); if (n2++ < 6000) std::fprintf(stderr, "[decaldbg]   EMIT generic tri: chunk=%d curFbp=%u vflip=%d fromFbo=%d tex.id=%u %dx%d src=%dx%d u/v/q v0=(%.3f,%.3f,%.4f) uRegion=(%.4f,%.4f,%.4f,%.0f) | GL uTexa=(%.2f,%.2f,%.2f,%.2f) cache=(%.2f,%.2f,%.2f,%.2f) uFboOne=%.1f uPerspQ=%.1f uTcc=%.1f uIdxMode=%.1f uTfx=%.1f uAtst=%.1f uAref=%.2f uZTex=%.1f uZScale=%.3f\n", (int)m_chunkMode, curFbp, (int)vflip, (int)fromFbo, tex.id, tex.width, tex.height, (int)c.srcTexW, (int)c.srcTexH, TV[0].u, TV[0].v, TV[0].q, g_curReg[0], g_curReg[1], g_curReg[2], g_curReg[3], gt[0], gt[1], gt[2], gt[3], g_curTexa[0], g_curTexa[1], g_curTexa[2], g_curTexa[3], gf, gp, gc, gi, gx, ga, gr, gz, gzs); }
+                EMIT_N(TV[i].q);   // .x carries the GS q (PS2X_PERSPQ)
                 // ortho maps window_depth = -z, so pass -z to store the intended depth.
-                if (depthOn) rlVertex3f(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
-                else rlVertex2f(TV[i].x + offX, TV[i].y + offY);
+                if (depthOn) EMIT_V3(TV[i].x + offX, TV[i].y + offY, -TV[i].z);
+                else EMIT_V2(TV[i].x + offX, TV[i].y + offY);
             }
-            rlEnd();
+            if (gsgl) { ps2x::gfx::GsGlEmit().End(); ps2x::gfx::GsGlFlush(); } else bt3rlEnd();
             }   // [glhoist] end of the per-triangle emit
             {   // [decalbatch] consecutive shadow-decal pieces share every GL state and the same FBO texture: keep the
                 // texture bound so rlgl accumulates them in ONE draw entry (one glDrawArrays per run of pieces instead of
@@ -17892,7 +18562,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     const GsGpuRenderer::DrawCmd &n = DC[ci + 1];
                     return n.isTriangle && n.srcPsm == 1u && n.srcTbp0 == 10752u && (n.blendMode & 0xFFu) == 0x44u && !n.isTransfer && n.destFbp == c.destFbp;
                 };
-                if (!nextIsDecal()) rlSetTexture(0);
+                if (!nextIsDecal()) bt3rlSetTexture(0);
             }
 
             // [pixprobe] (with PS2X_SRCDIAG): after emitting a character triangle, flush the
@@ -17997,7 +18667,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     {
                         glBindTexture(0x0DE1, (unsigned)prevBind);
                         flushBatch(__LINE__);
-                        rlDisableColorBlend();
+                        bt3rlDisableColorBlend();
                         if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
@@ -18037,16 +18707,16 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); bt3rlSetTexture(tex.id);
                         ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                        rlBegin(RL_QUADS);
-                        rlColor4ub(255, 255, 255, 255);
-                        rlNormal3f(0.0f, 0.0f, 1.0f);
-                        rlTexCoord2f(0.02f, 0.25f); rlVertex2f(10, 10);
-                        rlTexCoord2f(0.02f, 0.25f); rlVertex2f(10, 18);
-                        rlTexCoord2f(0.02f, 0.25f); rlVertex2f(18, 18);
-                        rlTexCoord2f(0.02f, 0.25f); rlVertex2f(18, 10);
-                        rlEnd();
+                        bt3rlBegin(BT3RL_QUADS);
+                        bt3rlColor4ub(255, 255, 255, 255);
+                        bt3rlNormal3f(0.0f, 0.0f, 1.0f);
+                        bt3rlTexCoord2f(0.02f, 0.25f); bt3rlVertex2f(10, 10);
+                        bt3rlTexCoord2f(0.02f, 0.25f); bt3rlVertex2f(10, 18);
+                        bt3rlTexCoord2f(0.02f, 0.25f); bt3rlVertex2f(18, 18);
+                        bt3rlTexCoord2f(0.02f, 0.25f); bt3rlVertex2f(18, 10);
+                        bt3rlEnd();
                         // Twin quad with NEGATIVE V (like the real char draws) at (30,10):
                         // GL REPEAT should wrap -0.75 -> 0.25 and give the same color as the
                         // positive twin. If this one is black, negative UVs are the killer.
@@ -18089,19 +18759,19 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); bt3rlSetTexture(tex.id);
                         ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                        rlBegin(RL_QUADS);
-                        rlColor4ub(255, 255, 255, 255);
-                        rlNormal3f(0.0f, 0.0f, 1.0f);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(30, 10);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(30, 18);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(38, 18);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(38, 10);
-                        rlEnd();
-                        rlSetTexture(0);
+                        bt3rlBegin(BT3RL_QUADS);
+                        bt3rlColor4ub(255, 255, 255, 255);
+                        bt3rlNormal3f(0.0f, 0.0f, 1.0f);
+                        bt3rlTexCoord2f(0.02f, -0.75f); bt3rlVertex2f(30, 10);
+                        bt3rlTexCoord2f(0.02f, -0.75f); bt3rlVertex2f(30, 18);
+                        bt3rlTexCoord2f(0.02f, -0.75f); bt3rlVertex2f(38, 18);
+                        bt3rlTexCoord2f(0.02f, -0.75f); bt3rlVertex2f(38, 10);
+                        bt3rlEnd();
+                        bt3rlSetTexture(0);
                         flushBatch(__LINE__);
-                        rlEnableColorBlend();
+                        bt3rlEnableColorBlend();
                         // Third twin at (50,10): drawn under the CHAR DRAW'S OWN blend state
                         // (constant-alpha k=FIX/128 was just applied for this very cmd) — the
                         // last remaining state difference vs the real draws.
@@ -18144,17 +18814,17 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // f336 DoF/blur composite) land on the Nx scene -- point sampling makes
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
-                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                    || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); bt3rlSetTexture(tex.id);
                         ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
-                        rlBegin(RL_QUADS);
-                        rlColor4ub(128, 128, 128, 255);
-                        rlNormal3f(0.0f, 0.0f, 1.0f);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(50, 10);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(50, 18);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(58, 18);
-                        rlTexCoord2f(0.02f, -0.75f); rlVertex2f(58, 10);
-                        rlEnd();
-                        rlSetTexture(0);
+                        bt3rlBegin(BT3RL_QUADS);
+                        bt3rlColor4ub(128, 128, 128, 255);
+                        bt3rlNormal3f(0.0f, 0.0f, 1.0f);
+                        bt3rlTexCoord2f(0.02f, -0.75f); bt3rlVertex2f(50, 10);
+                        bt3rlTexCoord2f(0.02f, -0.75f); bt3rlVertex2f(50, 18);
+                        bt3rlTexCoord2f(0.02f, -0.75f); bt3rlVertex2f(58, 18);
+                        bt3rlTexCoord2f(0.02f, -0.75f); bt3rlVertex2f(58, 10);
+                        bt3rlEnd();
+                        bt3rlSetTexture(0);
                         flushBatch(__LINE__);
                         unsigned char q[4] = {9, 9, 9, 9};
                         unsigned char qn[4] = {9, 9, 9, 9};
@@ -18221,7 +18891,7 @@ if (done.size() < 14 && !done.count(c.texKey))
         // final draw was therefore lost -- for BT3's boot memory-card box that draw is libgs's
         // sceGsSwapDBuff CLEAR of the back buffer (memory bt3-mc-prompt-ghosting), so the buffer
         // kept its history and the closing box left a stack of borders. Proven by a probe whose
-        // rlDrawRenderBatchActive() alone made the replay clean. PS2X_TAILFLUSH=0 reverts.
+        // bt3rlDrawRenderBatchActive() alone made the replay clean. PS2X_TAILFLUSH=0 reverts.
         static const bool s_tf = [](){ const char *v = std::getenv("PS2X_TAILFLUSH"); return !(v && v[0] == '0'); }();
         if (s_tf) flushBatch(__LINE__);
     }
@@ -18248,18 +18918,18 @@ if (done.size() < 14 && !done.count(c.texKey))
     if (s_triTest && !g_glTex.empty())
     {
         beginFbp(displayFbp);
-        Texture2D tt = g_glTex.begin()->second;
+        bt3Texture2D tt = g_glTex.begin()->second;
         for (auto &kv : g_glTex) if (kv.second.width >= 256) { tt = kv.second; break; }
-        rlSetTexture(tt.id);
-        rlBegin(RL_QUADS);
-        rlColor4ub(255, 255, 255, 255);
-        rlNormal3f(0.0f, 0.0f, 1.0f);
-        rlTexCoord2f(0.0f, 0.0f); rlVertex2f(50.0f, 300.0f);
-        rlTexCoord2f(0.0f, 1.0f); rlVertex2f(50.0f, 430.0f);
-        rlTexCoord2f(1.0f, 1.0f); rlVertex2f(250.0f, 430.0f);
-        rlTexCoord2f(1.0f, 0.0f); rlVertex2f(250.0f, 300.0f);
-        rlEnd();
-        rlSetTexture(0);
+        bt3rlSetTexture(tt.id);
+        bt3rlBegin(BT3RL_QUADS);
+        bt3rlColor4ub(255, 255, 255, 255);
+        bt3rlNormal3f(0.0f, 0.0f, 1.0f);
+        bt3rlTexCoord2f(0.0f, 0.0f); bt3rlVertex2f(50.0f, 300.0f);
+        bt3rlTexCoord2f(0.0f, 1.0f); bt3rlVertex2f(50.0f, 430.0f);
+        bt3rlTexCoord2f(1.0f, 1.0f); bt3rlVertex2f(250.0f, 430.0f);
+        bt3rlTexCoord2f(1.0f, 0.0f); bt3rlVertex2f(250.0f, 300.0f);
+        bt3rlEnd();
+        bt3rlSetTexture(0);
         flushBatch(__LINE__);
     }
 
@@ -18285,13 +18955,13 @@ if (done.size() < 14 && !done.count(c.texKey))
             if (fit != g_fbos.end() && fit->second.rt.texture.id != 0)
             {
                 endMode();
-                BeginTextureMode(fit->second.rt);
+                ps2x::gfx::GsRtBegin(fit->second.rt);
                 const int fh2 = fit->second.h;
                 const int rx = 60, rw = 170, ryTop = 15, rh = 20;
                 const int ry = fh2 - (ryTop + rh); // FBO is bottom-up
                 std::vector<uint8_t> px((size_t)rw * rh * 4);
                 glReadPixels(rx, ry, rw, rh, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, px.data());
-                EndTextureMode();
+                ps2x::gfx::GsRtEnd();
                 char prof[176];
                 for (int x = 0; x < rw; x += 2)
                 {
@@ -18305,8 +18975,8 @@ if (done.size() < 14 && !done.count(c.texKey))
             }
         }
     }
-    if (curBlendOn == 0) rlEnableColorBlend(); // restore GL default (a trailing opaque prim left it off)
-    if (curBlendEq >= 1) rlSetBlendMode(RL_BLEND_ALPHA); // restore from subtractive/constant
+    if (curBlendOn == 0) bt3rlEnableColorBlend(); // restore GL default (a trailing opaque prim left it off)
+    if (curBlendEq >= 1) bt3rlSetBlendMode(BT3RL_BLEND_ALPHA); // restore from subtractive/constant
     endMode();
 
     // PS2X_ATLASTEST: draw a bright test rectangle into the DISPLAY slot after all game draws. If the
@@ -18315,11 +18985,11 @@ if (done.size() < 14 && !done.count(c.texKey))
     if (s_atlas && std::getenv("PS2X_ATLASTEST") && g_atlas.texture.id != 0 && g_atlasSlots.count(displayFbp))
     {
         AtlasSlot &ts = g_atlasSlots[displayFbp];
-        BeginTextureMode(g_atlas);
-        rlDisableScissorTest();
-        DrawRectangle(ts.x + 40, ts.y + 40, 200, 160, Color{255, 0, 255, 255});
+        ps2x::gfx::GsRtBegin(g_atlas);
+        bt3rlDisableScissorTest();
+        bt3DrawRectangle(ts.x + 40, ts.y + 40, 200, 160, Color{255, 0, 255, 255});
         flushBatch(__LINE__);
-        EndTextureMode();
+        ps2x::gfx::GsRtEnd();
     }
 
     // PS2X_TEXDIAG: per-frame draw census -> pin WHY the battle is black in GPU. Logs how draws
@@ -18562,10 +19232,10 @@ if (done.size() < 14 && !done.count(c.texKey))
                 {
                     static std::vector<unsigned char> px;
                     px.resize((size_t)W * bandH * 4);
-                    rlEnableFramebuffer(fit->second.rt.id);
+                    bt3rlEnableFramebuffer(fit->second.rt.id);
                     // GS row 0 is the TOP of the buffer; the GL texture is bottom-up.
                     glReadPixels(0, H - bandH, W, bandH, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, px.data());
-                    rlDisableFramebuffer();
+                    bt3rlDisableFramebuffer();
                     unsigned long green = 0, lit = 0;
                     for (size_t i = 0; i + 3 < px.size(); i += 4)
                     {
@@ -18621,9 +19291,9 @@ if (done.size() < 14 && !done.count(c.texKey))
             {
                 static int s_sn = 0;
                 if (s_sn < 24) {
-                    Image img = LoadImageFromTexture(g_atlas.texture); ImageFlipVertical(&img);
+                    GsReadImage img; gsReadImageFromTexture(g_atlas.texture, img); gsFlipVertical(img);
                     char p[160]; std::snprintf(p, sizeof(p), "/home/z3/Desktop/bt3/work/seq_%02d.png", s_sn++);
-                    ExportImage(img, p); UnloadImage(img);
+                    gsExportImage(img, p); gsUnloadImage(img);
                     std::fprintf(stderr, "[atlasseq] %s f=%d displayFbp=%u cmds=%zu\n", p, s_fn, displayFbp, cmds.size());
                 }
             }
@@ -18638,9 +19308,9 @@ if (done.size() < 14 && !done.count(c.texKey))
                     {
                         const int zw = z0->second.w, zh = z0->second.h;
                         std::vector<float> zb((size_t)zw * zh, 0.0f);
-                        rlEnableFramebuffer(z0->second.rt.id);
+                        bt3rlEnableFramebuffer(z0->second.rt.id);
                         glReadPixels(0, 0, zw, zh, 0x1902 /*GL_DEPTH_COMPONENT*/, 0x1406 /*GL_FLOAT*/, zb.data());
-                        rlDisableFramebuffer();
+                        bt3rlDisableFramebuffer();
                         FILE *zf = std::fopen("/home/z3/Desktop/bt3/work/ours_depth_fbp0.raw", "wb");
                         if (zf) { std::fwrite(&zw, 4, 1, zf); std::fwrite(&zh, 4, 1, zf);
                                   std::fwrite(zb.data(), 4, zb.size(), zf); std::fclose(zf); }
@@ -18660,20 +19330,14 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if (kv.second.rt.texture.id == 0) continue;
                     char path[160];
                     std::snprintf(path, sizeof(path), "/home/z3/Desktop/bt3/work/gpu_all_fbp%u.png", kv.first);
-                    Image img = LoadImageFromTexture(kv.second.rt.texture);
-                    ImageFlipVertical(&img);
-                    ExportImage(img, path);
-                    UnloadImage(img);
+                    ps2xGfxDumpTexPng(kv.second.rt.texture, path, true);
                     std::fprintf(stderr, "  [fbp-dump] fbp%u %dx%d\n", kv.first, kv.second.w, kv.second.h);
                 }
                 // Atlas mode: g_fbos is empty; dump the ONE atlas texture + log every slot rect so we
                 // can see which slot holds the fight, the HUD, and whether present crops the right one.
                 if (s_atlas && g_atlas.texture.id != 0)
                 {
-                    Image img = LoadImageFromTexture(g_atlas.texture);
-                    ImageFlipVertical(&img);
-                    ExportImage(img, "/home/z3/Desktop/bt3/work/gpu_atlas.png");
-                    UnloadImage(img);
+                    ps2xGfxDumpTexPng(g_atlas.texture, "/home/z3/Desktop/bt3/work/gpu_atlas.png", true);
                     std::fprintf(stderr, "  [atlas-dump] %dx%d displayFbp=%u presentSrc=(%d,%d) slots:", g_atlasW, g_atlasH, displayFbp, m_presentSrcX, m_presentSrcY);
                     for (auto &kv : g_atlasSlots) std::fprintf(stderr, " fbp%u=(%d,%d,%d,%d)", kv.first, kv.second.x, kv.second.y, kv.second.w, kv.second.h);
                     std::fprintf(stderr, "\n");
@@ -18739,10 +19403,10 @@ if (done.size() < 14 && !done.count(c.texKey))
                     auto fit = g_fbos.find((uint32_t)v);
                     if (fit == g_fbos.end() || fit->second.rt.texture.id == 0)
                     { std::fprintf(stderr, " f%lu=none", v); continue; }
-                    Image img = LoadImageFromTexture(fit->second.rt.texture);
+                    GsReadImage img; gsReadImageFromTexture(fit->second.rt.texture, img);
                     const unsigned char *px0 = (const unsigned char *)img.data;
                     unsigned long n = 0, nz = 0, na = 0; double sl = 0, sa = 0;
-                    if (px0 && img.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+                    if (px0 && img.format == BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
                         for (int y = 0; y < img.height; y += 4)
                             for (int x = 0; x < img.width; x += 4)
                             {
@@ -18760,7 +19424,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     {   // alpha HISTOGRAM: the mean cannot tell a uniform wash from a gradient,
                         // and that is exactly the distinction that matters for an INDEX page.
                         unsigned long h8[8] = {0,0,0,0,0,0,0,0};
-                        if (px0 && img.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+                        if (px0 && img.format == BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
                             for (int y = 0; y < img.height; y += 4)
                                 for (int x = 0; x < img.width; x += 4)
                                     ++h8[px0[((size_t)y * img.width + x) * 4 + 3] >> 5];
@@ -18774,24 +19438,24 @@ if (done.size() < 14 && !done.count(c.texKey))
                         static const char *s_dd = std::getenv("PS2X_FBOLIVE_DUMP");
                         static int s_tick = 0;
                         if (s_dd && s_dd[0] && (s_tick % 5) == 0 && px0
-                            && img.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+                            && img.format == BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
                         {
-                            Image a{}; a.width = img.width; a.height = img.height; a.mipmaps = 1;
-                            a.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-                            a.data = RL_MALLOC((size_t)img.width * img.height * 4);
+                            bt3Image a{}; a.width = img.width; a.height = img.height; a.mipmaps = 1;
+                            a.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                            a.data = BT3RL_MALLOC((size_t)img.width * img.height * 4);
                             unsigned char *dp = (unsigned char *)a.data;
                             for (size_t i = 0; i < (size_t)img.width * img.height; ++i)
                             { const unsigned char al8 = px0[i * 4 + 3];
                               dp[i*4+0] = dp[i*4+1] = dp[i*4+2] = al8; dp[i*4+3] = 255; }
-                            ImageFlipVertical(&a);
+                            gsFlipVertical(a);
                             char pth[256];
                             std::snprintf(pth, sizeof pth, "%s/alpha_f%lu_%04d.png", s_dd, v, s_tick);
-                            ExportImage(a, pth);
-                            RL_FREE(a.data);
+                            gsExportImage(a, pth);
+                            BT3RL_FREE(a.data);
                         }
                         if (v == 224u) ++s_tick;
                     }
-                    UnloadImage(img);
+                    gsUnloadImage(img);
                 }
                 std::fprintf(stderr, "\n");
             }
@@ -18826,11 +19490,11 @@ if (done.size() < 14 && !done.count(c.texKey))
         const bool pdArmed = !s_pdFmv || g_fmvBlitCount.load(std::memory_order_relaxed) > 0u;
         if (s_pd && pdArmed && outId != 0 && (++s_pf % s_pdEvery) == 0 && cmds.size() > s_pdMin && s_pn < s_pdCap)
         {
-            Texture2D pt{};
+            bt3Texture2D pt{};
             pt.id = outId;
             {   // [rscale] the SAME trap debugSavePresent documents: at render scale > 1 the
                 // present texture is N x native while m_presentTexW/H still describe the native
-                // size, so LoadImageFromTexture allocates too little and glGetTexImage overruns
+                // size, so bt3LoadImageFromTexture allocates too little and glGetTexImage overruns
                 // it (SIGSEGV). Ask GL for the real level size instead of trusting the fields.
                 int tw = 0, th = 0;
                 glBindTexture(0x0DE1 /*GL_TEXTURE_2D*/, outId);
@@ -18840,10 +19504,10 @@ if (done.size() < 14 && !done.count(c.texKey))
                 pt.width  = tw > 0 ? tw : (m_presentTexW > 0 ? m_presentTexW : 512);
                 pt.height = th > 0 ? th : (m_presentTexH > 0 ? m_presentTexH : 448);
             }
-            pt.mipmaps = 1; pt.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-            Image im = LoadImageFromTexture(pt);
+            pt.mipmaps = 1; pt.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            GsReadImage im; gsReadImageFromTexture(pt, im);
             char p[128]; std::snprintf(p, sizeof(p), "/home/z3/Desktop/bt3/work/present_%02d.png", s_pn++);
-            ExportImage(im, p); UnloadImage(im);
+            gsExportImage(im, p); gsUnloadImage(im);
             std::fprintf(stderr, "[presentdump] %s outId=%u %dx%d srcXY=(%d,%d) dispWH=(%d,%d)\n",
                          p, outId, m_presentTexW, m_presentTexH, m_presentSrcX, m_presentSrcY, m_dispW, m_dispH);
         }
@@ -18863,11 +19527,11 @@ if (done.size() < 14 && !done.count(c.texKey))
         }
         if (g_forensicThisFrame)
         {
-            Texture2D pt{}; pt.id = outId; pt.width = m_presentTexW; pt.height = m_presentTexH;
-            pt.mipmaps = 1; pt.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-            Image pim = LoadImageFromTexture(pt);
+            bt3Texture2D pt{}; pt.id = outId; pt.width = m_presentTexW; pt.height = m_presentTexH;
+            pt.mipmaps = 1; pt.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            GsReadImage pim; gsReadImageFromTexture(pt, pim);
             char pp[160]; std::snprintf(pp, sizeof(pp), "/home/z3/Desktop/bt3/work/forensic_g%u_present.png", frameGen);
-            ExportImage(pim, pp); UnloadImage(pim);
+            gsExportImage(pim, pp); gsUnloadImage(pim);
             std::fprintf(stderr, "[forensic] gen=%u cmds=%zu displayFbp=%u outId=%u hint=%u destAreas:", frameGen, cmds.size(), displayFbp, outId, m_hintDisplayFbp);
             for (auto &kv : destArea) std::fprintf(stderr, " f%u=%.0f%s", kv.first, kv.second, sourceFbps.count(kv.first) ? "(RT)" : "");
             std::fprintf(stderr, "\n");
@@ -18884,11 +19548,11 @@ if (done.size() < 14 && !done.count(c.texKey))
             for (auto &kv : g_fbos)
             {
                 if (kv.second.rt.texture.id != outId) continue;
-                BeginTextureMode(kv.second.rt);
-                rlDisableScissorTest();
-                DrawRectangle(60, 60, 120, 120, Color{255, 0, 255, 255});
+                ps2x::gfx::GsRtBegin(kv.second.rt);
+                bt3rlDisableScissorTest();
+                bt3DrawRectangle(60, 60, 120, 120, Color{255, 0, 255, 255});
                 flushBatch(__LINE__);
-                EndTextureMode();
+                ps2x::gfx::GsRtEnd();
                 break;
             }
         }
@@ -18952,9 +19616,9 @@ if (done.size() < 14 && !done.count(c.texKey))
                 static std::vector<uint32_t> vpx;
                 vpx.assign((size_t)vw * vh, 0u);
                 flushBatch(__LINE__);
-                rlEnableFramebuffer(vfbo.rt.id);
+                bt3rlEnableFramebuffer(vfbo.rt.id);
                 glReadPixels(0, vfbo.h - vh, vw, vh, 0x1908, 0x1401, vpx.data());
-                rlDisableFramebuffer();
+                bt3rlDisableFramebuffer();
                 for (int y = 0; y < vh / 2; ++y)               // glReadPixels is bottom-up
                     std::swap_ranges(vpx.begin() + (size_t)y * vw, vpx.begin() + (size_t)(y + 1) * vw,
                                      vpx.begin() + (size_t)(vh - 1 - y) * vw);
@@ -19060,7 +19724,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 // src RGBA=(2,3,2,247) where the live scene reads mean RGB 90.5.
                 { extern std::unordered_set<uint32_t> g_drawnThisFrame;
                   if (!g_drawnThisFrame.count(fbp)) continue; }
-                // ⚠ These pages hold UPLOADED texture data as well as rendered content -- that is
+                // âš  These pages hold UPLOADED texture data as well as rendered content -- that is
                 // the whole reason srcUploaded arbitration exists. Writing the rendered extent
                 // back unconditionally every frame destroyed whatever the guest had uploaded
                 // there, and the damage compounded per match (corrupted by match 3-4, vs 8 with
@@ -19105,10 +19769,10 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (rowBytes > 0) h = (int)std::min<long>(h, availBytes / rowBytes);
                 if (w <= 0 || h <= 0) continue;
                 px.resize((size_t)w * h);
-                rlEnableFramebuffer(it->second.rt.id);
+                bt3rlEnableFramebuffer(it->second.rt.id);
                 rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                 glReadPixels(0, 0, w, h, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, px.data());
-                rlDisableFramebuffer();
+                bt3rlDisableFramebuffer();
                 // glReadPixels is bottom-up; VRAM rows are top-down.
                 for (int y = 0; y < h / 2; ++y)
                     std::swap_ranges(px.begin() + (size_t)y * w, px.begin() + (size_t)(y + 1) * w,
@@ -19180,10 +19844,10 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (w <= 0 || h <= 0) continue;
                 static std::vector<uint32_t> buf;
                 buf.resize((size_t)w * h);
-                rlEnableFramebuffer(it->second.rt.id);
+                bt3rlEnableFramebuffer(it->second.rt.id);
                 rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
                 glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data());
-                rlDisableFramebuffer();
+                bt3rlDisableFramebuffer();
                 unsigned long nz = 0, tot = 0, sum = 0; unsigned amax = 0;
                 std::map<unsigned, unsigned long> hist;
                 for (int y = 0; y < h; y += 3)
@@ -19218,23 +19882,23 @@ if (done.size() < 14 && !done.count(c.texKey))
                         std::fprintf(stderr, "[alphadump] fbp224 FBO absent -- not an arena frame, skipping dump\n");
                     if (s_dmp && (inFight || std::getenv("PS2X_DUMPANY")) && (++seen[fbp] % (std::getenv("PS2X_DUMPANY") ? 1 : 4)) == 0)
                     {
-                        Image ia = GenImageColor(w, h, BLACK);
-                        Image ic = GenImageColor(w, h, BLACK);
+                        GsReadImage ia = ps2x::gfx::GsImageMake(w, h, BLACK);
+                        GsReadImage ic = ps2x::gfx::GsImageMake(w, h, BLACK);
                         for (int y = 0; y < h; ++y)
                             for (int x = 0; x < w; ++x)
                             {
                                 const uint32_t v = buf[(size_t)y * w + x];
                                 const unsigned char a = (v >> 24) & 0xFF;
-                                ImageDrawPixel(&ia, x, y, Color{a, a, a, 255});
-                                ImageDrawPixel(&ic, x, y, Color{(unsigned char)(v & 0xFF),
+                                ps2x::gfx::GsImageSetPx(ia, x, y, Color{a, a, a, 255});
+                                ps2x::gfx::GsImageSetPx(ic, x, y, Color{(unsigned char)(v & 0xFF),
                                     (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255});
                             }
-                        ImageFlipVertical(&ia); ImageFlipVertical(&ic);
+                        gsFlipVertical(ia); gsFlipVertical(ic);
                         char pa[192], pc[192];
                         std::snprintf(pa, sizeof pa, "/home/z3/Desktop/bt3/work/shots/alpha_fbp%u.png", fbp);
                         std::snprintf(pc, sizeof pc, "/home/z3/Desktop/bt3/work/shots/rgb_fbp%u.png", fbp);
-                        ExportImage(ia, pa); ExportImage(ic, pc);
-                        UnloadImage(ia); UnloadImage(ic);
+                        gsExportImage(ia, pa); gsExportImage(ic, pc);
+                        gsUnloadImage(ia); gsUnloadImage(ic);
                         std::fprintf(stderr, "[alphadump] wrote alpha_fbp%u.png / rgb_fbp%u.png\n", fbp, fbp);
                     }
                 }
@@ -19248,6 +19912,13 @@ if (done.size() < 14 && !done.count(c.texKey))
     }
     clrProbeCols("post-present", frameGen);
     g_lastOutId = outId;
+#if defined(_WIN32)
+    // [d3d11] remember the native texture that matches the presented GL texture, so the present
+    // shows the fbp the GL path actually chose (display parity/latch), not a fixed buffer. Only
+    // overwrite when the mapping exists -- a null here would drop the present to the readback
+    // path, which reads an empty GL buffer in native mode (a black frame -> flicker).
+    if (ps2x::gfx::Texture *pt = d3dFboTexForGl(outId)) g_d3dPresentTex = pt;
+#endif
     return outId;
 }
 
@@ -19256,12 +19927,12 @@ bool GsGpuRenderer::debugSavePresent(const char *path)
 {
     if (g_lastOutId == 0)
         return false;
-    Texture2D t{};
+    bt3Texture2D t{};
     t.id = g_lastOutId;
     {   // [rscale] at render scale > 1 the present texture is scale x native while
-        // m_presentTexW/H still describe the native size; LoadImageFromTexture allocates
+        // m_presentTexW/H still describe the native size; bt3LoadImageFromTexture allocates
         // from these fields, so glGetTexImage overran the buffer (SIGSEGV in
-        // ImageFlipVertical on every replay at scale 4). Ask GL for the real level size.
+        // bt3ImageFlipVertical on every replay at scale 4). Ask GL for the real level size.
         int tw = 0, th = 0;
         glBindTexture(0x0DE1 /*GL_TEXTURE_2D*/, g_lastOutId);
         glGetTexLevelParameteriv(0x0DE1, 0, 0x1000 /*GL_TEXTURE_WIDTH*/, &tw);
@@ -19271,14 +19942,167 @@ bool GsGpuRenderer::debugSavePresent(const char *path)
         t.height = th > 0 ? th : (m_presentTexH > 0 ? m_presentTexH : 448);
     }
     t.mipmaps = 1;
-    t.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-    Image im = LoadImageFromTexture(t);
-    ImageFlipVertical(&im); // FBO textures are bottom-up
+    t.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    GsReadImage im; gsReadImageFromTexture(t, im);
+    gsFlipVertical(im); // FBO textures are bottom-up
     // Junk GS alpha makes the PNG look transparent -- force opaque for inspection.
-    if (im.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 && im.data)
+    if (im.format == BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 && im.data)
         for (int i = 0; i < im.width * im.height; ++i)
             ((unsigned char *)im.data)[i * 4 + 3] = 255;
-    const bool ok = ExportImage(im, path);
-    UnloadImage(im);
+    const bool ok = gsExportImage(im, path);
+    gsUnloadImage(im);
     return ok;
+}
+
+bool GsGpuRenderer::copyPresentPixels(std::vector<unsigned char> &outRgba, int &w, int &h)
+{
+    if (g_lastOutId == 0)
+        return false;
+
+    int tw = 0, th = 0;
+    glBindTexture(0x0DE1 /*GL_TEXTURE_2D*/, g_lastOutId);
+    glGetTexLevelParameteriv(0x0DE1, 0, 0x1000 /*GL_TEXTURE_WIDTH*/, &tw);
+    glGetTexLevelParameteriv(0x0DE1, 0, 0x1001 /*GL_TEXTURE_HEIGHT*/, &th);
+    glBindTexture(0x0DE1, 0);
+    w = tw > 0 ? tw : (m_presentTexW > 0 ? m_presentTexW : 512);
+    h = th > 0 ? th : (m_presentTexH > 0 ? m_presentTexH : 448);
+
+    // [d3d11] Asynchronous readback: glReadPixels into a PBO (returns immediately) and map the
+    // PBO issued LAST frame. One frame of latency, but no per-frame GPU->CPU stall (the old
+    // bt3LoadImageFromTexture path synced every frame and halved the fps).
+    typedef void (*PFN_GenFB)(int, unsigned *);
+    typedef void (*PFN_BindFB)(unsigned, unsigned);
+    typedef void (*PFN_FBTex)(unsigned, unsigned, unsigned, unsigned, int);
+    typedef void (*PFN_GenBuf)(int, unsigned *);
+    typedef void (*PFN_BindBuf)(unsigned, unsigned);
+    typedef void (*PFN_BufData)(unsigned, ptrdiff_t, const void *, unsigned);
+    typedef void (*PFN_ReadPix)(int, int, int, int, unsigned, unsigned, void *);
+    typedef void *(*PFN_Map)(unsigned, ptrdiff_t, ptrdiff_t, unsigned);
+    typedef unsigned char (*PFN_Unmap)(unsigned);
+    static PFN_GenFB  pGenFB  = reinterpret_cast<PFN_GenFB>(ps2xGlProc("glGenFramebuffers"));
+    static PFN_BindFB pBindFB = reinterpret_cast<PFN_BindFB>(ps2xGlProc("glBindFramebuffer"));
+    static PFN_FBTex  pFBTex  = reinterpret_cast<PFN_FBTex>(ps2xGlProc("glFramebufferTexture2D"));
+    static PFN_GenBuf pGenBuf = reinterpret_cast<PFN_GenBuf>(ps2xGlProc("glGenBuffers"));
+    static PFN_BindBuf pBindBuf = reinterpret_cast<PFN_BindBuf>(ps2xGlProc("glBindBuffer"));
+    static PFN_BufData pBufData = reinterpret_cast<PFN_BufData>(ps2xGlProc("glBufferData"));
+    static PFN_ReadPix pRead   = reinterpret_cast<PFN_ReadPix>(ps2xGlProc("glReadPixels"));
+    static PFN_Map    pMap     = reinterpret_cast<PFN_Map>(ps2xGlProc("glMapBufferRange"));
+    static PFN_Unmap  pUnmap   = reinterpret_cast<PFN_Unmap>(ps2xGlProc("glUnmapBuffer"));
+    if (!pGenFB || !pBindFB || !pFBTex || !pGenBuf || !pBindBuf || !pBufData || !pRead || !pMap || !pUnmap)
+        return false;
+
+    static unsigned sFbo = 0, sPbo[2] = {0, 0};
+    static int sW = 0, sH = 0, sCur = 0;
+    static bool sPending = false;
+    const ptrdiff_t bytes = (ptrdiff_t)w * (ptrdiff_t)h * 4;
+
+    if (sW != w || sH != h)
+    {
+        if (!sFbo) pGenFB(1, &sFbo);
+        if (!sPbo[0]) pGenBuf(2, sPbo);
+        for (int i = 0; i < 2; ++i)
+        {
+            pBindBuf(0x88EB /*GL_PIXEL_PACK_BUFFER*/, sPbo[i]);
+            pBufData(0x88EB, bytes, nullptr, 0x88E1 /*GL_STREAM_READ*/);
+        }
+        pBindBuf(0x88EB, 0);
+        sW = w; sH = h; sPending = false;
+    }
+
+    // Attach the current present texture so glReadPixels reads it.
+    pBindFB(0x8D40 /*GL_FRAMEBUFFER*/, sFbo);
+    pFBTex(0x8D40, 0x8CE0 /*GL_COLOR_ATTACHMENT0*/, 0x0DE1, g_lastOutId, 0);
+
+    bool filled = false;
+    if (sPending)
+    {
+        pBindBuf(0x88EB, sPbo[sCur ^ 1]);
+        void *m = pMap(0x88EB, 0, bytes, 0x0001 /*GL_MAP_READ_BIT*/);
+        if (m)
+        {
+            outRgba.assign((size_t)bytes, 255);
+            std::memcpy(outRgba.data(), m, (size_t)bytes);
+            pUnmap(0x88EB);
+            filled = true;
+        }
+        pBindBuf(0x88EB, 0);
+    }
+
+    pBindBuf(0x88EB, sPbo[sCur]);
+    pRead(0, 0, w, h, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, nullptr);
+    pBindBuf(0x88EB, 0);
+    pBindFB(0x8D40, 0);
+
+    sCur ^= 1;
+    sPending = true;
+    return filled;
+}
+
+#if defined(_WIN32)
+// [d3d11] The one texture the present must use: the movie buffer while a movie is playing,
+// otherwise the GL-selected/latched present texture. SRV and size must come from the SAME
+// texture or the present blit scales/crops with the wrong dimensions (the corrupt movie frame).
+static ps2x::gfx::Texture *d3dPresentTexPtr()
+{
+    extern std::atomic<uint32_t> g_fmvDisplayFbp, g_fmvDisplayHold;
+    // While a movie is playing, always present the single stable movie RT (it holds the latest
+    // movie frame). Presenting the latch/GS buffer on publishes that carry no movie quad is what
+    // made the picture alternate and the width jump (448 vs the latch's 512).
+    if (g_fmvDisplayHold.load(std::memory_order_relaxed) > 0u && g_d3dMovieRt)
+        return &g_d3dMovieRt->Color();
+    if (g_d3dMoviePresent && g_d3dMovieRt) return &g_d3dMovieRt->Color();
+    if (g_fmvDisplayHold.load(std::memory_order_relaxed) > 0u)
+    {
+        const uint32_t f = g_fmvDisplayFbp.load(std::memory_order_relaxed);
+        auto it = g_fbos.find(f);
+        if (it != g_fbos.end() && it->second.d3dRt) return &it->second.d3dRt->Color();
+    }
+    return g_d3dPresentTex;
+}
+#endif
+
+void *GsGpuRenderer::d3dPresentSRV() const
+{
+#if defined(_WIN32)
+    ps2x::gfx::Texture *t = d3dPresentTexPtr();
+    return t ? t->NativeSRV() : nullptr;
+#else
+    return nullptr;
+#endif
+}
+
+unsigned GsGpuRenderer::d3dPresentWidth() const
+{
+#if defined(_WIN32)
+    ps2x::gfx::Texture *t = d3dPresentTexPtr();
+    return t ? t->Width() : 0u;
+#else
+    return 0u;
+#endif
+}
+
+unsigned GsGpuRenderer::d3dPresentHeight() const
+{
+#if defined(_WIN32)
+    ps2x::gfx::Texture *t = d3dPresentTexPtr();
+    return t ? t->Height() : 0u;
+#else
+    return 0u;
+#endif
+}
+
+bool GsGpuRenderer::d3dDumpPresent(const char *path)
+{
+#if defined(_WIN32)
+    ps2x::gfx::D3D11Device *dev = ps2x::gfx::VideoDevice();
+    ps2x::gfx::Texture *t = d3dPresentTexPtr();
+    if (!dev || !t || t->Width() == 0) return false;
+    std::vector<uint8_t> buf;
+    if (!ps2x::gfx::ReadbackRGBA(*dev, *t, buf)) return false;
+    bt3Image img(static_cast<void *>(buf.data()), (int)t->Width(), (int)t->Height(), 1,
+              BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    return gsExportImage(img, path);
+#else
+    (void)path; return false;
+#endif
 }

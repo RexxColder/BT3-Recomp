@@ -37,6 +37,17 @@ namespace ps2tex
     // True once a replacement directory has been indexed (PS2X_TEXREPLACE=<dir>).
     bool replacementsEnabled();
 
+    // [texrepdiag] A pack entry that has this TEX0 hash, whatever its CLUT: a lookup miss whose hash
+    // pair differs ONLY in the palette comes back here. Returns the file stem (name without extension)
+    // or nullptr. Used to tell "the pack does not have this texture" from "our CLUT differs".
+    const char *findByTex0Hash(uint64_t tex0Hash);
+
+    // [texrepdiag] Is there a pack entry for this exact hash PAIR (what the lookup keys on)? A miss
+    // with hasPair=true is not "absent from the pack": it is queued for decode or failed to decode.
+    bool hasPair(uint64_t tex0Hash, uint64_t clutHash);
+
+
+
     // Look up a replacement for `id` and decode it to RGBA8. Matches on the HASH PAIR only --
     // the bits field is advisory (a real pack was built by an older PCSX2 whose TEXA convention
     // differs, so an exact-name match would silently find nothing). Returns false if absent.
@@ -53,5 +64,18 @@ namespace ps2tex
     // decoded blob from here. PS2X_TEXPACK_ASYNC=0 restores the synchronous load.
     bool loadReplacement(const TexIdent &id, uint64_t texKey, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt);
     bool takeReadySwap(uint64_t texKey);
+
+    // [texmega] One-shot diagnostic dump (enable PS2X_TEXMEGA=1, arm with F9). While armed it
+    // writes to <dir>: texlookup.tsv (every lookup, HIT/MISS + full identity), the original
+    // decode and the replacement as PNG pairs (<name>_orig / <name>_new), the whole pack index
+    // (texpack_index.tsv) and a summary. Bounded, so a single capture is enough to see why a
+    // texture is not replaced.
+    void megaArm(const char *dir, double seconds);
+    bool megaActive();
+    void megaDumpIndex();
+    void megaLookup(const TexIdent &id, uint64_t texKey, uint32_t tbp0, uint32_t tbw,
+                    uint8_t psm, uint8_t tw, uint8_t th, bool hit,
+                    const uint8_t *origRgba, int ow, int oh,
+                    const uint8_t *repRgba, int rw, int rh, int rfmt);
 }
 #endif

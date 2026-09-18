@@ -42,6 +42,7 @@ file(GLOB LAUNCHER_SOURCES CONFIGURE_DEPENDS
 # 7z/LZMA2 texture pack and disc dumps need it.
 set(LA_LINK "")
 set(LA_INCLUDES "")
+set(LA_EXTRA "")
 find_package(LibArchive QUIET)
 if(LibArchive_FOUND)
     set(LA_LINK ${LibArchive_LIBRARIES})
@@ -54,11 +55,39 @@ else()
     set(ENABLE_TAR OFF CACHE BOOL "" FORCE)
     set(ENABLE_CPIO OFF CACHE BOOL "" FORCE)
     set(ENABLE_CAT OFF CACHE BOOL "" FORCE)
+    # [lzma] libarchive needs liblzma to read 7z/LZMA2 (the texture pack). Windows has no
+    # system liblzma, so fetch xz; then satisfy libarchive's find_package(LibLZMA) (CMake's
+    # standard module) with xz's source tree + target. Pre-setting the module's REQUIRED_VARS
+    # as cache entries makes its check_c_source_compiles honour them (the .lib does not exist
+    # until build time). Without this the fetched libarchive builds LZMA-less and the texture
+    # install fails with "lzma codec unsupported".
+    FetchContent_Declare(liblzma
+        URL https://github.com/tukaani-project/xz/releases/download/v5.6.2/xz-5.6.2.tar.gz
+        # [xzpin] Pinned like libarchive below. Hash of the tarball whose .sig verifies against Lasse
+        # Collin's release key (3690C240CE51B4670D30AD1C38EE757D69184620); 5.6.2 postdates the
+        # 5.6.0/5.6.1 backdoor.
+        URL_HASH SHA256=8bfd20c0e1d86f0402f2497cfa71c6ab62d4cd35fd704276e3140bfb71414519
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        EXCLUDE_FROM_ALL)   # only the liblzma target is needed; its tools/tests do not build under clang-cl
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(CREATE_XZ_SYMLINKS OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(liblzma)
+    set(LIBLZMA_INCLUDE_DIR "${liblzma_SOURCE_DIR}/src/liblzma/api" CACHE PATH "" FORCE)
+    set(LIBLZMA_LIBRARY liblzma CACHE STRING "" FORCE)   # a target name: resolved at link time
+    set(LIBLZMA_HAS_AUTO_DECODER 1 CACHE INTERNAL "" FORCE)
+    set(LIBLZMA_HAS_EASY_ENCODER 1 CACHE INTERNAL "" FORCE)
+    set(LIBLZMA_HAS_LZMA_PRESET 1 CACHE INTERNAL "" FORCE)
     FetchContent_Declare(libarchive
         URL https://github.com/libarchive/libarchive/releases/download/v3.8.1/libarchive-3.8.1.tar.gz
         URL_HASH SHA256=bde832a5e3344dc723cfe9cc37f8e54bde04565bfe6f136bc1bd31ab352e9fab)
     FetchContent_MakeAvailable(libarchive)
     set(LA_LINK archive_static)
+    # Make the xz target build before libarchive and make sure the launcher links it too:
+    # archive_static is a static lib, so its LIBLZMA dependency does not propagate.
+    if(TARGET archive_static)
+        add_dependencies(archive_static liblzma)
+    endif()
+    set(LA_EXTRA liblzma)
 endif()
 
 set(LAUNCHER_RES "")
@@ -105,6 +134,7 @@ target_link_libraries(Launcher PRIVATE
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Network
     ${LA_LINK}
+    ${LA_EXTRA}
     glfw)
 
 # The pinned libarchive is a static library (archive_static builds it itself with

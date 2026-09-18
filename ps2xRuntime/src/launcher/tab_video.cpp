@@ -116,20 +116,26 @@ VideoTab::VideoTab(QWidget *parent)
 
     // RENDERER
     root->addWidget(sectionLabel(QStringLiteral("RENDERER")));
-    QStringList renderers = {
-        QStringLiteral("OpenGL"),
-        QStringLiteral("Software (CPU)"),
-        QStringLiteral("paraLLEl-GS (Vulkan)")};
-    const int curRenderer = std::min(std::max(s.renderer(), 0), 2);
+    QStringList renderers;
+    QList<int> rendererValues;
+    // [pgs] D3D11 is retired for now, so paraLLEl-GS is back in the list on every platform that can
+    // build it (Windows included).
+    renderers = { QStringLiteral("OpenGL (New)"),
+                  QStringLiteral("Software (CPU)"),
+                  QStringLiteral("paraLLEl-GS (Vulkan)") };
+    rendererValues = { SettingsManager::kRendererOpenGL,
+                       SettingsManager::kRendererSoftware,
+                       SettingsManager::kRendererParallelGS };
+    int curRenderer = 0;
+    for (int i = 0; i < rendererValues.size(); ++i)
+        if (rendererValues[i] == s.renderer()) { curRenderer = i; break; }
     root->addWidget(comboRow(QStringLiteral("Renderer"), &m_renderer, renderers, curRenderer));
-#ifdef _WIN32
+    for (int i = 0; i < rendererValues.size(); ++i)
+        m_renderer->setItemData(i, rendererValues[i]);
     root->addWidget(hintRow(QStringLiteral(
-        "paraLLEl-GS runs on the bundled Mesa lavapipe (software Vulkan) on Windows; "
-        "if it fails, the game falls back to OpenGL. See logs/vulkan-fallback.log. "
-        "Set PS2X_VK_NATIVE=1 to use the system Vulkan driver.")));
-#else
-    root->addWidget(hintRow(QStringLiteral("paraLLEl-GS is the default backend. Falls back to OpenGL if Vulkan is unavailable.")));
-#endif
+        "paraLLEl-GS is the default backend (Vulkan compute; falls back to OpenGL (New) if Vulkan is "
+        "unavailable). OpenGL (New) presents through our own GL layer; Software uses the CPU "
+        "rasterizer.")));
     root->addWidget(toggleRow(QStringLiteral("Cel Outline"), &m_outline, s.outline()));
     m_inkRow = sliderPair(QStringLiteral("Ink Strength"), &m_ink, &m_inkVal, 100, 260,
                           s.inkStrength(), "%d %%");
@@ -223,8 +229,8 @@ VideoTab::VideoTab(QWidget *parent)
     outer->addWidget(scroll);
 
     // Live write-through into SettingsManager (Save persists to INI).
-    connect(m_renderer, &QComboBox::currentIndexChanged, this, [](int v) {
-        SettingsManager::instance().setRenderer(v);
+    connect(m_renderer, &QComboBox::currentIndexChanged, this, [this](int) {
+        SettingsManager::instance().setRenderer(m_renderer->currentData().toInt());
     });
     connect(m_outline, &QCheckBox::toggled, this, &VideoTab::onOutline);
     connect(m_ink, &QSlider::valueChanged, this, [this](int v) {

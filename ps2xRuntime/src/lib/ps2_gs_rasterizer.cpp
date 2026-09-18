@@ -3637,19 +3637,32 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
             {
                 std::vector<uint8_t> rep; int rw = 0, rh = 0, rfmt = 0;
                 const bool found = ps2tex::loadReplacement(id, texKey, rep, rw, rh, rfmt);   // [texpackasync]
-                {   // [texrepdiag] PS2X_TEXREPDIAG=1: every lookup, unthrottled, with the
-                    // palette we hashed -- so a draw that resolves to the WRONG CLUT
-                    // variant is visible as a name mismatch rather than guessed at.
-                    static const bool s_d = [](){ const char *v = std::getenv("PS2X_TEXREPDIAG"); return v && v[0] && v[0] != '0'; }();
-                    if (s_d)
+                {   // [texrepdiag] PS2X_TEXREPDIAG=1: log the MISSES only (bounded). A character
+                    // whose hair is replaced but body is not shows up here as the body texture's
+                    // hash pair/tbp0/PSM -- the format or CLUT we are not matching to the pack.
+                    static const bool s_d = [](){ const char *v = std::getenv("PS2X_TEXREPDIAG"); return !(v && v[0] == '0'); }();
+                    if (s_d && !found)
                     {
-                        const uint32_t *cl = pal ? clut : nullptr;
-                        std::fprintf(stderr, "[texrepdiag] %s %s tbp0=%u psm=%u %dx%d clut[0..3]=%08x %08x %08x %08x clutKey=%llx\n",
-                                     found ? "HIT " : "MISS", id.name().c_str(), tex0.tbp0, tex0.psm, subW, texH,
-                                     cl ? cl[0] : 0u, cl ? cl[1] : 0u, cl ? cl[2] : 0u, cl ? cl[3] : 0u,
-                                     (unsigned long long)clutKey);
+                        static int s_miss = 0;
+                        if (s_miss < 300)
+                        {
+                            const uint32_t *cl = pal ? clut : nullptr;
+                            // [texrepdiag] sameTex0: a pack entry with the same TEX0 hash but any
+                            // CLUT. If it exists, the miss is ours (palette mismatch), not the pack's.
+                            const char *same = ps2tex::findByTex0Hash(id.tex0Hash);
+                            const bool inPack = ps2tex::hasPair(id.tex0Hash, id.hasClut ? id.clutHash : 0);
+                            std::fprintf(stderr, "[texrepdiag] MISS %s tbp0=%u tbw=%u psm=%u %ux%u clut4=%08x %08x %08x %08x clutKey=%llx inPack=%d sameTex0=%s\n",
+                                         id.name().c_str(), tex0.tbp0, tex0.tbw, tex0.psm, 1u << tex0.tw, 1u << tex0.th,
+                                         cl ? cl[0] : 0u, cl ? cl[1] : 0u, cl ? cl[2] : 0u, cl ? cl[3] : 0u,
+                                         (unsigned long long)clutKey, inPack ? 1 : 0, same ? same : "none");
+                        }
+                        else if (s_miss == 300)
+                            std::fprintf(stderr, "[texrepdiag] ... (miss list truncated)\n");
+                        ++s_miss;
                     }
                 }
+                ps2tex::megaLookup(id, texKey, tex0.tbp0, tex0.tbw, tex0.psm, tex0.tw, tex0.th, found,
+                                   rgba.data(), subW, texH, rep.data(), rw, rh, rfmt);   // [texmega]
                 if (found)
                 {
                     // The UV path can only express an INTEGER, UNIFORM upscale
@@ -3657,10 +3670,9 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                     // else would sample wrong, so refuse it rather than render it
                     // stretched -- a skipped texture is a non-event, a stretched one
                     // is a visible bug.
-                    const int sX = (subW > 0 && rw % subW == 0) ? rw / subW : 0;
+                    int useScale = (subW > 0 && rw % subW == 0) ? rw / subW : 0;
                     const int sY = (texH > 0 && rh % texH == 0) ? rh / texH : 0;
-                    if (sX <= 0 || sX != sY)
-                    {
+                    if (useScale <= 0 || useScale != sY)                    {
                         static std::atomic<unsigned long> s_bad{0};
                         if (s_bad.fetch_add(1) < 5)
                             std::fprintf(stderr, "[texreplace] SKIP %s: %dx%d is not a "
@@ -3703,7 +3715,11 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                     // texture: a native-resolution gauge is right, an upscaled one that
                     // breaks the health bar is not.
                     if (gateAlpha && rfmt != 0)
-                    {
+                    {   // [texreplace] A BC payload cannot have its alpha rewritten byte by byte, so the
+                        // DATE-gate correction is impossible: keep the game's own texture (a native
+                        // gauge is right; an upscaled one that breaks the gate is not).
+                        // Decompressing these was tried and REVERTED: the art is a 16x pack upscale and
+                        // the zoomed character-select highlight then sampled garbage.
                         static std::atomic<unsigned long> s_skip{0};
                         if (s_skip.fetch_add(1) < 5)
                             std::fprintf(stderr, "[texreplace] SKIP %s: alpha is a DATE gate and the "
@@ -3714,7 +3730,7 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                     if (gateAlpha)
                         for (size_t i = 3; i < rep.size(); i += 4)
                             rep[i] = (uint8_t)((std::min<unsigned>(rep[i] * 255u / 128u, 255u) >= 128u) ? 255u : 0u);
-                    rgba = std::move(rep); upW = rw; upH = rh; upFmt = rfmt; upScale = sX;
+                    rgba = std::move(rep); upW = rw; upH = rh; upFmt = rfmt; upScale = useScale;
                     // [texreplace] Alpha range. decodeTexRGBA expanded PS2 alpha
                     // (0x80 == opaque) to 0..255 via kAlpha128To255, but these bytes
                     // came straight out of the pack and skipped that -- and a
@@ -3729,9 +3745,25 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                     const unsigned long k = s_hits.fetch_add(1) + 1ul;
                     if (k <= 5 || (k % 100ul) == 0ul)
                         std::fprintf(stderr, "[texreplace] hit #%lu %s -> %dx%d (%dx)\n",
-                                     k, id.name().c_str(), rw, rh, sX);
+                                     k, id.name().c_str(), rw, rh, useScale);
                     }
                     }
+                }
+            }
+            else
+            {   // [texrepdiag] Never identified: the format is not PSMT8/PSMT4 and the pack holds ONLY
+                // those two, so no replacement can exist for it. One line per distinct (psm,tw,th)
+                // tells a screen's un-replaced element apart from a hash/palette mismatch.
+                static const bool s_id = [](){ const char *v = std::getenv("PS2X_TEXREPDIAG"); return !(v && v[0] == '0'); }();
+                if (s_id)
+                {
+                    static std::unordered_set<uint32_t> s_seen;
+                    static std::mutex s_seenMx;   // [texfix] reached from the GS thread AND the DecPool workers
+                    const uint32_t kk = ((uint32_t)tex0.psm << 24) | ((uint32_t)tex0.tw << 12) | (uint32_t)tex0.th;
+                    std::lock_guard<std::mutex> seenLk(s_seenMx);
+                    if (s_seen.size() < 200u && s_seen.insert(kk).second)
+                        std::fprintf(stderr, "[texrepdiag] NOTID psm=%u %ux%u tbp0=%u tbw=%u\n",
+                                     tex0.psm, 1u << tex0.tw, 1u << tex0.th, tex0.tbp0, tex0.tbw);
                 }
             }
         }
@@ -4497,10 +4529,9 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
             {
                 static std::atomic<uint64_t> s_prims{0}, s_decodes{0}, s_texels{0};
                 s_prims.fetch_add(1, std::memory_order_relaxed);
-                // [texpackasync] a replacement that finished decoding since this texture was cached forces ONE
-                // re-resolve so the decode path below swaps it in (the cache entry is re-put under the same key).
-                const bool miss = !r.hasTexture(texKey, texPageLo, texPageHi)
-                               || (GsGpuRenderer::texPackEnabled() && ps2tex::takeReadySwap(texKey));
+                // [texpackasync] (counting only: the real swap trigger lives further down, outside this
+                // diagnostic, so it also works with PS2X_GPU_DIAG off)
+                const bool miss = !r.hasTexture(texKey, texPageLo, texPageHi);
                 if (miss) { s_decodes.fetch_add(1, std::memory_order_relaxed); s_texels.fetch_add(static_cast<uint64_t>(texW) * texH, std::memory_order_relaxed); }
                 static std::mutex s_dm; static std::chrono::steady_clock::time_point s_t = std::chrono::steady_clock::now();
                 // Which textures are churning: sum re-decoded texels per (tbp0,psm,w,h).
@@ -4552,6 +4583,14 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
                                  || ((ctx.frame.fbmsk & 0x00ffffffu) == 0x00ffffffu); }
         const uint64_t texKeyBase = texKey;   // [dectime] pre-version key (material + CLUT content)
         if (!gaServedRead) texKey = r.resolveTextureVersion(texKey, texPageLo, texPageHi, in.vram, in.vramSize, texNeedDecode);
+        // [texpackasync] A replacement that finished decoding since this texture was cached forces ONE
+        // re-resolve, so the decode path below puts the cache entry again and swaps the art in.
+        // THIS USED TO LIVE INSIDE THE PS2X_GPU_DIAG BLOCK above: with diagnostics off (the default)
+        // the ready-swap flag was never consumed, so any texture that had already been resolved before
+        // its replacement finished decoding kept drawing the ORIGINAL forever -- the pack looked
+        // half-applied (183 lookups, 182 of them "in the pack" and none applied, per [texrepdiag]).
+        if (!texNeedDecode && GsGpuRenderer::texPackEnabled() && ps2tex::takeReadySwap(texKey))
+            texNeedDecode = true;
         if (deferTex || deferClut) texNeedDecode = true;   // [deferdec] GL-dirty source: the record-time hash saw stale VRAM
         // [deferpend] a page whose deferred flush is still queued is stale in VRAM: a read that needs a decode
         // (a different view / key of the same page) must queue behind that flush, never decode synchronously.
@@ -4983,10 +5022,10 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
         // REGION_* wrap modes whose window params (MINU/MAXU/MINV/MAXV) we currently drop?
         {
             static const bool s_rr = [](){ const char *v = std::getenv("PS2X_REGIONREC"); return v && v[0] && v[0] != '0'; }();
-            // Log REGION-mode draws on ANY texture (window params are currently dropped by
-            // the GPU DrawCmd — the 2026-07-30 window-decode experiment was reverted after
-            // it caused 2D-screen flashing; the only in-fight user is the FB-copy 512x448).
-            if (s_rr && tme && (wms >= 2u || wmt >= 2u))
+            // [regionrec] also log a specific tbp (PS2X_REGIONTBP=<tbp>) regardless of its wrap
+            // mode, so a plain REPEAT/CLAMP draw like the pause-popup corner can be inspected.
+            static const uint32_t s_rtbp = [](){ const char *v = std::getenv("PS2X_REGIONTBP"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 0) : 0xFFFFFFFFu; }();
+            if (s_rr && tme && (wms >= 2u || wmt >= 2u || ctx.tex0.tbp0 == s_rtbp))
             {
                 static std::atomic<uint32_t> s_rn{0};
                 const uint32_t n = s_rn.fetch_add(1);

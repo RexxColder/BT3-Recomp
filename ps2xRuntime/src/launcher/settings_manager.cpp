@@ -26,7 +26,8 @@ namespace
             case 0: return "opengl";
             case 1: return "software";
             case 2: return "parallel-gs";
-            default: return "parallel-gs";
+            case 3: return "d3d11";
+            default: return "opengl";
         }
     }
 
@@ -35,6 +36,7 @@ namespace
         if (s == "opengl" || s == "gl") return 0;
         if (s == "software" || s == "sw") return 1;
         if (s == "parallel-gs" || s == "parallel_gs" || s == "pgs") return 2;
+        if (s == "d3d11" || s == "dx11" || s == "d3d") return 3;
         return def;
     }
 
@@ -164,7 +166,11 @@ bool SettingsManager::loadToml(const QString &path)
     m_sfx = static_cast<float>(doc.getD("audio.sfx_volume", m_sfx));
 
     {
-        const int r = nameToRenderer(doc.getS("video.renderer", rendererName(m_renderer)), m_renderer);
+        int r = nameToRenderer(doc.getS("video.renderer", rendererName(m_renderer)), m_renderer);
+        // [pgswin] Direct3D 11 is retired on every platform: an old "d3d11" becomes OpenGL (New),
+        // matching the runtime. paraLLEl-GS is kept as-is -- the Windows "PGS -> d3d11" remap
+        // turned a saved paraLLEl-GS into OpenGL and wrote that back on every Play.
+        if (r == kRendererD3D11) r = kRendererOpenGL;
         if (r >= 0 && r <= 2) { m_renderer = r; m_sawRenderer = true; }
     }
     m_glow = doc.getB("video.glow", m_glow);

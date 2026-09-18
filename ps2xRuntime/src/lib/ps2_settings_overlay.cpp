@@ -13,8 +13,8 @@
 #endif
 
 #include "imgui.h"
-#include "rlImGui.h"
-#include "raylib.h"
+#include "gfx/ps2x_ui.h"   // UiSetup/Begin/End: rlImGui (GL) or imgui_impl_dx11 (PS2X_D3D11)
+#include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 
 #include "runtime/ps2_toml.h"
 
@@ -42,13 +42,14 @@ namespace
     // --- settings.toml helpers -----------------------------------------------
     const char *rendererName(int r)
     {
-        switch (r) { case 0: return "opengl"; case 1: return "software"; case 2: return "parallel-gs"; default: return "parallel-gs"; }
+        switch (r) { case 0: return "opengl"; case 1: return "software"; case 2: return "parallel-gs"; case 3: return "d3d11"; default: return "opengl"; }
     }
     int nameToRenderer(const std::string &s, int def)
     {
         if (s == "opengl" || s == "gl") return 0;
         if (s == "software" || s == "sw") return 1;
         if (s == "parallel-gs" || s == "parallel_gs" || s == "pgs") return 2;
+        if (s == "d3d11" || s == "dx11" || s == "d3d") return 3;
         return def;
     }
     std::string colorToHex(unsigned c)
@@ -115,7 +116,7 @@ namespace
     bool allKeysReleased(const std::vector<int> &keys)
     {
         for (int k : keys)
-            if (IsKeyDown(k)) return false;
+            if (bt3IsKeyDown(k)) return false;
         return true;
     }
 }
@@ -246,7 +247,7 @@ namespace
     // Blinking alpha for "Press..." capture hints.
     float blinkAlpha()
     {
-        return 0.5f + 0.5f * std::sin(ImGui::GetTime() * 6.0f);
+        return 0.5f + 0.5f * std::sin(ImGui::bt3GetTime() * 6.0f);
     }
 
     // Section header helper: small uppercase accent text (Russo One, when loaded)
@@ -288,7 +289,7 @@ namespace
 
 bool PS2SettingsOverlay::s_widescreen = false;
 
-// [fsnative] Fullscreen at the MONITOR's resolution. raylib's ToggleFullscreen() keeps the window's current size as
+// [fsnative] Fullscreen at the MONITOR's resolution. raylib's bt3ToggleFullscreen() keeps the window's current size as
 // the video mode (1024x768 from the INI); on Wayland the compositor then stretches that 4:3 surface across the 16:9
 // panel while the game still sees a 4:3 screen -- neither the true-widescreen FOV patch nor the HUD squeeze engage
 // and the whole picture is stretched. Size the window to the monitor first; restore the saved size on the way out.
@@ -296,19 +297,19 @@ bool PS2SettingsOverlay::s_widescreen = false;
 static void ps2xSetFullscreen(bool on, int windowW, int windowH)
 {
     static const bool s_native = [](){ const char *v = std::getenv("PS2X_FSNATIVE"); return !(v && v[0] == '0'); }();
-    if (!s_native) { ToggleFullscreen(); return; }
+    if (!s_native) { bt3ToggleFullscreen(); return; }
     if (on)
     {
-        if (IsWindowFullscreen()) return;
-        const int m = GetCurrentMonitor();
-        const int mw = GetMonitorWidth(m), mh = GetMonitorHeight(m);
-        if (mw >= 320 && mh >= 240) SetWindowSize(mw, mh);
-        ToggleFullscreen();
+        if (bt3IsWindowFullscreen()) return;
+        const int m = bt3GetCurrentMonitor();
+        const int mw = bt3GetMonitorWidth(m), mh = bt3GetMonitorHeight(m);
+        if (mw >= 320 && mh >= 240) bt3SetWindowSize(mw, mh);
+        bt3ToggleFullscreen();
     }
     else
     {
-        if (IsWindowFullscreen()) ToggleFullscreen();
-        if (windowW >= 320 && windowH >= 240) SetWindowSize(windowW, windowH);
+        if (bt3IsWindowFullscreen()) bt3ToggleFullscreen();
+        if (windowW >= 320 && windowH >= 240) bt3SetWindowSize(windowW, windowH);
     }
 }
 // [wshudmap] live HUD-layout state, defined in ps2_gs_gpu_renderer.cpp
@@ -365,7 +366,7 @@ void PS2SettingsOverlay::initialize()
             std::fprintf(stderr, "[overlay] Russo One font not found at %s, falling back to default font\n",
                         fontPath.string().c_str());
     }
-    rlImGuiSetup(true);
+    ps2x::gfx::UiSetup();
     // The rlImGui version used here has no rlImGuiSetLoadFontsCallback() hook, so load
     // the Capsule HUD fonts directly after setup — ImGui rebuilds the atlas lazily on
     // the first frame.
@@ -385,7 +386,7 @@ void PS2SettingsOverlay::initialize()
     // Apply the saved window size (before any fullscreen toggle, so it sizes the
     // windowed state the user returns to). 0 = keep the default host window.
     if (m_settings.windowW >= 320 && m_settings.windowH >= 240)
-        SetWindowSize(m_settings.windowW, m_settings.windowH);
+        bt3SetWindowSize(m_settings.windowW, m_settings.windowH);
     // Apply fullscreen on startup if the INI says so (or the default is true).
     if (m_settings.fullscreen)
         ps2xSetFullscreen(true, m_settings.windowW, m_settings.windowH);
@@ -411,7 +412,7 @@ void PS2SettingsOverlay::shutdown()
     // ini untouched so launcher-authored settings survive a play session.
     if (!(m_settings == m_settingsAtBoot) || !std::filesystem::exists(m_configPath))
         saveSettings();
-    rlImGuiShutdown();
+    ps2x::gfx::UiShutdown();
     m_initialized = false;
 }
 
@@ -508,11 +509,14 @@ void PS2SettingsOverlay::loadSettings()
     m_settings.sfxVolume = std::clamp((float)doc.getD("audio.sfx_volume", m_settings.sfxVolume), 0.0f, 1.0f);
 
     {
-        int r = nameToRenderer(doc.getS("video.renderer", rendererName(m_settings.renderer)), m_settings.renderer);
+            int r = nameToRenderer(doc.getS("video.renderer", rendererName(m_settings.renderer)), m_settings.renderer);
 #if !defined(PS2X_HAVE_PGS)
-        if (r == Settings::kRendererParallelGS) r = Settings::kRendererOpenGL;
+            if (r == Settings::kRendererParallelGS) r = Settings::kRendererOpenGL;
 #endif
-        if (r >= 0 && r <= 2) { m_settings.renderer = r; m_sawRendererKey = true; }
+            // [d3d11] Direct3D 11 is retired for now: an old settings file that picks it falls back to
+            // the new OpenGL present. paraLLEl-GS is a normal option on every platform again.
+            if (r == Settings::kRendererD3D11) r = Settings::kRendererOpenGL;
+            if (r >= 0 && r <= 3) { m_settings.renderer = r; m_sawRendererKey = true; }
     }
     if (!envUserSet("PS2X_GLOW")) m_settings.glow = doc.getB("video.glow", m_settings.glow);
     if (!envUserSet("PS2X_GLOWFIX")) m_settings.glowFix = doc.getB("video.glowfix", m_settings.glowFix);
@@ -583,6 +587,19 @@ static void setEnvDefault(const char *name, const char *value)
 }
 static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
 {
+#if defined(_WIN32)
+    // [d3d11] The D3D11 present is retired for now: nothing selects it any more, and the flag is
+    // forced off so a stale PS2X_D3D11 in the environment cannot bring back the old path.
+    setEnvDefault("PS2X_D3D11", "0");
+#endif
+    // [opengl-new] renderer 0 is the NEW OpenGL present (gfx::gl / altGL). The old raylib GL present
+    // is gone, so this is the only OpenGL option the UI offers.
+    if (renderer == 0)
+    {
+        setEnvDefault("PS2X_ALTGL", "1");
+        setEnvDefault("PS2X_PGS", "0");
+        return;
+    }
 #if defined(PS2X_HAVE_PGS)
     if (renderer == 2)
     {
@@ -602,11 +619,32 @@ static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
 #endif
 }
 
+extern "C" const char *ps2xExeDirC();   // [mergefix] main.cpp: <exeDir> (honors PS2X_EXEDIR)
+
 void PS2SettingsOverlay::preloadSettings()
 {
-    const std::string configPath = s_configDir.empty()
-        ? (std::filesystem::current_path() / kConfigFileName).string()
-        : (std::filesystem::path(s_configDir) / kConfigFileName).string();
+    // [cfgpath] The deploy keeps settings.toml in <exeDir>/savedata, but the overlay only
+    // looked in the CWD unless setConfigDirectory() had been called (never, in practice), so a
+    // launch that did not set the CWD to the deploy silently dropped every setting -- notably
+    // texture_pack, i.e. "the texture pack does not load". Prefer an existing file: CWD first,
+    // then <exeDir>/savedata, then <exeDir>; fall back to the CWD path.
+    std::filesystem::path cfgPath;
+    if (!s_configDir.empty())
+        cfgPath = std::filesystem::path(s_configDir) / kConfigFileName;
+    else
+    {
+        const std::filesystem::path cwd = std::filesystem::current_path() / kConfigFileName;
+        const char *xd = ps2xExeDirC();
+        std::error_code ec;
+        const std::filesystem::path exeSaved = (xd && xd[0]) ? (std::filesystem::path(xd) / "savedata" / kConfigFileName) : std::filesystem::path();
+        const std::filesystem::path exeRoot = (xd && xd[0]) ? (std::filesystem::path(xd) / kConfigFileName) : std::filesystem::path();
+        if (std::filesystem::exists(cwd, ec)) cfgPath = cwd;
+        else if (!exeSaved.empty() && std::filesystem::exists(exeSaved, ec)) cfgPath = exeSaved;
+        else if (!exeRoot.empty() && std::filesystem::exists(exeRoot, ec)) cfgPath = exeRoot;
+        else cfgPath = cwd;
+    }
+    const std::string configPath = cfgPath.string();
+    s_configDir = cfgPath.parent_path().string();
     int rendererPre = Settings::kRendererDefault;   // [renderer] exported below even when no toml exists yet
     bool texPackPre = false;
     bool forceBilinearPre = true;
@@ -1004,14 +1042,14 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
     {
         bool allDown = true;
         for (int k : m_settings.overlayKeys)
-            if (!IsKeyDown(k)) { allDown = false; break; }
+            if (!bt3IsKeyDown(k)) { allDown = false; break; }
         const int lastKey = m_settings.overlayKeys.back();
-        if (allDown && IsKeyPressed(lastKey))
+        if (allDown && bt3IsKeyPressed(lastKey))
             toggleVisible();
     }
 
     // --- F11: toggle fullscreen / windowed ---
-    if (IsKeyPressed(KEY_F11))
+    if (bt3IsKeyPressed(BT3_KEY_F11))
     {
         m_settings.fullscreen = !m_settings.fullscreen;
         ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
@@ -1075,7 +1113,7 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
     const bool wasVisible = m_visible;
     try
     {
-        rlImGuiBegin();
+        ps2x::gfx::UiBegin();
 
         pushDbzTheme();
         DbzThemeScope dbzTheme;   // pops all 40 style colours on scope exit
@@ -1222,7 +1260,7 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
         // Never let an overlay rendering fault kill the whole game.
         m_visible = false;
     }
-    rlImGuiEnd();
+    ps2x::gfx::UiEnd();
 }
 
 void PS2SettingsOverlay::drawAudioTab()
@@ -1260,21 +1298,26 @@ void PS2SettingsOverlay::drawVideoTab()
     // Renderer + Effects (flat, compact — no card borders)
     sectionHeader("RENDERER");
     {   // [renderer] backend dropdown
+        static const char *const kLabels[] = { "OpenGL (New)", "Software rasterizer",
 #if defined(PS2X_HAVE_PGS)
-        static const char *const kRenderers[] = { "OpenGL", "Software rasterizer", "paraLLEl-GS (Vulkan compute)" };
-        const int nRenderers = 3;
-#else
-        static const char *const kRenderers[] = { "OpenGL", "Software rasterizer" };
-        const int nRenderers = 2;
+            "paraLLEl-GS (Vulkan compute)",
 #endif
-        int r = std::clamp(m_settings.renderer, 0, nRenderers - 1);
+        };
+        static const int kValues[] = { 0, 1,
+#if defined(PS2X_HAVE_PGS)
+            2,
+#endif
+        };
+        const int nRenderers = (int)(sizeof(kValues) / sizeof(kValues[0]));
+        int cur = 0;
+        for (int i = 0; i < nRenderers; ++i) if (kValues[i] == m_settings.renderer) { cur = i; break; }
         ImGui::TextUnformatted("Renderer");
         ImGui::SameLine(180.0f);
         ImGui::SetNextItemWidth(260.0f);
-        if (ImGui::Combo("##renderer", &r, kRenderers, nRenderers))
+        if (ImGui::Combo("##renderer", &cur, kLabels, nRenderers))
         {
-            m_settings.renderer = r;
-            m_settings.gpuRenderer = (r != Settings::kRendererSoftware);
+            m_settings.renderer = kValues[cur];
+            m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);
             m_dirty = true;
         }
     }
@@ -1396,6 +1439,9 @@ void PS2SettingsOverlay::drawVideoTab()
     if (toggleSwitch("Fullscreen", &m_settings.fullscreen))
     {
         ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
+        // The [builtin-res] block that derived the render scale from the screen height on this toggle
+        // is gone on purpose: upstream turned the render scale into its own setting again (see the
+        // [rscale] block below), because deriving it meant a 1080p window could never render at 1x or 4x.
         m_dirty = true;
     }
     if (toggleSwitch("Widescreen (true FOV)", &m_settings.widescreen))
@@ -1458,7 +1504,7 @@ void PS2SettingsOverlay::drawVideoTab()
                                           "3840 x 2160 (4K)"};
         constexpr int kResCount = 10;
         int cur = -1;
-        const int w = GetScreenWidth(), h = GetScreenHeight();
+        const int w = bt3GetScreenWidth(), h = bt3GetScreenHeight();
         for (int i = 0; i < kResCount; ++i)
             if (kRes[i][0] == w && kRes[i][1] == h) { cur = i; break; }
         char curLabel[32];
@@ -1469,9 +1515,9 @@ void PS2SettingsOverlay::drawVideoTab()
         {
             for (int i = 0; i < kResCount; ++i)
             {
-                if (ImGui::Selectable(kResNames[i], i == cur) && i != cur && !IsWindowFullscreen())
+                if (ImGui::Selectable(kResNames[i], i == cur) && i != cur && !bt3IsWindowFullscreen())
                 {
-                    SetWindowSize(kRes[i][0], kRes[i][1]);
+                    bt3SetWindowSize(kRes[i][0], kRes[i][1]);
                     m_settings.windowW = kRes[i][0];
                     m_settings.windowH = kRes[i][1];
                     m_dirty = true;
@@ -1479,7 +1525,7 @@ void PS2SettingsOverlay::drawVideoTab()
             }
             ImGui::EndCombo();
         }
-        if (IsWindowFullscreen())
+        if (bt3IsWindowFullscreen())
             ImGui::TextDisabled("(windowed mode only)");
     }
 }
@@ -1575,7 +1621,7 @@ void PS2SettingsOverlay::drawControllersTab()
                 for (int a = 0; a < 6 && !anyDown; ++a)
                     if (std::fabs(curAxis[a]) > 0.3f) anyDown = true;
                 for (int k = 32; k <= 348 && !anyDown; ++k)
-                    if (IsKeyDown(k)) anyDown = true;
+                    if (bt3IsKeyDown(k)) anyDown = true;
                 if (!anyDown)
                     m_captureWaitRelease = false;
             }
@@ -1586,7 +1632,7 @@ void PS2SettingsOverlay::drawControllersTab()
 
                 // 1. Keyboard
                 for (int k = 32; k <= 348 && bind.kind == ps2_stubs::PadBindKind::None; ++k)
-                    if (IsKeyPressed(k))
+                    if (bt3IsKeyPressed(k))
                     {
                         bind = ps2_stubs::PadBind{ps2_stubs::PadBindKind::Key, k, 1.0f, m_settings.deadzone};
                         capturedKey = k;
@@ -1632,7 +1678,7 @@ void PS2SettingsOverlay::drawControllersTab()
             {
                 // Keyboard: gather keys currently held.
                 for (int k = 32; k <= 348; ++k)
-                    if (IsKeyDown(k))
+                    if (bt3IsKeyDown(k))
                     {
                         bool present = false;
                         for (int x : m_capturedKeys) if (x == k) { present = true; break; }
