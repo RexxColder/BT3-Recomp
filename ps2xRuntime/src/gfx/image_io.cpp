@@ -2,11 +2,16 @@
 
 #include "gfx/gl/GlApi.h"
 
+// [linux] raylib's rtextures.c compiles its own copy of the stb implementations. Keep ours internal
+// (static) so GNU ld does not fail with "multiple definition of stbi_write_*": the Windows link line
+// tolerated the duplicates via /FORCE:MULTIPLE, Linux does not.
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_WRITE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_STDIO          // we do the fopen ourselves: keeps the TU free of stdio surprises
-#include "stb_image.h"
+#include "external/stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+#include "external/stb_image_write.h"
 
 #include <cstdio>
 #include <cstring>

@@ -40,6 +40,10 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_gpu_renderer.h"
 
+// [mergefix] main.cpp exposes <exeDir>; used by the window-mode startup read too, so the declaration
+// lives outside the Windows-only block below.
+extern "C" const char *ps2xExeDirC();
+
 #if defined(_WIN32)
 // [d3d11] Native video device. Present path only for now (PS2X_D3D11=1): the GS still
 // renders through the existing GL renderer until it is ported (P3); this swaps the final
@@ -6901,7 +6905,9 @@ void PS2Runtime::run()
         {
 #endif
         bt3BeginDrawing();
+#if defined(_WIN32)
         texmegaHotkey();   // [texmega] F9 works here too (the D3D11 branch has its own call)
+#endif
         {   // [winlog] Log every size the window takes, so a "wrong at startup, right after maximize"
             // report can be read straight from the log: the first line plus any later change.
             static int s_lastW = -1, s_lastH = -1;
@@ -7633,11 +7639,18 @@ namespace ps2x   // [video] at global scope: the overlay calls ps2x::GetVideoSta
     {
         VideoStatus s;
         const bool wantPgs = envOn("PS2X_PGS"), wantGl = envOn("PS2X_ALTGL"), wantD3D = envOn("PS2X_D3D11");
+#if defined(_WIN32)
         s.rendererConfigured = wantD3D ? "Direct3D 11" : wantPgs ? "paraLLEl-GS" : wantGl ? "OpenGL (New)" : "Software";
-        if (g_ps2xD3D11Mode)                                    s.rendererName = "Direct3D 11";
-        else if (ps2x_pgs::enabled())                           s.rendererName = "paraLLEl-GS";
+        if (g_ps2xD3D11Mode)                                      s.rendererName = "Direct3D 11";
+        else if (ps2x_pgs::enabled())                             s.rendererName = "paraLLEl-GS";
         else if (AltGlEnabled() && ps2x::gfx::gl::ContextReady()) s.rendererName = "OpenGL (New)";
-        else                                                     s.rendererName = "Software";
+        else                                                      s.rendererName = "Software";
+#else
+        // Linux/macOS: the present is raylib's own GL swap chain (altGL/D3D11 are the Windows paths).
+        s.rendererConfigured = wantPgs ? "paraLLEl-GS" : "OpenGL";
+        if (ps2x_pgs::enabled())                                  s.rendererName = "paraLLEl-GS";
+        else                                                      s.rendererName = "OpenGL";
+#endif
         s.renderer = (bt3GetScreenWidth() <= 0) ? VideoState::Fail
                    : (std::strcmp(s.rendererName, s.rendererConfigured) == 0) ? VideoState::Ok
                                                                               : VideoState::Fallback;

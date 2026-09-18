@@ -12,6 +12,7 @@ extern "C"
 }
 
 #include "runtime/ps2_toml.h"
+#include <cstring>   // [linux] std::strstr comes from <cstring> there, not from a transitively included header
 
 #include <atomic>
 #include <cctype>

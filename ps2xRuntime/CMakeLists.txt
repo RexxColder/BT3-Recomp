@@ -141,16 +141,18 @@ else()
     # video path instead of rlImGui/rlgl when PS2X_D3D11=1 is active.
     if(WIN32)
         target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_dx11.cpp")
-    target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}/backends")
+        target_link_libraries(imgui PUBLIC d3d11 dxgi)
+    endif()
 
     # [C] ImGui's SDL2 PLATFORM backend: the overlay's window/input glue. It replaces rlImGui (raylib's
     # ecosystem) while the renderers stay ours -- imgui_impl_opengl3 for gfx::gl and imgui_impl_dx11 for
     # the native path. SDL event WATCHING (see ui_sdl.cpp) lets ImGui see every event without consuming
     # it, so raylib keeps its own input. The SDL2 link is added after the SDL2 target exists, below.
+    # NOTE: this must stay OUTSIDE the WIN32 block above -- nested inside it, a Linux build silently
+    # skipped the platform backend and failed at link time with undefined ImGui_ImplSDL2_*.
+    target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}/backends")
     if(PS2X_HOST_SDL2)
         target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp")
-    endif()
-        target_link_libraries(imgui PUBLIC d3d11 dxgi)
     endif()
 
     # [C] rlImGui is GONE: the overlay is ImGui over our own backends (imgui_impl_sdl2 for the platform
@@ -676,7 +678,10 @@ if(PS2X_USE_GSRL)
     target_compile_definitions(ps2_runtime PRIVATE PS2X_USE_GSRL=1)
     message(STATUS "[gsrl] experiment ON: the replay submits through the renamed vendored rlgl copy")
 endif()
-target_include_directories(ps2_runtime PRIVATE "${bt3gl_SOURCE_DIR}/src/external")   # [A4] stb_image(_write)
+# [A4] stb_image/stb_image_write are included as "external/stb_*.h", which resolves through the
+# bt3gl `src` include dir. src/external must NOT go on the include path: the vendor's Windows-only
+# external/dirent.h would shadow the real <dirent.h> on Linux (pad_evdev_linux.cpp) and the build
+# would die on the missing io.h.
 # [C] ui_sdl.cpp includes imgui_impl_sdl2.h: the backend headers come from the imgui target (PUBLIC).
 target_link_libraries(ps2_runtime PRIVATE imgui)
 if(WIN32)

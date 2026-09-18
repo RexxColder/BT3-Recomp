@@ -226,6 +226,15 @@ def step(msg: str) -> None:
     LOG.step(msg)
 
 
+def _child_env() -> dict:
+    """Subprocess environment: force a C locale when none is generated (minimal Arch images print
+    'bsdtar: Failed to set default locale' and locale-dependent tool output otherwise)."""
+    env = dict(os.environ)
+    env.setdefault("LC_ALL", "C")
+    env.setdefault("LANG", "C")
+    return env
+
+
 def run(cmd, quiet: bool = False, **kw) -> None:
     """Run a command with live, tee'd output (classified per line into the log).
 
@@ -238,6 +247,7 @@ def run(cmd, quiet: bool = False, **kw) -> None:
     popen_kw.pop("check", None)
     popen_kw.pop("stdout", None)
     popen_kw.pop("stderr", None)
+    popen_kw.setdefault("env", _child_env())
     p = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, errors="replace", bufsize=1, **popen_kw)
     assert p.stdout is not None
@@ -255,7 +265,8 @@ def run_capture(cmd) -> str:
     LOG.verbose("+ " + " ".join(str(c) for c in cmd) + "  (captured)")
     try:
         r = subprocess.run([str(c) for c in cmd], stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, text=True, errors="replace")
+                           stderr=subprocess.STDOUT, text=True, errors="replace",
+                           env=_child_env())
         return r.stdout or ""
     except OSError:
         return ""
@@ -549,9 +560,11 @@ class PlatformInfo:
                 extra.append("-DPS2X_DISABLE_PGS=ON")
             if os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
                 extra.append("-DCMAKE_OSX_DEPLOYMENT_TARGET=" + os.environ["MACOSX_DEPLOYMENT_TARGET"])
+        if not self.is_windows:
+            # Prefer Ninja on Linux/macOS too: the default generator is Unix Makefiles, which minimal
+            # distros (Arch) do not ship, and CMake then fails with "unable to find a build program".
             if not (build_dir / "CMakeCache.txt").exists() and shutil.which("ninja"):
                 extra += ["-G", "Ninja"]
-        if not self.is_windows:
             return extra
         # GUI subsystem for the shipped runner: without this the fresh configure produces a console
         # binary and the PE gate rejects it (a console window pops up next to the game). The old
@@ -708,6 +721,39 @@ def _inst_mesa(ctx: "Context") -> None:
     archive.unlink(missing_ok=True)
 
 
+_PACMAN_READY = False
+
+
+def _pacman_prepare(ctx: "Context") -> None:
+    """A fresh Arch image (or a stale keyring) cannot install anything: pacman fails with 'keyring is
+    not writable' / 'required key missing from keyring'. Probe, reset the keyring from the files
+    shipped with pacman-key when needed, then upgrade."""
+    global _PACMAN_READY
+    if _PACMAN_READY:
+        return
+    _PACMAN_READY = True
+    need_sudo = hasattr(os, "geteuid") and os.geteuid() != 0
+    sudo = ["sudo"] if need_sudo else []
+    gnupg = Path("/etc/pacman.d/gnupg")
+
+    def _try(argv) -> bool:
+        LOG.verbose("+ " + " ".join(argv) + "  (probe)")
+        try:
+            return subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, errors="replace", env=_child_env()).returncode == 0
+        except OSError:
+            return False
+
+    if not _try(sudo + ["pacman", "-Sy", "--noconfirm", "--disable-download-timeout"]):
+        print("  pacman: resetting the keyring (fresh install)")
+        run(sudo + ["rm", "-rf", str(gnupg)])
+        run(sudo + ["pacman-key", "--init"])
+        run(sudo + ["pacman-key", "--populate", "archlinux"])
+        run(sudo + ["pacman", "-Sy", "--noconfirm", "--disable-download-timeout"])
+    step("pacman: upgrading the system (first install on this machine)")
+    run(sudo + ["pacman", "-Syu", "--noconfirm", "--needed", "--disable-download-timeout"])
+
+
 def _inst_pkg(ctx: "Context", group: str) -> None:
     """Install a distro package group with the detected manager (sudo when not root)."""
     mgr = ctx.platform.pkg_mgr or "apt"
@@ -720,7 +766,7 @@ def _inst_pkg(ctx: "Context", group: str) -> None:
         "apt": ["apt-get", "install", "-y"],
         "dnf": ["dnf", "install", "-y"],
         "yum": ["yum", "install", "-y"],
-        "pacman": ["pacman", "-S", "--noconfirm"],
+        "pacman": ["pacman", "-S", "--noconfirm", "--needed"],
         "zypper": ["zypper", "--non-interactive", "install"],
         "apk": ["apk", "add"],
         "xbps": ["xbps-install", "-y"],
@@ -728,6 +774,8 @@ def _inst_pkg(ctx: "Context", group: str) -> None:
     }.get(mgr)
     if install is None:
         raise RuntimeError(f"unsupported package manager: {mgr}")
+    if mgr == "pacman":
+        _pacman_prepare(ctx)
     refresh = {
         "apt": ["apt-get", "update"],
         "apk": ["apk", "update"],
@@ -1198,6 +1246,13 @@ def build_launcher(ctx: "Context") -> Optional[Path]:
         extra.append("-DCMAKE_PREFIX_PATH=" + str(ctx.platform.qt_prefix))
     if ctx.platform.is_windows:
         extra += ctx.platform.windows_generator_flags(bdir)
+    else:
+        # Same as the main tree: use Ninja when available, otherwise CMake defaults to Unix Makefiles
+        # (not installed on minimal distros like Arch) and the configure fails.
+        if not (bdir / "CMakeCache.txt").exists() and shutil.which("ninja"):
+            extra += ["-G", "Ninja"]
+        if ctx.platform.is_macos and os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
+            extra.append("-DCMAKE_OSX_DEPLOYMENT_TARGET=" + os.environ["MACOSX_DEPLOYMENT_TARGET"])
     run(["cmake", "-S", src, "-B", bdir] + extra)
     cmake_build(ctx.platform, bdir, "Launcher", ctx.jobs)
     exe = bdir / ctx.platform.exe("Launcher")
@@ -1357,8 +1412,17 @@ def _bundle_closure(binaries: list[Path], stage_lib: Path) -> None:
             if name in seen or name.startswith(LINUX_LIB_BLACKLIST):
                 continue
             seen.add(name)
-            shutil.copy2(dep, stage_lib / name)
-            queue.append(stage_lib / name)
+            dst = stage_lib / name
+            # A plugin's dependency can resolve (through ..) to a file already bundled: copying it
+            # again raises SameFileError. Compare resolved paths and just reuse it.
+            try:
+                if dst.exists() and dep.resolve() == dst.resolve():
+                    queue.append(dst)
+                    continue
+            except OSError:
+                pass
+            shutil.copy2(dep, dst)
+            queue.append(dst)
 
 
 def bundle_linux(ctx: "Context", stage: Path, runner: Path, launcher: Optional[Path]) -> None:
@@ -1369,6 +1433,9 @@ def bundle_linux(ctx: "Context", stage: Path, runner: Path, launcher: Optional[P
     bin_runner = stage / "bt3-runner"
     shutil.copy2(runner, bin_runner)
     bin_runner.chmod(bin_runner.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    raw = stage / "ps2EntryRunner"   # deploy_tree dropped the build name here; the launcher boots bt3-runner
+    if raw.exists() and raw != bin_runner:
+        raw.unlink()
     targets = [bin_runner]
 
     if launcher is not None:
