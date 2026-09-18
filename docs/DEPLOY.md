@@ -182,6 +182,24 @@ python3 games/bt3/setup.py <iso|elf> [--stage N] [--jobs N] [-y] [--deploy OUT] 
 | `--skip-setup` | reuse `games/bt3/work/` + generated sources; rebuild the runner only |
 | `--gen-only` | stop after generation/patches (used by the release containers) |
 
+### Linux distributions (stage 2)
+
+Stage 2 detects the package manager and installs the toolchain, FFmpeg and Qt with the right package
+names; the build cache (`ccache`/`mold`) is optional (a failure only warns). It only installs when
+there is a prompt or `-y`/`--install-deps` was passed -- without a TTY it stops with the exact commands.
+
+| Package manager | Distributions | Notes |
+|---|---|---|
+| `apt` | Debian, Ubuntu, Mint, Pop!_OS, Kali, Raspberry Pi OS | `apt-get update` runs first |
+| `dnf` | Fedora, RHEL 8+, CentOS Stream, Nobara | FFmpeg needs RPM Fusion |
+| `yum` | older RHEL/CentOS | used only when `dnf` is absent |
+| `pacman` | Arch, Manjaro, EndeavourOS | |
+| `zypper` | openSUSE Tumbleweed/Leap | FFmpeg may need the Packman repo |
+| `apk` | Alpine | musl; best effort |
+| `xbps` | Void | |
+| `eopkg` | Solus | |
+| `emerge` | Gentoo | not automated: prints the `emerge` atoms |
+
 ## Input handling (launcher)
 
 The launcher reads controllers through **GLFW** (same joystick mapping database

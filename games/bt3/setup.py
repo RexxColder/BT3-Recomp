@@ -49,36 +49,76 @@ MESA_LAVAPIPE_VERSION = "26.2.0"
 DEPS_7ZR_URL = "https://www.7-zip.org/a/7zr.exe"
 
 # Linux package groups per package manager (stage 2). Split so a missing FFmpeg or Qt can be
-# installed without re-running the whole toolchain install.
+# installed without re-running the whole toolchain install; "extras" are optional (a failure only
+# warns). Package names follow each distro family.
 LINUX_GROUPS: dict[str, dict[str, str]] = {
-    "apt": {
-        "toolchain": "clang cmake ninja-build pkg-config git ccache mold libx11-dev libxrandr-dev "
+    "apt": {   # Debian, Ubuntu, Mint, Pop!_OS, Kali, Raspberry Pi OS
+        "toolchain": "clang cmake ninja-build pkg-config git libx11-dev libxrandr-dev "
                      "libxi-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev libglu1-mesa-dev "
                      "libarchive-tools p7zip-full",
         "ffmpeg": "libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev",
         "qt": "qt6-base-dev",
+        "extras": "ccache mold",
     },
-    "pacman": {
-        "toolchain": "clang cmake ninja pkgconf git ccache mold libx11 libxrandr libxi libxcursor "
+    "dnf": {   # Fedora, RHEL 8+, CentOS Stream, Nobara
+        "toolchain": "clang cmake ninja-build pkgconf-pkg-config git libX11-devel "
+                     "libXrandr-devel libXi-devel libXcursor-devel libXinerama-devel mesa-libGL-devel "
+                     "mesa-libGLU-devel libarchive p7zip",
+        "ffmpeg": "ffmpeg-devel",   # needs RPM Fusion on Fedora
+        "qt": "qt6-qtbase-devel",
+        "extras": "ccache mold",
+    },
+    "yum": {   # older RHEL/CentOS (dnf preferred when present)
+        "toolchain": "clang cmake ninja-build pkgconfig git libX11-devel libXrandr-devel "
+                     "libXi-devel libXcursor-devel libXinerama-devel mesa-libGL-devel "
+                     "mesa-libGLU-devel libarchive",
+        "ffmpeg": "ffmpeg-devel",
+        "qt": "qt6-qtbase-devel",
+        "extras": "ccache",
+    },
+    "pacman": {   # Arch, Manjaro, EndeavourOS
+        "toolchain": "clang cmake ninja pkgconf git libx11 libxrandr libxi libxcursor "
                      "libxinerama mesa glu libarchive p7zip",
         "ffmpeg": "ffmpeg",
         "qt": "qt6-base",
+        "extras": "ccache mold",
     },
-    "dnf": {
-        "toolchain": "clang cmake ninja-build pkgconf-pkg-config git ccache mold libX11-devel "
-                     "libXrandr-devel libXi-devel libXcursor-devel libXinerama-devel mesa-libGL-devel "
-                     "mesa-libGLU-devel libarchive p7zip",
-        "ffmpeg": "ffmpeg-devel",
-        "qt": "qt6-qtbase-devel",
-    },
-    "zypper": {
-        "toolchain": "clang cmake ninja pkg-config git ccache mold libX11-devel libXrandr-devel "
+    "zypper": {   # openSUSE Tumbleweed/Leap
+        "toolchain": "clang cmake ninja pkg-config git libX11-devel libXrandr-devel "
                      "libXi-devel libXcursor-devel libXinerama-devel Mesa-libGL-devel glu-devel "
                      "libarchive p7zip",
+        "ffmpeg": "ffmpeg-devel",   # may need the Packman repo
+        "qt": "qt6-base-devel",
+        "extras": "ccache mold",
+    },
+    "apk": {   # Alpine (musl; best effort)
+        "toolchain": "clang cmake ninja pkgconf git libx11-dev libxrandr-dev libxi-dev "
+                     "libxcursor-dev libxinerama-dev mesa-dev glu-dev libarchive-tools",
+        "ffmpeg": "ffmpeg-dev",
+        "qt": "qt6-qtbase-dev",
+        "extras": "ccache mold",
+    },
+    "xbps": {   # Void
+        "toolchain": "clang cmake ninja pkgconf git libX11-devel libXrandr-devel libXi-devel "
+                     "libXcursor-devel libXinerama-devel MesaLib-devel glu-devel libarchive-tools",
         "ffmpeg": "ffmpeg-devel",
         "qt": "qt6-base-devel",
+        "extras": "ccache mold",
+    },
+    "eopkg": {   # Solus
+        "toolchain": "clang cmake ninja pkgconf git libx11-devel libxrandr-devel libxi-devel "
+                     "libxcursor-devel libxinerama-devel mesa-devel glu-devel libarchive",
+        "ffmpeg": "ffmpeg-devel",
+        "qt": "qt6-base-devel",
+        "extras": "ccache",
     },
 }
+
+# Gentoo has no safe unattended package install (USE flags, source builds): stage 2 prints the atoms.
+GENTOO_HINT = ("emerge -a sys-devel/clang dev-build/cmake dev-build/ninja dev-util/pkgconf "
+               "dev-vcs/git x11-libs/libX11 x11-libs/libXrandr x11-libs/libXi x11-libs/libXcursor "
+               "x11-libs/libXinerama media-libs/mesa media-libs/glu app-arch/libarchive "
+               "media-libs/ffmpeg dev-qt/qtbase")
 
 # Stage registry: name -> (number, callable). Order matters.
 STAGES: list[tuple[str, str]] = [
@@ -258,12 +298,27 @@ def _distro_name() -> str:
 
 
 def _detect_pkg_mgr() -> Optional[str]:
+    """First package manager present, in preference order. dnf before yum (yum is a shim on Fedora),
+    apt before nothing else on Debian-likes."""
     for name, probe in (
-        ("apt", "apt-get"), ("dnf", "dnf"), ("pacman", "pacman"), ("zypper", "zypper"),
+        ("apt", "apt-get"), ("dnf", "dnf"), ("yum", "yum"), ("pacman", "pacman"),
+        ("zypper", "zypper"), ("apk", "apk"), ("xbps", "xbps-install"),
+        ("eopkg", "eopkg"), ("emerge", "emerge"),
     ):
         if shutil.which(probe):
             return name
     return None
+
+
+def _distro_pretty() -> str:
+    try:
+        txt = Path("/etc/os-release").read_text(errors="replace")
+    except OSError:
+        return ""
+    for line in txt.splitlines():
+        if line.startswith("PRETTY_NAME="):
+            return line.split("=", 1)[1].strip().strip('"')
+    return ""
 
 
 def _qt_prefix() -> Optional[Path]:
@@ -436,7 +491,11 @@ def detect_platform() -> PlatformInfo:
 
 
 def print_platform_report(info: PlatformInfo) -> None:
-    print(f"Platform : {info.os} ({info.arch})" + (f" distro={info.distro}" if info.distro else ""))
+    distro = f" distro={info.distro}" if info.distro else ""
+    pretty = _distro_pretty() if info.os == "linux" else ""
+    if pretty and f'"{pretty}"' != f'"{info.distro}"':
+        distro += f' ({pretty})'
+    print(f"Platform : {info.os} ({info.arch}){distro}")
     print(f"Package  : {info.pkg_mgr or 'not detected'}"
           + ("  [container/non-interactive]" if info.in_container else ""))
     print(f"Build dir: {BUILD}")
@@ -471,6 +530,7 @@ class Dep:
     check: Callable[[PlatformInfo], bool]
     hint: str            # what to install (shown to the user)
     install: Optional[Callable[["Context"], None]] = None   # filled in stage 2 execution
+    optional: bool = False   # a failure warns instead of stopping the build
 
 
 def _have(name: str) -> Callable[[PlatformInfo], bool]:
@@ -527,19 +587,30 @@ def _inst_pkg(ctx: "Context", group: str) -> None:
     mgr = ctx.platform.pkg_mgr or "apt"
     packages = LINUX_GROUPS.get(mgr, {}).get(group)
     if not packages:
+        if mgr == "emerge":
+            raise RuntimeError(f"Gentoo is not automated; run manually:\n    {GENTOO_HINT}")
         raise RuntimeError(f"no package mapping for {mgr}/{group}")
-    cmd = {
+    install = {
         "apt": ["apt-get", "install", "-y"],
         "dnf": ["dnf", "install", "-y"],
+        "yum": ["yum", "install", "-y"],
         "pacman": ["pacman", "-S", "--noconfirm"],
         "zypper": ["zypper", "--non-interactive", "install"],
+        "apk": ["apk", "add"],
+        "xbps": ["xbps-install", "-y"],
+        "eopkg": ["eopkg", "install", "-y"],
     }.get(mgr)
-    if cmd is None:
+    if install is None:
         raise RuntimeError(f"unsupported package manager: {mgr}")
-    full = cmd + packages.split()
-    if hasattr(os, "geteuid") and os.geteuid() != 0:
-        full = ["sudo"] + full
-    run(full)
+    refresh = {
+        "apt": ["apt-get", "update"],
+        "apk": ["apk", "update"],
+        "xbps": ["xbps-install", "-S"],
+    }.get(mgr)
+    need_sudo = hasattr(os, "geteuid") and os.geteuid() != 0
+    if refresh:
+        run((["sudo"] if need_sudo else []) + refresh)
+    run((["sudo"] if need_sudo else []) + install + packages.split())
 
 
 def _inst_brew(ctx: "Context", packages: str) -> None:
@@ -604,19 +675,30 @@ def deps_for(info: PlatformInfo) -> list[Dep]:
             Dep("Qt 6", lambda i: bool(i.qt_prefix), "brew install qt",
                 lambda ctx: _inst_brew(ctx, "qt")),
         ]
-    return [
+    mgr = info.pkg_mgr or "apt"
+    if mgr == "emerge":
+        return [
+            Dep("Gentoo build packages",
+                lambda i: all(shutil.which(t) for t in ("clang", "cmake", "ninja", "pkg-config")),
+                GENTOO_HINT, None),
+        ]
+    groups = LINUX_GROUPS.get(mgr, {})
+    pkg_hint = lambda group: f"{mgr} install {groups.get(group, '<packages>')}"   # noqa: E731
+    deps = [
         Dep("build toolchain (clang/cmake/ninja/pkg-config)", lambda i: all(
                 shutil.which(t) for t in ("clang", "cmake", "ninja", "pkg-config")),
-            f"{info.pkg_mgr or 'apt'} install <toolchain packages>",
-            lambda ctx: _inst_pkg(ctx, "toolchain")),
+            pkg_hint("toolchain"), lambda ctx: _inst_pkg(ctx, "toolchain")),
         Dep("FFmpeg dev libs", lambda i: bool(shutil.which("pkg-config")) and
             subprocess.run(["pkg-config", "--exists", "libavcodec"], capture_output=True).returncode == 0,
-            f"{info.pkg_mgr or 'apt'} install <ffmpeg dev package>",
-            lambda ctx: _inst_pkg(ctx, "ffmpeg")),
+            pkg_hint("ffmpeg"), lambda ctx: _inst_pkg(ctx, "ffmpeg")),
         Dep("Qt 6 (launcher)", lambda i: bool(i.qt_prefix),
-            f"{info.pkg_mgr or 'apt'} install <qt6 base dev package>",
-            lambda ctx: _inst_pkg(ctx, "qt")),
+            pkg_hint("qt"), lambda ctx: _inst_pkg(ctx, "qt")),
     ]
+    if groups.get("extras"):
+        deps.append(Dep("build cache (ccache/mold, optional)",
+                        lambda i: bool(shutil.which("ccache") or shutil.which("mold")),
+                        pkg_hint("extras"), lambda ctx: _inst_pkg(ctx, "extras"), optional=True))
+    return deps
 
 def stage_deps(ctx: "Context") -> None:
     """Report the platform dependencies, then (interactively) install what is missing."""
@@ -644,16 +726,25 @@ def stage_deps(ctx: "Context") -> None:
         if d.install is None:
             die(f"cannot install automatically: {d.name}\n  install manually: {d.hint}", 2)
         if not ask_yes_no(ctx, f"Install {d.name} now?", default=True):
+            if d.optional:
+                warn(f"skipping optional dependency: {d.name}")
+                continue
             die(f"missing dependency: {d.name}\n  install manually: {d.hint}", 2)
         try:
             d.install(ctx)
         except Exception as e:   # noqa: BLE001
+            if d.optional:
+                warn(f"could not install optional {d.name}: {e}\n  install manually: {d.hint}")
+                continue
             die(f"failed to install {d.name}: {e}\n  install manually: {d.hint}", 2)
         if not d.check(ctx.platform):
             # winget/brew installs land outside this process' PATH; the tool is usually fine from a new
             # shell, so warn with the exact command instead of pretending it worked.
-            warn(f"{d.name} is still not visible in this shell; open a new one if the build cannot find it."
-                 f"\n  expected: {d.hint}")
+            if d.optional:
+                warn(f"optional {d.name} not visible in this shell; continuing without it")
+            else:
+                warn(f"{d.name} is still not visible in this shell; open a new one if the build cannot find it."
+                     f"\n  expected: {d.hint}")
         else:
             print(f"  installed: {d.name}")
 
