@@ -1291,7 +1291,9 @@ def bundle_windows(ctx: "Context", stage: Path, runner: Path, launcher: Path) ->
     """Flat self-contained layout: Qt + VC runtime + FFmpeg in lib/, critical DLLs next to the EXEs,
     qt.conf for plugin discovery, lavapipe as the software Vulkan fallback."""
     step("bundling the Windows runtime")
-    stage_lib = stage / "lib"
+    stage_assets = stage / "assets"
+    stage_assets.mkdir(parents=True, exist_ok=True)
+    stage_lib = stage_assets / "lib"
     stage_lib.mkdir(parents=True, exist_ok=True)
 
     # The launcher boots <appDir>/bt3-runner.exe: rename the built ps2EntryRunner.exe.
@@ -1346,23 +1348,22 @@ def bundle_windows(ctx: "Context", stage: Path, runner: Path, launcher: Path) ->
         else:
             warn(f"VC++ runtime {dll} not found; the target machine must install the VC++ redistributable")
 
-    # Windows resolves DLLs from the EXE's directory before main(): flatten the critical ones so a
-    # double-click works without a wrapper script.
-    for dll in ("Qt6Core.dll", "Qt6Gui.dll", "Qt6Widgets.dll", "Qt6Network.dll",
-                "Qt6Concurrent.dll", "Qt6OpenGL.dll", "Qt6OpenGLWidgets.dll",
-                "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
-                "vcruntime140.dll", "vcruntime140_1.dll"):
-        src = stage_lib / dll
-        if src.exists():
-            shutil.copy2(src, stage / dll)
+    # Windows resolves DLLs from the EXE's directory before main(): flatten EVERY bundled DLL next to
+    # the executables so a double-click on bt3-runner.exe works (and the launcher does not need PATH
+    # gymnastics). assets/lib stays the canonical bundle; the flat copies are the load-time safety net.
+    flat = 0
+    for p in stage_lib.glob("*.dll"):
+        shutil.copy2(p, stage / p.name)
+        flat += 1
+    print(f"  flattened {flat} DLLs next to the executables")
 
-    (stage / "qt.conf").write_text("[Paths]\nPrefix = .\nPlugins = lib/qt6/plugins\n", encoding="ascii")
+    (stage / "qt.conf").write_text("[Paths]\nPrefix = .\nPlugins = assets/lib/qt6/plugins\n", encoding="ascii")
 
     copy_licences(stage)
 
     lvp = ctx.platform.lavapipe_dir
     if lvp and (lvp / "vulkan_lvp.dll").exists():
-        lvp_dst = stage / "lavapipe"
+        lvp_dst = stage_assets / "lavapipe"
         lvp_dst.mkdir(exist_ok=True)
         shutil.copy2(lvp / "vulkan_lvp.dll", lvp_dst / "vulkan_lvp.dll")
         icd = lvp / "lvp_icd.x86_64.json"
@@ -1427,7 +1428,9 @@ def _bundle_closure(binaries: list[Path], stage_lib: Path) -> None:
 
 def bundle_linux(ctx: "Context", stage: Path, runner: Path, launcher: Optional[Path]) -> None:
     step("bundling the Linux runtime")
-    stage_lib = stage / "lib"
+    stage_assets = stage / "assets"
+    stage_assets.mkdir(parents=True, exist_ok=True)
+    stage_lib = stage_assets / "lib"
     stage_lib.mkdir(parents=True, exist_ok=True)
 
     bin_runner = stage / "bt3-runner"

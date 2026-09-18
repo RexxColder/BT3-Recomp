@@ -11,7 +11,7 @@ DEST="$BASE/bt3-recomp"
 echo "== installing to $DEST"
 mkdir -p "$DEST"
 
-cp -a "$SRC"/Launcher "$SRC"/bt3-runner "$SRC"/lib "$SRC"/assets "$DEST"/
+cp -a "$SRC"/Launcher "$SRC"/bt3-runner "$SRC"/assets "$DEST"/
 
 # no game data here: the launcher's install wizard extracts it from the user's
 # own ISO into $DEST/data on first run. Existing $DEST/data is left untouched.
@@ -37,8 +37,8 @@ cat > "$WRAP" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$DEST"
-export LD_LIBRARY_PATH="\$PWD/lib"
-export QT_PLUGIN_PATH="\$PWD/lib/qt6/plugins"
+export LD_LIBRARY_PATH="\$PWD/assets/lib"
+export QT_PLUGIN_PATH="\$PWD/assets/lib/qt6/plugins"
 export PS2X_EXEDIR="\$PWD"
 exec ./Launcher "\$@"
 EOF

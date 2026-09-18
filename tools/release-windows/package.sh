@@ -13,7 +13,7 @@
 #   Launcher.exe        Qt launcher
 #   bt3-runner.exe      the game runner
 #   qt.conf             Qt plugin discovery for the flat layout
-#   lib/                Qt6 + FFmpeg + VC++ runtime DLLs and the Qt plugins
+#   assets/lib/         Qt6 + FFmpeg + VC++ runtime DLLs and the Qt plugins
 #   assets/             sky theme + fonts
 #   savedata/BASLUS-21678DBZT3/   placeholder created by the wizard later
 #   savedata/fps60_sites.txt     60 fps pacing rules
@@ -29,17 +29,16 @@ OUT_DIR="$RELEASE/out"
 TREE_NAME="Dragon Ball Budokai Tenkaichi 3 Recompiled"
 
 [[ -d "$STAGE" ]] || { echo "ERROR: $STAGE missing (run tools/release-windows/build-windows.sh first)"; exit 2; }
-[[ -f "$STAGE/Launcher.exe" && -f "$STAGE/bt3-runner.exe" && -f "$STAGE/qt.conf" && -d "$STAGE/lib" ]] || {
+[[ -f "$STAGE/Launcher.exe" && -f "$STAGE/bt3-runner.exe" && -f "$STAGE/qt.conf" && -d "$STAGE/assets/lib" ]] || {
     echo "ERROR: stage incomplete"; exit 2; }
 
 # ---- portable tree ---------------------------------------------------------
 TMP_TREE="$OUT_DIR/$TREE_NAME"
 rm -rf "$TMP_TREE"; mkdir -p "$TMP_TREE"
 cp -a "$STAGE"/Launcher.exe "$STAGE"/bt3-runner.exe "$STAGE"/qt.conf "$TMP_TREE"/
-cp -a "$STAGE"/lib "$STAGE"/assets "$TMP_TREE"/
+cp -a "$STAGE"/assets "$TMP_TREE"/
 # The flat layout keeps the critical Qt/VC DLLs next to the executables.
 find "$STAGE" -maxdepth 1 -name "*.dll" -exec cp -a {} "$TMP_TREE"/ \;
-[[ -d "$STAGE/lavapipe" ]] && cp -a "$STAGE"/lavapipe "$TMP_TREE"/
 # Licences must travel with the binaries (GPL-3.0 + LGPL-3.0 for paraLLEl-GS).
 cp -a "$STAGE"/LICENSE "$STAGE"/COPYING.LGPLv3 "$TMP_TREE"/
 mkdir -p "$TMP_TREE/savedata/BASLUS-21678DBZT3"

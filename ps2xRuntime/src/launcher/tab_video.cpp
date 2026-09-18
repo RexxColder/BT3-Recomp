@@ -271,6 +271,20 @@ namespace
                                                    "uses the monitor's current mode.")));
 
             root->addLayout(buttonRow());
+            // Preselect from the saved settings: without this the widgets keep their construction
+            // defaults (monitor index 0, first resolution, no radio checked) and the dialog showed --
+            // and Saved -- the wrong values, so a chosen monitor never appeared to stick.
+            {
+                int res = 0;
+                for (int i = 0; i < kWinCount; ++i)
+                    if (kWinW[i] == s.windowW() && kWinH[i] == s.windowH()) { res = i; break; }
+                m_res->setCurrentIndex(res);
+                const int scale = std::clamp(s.renderScale(), 1, 3);
+                (scale >= 3 ? m_x3 : scale == 2 ? m_x2 : m_x1)->setChecked(true);
+                m_mon->setCurrentIndex(std::clamp(s.monitor(), 0, std::max(0, m_mon->count() - 1)));
+                const int mode = s.windowMode();
+                (mode == 2 ? m_full : mode == 1 ? m_borderless : m_win)->setChecked(true);
+            }
             m_opened = capture();
             loadOpened();
         }

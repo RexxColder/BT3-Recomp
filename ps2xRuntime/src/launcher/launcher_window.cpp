@@ -254,6 +254,13 @@ void LauncherWindow::onPlayClicked()
         env.insert(QStringLiteral("PS2X_EXEDIR"), apppaths::userRoot());
         env.insert(QStringLiteral("PS2X_ASSETDIR"), apppaths::assets());
 #ifdef _WIN32
+        // The bundle lives in assets/lib now (flat copies also sit next to the exes); prepend it to
+        // PATH so the runner resolves its DLLs even when a file was not flattened.
+        {
+            const QString libDir = QDir(apppaths::assets()).filePath(QStringLiteral("lib"));
+            const QString path = env.value(QStringLiteral("PATH"));
+            env.insert(QStringLiteral("PATH"), libDir + QLatin1Char(';') + path);
+        }
         // [vulkan] Windows: paraLLEl-GS runs on the bundled Mesa lavapipe ICD by
         // default. The vendor Vulkan driver (AMD amdvlk64.dll) access-violates
         // inside its shader compiler on Polaris/GCN parts and kills the runner.
@@ -261,7 +268,7 @@ void LauncherWindow::onPlayClicked()
         if (SettingsManager::instance().renderer() == SettingsManager::kRendererParallelGS &&
             qEnvironmentVariable("PS2X_VK_NATIVE") != QLatin1String("1"))
         {
-            const QString lvp = appDir.filePath(QStringLiteral("lavapipe/lvp_icd.x86_64.json"));
+            const QString lvp = QDir(apppaths::assets()).filePath(QStringLiteral("lavapipe/lvp_icd.x86_64.json"));
             if (QFile::exists(lvp))
             {
                 env.insert(QStringLiteral("VK_DRIVER_FILES"), lvp);
@@ -273,7 +280,8 @@ void LauncherWindow::onPlayClicked()
         // position-independent loader search is a POSIX concept; Windows
         // resolves the bundled dlls from the executable's own directory, and
         // the macOS bundle resolves its dylibs through @rpath.
-        env.insert(QStringLiteral("LD_LIBRARY_PATH"), appDir.filePath(QStringLiteral("lib")));
+        env.insert(QStringLiteral("LD_LIBRARY_PATH"),
+                   QDir(apppaths::assets()).filePath(QStringLiteral("lib")));
 #endif
         proc->setProcessEnvironment(env);
     }

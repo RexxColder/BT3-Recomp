@@ -116,7 +116,7 @@ cd "Dragon Ball Budokai Tenkaichi 3 Recompiled"
 ```
 
 or run `install game.sh` for a desktop menu entry + icon. The launcher boots
-`bt3-runner` with the extracted `data/SLUS_216.78` and the bundled `lib/`
+`bt3-runner` with the extracted `data/SLUS_216.78` and the bundled `assets/lib/`
 automatically.
 
 **Windows (native, PowerShell):** the native build runs locally with Visual

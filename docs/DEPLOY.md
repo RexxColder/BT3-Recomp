@@ -21,7 +21,7 @@ Dragon Ball Budokai Tenkaichi 3 Recompiled/
 ├── Launcher                # Qt 6 config UI (Linux/X11; Windows → Launcher.exe)
 ├── bt3-runner              # the recompiled game (Windows → bt3-runner.exe)
 ├── install game.sh         # Linux helper: menu entry + desktop icon
-├── lib/                    # runner's shared-library closure (Linux)
+├── assets/lib/             # runner's shared-library closure (Linux)
 ├── assets/                 # launcher artwork, fonts (background.png, icon.png, …)
 ├── savedata/
 │   ├── settings.toml    # user settings ([logging], [video], …)
@@ -102,11 +102,11 @@ tools/release-windows/package.sh
 
 The container generates the generated sources natively (`setup.py --gen-only` —
 the codegen is target-agnostic), cross-compiles the runner and the Qt 6
-launcher, bundles Qt, FFmpeg and the VC++ runtime DLLs into `lib/`, writes the
+launcher, bundles Qt, FFmpeg and the VC++ runtime DLLs into `assets/lib/`, writes the
 portable tree to `build/release-windows/out/stage/` (`Launcher.exe`,
 `bt3-runner.exe`, `qt.conf`, `assets/`, `savedata/`, licences,
 `settings.toml`) and runs a PE gate — `check_windows_deps.py` (pefile) verifies
-that every PE import resolves either from `lib/` or to a Windows OS component,
+that every PE import resolves either from `assets/lib/` or to a Windows OS component,
 and that the layout is complete. `package.sh` then zips the tree into
 `BT3-Recomp-x86_64.zip` + `.sha256`. Windows resolves the bundled DLLs from the
 executable's own directory, so no `LD_LIBRARY_PATH` games are needed. The full
@@ -247,7 +247,7 @@ before unpacking.
 - The launcher is Qt 6 (Widgets only) and builds its GLFW dependency from
   source via `FetchContent`, so no system GLFW install is needed on any
   platform.
-- On Linux the runner's shared libraries travel in `lib/`, resolvable via
+- On Linux the runner's shared libraries travel in `assets/lib/`, resolvable via
   `LD_LIBRARY_PATH`; macOS uses its own loader search-path semantics and Windows
   its DLL search order — the same tree, no per-OS tweaks in the game itself.
 - If a run stops dead with a one-line `bt3.log` saying
