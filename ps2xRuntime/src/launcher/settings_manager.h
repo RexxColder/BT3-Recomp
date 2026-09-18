@@ -64,13 +64,9 @@ public:
     int hudOffR() const { return m_hudOffR; }
 
     void setRenderer(int v) { m_renderer = v; }
-    void setGpuRenderer(bool v) { m_renderer = (v != false) ?
-#if defined(PS2X_HAVE_PGS)
-        kRendererParallelGS :
-#else
-        kRendererOpenGL :
-#endif
-        kRendererSoftware; }
+    // [pgswin] The launcher is never built with PS2X_HAVE_PGS (that is the runner's define), so the
+    // #if here always picked OpenGL. The runner falls back to OpenGL itself when Vulkan is missing.
+    void setGpuRenderer(bool v) { m_renderer = (v != false) ? kRendererParallelGS : kRendererSoftware; }
     void setGlow(bool v) { m_glow = v; }
     void setGlowFix(bool v) { m_glowFix = v; }
     void setBilinear(bool v) { m_bilinear = v; }
@@ -123,11 +119,7 @@ private:
     bool m_sawRenderer = false;   // [renderer] set when the ini had an explicit `renderer` key
     QString m_dir;
     float m_master = 1.0f, m_music = 1.0f, m_sfx = 1.0f;
-#if defined(_WIN32)
-    int m_renderer = kRendererOpenGL;   // [opengl-new] our own GL present (D3D11 retired for now)
-#else
-    int m_renderer = kRendererParallelGS;
-#endif
+    int m_renderer = kRendererParallelGS;   // [pgswin] every platform, as the Video tab's hint says
     bool m_glow = true, m_glowFix = true;
     bool m_bilinear = true, m_halfTexel = true, m_skipPost = true, m_skipStaleVram = true;
     int m_renderScale = 1;

@@ -167,12 +167,11 @@ bool SettingsManager::loadToml(const QString &path)
 
     {
         int r = nameToRenderer(doc.getS("video.renderer", rendererName(m_renderer)), m_renderer);
-#if defined(_WIN32)
-        if (r == 2) r = 3;    // [d3d11] paraLLEl-GS retired on Windows -> Direct3D 11
-#else
-        if (r == 3) r = 0;    // [d3d11] Direct3D 11 is Windows-only
-#endif
-        if (r >= 0 && r <= 3) { m_renderer = r; m_sawRenderer = true; }
+        // [pgswin] Direct3D 11 is retired on every platform: an old "d3d11" becomes OpenGL (New),
+        // matching the runtime. paraLLEl-GS is kept as-is -- the Windows "PGS -> d3d11" remap
+        // turned a saved paraLLEl-GS into OpenGL and wrote that back on every Play.
+        if (r == kRendererD3D11) r = kRendererOpenGL;
+        if (r >= 0 && r <= 2) { m_renderer = r; m_sawRenderer = true; }
     }
     m_glow = doc.getB("video.glow", m_glow);
     m_glowFix = doc.getB("video.glowfix", m_glowFix);

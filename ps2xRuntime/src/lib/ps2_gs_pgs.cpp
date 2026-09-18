@@ -1669,24 +1669,16 @@ void setRenderScale(int scale)
     if (scale > 4) scale = 4;
     g_wantScale.store(scale, std::memory_order_relaxed);
 }
+// [pgswin] No Windows hard-off: the D3D11 plan that retired paraLLEl-GS there is itself retired
+// (1984cd1 brings paraLLEl-GS back as a renderer on every platform that builds it), but these two
+// kept returning false on _WIN32, so selecting it silently ran nothing.
 bool enabled()
 {
-#if defined(_WIN32)
-    return false;   // [d3d11] paraLLEl-GS is retired on Windows; the native D3D11 renderer is used.
-#else
     int v = g_enabled.load(std::memory_order_relaxed);
     if (v < 0) { v = envOn("PS2X_PGS") ? 1 : 0; g_enabled.store(v, std::memory_order_relaxed); }
     return v != 0;
-#endif
 }
-bool packMode()
-{
-#if defined(_WIN32)
-    return false;   // [d3d11] retired on Windows
-#else
-    static const bool p = envOn("PS2X_PGS") && envOn("PS2X_PGS_PACK"); return p;
-#endif
-}
+bool packMode() { static const bool p = envOn("PS2X_PGS") && envOn("PS2X_PGS_PACK"); return p; }
 bool coalesce() { static const bool c = envOn("PS2X_PGS_COALESCE") && !packMode(); return c; }   // pack mode needs per-packet order
 void setGs(GS *gs) { State &s = st(); std::lock_guard<std::mutex> lk(s.mtx); s.replacer.gs = gs; }
 static thread_local bool t_suppressed = false;
