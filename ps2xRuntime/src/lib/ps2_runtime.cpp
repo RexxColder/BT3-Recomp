@@ -44,6 +44,13 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 // lives outside the Windows-only block below.
 extern "C" const char *ps2xExeDirC();
 
+// [winmode] What the startup asked for (settings.toml [video], PS2X_* env wins when set). VideoStatus
+// uses these as the "requested" side so the overlay dots compare against the real configuration
+// instead of an env variable that may never be set (which showed a false amber on the monitor row).
+static int g_ps2xWinModeReq = 0;
+static int g_ps2xMonitorReq = 0;
+static int g_ps2xWinWReq = 0, g_ps2xWinHReq = 0;
+
 #if defined(_WIN32)
 // [d3d11] Native video device. Present path only for now (PS2X_D3D11=1): the GS still
 // renders through the existing GL renderer until it is ported (P3); this swaps the final
@@ -1459,6 +1466,9 @@ bool PS2Runtime::initialize(const char *title)
             if (winMode < 0) winMode = 0;
             if (winMode > 2) winMode = 2;
             if (winMonitor < 0) winMonitor = 0;
+            g_ps2xWinModeReq = winMode;
+            g_ps2xMonitorReq = winMonitor;
+            g_ps2xWinWReq = hostWinW; g_ps2xWinHReq = hostWinH;
             if (winMode == 2) bt3SetConfigFlags(FLAG_FULLSCREEN_MODE);
             else if (winMode == 1) bt3SetConfigFlags(FLAG_WINDOW_UNDECORATED);
             else bt3SetConfigFlags(FLAG_WINDOW_RESIZABLE);
@@ -7656,7 +7666,7 @@ namespace ps2x   // [video] at global scope: the overlay calls ps2x::GetVideoSta
                                                                               : VideoState::Fallback;
 
         s.monitorCount = bt3GetMonitorCount();
-        s.monitorRequested = envInt("PS2X_MONITOR", 0);
+        s.monitorRequested = g_ps2xMonitorReq;   // [winmode] settings/env-resolved at startup
         s.monitorIndex = bt3GetCurrentMonitor();
         if (s.monitorIndex < 0) s.monitorIndex = 0;
         const char *mn = bt3GetMonitorName(s.monitorIndex);
@@ -7669,14 +7679,17 @@ namespace ps2x   // [video] at global scope: the overlay calls ps2x::GetVideoSta
                                                                  : VideoState::Ok;
 
         s.winW = bt3GetScreenWidth(); s.winH = bt3GetScreenHeight();
-        s.resRequestedW = envInt("PS2X_WINDOW_W", s.winW);
-        s.resRequestedH = envInt("PS2X_WINDOW_H", s.winH);
+        s.resRequestedW = g_ps2xWinWReq > 0 ? g_ps2xWinWReq : s.winW;
+        s.resRequestedH = g_ps2xWinHReq > 0 ? g_ps2xWinHReq : s.winH;
         s.resolution = (s.winW <= 0 || s.winH <= 0) ? VideoState::Fail
                      : (s.resRequestedW != s.winW || s.resRequestedH != s.winH) ? VideoState::Fallback
                                                                                : VideoState::Ok;
 
         s.scaleActive = GsGpuRenderer::renderScale();
-        s.scaleRequested = envInt("PS2X_RENDER_SCALE", s.scaleActive);
+        {   // [rscale] the requested scale is the setting itself unless the env lever overrides it
+            const char *rsEnv = std::getenv("PS2X_RENDER_SCALE");
+            s.scaleRequested = (rsEnv && rsEnv[0]) ? std::atoi(rsEnv) : s.scaleActive;
+        }
         const bool liveScale = ps2x_pgs::enabled();   // PGS rebuilds the backend live; OpenGL wants a restart
         s.scaleNeedsRestart = (s.scaleRequested != s.scaleActive) && !liveScale;
         s.upscale = (s.scaleActive <= 0) ? VideoState::Fail
