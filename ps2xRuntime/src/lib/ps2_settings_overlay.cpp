@@ -1616,67 +1616,88 @@ void PS2SettingsOverlay::drawControllersTab()
 {
     ImGui::Spacing();
 
-    // --- Device / Player selectors ---
-    sectionHeader("DEVICE");
-
-    // Player
+    // [padui] Same shape as the Video tab: a compact STATUS summary with dots, the actions in popups,
+    // and the live test inline (it is what you watch while binding). Apply = live only; Save = live and
+    // persisted; Reset = back to the values it opened with; Close = discard.
     {
-        ImGui::Text("Player");
-        ImGui::SameLine(90);
-        ImGui::SetNextItemWidth(110);
-        const char *playerNames[] = {"P1", "P2"};
-        if (ImGui::Combo("##player", &m_editPlayer, playerNames, 2))
-            m_selectedDevice = deviceIndexForPlayer(m_editPlayer);   // [paddev] show THIS player's device, not the last pick
-    }
-
-    // Device
-    {
-        ImGui::Text("Device");
-        ImGui::SameLine(90);
-        std::vector<const char *> labels;
-        labels.reserve(m_deviceList.size());
-        for (auto &d : m_deviceList)
-            labels.push_back(d.name.c_str());
-        if (!labels.empty() &&
-            ImGui::Combo("##device", &m_selectedDevice, labels.data(), static_cast<int>(labels.size())))
+        sectionHeader("STATUS");
+        int pads = 0;
+        for (int g = 0; g < ps2x_pad::kMaxSlots; ++g)
+            if (ps2x_pad::available(g)) ++pads;
+        const bool haveDev = !m_deviceList.empty() && m_selectedDevice >= 0 && m_selectedDevice < (int)m_deviceList.size();
+        const char *devName = haveDev ? m_deviceList[m_selectedDevice].name.c_str() : "Auto (keyboard)";
+        const ImVec4 col = pads > 0 ? ImVec4(0.25f, 0.73f, 0.31f, 1.0f)   // green: a gamepad is being read
+                                    : ImVec4(0.82f, 0.60f, 0.13f, 1.0f);  // amber: keyboard fallback
+        auto dot = [&](const char *label, const char *value, const char *note)
         {
-            applyDeviceToPlayer(m_editPlayer, m_selectedDevice);   // [paddev] this player only
-            m_dirty = true;
-        }
-        ImGui::TextDisabled(m_editPlayer == 0 ? "Auto: the first gamepad, or the keyboard if none is plugged in."
-                                              : "Auto: the second gamepad, or the keyboard if there is only one.");
-    }
+            ImGui::TextColored(col, "*");
+            ImGui::SameLine(0.0f, 8.0f);
+            ImGui::Text("%-11s %-18s", label, value);
+            ImGui::SameLine(0.0f, 8.0f);
+            ImGui::TextDisabled("%s", note);
+        };
+        char val[128], note[256];
+        std::snprintf(val, sizeof val, "P%d", m_editPlayer + 1);
+        dot("Player", val, m_editPlayer == 0 ? "first gamepad, else the keyboard" : "second gamepad, else the keyboard");
+        std::snprintf(val, sizeof val, "%.0f%%", m_settings.deadzone * 100.0f);
+        std::snprintf(note, sizeof note, "%s | %s", devName,
+                      pads > 0 ? "gamepad detected" : "no gamepad: keyboard fallback");
+        dot("Deadzone", val, note);
 
-    // Deadzone
-    {
-        ImGui::Text("Deadzone");
-        ImGui::SameLine(90);
-        ImGui::SetNextItemWidth(180);
-        if (ImGui::SliderFloat("##dz", &m_settings.deadzone, 0.0f, 0.5f, "%.2f"))
-        {
-            applyDeadzone();
-            saveSettings();
-        }
+        ImGui::Spacing();
+        if (ImGui::Button("Player & Device...", ImVec2(200.0f, 0.0f))) ImGui::OpenPopup("Player & Device");
         ImGui::SameLine();
-        ImGui::TextDisabled("(%.0f%%)", m_settings.deadzone * 100.0f);
-    }
-
-    // --- Bindings popup trigger button ---
-    sectionHeader("BINDINGS");
-    ImGui::Spacing();
-    {
-        const float btnW = 220.0f;
-        ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - btnW) / 2.0f);
         ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.20f, 0.17f, 0.12f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, accent());
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, dbz(0.85f, 0.55f, 0.15f));
-        if (ImGui::Button("Button Bindings", ImVec2(btnW, 34)))
-        {
-            m_showBindingsPopup = true;
-        }
+        if (ImGui::Button("Button Bindings...", ImVec2(200.0f, 0.0f))) m_showBindingsPopup = true;
         ImGui::PopStyleColor(3);
+
+        static bool pInit = false;
+        static int  pPlayer = 0, pDev = 0;
+        static float pDz = 0.12f;
+        // OpenPopup and BeginPopupModal must share the ID scope (same rule as the other popups).
+        if (ImGui::BeginPopupModal("Player & Device", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            if (!pInit)
+            {
+                pPlayer = m_editPlayer; pDev = m_selectedDevice; pDz = m_settings.deadzone;
+                pInit = true;
+            }
+            ImGui::TextUnformatted("Player");
+            ImGui::RadioButton("P1", &pPlayer, 0); ImGui::SameLine();
+            ImGui::RadioButton("P2", &pPlayer, 1);
+            ImGui::TextUnformatted("Device");
+            ImGui::SetNextItemWidth(360.0f);
+            std::vector<const char *> labels;
+            labels.reserve(m_deviceList.size());
+            for (auto &d : m_deviceList) labels.push_back(d.name.c_str());
+            if (labels.empty()) ImGui::TextDisabled("No devices detected.");
+            else ImGui::Combo("##pdev", &pDev, labels.data(), (int)labels.size());
+            ImGui::TextUnformatted("Deadzone");
+            ImGui::SetNextItemWidth(260.0f);
+            ImGui::SliderFloat("##pdz", &pDz, 0.0f, 0.5f, "%.2f");
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%.0f%%)", pDz * 100.0f);
+            ImGui::TextDisabled("Auto uses the first gamepad, or the keyboard if none is plugged in.");
+            auto applyLive = [&]()
+            {
+                m_editPlayer = pPlayer;
+                m_selectedDevice = pDev;
+                if (pDev >= 0 && pDev < (int)m_deviceList.size()) applyDeviceToPlayer(pPlayer, pDev);
+                m_settings.deadzone = pDz;
+                applyDeadzone();
+            };
+            if (ImGui::Button("Reset")) pInit = false;
+            ImGui::SameLine();
+            if (ImGui::Button("Close")) { pInit = false; ImGui::CloseCurrentPopup(); }
+            ImGui::SameLine(0.0f, 24.0f);
+            if (ImGui::Button("Apply")) { applyLive(); m_dirty = true; }
+            ImGui::SameLine();
+            if (ImGui::Button("Save")) { applyLive(); saveSettings(); m_dirty = true; pInit = false; ImGui::CloseCurrentPopup(); }
+            ImGui::EndPopup();
+        }
     }
-    ImGui::Spacing();
 
     // --- Capture logic ---
     // ALWAYS read gamepad state and update edge tracking (independent of UI visibility)
