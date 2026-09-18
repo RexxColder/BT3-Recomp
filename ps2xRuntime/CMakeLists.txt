@@ -148,6 +148,17 @@ else()
     option(PS2X_HOST_SDL2 "Use SDL2 for gamepad input and audio output" ON)
     if(PS2X_HOST_SDL2)
         target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp")
+        # [sdlprefetch] clang-cl: SDL_endian.h defines _m_prefetch, a builtin on current clang ("definition
+        # of builtin function"). Our files include SDL via ps2_host_sdl.h, which sets clang's guard first;
+        # imgui's SDL2 backend and bt3gl's SDL platform (rcore.c) include <SDL.h> directly, so force the
+        # same guard into those two. Out of the unity build so the force-include stays on that one file.
+        if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            set(_ps2x_sdl_prefetch_fix "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/ps2_sdl_prefetch_fix.h")
+            set_source_files_properties(
+                "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp"
+                "${bt3gl_SOURCE_DIR}/src/rcore.c"
+                PROPERTIES COMPILE_OPTIONS "/FI${_ps2x_sdl_prefetch_fix}" SKIP_UNITY_BUILD_INCLUSION ON)
+        endif()
     endif()
 
     # [C] rlImGui is GONE: the overlay is ImGui over our own backends (imgui_impl_sdl2 for the platform
