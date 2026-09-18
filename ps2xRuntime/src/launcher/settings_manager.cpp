@@ -168,7 +168,10 @@ bool SettingsManager::loadToml(const QString &path)
     {
         int r = nameToRenderer(doc.getS("video.renderer", rendererName(m_renderer)), m_renderer);
 #if defined(_WIN32)
-        if (r == 2) r = 3;    // [d3d11] paraLLEl-GS retired on Windows -> Direct3D 11
+        // [d3d11] Direct3D 11 is retired: a file that still asks for it falls back to OpenGL (New).
+        // paraLLEl-GS is supported on Windows again (the release bundles the lavapipe ICD), so it must
+        // NOT be rewritten any more -- doing so silently turned every "parallel-gs" choice into OpenGL.
+        if (r == 3) r = 0;
 #else
         if (r == 3) r = 0;    // [d3d11] Direct3D 11 is Windows-only
 #endif
