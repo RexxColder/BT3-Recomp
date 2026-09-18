@@ -1487,6 +1487,8 @@ bool PS2Runtime::initialize(const char *title)
                 const int mw = bt3GetMonitorWidth(idx), mh = bt3GetMonitorHeight(idx);
                 if (mw >= 320 && mh >= 240) bt3SetWindowSize(mw, mh);
             }
+            else if (winMode == 0)
+                bt3SetWindowSize(hostWinW, hostWinH);   // moving monitors can leave the window fitted
         }
         // [icon] Carry the launcher's icon onto the runner window. Same asset
         // convention as the overlay font (<exeDir>/assets/icon.png); exeDir is
