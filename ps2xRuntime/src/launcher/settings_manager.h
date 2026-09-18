@@ -52,6 +52,10 @@ public:
     bool dofBlur() const { return m_dofBlur; }
     int dofZFar() const { return m_dofZFar; }
     bool fullscreen() const { return m_fullscreen; }
+    // [video.mode] 0 = windowed (resizable), 1 = borderless, 2 = fullscreen. Owns the legacy
+    // fullscreen bool, which stays in sync for old readers.
+    int windowMode() const { return m_windowMode; }
+    int monitor() const { return m_monitor; }
     bool widescreen() const { return m_widescreen; }
     int windowW() const { return m_windowW; }
     int windowH() const { return m_windowH; }
@@ -86,6 +90,8 @@ public:
     void setDofBlur(bool v) { m_dofBlur = v; }
     void setDofZFar(int v) { m_dofZFar = v; }
     void setFullscreen(bool v) { m_fullscreen = v; }
+    void setWindowMode(int v) { m_windowMode = v; }
+    void setMonitor(int v) { m_monitor = v; }
     void setWidescreen(bool v) { m_widescreen = v; }
     void setWindowSize(int w, int h) { m_windowW = w; m_windowH = h; }
     void setForceBilinear(bool v) { m_forceBilinear = v; }
@@ -136,6 +142,7 @@ private:
     int m_inkWidth = 100;
     unsigned m_inkColor = 0;
     bool m_fullscreen = false, m_widescreen = false, m_forceBilinear = true;
+    int m_windowMode = 0, m_monitor = 0;   // [video.mode] shared with the in-game overlay
     bool m_texPack = false;   // [texreplace] default OFF
     bool m_fps60 = false;     // [fps60] default OFF
     int m_windowW = 0, m_windowH = 0;
