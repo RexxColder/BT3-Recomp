@@ -28,7 +28,7 @@ $typeCandidates = @('Vector2','Vector3','Color','Rectangle','Image','Texture2D',
 
 $headerText = (Get-Content -Raw (Join-Path $vendor 'raylib.h')) + "`n" + (Get-Content -Raw (Join-Path $vendor 'rlgl.h'))
 $allSources = Get-ChildItem (Join-Path $root 'ps2xRuntime') -Recurse -Include *.cpp,*.h -File |
-    Where-Object { $_.FullName -notlike "*third_party*" }
+    Where-Object { $_.FullName -notlike "*third_party*" -and $_.Name -ne 'bt3gl_api.h' }
 $sources = $allSources |
     # Only the TUs that already include the vendor headers. Others reach raylib symbols through a
     # project header (and may also pull <windows.h>, whose Rectangle clashes with raylib's) -- they
@@ -91,6 +91,11 @@ foreach ($f in $usedFn) { [void]$sb.AppendLine("#define bt3$f $f") }
 [void]$sb.AppendLine('// ---- constants ---------------------------------------------------------------------')
 foreach ($c in $usedConst) { [void]$sb.AppendLine("#define $($map[$c]) $c") }
 
+if ($usedFn.Count + $usedConst.Count + $usedTypes.Count -eq 0) {
+    # Re-running on an already-migrated tree finds no upstream spelling left. Never overwrite the
+    # bridge with an empty one in that case (it would break every bt3* call site at once).
+    throw 'no upstream symbols found; nothing to migrate (already renamed?). Bridge left untouched.'
+}
 if ($Apply) { Set-Content -Path $bridge -Value $sb.ToString() -NoNewline; Write-Host "wrote $bridge" }
 
 # ---- rewrite our sources --------------------------------------------------------------
