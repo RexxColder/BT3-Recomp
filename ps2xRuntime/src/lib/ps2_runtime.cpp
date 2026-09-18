@@ -19,6 +19,7 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #include "ps2_host_window.h"   // [B] native window handle (SDL returns SDL_Window*, not the HWND)
 #include "runtime/ps2_texreplace.h"   // [texreplace]
 #include "runtime/ps2_video_status.h"   // [video] the Video-tab status the overlay polls
+#include "runtime/ps2_toml.h"   // [winmode] startup read of [video] window_mode / monitor
 #include "runtime/ps2_fmv_override.h"  // [fmvoverride]
 #include <filesystem>
 #include "runtime/ps2_memory.h"
@@ -1426,10 +1427,40 @@ bool PS2Runtime::initialize(const char *title)
             const char *v = std::getenv("PS2X_VSYNC");
             if (v && v[0] && v[0] != '0') bt3SetConfigFlags(FLAG_VSYNC_HINT);
         }
-        bt3SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+        // [winmode] Window mode / monitor / window size come from settings.toml [video] -- the same keys
+        // the launcher and the overlay write (window_mode, monitor, window_w, window_h). Windowed (0) is
+        // resizable AND decorated: it used to come up fixed and without a title bar, which left no way to
+        // move or resize the window. Borderless (1) fills the chosen monitor with no chrome; fullscreen
+        // (2) uses the monitor's own mode. PS2X_WINDOW_MODE / PS2X_MONITOR / PS2X_WINDOW_W / PS2X_WINDOW_H
+        // still win, so the rig levers keep working.
+        int winMode = 0, winMonitor = 0;
         int hostWinW = HOST_WINDOW_WIDTH, hostWinH = HOST_WINDOW_HEIGHT;
-        if (const char *w = std::getenv("PS2X_WINDOW_W")) { const int v = std::atoi(w); if (v > 0) hostWinW = v; }
-        if (const char *h = std::getenv("PS2X_WINDOW_H")) { const int v = std::atoi(h); if (v > 0) hostWinH = v; }
+        {
+            ps2x_toml::Document doc;
+            const char *xd = ps2xExeDirC();
+            std::ifstream f(std::string(xd ? xd : ".") + "/savedata/settings.toml");
+            if (f && doc.parse(f))
+            {
+                winMode = doc.getI("video.window_mode", doc.getB("video.fullscreen", false) ? 2 : 0);
+                winMonitor = doc.getI("video.monitor", 0);
+                hostWinW = doc.getI("video.window_w", hostWinW);
+                hostWinH = doc.getI("video.window_h", hostWinH);
+            }
+            if (const char *m = std::getenv("PS2X_WINDOW_MODE")) if (m[0]) winMode = std::atoi(m);
+            if (const char *m = std::getenv("PS2X_MONITOR")) if (m[0]) winMonitor = std::atoi(m);
+            if (const char *w = std::getenv("PS2X_WINDOW_W")) { const int v = std::atoi(w); if (v > 0) hostWinW = v; }
+            if (const char *h = std::getenv("PS2X_WINDOW_H")) { const int v = std::atoi(h); if (v > 0) hostWinH = v; }
+            if (hostWinW < 320) hostWinW = HOST_WINDOW_WIDTH;
+            if (hostWinH < 240) hostWinH = HOST_WINDOW_HEIGHT;
+            if (winMode < 0) winMode = 0;
+            if (winMode > 2) winMode = 2;
+            if (winMonitor < 0) winMonitor = 0;
+            if (winMode == 2) bt3SetConfigFlags(FLAG_FULLSCREEN_MODE);
+            else if (winMode == 1) bt3SetConfigFlags(FLAG_WINDOW_UNDECORATED);
+            else bt3SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+            std::fprintf(stderr, "[winmode] mode=%d monitor=%d size=%dx%d\n",
+                         winMode, winMonitor, hostWinW, hostWinH);
+        }
         ps2xHostPrepareWindow();   // [window] DPI hints must precede the window (SDL init happens inside)
         bt3InitWindow(hostWinW, hostWinH, title);
         {   // [winlog] what we asked for vs what the framework reports vs the REAL client area. The SDL
@@ -1445,9 +1476,17 @@ bool PS2Runtime::initialize(const char *title)
                          cw, ch, lw, lh, pw, ph,
                          (gotClient && gotSdl) ? "" : " (partial)");
         }
-        {   // [monitor] PS2X_MONITOR=<index>: move the window to that monitor (0 = primary).
-            const char *mon = std::getenv("PS2X_MONITOR");
-            if (mon && mon[0]) { const int idx = std::atoi(mon); if (idx >= 0 && idx < bt3GetMonitorCount()) bt3SetWindowMonitor(idx); }
+        {   // [monitor] the chosen monitor (settings.toml video.monitor / PS2X_MONITOR) and, for
+            // borderless, the monitor-sized chrome-less fill. Done after InitWindow because the monitor
+            // queries need SDL's video subsystem up.
+            const int mc = bt3GetMonitorCount();
+            const int idx = (winMonitor >= 0 && winMonitor < mc) ? winMonitor : 0;
+            if (mc > 0) bt3SetWindowMonitor(idx);
+            if (winMode == 1)
+            {
+                const int mw = bt3GetMonitorWidth(idx), mh = bt3GetMonitorHeight(idx);
+                if (mw >= 320 && mh >= 240) bt3SetWindowSize(mw, mh);
+            }
         }
         // [icon] Carry the launcher's icon onto the runner window. Same asset
         // convention as the overlay font (<exeDir>/assets/icon.png); exeDir is

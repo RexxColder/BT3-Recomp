@@ -1556,11 +1556,34 @@ void PS2SettingsOverlay::drawVideoTab()
     
             auto applyLive = [&]()
             {
-                bt3SetWindowSize(kW[eRes], kH[eRes]);
-                bt3SetWindowMonitor(eMon);
-                if (eMode == 2)      bt3SetWindowState(BT3_FLAG_FULLSCREEN_MODE);
-                else if (eMode == 1) bt3SetWindowState(BT3_FLAG_BORDERLESS_WINDOWED_MODE);
-                else                 bt3SetWindowState(BT3_FLAG_WINDOW_RESIZABLE);
+                // [winmode] Fullscreen and borderless are window STATES, not flags you can just add on
+                // top: switching back to windowed has to CLEAR them, otherwise the window keeps the
+                // borderless chrome -- no title bar, nothing to drag, nothing to resize (that was the
+                // old behaviour). Windowed = resizable + decorated; borderless = monitor-sized, no
+                // chrome; fullscreen = the monitor's own mode.
+                if (eMode == 2)
+                {
+                    bt3ClearWindowState(BT3_FLAG_BORDERLESS_WINDOWED_MODE | BT3_FLAG_WINDOW_UNDECORATED);
+                    bt3SetWindowMonitor(eMon);
+                    bt3SetWindowSize(kW[eRes], kH[eRes]);
+                    bt3SetWindowState(BT3_FLAG_FULLSCREEN_MODE);
+                }
+                else if (eMode == 1)
+                {
+                    bt3ClearWindowState(BT3_FLAG_FULLSCREEN_MODE);
+                    bt3SetWindowMonitor(eMon);
+                    const int mw = bt3GetMonitorWidth(eMon), mh = bt3GetMonitorHeight(eMon);
+                    if (mw >= 320 && mh >= 240) bt3SetWindowSize(mw, mh);
+                    bt3SetWindowState(BT3_FLAG_BORDERLESS_WINDOWED_MODE | BT3_FLAG_WINDOW_UNDECORATED);
+                }
+                else
+                {
+                    bt3ClearWindowState(BT3_FLAG_FULLSCREEN_MODE | BT3_FLAG_BORDERLESS_WINDOWED_MODE |
+                                        BT3_FLAG_WINDOW_UNDECORATED);
+                    bt3SetWindowMonitor(eMon);
+                    bt3SetWindowSize(kW[eRes], kH[eRes]);
+                    bt3SetWindowState(BT3_FLAG_WINDOW_RESIZABLE);
+                }
                 if (!envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(eScale);   // live on paraLLEl-GS
             };
             if (ImGui::Button("Reset")) eInit = false;

@@ -202,6 +202,8 @@ using bt3AudioStream = AudioStream;
 #define bt3GetMonitorRefreshRate GetMonitorRefreshRate
 // [display] added for the Display settings popup
 #define bt3SetWindowState SetWindowState
+#define bt3ClearWindowState ClearWindowState
 #define BT3_FLAG_FULLSCREEN_MODE FLAG_FULLSCREEN_MODE
 #define BT3_FLAG_BORDERLESS_WINDOWED_MODE FLAG_BORDERLESS_WINDOWED_MODE
 #define BT3_FLAG_WINDOW_RESIZABLE FLAG_WINDOW_RESIZABLE
+#define BT3_FLAG_WINDOW_UNDECORATED FLAG_WINDOW_UNDECORATED
