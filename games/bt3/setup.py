@@ -48,6 +48,38 @@ QT_KIT_WINDOWS = "win64_msvc2022_64"
 MESA_LAVAPIPE_VERSION = "26.2.0"
 DEPS_7ZR_URL = "https://www.7-zip.org/a/7zr.exe"
 
+# Linux package groups per package manager (stage 2). Split so a missing FFmpeg or Qt can be
+# installed without re-running the whole toolchain install.
+LINUX_GROUPS: dict[str, dict[str, str]] = {
+    "apt": {
+        "toolchain": "clang cmake ninja-build pkg-config git ccache mold libx11-dev libxrandr-dev "
+                     "libxi-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev libglu1-mesa-dev "
+                     "libarchive-tools p7zip-full",
+        "ffmpeg": "libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev",
+        "qt": "qt6-base-dev",
+    },
+    "pacman": {
+        "toolchain": "clang cmake ninja pkgconf git ccache mold libx11 libxrandr libxi libxcursor "
+                     "libxinerama mesa glu libarchive p7zip",
+        "ffmpeg": "ffmpeg",
+        "qt": "qt6-base",
+    },
+    "dnf": {
+        "toolchain": "clang cmake ninja-build pkgconf-pkg-config git ccache mold libX11-devel "
+                     "libXrandr-devel libXi-devel libXcursor-devel libXinerama-devel mesa-libGL-devel "
+                     "mesa-libGLU-devel libarchive p7zip",
+        "ffmpeg": "ffmpeg-devel",
+        "qt": "qt6-qtbase-devel",
+    },
+    "zypper": {
+        "toolchain": "clang cmake ninja pkg-config git ccache mold libX11-devel libXrandr-devel "
+                     "libXi-devel libXcursor-devel libXinerama-devel Mesa-libGL-devel glu-devel "
+                     "libarchive p7zip",
+        "ffmpeg": "ffmpeg-devel",
+        "qt": "qt6-base-devel",
+    },
+}
+
 # Stage registry: name -> (number, callable). Order matters.
 STAGES: list[tuple[str, str]] = [
     ("1", "detect  - platform, toolchain, package manager and build inputs"),
@@ -267,6 +299,10 @@ def _qt_prefix() -> Optional[Path]:
     return None
 
 
+def _mesa_dir_present(c: Optional[Path]) -> bool:
+    return bool(c) and ((c / "vulkan_lvp.dll").exists() or (c / "lavapipe" / "vulkan_lvp.dll").exists())
+
+
 def _vswhere() -> Optional[str]:
     on_path = shutil.which("vswhere")
     if on_path:
@@ -386,8 +422,9 @@ def detect_platform() -> PlatformInfo:
         info.tools["vswhere"] = _vswhere()
         info.tools["msvc"] = "yes" if _msvc_toolset_present() else None
         info.tools["vcvars"] = "loaded" if info.vs_dev_prompt() else None
-        for c in (ROOT / "build" / "mesa" / "x64", Path(os.environ.get("PS2X_MESA_DIR", "")) if os.environ.get("PS2X_MESA_DIR") else None):
-            if c and (c / "lavapipe" / "vulkan_lvp.dll").exists():
+        for c in (ROOT / "build" / "mesa" / "x64",
+                  Path(os.environ["PS2X_MESA_DIR"]) if os.environ.get("PS2X_MESA_DIR") else None):
+            if _mesa_dir_present(c):
                 info.lavapipe_dir = c
                 break
     return info
@@ -435,71 +472,154 @@ def _have(name: str) -> Callable[[PlatformInfo], bool]:
     return lambda info: bool(shutil.which(name))
 
 
+def _download(url: str, dst: Path) -> None:
+    import urllib.request
+    print(f"+ download {url} -> {dst}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    def hook(blocks, bs, total):
+        if total > 0:
+            print(f"\r  {min(100, blocks * bs * 100 // total):3d}%", end="", flush=True)
+
+    urllib.request.urlretrieve(url, dst, reporthook=hook)
+    print()
+
+
+def _inst_winget(ctx: "Context", pkg_id: str, override: Optional[str] = None) -> None:
+    exe = shutil.which("winget")
+    if not exe:
+        raise RuntimeError("winget not found (install 'App Installer' from the Microsoft Store)")
+    cmd = [exe, "install", "--id", pkg_id, "--accept-package-agreements",
+           "--accept-source-agreements", "--silent", "--disable-interactivity"]
+    if override:
+        cmd += ["--override", override]
+    run(cmd)
+
+
+def _inst_pip(ctx: "Context", module: str) -> None:
+    run([sys.executable, "-m", "pip", "install", "--upgrade", module])
+
+
+def _inst_aqt(ctx: "Context") -> None:
+    run([sys.executable, "-m", "aqt", "install-qt", "windows", "desktop",
+         QT_VERSION, QT_KIT_WINDOWS, "--outputdir", str(ROOT / "build" / "qt")])
+
+
+def _inst_mesa(ctx: "Context") -> None:
+    mesa_dir = ROOT / "build" / "mesa"
+    seven = mesa_dir / "7zr.exe"
+    if not seven.exists():
+        _download(DEPS_7ZR_URL, seven)
+    archive = mesa_dir / "mesa.7z"
+    _download(f"https://github.com/pal1000/mesa-dist-win/releases/download/"
+              f"{MESA_LAVAPIPE_VERSION}/mesa3d-{MESA_LAVAPIPE_VERSION}-release-msvc.7z", archive)
+    run([seven, "x", archive, f"-o{mesa_dir}", "-y"])
+    archive.unlink(missing_ok=True)
+
+
+def _inst_pkg(ctx: "Context", group: str) -> None:
+    """Install a distro package group with the detected manager (sudo when not root)."""
+    mgr = ctx.platform.pkg_mgr or "apt"
+    packages = LINUX_GROUPS.get(mgr, {}).get(group)
+    if not packages:
+        raise RuntimeError(f"no package mapping for {mgr}/{group}")
+    cmd = {
+        "apt": ["apt-get", "install", "-y"],
+        "dnf": ["dnf", "install", "-y"],
+        "pacman": ["pacman", "-S", "--noconfirm"],
+        "zypper": ["zypper", "--non-interactive", "install"],
+    }.get(mgr)
+    if cmd is None:
+        raise RuntimeError(f"unsupported package manager: {mgr}")
+    full = cmd + packages.split()
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        full = ["sudo"] + full
+    run(full)
+
+
+def _inst_brew(ctx: "Context", packages: str) -> None:
+    run(["brew", "install"] + packages.split())
+
+
+def _inst_xcode(ctx: "Context") -> None:
+    run(["xcode-select", "--install"])
+
+
 def deps_for(info: PlatformInfo) -> list[Dep]:
     """The dependency list for this platform. Checks are real (versions/kits), not just PATH probes."""
     if info.is_windows:
         cmv = _cmake_version()
+        vs_components = ("--quiet --wait --norestart --nocache "
+                         "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 "
+                         "--add Microsoft.VisualStudio.Component.VC.Llvm.Clang "
+                         "--add Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset "
+                         "--add Microsoft.VisualStudio.Component.Windows11SDK.22621")
         return [
             Dep("Visual Studio Build Tools + ClangCL",
                 lambda i: i.tools.get("msvc") == "yes" or bool(i.tools.get("vswhere")),
-                f"winget install Microsoft.VisualStudio.2022.BuildTools (components: "
-                f"Microsoft.VisualStudio.Component.VC.Tools.x86.x64, "
-                f"Microsoft.VisualStudio.Component.VC.Llvm.Clang, "
-                f"Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset, "
-                f"Microsoft.VisualStudio.Component.Windows11SDK.22621)"),
-            Dep(f"CMake >= {CMAKE_MIN[0]}.{CMAKE_MIN[1]}", lambda i: bool(cmv and cmv >= CMAKE_MIN),
-                "winget install Kitware.CMake"),
-            Dep("Ninja", _have("ninja"), "winget install Ninja-build.Ninja"),
-            Dep("Python 3", _have("python"), "winget install Python.Python.3.12"),
-            Dep("aqtinstall (pip)", lambda i: bool(run_capture([sys.executable, "-m", "pip", "show", "aqtinstall"])),
-                "python -m pip install aqtinstall"),
-            Dep("pefile (pip)", lambda i: bool(run_capture([sys.executable, "-m", "pip", "show", "pefile"])),
-                "python -m pip install pefile"),
+                f"winget install Microsoft.VisualStudio.2022.BuildTools --override \"{vs_components}\"",
+                lambda ctx: _inst_winget(ctx, "Microsoft.VisualStudio.2022.BuildTools",
+                                         override=vs_components)),
+            Dep(f"CMake >= {CMAKE_MIN[0]}.{CMAKE_MIN[1]}",
+                lambda i: bool(cmv and cmv >= CMAKE_MIN),
+                "winget install Kitware.CMake",
+                lambda ctx: _inst_winget(ctx, "Kitware.CMake")),
+            Dep("Ninja", _have("ninja"), "winget install Ninja-build.Ninja",
+                lambda ctx: _inst_winget(ctx, "Ninja-build.Ninja")),
+            Dep("Python 3", _have("python"), "winget install Python.Python.3.12",
+                lambda ctx: _inst_winget(ctx, "Python.Python.3.12")),
+            Dep("aqtinstall (pip)",
+                lambda i: bool(run_capture([sys.executable, "-m", "pip", "show", "aqtinstall"])),
+                "python -m pip install aqtinstall",
+                lambda ctx: _inst_pip(ctx, "aqtinstall")),
+            Dep("pefile (pip)",
+                lambda i: bool(run_capture([sys.executable, "-m", "pip", "show", "pefile"])),
+                "python -m pip install pefile",
+                lambda ctx: _inst_pip(ctx, "pefile")),
             Dep(f"Qt {QT_VERSION} ({QT_KIT_WINDOWS})", lambda i: bool(i.qt_prefix),
-                f"aqt install-qt windows desktop {QT_VERSION} {QT_KIT_WINDOWS} --outputdir <qt>"),
+                f"aqt install-qt windows desktop {QT_VERSION} {QT_KIT_WINDOWS} --outputdir build/qt",
+                _inst_aqt),
             Dep("Mesa lavapipe (Vulkan fallback)", lambda i: bool(i.lavapipe_dir),
-                f"download mesa-dist-win {MESA_LAVAPIPE_VERSION} and extract to build/mesa"),
+                f"download mesa-dist-win {MESA_LAVAPIPE_VERSION} and extract to build/mesa",
+                _inst_mesa),
         ]
     if info.is_macos:
         return [
-            Dep("Xcode Command Line Tools", lambda i: bool(shutil.which("clang")), "xcode-select --install"),
-            Dep(f"CMake >= {CMAKE_MIN[0]}.{CMAKE_MIN[1]}", lambda i: bool(_cmake_version() and _cmake_version() >= CMAKE_MIN),
-                "brew install cmake"),
-            Dep("Ninja", _have("ninja"), "brew install ninja"),
-            Dep("pkg-config", _have("pkg-config"), "brew install pkg-config"),
-            Dep("FFmpeg", lambda i: bool(run_capture(["pkg-config", "--exists", "libavcodec"]) == "" and shutil.which("pkg-config")),
-                "brew install ffmpeg"),
-            Dep("Qt 6", lambda i: bool(i.qt_prefix), "brew install qt"),
+            Dep("Xcode Command Line Tools", lambda i: bool(shutil.which("clang")),
+                "xcode-select --install", _inst_xcode),
+            Dep(f"CMake >= {CMAKE_MIN[0]}.{CMAKE_MIN[1]}",
+                lambda i: bool(_cmake_version() and _cmake_version() >= CMAKE_MIN),
+                "brew install cmake", lambda ctx: _inst_brew(ctx, "cmake")),
+            Dep("Ninja", _have("ninja"), "brew install ninja", lambda ctx: _inst_brew(ctx, "ninja")),
+            Dep("pkg-config", _have("pkg-config"), "brew install pkg-config",
+                lambda ctx: _inst_brew(ctx, "pkg-config")),
+            Dep("FFmpeg", lambda i: bool(shutil.which("pkg-config")) and
+                subprocess.run(["pkg-config", "--exists", "libavcodec"], capture_output=True).returncode == 0,
+                "brew install ffmpeg", lambda ctx: _inst_brew(ctx, "ffmpeg")),
+            Dep("Qt 6", lambda i: bool(i.qt_prefix), "brew install qt",
+                lambda ctx: _inst_brew(ctx, "qt")),
         ]
-    pkgs = "clang cmake ninja-build pkg-config git ccache mold libavcodec-dev libavformat-dev " \
-           "libavutil-dev libswresample-dev libswscale-dev libx11-dev libxrandr-dev libxi-dev " \
-           "libxcursor-dev libxinerama-dev libgl1-mesa-dev libglu1-mesa-dev qt6-base-dev " \
-           "libarchive-tools p7zip-full"
-    mgr = info.pkg_mgr or "apt"
-    if mgr == "pacman":
-        pkgs = "clang cmake ninja pkgconf git ccache mold ffmpeg libx11 libxrandr libxi libxcursor " \
-               "libxinerama mesa glu qt6-base libarchive p7zip"
-    elif mgr in ("dnf", "zypper"):
-        pkgs = "clang cmake ninja-build pkgconf-pkg-config git ccache mold ffmpeg-devel libX11-devel " \
-               "libXrandr-devel libXi-devel libXcursor-devel libXinerama-devel mesa-libGL-devel " \
-               "mesa-libGLU-devel qt6-qtbase-devel libarchive p7zip"
     return [
-        Dep(f"build packages ({mgr})", lambda i: all(shutil.which(t) for t in ("clang", "cmake", "ninja", "pkg-config")),
-            f"{mgr} install {pkgs}"),
-        Dep("FFmpeg dev libs", lambda i: shutil.which("pkg-config") and
+        Dep("build toolchain (clang/cmake/ninja/pkg-config)", lambda i: all(
+                shutil.which(t) for t in ("clang", "cmake", "ninja", "pkg-config")),
+            f"{info.pkg_mgr or 'apt'} install <toolchain packages>",
+            lambda ctx: _inst_pkg(ctx, "toolchain")),
+        Dep("FFmpeg dev libs", lambda i: bool(shutil.which("pkg-config")) and
             subprocess.run(["pkg-config", "--exists", "libavcodec"], capture_output=True).returncode == 0,
-            f"{mgr} install <ffmpeg-dev package>"),
-        Dep("Qt 6 (launcher)", lambda i: bool(i.qt_prefix), f"{mgr} install qt6-base-dev"),
+            f"{info.pkg_mgr or 'apt'} install <ffmpeg dev package>",
+            lambda ctx: _inst_pkg(ctx, "ffmpeg")),
+        Dep("Qt 6 (launcher)", lambda i: bool(i.qt_prefix),
+            f"{info.pkg_mgr or 'apt'} install <qt6 base dev package>",
+            lambda ctx: _inst_pkg(ctx, "qt")),
     ]
 
-
 def stage_deps(ctx: "Context") -> None:
+    """Report the platform dependencies, then (interactively) install what is missing."""
     step("stage 2: dependencies")
     deps = deps_for(ctx.platform)
     missing = [d for d in deps if not d.check(ctx.platform)]
     for d in deps:
-        ok = d not in missing
-        print(f"  {'OK ' if ok else '-- '}{d.name}")
+        print(f"  {'OK ' if d not in missing else '-- '}{d.name}")
     if not missing:
         print("All dependencies present.")
         return
@@ -511,12 +631,20 @@ def stage_deps(ctx: "Context") -> None:
         return
     for d in missing:
         if d.install is None:
-            # The installer for this dependency is not wired yet: fail loudly with the exact manual
-            # command instead of continuing into a half-provided build.
-            die(f"cannot install automatically yet: {d.name}\n  install manually: {d.hint}", 2)
+            die(f"cannot install automatically: {d.name}\n  install manually: {d.hint}", 2)
         if not ask_yes_no(ctx, f"Install {d.name} now?", default=True):
             die(f"missing dependency: {d.name}\n  install manually: {d.hint}", 2)
-        d.install(ctx)
+        try:
+            d.install(ctx)
+        except Exception as e:   # noqa: BLE001
+            die(f"failed to install {d.name}: {e}\n  install manually: {d.hint}", 2)
+        if not d.check(ctx.platform):
+            # winget/brew installs land outside this process' PATH; the tool is usually fine from a new
+            # shell, so warn with the exact command instead of pretending it worked.
+            warn(f"{d.name} is still not visible in this shell; open a new one if the build cannot find it."
+                 f"\n  expected: {d.hint}")
+        else:
+            print(f"  installed: {d.name}")
 
 
 # ------------------------------------------------------------------------------------------------
