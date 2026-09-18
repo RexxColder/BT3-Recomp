@@ -3,7 +3,7 @@
 #include <tuple>
 #include <deque>
 #include <condition_variable>
-// GPU (OpenGL via raylib) GS renderer â€” Stage 1: alpha-blended textured sprites.
+// GPU (OpenGL via raylib) GS renderer — Stage 1: alpha-blended textured sprites.
 // See ps2_gs_gpu_renderer.h for the threading model.
 #include <cstring>
 
@@ -767,7 +767,7 @@ namespace
     std::unordered_map<uint32_t, Fbo> g_fboCopy;
     // Completed-frame latch: a copy of the scene buffer taken at the exact list boundary
     // where its game frame finished (drawing switched to the other double-buffer). The
-    // present shows THIS, never live buffers â€” those are usually mid-redraw because one
+    // present shows THIS, never live buffers — those are usually mid-redraw because one
     // replay call processes several queued game frames.
     Fbo g_frontLatch;
     bool g_frontLatchValid = false;
@@ -1065,7 +1065,7 @@ namespace
                                fbp, w, h, f.w, f.h); }
             }
         }
-        {   // PS2X_FBOCAP=<fbp>:<w>x<h> â€” pin one FBO to an exact size, overriding GROW-ONLY.
+        {   // PS2X_FBOCAP=<fbp>:<w>x<h> — pin one FBO to an exact size, overriding GROW-ONLY.
             // BT3's shadow silhouette buffer (0x2A00 = fbp336) is 256x256 on hardware
             // (FRAME.FBW=4); ours grows to 1024x512 because the same page is also read at other
             // strides, and a silhouette written in 256-space then samples out of the wrong quarter.
@@ -1106,7 +1106,7 @@ namespace
         }
         // GROW-ONLY: recreating on ANY size change wipes the FBO to black. A buffer begun at
         // alternating sizes (e.g. fbp0 drawn 512-wide, displayed 640-wide) was recreated (and
-        // black-cleared) every publish â€” so the bloom downsample sampled a freshly-wiped fbp0
+        // black-cleared) every publish — so the bloom downsample sampled a freshly-wiped fbp0
         // (all-black fbp336 -> black glow overlay over the fight). Keep the largest allocation;
         // only recreate when the request GROWS beyond it (mirrors the atlas monotonic-max fix).
         if (f.rt.texture.id != 0 && w <= f.w && h <= f.h)
@@ -1594,10 +1594,10 @@ namespace
         "  finalColor = texture(texture0, uv);\n"
         "}\n";
 
-    // PS2 MODULATE is texel*vc/128 (Ã·128), which can BRIGHTEN when vc>128 (e.g. the
+    // PS2 MODULATE is texel*vc/128 (÷128), which can BRIGHTEN when vc>128 (e.g. the
     // font atlas is stored at 50% gray and modulated up to white). raylib's tint is
-    // Ã·255 and clamps at x1, so it can't brighten. This shader applies the real
-    // Ã·128 on RGB. The rasterizer pre-scales the passed color per primitive type so
+    // ÷255 and clamps at x1, so it can't brighten. This shader applies the real
+    // ÷128 on RGB. The rasterizer pre-scales the passed color per primitive type so
     // this one factor is correct for textured-modulate / decal / untextured.
     const char *kFragShader =
         "#version 330\n"
@@ -1613,7 +1613,7 @@ namespace
         "uniform float uIdxScale;\n" // 128 = GS byte scale for the alpha-as-index read
         "uniform float uFboOne;\n"  // non-indexed FBO sample: treat texture alpha as 1.0
    // >0.5: take the index from the FBO ALPHA and look it up
- // PS2 Ã·128 overbright factor (default 255/128), env-tunable
+ // PS2 ÷128 overbright factor (default 255/128), env-tunable
         // GS alpha test (TEST.ATE/ATST/AREF, AFAIL=0 KEEP -> discard). uAtst < 0 = off.
         // Alpha units: textures + vertex colors are stored GS-scaled (0x80 -> 1.0), so the
         // shader's pre-clamp alpha == GS Af/128; uAref is passed as AREF/128 to match.
@@ -4022,7 +4022,7 @@ void GsGpuRenderer::barrierBeforeRead(uint32_t srcBlock, bool requireAligned, bo
             {   extern uint32_t g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw; ++g_ptN;
                 std::fprintf(stderr, "[pt] %lu READ page=%u tbp=%u cbp=%u psm=%u tbw=%u dirtyB=%d pend=%d dirty=%d alpha=%d defer=%d seq=%u\n", g_ptN, page, g_barReqTbp, g_barReqCbp, g_barReqPsm, g_barReqTbw, (int)dirtyBefore, (int)pend, (int)dirty, (int)wantsAlphaAsData, (int)(deferOut != nullptr), m_writeSeq); }
             if (!dirty && !(wantsAlphaAsData && (s_barAlwaysAEnv || g_barAlphaStale.count(page)))) return;
-            {   // [barwho] PS2X_BARWHO=1: census of the reads that ACTUALLY block (post dirty-verdict) â€”
+            {   // [barwho] PS2X_BARWHO=1: census of the reads that ACTUALLY block (post dirty-verdict) —
                 // (page, reader psm, reader tbp0) via the g_barReq* globals the call sites publish.
                 static const bool s_bw = [](){ const char *v = std::getenv("PS2X_BARWHO"); return v && v[0] && v[0] != '0'; }();
                 if (s_bw)
@@ -4716,7 +4716,7 @@ bool GsGpuRenderer::revalidateTexture(uint64_t key, uint32_t pageLo, uint32_t pa
         return true;
     if (!vram || vramSize == 0)
         return false;
-    // Pages were written since decode â€” hash the span; unchanged bytes mean the decode
+    // Pages were written since decode — hash the span; unchanged bytes mean the decode
     // (whose key already folds in the CLUT content) is still exact.
     uint64_t begin = static_cast<uint64_t>(pageLo) * 8192ull;
     uint64_t end = (static_cast<uint64_t>(pageHi) + 1ull) * 8192ull;
@@ -4729,7 +4729,7 @@ bool GsGpuRenderer::revalidateTexture(uint64_t key, uint32_t pageLo, uint32_t pa
     while (n--) { h = (h ^ *p8++) * 1099511628211ull; }
     if (ct.srcHashValid && ct.srcHash == h)
     {
-        ct.decodeSeq = m_writeSeq; // content unchanged â€” revalidate, back to the fast path
+        ct.decodeSeq = m_writeSeq; // content unchanged — revalidate, back to the fast path
         return true;
     }
     // Content really changed (or first hash): remember it so putTexture's fresh decode
@@ -4900,7 +4900,7 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
     // menu's scrolling cloud tiles (re-uploaded every frame) blinked out for single frames,
     // and PS2X_TEXCACHEMB=1024 made it vanish. Stamp the entry as used now; GRACE covers it
     // until it is drawn.
-    // [texavg] diag: average decoded RGBA per texture â€” is the stage decoded DARK (decoder
+    // [texavg] diag: average decoded RGBA per texture — is the stage decoded DARK (decoder
     // bug) or bright (replay/blend bug)? Correlate key with [cover]/srcdiag texKey values.
     {
         static FILE *s_f = std::fopen("/home/z3/Desktop/bt3/work/texavg.txt", "w");
@@ -6303,14 +6303,14 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
     std::unique_lock<std::mutex> lk(m_mtx, std::defer_lock);
     if (s_recStage <= 0) lk.lock();
     DrawCmd c = cmd;   // [cmdref-revert] the alias let env-gated mutators (NOSHCOMP in play.sh!) poison the CALLER'S reused cmd -> fbmsk=ALL stuck -> HUD vanished in live play. Local copy restored; keep [listswap].
-    {   // [farskip] PS2X_FARSKIP=1: drop the far-terrain pass (psm20/clut12992) entirely â€”
+    {   // [farskip] PS2X_FARSKIP=1: drop the far-terrain pass (psm20/clut12992) entirely —
         // if the pale wash disappears, the wash IS this pass (texture-sampling suspect).
         static const bool s_fsk = [](){ const char *v = std::getenv("PS2X_FARSKIP"); return v && v[0] && v[0] != '0'; }();
         if (s_fsk && c.isTriangle && c.srcPsm == 20u && c.srcClutTbp == 12992u && !c.isTransfer)
             return;
     }
     {   // [farymin] PS2X_FARYMIN=1: per-frame min screen-Y of far-pass terrain (psm20, clut 12992)
-        // triangles at RECORD time â€” console floors at ~114px; spray above = the pale wash.
+        // triangles at RECORD time — console floors at ~114px; spray above = the pale wash.
         static const bool s_fym = [](){ const char *v = std::getenv("PS2X_FARYMIN"); return v && v[0] && v[0] != '0'; }();
         if (s_fym && c.isTriangle && c.srcPsm == 20u && c.srcClutTbp == 12992u && !c.isTransfer)
         {
@@ -6680,7 +6680,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
         }
     }
     // [barbox] (PS2X_BARBOX): FULL state of every draw touching the P1 health-bar rect
-    // (x 60-230, y 15-35) â€” the layered fill recipe incl. fbmsk + alpha test, which the
+    // (x 60-230, y 15-35) — the layered fill recipe incl. fbmsk + alpha test, which the
     // fdraw forensic lines omit. The fill mechanism is dest-alpha; this shows which
     // writer/reader pass our FBO alpha pipeline mishandles.
     {
@@ -6723,7 +6723,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
             }
         }
     }
-    // PS2X_BIGDRAW=N: log EVERY recorded command whose screen extent exceeds N px â€”
+    // PS2X_BIGDRAW=N: log EVERY recorded command whose screen extent exceeds N px —
     // sprites, triangles and transfers alike (the popup-triangle hunt showed screen-
     // sized draws that never trip the triangle-branch spike probe). Counter is plain:
     // we are under m_mtx.
@@ -6802,7 +6802,7 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
             c.srcRendered = true;
     }
     // PS2X_STRIP_FBO (experiment): full-height narrow strips are the glow/feedback chain
-    // sampling a render target â€” they must read the FBO even when the aliased page was
+    // sampling a render target — they must read the FBO even when the aliased page was
     // uploaded more recently (the stage-tile atlas shares fbp336's base page; the upload
     // veto made the strips paint raw ATLAS COLUMNS over the arena = the wedges/bands).
     if (c.srcUploaded && !c.isTriangle && !c.isTransfer)
@@ -7200,7 +7200,7 @@ void GsGpuRenderer::swapFrame()
         }
         // PS2X_GPU_QUEUE (default ON, =0 for the old replace-and-drop): queue every published
         // list so the present thread replays ALL of them in order. Dropping lists breaks the
-        // persistent-FBO model â€” a dropped list's draws never land, so scene buffers freeze
+        // persistent-FBO model — a dropped list's draws never land, so scene buffers freeze
         // half-built and the render-to-texture chain downsamples a mid-frame wipe.
         static const bool s_queue = [](){ const char *v = std::getenv("PS2X_GPU_QUEUE"); return !(v && v[0] == '0'); }();
         if (s_queue && !g_interpOn)
@@ -8390,7 +8390,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
 
     // PS2X_FORENSIC window decision (early, so ALL dump sites key off the same publishes):
     // 6 distinct publishes starting ~150 gens after the first big (fight) frame.
-    // PS2X_FORENSIC=key: arm on F9 instead â€” the artifacts are camera-moment-specific
+    // PS2X_FORENSIC=key: arm on F9 instead — the artifacts are camera-moment-specific
     // (intro pans, knockdowns), so the user triggers capture the instant they're visible.
     {
         static const char *s_fv = std::getenv("PS2X_FORENSIC");
@@ -8403,7 +8403,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             if (bt3IsKeyPressed(BT3_KEY_F9))
             {
                 s_startGen = frameGen; s_count = 0;
-                std::fprintf(stderr, "[forensic] F9 â€” armed at gen=%u\n", frameGen);
+                std::fprintf(stderr, "[forensic] F9 — armed at gen=%u\n", frameGen);
             }
         }
         else if (s_fo && cmds.size() > 4000 && s_startGen == 0) s_startGen = frameGen + 150;
@@ -8426,7 +8426,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     {
         int w = 0, h = 0;
         // Only draws into the DISPLAYED buffer define the visible region. The fight addresses
-        // its second scene buffer as rows 448..896 of a tall surface â€” folding EVERY cmd's
+        // its second scene buffer as rows 448..896 of a tall surface — folding EVERY cmd's
         // scissor in gave dispH=896, so present cropped 896 rows from a 448-tall FBO -> the
         // black/garbage fight window.
         {   // [cencache] incremental over the segment prefix (a max is order-independent)
@@ -8450,7 +8450,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         }
         if (w > 0) m_dispW = w;
         if (h > 0) m_dispH = h;
-        // Hard clamp to the presented texture size â€” a crop larger than the texture can only
+        // Hard clamp to the presented texture size — a crop larger than the texture can only
         // produce garbage.
         if (m_dispW > 16 && m_presentTexW > 0 && m_dispW > m_presentTexW) m_dispW = m_presentTexW;
         if (m_dispH > 16 && m_presentTexH > 0 && m_dispH > m_presentTexH) m_dispH = m_presentTexH;
@@ -8837,7 +8837,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
 
     // Non-atlas STICKY display buffer (mirrors the atlas fix): only move the presented buffer
     // when THIS publish drew a substantial amount into it. The fight double-buffers 0<->112 and
-    // publishes sometimes cut mid-frame â€” presenting a buffer that got no real draws this publish
+    // publishes sometimes cut mid-frame — presenting a buffer that got no real draws this publish
     // shows its cleared/half-built state (the black/flashing GPU fight).
     if (!s_atlas)
     {
@@ -8994,7 +8994,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         curDepthTest = wantTest; curDepthFunc = wantFunc; curDepthWrite = wantWrite;
     };
     // GS FRAME.FBMSK -> glColorMask (byte granularity: a channel is disabled only when its
-    // byte is fully masked; partial bit masks keep writing â€” closest GL can express). The
+    // byte is fully masked; partial bit masks keep writing — closest GL can express). The
     // Z-buffer-as-texture strips (opaque, depth-ALWAYS, sampling zbp) write alpha/Z channels
     // only on GS; without this they painted opaque black columns over the whole scene.
     bool s_a44vizArmed = false;
@@ -9180,7 +9180,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 endMode(); ensureAtlas();
                 ps2x::gfx::GsRtBegin(g_atlas);
                 static const bool s_noshader = [](){ const char *v = std::getenv("PS2X_NOSHADER"); return v && v[0] && v[0] != '0'; }();
-                if (!s_noshader) { bt3BeginShaderMode(g_shader); ps2xResetIdxMode(); }   // PS2 Ã·128 modulate (same as the per-fbp path)
+                if (!s_noshader) { bt3BeginShaderMode(g_shader); ps2xResetIdxMode(); }   // PS2 ÷128 modulate (same as the per-fbp path)
                 bt3BeginBlendMode(BT3_BLEND_ALPHA);
                 bt3rlDisableBackfaceCulling();  // GS triangles have arbitrary winding
                 inMode = true; curRealFbp = kAtlasFbp;
@@ -9270,12 +9270,17 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (depthOn && wantDepthClear)
         {
             flushBatch(__LINE__);
+            // [altglfix] glClear honours glDepthMask: a mask left off by the previous frame's last
+            // draw (or by the present) made this clear a no-op and kept last frame's Z.
+            unsigned char hadDepthMask = 1; glGetBooleanv(0x0B72 /*GL_DEPTH_WRITEMASK*/, &hadDepthMask);
+            glDepthMask(1);
             glClearDepth(0.0);
             glClear(GL_DEPTH_BUFFER_BIT);
             { extern unsigned long g_dbgDepthClears; ++g_dbgDepthClears; }
             glClearDepth(1.0); // restore raylib's default clear-depth
+            glDepthMask(hadDepthMask);
         }
-        bt3BeginShaderMode(g_shader);      // PS2 Ã·128 modulate (overbright-capable)
+        bt3BeginShaderMode(g_shader);      // PS2 ÷128 modulate (overbright-capable)
         ps2xResetIdxMode();             // [idxrt] present must never sample through the palette
         bt3BeginBlendMode(BT3_BLEND_ALPHA);
         bt3rlDisableBackfaceCulling();     // GS triangles have arbitrary winding
@@ -9528,7 +9533,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             }
             if (eq == 0 && csel == 1u) // fall through to the original Ad cases below
             {
-                // 0x52: (0-Cs)*Ad+Cd = Cd - Cs*Ad â€” the stage shadow/darken strips. The old
+                // 0x52: (0-Cs)*Ad+Cd = Cd - Cs*Ad — the stage shadow/darken strips. The old
                 // As fallback painted them as SOLID (50,50,50) fullscreen gray (a=255 -> As=1),
                 // erasing the fight scene. Our decoded alpha is stored GS-scaled (0x80->255),
                 // so GL_DST_ALPHA matches GS Ad semantics.
@@ -9539,14 +9544,14 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             }
         }
         // GS DEST-ALPHA TEST (TEST.DATE/DATM): pass only where framebuffer alpha bit7 ==
-        // DATM. No GL equivalent; approximate with dest-alpha lerp factors â€” exact for the
+        // DATM. No GL equivalent; approximate with dest-alpha lerp factors — exact for the
         // binary 0/0x80 masks the HUD bars use: DATM=1 -> out = Cs*Ad + Cd*(1-Ad) (draw
         // lands only where the mask is set), DATM=0 -> mirrored. PS2X_DATE=0 disables.
         {
             static const bool s_date = [](){ const char *v = std::getenv("PS2X_DATE"); return !(v && v[0] == '0'); }();
             // Scope: only draws whose SOURCE alpha actually paints (As>=0.5). DATE draws
             // with a=0 (the alpha-zeroer quads, the additive damage-flash overlays) are RGB
-            // no-ops on hardware via As=0 â€” overriding their blend painted solid black/red
+            // no-ops on hardware via As=0 — overriding their blend painted solid black/red
             // over the HUD. They keep their original equation (still RGB no-ops here).
             const uint8_t srcA = bc.isTriangle ? bc.tri[0].a : bc.a;
             // Only textures with ~binary alpha (or untextured solid quads): the lerp+discard
@@ -9559,7 +9564,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 binaryAlpha = (abIt != g_texAlphaBinary.end() && abIt->second);
             }
             // fst==1 only: HUD/2D draws (direct UV). Terrain/3D STQ draws use DATE with
-            // dithered masks + vertex-alpha gradients â€” the lerp override wrecks those.
+            // dithered masks + vertex-alpha gradients — the lerp override wrecks those.
             // [datefst0] EXCEPT triangles fully inside the snapped top band: the damage
             // flash's outer element is an fst=0 DATE draw (datm=0) that console hides via
             // the gate; painting it ungated was the spurious red strip at the stretched
@@ -9587,7 +9592,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // FIX-opaque: (Cs-Cd)*FIX+Cd with FIX>=0x70 is effectively src-only. The GL
         // constant-alpha path renders these fragments as src*0 through the rlgl batch
         // (PROVEN via the [samplertest] charBlend twin: same quad, blend-off = orange,
-        // constant-alpha k=1.0 = black) â€” every FIX-opaque fight draw (characters, stage,
+        // constant-alpha k=1.0 = black) — every FIX-opaque fight draw (characters, stage,
         // blendMode 0x64) was invisible. Disable blending outright for the opaque case.
         if (eq == 2 && bc.blendFix >= 0x70)
         {
@@ -9608,13 +9613,13 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         if (want)
         {
             bt3rlEnableColorBlend();
-            // GS semantics: the ALPHA channel is never blended â€” the SOURCE alpha is WRITTEN
+            // GS semantics: the ALPHA channel is never blended — the SOURCE alpha is WRITTEN
             // to the framebuffer (subject to FBMSK) no matter what the RGB blend does. GL's
             // single blend applies the RGB factors to alpha too, which broke every dest-alpha
             // pass: the game zeroes/maintains a per-pixel mask in dest alpha (untextured a=0
             // strips), then the bm52 shadow pass subtracts Cs*Ad. Our FBO alpha never got
             // zeroed -> Ad~1 everywhere -> the subtract darkened the whole fight scene.
-            // Fix: separate factors â€” RGB per GS blend mode, ALPHA = ONE/ZERO (write-through).
+            // Fix: separate factors — RGB per GS blend mode, ALPHA = ONE/ZERO (write-through).
             const int F_ONE = 0x0001, F_ZERO = 0x0000, E_ADD = 0x8006, E_RSUB = 0x800B;
             int srcRGB = 0x0302 /*GL_SRC_ALPHA*/, dstRGB = 0x0303 /*GL_ONE_MINUS_SRC_ALPHA*/, eqRGB = E_ADD;
             if (eq == 1)
@@ -9726,7 +9731,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         // DATE-emulated draws (dest-alpha lerp override in applyBlend): the lerp factors
         // drop the draw's own PER-TEXEL alpha term, so transparent texels painted their
         // raw palette RGB (white HUD backgrounds, broken terrain crossfades). Restore the
-        // As term by discarding transparent texels â€” exact for the binary CLUT alphas
+        // As term by discarding transparent texels — exact for the binary CLUT alphas
         // these draws carry.
         else if (!s_noAtest && tc.dateEnable)
         {
@@ -9764,7 +9769,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     };
 
     // [midsnap]: dump the bound FBO when this replay is N character-triangles deep, and
-    // again at the end of the same replay â€” the diff shows what covers the fighters.
+    // again at the end of the same replay — the diff shows what covers the fighters.
     auto dumpBoundFbo = [&](const char *path, int fw, int fh) {
         std::vector<uint8_t> fb((size_t)fw * fh * 4);
         glReadPixels(0, 0, fw, fh, 0x1908, 0x1401, fb.data());
@@ -11296,7 +11301,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         }
 
         // PS2X_PROGDUMP: during forensic publishes, dump the scene buffers every 5% of
-        // the draw list â€” progressive frame construction for bisecting which draw range
+        // the draw list — progressive frame construction for bisecting which draw range
         // paints an artifact. Files overwrite per step; they show the LAST forensic publish.
         {
             static const bool s_pd = [](){ const char *v = std::getenv("PS2X_PROGDUMP"); return v && v[0] && v[0] != '0'; }();
@@ -11321,7 +11326,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             }
         }
         // PS2X_DRAWCUTS: comma-separated draw indices; during forensic publishes dump the
-        // scene buffers at each index â€” fine-grained bisection of WHICH draw paints an
+        // scene buffers at each index — fine-grained bisection of WHICH draw paints an
         // artifact (PROGDUMP showed everything forms in the first 5%, so cuts go there).
         {
             static const std::vector<size_t> s_cuts = []() {
@@ -11464,7 +11469,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;
             }
             // [lists] anatomy (once, on the midsnap batch): per list, its range, scene fbp,
-            // and the largest-coverage draw â€” plus an f-buffer snapshot at every boundary.
+            // and the largest-coverage draw — plus an f-buffer snapshot at every boundary.
             if (wantEndSnap && s_latch && !listSceneFbp.empty() && nextListBoundary <= 14)
             {
                 const size_t li = nextListBoundary - 1;
@@ -11620,7 +11625,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                  c.xSrcFbp, g_fbos.count(c.xSrcFbp) && g_fbos[c.xSrcFbp].rt.texture.id != 0 ? 1 : 0,
                                  c.xDstFbp, c.xSX, c.xSY, c.xDX, c.xDY, c.xW, c.xH); }
             }
-            // [xferlog] (srcdiag): transfers were invisible to every draw diagnostic â€” log the
+            // [xferlog] (srcdiag): transfers were invisible to every draw diagnostic — log the
             // ones landing in the scene buffers; they are the end-of-frame "processed scene
             // copy-back" whose source RT content is broken in GPU mode (paints uniform gray).
             static const bool s_srcDiagX = [](){ const char *v = std::getenv("PS2X_SRCDIAG"); return !(v && v[0] == '0'); }();
@@ -11680,14 +11685,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
 
         // PS2X_HOP336: bloom-chain hop forensics. For ONE frame (the first past gen 300 whose
         // draw list writes fbp336), log every draw into fbp336 (src/uv/dst/blend) and snapshot
-        // the fbp336 FBO each time the replay LEAVES it â€” the progressive buildup separates
+        // the fbp336 FBO each time the replay LEAVES it — the progressive buildup separates
         // "the scene-downsample strips land wrong" from "a later chain pass whites them out".
         {
             static const bool s_hop = [](){ const char *v = std::getenv("PS2X_HOP336"); return v && v[0] && v[0] != '0'; }();
             if (s_hop)
             {
                 static uint32_t s_hopGen = 0; static int s_snapN = 0, s_logN = 0;
-                // Target the 40th chain-active publish (steady state), not the first â€” the first
+                // Target the 40th chain-active publish (steady state), not the first — the first
                 // chain frame legitimately samples the pre-title loading fade (flat gray).
                 static int s_seenChain = 0; static uint32_t s_lastSeenGen = 0;
                 if (s_hopGen == 0 && destArea.count(336u) && frameGen != s_lastSeenGen)
@@ -14133,7 +14138,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         }
         // DEST-ALPHA-coefficient draws (GS ALPHA C=Ad: bm 0x54/0x14/0x58...): these lerp/scale
         // by the per-pixel alpha MASK the game built in the framebuffer (health/blast-stock bar
-        // fill, DOF focus mix). They are ALWAYS RT composites â€” the srcUploaded veto (stage
+        // fill, DOF focus mix). They are ALWAYS RT composites — the srcUploaded veto (stage
         // tiles stream through the same base page) must not reroute them to the decoded atlas,
         // and the postgate must not eat them: where the mask is 0 they are a no-op by
         // construction, so letting them through is safe. PS2X_DESTALPHA=0 restores old gating.
@@ -14206,7 +14211,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         {
             // A/B: PS2X_RTSKIP=1 skips this RT-sampling pass entirely instead of drawing it
             // white. Tried as default 2026-07-16: the whole 3D scene VANISHED (screen went
-            // uniform gray) â€” so this white pass is the ONLY scene geometry reaching the
+            // uniform gray) — so this white pass is the ONLY scene geometry reaching the
             // display; the textured pass lands elsewhere (see srcdiag dest= data).
             static const bool s_rtSkip = [](){ const char *v = std::getenv("PS2X_RTSKIP"); return v && v[0] && v[0] != '0'; }();
             if (s_rtSkip)
@@ -14378,7 +14383,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (blackTex && cover > 0.25 * disp)
                     { PS2X_GATE_HIT(); continue; }
             }
-            // PS2X_SKIPPOST: skip the fight's fullscreen FRAMEBUFFER-READBACK effect quads â€”
+            // PS2X_SKIPPOST: skip the fight's fullscreen FRAMEBUFFER-READBACK effect quads —
             // indexed (T8H) draws that sample a buffer other draws RENDER INTO this frame
             // (fbp0/fbp112), covering most of the display. On real GS they posterize the
             // rendered scene; in GPU mode that VRAM is stale gray, so the quad paints flat
@@ -14912,7 +14917,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             }
         }
 
-        // PS2X_SKIP62: A/B â€” skip the SUBTRACTIVE (blend 0x62, Cd - Cs*FIX) triangle passes.
+        // PS2X_SKIP62: A/B — skip the SUBTRACTIVE (blend 0x62, Cd - Cs*FIX) triangle passes.
         // The fight draws chars textured (0x64 opaque), then darkens them with a subtractive
         // cel/shadow pass whose content is wrong in GPU mode; combined with PS2X_RTSKIP=1 this
         // should reveal the raw textured scene.
@@ -15143,7 +15148,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     t3.r = c.tri[2].r; t3.g = c.tri[2].g; t3.b = c.tri[2].b; t3.a = c.tri[2].a; }
         }
         // [chartri]: dump full state of the first N character-texture triangles (the fight's
-        // 0x64 opaque pass that records but never shows) â€” coords/scissor/color/fbmsk decide
+        // 0x64 opaque pass that records but never shows) — coords/scissor/color/fbmsk decide
         // between collapsed geometry, scissor kill, and state kill. seq = index in this
         // command list (ci), to order against the untextured overlay sprites below.
         if (s_srcDiag && c.isTriangle && c.texKey != 0 && c.blendMode == 0x64 &&
@@ -15168,7 +15173,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             }
         }
 
-        // [charbox]: per-second bounding box + count over ALL character-texture draws â€” is
+        // [charbox]: per-second bounding box + count over ALL character-texture draws — is
         // there a full-size character pass, or is the whole model really a ~20px speck
         // (degenerate-MVP scale)?
         if (s_srcDiag && c.isTriangle && c.texKey != 0 &&
@@ -15238,7 +15243,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         }
 
         // Bisect the erase: range-triggered FBO snapshots through the same replay batch (the
-        // frame that had Goku at char#2000). Range-based (ci >= mark), NOT exact-index â€” the
+        // frame that had Goku at char#2000). Range-based (ci >= mark), NOT exact-index — the
         // exact command at an index may be skipped by an earlier continue.
         // [tail] census: the frame darkens between ci~24800 and end (probefb bisect). Log a
         // compact sample of every large-ish tail draw to identify the darkening pass.
@@ -15285,7 +15290,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             }
         }
 
-        // [cover]: identify every draw covering >30% of a scene buffer (f0/f112) â€” these are
+        // [cover]: identify every draw covering >30% of a scene buffer (f0/f112) — these are
         // the end-of-frame layers that bury the (now-rendering) fighters.
         if (s_srcDiag && (c.destFbp == 0u || c.destFbp == 112u) && !c.isTransfer)
         {
@@ -15318,7 +15323,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             }
         }
 
-        // PS2X_SKIPUNTEXFS: skip untextured draws covering >25% of the display â€” the last
+        // PS2X_SKIPUNTEXFS: skip untextured draws covering >25% of the display — the last
         // fullscreen layers still painting over the (skipped-down) scene.
         {
             static const bool s_suf = [](){ const char *v = std::getenv("PS2X_SKIPUNTEXFS"); return v && v[0] && v[0] != '0'; }();
@@ -15338,7 +15343,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             }
         }
 
-        // [untexspr]: dump the first N untextured draws â€” a fullscreen flat fill drawn AFTER
+        // [untexspr]: dump the first N untextured draws — a fullscreen flat fill drawn AFTER
         // the scene would explain "everything gray with the effect passes skipped".
         if (s_srcDiag && c.texKey == 0 && !c.isTransfer)
         {
@@ -15362,12 +15367,12 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         }
 
         // Honor GS CLAMP wrap modes: REPEAT (tiling) vs CLAMP. Textures are created CLAMP;
-        // stage/sky triangles use negative / >1 STQ coords with REPEAT â€” leaving them clamped
+        // stage/sky triangles use negative / >1 STQ coords with REPEAT — leaving them clamped
         // collapsed whole triangles to texel(0,0) (flat gray/black 3D scene).
         //
         // This used to skip RENDER-TARGET sources (!fromFbo), so every draw sampling an FBO was
         // silently force-clamped. BT3's character shading pass samples the 64x64 blurred-scene
-        // buffer (fbp502) with WMS=WMT=REPEAT and t/q in [-1,0] â€” measured identical to console.
+        // buffer (fbp502) with WMS=WMT=REPEAT and t/q in [-1,0] — measured identical to console.
         // Clamped, all of it collapsed onto row 0 (the white cloud band at the top of the blur),
         // which is the mid-field white blob. REPEAT wraps -0.74 to 0.26 as the GS does.
         // PS2X_FBOWRAP=0 restores the old clamp-everything behaviour.
@@ -15653,13 +15658,13 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         }
         // GS TEX0.TCC per draw: TCC=0 -> texture alpha unused (swizzle A to ONE); TCC=1 -> normal.
         // Applies to decoded AND FBO-sourced textures (our FBO alpha is junk; a TCC=0 sampler must
-        // not blend by it â€” the bloom downsample bug that blacked out the fight).
+        // not blend by it — the bloom downsample bug that blacked out the fight).
         if (tex.id != 0 && tex.id != g_white.id)
         {
             auto &s_swzState = g_swzState; // tex.id -> tcc
             // FBO sources: force A=ONE even when TCC=1. GS code that samples a framebuffer with
             // TCC=1 reads the fb's alpha, which opaque GS draws leave at 0x80 (=1.0 in blend
-            // units) â€” but OUR FBO alpha channel is junk. The bloom downsample strips blend
+            // units) — but OUR FBO alpha channel is junk. The bloom downsample strips blend
             // bm=0x44 (As) with TCC=1; junk As turned the chain content to noise/flat.
             // An indexed RT read takes its palette INDEX from the framebuffer's alpha byte, so it
             // must sample the real alpha. Every other fromFbo draw swizzles alpha to GL_ONE
@@ -15689,12 +15694,12 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             const bool s_glow = GsGpuRenderer::glowEnabled();   // [uitoggles]
             if (!s_glow && fromFbo && c.abe && ((c.blendMode & 3u) == 2u) && (((c.blendMode >> 4) & 3u) == 2u))
                 { PS2X_GATE_HIT(); continue; } // A=zero, C=FIX -> subtractive family
-            // PS2X_NOSUB: diagnostic â€” skip ALL subtractive draws. Chars colored -> the subtract
+            // PS2X_NOSUB: diagnostic — skip ALL subtractive draws. Chars colored -> the subtract
             // application is the blackener; chars still black -> it's something else entirely.
             static const bool s_nosub = [](){ const char *v = std::getenv("PS2X_NOSUB"); return v && v[0] && v[0] != '0'; }();
             if (s_nosub && c.abe && ((c.blendMode & 3u) == 2u) && (((c.blendMode >> 4) & 3u) == 2u))
                 { PS2X_GATE_HIT(); continue; }
-            // PS2X_DARKCULL: diagnostic â€” skip LARGE dark-modulated far-z scene triangles
+            // PS2X_DARKCULL: diagnostic — skip LARGE dark-modulated far-z scene triangles
             // (the ci=573935 class: terrain-textured, vc near-black, z~0, GEQUAL). On HW
             // the ground depth rejects them; if the green patches vanish with this, our
             // depth path fails for them and that is the real bug to fix.
@@ -15712,7 +15717,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (maxc < 80 && maxz < 0.001f && (mxx - mnx) > 150.0f && (mxy - mny) > 150.0f)
                     { PS2X_GATE_HIT(); continue; }
             }
-            // PS2X_NO52: diagnostic â€” skip the dest-alpha darken passes (bm 0x52, Cd - Cs*Ad).
+            // PS2X_NO52: diagnostic — skip the dest-alpha darken passes (bm 0x52, Cd - Cs*Ad).
             // On HW, Ad is a precise mask the game builds in framebuffer alpha; our FBO alpha
             // is unmanaged junk, so the darkening can land wholesale (dark-green terrain
             // patches suspect). Disappears with this flag -> implement real dest-alpha.
@@ -15725,26 +15730,26 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // unconditional -- identical to the validated default behaviour.
             {
                 // The glow/feedback composite paints the scene buffers in NARROW COLUMN STRIPS
-                // (16px each) â€” a coverage threshold never catches it. Gate ALL RT-sourced draws
+                // (16px each) — a coverage threshold never catches it. Gate ALL RT-sourced draws
                 // into the scene buffers until the bloom chain is numerically right; the chain's
                 // own buffers (336/368/...) still receive their downsamples.
                 // NOT just fromFbo: the srcUploaded veto (upload-vs-RT precedence) reroutes
                 // strips sampling fbp336 (base 10752 = the stage-tile upload page) to the
-                // DECODE path, un-gating them â€” they then paint stale gray over the whole
+                // DECODE path, un-gating them — they then paint stale gray over the whole
                 // finished scene (the "gray wall" that erased Goku between frame completion
                 // and present). Gate ANY exact-RT-base sample into a scene buffer.
                 const bool sceneDest = (c.destFbp == 0u || c.destFbp == 112u);
                 const uint32_t xsf = c.srcTbp0 ? tbp0ToFbp(c.srcTbp0) : 0u;
                 // Indexed textures sampling an RT base are EITHER real uploaded textures
-                // (HUD frame â€” srcUploaded set) OR the T8H framebuffer-readback posterize
-                // strips (tbp0=7168=fbp224 etc. â€” never uploaded, decode stale gray, and
+                // (HUD frame — srcUploaded set) OR the T8H framebuffer-readback posterize
+                // strips (tbp0=7168=fbp224 etc. — never uploaded, decode stale gray, and
                 // wallpaper the finished scene in 32px columns). Gate the never-uploaded ones.
                 // Column-strip shape veto override: the feedback chain paints the scene in
                 // full-height narrow strips. When the sampled RT base is ALSO a live upload
                 // page (stage tiles at 10752 alias fbp336), srcUploaded un-gates them and
                 // they wallpaper the fight in stretched stage-texture columns (the "giant
                 // map-textured triangles"). A full-height <=64px strip into the scene is
-                // always the chain, never a legit HUD/texture draw â€” gate it regardless.
+                // always the chain, never a legit HUD/texture draw — gate it regardless.
                 const float gdw = c.isTriangle ? 0.0f : std::fabs(c.dx1 - c.dx0);
                 const float gdh = c.isTriangle ? 0.0f : std::fabs(c.dy1 - c.dy0);
                 const bool columnStrip = !c.isTriangle && gdh >= 440.0f && gdw > 0.0f && gdw <= 64.0f;
@@ -15752,7 +15757,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                           g_fbos.count(xsf) && xsf != c.destFbp &&
                                           (!c.srcIndexed || !c.srcUploaded || columnStrip);
                 // [lerpchk] (PS2X_BARALPHA): at each dest-alpha lerp strip into the scene,
-                // flush and read back the bar rect's CURRENT dest alpha â€” is the HP mask
+                // flush and read back the bar rect's CURRENT dest alpha — is the HP mask
                 // still present when its consumer actually runs?
                 if (destAlphaLerp && sceneDest)
                 {
@@ -16574,7 +16579,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                  c.dx0, c.dy0, c.dx1, c.dy1, c.su0, c.sv0, c.su1, c.sv1, c.r, c.g, c.b, c.a, c.abe?1:0, c.blendMode, c.blendFix);
                 }
             }
-            // Triangles only â€” the frame-clear (untextured full-height column sprites) otherwise
+            // Triangles only — the frame-clear (untextured full-height column sprites) otherwise
             // floods the per-fbp cap before a single real 3D triangle is logged.
             if (s_rt && sourceFbps.count(c.destFbp) && c.isTriangle)
             {
@@ -17586,8 +17591,8 @@ if (done.size() < 14 && !done.count(c.texKey))
             // samples v in [sv0/texH .. sv1/texH] (source.y -= source.height, height stays negative)
             // -> it shows GS rows [texH-sv1 .. texH-sv0] MIRRORED IN BAND POSITION. That is only
             // correct when the rect spans the full texture height (the present/blit case); partial
-            // rects â€” the bloom downsample's 16px column strips sampling the 448-row scene out of a
-            // 512-tall FBO â€” sampled 64 rows off with a junk band. Correct rect: y = texH - max(sv0,
+            // rects — the bloom downsample's 16px column strips sampling the 448-row scene out of a
+            // 512-tall FBO — sampled 64 rows off with a junk band. Correct rect: y = texH - max(sv0,
             // sv1) with height -(sv1-sv0); max() keeps V-mirrored sprites (sv0 > sv1, positive
             // height after negation) working. Matches the manual quad path's per-vertex 1 - sv/texH.
             // PS2X_FBOSRC_OLD=1 restores the old band-mirrored rect for A/B.
@@ -17932,7 +17937,7 @@ if (done.size() < 14 && !done.count(c.texKey))
         {
             // Triangle -> degenerate BT3RL_QUADS (0,1,2,2). BT3RL_TRIANGLES doesn't sample in
             // raylib's quad batch. FBO sources: flip V.
-            // PS2X_NOBLACKTRI: diagnostic â€” skip triangles whose vertex colors are all near-black
+            // PS2X_NOBLACKTRI: diagnostic — skip triangles whose vertex colors are all near-black
             // (the cel-shading outline shells). Models turning colored = shells are winning the
             // z-ties/coverage and blacking out the characters/stage.
             {
@@ -17946,7 +17951,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 }
             }
             // PS2X_PASSLOG: character multi-pass forensics. Log consecutive triangle draws that
-            // share (approx) the same first-vertex position â€” the same mesh drawn multiple times
+            // share (approx) the same first-vertex position — the same mesh drawn multiple times
             // (base + shading passes). Shows each pass's texKey/blend/tcc/color so we can see
             // which pass wins the z-tie and why it's black.
             {
@@ -17968,7 +17973,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 }
             }
             // PS2X_TEXID_COLORS: draw every triangle as a SOLID COLOR derived from its texKey.
-            // The window then shows which texture owns each region â€” identifies the black-char
+            // The window then shows which texture owns each region — identifies the black-char
             // pixel owner without any GL readback.
             {
                 static const bool s_tid = [](){ const char *v = std::getenv("PS2X_TEXID_COLORS"); return v && v[0] && v[0] != '0'; }();
@@ -18471,7 +18476,7 @@ if (done.size() < 14 && !done.count(c.texKey))
             auto EMIT_V3 = [&](float x, float y, float z) { if (gsgl) ps2x::gfx::GsGlEmit().Vertex3f(x, y, z); else bt3rlVertex3f(x, y, z); };
             if (gsgl) { bt3rlDrawRenderBatchActive(); ps2x::gfx::GsGlTexture(tex.id); gsGlMirrorUniforms(); ps2x::gfx::GsGlEmit().Begin(ps2x::gfx::GsEmit::Quads); } else bt3rlBegin(BT3RL_QUADS);
             const int quad[4] = {0, 1, 2, 2};
-            // PS2X_TRIWHITE: diagnostic â€” draw triangles with WHITE vertex color, exposing the raw
+            // PS2X_TRIWHITE: diagnostic — draw triangles with WHITE vertex color, exposing the raw
             // texture sample (separates color-modulation bugs from UV/sampling bugs).
             static const bool s_triWhite = [](){ const char *v = std::getenv("PS2X_TRIWHITE"); return v && v[0] && v[0] != '0'; }();
             for (int k = 0; k < 4; ++k)
@@ -18562,7 +18567,7 @@ if (done.size() < 14 && !done.count(c.texKey))
 
             // [pixprobe] (with PS2X_SRCDIAG): after emitting a character triangle, flush the
             // batch and read the pixel at its centroid from the BOUND FBO. Answers, at the GL
-            // level, whether the draw wrote anything â€” and logs the texture object it sampled.
+            // level, whether the draw wrote anything — and logs the texture object it sampled.
             if (s_srcDiag && c.texKey != 0 && c.blendMode == 0x64 &&
                 c.srcTbp0 >= 13000u && c.srcTbp0 < 14100u)
             {
@@ -18594,7 +18599,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     { auto fit = g_fbos.find(c.destFbp); if (fit != g_fbos.end()) fboH = fit->second.h; }
                     unsigned char px[4] = {1, 2, 3, 4};
                     glReadPixels((int)cx, fboH - 1 - (int)cy, 1, 1, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, px);
-                    // Live GL wrap/filter state of the sampled texture â€” the replay caches wrap
+                    // Live GL wrap/filter state of the sampled texture — the replay caches wrap
                     // per texture-id, but GL recycles ids on delete, so the cache can go stale
                     // and leave a REPEAT texture clamped (0x2901=REPEAT, 0x812F=CLAMP_TO_EDGE).
                     int prevBind = 0, wrapS = 0, wrapT = 0, minf = 0;
@@ -18604,7 +18609,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     glGetTexParameteriv(0x0DE1, 0x2803 /*WRAP_T*/, &wrapT);
                     glGetTexParameteriv(0x0DE1, 0x2801 /*MIN_FILTER*/, &minf);
                     // Snapshot the ENTIRE bound FBO as a PPM at this exact moment (mid-frame,
-                    // right after this char triangle flushed) â€” see what the base pass painted
+                    // right after this char triangle flushed) — see what the base pass painted
                     // before any later pass touches it.
                     if (s_n == 1 || s_n == 12)
                     {
@@ -18656,7 +18661,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                          tx, ty, tb[o], tb[o+1], tb[o+2], tb[o+3], ifmt, swr, swg, swb, swa);
                     }
                     // Controlled sampler test (once): draw an 8x8 quad at (10,10) with THIS
-                    // texture at a fixed interior UV, white vertex color, blending OFF â€” then
+                    // texture at a fixed interior UV, white vertex color, blending OFF — then
                     // read the pixel back. Whatever comes out IS the sampler's verdict.
                     if (s_n == 2)
                     {
@@ -18768,7 +18773,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         flushBatch(__LINE__);
                         bt3rlEnableColorBlend();
                         // Third twin at (50,10): drawn under the CHAR DRAW'S OWN blend state
-                        // (constant-alpha k=FIX/128 was just applied for this very cmd) â€” the
+                        // (constant-alpha k=FIX/128 was just applied for this very cmd) — the
                         // last remaining state difference vs the real draws.
                         if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
@@ -18936,7 +18941,7 @@ if (done.size() < 14 && !done.count(c.texKey))
         if (FILE *f = srcDiagFile()) { std::fprintf(f, "[endsnap] taken, lastFbp=%u\n", curFbp); std::fflush(f); }
     }
     // [baralpha] (PS2X_BARALPHA): end-of-replay FBO ALPHA readback of the P1 health-bar rect
-    // (x 60..230, screen y 15..35) from the displayed scene buffer â€” an ASCII per-column
+    // (x 60..230, screen y 15..35) from the displayed scene buffer — an ASCII per-column
     // max-alpha profile. Decides whether the game's HP alpha mask ever LANDS in our FBO
     // (writers broken vs consumer missing). ~1/sec rate to keep readback stalls negligible.
     {
@@ -19057,7 +19062,7 @@ if (done.size() < 14 && !done.count(c.texKey))
     // Double-buffer-aware present (PS2X_DBPRESENT=0 disables): the fight alternates
     // f0/f112 and splits each frame across several publishes (clear+sky / chars / hud).
     // Presenting the buffer the LATEST list drew into shows a freshly-cleared, half-built
-    // frame â€” the stable "gray fight" while a complete Goku sits in the other buffer
+    // frame — the stable "gray fight" while a complete Goku sits in the other buffer
     // (proven: mid-frame FBO snapshot). When BOTH scene buffers are actively drawn,
     // present the one NOT touched by the most recent scene list: the completed frame.
     bool presentLatch = false;
@@ -19181,7 +19186,7 @@ if (done.size() < 14 && !done.count(c.texKey))
         if (it != g_fbos.end()) { outId = it->second.rt.texture.id; m_presentTexW = it->second.w; m_presentTexH = it->second.h; }
         // Present crops display rows [0..dispH] out of an FBO that can be TALLER than the display
         // (fight: fbp0/112 double as sampled RTs sized 512x512 while the display is 448). The blit
-        // samples {srcY, -dispH} from the bottom-up texture, so anchor at texH - dispH â€” the same
+        // samples {srcY, -dispH} from the bottom-up texture, so anchor at texH - dispH — the same
         // formula the atlas branch uses. srcY=0 (the old behavior) only holds when texH == dispH;
         // in the fight it presented the frame shifted 64 rows (junk band at the bottom).
         const int dispH = std::min(448, (m_dispH > 0 && m_dispH <= m_presentTexH) ? m_dispH : m_presentTexH);   // [dispanchor] the crop HEIGHT is clamped to 448 in the present (DEFAULT_DISPLAY_HEIGHT); the anchor must use the same value or a 512-row RT pass into fbp0/112 shifts the picture 64 rows for one present (squish.webm)
@@ -19191,7 +19196,7 @@ if (done.size() < 14 && !done.count(c.texKey))
     // (Stride-remap experiment removed: the popup has the SAME draw512/display640 FBW
     // mismatch yet renders fine without re-striding, so a blanket re-stride is wrong and
     // breaks the popup. The logo's re-stride distinction is something more specific.)
-    // (TEXTURE_FIXES.md fix 5 â€” conditional drawFBW!=dispFBW re-stride â€” was tried here
+    // (TEXTURE_FIXES.md fix 5 — conditional drawFBW!=dispFBW re-stride — was tried here
     // 2026-07-31 and reverted: broke rendering in testing, same as the blanket version.)
 
     {   // [fboprobe] PS2X_FBOPROBE=1: is the HUD actually IN the display FBO at end of frame?
@@ -19458,7 +19463,7 @@ if (done.size() < 14 && !done.count(c.texKey))
     }
 
     // PS2X_PRESENTDUMP: export the PRESENTED texture (what the window shows) every 60 renders,
-    // numbered â€” resolves "FBO dump has content but the screen is black" contradictions.
+    // numbered — resolves "FBO dump has content but the screen is black" contradictions.
     {
         // PS2X_PRESENTDUMP=<n>: n is the render interval (default 60). The cap is 10 at the
         // default interval and 60 when an interval is given, so a capture can span long enough
@@ -19509,7 +19514,7 @@ if (done.size() < 14 && !done.count(c.texKey))
     }
 
     // PS2X_FORENSIC: same-publish forensics. For 6 consecutive DISTINCT fight publishes, dump
-    // fbp0 + fbp112 + the presented texture (all keyed by publish gen) and one metadata line â€”
+    // fbp0 + fbp112 + the presented texture (all keyed by publish gen) and one metadata line —
     // reconcile every buffer against what the window shows. No more cross-frame guessing.
     {
         {   // [presfor] PS2X_PRESFOR=<startFrame>: per-present selection log for a 3000-frame window

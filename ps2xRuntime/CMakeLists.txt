@@ -148,11 +148,21 @@ else()
     # ecosystem) while the renderers stay ours -- imgui_impl_opengl3 for gfx::gl and imgui_impl_dx11 for
     # the native path. SDL event WATCHING (see ui_sdl.cpp) lets ImGui see every event without consuming
     # it, so raylib keeps its own input. The SDL2 link is added after the SDL2 target exists, below.
-    # NOTE: this must stay OUTSIDE the WIN32 block above -- nested inside it, a Linux build silently
-    # skipped the platform backend and failed at link time with undefined ImGui_ImplSDL2_*.
-    target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}/backends")
+    # [linuxfix] This block used to sit INSIDE if(WIN32), so Linux never got the platform backend.
+    # (The PS2X_HOST_SDL2 option() is declared above, before its first use.)
     if(PS2X_HOST_SDL2)
         target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp")
+        # [sdlprefetch] clang-cl: SDL_endian.h defines _m_prefetch, a builtin on current clang ("definition
+        # of builtin function"). Our files include SDL via ps2_host_sdl.h, which sets clang's guard first;
+        # imgui's SDL2 backend and bt3gl's SDL platform (rcore.c) include <SDL.h> directly, so force the
+        # same guard into those two. Out of the unity build so the force-include stays on that one file.
+        if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            set(_ps2x_sdl_prefetch_fix "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/ps2_sdl_prefetch_fix.h")
+            set_source_files_properties(
+                "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp"
+                "${bt3gl_SOURCE_DIR}/src/rcore.c"
+                PROPERTIES COMPILE_OPTIONS "/FI${_ps2x_sdl_prefetch_fix}" SKIP_UNITY_BUILD_INCLUSION ON)
+        endif()
     endif()
 
     # [C] rlImGui is GONE: the overlay is ImGui over our own backends (imgui_impl_sdl2 for the platform
@@ -678,10 +688,9 @@ if(PS2X_USE_GSRL)
     target_compile_definitions(ps2_runtime PRIVATE PS2X_USE_GSRL=1)
     message(STATUS "[gsrl] experiment ON: the replay submits through the renamed vendored rlgl copy")
 endif()
-# [A4] stb_image/stb_image_write are included as "external/stb_*.h", which resolves through the
-# bt3gl `src` include dir. src/external must NOT go on the include path: the vendor's Windows-only
-# external/dirent.h would shadow the real <dirent.h> on Linux (pad_evdev_linux.cpp) and the build
-# would die on the missing io.h.
+# [A4] stb_image(_write) / glad come from bt3gl as "external/<name>.h" (bt3gl/src is on the path through
+# the bt3gl link). [linuxfix] Do NOT add bt3gl/src/external itself: its Windows dirent.h shim (<io.h>)
+# would shadow the system <dirent.h> in every runtime file (pad_evdev_linux.cpp).
 # [C] ui_sdl.cpp includes imgui_impl_sdl2.h: the backend headers come from the imgui target (PUBLIC).
 target_link_libraries(ps2_runtime PRIVATE imgui)
 if(WIN32)

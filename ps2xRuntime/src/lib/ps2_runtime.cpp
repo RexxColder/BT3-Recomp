@@ -171,7 +171,7 @@ float g_ps2xWsHudInv = 1.0f;
 // by FBW shoved the center window into a bridge zone and stretched the timer plaque.
 float g_ps2xWsSrcW = 512.0f;
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(PS2X_HAVE_SDL2)   // [linuxfix] was _WIN32 only: Linux never created the gfx::gl context
 // [altGL] Opt-in present through the standalone GL layer (PS2X_ALTGL=1): the game frame is drawn
 // with gfx::gl instead of raylib's bt3DrawTexturePro. The GS still renders through rlgl for now;
 // only the final blit moves. Borrows raylib's window/context during the transition (tools/gl_probe).
@@ -182,9 +182,31 @@ float g_ps2xWsSrcW = 512.0f;
 #include "gfx/gl_context.h"
 #include "gfx/gs_gl.h"
 #include "gfx/video_overlay.h"
+#if defined(_WIN32)
 extern "C" __declspec(dllimport) void *__stdcall wglGetProcAddress(const char *);
+#else
+#include <SDL_video.h>   // [linuxfix] SDL_GL_GetProcAddress: the window and its GL context are SDL's
+#endif
 namespace
 {
+    // [linuxfix] Platform GL entry-point loader for the shared gfx::gl context. It only existed as a
+    // wglGetProcAddress lambda under _WIN32, so on Linux the context was never created and every
+    // GsRtCreate render target came back as id 0 (nothing drawn). GlApi falls back to
+    // opengl32.dll / dlsym(RTLD_DEFAULT) for anything this returns null for.
+    void *ps2xGlGetProc(const char *n)
+    {
+#if defined(_WIN32)
+        return (void *)wglGetProcAddress(n);
+#else
+        return SDL_GL_GetProcAddress(n);
+#endif
+    }
+    bool ps2xGlEnsureContext()
+    {
+        return ps2x::gfx::gl::EnsureContext(GetWindowHandle(), ps2xGlGetProc,
+                                            (uint32_t)bt3GetScreenWidth(), (uint32_t)bt3GetScreenHeight());
+    }
+
     bool g_altglOk = false, g_altglTried = false;
     ps2x::gfx::gl::Shader   g_altglBlit;
     ps2x::gfx::gl::Texture  g_altglSrc;
@@ -197,9 +219,7 @@ namespace
         if (g_altglTried) return g_altglOk;
         g_altglTried = true;
         // Shared, process-wide gfx::gl context (also used by the GS backend from A1 on).
-        g_altglOk = ps2x::gfx::gl::EnsureContext(GetWindowHandle(),
-                                                 [](const char *n) { return (void *)wglGetProcAddress(n); },
-                                                 (uint32_t)bt3GetScreenWidth(), (uint32_t)bt3GetScreenHeight())
+        g_altglOk = ps2xGlEnsureContext()
                  && g_altglBlit.Compile(ps2x::gfx::gl::Device(), ps2x::gfx::gl::kGlBlitVertexShader,
                                         ps2x::gfx::gl::kGlBlitFragmentShader);
         std::fprintf(stderr, "[altgl] present init %s (GL %s)\n", g_altglOk ? "ok" : "FAILED",
@@ -208,21 +228,6 @@ namespace
     }
 
     // Returns true when gfx::gl drew the frame (the caller then skips the raylib present).
-    // [texmega] PS2X_TEXMEGA=1 (default ON): F9 arms a 6-second texture-replacement mega dump
-    // (every lookup HIT/MISS + originals/replacements + the pack index) into <exeDir>/logs/texmega.
-    // Shared by BOTH present paths: it used to live inside the D3D11 branch only, so the ALTGL
-    // present -- the one that is actually used -- could never trigger it.
-    void texmegaHotkey()
-    {
-        static const bool s_tm = [](){ const char *v = std::getenv("PS2X_TEXMEGA"); return !(v && v[0] == '0'); }();
-        if (!s_tm || !bt3IsKeyPressed(BT3_KEY_F9)) return;
-        const char *xd = ps2xExeDirC();
-        const std::string d = std::string((xd && xd[0]) ? xd : ".") + "/logs/texmega";
-        ps2tex::megaArm(d.c_str(), 6.0);
-        ps2tex::megaDumpIndex();
-        std::fprintf(stderr, "[texmega] armed -> %s\n", d.c_str());
-    }
-
     bool AltGlPresent(bt3Texture2D &tex, const bt3Rectangle &src, const bt3Rectangle &dst, bool bilinear)
     {
         if (!AltGlEnabled() || !tex.id || !AltGlInit()) return false;
@@ -250,8 +255,13 @@ namespace
         auto V = [](float x, float y, float u, float v) {
             ps2x::gfx::gl::Vertex p{}; p.x = x; p.y = y; p.u = u; p.v = v;
             p.r = p.g = p.b = p.a = 255; p.q = 1.0f; p.z = 0.0f; return p; };
-        g_altglBlit.SetMat4("mvp", m);
         r.SetShader(&g_altglBlit);
+        // [altglfix] Bind BEFORE setting the matrix. SetMat4 trusts gfx::gl's "current program"
+        // cache, which rlgl's own glUseProgram calls make stale: from the second frame on the
+        // upload skipped glUseProgram, went to whatever program rlgl had bound, and the blit kept
+        // the FIRST frame's window size (a resize / F11 then mis-scaled the picture).
+        g_altglBlit.Bind(dev);
+        g_altglBlit.SetMat4("mvp", m);
         r.SetTexture(&g_altglSrc);
         ps2x::gfx::gl::BlendDesc opaque; opaque.enable = false;
         r.SetBlend(opaque);
@@ -259,7 +269,13 @@ namespace
         r.SetColorMask(true, true, true, true);
         r.SetDepth(false, false, 0x0203);
         ps2xgl::glDisable(ps2xgl::GL_CULL_FACE);   // raylib's rlgl leaves culling on
+        // [altglfix] SetDepth(write=false) turns glDepthMask off and nothing turned it back on: the
+        // GS renderer's per-frame glClear(GL_DEPTH_BUFFER_BIT) honours the mask, so the next frame's
+        // first depth clear silently did nothing. Hand the mask back as we found it.
+        ps2xgl::GLboolean hadDepthMask = 1;
+        ps2xgl::glGetBooleanv(ps2xgl::GL_DEPTH_WRITEMASK, &hadDepthMask);
         r.DrawQuad(V(x0, y0, u0, vTop), V(x1, y0, u1, vTop), V(x1, y1, u1, vBottom), V(x0, y1, u0, vBottom));
+        ps2xgl::glDepthMask(hadDepthMask);
         // [altGL] Hand the GL state back through RAYLIB'S OWN rlgl API. Our direct draws changed
         // GL (blend disabled, our program/texture/VAO bound) but rlgl's cached state still says
         // "alpha blend on, rlgl's program/texture bound" and therefore re-applies NOTHING. The
@@ -277,6 +293,26 @@ namespace
 #else
 namespace { bool AltGlPresent(bt3Texture2D &, const bt3Rectangle &, const bt3Rectangle &, bool) { return false; } }
 #endif
+extern "C" const char *ps2xExeDirC();   // [mergefix] main.cpp: <exeDir> ([linuxfix] the only other declaration is _WIN32-only)
+namespace
+{
+    // [texmega] PS2X_TEXMEGA=1 (default OFF [linuxfix]: a debug dump -- up to 800 PNGs per press,
+    // encoded synchronously -- should not sit on a key players press): F9 arms a 6-second
+    // texture-replacement mega dump (every lookup HIT/MISS + originals/replacements + the pack
+    // index) into <exeDir>/logs/texmega. Shared by BOTH present paths: it used to live inside the
+    // D3D11 branch only, so the ALTGL present -- the one that is actually used -- could never
+    // trigger it. [linuxfix] Outside the platform block: it is called on every platform.
+    void texmegaHotkey()
+    {
+        static const bool s_tm = [](){ const char *v = std::getenv("PS2X_TEXMEGA"); return v && v[0] && v[0] != '0'; }();
+        if (!s_tm || !bt3IsKeyPressed(BT3_KEY_F9)) return;
+        const char *xd = ps2xExeDirC();
+        const std::string d = std::string((xd && xd[0]) ? xd : ".") + "/logs/texmega";
+        ps2tex::megaArm(d.c_str(), 6.0);
+        ps2tex::megaDumpIndex();
+        std::fprintf(stderr, "[texmega] armed -> %s\n", d.c_str());
+    }
+}
 
 namespace ps2_syscalls { bool bt3WakeThreadByEntry(uint32_t entry); }
 
@@ -1557,14 +1593,12 @@ bool PS2Runtime::initialize(const char *title)
                 }
             }
         }
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(PS2X_HAVE_SDL2)   // [linuxfix] Linux needs the context too
         // [altGL] Bring the shared gfx::gl context up BEFORE the GS renderer creates any render
         // target: GsRtCreate goes through gfx::gl on EVERY renderer (the GS still renders via GL
         // even when the present is D3D11), so the context must exist regardless of the present.
         if (AltGlEnabled()) AltGlInit();
-        else ps2x::gfx::gl::EnsureContext(GetWindowHandle(),
-                                          [](const char *n) { return (void *)wglGetProcAddress(n); },
-                                          (uint32_t)bt3GetScreenWidth(), (uint32_t)bt3GetScreenHeight());
+        else ps2xGlEnsureContext();
 #endif
         // [hostio] audio and gamepads go through the host layers (SDL2 by default, raylib on
         // PS2X_HOSTAUDIO=raylib / PS2X_HOSTPAD=raylib); the window and keyboard stay raylib's.
@@ -6971,11 +7005,12 @@ void PS2Runtime::run()
         // 4:3 proportions, drew it round). PS2X_SQPIX=1 restores the old square-pixel
         // letterbox (the rig's boot screen-matching references were captured that way).
         {
-            // [tv43] DEFAULT: square pixels (no horizontal stretch). The ~8% "TV pixel"
-            // stretch made the present wider than the buffer and cut the right/bottom edge of
-            // full-frame 2D art (the pause popup's frame) on the OpenGL present. PS2X_SQPIX=0
-            // re-enables the authentic TV-pixel stretch.
-            static const bool s_sqpix = [](){ const char *v = std::getenv("PS2X_SQPIX"); return !(v && v[0] == '0'); }();
+            // [tv43] DEFAULT: the authentic TV-pixel stretch (main's default, restored). The PR had
+            // flipped it to square pixels because the pause popup's frame lost its right/bottom
+            // edge on the OpenGL present; the letterbox below always fits the window
+            // (dst = src*k*ls <= W, src*ls <= H), so that cut is not this stretch -- keep the
+            // tuned default and chase the popup separately. PS2X_SQPIX=1 = square pixels.
+            static const bool s_sqpix = [](){ const char *v = std::getenv("PS2X_SQPIX"); return v && v[0] && v[0] != '0'; }();
             static const float s_pixk = [](){ const char *v = std::getenv("PS2X_PIXK"); const float f = v ? (float)std::atof(v) : 1.08f; return (f > 0.5f && f < 2.0f) ? f : 1.08f; }();
             if (!s_sqpix)
             {   // measured against a native-4:3 Wii longplay capture: authentic TV pixels are

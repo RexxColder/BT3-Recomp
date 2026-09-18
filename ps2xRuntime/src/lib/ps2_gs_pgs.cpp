@@ -1669,6 +1669,9 @@ void setRenderScale(int scale)
     if (scale > 4) scale = 4;
     g_wantScale.store(scale, std::memory_order_relaxed);
 }
+// [pgswin] No Windows hard-off: the D3D11 plan that retired paraLLEl-GS there is itself retired
+// (1984cd1 brings paraLLEl-GS back as a renderer on every platform that builds it), but these two
+// kept returning false on _WIN32, so selecting it silently ran nothing.
 bool enabled()
 {
     // NOTE: this used to hard-return false on Windows ("paraLLEl-GS retired on Windows"), left over

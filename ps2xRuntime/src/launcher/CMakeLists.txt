@@ -63,6 +63,10 @@ else()
     # install fails with "lzma codec unsupported".
     FetchContent_Declare(liblzma
         URL https://github.com/tukaani-project/xz/releases/download/v5.6.2/xz-5.6.2.tar.gz
+        # [xzpin] Pinned like libarchive below. Hash of the tarball whose .sig verifies against Lasse
+        # Collin's release key (3690C240CE51B4670D30AD1C38EE757D69184620); 5.6.2 postdates the
+        # 5.6.0/5.6.1 backdoor.
+        URL_HASH SHA256=8bfd20c0e1d86f0402f2497cfa71c6ab62d4cd35fd704276e3140bfb71414519
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         EXCLUDE_FROM_ALL)   # only the liblzma target is needed; its tools/tests do not build under clang-cl
     set(BUILD_TESTING OFF CACHE BOOL "" FORCE)

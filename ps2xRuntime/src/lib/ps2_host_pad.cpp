@@ -296,7 +296,11 @@ namespace ps2x_pad
             {
                 if (!s_up) return;
                 SDL_GameControllerUpdate();   // joystick update + hotplug detection
-                SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+                // [sdlflush] Only the joystick/controller range (0x600-0x6FF). SDL owns the WINDOW now
+                // (raylib's SDL platform polls the same queue), so flushing everything could drop
+                // window/keyboard events queued between raylib's polls, e.g. the resize a
+                // SetWindowSize/fullscreen toggle posts synchronously.
+                SDL_FlushEvents(SDL_JOYAXISMOTION, SDL_FINGERDOWN - 1);
                 scanHotplug();
                 for (Slot &s : s_slots)
                 {
