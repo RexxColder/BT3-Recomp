@@ -2,7 +2,7 @@
 """PE dependency + layout gate for the Windows release stage.
 
 Analyses every PE under <stage_dir> with pefile and verifies the "portable tree"
-contract the Launcher.bat wrapper enforces (PATH <stage>/lib):
+contract the flat layout enforces (qt.conf + DLLs next to the executables):
 
   * every import of every bundled binary resolves either inside the stage's own
     lib/ (Qt6, FFmpeg, VC++ runtime) or to a Windows OS / driver component that
@@ -114,6 +114,7 @@ SUBSYSTEM_WINDOWS_GUI = 2  # IMAGE_SUBSYSTEM_WINDOWS_GUI
 REQUIRED_LAYOUT = [
     "Launcher.exe",
     "bt3-runner.exe",
+    "qt.conf",
     "LICENSE",
     "COPYING.LGPLv3",
     "savedata/settings.toml",

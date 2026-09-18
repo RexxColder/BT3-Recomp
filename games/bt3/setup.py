@@ -279,9 +279,9 @@ def _qt_prefix() -> Optional[Path]:
         ROOT / "build" / "qt" / QT_VERSION / QT_KIT_WINDOWS,
         Path.home() / "Qt" / QT_VERSION / QT_KIT_WINDOWS,
     ]
-    # Any kit already unpacked under build/qt/<ver>/<kit> counts (the native scripts pinned
-    # msvc2019_64 historically; the release containers use msvc2022_64).
-    if (ROOT / "build" / "qt").is_dir():
+    # Any kit already unpacked under build/qt/<ver>/<kit> counts, but only on Windows: those kits are
+    # MSVC builds and unusable on Linux/macOS.
+    if os.name == "nt" and (ROOT / "build" / "qt").is_dir():
         candidates += sorted((ROOT / "build" / "qt").glob(f"*/{QT_KIT_WINDOWS}"))
         candidates += sorted((ROOT / "build" / "qt").glob("*/*"))
     if sys.platform == "darwin":
@@ -858,16 +858,365 @@ def deploy_tree(runner: Path, out: Path) -> None:
     print(f"Deploy tree ready: {out}")
 
 
+def _release_out(ctx: "Context") -> Path:
+    if ctx.args.output:
+        return Path(ctx.args.output).resolve()
+    sub = "release-windows" if ctx.platform.is_windows else "release"
+    return BUILD / sub / "out"
+
+
+def _is_qt_debug_dll(p: Path) -> bool:
+    """Qt ships debug DLLs next to the release ones (Qt6Cored.dll). Only treat a file as debug when
+    the release counterpart exists: some TLS backends legitimately end in 'd.dll'."""
+    n = p.name
+    if not n.endswith("d.dll"):
+        return False
+    return p.with_name(n[:-5] + ".dll").exists()
+
+
+def build_launcher(ctx: "Context") -> Optional[Path]:
+    """Configure + build the Qt launcher and return the built artifact (.exe, binary or .app)."""
+    if ctx.args.skip_launcher or ctx.platform.is_macos:
+        return None
+    step("building the Qt launcher")
+    src = ROOT / "ps2xRuntime" / "src" / "launcher"
+    bdir = BUILD / ("launcher_qt" if ctx.platform.is_windows else "launcher")
+    extra = ["-DCMAKE_BUILD_TYPE=Release"]
+    if ctx.platform.qt_prefix:
+        extra.append("-DCMAKE_PREFIX_PATH=" + str(ctx.platform.qt_prefix))
+    if ctx.platform.is_windows:
+        if (os.environ.get("PS2X_SETUP_GENERATOR", "ninja").lower() != "vs" and ctx.platform.vs_dev_prompt()
+                and shutil.which("ninja") and shutil.which("clang-cl")):
+            extra += ["-G", "Ninja", "-DCMAKE_C_COMPILER=clang-cl", "-DCMAKE_CXX_COMPILER=clang-cl"]
+        else:
+            extra += ["-T", os.environ.get("PS2X_SETUP_TOOLSET", "ClangCL")]
+    run(["cmake", "-S", src, "-B", bdir] + extra)
+    cmake_build(ctx.platform, bdir, "Launcher", ctx.jobs)
+    exe = bdir / ctx.platform.exe("Launcher")
+    if not exe.exists():
+        die(f"Launcher not found after build ({exe})")
+    return exe
+
+
+def _vc_runtime_dll(name: str) -> Optional[Path]:
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")):
+        if not base:
+            continue
+        for edition in ("BuildTools", "Community", "Professional", "Enterprise"):
+            root = Path(base) / "Microsoft Visual Studio" / "2022" / edition / "VC" / "Redist" / "MSVC"
+            if root.is_dir():
+                hits = [h for h in sorted(root.rglob(name), reverse=True) if "x64" in h.parts]
+                if hits:
+                    return hits[0]
+    sys32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / name
+    return sys32 if sys32.exists() else None
+
+
+def copy_licences(stage: Path) -> None:
+    """GPL-3.0 for the project and the LGPL-3.0 for the bundled paraLLEl-GS (the PE/floor gates and
+    the packaging checks require both)."""
+    for lic, name in ((ROOT / "LICENSE", "LICENSE"),
+                      (ROOT / "ps2xRuntime" / "third_party" / "parallel-gs" / "COPYING.LGPLv3",
+                       "COPYING.LGPLv3")):
+        if lic.exists():
+            shutil.copy2(lic, stage / name)
+        else:
+            warn(f"licence file not found: {lic}")
+
+
+def bundle_windows(ctx: "Context", stage: Path, runner: Path, launcher: Path) -> None:
+    """Flat self-contained layout: Qt + VC runtime + FFmpeg in lib/, critical DLLs next to the EXEs,
+    qt.conf for plugin discovery, lavapipe as the software Vulkan fallback."""
+    step("bundling the Windows runtime")
+    stage_lib = stage / "lib"
+    stage_lib.mkdir(parents=True, exist_ok=True)
+
+    # The launcher boots <appDir>/bt3-runner.exe: rename the built ps2EntryRunner.exe.
+    runner_name = "bt3-runner.exe"
+    if (stage / runner_name).exists():
+        pass
+    elif (stage / "ps2EntryRunner.exe").exists():
+        (stage / "ps2EntryRunner.exe").rename(stage / runner_name)
+    else:
+        shutil.copy2(runner, stage / runner_name)
+
+    qt_bin = (ctx.platform.qt_prefix / "bin") if ctx.platform.qt_prefix else None
+    if not qt_bin or not qt_bin.is_dir():
+        die("Qt bin directory not found; install Qt (stage 2) or set QT_ROOT")
+    for p in qt_bin.glob("Qt6*.dll"):
+        if not _is_qt_debug_dll(p):
+            shutil.copy2(p, stage_lib / p.name)
+
+    plugins_src = None
+    for cand in (ctx.platform.qt_prefix / "plugins", ctx.platform.qt_prefix / "share" / "qt6" / "plugins"):
+        if cand.is_dir():
+            plugins_src = cand
+            break
+    plugins_dst = stage_lib / "qt6" / "plugins"
+    if plugins_src:
+        plugins_dst.mkdir(parents=True, exist_ok=True)
+        for p in plugins_src.rglob("*"):
+            if p.is_dir():
+                continue
+            rel = p.relative_to(plugins_src)
+            if rel.parts and rel.parts[0] == "sqldrivers":
+                continue   # qsqlpsql needs a non-system LIBPQ.dll; unused
+            if _is_qt_debug_dll(p):
+                continue
+            dst = plugins_dst / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dst)
+    else:
+        warn("Qt plugins directory not found; the platform plugin will be missing")
+
+    # FFmpeg DLLs staged next to the runner by CMake POST_BUILD.
+    for pattern in ("avcodec-*.dll", "avformat-*.dll", "avutil-*.dll",
+                    "swresample-*.dll", "swscale-*.dll"):
+        for p in stage.glob(pattern):
+            shutil.move(str(p), str(stage_lib / p.name))
+
+    for dll in ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll",
+                "msvcp140_1.dll", "msvcp140_2.dll"):
+        src = _vc_runtime_dll(dll)
+        if src:
+            shutil.copy2(src, stage_lib / dll)
+        else:
+            warn(f"VC++ runtime {dll} not found; the target machine must install the VC++ redistributable")
+
+    # Windows resolves DLLs from the EXE's directory before main(): flatten the critical ones so a
+    # double-click works without a wrapper script.
+    for dll in ("Qt6Core.dll", "Qt6Gui.dll", "Qt6Widgets.dll", "Qt6Network.dll",
+                "Qt6Concurrent.dll", "Qt6OpenGL.dll", "Qt6OpenGLWidgets.dll",
+                "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+                "vcruntime140.dll", "vcruntime140_1.dll"):
+        src = stage_lib / dll
+        if src.exists():
+            shutil.copy2(src, stage / dll)
+
+    (stage / "qt.conf").write_text("[Paths]\nPrefix = .\nPlugins = lib/qt6/plugins\n", encoding="ascii")
+
+    copy_licences(stage)
+
+    lvp = ctx.platform.lavapipe_dir
+    if lvp and (lvp / "vulkan_lvp.dll").exists():
+        lvp_dst = stage / "lavapipe"
+        lvp_dst.mkdir(exist_ok=True)
+        shutil.copy2(lvp / "vulkan_lvp.dll", lvp_dst / "vulkan_lvp.dll")
+        icd = lvp / "lvp_icd.x86_64.json"
+        if icd.exists():
+            shutil.copy2(icd, lvp_dst / "lvp_icd.x86_64.json")
+    else:
+        warn("lavapipe not found; the Windows Vulkan fallback will be unavailable (stage 2 installs it)")
+
+    if launcher is not None:
+        shutil.copy2(launcher, stage / "Launcher.exe")
+        assets = launcher.parent / "assets"
+        if assets.is_dir():
+            copytree_overlay(assets, stage / "assets")
+
+
+LINUX_LIB_BLACKLIST = (
+    "libc.so", "libm.so", "libpthread.so", "libdl.so", "librt.so", "libutil.so", "libresolv.so",
+    "libnsl.so", "libstdc++.so", "libgcc_s.so", "ld-linux",
+)
+
+
+def _ldd_deps(path: Path) -> list[Path]:
+    if not shutil.which("ldd"):
+        return []
+    out = run_capture(["ldd", str(path)])
+    deps = []
+    for line in out.splitlines():
+        if "=>" in line:
+            target = line.split("=>", 1)[1].strip().split(" ")[0]
+        else:
+            target = line.strip().split(" ")[0]
+        if target.startswith("/") and Path(target).exists():
+            deps.append(Path(target))
+    return deps
+
+
+def _bundle_closure(binaries: list[Path], stage_lib: Path) -> None:
+    """Copy the transitive ldd closure of the binaries into lib/, minus the glibc/C++ core (the
+    release relies on the distro's own runtime; bundling it caused GLIBC_PRIVATE clashes)."""
+    stage_lib.mkdir(parents=True, exist_ok=True)
+    seen: set[str] = set()
+    queue = list(binaries)
+    while queue:
+        cur = queue.pop()
+        for dep in _ldd_deps(cur):
+            name = dep.name
+            if name in seen or name.startswith(LINUX_LIB_BLACKLIST):
+                continue
+            seen.add(name)
+            shutil.copy2(dep, stage_lib / name)
+            queue.append(stage_lib / name)
+
+
+def bundle_linux(ctx: "Context", stage: Path, runner: Path, launcher: Optional[Path]) -> None:
+    step("bundling the Linux runtime")
+    stage_lib = stage / "lib"
+    stage_lib.mkdir(parents=True, exist_ok=True)
+
+    bin_runner = stage / "bt3-runner"
+    shutil.copy2(runner, bin_runner)
+    bin_runner.chmod(bin_runner.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    targets = [bin_runner]
+
+    if launcher is not None:
+        bin_launcher = stage / "Launcher"
+        shutil.copy2(launcher, bin_launcher)
+        bin_launcher.chmod(bin_launcher.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        targets.append(bin_launcher)
+        assets = launcher.parent / "assets"
+        if assets.is_dir():
+            copytree_overlay(assets, stage / "assets")
+
+    _bundle_closure(targets, stage_lib)
+
+    # Qt platform plugins are dlopened, so ldd does not see them: copy them explicitly plus their own
+    # dependencies.
+    plugin_src = None
+    for cand in (Path("/usr/lib/x86_64-linux-gnu/qt6/plugins"), Path("/usr/lib/qt6/plugins")):
+        if cand.is_dir():
+            plugin_src = cand
+            break
+    plugins_dst = stage_lib / "qt6" / "plugins" / "platforms"
+    if plugin_src and (plugin_src / "platforms").is_dir():
+        plugins_dst.mkdir(parents=True, exist_ok=True)
+        extra_bins = []
+        for name in ("libqxcb.so", "libqoffscreen.so"):
+            src = plugin_src / "platforms" / name
+            if src.exists():
+                shutil.copy2(src, plugins_dst / name)
+                extra_bins.append(plugins_dst / name)
+        if extra_bins:
+            _bundle_closure(extra_bins, stage_lib)
+    else:
+        warn("Qt platform plugins not found; the launcher will not start without them")
+
+    copy_licences(stage)
+
+    (stage / "logs").mkdir(exist_ok=True)
+    (stage / "savedata" / "BASLUS-21678DBZT3").mkdir(parents=True, exist_ok=True)
+    installer = ROOT / "tools" / "release" / "install-game.sh.in"
+    if installer.exists():
+        dst = stage / "install game.sh"
+        shutil.copy2(installer, dst)
+        dst.chmod(dst.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def seed_savedata(ctx: "Context", stage: Path) -> None:
+    """settings.toml (only when absent), fps60 pacing table and the memory-card slot."""
+    savedata = stage / "savedata"
+    savedata.mkdir(parents=True, exist_ok=True)
+    default = ROOT / "tools" / "release" / "settings.toml.default"
+    cfg = savedata / "settings.toml"
+    if default.exists() and not cfg.exists():
+        shutil.copy2(default, cfg)
+    fps60 = HERE / "fps60_sites.txt"
+    if fps60.exists():
+        shutil.copy2(fps60, savedata / "fps60_sites.txt")
+    (savedata / "BASLUS-21678DBZT3").mkdir(exist_ok=True)
+
+
+def run_gate(ctx: "Context", stage: Path) -> None:
+    if ctx.platform.is_windows:
+        gate = ROOT / "tools" / "release-windows" / "check_windows_deps.py"
+        if gate.exists():
+            step("running the PE dependency gate")
+            run([sys.executable, str(gate), str(stage)])
+        else:
+            warn("PE gate script not found; skipping")
+    elif ctx.platform.os == "linux":
+        gate = ROOT / "tools" / "release" / "check_floor.sh"
+        if gate.exists() and shutil.which("bash"):
+            step("running the glibc floor gate")
+            run(["bash", str(gate), str(stage)])
+
+
+def package_artifact(ctx: "Context", out_root: Path, stage: Path) -> None:
+    """Assemble the portable tree and produce the archive + sha256 for this OS."""
+    import datetime
+    import tarfile
+    import zipfile
+
+    tree_name = "Dragon Ball Budokai Tenkaichi 3 Recompiled"
+    out_root.mkdir(parents=True, exist_ok=True)
+    tree = out_root / tree_name
+    if tree.exists():
+        shutil.rmtree(tree)
+    copytree_overlay(stage, tree)
+
+    if ctx.platform.is_windows:
+        archive = out_root / "BT3-Recomp-x86_64.zip"
+        step(f"packaging {archive.name}")
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+            for p in sorted(tree.rglob("*")):
+                if p.is_file():
+                    z.write(p, p.relative_to(out_root).as_posix())
+    else:
+        archive = out_root / "BT3-Recomp-x86_64.tar.gz"
+        step(f"packaging {archive.name}")
+        with tarfile.open(archive, "w:gz") as t:
+            t.add(tree, arcname=tree_name)
+
+    shutil.rmtree(tree)
+    digest = sha256_of(archive)
+    base = archive.name
+    for suffix in (".tar.gz", ".zip"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    (out_root / (base + ".sha256")).write_text(f"{digest}  {archive.name}\n")
+    print(f"  {archive}  ({archive.stat().st_size / (1 << 20):.1f} MB)")
+    print(f"  sha256: {digest}")
+
+    if not ctx.args.no_desktop_copy:
+        desktop = Path.home() / "Desktop"
+        if desktop.is_dir() and ask_yes_no(ctx, f"Copy the artifact to {desktop}?", default=False):
+            shutil.copy2(archive, desktop / archive.name)
+
+
 def stage_package(ctx: "Context") -> None:
     step("stage 4: deploy/package")
     if ctx.runner is None:
-        die("no runner to deploy: run the build stage first (or drop --skip-setup/--gen-only misuse)")
+        ctx.runner = find_binary("ps2EntryRunner")
+
+    if ctx.args.deploy and not ctx.args.package:
+        deploy_tree(ctx.runner, Path(ctx.args.deploy).resolve())
+        return
+
+    out_root = _release_out(ctx)
+    stage = out_root / "stage"
+    if stage.exists():
+        shutil.rmtree(stage)
+    stage.mkdir(parents=True, exist_ok=True)
+    deploy_tree(ctx.runner, stage)
+    seed_savedata(ctx, stage)
     if ctx.args.deploy:
         deploy_tree(ctx.runner, Path(ctx.args.deploy).resolve())
+
+    if ctx.platform.is_macos:
+        bundler = ROOT / "tools" / "macos" / "deploy.py"
+        if not bundler.exists():
+            die("macOS bundler not found (tools/macos/deploy.py)")
+        app = out_root / "BT3-Recomp.app"
+        run([sys.executable, str(bundler), "--skip-build", "--output", str(app), "--jobs", ctx.jobs])
+        print(f"App bundle ready: {app}")
+        return
+
+    launcher = build_launcher(ctx)
+    if ctx.platform.is_windows:
+        bundle_windows(ctx, stage, ctx.runner, launcher)
+    else:
+        bundle_linux(ctx, stage, ctx.runner, launcher)
+
+    if not ctx.args.no_gate:
+        run_gate(ctx, stage)
+
     if ctx.args.package:
-        die("--package is implemented in the packaging phase; use --deploy for now", 2)
-
-
+        package_artifact(ctx, out_root, stage)
 # ------------------------------------------------------------------------------------------------
 # CLI + stage runner
 # ------------------------------------------------------------------------------------------------
@@ -906,6 +1255,14 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="after the build, assemble the playable tree into OUT")
     ap.add_argument("--package", action="store_true",
                     help="also produce the release artifact for this OS (+ checksum)")
+    ap.add_argument("--output", metavar="DIR",
+                    help="where the stage tree and the artifact go (default build/release-<os>/out)")
+    ap.add_argument("--skip-launcher", action="store_true",
+                    help="do not build the Qt launcher (developer tree without the UI)")
+    ap.add_argument("--no-gate", dest="no_gate", action="store_true",
+                    help="skip the release gate (PE imports / glibc floor)")
+    ap.add_argument("--no-desktop-copy", dest="no_desktop_copy", action="store_true",
+                    help="never offer to copy the artifact to the Desktop")
     ap.add_argument("--skip-setup", action="store_true",
                     help="skip ISO/recompile/patches; only rebuild the runner (+deploy)")
     ap.add_argument("--gen-only", action="store_true",

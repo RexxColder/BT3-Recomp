@@ -214,19 +214,16 @@ if [[ -f "$SRC/tools/release/settings.toml.default" ]]; then
     cp -v "$SRC/tools/release/settings.toml.default" "$STAGE/savedata/settings.toml" | sed 's/^/  /'
 fi
 
-# Launcher.bat: PATH/QT_PLUGIN_PATH so the DLLs resolve relative to the install
-# dir (portable tree, no machine-wide install). Mirror of install-game.sh.
-cat > "$STAGE/Launcher.bat" <<'EOF'
-@echo off
-setlocal
-set "HERE=%~dp0"
-set "PATH=%HERE%lib;%PATH%"
-set "QT_PLUGIN_PATH=%HERE%lib\qt6\plugins"
-set "PS2X_EXEDIR=%HERE%"
-start "" "%HERE%Launcher.exe" %*
-endlocal
-EOF
-log "wrote $STAGE/Launcher.bat"
+# Flat self-contained layout: qt.conf tells Qt where the plugins are (Prefix=. resolves to the
+# exe dir, Plugins=lib/qt6/plugins points at the staged tree) and the critical DLLs are copied next
+# to the executables so a double-click works -- no Launcher.bat wrapper.
+printf '[Paths]\nPrefix = .\nPlugins = lib/qt6/plugins\n' > "$STAGE/qt.conf"
+for dll in Qt6Core.dll Qt6Gui.dll Qt6Widgets.dll Qt6Network.dll Qt6Concurrent.dll Qt6OpenGL.dll \
+           Qt6OpenGLWidgets.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll \
+           vcruntime140.dll vcruntime140_1.dll; do
+    [[ -f "$STAGE/lib/$dll" ]] && cp -v "$STAGE/lib/$dll" "$STAGE/$dll" | sed 's/^/  /'
+done
+log "wrote $STAGE/qt.conf (flat layout)"
 
 # ---- 5. stage assembled (PE gate runs on the host side) ----------------------
 log "stage assembled:"
