@@ -370,6 +370,14 @@ bool ps2HalfStepFightActive()
     const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
     return fr - g_ps2HalfStepLogicFrame.load(std::memory_order_relaxed) <= 2u && g_hsStreak.load(std::memory_order_relaxed) >= 60u;
 }
+// [wshudmenu] the fight update ran within the last 2 render frames, WITHOUT the 60-frame streak: the widescreen HUD
+// squeeze needs a gate that is already true on the fight's first frame (with the streak the HUD sat unsqueezed for
+// the first second of every fight), and menus never run the update at all.
+bool ps2FightUpdateRecent()
+{
+    const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+    return fr - g_ps2HalfStepLogicFrame.load(std::memory_order_relaxed) <= 2u;
+}
 namespace
 {
     uint8_t *g_hs = nullptr;                      // 0 none, 1 float-halve, 2 int-every-other-frame

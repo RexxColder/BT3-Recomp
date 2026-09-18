@@ -33,6 +33,8 @@ bool ps2xGsRegionDrawnSinceWrite(const GS *gs, uint32_t bp, uint32_t bw, uint8_t
 extern float g_ps2xWsHudInv;   // [wshud] per-frame HUD squeeze factor from the present (1.0 = off), ps2_runtime.cpp
 extern std::atomic<int> g_wsHudLayout;   // overlay: 0 centered, 1 edge-pinned, 2 custom (-1 = unset)
 extern std::atomic<int> g_wsHudOffLQ, g_wsHudOffCQ, g_wsHudOffRQ;   // custom offsets x16
+bool ps2FightUpdateRecent();   // ps2_stepcensus.cpp [wshudmenu]: the fight update ran within the last 2 render frames (menus: never)
+
 namespace ps2x_pgs
 {
 static std::atomic<int> g_enabled{-1};
@@ -696,7 +698,30 @@ static void wsHudKickLocked(State &s, uint8_t *data, float inv)
         }
         h.rgbaN = 0;
     }
-    if (!h.active || inv >= 0.999f) return;
+    {   // [primlog] PS2X_PGS_PRIMLOG=<swap>: every textured primitive in the top band (y1 < 110) from that swap on --
+        // box, projection type (fst: 1 = UV sprite, 0 = STQ / 3D-projected) -- to compare a menu row at rest vs scrolling.
+        // Placed before the scene/HUD gates on purpose: menus have no 3D-tested scene and the gates close.
+        static const unsigned long long s_from = [](){ const char *v = std::getenv("PS2X_PGS_PRIMLOG"); return v && v[0] ? std::strtoull(v, nullptr, 10) : ~0ull; }();
+        static unsigned s_n = 0;
+        const int np = isSprite ? 2 : (isTri ? 3 : 0);
+        if (np && s.swaps >= s_from && s_n < 1500000u && ((attr >> 4) & 1u) && h.qn >= np)
+        {
+            float bx0 = 1e9f, bx1 = -1e9f, by0 = 1e9f, by1 = -1e9f;
+            for (int i = 0; i < np; i++) { const float x = h.q[i].x / 16.0f - c.ofx, y = h.q[i].y / 16.0f - c.ofy; bx0 = std::min(bx0, x); bx1 = std::max(bx1, x); by0 = std::min(by0, y); by1 = std::max(by1, y); }
+            if (by1 < 110.f && by0 > -10.f && bx1 - bx0 > 4.f)
+            {
+                s_n++;
+                std::fprintf(stderr, "[primlog] swap=%llu prim=%u fst=%d ctx=%u fbp=%u fbw=%u zte=%u ztst=%u z=%u/%u/%u active=%d inv=%.3f box=(%.1f,%.1f)-(%.1f,%.1f) w=%.1f h=%.1f tex0=%llx\n",
+                             (unsigned long long)s.swaps, primType, fst ? 1 : 0, ci, c.fbp, c.fbw, c.zte, c.ztst, h.q[0].z, h.q[1].z, np > 2 ? h.q[2].z : 0u, h.active ? 1 : 0, inv, bx0, by0, bx1, by1, bx1 - bx0, by1 - by0, (unsigned long long)(c.tex0 & 0xFFFFFFFFFFull));
+            }
+        }
+    }
+    // [wshudmenu] the squeeze is for the FIGHT HUD only. The scene gate (h.active) also opens in the character
+    // select, whose 3D model preview counts as a scene, and then the row tiles of the roster (64x64 top-band
+    // strips) were mapped whenever the gate happened to be on -- the row visibly narrowed while it scrolled and
+    // snapped back at rest (user, widescreen). Menus never run the fight update, so gate on it -- on the plain
+    // "ran recently" form: the 60-frame streak gate left the HUD unsqueezed for the fight's first second (user).
+    if (!h.active || inv >= 0.999f || !::ps2FightUpdateRecent()) return;
     if (!(isTri || isSprite)) return;
     if (!(c.fbp == 0u || c.fbp == 112u) || !(c.fpsm == 0u || c.fpsm == 1u)) return;
     const float W = (c.fbw * 64u >= 320u && c.fbw * 64u <= 1024u) ? float(c.fbw * 64u) : 512.0f;
