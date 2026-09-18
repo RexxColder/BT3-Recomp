@@ -861,7 +861,7 @@ gsrlAPI void gsrlLoadDrawQuad(void);     // Load and draw a quad
     #define GLAD_FREE GSRL_FREE
 
     // [R1] glad is compiled once by the raylib build: link to those symbols, do not recompile the implementation here.
-    #include "glad.h"          // GLAD extensions loading library, includes OpenGL headers
+    #include "external/glad.h" // GLAD extensions loading library, includes OpenGL headers ([linuxfix] upstream rlgl path)
 #endif
 
 #if defined(GRAPHICS_API_OPENGL_ES3)

@@ -84,9 +84,11 @@ namespace ps2x::gfx
 
     void UiSetup()
     {
+#if defined(_WIN32)   // [linuxfix] ui_d3d11.cpp is only built on Windows
         if (NativeVideo())
             UiD3D11Init(*VideoDevice());
         else
+#endif
         {
             // The GL overlay needs its own ImGui context (imgui_impl_opengl3 does not create one, and
             // ImGui::NewFrame on a null context is what crashed the runner).
@@ -102,6 +104,7 @@ namespace ps2x::gfx
 
     void UiBegin()
     {
+#if defined(_WIN32)
         if (NativeVideo())
         {
             UiD3D11NewFrame();
@@ -109,6 +112,7 @@ namespace ps2x::gfx
             ImGui::NewFrame();
         }
         else
+#endif
         {
             if (UiSdlInputActive()) UiSdlNewFrame(); else feedImGuiInput();
             ImGui_ImplOpenGL3_NewFrame();
@@ -118,9 +122,11 @@ namespace ps2x::gfx
 
     void UiEnd()
     {
+#if defined(_WIN32)
         if (NativeVideo())
             UiD3D11Render();   // ImGui::Render() + ImGui_ImplDX11_RenderDrawData()
         else
+#endif
         {
             // rlgl is still alive: flush the batch so our raw-GL overlay draws on top of it, then
             // hand the state back through rlgl's own API (rlgl caches blend/program/texture and
@@ -139,9 +145,11 @@ namespace ps2x::gfx
 
     void UiShutdown()
     {
+#if defined(_WIN32)
         if (NativeVideo())
             UiD3D11Shutdown();
         else
+#endif
         {
             UiSdlShutdown();
             ImGui_ImplOpenGL3_Shutdown();
@@ -154,9 +162,11 @@ namespace ps2x::gfx
         ImGui::Begin("D3D11 UI test");
         ImGui::Text("ImGui over D3D11 OK: %.1f fps", ImGui::GetIO().Framerate);
         ImGui::End();
+#if defined(_WIN32)
         if (NativeVideo())
             UiD3D11Render();   // ImGui::Render() + ImGui_ImplDX11_RenderDrawData()
         else
+#endif
         {
             bt3rlDrawRenderBatchActive();
             ImGui::Render();

@@ -19,6 +19,7 @@ extern "C"
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>   // [linuxfix] std::strstr
 #include <deque>
 #include <filesystem>
 #include <fstream>
