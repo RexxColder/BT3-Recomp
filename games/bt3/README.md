@@ -28,7 +28,7 @@ repository contains no game code, assets, or media.
 ## Build
 
 ```sh
-./games/bt3/setup.sh /path/to/bt3-usa.iso
+./scripts/build-linux.sh /path/to/bt3-usa.iso
 ```
 
 This extracts and verifies the ELF, builds the recompiler, generates ~7,800 C++

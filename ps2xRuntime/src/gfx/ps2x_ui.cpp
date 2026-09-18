@@ -1,7 +1,9 @@
 #include "gfx/ps2x_ui.h"
 
 #include "gfx/video_state.h"
-#include "gfx/d3d11/ui_d3d11.h"
+#if defined(_WIN32)
+#include "gfx/d3d11/ui_d3d11.h"   // imgui_impl_dx11 backend (compiled only on Windows)
+#endif
 
 #include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 #include "imgui.h"
@@ -84,10 +86,12 @@ namespace ps2x::gfx
 
     void UiSetup()
     {
-#if defined(_WIN32)   // [linuxfix] ui_d3d11.cpp is only built on Windows
+#if defined(_WIN32)
         if (NativeVideo())
+        {
             UiD3D11Init(*VideoDevice());
-        else
+            return;
+        }
 #endif
         {
             // The GL overlay needs its own ImGui context (imgui_impl_opengl3 does not create one, and
@@ -110,8 +114,8 @@ namespace ps2x::gfx
             UiD3D11NewFrame();
             feedImGuiInput();
             ImGui::NewFrame();
+            return;
         }
-        else
 #endif
         {
             if (UiSdlInputActive()) UiSdlNewFrame(); else feedImGuiInput();
@@ -124,8 +128,10 @@ namespace ps2x::gfx
     {
 #if defined(_WIN32)
         if (NativeVideo())
+        {
             UiD3D11Render();   // ImGui::Render() + ImGui_ImplDX11_RenderDrawData()
-        else
+            return;
+        }
 #endif
         {
             // rlgl is still alive: flush the batch so our raw-GL overlay draws on top of it, then
@@ -147,8 +153,10 @@ namespace ps2x::gfx
     {
 #if defined(_WIN32)
         if (NativeVideo())
+        {
             UiD3D11Shutdown();
-        else
+            return;
+        }
 #endif
         {
             UiSdlShutdown();

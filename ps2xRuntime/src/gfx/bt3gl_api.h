@@ -196,3 +196,14 @@ using bt3AudioStream = AudioStream;
 #define BT3_SHADER_UNIFORM_IVEC4 SHADER_UNIFORM_IVEC4
 #define BT3_SHADER_UNIFORM_VEC2 SHADER_UNIFORM_VEC2
 #define BT3_SHADER_UNIFORM_VEC4 SHADER_UNIFORM_VEC4
+
+// [video] added for the Video-tab status: monitor name/refresh
+#define bt3GetMonitorName GetMonitorName
+#define bt3GetMonitorRefreshRate GetMonitorRefreshRate
+// [display] added for the Display settings popup
+#define bt3SetWindowState SetWindowState
+#define bt3ClearWindowState ClearWindowState
+#define BT3_FLAG_FULLSCREEN_MODE FLAG_FULLSCREEN_MODE
+#define BT3_FLAG_BORDERLESS_WINDOWED_MODE FLAG_BORDERLESS_WINDOWED_MODE
+#define BT3_FLAG_WINDOW_RESIZABLE FLAG_WINDOW_RESIZABLE
+#define BT3_FLAG_WINDOW_UNDECORATED FLAG_WINDOW_UNDECORATED

@@ -119,6 +119,11 @@ else()
 
     set(PS2X_IMGUI_SOURCE_DIR "${imgui_SOURCE_DIR}")
 
+    # Declared BEFORE its first use below: with the option only defined further down (next to the SDL2
+    # fetch) the variable was empty on a FRESH configure, so imgui_impl_sdl2.cpp was silently left out
+    # and the link failed with undefined ImGui_ImplSDL2_* symbols. Cached builds hid it.
+    option(PS2X_HOST_SDL2 "Use SDL2 for gamepad input and audio output" ON)
+
     add_library(imgui STATIC
         "${PS2X_IMGUI_SOURCE_DIR}/imgui.cpp"
         "${PS2X_IMGUI_SOURCE_DIR}/imgui_draw.cpp"
@@ -143,9 +148,8 @@ else()
     # ecosystem) while the renderers stay ours -- imgui_impl_opengl3 for gfx::gl and imgui_impl_dx11 for
     # the native path. SDL event WATCHING (see ui_sdl.cpp) lets ImGui see every event without consuming
     # it, so raylib keeps its own input. The SDL2 link is added after the SDL2 target exists, below.
-    # [linuxfix] This used to sit INSIDE if(WIN32) (Linux never got the backend) and ahead of the
-    # PS2X_HOST_SDL2 option() (a fresh configure saw it undefined): declare the option here.
-    option(PS2X_HOST_SDL2 "Use SDL2 for gamepad input and audio output" ON)
+    # [linuxfix] This block used to sit INSIDE if(WIN32), so Linux never got the platform backend.
+    # (The PS2X_HOST_SDL2 option() is declared above, before its first use.)
     if(PS2X_HOST_SDL2)
         target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp")
         # [sdlprefetch] clang-cl: SDL_endian.h defines _m_prefetch, a builtin on current clang ("definition
@@ -168,7 +172,7 @@ else()
     # [hostio] SDL2 for gamepads and audio output (the window and keyboard stay raylib's). Built
     # static from source so every platform gets the same version; PS2X_HOSTPAD=raylib /
     # PS2X_HOSTAUDIO=raylib switch back at runtime, -DPS2X_HOST_SDL2=OFF leaves it out entirely.
-    option(PS2X_HOST_SDL2 "Use SDL2 for gamepad input and audio output" ON)
+    # (The option itself is declared earlier, before the imgui target uses it.)
     if(PS2X_HOST_SDL2)
         set(SDL_TEST OFF CACHE BOOL "" FORCE)
         set(SDL_TESTS OFF CACHE BOOL "" FORCE)

@@ -29,6 +29,8 @@ public:
         static constexpr int kRendererDefault = 0;   // [opengl-new] our own present
 #endif
         int renderer = kRendererDefault;
+        int windowMode = 0;   // [display] 0 = windowed (resizable), 1 = borderless, 2 = fullscreen
+        int monitor = 0;      // [display] monitor index, 0 = primary
         bool glow = true;
         bool glowFix = true;   // [glowfix] BT3's bloom/glow chain (Kaioken aura); applies on restart
         bool bilinear = true;

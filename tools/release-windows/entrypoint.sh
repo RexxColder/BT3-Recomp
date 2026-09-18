@@ -27,7 +27,7 @@ export LIB="$XWIN/crt/lib/x86_64;$XWIN/sdk/lib/ucrt/x86_64;$XWIN/sdk/lib/um/x86_
 log() { echo "== $*"; }
 
 STAGE="$OUT/stage"
-mkdir -p "$STAGE/lib" "$STAGE/savedata/BASLUS-21678DBZT3" "$STAGE/logs"
+mkdir -p "$STAGE/assets/lib" "$STAGE/savedata/BASLUS-21678DBZT3" "$STAGE/logs"
 
 # ---- 0. submodules ---------------------------------------------------------
 # Mirrors tools/release/entrypoint.sh: CMake skips the paraLLEl-GS backend
@@ -145,19 +145,19 @@ LAUNCHER="$LAUNCH_BUILD/Launcher.exe"
 # whatever Qt6*.dll import, if it lives in the kit it lands in lib/ too.
 log "bundling Qt DLLs"
 if compgen -G "$QT_ROOT/bin/*.dll" >/dev/null; then
-    cp -v "$QT_ROOT"/bin/*.dll "$STAGE/lib/" | sed 's/^/  /'
+    cp -v "$QT_ROOT"/bin/*.dll "$STAGE/assets/lib/" | sed 's/^/  /'
 else
     for dll in Qt6Core.dll Qt6Gui.dll Qt6Widgets.dll Qt6Network.dll; do
         for cand in "$QT_ROOT/bin/$dll" "$QT_ROOT/lib/$dll"; do
-            if [[ -f "$cand" ]]; then cp -v "$cand" "$STAGE/lib/" | sed 's/^/  /'; break; fi
+            if [[ -f "$cand" ]]; then cp -v "$cand" "$STAGE/assets/lib/" | sed 's/^/  /'; break; fi
         done
     done
 fi
 QT_PLUGIN_SRC="$(find "$QT_ROOT" -type d -path '*/plugins' 2>/dev/null | head -1)"
 if [[ -n "$QT_PLUGIN_SRC" && -d "$QT_PLUGIN_SRC" ]]; then
     log "bundling Qt plugins from $QT_PLUGIN_SRC"
-    mkdir -p "$STAGE/lib/qt6/plugins"
-    cp -rv "$QT_PLUGIN_SRC/." "$STAGE/lib/qt6/plugins/" | sed 's/^/  /'
+    mkdir -p "$STAGE/assets/lib/qt6/plugins"
+    cp -rv "$QT_PLUGIN_SRC/." "$STAGE/assets/lib/qt6/plugins/" | sed 's/^/  /'
 else
     log "WARNING: no Qt plugins dir found under $QT_ROOT"
 fi
@@ -165,7 +165,7 @@ fi
 # FFmpeg -> cosmetics-free runtime DLLs (avcodec-61, avformat-61, avutil-59,
 # swresample-5, swscale-8 + the LICENSES texts the lgpl build ships).
 log "bundling FFmpeg DLLs"
-cp -v "$FFMPEG_LIB_DIR"/*.dll "$STAGE/lib/" | sed 's/^/  /'
+cp -v "$FFMPEG_LIB_DIR"/*.dll "$STAGE/assets/lib/" | sed 's/^/  /'
 
 # VC++ runtime (vcruntime140/140_1/msvcp140): required by the runner (link /MD),
 # Qt6, and the FFmpeg DLLs. Required -- a missing one aborts the bundle with a
@@ -181,11 +181,11 @@ for dll in "${REQUIRED_VCRUNTIME[@]}"; do
         log "ERROR: required VC++ runtime DLL not found: $dll (looked in $VC_REDIST_DIR and the wine prefix)"
         exit 1
     fi
-    cp -v "$src" "$STAGE/lib/" | sed 's/^/  /'
+    cp -v "$src" "$STAGE/assets/lib/" | sed 's/^/  /'
 done
 for dll in msvcp140_1.dll msvcp140_2.dll concrt140.dll vcomp140.dll; do
     for cand in "$VC_REDIST_DIR/$dll" "$WINEPREFIX/drive_c/windows/system32/$dll"; do
-        [[ -f "$cand" ]] && { cp -v "$cand" "$STAGE/lib/" | sed 's/^/  /'; break; }
+        [[ -f "$cand" ]] && { cp -v "$cand" "$STAGE/assets/lib/" | sed 's/^/  /'; break; }
     done
 done
 
@@ -214,19 +214,16 @@ if [[ -f "$SRC/tools/release/settings.toml.default" ]]; then
     cp -v "$SRC/tools/release/settings.toml.default" "$STAGE/savedata/settings.toml" | sed 's/^/  /'
 fi
 
-# Launcher.bat: PATH/QT_PLUGIN_PATH so the DLLs resolve relative to the install
-# dir (portable tree, no machine-wide install). Mirror of install-game.sh.
-cat > "$STAGE/Launcher.bat" <<'EOF'
-@echo off
-setlocal
-set "HERE=%~dp0"
-set "PATH=%HERE%lib;%PATH%"
-set "QT_PLUGIN_PATH=%HERE%lib\qt6\plugins"
-set "PS2X_EXEDIR=%HERE%"
-start "" "%HERE%Launcher.exe" %*
-endlocal
-EOF
-log "wrote $STAGE/Launcher.bat"
+# Flat self-contained layout: qt.conf tells Qt where the plugins are (Prefix=. resolves to the
+# exe dir, Plugins=assets/lib/qt6/plugins points at the staged tree) and the critical DLLs are copied next
+# to the executables so a double-click works -- no Launcher.bat wrapper.
+printf '[Paths]\nPrefix = .\nPlugins = assets/lib/qt6/plugins\n' > "$STAGE/qt.conf"
+for dll in Qt6Core.dll Qt6Gui.dll Qt6Widgets.dll Qt6Network.dll Qt6Concurrent.dll Qt6OpenGL.dll \
+           Qt6OpenGLWidgets.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll \
+           vcruntime140.dll vcruntime140_1.dll; do
+    [[ -f "$STAGE/assets/lib/$dll" ]] && cp -v "$STAGE/assets/lib/$dll" "$STAGE/$dll" | sed 's/^/  /'
+done
+log "wrote $STAGE/qt.conf (flat layout)"
 
 # ---- 5. stage assembled (PE gate runs on the host side) ----------------------
 log "stage assembled:"

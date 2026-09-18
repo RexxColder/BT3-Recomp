@@ -21,7 +21,7 @@ Changes implemented:
 - The first real generation exposed a recompiler race: a freshly finished result
   could still sit in `readyCode` while checking whether a function was missing.
   The check and the pending-result cap were fixed.
-- `build_and_deploy_macos.sh` and `tools/macos/deploy.py` prepare a `.app` with
+- `scripts/build-macos.sh` and `tools/macos/deploy.py` prepare a `.app` with
   `macdeployqt`, a dependency/architecture/minimum-version audit and ad-hoc
   signing. Data, saves and settings stay outside the bundle, in
   `~/Library/Application Support/BT3-Recomp/`.
@@ -31,7 +31,7 @@ Port commands:
 ```sh
 brew install cmake ninja pkg-config ffmpeg qt
 python3 games/bt3/setup.py /path/bt3-usa.iso --jobs 3
-./build_and_deploy_macos.sh --skip-setup --output /path/BT3-Recomp.app
+./scripts/build-macos.sh --skip-setup --output /path/BT3-Recomp.app
 ```
 
 The default minimum version is that of the build Mac. Nothing older than what the
@@ -132,7 +132,7 @@ to Apple hard.
 | `ps2xAnalyzer` / `ps2xTest` | Analysis tools and tests | No platform findings. |
 | `ps2xStudio` | Editor; 4 git fetches at configure time | `OFF` by default in setup.py. Ignore. |
 | `games/bt3/setup.py` | Pipeline: ISO → generation → build | Only two branches: Windows and "the rest". |
-| `build_and_deploy.sh` | Assembles the self-extracting ELF | Useless on macOS. Rewrite. |
+| `scripts/build-linux.sh` | Assembles the self-extracting ELF | Useless on macOS. Rewrite. |
 | `tools/release/` | Reproducible release in Docker | No macOS equivalent. See phase 4. |
 
 > The generation pipeline takes a few minutes at `--jobs 16`; the conservative default
@@ -266,16 +266,16 @@ equivalent.
 
 | Linux dependency | Where | macOS equivalent |
 |---|---|---|
-| `gcc -static` | `build_and_deploy.sh:88` | **None.** macOS does not allow linking libc statically. The stub is not viable. |
+| `gcc -static` | `scripts/build-linux.sh:88` | **None.** macOS does not allow linking libc statically. The stub is not viable. |
 | `readlink("/proc/self/exe")` | `tools/selfx/stub.c:276` | `_NSGetExecutablePath()` |
 | `LD_LIBRARY_PATH` | `stub.c:372`, `:417` | `@rpath` / `@executable_path` via `install_name_tool` |
-| `ldd` + `mapfile` | `build_and_deploy.sh:97` | `otool -L`. And `mapfile` does not exist in Apple's bash 3.2. |
-| glibc blacklist | `build_and_deploy.sh:112` | Unnecessary: macOS does not have the `GLIBC_PRIVATE` problem. |
-| `sha256sum` | `build_and_deploy.sh:125` | `shasum -a 256` |
-| `nproc` | `build_and_deploy.sh:27` | `sysctl -n hw.ncpu` |
-| `realpath -m` | `build_and_deploy.sh:49` | Does not exist. `python3 -c os.path.abspath` or brew's coreutils. |
-| Hard-coded Qt6 path | `build_and_deploy.sh:148` | `/usr/lib/cmake/Qt6/Qt6Config.cmake` will never exist; use `CMAKE_PREFIX_PATH` with `brew --prefix qt6`. |
-| Concatenate ELF + footer | `build_and_deploy.sh:128-135` | `.app` bundle, or DMG. Mach-O does not support this trick as-is. |
+| `ldd` + `mapfile` | `scripts/build-linux.sh:97` | `otool -L`. And `mapfile` does not exist in Apple's bash 3.2. |
+| glibc blacklist | `scripts/build-linux.sh:112` | Unnecessary: macOS does not have the `GLIBC_PRIVATE` problem. |
+| `sha256sum` | `scripts/build-linux.sh:125` | `shasum -a 256` |
+| `nproc` | `scripts/build-linux.sh:27` | `sysctl -n hw.ncpu` |
+| `realpath -m` | `scripts/build-linux.sh:49` | Does not exist. `python3 -c os.path.abspath` or brew's coreutils. |
+| Hard-coded Qt6 path | `scripts/build-linux.sh:148` | `/usr/lib/cmake/Qt6/Qt6Config.cmake` will never exist; use `CMAKE_PREFIX_PATH` with `brew --prefix qt6`. |
+| Concatenate ELF + footer | `scripts/build-linux.sh:128-135` | `.app` bundle, or DMG. Mach-O does not support this trick as-is. |
 | Runner copy | `setup.py:212-217` | The `else` branch assumes Linux; on macOS it lands here through `os.name == "posix"` (`setup.py:36`). |
 | Docker release | `tools/release/` | Ubuntu 22.04 sets the glibc 2.35 floor, with `check_floor.sh` as the gate. On macOS the equivalent is `-mmacosx-version-min` + `MACOSX_DEPLOYMENT_TARGET`, and there is no container: a Mac is needed. |
 
@@ -396,7 +396,7 @@ This is the least reliable estimate in the report.
 
 ### Phase 4 — `.app` bundle and distribution · ≈2-3 days · rewrite, not patch
 
-A new `build_and_deploy_macos.sh`, sibling of the Linux one, not an `if` version.
+A new `scripts/build-macos.sh`, sibling of the Linux one, not an `if` version.
 Bundle, `macdeployqt`, ad-hoc signing, and a declared `MACOSX_DEPLOYMENT_TARGET` that
 plays the role the glibc 2.35 floor plays on Linux. Update `README.md` and
 `docs/DEPLOY.md`, which today state "Linux or Windows".
@@ -429,7 +429,7 @@ Not counting Apple notarization, which is administrative paperwork and a paid ac
 
 Things that will cost time to anyone who does not know them in advance.
 
-- **Do not patch `build_and_deploy.sh`.** It has seven intertwined Linux dependencies,
+- **Do not patch `scripts/build-linux.sh`.** It has seven intertwined Linux dependencies,
   one of them (`gcc -static`) with no equivalent. A sibling script comes out cleaner and
   does not break the Linux path, which works.
 - **macOS's bash is 3.2.** Any new script using `mapfile`, `${x,,}` or associative arrays

@@ -14,7 +14,7 @@ image** — this repository contains no game code, assets, or media.
 - **Your own legally obtained BT3 USA ISO** (SLUS-21678). Other regions are not
   supported — the committed function maps are for the USA executable.
 - Linux, Windows or macOS, x86-64 CPU with SSE4.1 (Windows can build with the
-  Docker flow or natively via `build-windows.ps1`; macOS experimental). On macOS
+  Docker flow or natively via `scripts\build-windows.ps1`; macOS experimental). On macOS
   the build is native arm64 (Apple Silicon) or x86-64, one at a time; see
   [the port notes](docs/MACOS-PORT.md).
 - ~16 GB RAM and ~10 GB free disk for the build.
@@ -33,7 +33,7 @@ image** — this repository contains no game code, assets, or media.
   sudo pacman -S --needed base-devel cmake git python rsync libarchive ffmpeg
   ```
 
-  Native Windows (see `build-windows.ps1`):
+  Native Windows (see `scripts\build-windows.ps1`):
   - VS Build Tools 2022 with the C++ Clang Compiler for Windows
     (`Microsoft.VisualStudio.Component.VC.Llvm.Clang`), installable with
     `winget install -e --id Microsoft.VisualStudio.2022.BuildTools`
@@ -48,7 +48,7 @@ image** — this repository contains no game code, assets, or media.
 ```sh
 git clone https://github.com/z3xox/BT3-Recomp.git
 cd BT3-Recomp
-./build_and_deploy.sh --iso /path/to/your/bt3-usa.iso --output /path/where/deploy
+./scripts/build-linux.sh --iso /path/to/your/bt3-usa.iso --output /path/where/deploy
 ```
 
 The script asks for the ISO and output directory if they are not given, runs the
@@ -62,7 +62,7 @@ artifact. See `docs/DEPLOY.md` for the full picture.
 **Windows (Docker):** no toolchain to install — the build runs inside a
 [Docker](https://www.docker.com/products/docker-desktop/) container that
 cross-compiles for Windows (clang-cl + xwin + lld-link; no Visual Studio).
-Prefer the native `build-windows.ps1` flow (below) if Docker is not available.
+Prefer the native `scripts\build-windows.ps1` flow (below) if Docker is not available.
 You need **Docker Desktop** and **Git for Windows** (for `bash`). The simplest
 route is to double-click `tools\release-windows\build-windows.bat`: it starts
 Docker Desktop if needed, prompts for your ISO (or accepts a `.iso` dragged on
@@ -92,7 +92,7 @@ pass your core count with `--jobs N` if you have 8 GB+ of free RAM.
 
 ```sh
 brew install cmake ninja pkg-config ffmpeg qt
-./build_and_deploy_macos.sh --iso /path/to/bt3-usa.iso --jobs 3
+./scripts/build-macos.sh --iso /path/to/bt3-usa.iso --jobs 3
 open build/macos-dist/BT3-Recomp.app
 ```
 
@@ -116,18 +116,18 @@ cd "Dragon Ball Budokai Tenkaichi 3 Recompiled"
 ```
 
 or run `install game.sh` for a desktop menu entry + icon. The launcher boots
-`bt3-runner` with the extracted `data/SLUS_216.78` and the bundled `lib/`
+`bt3-runner` with the extracted `data/SLUS_216.78` and the bundled `assets/lib/`
 automatically.
 
 **Windows (native, PowerShell):** the native build runs locally with Visual
 Studio Build Tools 2022 (ClangCL + Win11 SDK), Ninja, Python 3 and Qt 6 (fetched
-via aqtinstall). No Docker or WSL. Double-click `build-windows.ps1` in PowerShell
+via aqtinstall). No Docker or WSL. Double-click `scripts\build-windows.ps1` in PowerShell
 or run it from a terminal; the first run installs all missing prerequisites via
 winget and pip. To install only the dependencies, run the standalone script:
 
 ```powershell
-.\install-deps-windows.ps1 -Install   # install all prerequisites
-.\build-windows.ps1 -Iso "C:\path\to\bt3-usa.iso"
+.\scripts\install-deps-windows.ps1   # install all prerequisites
+.\scripts\build-windows.ps1 -Iso "C:\path\to\bt3-usa.iso"
 ```
 
 Call it without arguments to be prompted for the ISO and output directory. Pass
@@ -135,7 +135,7 @@ Call it without arguments to be prompted for the ISO and output directory. Pass
 stage passes the PE gate, package the release zip with:
 
 ```powershell
-.\package-windows.ps1
+.\scripts\package-windows.ps1
 ```
 
 Produce `build\release-windows\out\stage\` and
@@ -178,12 +178,12 @@ Known issues:
 
 | Path | What it is |
 | --- | --- |
-| `build_and_deploy.sh` | Linux one-command build + deploy (ISO prompt, portable game tree) |
-| `build-windows.ps1` | Windows one-command native build + deploy (no Docker/WSL; installs deps, builds runner + Qt launcher, stages, PE gate) |
-| `install-deps-windows.ps1` | Windows standalone dependency installer (VS Build Tools, CMake, Ninja, Python, Qt) — run `-Install` |
-| `package-windows.ps1` | Windows release packaging from the native stage (`BT3-Recomp-x86_64.zip` + `.sha256`) |
+| `scripts/build-linux.sh` | Linux build + package wrapper around `setup.py` (ISO prompt, portable tree, tar.gz + sha256) |
+| `scripts/build-windows.ps1` | Windows native build + package wrapper (installs missing deps, builds runner + Qt launcher, PE gate, zip) |
+| `scripts/install-deps-windows.ps1` | Windows dependency installer (VS Build Tools + ClangCL, CMake, Ninja, Python, Qt, Mesa lavapipe) |
+| `scripts/package-windows.ps1` | Windows release packaging from the native stage (`BT3-Recomp-x86_64.zip` + `.sha256`) |
 | `tools/release/package.sh` | wraps the deploy tree into the release tarball (`BT3-Recomp-x86_64.tar.gz` + `.sha256`) |
-| `games/bt3/setup.py` | cross-platform build pipeline (`--deploy`, `--skip-setup`, `--jobs`) |
+| `games/bt3/setup.py` | the single four-stage script: detect / deps / build / package (see `docs/DEPLOY.md`) |
 | `docs/DEPLOY.md` | the deploy structure and cross-platform packaging documentation |
 | `games/bt3/functions.csv`, `dbzp_*.csv` | function address maps (symbols only) |
 | `games/bt3/vu1_programs.json` | ELF offsets + hashes of the VU1 microprograms (the translation is generated from your ELF at setup) |

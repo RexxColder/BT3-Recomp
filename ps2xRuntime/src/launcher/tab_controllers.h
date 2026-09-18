@@ -10,6 +10,7 @@
 
 class QCheckBox;
 class QComboBox;
+class QDialog;
 class QLabel;
 class QSlider;
 class QTimer;
@@ -51,7 +52,15 @@ public:
     // Re-read the shared per-player pad devices after BindingsTab::load() ran.
     void syncFromPads();
 
+public slots:
+    // Recompute the STATUS summary (dot + one line) from the widget state.
+    void refreshStatus();
+
 private:
+    QDialog *m_playerDlg = nullptr;
+    QLabel *m_dot = nullptr;
+    QLabel *m_status = nullptr;
+    QString m_statusText;
     QComboBox *m_player = nullptr;
     QComboBox *m_device = nullptr;
     QSlider *m_deadzone = nullptr;

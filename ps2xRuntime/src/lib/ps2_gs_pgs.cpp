@@ -1674,11 +1674,18 @@ void setRenderScale(int scale)
 // kept returning false on _WIN32, so selecting it silently ran nothing.
 bool enabled()
 {
+    // NOTE: this used to hard-return false on Windows ("paraLLEl-GS retired on Windows"), left over
+    // from the D3D11 era. The backend builds and runs on Windows again (the release bundles the Mesa
+    // lavapipe ICD as the fallback driver), so the platform stub is gone: the PS2X_PGS env exported at
+    // startup decides on every platform, and a failed init stores a definitive 0 via fail().
     int v = g_enabled.load(std::memory_order_relaxed);
     if (v < 0) { v = envOn("PS2X_PGS") ? 1 : 0; g_enabled.store(v, std::memory_order_relaxed); }
     return v != 0;
 }
-bool packMode() { static const bool p = envOn("PS2X_PGS") && envOn("PS2X_PGS_PACK"); return p; }
+bool packMode()
+{
+    static const bool p = envOn("PS2X_PGS") && envOn("PS2X_PGS_PACK"); return p;
+}
 bool coalesce() { static const bool c = envOn("PS2X_PGS_COALESCE") && !packMode(); return c; }   // pack mode needs per-packet order
 void setGs(GS *gs) { State &s = st(); std::lock_guard<std::mutex> lk(s.mtx); s.replacer.gs = gs; }
 static thread_local bool t_suppressed = false;

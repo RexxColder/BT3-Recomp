@@ -1347,7 +1347,7 @@ namespace
             else g_d3dGsSh.SetVec4(n, v[0], v[1], v[2], v[3]);
         }
     }
-#endif   // _WIN32 [linuxfix] the image/readback helpers below are portable: used on every platform
+#endif   // _WIN32: end of the D3D-only draw helpers
     // [A4] Local stand-in for raylib's bt3Image on the readback path: same surface the diagnostic
     // code uses (.data/.width/.height/.format) but backed by our own GL readback + PNG writer, so
     // bt3LoadImageFromTexture/bt3ExportImage/bt3UnloadImage/bt3ImageFlipVertical/bt3GetImageColor leave the replay.
@@ -1410,7 +1410,7 @@ namespace
         }
         return ps2x::gfx::GsWritePngRGBA8(path, px.data(), t.width, t.height);
     }
-#if defined(_WIN32)
+#if defined(_WIN32)   // D3D-only mirror/bind helpers (the A4 readback shims above are portable)
     static void d3dGsMirrorState(int rtW, int rtH)
     {
         ps2x::gfx::BlendDesc b;
@@ -1442,7 +1442,7 @@ namespace
         const float m[16] = {2.0f / W, 0, 0, 0,  0, -2.0f / H, 0, 0,  0, 0, 1, 0,  -1, 1, 0, 1};
         g_d3dGsSh.SetMat4("mvp", m);
     }
-#endif   // _WIN32 [linuxfix] gsGlMirrorUniforms is plain GL: used on every platform
+#endif   // _WIN32: end of the D3D mirror/state helpers (the gsgl mirror below is portable GL)
     // [gsgl A3.2b] Mirror the main shader's current uniforms into the gfx::gl copy (same trick as
     // d3dGsMirrorUniforms): read them back from the raylib program and push them by NAME into our
     // program. Cheap enough for an A/B and avoids mirroring ~20 individual bt3SetShaderValue sites.

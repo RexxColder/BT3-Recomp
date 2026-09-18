@@ -24,7 +24,9 @@ texture_pack = false
 shadows = true
 dof_blur = true
 dof_zfar = 200000
-fullscreen = false
+fullscreen = false      # legacy mirror of window_mode == 2
+window_mode = 0         # 0 windowed (resizable, decorated), 1 borderless, 2 fullscreen
+monitor = 0             # 0-based display index; applied at startup (PS2X_MONITOR overrides)
 widescreen = false
 window_w = 0
 window_h = 0

@@ -2,7 +2,7 @@
 
 Produces the Windows deploy as a 1/1 port of the Linux flow in `tools/release/`:
 same runner, same launcher, same paraLLEl-GS backend, same bundle layout
-(`lib/`, `assets/`, `savedata/`, licences, default `settings.toml`) — just for
+(`assets/lib/`, `assets/`, `savedata/`, licences, default `settings.toml`) — just for
 the MSVC/Windows SDK pair instead of glibc.
 
 The toolchain is **clang-cl + lld-link against the CRT/SDK materialised by
@@ -25,7 +25,7 @@ tools/release-windows/
   build-windows.bat      double-click entry point on Windows (auto-starts
                          Docker Desktop, ISO drag & drop, optional packaging)
   entrypoint.sh          configures/builds runner + launcher, bundles stage/
-  check_windows_deps.py  PE gate: every import resolves (stage lib/ or the OS),
+  check_windows_deps.py  PE gate: every import resolves (stage assets/lib/ or the OS),
                          every required artefact is present
   package.sh             BT3-Recomp-x86_64.zip + .sha256
   README.md              this file
@@ -51,7 +51,7 @@ tools/release-windows/package.sh
 
 Outputs under `build/release-windows/out/`:
 - `stage/` — the portable tree (`Launcher.exe`, `bt3-runner.exe`, `Launcher.bat`,
-  `lib/`, `assets/`, `savedata/`, licences, `settings.toml`).
+  `assets/lib/`, `assets/`, `savedata/`, licences, `settings.toml`).
 - `BT3-Recomp-x86_64.zip` + `.sha256` — the end-user artefact.
 
 A fresh clone has no game code: pass `--iso` once and `setup.py --gen-only`
@@ -61,9 +61,9 @@ the launcher's install wizard extracts it from the user's ISO into `data/`.
 ## What 1/1 parity means here
 
 Lowered to the Windows equivalent of the Linux gates:
-- **Bundle** (`lib/`): Qt6 Core/Gui/Widgets/Network (plus the kit's `bin/*.dll`:
+- **Bundle** (`assets/lib/`): Qt6 Core/Gui/Widgets/Network (plus the kit's `bin/*.dll`:
   ICU, OpenSSL, ...), the Qt `qwindows`/style/image plugins under
-  `lib/qt6/plugins/`, FFmpeg `avcodec-61/avformat-61/avutil-59/swresample-5/
+  `assets/lib/qt6/plugins/`, FFmpeg `avcodec-61/avformat-61/avutil-59/swresample-5/
   swscale-8`, and `vcruntime140.dll`/`vcruntime140_1.dll`/`msvcp140.dll`.
 - **Wrapper**: `Launcher.bat` sets `PATH=lib`, `QT_PLUGIN_PATH=lib\qt6\plugins`
   and `PS2X_EXEDIR`, the mirror of `install game.sh`.
@@ -101,7 +101,7 @@ run it only when a real Windows test machine is not available.
 
 - The MSVC C runtime is `/MD` for the whole tree (pinned in `CMakeLists.txt:19-21`
   because paraLLEl-GS otherwise builds `/MT` and lld-link rejects the mix); the
-  runtime DLLs are shipped in `lib/`.
+  runtime DLLs are shipped in `assets/lib/`.
 - `Launcher.exe` is a true GUI-subsystem process (`WIN32_EXECUTABLE`); the runner
   suppress its console via `-DPS2X_SHOW_WINDOWS_CONSOLE=OFF`.
 - Host tools (`ps2xAnalyzer`, `ps2xTest`, `ps2xStudio`, recompiler) are disabled

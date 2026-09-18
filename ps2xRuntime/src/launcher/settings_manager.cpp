@@ -189,6 +189,9 @@ bool SettingsManager::loadToml(const QString &path)
     m_dofBlur = doc.getB("video.dof_blur", m_dofBlur);
     m_dofZFar = doc.getI("video.dof_zfar", m_dofZFar);
     m_fullscreen = doc.getB("video.fullscreen", m_fullscreen);
+    // [video.mode] window mode owns fullscreen now; the legacy bool is kept in sync for old readers.
+    m_windowMode = doc.getI("video.window_mode", m_fullscreen ? 2 : 0);
+    m_monitor = doc.getI("video.monitor", 0);
     m_widescreen = doc.getB("video.widescreen", m_widescreen);
     m_windowW = doc.getI("video.window_w", m_windowW);
     m_windowH = doc.getI("video.window_h", m_windowH);
@@ -268,7 +271,7 @@ bool SettingsManager::loadIniLegacy(const QString &path)
             else if (key == "shadows") m_shadows = b;
             else if (key == "dof_blur") m_dofBlur = b;
             else if (key == "dof_zfar") m_dofZFar = ist(val, 200000);
-            else if (key == "fullscreen") m_fullscreen = b;
+            else if (key == "fullscreen") { m_fullscreen = b; m_windowMode = b ? 2 : 0; }
             else if (key == "widescreen") m_widescreen = b;
             else if (key == "window_w") m_windowW = ist(val, 0);
             else if (key == "window_h") m_windowH = ist(val, 0);
@@ -343,6 +346,8 @@ bool SettingsManager::save()
     os << "dof_blur = " << fmtBool(m_dofBlur) << "\n";
     os << "dof_zfar = " << fmtInt(m_dofZFar) << "\n";
     os << "fullscreen = " << fmtBool(m_fullscreen) << "\n";
+    os << "window_mode = " << fmtInt(m_windowMode) << "\n";
+    os << "monitor = " << fmtInt(m_monitor) << "\n";
     os << "widescreen = " << fmtBool(m_widescreen) << "\n";
     os << "window_w = " << fmtInt(m_windowW) << "\n";
     os << "window_h = " << fmtInt(m_windowH) << "\n";

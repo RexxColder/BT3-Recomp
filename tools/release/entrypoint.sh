@@ -19,7 +19,7 @@ export CCACHE_MAXSIZE=8G
 
 log() { echo "== $*"; }
 
-mkdir -p "$OUT/stage/lib" "$OUT/stage/savedata/BASLUS-21678DBZT3" "$OUT/stage/logs"
+mkdir -p "$OUT/stage/assets/lib" "$OUT/stage/savedata/BASLUS-21678DBZT3" "$OUT/stage/logs"
 
 # ---- 0. submodules ---------------------------------------------------------
 # Nothing here used to init them, so a non-recursive clone built a runner with NO
@@ -140,9 +140,9 @@ bundle_binary() {
                 continue
             fi
             local src="$(realpath -m "$lib" 2>/dev/null || echo "$lib")"
-            local dst="$(realpath -m "$OUT/stage/lib/$base" 2>/dev/null || echo "$OUT/stage/lib/$base")"
+            local dst="$(realpath -m "$OUT/stage/assets/lib/$base" 2>/dev/null || echo "$OUT/stage/assets/lib/$base")"
             if [[ -f "$lib" && -z "${COPIED[$base]+_}" && "$src" != "$dst" ]]; then
-                cp -L "$lib" "$OUT/stage/lib/$base"
+                cp -L "$lib" "$OUT/stage/assets/lib/$base"
                 COPIED[$base]=1
             fi
         done
@@ -167,12 +167,12 @@ if [[ -z "$QT_PLUGIN_DIR" ]]; then
 fi
 if [[ -n "$QT_PLUGIN_DIR" && -d "$QT_PLUGIN_DIR/platforms" ]]; then
     log "bundling Qt platform plugins from $QT_PLUGIN_DIR"
-    mkdir -p "$OUT/stage/lib/qt6/plugins/platforms"
+    mkdir -p "$OUT/stage/assets/lib/qt6/plugins/platforms"
     for plugin in "$QT_PLUGIN_DIR"/platforms/libqxcb.so "$QT_PLUGIN_DIR"/platforms/libqoffscreen.so; do
         [[ -f "$plugin" ]] || continue
-        cp -L "$plugin" "$OUT/stage/lib/qt6/plugins/platforms/"
+        cp -L "$plugin" "$OUT/stage/assets/lib/qt6/plugins/platforms/"
     done
-    for plugin in "$OUT/stage"/lib/qt6/plugins/platforms/*.so; do
+    for plugin in "$OUT/stage"/assets/lib/qt6/plugins/platforms/*.so; do
         [[ -e "$plugin" ]] && bundle_binary "$plugin"
     done
 else

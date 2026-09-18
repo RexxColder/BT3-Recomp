@@ -5,11 +5,13 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDialog>
 #include <QFrame>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPainter>
+#include <QPushButton>
 #include <QSlider>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -75,10 +77,22 @@ ControllersTab::ControllersTab(std::array<padconf::Player, 2> *shared, QWidget *
     root->setContentsMargins(18, 14, 18, 14);
     root->setSpacing(10);
 
+    // [padui] Same shape as the overlay Controllers tab: a STATUS summary with a dot, the device picks
+    // in a dialog, and the live gamepad test inline (it is what you watch while binding). The widgets
+    // below live in the dialog but the tab keeps the pointers -- the poller and the handlers drive them
+    // directly, which is why they stay members.
+    m_playerDlg = new QDialog(this);
+    m_playerDlg->setWindowTitle(QStringLiteral("Player & Device"));
+    m_playerDlg->setModal(true);
+    m_playerDlg->setMinimumWidth(520);
+    auto *dlgRoot = new QVBoxLayout(m_playerDlg);
+    dlgRoot->setContentsMargins(14, 12, 14, 12);
+    dlgRoot->setSpacing(8);
+
     // DEVICE section
     auto *devLabel = new QLabel(QStringLiteral("DEVICE"));
     devLabel->setObjectName(QStringLiteral("sectionLabel"));
-    root->addWidget(devLabel);
+    dlgRoot->addWidget(devLabel);
 
     auto *playerRow = new QWidget;
     auto *playerLay = new QHBoxLayout(playerRow);
@@ -89,7 +103,7 @@ ControllersTab::ControllersTab(std::array<padconf::Player, 2> *shared, QWidget *
     m_player->addItems({QStringLiteral("P1"), QStringLiteral("P2")});
     playerLay->addWidget(pl, 1);
     playerLay->addWidget(m_player, 0);
-    root->addWidget(playerRow);
+    dlgRoot->addWidget(playerRow);
 
     auto *devRow = new QWidget;
     auto *devLay = new QHBoxLayout(devRow);
@@ -100,7 +114,7 @@ ControllersTab::ControllersTab(std::array<padconf::Player, 2> *shared, QWidget *
     devLay->addWidget(dl, 1);
     devLay->addWidget(m_device, 0);
     m_device->setMinimumWidth(260);
-    root->addWidget(devRow);
+    dlgRoot->addWidget(devRow);
 
     // Deadzone
     auto *dzRow = new QWidget;
@@ -117,12 +131,12 @@ ControllersTab::ControllersTab(std::array<padconf::Player, 2> *shared, QWidget *
     dzLay->addWidget(zl);
     dzLay->addWidget(m_deadzone, 1);
     dzLay->addWidget(m_deadzoneVal);
-    root->addWidget(dzRow);
+    dlgRoot->addWidget(dzRow);
 
     // OVERLAY master switch
     auto *ovLabel = new QLabel(QStringLiteral("OVERLAY"));
     ovLabel->setObjectName(QStringLiteral("sectionLabel"));
-    root->addWidget(ovLabel);
+    dlgRoot->addWidget(ovLabel);
     auto *ovRow = new QWidget;
     auto *ovLay = new QHBoxLayout(ovRow);
     ovLay->setContentsMargins(8, 2, 8, 2);
@@ -132,12 +146,59 @@ ControllersTab::ControllersTab(std::array<padconf::Player, 2> *shared, QWidget *
     m_overlayEnabled->setChecked(s.overlayEnabled());
     ovLay->addWidget(ol, 1);
     ovLay->addWidget(m_overlayEnabled);
-    root->addWidget(ovRow);
+    dlgRoot->addWidget(ovRow);
     auto *ovHint = new QLabel(QStringLiteral(
         "Holds the open-hint combo (Shift+Tab / Select+Start). Off = the overlay never opens in-game."));
     ovHint->setObjectName(QStringLiteral("hintLabel"));
     ovHint->setWordWrap(true);
-    root->addWidget(ovHint);
+    dlgRoot->addWidget(ovHint);
+    {
+        auto *row = new QHBoxLayout;
+        auto *reset = new QPushButton(QStringLiteral("Reset"));
+        auto *closeBtn = new QPushButton(QStringLiteral("Close"));
+        auto *save = new QPushButton(QStringLiteral("Save"));
+        for (auto *b : {reset, closeBtn, save}) b->setMinimumWidth(96);
+        // Live write-through already happened on every change (same as before); Reset reloads from the
+        // settings, Save persists to savedata/settings.toml, Close just closes.
+        connect(reset, &QPushButton::clicked, this, [this] {
+            auto &st = SettingsManager::instance();
+            m_deadzone->setValue(int(st.deadzone() * 100.0f));
+            m_overlayEnabled->setChecked(st.overlayEnabled());
+            syncFromPads();
+            refreshDevices();
+            refreshStatus();
+        });
+        connect(closeBtn, &QPushButton::clicked, m_playerDlg, &QDialog::close);
+        connect(save, &QPushButton::clicked, this, [] { SettingsManager::instance().save(); });
+        row->addWidget(reset);
+        row->addWidget(closeBtn);
+        row->addStretch(1);
+        row->addWidget(save);
+        dlgRoot->addLayout(row);
+    }
+    dlgRoot->addStretch(1);
+
+    // STATUS summary + the dialog trigger; the live test stays on the tab.
+    {
+        auto *stLabel = new QLabel(QStringLiteral("STATUS"));
+        stLabel->setObjectName(QStringLiteral("sectionLabel"));
+        root->addWidget(stLabel);
+        auto *row = new QHBoxLayout;
+        m_dot = new QLabel(QStringLiteral("*"));
+        m_dot->setFixedWidth(12);
+        m_status = new QLabel;
+        m_status->setObjectName(QStringLiteral("valueLabel"));
+        row->addWidget(m_dot);
+        row->addWidget(m_status, 1);
+        root->addLayout(row);
+        auto *btns = new QHBoxLayout;
+        auto *edit = new QPushButton(QStringLiteral("Player & Device..."));
+        edit->setMinimumWidth(200);
+        connect(edit, &QPushButton::clicked, m_playerDlg, &QDialog::show);
+        btns->addWidget(edit);
+        btns->addStretch(1);
+        root->addLayout(btns);
+    }
 
     // GAMEPAD TEST
     auto *testLabel = new QLabel(QStringLiteral("GAMEPAD TEST"));
@@ -366,8 +427,29 @@ void ControllersTab::openDevice()
     }
 }
 
+void ControllersTab::refreshStatus()
+{
+    if (!m_status || !m_dot) return;
+    const bool haveDev = m_device && m_device->count() > 0 && m_device->currentIndex() > 0;
+    const QString dev = haveDev ? m_device->currentText()
+                                : QStringLiteral("Auto (first gamepad, else the keyboard)");
+    const int dz = m_deadzone ? m_deadzone->value() : 0;
+    const QString txt = QStringLiteral("P%1  |  %2  |  deadzone %3  |  overlay %4")
+                            .arg((m_player ? m_player->currentIndex() : 0) + 1)
+                            .arg(dev)
+                            .arg(QStringLiteral("%1%").arg(dz))
+                            .arg(m_overlayEnabled && m_overlayEnabled->isChecked() ? QStringLiteral("on")
+                                                                                   : QStringLiteral("off"));
+    if (txt == m_statusText) return;
+    m_statusText = txt;
+    m_status->setText(txt);
+    m_dot->setStyleSheet(QStringLiteral("color:%1;font-weight:bold;")
+                             .arg(haveDev ? QStringLiteral("#3fba4f") : QStringLiteral("#d1991f")));
+}
+
 void ControllersTab::pollGamepad()
 {
+    refreshStatus();   // [padui] cheap: only rebuilds the label text when it actually changes
     if (!m_reader.isOpen())
     {
         // No device selected/available: reset indicators once and bail.

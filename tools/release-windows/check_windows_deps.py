@@ -2,7 +2,7 @@
 """PE dependency + layout gate for the Windows release stage.
 
 Analyses every PE under <stage_dir> with pefile and verifies the "portable tree"
-contract the Launcher.bat wrapper enforces (PATH <stage>/lib):
+contract the flat layout enforces (qt.conf + DLLs next to the executables):
 
   * every import of every bundled binary resolves either inside the stage's own
     lib/ (Qt6, FFmpeg, VC++ runtime) or to a Windows OS / driver component that
@@ -114,26 +114,27 @@ SUBSYSTEM_WINDOWS_GUI = 2  # IMAGE_SUBSYSTEM_WINDOWS_GUI
 REQUIRED_LAYOUT = [
     "Launcher.exe",
     "bt3-runner.exe",
+    "qt.conf",
     "LICENSE",
     "COPYING.LGPLv3",
     "savedata/settings.toml",
     "savedata/fps60_sites.txt",
-    "lib/Qt6Core.dll",
-    "lib/Qt6Gui.dll",
-    "lib/Qt6Widgets.dll",
-    "lib/Qt6Network.dll",
-    "lib/qt6/plugins/platforms/qwindows.dll",
-    "lib/vcruntime140.dll",
-    "lib/vcruntime140_1.dll",
-    "lib/msvcp140.dll",
+    "assets/lib/Qt6Core.dll",
+    "assets/lib/Qt6Gui.dll",
+    "assets/lib/Qt6Widgets.dll",
+    "assets/lib/Qt6Network.dll",
+    "assets/lib/qt6/plugins/platforms/qwindows.dll",
+    "assets/lib/vcruntime140.dll",
+    "assets/lib/vcruntime140_1.dll",
+    "assets/lib/msvcp140.dll",
 ]
 
 REQUIRED_GLOB = [
-    ("lib/avcodec-*.dll", "FFmpeg avcodec"),
-    ("lib/avformat-*.dll", "FFmpeg avformat"),
-    ("lib/avutil-*.dll", "FFmpeg avutil"),
-    ("lib/swresample-*.dll", "FFmpeg swresample"),
-    ("lib/swscale-*.dll", "FFmpeg swscale"),
+    ("assets/lib/avcodec-*.dll", "FFmpeg avcodec"),
+    ("assets/lib/avformat-*.dll", "FFmpeg avformat"),
+    ("assets/lib/avutil-*.dll", "FFmpeg avutil"),
+    ("assets/lib/swresample-*.dll", "FFmpeg swresample"),
+    ("assets/lib/swscale-*.dll", "FFmpeg swscale"),
 ]
 
 

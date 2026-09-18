@@ -12,7 +12,7 @@
 # Layout assumptions on stage/ (produced by tools/release/entrypoint.sh):
 #   Launcher            Qt launcher
 #   bt3-runner      the game runner
-#   lib/                bundled shared libs (incl. lib/qt6/plugins)
+#   assets/lib/         bundled shared libs (incl. assets/lib/qt6/plugins)
 #   assets/             sky theme + fonts
 #   savedata/BASLUS-21678DBZT3/   placeholder created by the wizard later
 #   savedata/fps60_sites.txt     60 fps pacing rules
@@ -28,7 +28,7 @@ OUT_DIR="$RELEASE/out"
 TREE_NAME="Dragon Ball Budokai Tenkaichi 3 Recompiled"
 
 [[ -d "$STAGE" ]] || { echo "ERROR: $STAGE missing (run tools/release/build.sh first)"; exit 2; }
-[[ -x "$STAGE/Launcher" && -x "$STAGE/bt3-runner" && -d "$STAGE/lib" ]] || {
+[[ -x "$STAGE/Launcher" && -x "$STAGE/bt3-runner" && -d "$STAGE/assets/lib" ]] || {
     echo "ERROR: stage incomplete"; exit 2; }
 
 # ---- portable tree ---------------------------------------------------------
@@ -36,7 +36,7 @@ TARBALL="$OUT_DIR/BT3-Recomp-x86_64.tar.gz"
 TMP_TREE="$OUT_DIR/$TREE_NAME"
 rm -rf "$TMP_TREE"; mkdir -p "$TMP_TREE"
 cp -a "$STAGE"/Launcher "$STAGE"/bt3-runner "$TMP_TREE"/
-cp -a "$STAGE"/lib "$STAGE"/assets "$TMP_TREE"/
+cp -a "$STAGE"/assets "$TMP_TREE"/
 # Licences must travel with the binaries (GPL-3.0 + LGPL-3.0 for paraLLEl-GS).
 cp -a "$STAGE"/LICENSE "$STAGE"/COPYING.LGPLv3 "$TMP_TREE"/
 mkdir -p "$TMP_TREE/savedata/BASLUS-21678DBZT3"
