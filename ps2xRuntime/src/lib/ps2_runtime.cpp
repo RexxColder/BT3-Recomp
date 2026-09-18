@@ -18,6 +18,7 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #endif
 #include "ps2_host_window.h"   // [B] native window handle (SDL returns SDL_Window*, not the HWND)
 #include "runtime/ps2_texreplace.h"   // [texreplace]
+#include "runtime/ps2_video_status.h"   // [video] the Video-tab status the overlay polls
 #include "runtime/ps2_fmv_override.h"  // [fmvoverride]
 #include <filesystem>
 #include "runtime/ps2_memory.h"
@@ -50,8 +51,8 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 extern "C" const char *ps2xExeDirC();   // [mergefix] main.cpp: <exeDir>
 namespace
 {
-    ps2x::gfx::D3D11Device g_ps2xD3D11;
-    bool g_ps2xD3D11Mode = false;   // PS2X_D3D11=1 and the device came up
+ps2x::gfx::D3D11Device g_ps2xD3D11;
+bool g_ps2xD3D11Mode = false;   // PS2X_D3D11=1 and the device came up
 
     // [d3d11] Present bridge: the GS still renders through GL, so the D3D11 present reads the
     // presented texture back to CPU and blits it. Replaced by the native GS port (P3.3).
@@ -1530,6 +1531,7 @@ bool PS2Runtime::initialize(const char *title)
             }
         }
 #endif
+        (void)ps2x::GetVideoStatus();   // [vstatus] one-shot: what the Video tab will report
         bt3SetTargetFPS(60);
         {   // [texreplace] Index replacements at STARTUP rather than lazily on the first texture
             // decode, so the overlay's Texture Replacement switch is correctly enabled/disabled
@@ -7566,4 +7568,82 @@ void PS2Runtime::run()
         std::cerr << "[run] warning: " << remainingThreads
                   << " guest worker thread(s) still active during shutdown." << std::endl;
     }
+}
+
+namespace ps2x   // [video] at global scope: the overlay calls ps2x::GetVideoStatus()
+{
+    // [video] Live Video-tab status (see runtime/ps2_video_status.h): derived from what is running NOW
+    // plus the requests the UI exported as PS2X_* envs, so the overlay can poll it every frame.
+    namespace
+    {
+        int envInt(const char *n, int def)
+        {
+            const char *v = std::getenv(n);
+            return (v && v[0]) ? std::atoi(v) : def;
+        }
+        bool envOn(const char *n)
+        {
+            const char *v = std::getenv(n);
+            return v && v[0] && v[0] != '0';
+        }
+    }
+
+    VideoStatus GetVideoStatus()
+    {
+        VideoStatus s;
+        const bool wantPgs = envOn("PS2X_PGS"), wantGl = envOn("PS2X_ALTGL"), wantD3D = envOn("PS2X_D3D11");
+        s.rendererConfigured = wantD3D ? "Direct3D 11" : wantPgs ? "paraLLEl-GS" : wantGl ? "OpenGL (New)" : "Software";
+        if (g_ps2xD3D11Mode)                                    s.rendererName = "Direct3D 11";
+        else if (ps2x_pgs::enabled())                           s.rendererName = "paraLLEl-GS";
+        else if (AltGlEnabled() && ps2x::gfx::gl::ContextReady()) s.rendererName = "OpenGL (New)";
+        else                                                     s.rendererName = "Software";
+        s.renderer = (bt3GetScreenWidth() <= 0) ? VideoState::Fail
+                   : (std::strcmp(s.rendererName, s.rendererConfigured) == 0) ? VideoState::Ok
+                                                                              : VideoState::Fallback;
+
+        s.monitorCount = bt3GetMonitorCount();
+        s.monitorRequested = envInt("PS2X_MONITOR", 0);
+        s.monitorIndex = bt3GetCurrentMonitor();
+        if (s.monitorIndex < 0) s.monitorIndex = 0;
+        const char *mn = bt3GetMonitorName(s.monitorIndex);
+        s.monitorName = mn ? mn : "?";
+        s.monitorWidth = bt3GetMonitorWidth(s.monitorIndex);
+        s.monitorHeight = bt3GetMonitorHeight(s.monitorIndex);
+        s.monitorRefresh = bt3GetMonitorRefreshRate(s.monitorIndex);
+        s.monitor = (s.monitorCount <= 0 || s.monitorWidth <= 0) ? VideoState::Fail
+                  : (s.monitorRequested != s.monitorIndex)       ? VideoState::Fallback
+                                                                 : VideoState::Ok;
+
+        s.winW = bt3GetScreenWidth(); s.winH = bt3GetScreenHeight();
+        s.resRequestedW = envInt("PS2X_WINDOW_W", s.winW);
+        s.resRequestedH = envInt("PS2X_WINDOW_H", s.winH);
+        s.resolution = (s.winW <= 0 || s.winH <= 0) ? VideoState::Fail
+                     : (s.resRequestedW != s.winW || s.resRequestedH != s.winH) ? VideoState::Fallback
+                                                                               : VideoState::Ok;
+
+        s.scaleActive = GsGpuRenderer::renderScale();
+        s.scaleRequested = envInt("PS2X_RENDER_SCALE", s.scaleActive);
+        const bool liveScale = ps2x_pgs::enabled();   // PGS rebuilds the backend live; OpenGL wants a restart
+        s.scaleNeedsRestart = (s.scaleRequested != s.scaleActive) && !liveScale;
+        s.upscale = (s.scaleActive <= 0) ? VideoState::Fail
+                  : (s.scaleRequested != s.scaleActive) ? VideoState::Fallback
+                                                        : VideoState::Ok;
+
+        {   // [vstatus] one-shot: the whole picture, handy when a report says "the dot is yellow"
+            static bool once = false;
+            if (!once)
+            {
+                once = true;
+                std::fprintf(stderr,
+                             "[vstatus] renderer=%s (configured %s, state %d) monitor=%d/%d \"%s\" %dx%d@%d state %d "
+                             "res=%dx%d (asked %dx%d, state %d) scale=%d (asked %d, state %d, restart=%d)\n",
+                             s.rendererName, s.rendererConfigured, (int)s.renderer,
+                             s.monitorIndex, s.monitorCount, s.monitorName, s.monitorWidth, s.monitorHeight,
+                             s.monitorRefresh, (int)s.monitor, s.winW, s.winH, s.resRequestedW, s.resRequestedH,
+                             (int)s.resolution, s.scaleActive, s.scaleRequested, (int)s.upscale, (int)s.scaleNeedsRestart);
+            }
+        }
+        return s;
+    }
+
 }

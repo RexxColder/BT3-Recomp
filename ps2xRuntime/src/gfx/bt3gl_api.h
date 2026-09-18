@@ -196,3 +196,7 @@ using bt3AudioStream = AudioStream;
 #define BT3_SHADER_UNIFORM_IVEC4 SHADER_UNIFORM_IVEC4
 #define BT3_SHADER_UNIFORM_VEC2 SHADER_UNIFORM_VEC2
 #define BT3_SHADER_UNIFORM_VEC4 SHADER_UNIFORM_VEC4
+
+// [video] added for the Video-tab status: monitor name/refresh
+#define bt3GetMonitorName GetMonitorName
+#define bt3GetMonitorRefreshRate GetMonitorRefreshRate
