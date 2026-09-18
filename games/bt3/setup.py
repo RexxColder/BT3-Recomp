@@ -27,6 +27,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -44,7 +45,9 @@ DEFAULT_JOBS = "3"
 # Pinned tool versions (stage 2 installs exactly these; keep in sync with the release containers).
 CMAKE_MIN = (3, 21)
 QT_VERSION = "6.5.3"
-QT_KIT_WINDOWS = "win64_msvc2022_64"
+# Preferred Windows kit. 6.5.x only ships win64_msvc2019_64 (no msvc2022 kit), so that is the pin;
+# _pick_qt_kit() falls back to whatever aqt offers for the configured version.
+QT_KIT_WINDOWS = "win64_msvc2019_64"
 MESA_LAVAPIPE_VERSION = "26.2.0"
 DEPS_7ZR_URL = "https://www.7-zip.org/a/7zr.exe"
 
@@ -130,30 +133,130 @@ STAGES: list[tuple[str, str]] = [
 
 
 # ------------------------------------------------------------------------------------------------
-# Output helpers
+# Output: console gated by --log-level + a complete execution log (always, every line)
 # ------------------------------------------------------------------------------------------------
-def die(msg: str, code: int = 1) -> "None":
-    print(f"ERROR: {msg}", file=sys.stderr)
+LOG_LEVELS = {0: "silent", 1: "errors", 2: "errors+warnings", 3: "info", 4: "verbose"}
+
+
+class CommandError(RuntimeError):
+    def __init__(self, cmdline: str, code: int):
+        super().__init__(f"command failed (exit {code}): {cmdline}")
+        self.cmdline = cmdline
+        self.code = code
+
+
+class Logger:
+    """Console output filtered by level; the log file always receives everything.
+
+    Levels: 0 silent, 1 errors, 2 errors+warnings, 3 info/steps (default), 4 verbose (every command).
+    Subprocess output is classified per line, so at level 2 a long build still shows warnings/errors
+    on screen while the log file keeps the full transcript.
+    """
+
+    def __init__(self, path: Optional[Path], level: int):
+        self.level = level
+        self.path = path
+        self._fh = None
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(path, "a", encoding="utf-8", errors="replace")
+            self._fh.write(f"\n===== setup.py run {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                           f"=====\n")
+
+    def _write_file(self, text: str) -> None:
+        if self._fh:
+            self._fh.write(text if text.endswith("\n") else text + "\n")
+            self._fh.flush()
+
+    def _emit(self, text: str, kind: int, stream=None) -> None:
+        self._write_file(text)
+        if self.level >= kind:
+            stream = stream or sys.stdout
+            stream.write(text if text.endswith("\n") else text + "\n")
+            stream.flush()
+
+    # kinds: 0 always, 1 error, 2 warning, 3 info, 4 verbose
+    def banner(self, msg: str) -> None: self._emit(msg, 0)
+    def error(self, msg: str) -> None: self._emit(f"ERROR: {msg}", 1, sys.stderr)
+    def warn(self, msg: str) -> None: self._emit(f"WARNING: {msg}", 2, sys.stderr)
+    def info(self, msg: str = "") -> None: self._emit(msg, 3)
+    def step(self, msg: str) -> None: self._emit(f"\n== {msg}", 3)
+    def verbose(self, msg: str) -> None: self._emit(msg, 4)
+
+    def raw(self, text: str) -> None:
+        """Straight to the log, never to the console (quiet subprocesses)."""
+        self._write_file(text)
+
+    @staticmethod
+    def classify(line: str) -> int:
+        low = line.lower()
+        if any(k in low for k in ("error", "failed", "undefined symbol", "fatal", "cannot open")):
+            return 1
+        if "warning" in low:
+            return 2
+        return 3
+
+    def process_line(self, line: str) -> None:
+        self._emit(line.rstrip("\n"), self.classify(line))
+
+    def close(self) -> None:
+        if self._fh:
+            self._fh.flush()
+            self._fh.close()
+            self._fh = None
+
+
+LOG = Logger(None, 3)
+
+
+def die(msg: str, code: int = 1, stage: str = "") -> "None":
+    where = f" at stage {stage}" if stage else ""
+    LOG.error(f"{msg}{where}")
+    if LOG.path:
+        print(f"FAILED{where}. Full log: {LOG.path}", file=sys.stderr)
+    LOG.close()
     sys.exit(code)
 
 
 def warn(msg: str) -> None:
-    print(f"WARNING: {msg}", file=sys.stderr)
+    LOG.warn(msg)
 
 
 def step(msg: str) -> None:
-    print(f"\n== {msg}")
+    LOG.step(msg)
 
 
-def run(cmd, **kw) -> None:
-    print("+ " + " ".join(str(c) for c in cmd))
-    subprocess.run([str(c) for c in cmd], check=True, **kw)
+def run(cmd, quiet: bool = False, **kw) -> None:
+    """Run a command with live, tee'd output (classified per line into the log).
+
+    Raises CommandError on failure so callers can add context; the top level turns it into a clean
+    FAILED message plus the log path instead of a traceback.
+    """
+    cmdline = " ".join(str(c) for c in cmd)
+    LOG.verbose("+ " + cmdline)
+    popen_kw = dict(kw)
+    popen_kw.pop("check", None)
+    popen_kw.pop("stdout", None)
+    popen_kw.pop("stderr", None)
+    p = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, errors="replace", bufsize=1, **popen_kw)
+    assert p.stdout is not None
+    for line in p.stdout:
+        if quiet:
+            LOG.raw(line)
+        else:
+            LOG.process_line(line)
+    p.wait()
+    if p.returncode != 0:
+        raise CommandError(cmdline, p.returncode)
 
 
 def run_capture(cmd) -> str:
+    LOG.verbose("+ " + " ".join(str(c) for c in cmd) + "  (captured)")
     try:
-        r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
-        return (r.stdout or "") + (r.stderr or "")
+        r = subprocess.run([str(c) for c in cmd], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True, errors="replace")
+        return r.stdout or ""
     except OSError:
         return ""
 
@@ -234,7 +337,7 @@ def sync_tree(src: Path, dst: Path, exclude=()) -> None:
            sha256_of(s) != sha256_of(d):
             shutil.copyfile(s, d)
             copied += 1
-    print(f"synced {src} -> {dst} ({copied} updated, {len(src_names)} total)")
+    LOG.info(f"synced {src} -> {dst} ({copied} updated, {len(src_names)} total)")
 
 
 def copytree_overlay(src: Path, dst: Path) -> None:
@@ -450,6 +553,11 @@ class PlatformInfo:
                 extra += ["-G", "Ninja"]
         if not self.is_windows:
             return extra
+        # GUI subsystem for the shipped runner: without this the fresh configure produces a console
+        # binary and the PE gate rejects it (a console window pops up next to the game). The old
+        # build-windows.ps1 pre-configured this; PS2X_SETUP_CONSOLE=1 keeps the console for debugging.
+        extra.append("-DPS2X_SHOW_WINDOWS_CONSOLE="
+                     + ("ON" if os.environ.get("PS2X_SETUP_CONSOLE") == "1" else "OFF"))
         return extra + self.windows_generator_flags(build_dir)
 
 
@@ -495,26 +603,26 @@ def print_platform_report(info: PlatformInfo) -> None:
     pretty = _distro_pretty() if info.os == "linux" else ""
     if pretty and f'"{pretty}"' != f'"{info.distro}"':
         distro += f' ({pretty})'
-    print(f"Platform : {info.os} ({info.arch}){distro}")
-    print(f"Package  : {info.pkg_mgr or 'not detected'}"
+    LOG.info(f"Platform : {info.os} ({info.arch}){distro}")
+    LOG.info(f"Package  : {info.pkg_mgr or 'not detected'}"
           + ("  [container/non-interactive]" if info.in_container else ""))
-    print(f"Build dir: {BUILD}")
-    print(f"Work dir : {WORK}")
-    print("Tools:")
+    LOG.info(f"Build dir: {BUILD}")
+    LOG.info(f"Work dir : {WORK}")
+    LOG.info("Tools:")
     for name in ("cmake", "cmake_ok", "ninja", "git", "clang", "clang-cl", "bsdtar", "7z",
                  "pkg-config", "ccache", "mold", "vswhere", "msvc", "vcvars", "qt"):
         if name not in info.tools:
             continue
         value = info.tools[name]
         mark = "OK " if value else "-- "
-        print(f"  {mark}{name:<11} {value or 'missing'}")
+        LOG.info(f"  {mark}{name:<11} {value or 'missing'}")
 
 
 def stage_detect(ctx: "Context") -> None:
     step("stage 1: platform detection")
     print_platform_report(ctx.platform)
     if ctx.args.report == "json":
-        print(json.dumps({
+        LOG.info(json.dumps({
             "os": ctx.platform.os, "arch": ctx.platform.arch, "distro": ctx.platform.distro,
             "pkg_mgr": ctx.platform.pkg_mgr, "in_container": ctx.platform.in_container,
             "tools": {k: (str(v) if v is not None else None) for k, v in ctx.platform.tools.items()},
@@ -565,9 +673,27 @@ def _inst_pip(ctx: "Context", module: str) -> None:
     run([sys.executable, "-m", "pip", "install", "--upgrade", module])
 
 
+def _pick_qt_kit() -> str:
+    """The Windows Qt kit aqt actually offers for QT_VERSION. 6.5.x has no msvc2022_64, and a hard pin
+    made the install fail with 'packages [qt_base] were not found'."""
+    archs = run_capture([sys.executable, "-m", "aqt", "list-qt", "windows", "desktop",
+                         "--arch", QT_VERSION]).split()
+    if QT_KIT_WINDOWS in archs:
+        return QT_KIT_WINDOWS
+    for pref in ("win64_msvc2022_64", "win64_msvc2019_64"):
+        if pref in archs:
+            return pref
+    for a in archs:
+        if a.startswith("win64_msvc") and a.endswith("_64"):
+            return a
+    return QT_KIT_WINDOWS
+
+
 def _inst_aqt(ctx: "Context") -> None:
+    kit = _pick_qt_kit()
+    LOG.info(f"  aqt kit: {kit}")
     run([sys.executable, "-m", "aqt", "install-qt", "windows", "desktop",
-         QT_VERSION, QT_KIT_WINDOWS, "--outputdir", str(ROOT / "build" / "qt")])
+         QT_VERSION, kit, "--outputdir", str(ROOT / "build" / "qt")])
 
 
 def _inst_mesa(ctx: "Context") -> None:
@@ -652,10 +778,12 @@ def deps_for(info: PlatformInfo) -> list[Dep]:
                 lambda i: bool(run_capture([sys.executable, "-m", "pip", "show", "pefile"])),
                 "python -m pip install pefile",
                 lambda ctx: _inst_pip(ctx, "pefile")),
-            Dep(f"Qt {QT_VERSION} ({QT_KIT_WINDOWS})", lambda i: bool(i.qt_prefix),
+            Dep(f"Qt {QT_VERSION} ({QT_KIT_WINDOWS})",
+                lambda i: bool(i.qt_prefix) or _qt_prefix() is not None,
                 f"aqt install-qt windows desktop {QT_VERSION} {QT_KIT_WINDOWS} --outputdir build/qt",
                 _inst_aqt),
-            Dep("Mesa lavapipe (Vulkan fallback)", lambda i: bool(i.lavapipe_dir),
+            Dep("Mesa lavapipe (Vulkan fallback)",
+                lambda i: bool(i.lavapipe_dir) or _mesa_dir_present(ROOT / "build" / "mesa" / "x64"),
                 f"download mesa-dist-win {MESA_LAVAPIPE_VERSION} and extract to build/mesa",
                 _inst_mesa),
         ]
@@ -706,15 +834,15 @@ def stage_deps(ctx: "Context") -> None:
     deps = deps_for(ctx.platform)
     missing = [d for d in deps if not d.check(ctx.platform)]
     for d in deps:
-        print(f"  {'OK ' if d not in missing else '-- '}{d.name}")
+        LOG.info(f"  {'OK ' if d not in missing else '-- '}{d.name}")
     if not missing:
-        print("All dependencies present.")
+        LOG.info("All dependencies present.")
         return
-    print(f"\n{len(missing)} dependency(ies) missing:")
+    LOG.info(f"\n{len(missing)} dependency(ies) missing:")
     for d in missing:
-        print(f"  - {d.name}\n      install: {d.hint}")
+        LOG.info(f"  - {d.name}\n      install: {d.hint}")
     if ctx.args.dry_run or ctx.args.no_deps:
-        print("(not installing: --dry-run/--no-deps)")
+        LOG.info("(not installing: --dry-run/--no-deps)")
         return
     # Non-interactive means "never guess": without -y/--install-deps, stop and print the exact commands
     # instead of silently mutating the machine (a container/WSL run once apt-installed Qt on its own).
@@ -746,7 +874,7 @@ def stage_deps(ctx: "Context") -> None:
                 warn(f"{d.name} is still not visible in this shell; open a new one if the build cannot find it."
                      f"\n  expected: {d.hint}")
         else:
-            print(f"  installed: {d.name}")
+            LOG.info(f"  installed: {d.name}")
 
 
 # ------------------------------------------------------------------------------------------------
@@ -819,7 +947,7 @@ def ensure_msvc_env(ctx: "Context") -> None:
         for b in bin_dirs:
             if (b / "clang-cl.exe").exists():
                 os.environ["PATH"] = str(b) + os.pathsep + os.environ.get("PATH", "")
-                print(f"  clang-cl: added {b} to PATH")
+                LOG.info(f"  clang-cl: added {b} to PATH")
                 break
         else:
             warn("clang-cl not found; the configure will fall back to MSBuild + -T ClangCL "
@@ -842,6 +970,13 @@ def configured(build_dir: Path, info: PlatformInfo) -> bool:
         if not any(line.startswith("PS2X_DISABLE_PGS:") and line.endswith("=" + desired_pgs)
                    for line in cache_text.splitlines()):
             return False
+    if info.is_windows:
+        # The shipped runner must be a GUI binary; a cache configured with the console on (or before
+        # this flag existed) has to be reconfigured or the PE gate rejects subsystem 3.
+        desired_console = "ON" if os.environ.get("PS2X_SETUP_CONSOLE") == "1" else "OFF"
+        if not any(line.startswith("PS2X_SHOW_WINDOWS_CONSOLE:") and line.endswith("=" + desired_console)
+                   for line in cache_text.splitlines()):
+            return False
     if any((build_dir / f).exists() for f in ("build.ninja", "Makefile", "ALL_BUILD.vcxproj")):
         return True
     return any(build_dir.glob("*.sln"))
@@ -861,7 +996,7 @@ def cmake_build(info: PlatformInfo, build_dir: Path, target: str, jobs: str) -> 
 def extract_inputs(ctx: "Context") -> None:
     """Step 1: obtain the two files source generation needs (the boot ELF and DBZP.BIN)."""
     if ctx.args.skip_setup:
-        print("--skip-setup: reusing existing games/bt3/work/ and generated sources")
+        LOG.info("--skip-setup: reusing existing games/bt3/work/ and generated sources")
         return
     WORK.mkdir(parents=True, exist_ok=True)
     src = ctx.src
@@ -887,8 +1022,8 @@ def extract_inputs(ctx: "Context") -> None:
             make_writable(WORK)
         shutil.copyfile(src, ctx.elf)
         make_writable(WORK)
-        print("NOTE: you passed a bare ELF. The build also needs the ISO's")
-        print(f"      BIN/DBZP.BIN next to it in {WORK}.")
+        LOG.info("NOTE: you passed a bare ELF. The build also needs the ISO's")
+        LOG.info(f"      BIN/DBZP.BIN next to it in {WORK}.")
 
 
 def verify_elf(ctx: "Context") -> None:
@@ -997,7 +1132,7 @@ def stage_build(ctx: "Context") -> None:
         recomp = build_recompiler(ctx)
         generate_runner(ctx, recomp)
     if ctx.args.gen_only:
-        print("--gen-only: runner + overlay sources generated (skipping runner build)")
+        LOG.info("--gen-only: runner + overlay sources generated (skipping runner build)")
         ctx.runner = None
         return
     ctx.runner = build_runner(ctx, ctx.jobs)
@@ -1021,7 +1156,7 @@ def deploy_tree(runner: Path, out: Path) -> None:
     cfg_dst = save_dst / "settings.toml"
     if cfg_src.exists() and not cfg_dst.exists():
         shutil.copy2(cfg_src, cfg_dst)
-        print(f"  copied default settings -> {cfg_dst}")
+        LOG.info(f"  copied default settings -> {cfg_dst}")
     for a in ("assets",):
         src = runner.parent / a
         if src.exists():
@@ -1031,8 +1166,8 @@ def deploy_tree(runner: Path, out: Path) -> None:
             shutil.copy2(p, out / p.name)
     shutil.copy2(runner, out / runner.name)
     shutil.copymode(runner, out / runner.name)
-    print(f"  runner -> {out / runner.name}")
-    print(f"Deploy tree ready: {out}")
+    LOG.info(f"  runner -> {out / runner.name}")
+    LOG.info(f"Deploy tree ready: {out}")
 
 
 def _release_out(ctx: "Context") -> Path:
@@ -1342,8 +1477,8 @@ def package_artifact(ctx: "Context", out_root: Path, stage: Path) -> None:
             base = base[: -len(suffix)]
             break
     (out_root / (base + ".sha256")).write_text(f"{digest}  {archive.name}\n")
-    print(f"  {archive}  ({archive.stat().st_size / (1 << 20):.1f} MB)")
-    print(f"  sha256: {digest}")
+    LOG.info(f"  {archive}  ({archive.stat().st_size / (1 << 20):.1f} MB)")
+    LOG.info(f"  sha256: {digest}")
 
     if not ctx.args.no_desktop_copy:
         desktop = Path.home() / "Desktop"
@@ -1377,7 +1512,7 @@ def stage_package(ctx: "Context") -> None:
             die("macOS bundler not found (tools/macos/deploy.py)")
         app = out_root / "BT3-Recomp.app"
         run([sys.executable, str(bundler), "--skip-build", "--output", str(app), "--jobs", ctx.jobs])
-        print(f"App bundle ready: {app}")
+        LOG.info(f"App bundle ready: {app}")
         return
 
     launcher = build_launcher(ctx)
@@ -1404,6 +1539,7 @@ class Context:
     elf: Path = field(default_factory=lambda: WORK / "SLUS_216.78")
     runner: Optional[Path] = None
     run_mode: int = 1   # highest stage number requested
+    stage_name: str = ""   # for FAILED messages ("3 build" ...)
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -1441,6 +1577,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="skip ISO/recompile/patches; only rebuild the runner (+deploy)")
     ap.add_argument("--gen-only", action="store_true",
                     help="stop after recompile/generation/patches; do not build the runner")
+    ap.add_argument("--log", metavar="PATH",
+                    help="full execution log (default build/setup-<timestamp>.log)")
+    ap.add_argument("--no-log", dest="no_log", action="store_true", help="no log file")
+    ap.add_argument("--log-level", dest="log_level", type=int, default=3, choices=(0, 1, 2, 3, 4),
+                    help="0 silent, 1 errors, 2 errors+warnings, 3 info (default), 4 verbose")
+    ap.add_argument("-q", "--quiet", action="store_true", help="console: errors only (= --log-level 1)")
+    ap.add_argument("-v", "--verbose", action="store_true", help="console: every command (= level 4)")
     args = ap.parse_args(argv)
     if args.skip_setup and args.gen_only:
         die("--skip-setup and --gen-only are mutually exclusive")
@@ -1455,11 +1598,12 @@ def wanted_stages(args: argparse.Namespace) -> set:
     if args.stage:
         return {"1", args.stage}
     if args.stages:
+        spec = args.stages
+        a_str, b_str = spec.split("-", 1) if "-" in spec else (spec, spec)
         try:
-            a, b = args.stages.split("-", 1)
-            a, b = int(a), int(b)
+            a, b = int(a_str), int(b_str)
         except ValueError:
-            die(f"bad --stages value: {args.stages} (use A-B)")
+            die(f"bad --stages value: {spec} (use N or A-B)")
         if a > b:
             a, b = b, a
         return {str(n) for n in range(max(1, a), min(4, b) + 1)} | {"1"}
@@ -1488,11 +1632,21 @@ def resolve_source(ctx: "Context") -> None:
 
 
 def main(argv=None) -> None:
+    global LOG
     args = parse_args(argv)
     if args.list_stages:
         for num, desc in STAGES:
             print(f"  --stage {num}   {desc}")
         return
+
+    level = 4 if args.verbose else (1 if args.quiet else args.log_level)
+    log_path = None
+    if not args.no_log:
+        log_path = Path(args.log).expanduser() if args.log else \
+            BUILD / f"setup-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    LOG = Logger(log_path, level)
+    LOG.banner(f"[setup] console={LOG_LEVELS.get(level, level)}"
+               + (f" | log: {LOG.path}" if LOG.path else " | no log file"))
 
     info = detect_platform()
     interactive = info.interactive and not args.non_interactive
@@ -1505,34 +1659,46 @@ def main(argv=None) -> None:
     stages = wanted_stages(args)
     ctx.run_mode = max(int(s) for s in stages)
 
-    stage_detect(ctx)
-    if "2" in stages:
-        stage_deps(ctx)
+    try:
+        ctx.stage_name = "1 detect"
+        stage_detect(ctx)
 
-    if args.dry_run:
-        if "3" in stages:
-            print("\ndry-run: would build (stage 3) and deploy"
-                  + (" and package" if args.package else "") + ".")
-        return
+        if "2" in stages:
+            ctx.stage_name = "2 deps"
+            stage_deps(ctx)
 
-    if "3" in stages and not args.deps_only:
-        resolve_source(ctx)
-        if ctx.src is not None and ctx.src.suffix.lower() != ".iso" and not args.skip_setup:
-            # bare ELF: keep the historical behaviour of copying it into WORK
-            pass
-        stage_build(ctx)
+        if args.dry_run:
+            if "3" in stages:
+                LOG.info("\ndry-run: would build (stage 3) and deploy"
+                         + (" and package" if args.package else "") + ".")
+            LOG.banner("[setup] dry-run ok" + (f" | log: {LOG.path}" if LOG.path else ""))
+            LOG.close()
+            return
 
-    if "4" in stages and not args.deps_only:
-        if ctx.runner is None and args.deploy:
-            # --stage 4 (or --skip-setup) with an existing build: locate the runner.
-            ctx.runner = find_binary("ps2EntryRunner")
-        stage_package(ctx)
+        if "3" in stages and not args.deps_only:
+            ctx.stage_name = "3 build"
+            resolve_source(ctx)
+            stage_build(ctx)
 
-    if ctx.runner is not None and not args.deploy and not args.package:
-        env_line = ("set PS2X_CD_IMAGE=<path to your BT3 ISO>& " if info.is_windows else
-                    'env PS2X_CD_IMAGE="<path to your BT3 ISO>" ')
-        step("done")
-        print(f"Run with:\n\n  cd {ctx.runner.parent}\n  {env_line}\\\n      {ctx.runner} {ctx.elf}\n")
+        if "4" in stages and not args.deps_only:
+            ctx.stage_name = "4 package"
+            if ctx.runner is None and (args.deploy or args.package):
+                # --stage 4 (or --skip-setup) with an existing build: locate the runner.
+                ctx.runner = find_binary("ps2EntryRunner")
+            stage_package(ctx)
+
+        if ctx.runner is not None and not args.deploy and not args.package:
+            env_line = ("set PS2X_CD_IMAGE=<path to your BT3 ISO>& " if info.is_windows else
+                        'env PS2X_CD_IMAGE="<path to your BT3 ISO>" ')
+            step("done")
+            LOG.info(f"Run with:\n\n  cd {ctx.runner.parent}\n  {env_line}\\\n      {ctx.runner} {ctx.elf}\n")
+    except CommandError as e:
+        die(str(e), 2, stage=ctx.stage_name)
+    except KeyboardInterrupt:
+        die("interrupted by the user", 130, stage=ctx.stage_name)
+
+    LOG.banner("[setup] done" + (f" | log: {LOG.path}" if LOG.path else ""))
+    LOG.close()
 
 
 if __name__ == "__main__":

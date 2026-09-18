@@ -181,6 +181,10 @@ python3 games/bt3/setup.py <iso|elf> [--stage N] [--jobs N] [-y] [--deploy OUT] 
 | `--skip-launcher`, `--no-gate`, `--no-desktop-copy` | developer escapes |
 | `--skip-setup` | reuse `games/bt3/work/` + generated sources; rebuild the runner only |
 | `--gen-only` | stop after generation/patches (used by the release containers) |
+| `--log PATH`, `--no-log` | full execution log (default `build/setup-<timestamp>.log`); it always keeps every line and the failing command |
+| `--log-level N`, `-q`, `-v` | console detail: 0 silent, 1 errors, 2 errors+warnings, 3 info (default), 4 verbose. Subprocess output is classified per line, so `--log-level 2` still shows build warnings/errors on screen while the log gets everything |
+
+Failures print `FAILED at stage N ... Full log: <path>` instead of a Python traceback.
 
 ### Linux distributions (stage 2)
 

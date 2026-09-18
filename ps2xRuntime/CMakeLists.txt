@@ -119,6 +119,11 @@ else()
 
     set(PS2X_IMGUI_SOURCE_DIR "${imgui_SOURCE_DIR}")
 
+    # Declared BEFORE its first use below: with the option only defined further down (next to the SDL2
+    # fetch) the variable was empty on a FRESH configure, so imgui_impl_sdl2.cpp was silently left out
+    # and the link failed with undefined ImGui_ImplSDL2_* symbols. Cached builds hid it.
+    option(PS2X_HOST_SDL2 "Use SDL2 for gamepad input and audio output" ON)
+
     add_library(imgui STATIC
         "${PS2X_IMGUI_SOURCE_DIR}/imgui.cpp"
         "${PS2X_IMGUI_SOURCE_DIR}/imgui_draw.cpp"
@@ -155,7 +160,7 @@ else()
     # [hostio] SDL2 for gamepads and audio output (the window and keyboard stay raylib's). Built
     # static from source so every platform gets the same version; PS2X_HOSTPAD=raylib /
     # PS2X_HOSTAUDIO=raylib switch back at runtime, -DPS2X_HOST_SDL2=OFF leaves it out entirely.
-    option(PS2X_HOST_SDL2 "Use SDL2 for gamepad input and audio output" ON)
+    # (The option itself is declared earlier, before the imgui target uses it.)
     if(PS2X_HOST_SDL2)
         set(SDL_TEST OFF CACHE BOOL "" FORCE)
         set(SDL_TESTS OFF CACHE BOOL "" FORCE)
