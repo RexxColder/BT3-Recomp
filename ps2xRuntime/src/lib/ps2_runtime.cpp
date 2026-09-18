@@ -6936,11 +6936,12 @@ void PS2Runtime::run()
         // 4:3 proportions, drew it round). PS2X_SQPIX=1 restores the old square-pixel
         // letterbox (the rig's boot screen-matching references were captured that way).
         {
-            // [tv43] DEFAULT: square pixels (no horizontal stretch). The ~8% "TV pixel"
-            // stretch made the present wider than the buffer and cut the right/bottom edge of
-            // full-frame 2D art (the pause popup's frame) on the OpenGL present. PS2X_SQPIX=0
-            // re-enables the authentic TV-pixel stretch.
-            static const bool s_sqpix = [](){ const char *v = std::getenv("PS2X_SQPIX"); return !(v && v[0] == '0'); }();
+            // [tv43] DEFAULT: the authentic TV-pixel stretch (main's default, restored). The PR had
+            // flipped it to square pixels because the pause popup's frame lost its right/bottom
+            // edge on the OpenGL present; the letterbox below always fits the window
+            // (dst = src*k*ls <= W, src*ls <= H), so that cut is not this stretch -- keep the
+            // tuned default and chase the popup separately. PS2X_SQPIX=1 = square pixels.
+            static const bool s_sqpix = [](){ const char *v = std::getenv("PS2X_SQPIX"); return v && v[0] && v[0] != '0'; }();
             static const float s_pixk = [](){ const char *v = std::getenv("PS2X_PIXK"); const float f = v ? (float)std::atof(v) : 1.08f; return (f > 0.5f && f < 2.0f) ? f : 1.08f; }();
             if (!s_sqpix)
             {   // measured against a native-4:3 Wii longplay capture: authentic TV pixels are
