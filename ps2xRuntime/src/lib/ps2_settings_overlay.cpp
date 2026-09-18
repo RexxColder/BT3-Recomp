@@ -294,15 +294,19 @@ bool PS2SettingsOverlay::s_widescreen = false;
 // the video mode (1024x768 from the INI); on Wayland the compositor then stretches that 4:3 surface across the 16:9
 // panel while the game still sees a 4:3 screen -- neither the true-widescreen FOV patch nor the HUD squeeze engage
 // and the whole picture is stretched. Size the window to the monitor first; restore the saved size on the way out.
+// monitor = the CONFIGURED display (m_settings.monitor), not bt3GetCurrentMonitor(): the latter is wherever the
+// window happens to be, which made "make it fullscreen" move the game to the other monitor.
 // PS2X_FSNATIVE=0 restores the old toggle.
-static void ps2xSetFullscreen(bool on, int windowW, int windowH)
+static void ps2xSetFullscreen(bool on, int windowW, int windowH, int monitor)
 {
     static const bool s_native = [](){ const char *v = std::getenv("PS2X_FSNATIVE"); return !(v && v[0] == '0'); }();
     if (!s_native) { bt3ToggleFullscreen(); return; }
     if (on)
     {
         if (bt3IsWindowFullscreen()) return;
-        const int m = bt3GetCurrentMonitor();
+        const int mc = bt3GetMonitorCount();
+        const int m = (monitor >= 0 && monitor < mc) ? monitor : 0;
+        if (mc > 0) bt3SetWindowMonitor(m);
         const int mw = bt3GetMonitorWidth(m), mh = bt3GetMonitorHeight(m);
         if (mw >= 320 && mh >= 240) bt3SetWindowSize(mw, mh);
         bt3ToggleFullscreen();
@@ -384,13 +388,14 @@ void PS2SettingsOverlay::initialize()
         ? (std::filesystem::current_path() / kConfigFileName).string()
         : (std::filesystem::path(s_configDir) / kConfigFileName).string();
     loadSettings();
-    // Apply the saved window size (before any fullscreen toggle, so it sizes the
-    // windowed state the user returns to). 0 = keep the default host window.
-    if (m_settings.windowW >= 320 && m_settings.windowH >= 240)
+    // The runtime already applied window_mode/monitor before the window was mapped (see the [winmode]
+    // block in ps2_runtime.cpp). Re-applying the legacy size+fullscreen here fought that: it resized
+    // the fullscreen window back to the saved window size and re-entered fullscreen on whichever
+    // monitor the window happened to be (usually the wrong one). Only the windowed mode needs the
+    // saved size restored, and only if it differs.
+    if (m_settings.windowMode == 0 && m_settings.windowW >= 320 && m_settings.windowH >= 240
+        && (bt3GetScreenWidth() != m_settings.windowW || bt3GetScreenHeight() != m_settings.windowH))
         bt3SetWindowSize(m_settings.windowW, m_settings.windowH);
-    // Apply fullscreen on startup if the INI says so (or the default is true).
-    if (m_settings.fullscreen)
-        ps2xSetFullscreen(true, m_settings.windowW, m_settings.windowH);
     // Build the device list up front so the gamepad toggle combo works before the
     // overlay is opened for the first time (m_deviceList is otherwise only populated
     // when the overlay opens via resetCaptureState/buildDeviceList).
@@ -1058,7 +1063,8 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
     if (bt3IsKeyPressed(BT3_KEY_F11))
     {
         m_settings.fullscreen = !m_settings.fullscreen;
-        ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
+        ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH, m_settings.monitor);
+        m_settings.windowMode = m_settings.fullscreen ? 2 : 0;   // keep the mode in sync with the toggle
         m_dirty = true;
     }
 

@@ -1469,9 +1469,11 @@ bool PS2Runtime::initialize(const char *title)
             g_ps2xWinModeReq = winMode;
             g_ps2xMonitorReq = winMonitor;
             g_ps2xWinWReq = hostWinW; g_ps2xWinHReq = hostWinH;
-            if (winMode == 2) bt3SetConfigFlags(FLAG_FULLSCREEN_MODE);
-            else if (winMode == 1) bt3SetConfigFlags(FLAG_WINDOW_UNDECORATED);
-            else bt3SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+            // Fullscreen is applied AFTER InitWindow and after the monitor move below: setting
+            // FLAG_FULLSCREEN_MODE here would go fullscreen on whatever monitor is current (often the
+            // primary) and the later move/size fight showed up as a black band on the right edge.
+            if (winMode == 1) bt3SetConfigFlags(FLAG_WINDOW_UNDECORATED);
+            else if (winMode == 0) bt3SetConfigFlags(FLAG_WINDOW_RESIZABLE);
             std::fprintf(stderr, "[winmode] mode=%d monitor=%d size=%dx%d\n",
                          winMode, winMonitor, hostWinW, hostWinH);
         }
@@ -1496,12 +1498,20 @@ bool PS2Runtime::initialize(const char *title)
             const int mc = bt3GetMonitorCount();
             const int idx = (winMonitor >= 0 && winMonitor < mc) ? winMonitor : 0;
             if (mc > 0) bt3SetWindowMonitor(idx);
-            if (winMode == 1)
+            if (winMode == 2)
+            {
+                // Fullscreen on the CHOSEN monitor, sized to its mode: enter fullscreen only now so
+                // the window never lands on the primary monitor first.
+                const int mw = bt3GetMonitorWidth(idx), mh = bt3GetMonitorHeight(idx);
+                if (mw >= 320 && mh >= 240) bt3SetWindowSize(mw, mh);
+                bt3SetWindowState(FLAG_FULLSCREEN_MODE);
+            }
+            else if (winMode == 1)
             {
                 const int mw = bt3GetMonitorWidth(idx), mh = bt3GetMonitorHeight(idx);
                 if (mw >= 320 && mh >= 240) bt3SetWindowSize(mw, mh);
             }
-            else if (winMode == 0)
+            else
                 bt3SetWindowSize(hostWinW, hostWinH);   // moving monitors can leave the window fitted
         }
         // [icon] Carry the launcher's icon onto the runner window. Same asset
