@@ -1,6 +1,7 @@
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_gs_pgs.h"   // [pgs]
 #include <algorithm>
+#include <map>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -45,28 +46,128 @@ bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
     return flg == 2u;
 }
 
+// [gifcensus] PS2X_GIFCENSUS=1: what the GIF stream is made of, per class, every 5 s -- the datum for deciding which
+// draws a native (non-GIF) path could take. Class = path (1 XGKICK / 2 VIF DIRECT / 3 DMA) and, for PATH1, the VU1
+// program that emitted it. Per class: packets, KB, GIF tags, vertex kicks (XYZ2/XYZF2 with ADC=0, packed + A+D +
+// REGLIST forms) split by the current PRIM type, IMAGE bytes (uploads), and the A+D writes that mark uploads/texture
+// binds (BITBLTBUF, TRXDIR, TEX0). A walk over bytes the arena already copies; nothing when off.
+extern thread_local uint32_t g_vu1CensusProg;   // ps2_vu1.cpp
+namespace
+{
+struct CensusClass
+{
+    uint64_t pkts = 0, bytes = 0, tags = 0, imageBytes = 0, adWrites = 0, bitblt = 0, trxdir = 0, tex0 = 0;
+    uint64_t verts[8] = {};   // by PRIM type 0..6 (7 = unknown)
+};
+struct Census
+{
+    std::mutex mtx;
+    std::map<uint64_t, CensusClass> cls;   // key = path << 32 | prog
+    uint32_t prim = 7;                     // last PRIM type seen (GS state is global across paths; approximate)
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+};
+Census &census() { static Census *c = new Census; return *c; }
+bool censusOn() { static const bool s = [](){ const char *v = std::getenv("PS2X_GIFCENSUS"); return v && v[0] && v[0] != '0'; }(); return s; }
+void censusWalk(GifPathId pathId, const uint8_t *data, uint32_t size)
+{
+    Census &c = census();
+    std::lock_guard<std::mutex> lk(c.mtx);
+    const uint64_t key = ((uint64_t)pathId << 32) | (pathId == GifPathId::Path1 ? g_vu1CensusProg : 0u);
+    CensusClass &k = c.cls[key];
+    k.pkts++; k.bytes += size;
+    size_t off = 0;
+    while (off + 16 <= size)
+    {
+        uint64_t lo, hi; std::memcpy(&lo, data + off, 8); std::memcpy(&hi, data + off + 8, 8);
+        off += 16; k.tags++;
+        const uint32_t nloop = (uint32_t)(lo & 0x7FFFu), flg = (uint32_t)((lo >> 58) & 3u);
+        uint32_t nreg = (uint32_t)((lo >> 60) & 0xFu); if (nreg == 0) nreg = 16;
+        if (lo & (1ull << 46)) c.prim = (uint32_t)((lo >> 47) & 7u);   // PRE: the tag's PRIM
+        if (flg == 2u || flg == 3u) { const size_t n = (size_t)nloop * 16u; k.imageBytes += std::min(n, size - off); off += n; continue; }
+        if (flg == 1u)
+        {   // REGLIST: two 64-bit registers per qword
+            const size_t nRegs = (size_t)nloop * nreg; size_t idx = 0;
+            for (; idx < nRegs && off + 8 <= size; ++idx)
+            {
+                const uint32_t d = (uint32_t)((hi >> (4u * (idx % nreg))) & 0xFu);
+                if (d == 0x4u || d == 0x5u) k.verts[c.prim < 7 ? c.prim : 7]++;
+                else if (d == 0x0u) { uint64_t v; std::memcpy(&v, data + off, 8); c.prim = (uint32_t)(v & 7u); }
+                off += 8;
+            }
+            if (nRegs & 1u) off += 8;   // pad to a qword
+            continue;
+        }
+        // PACKED
+        for (uint32_t l = 0; l < nloop && off + 16 <= size; ++l)
+            for (uint32_t r = 0; r < nreg && off + 16 <= size; ++r, off += 16)
+            {
+                const uint32_t d = (uint32_t)((hi >> (4u * r)) & 0xFu);
+                uint64_t qlo, qhi; std::memcpy(&qlo, data + off, 8); std::memcpy(&qhi, data + off + 8, 8);
+                if (d == 0x4u || d == 0x5u) { if (!(qhi & (1ull << 47))) k.verts[c.prim < 7 ? c.prim : 7]++; }   // ADC (bit 111) = no kick
+                else if (d == 0x0u) c.prim = (uint32_t)(qlo & 7u);
+                else if (d == 0xEu)
+                {
+                    const uint32_t a = (uint32_t)(qhi & 0xFFu); k.adWrites++;
+                    if (a == 0x00u) c.prim = (uint32_t)(qlo & 7u);
+                    else if (a == 0x04u || a == 0x05u) k.verts[c.prim < 7 ? c.prim : 7]++;
+                    else if (a == 0x50u) k.bitblt++;
+                    else if (a == 0x53u) k.trxdir++;
+                    else if (a == 0x06u || a == 0x07u) k.tex0++;
+                }
+            }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double dt = std::chrono::duration<double>(now - c.t0).count();
+    if (dt >= 5.0)
+    {
+        static const char *const primName[8] = {"pt", "ln", "lstrip", "tri", "tstrip", "tfan", "sprite", "?"};
+        std::fprintf(stderr, "[gifcensus] %.1fs, per second:\n", dt);
+        for (auto &kv : c.cls)
+        {
+            const CensusClass &x = kv.second; const uint32_t path = (uint32_t)(kv.first >> 32), prog = (uint32_t)kv.first;
+            uint64_t tv = 0; for (auto v : x.verts) tv += v;
+            std::fprintf(stderr, "   path%u%s%08x: %7.0f pk %8.0f KB %8.0f tags %9.0f verts [", path, path == 1u ? " prog " : " ", prog, x.pkts / dt, x.bytes / 1024.0 / dt, x.tags / dt, tv / dt);
+            for (int i = 0; i < 8; ++i) if (x.verts[i]) std::fprintf(stderr, " %s %.0f%%", primName[i], 100.0 * x.verts[i] / (double)(tv ? tv : 1));
+            std::fprintf(stderr, " ] image %6.0f KB, A+D %6.0f (bitblt %.0f trxdir %.0f tex0 %.0f)\n", x.imageBytes / 1024.0 / dt, x.adWrites / dt, x.bitblt / dt, x.trxdir / dt, x.tex0 / dt);
+        }
+        c.cls.clear(); c.t0 = now;
+    }
+}
+}
+
 void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
 {
     if (!data || sizeBytes < 16 || !m_processFn)
         return;
+    if (censusOn()) censusWalk(pathId, data, sizeBytes);   // [gifcensus]
 
     GifArbiterPacket pkt;
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);   // the copy stays OUTSIDE the lock
+    pkt.size = sizeBytes;
+    Lane &ln = lane();
     CountedLock lk(m_qMtx, m_lockWaits, m_lockWaitNs);
-    m_queue.push_back(std::move(pkt));
+    pkt.offset = static_cast<uint32_t>(ln.arena.size());   // [gifarena] append, no per-packet block
+    ln.arena.insert(ln.arena.end(), data, data + sizeBytes);
+    ln.queue.push_back(pkt);
+    ln.pending.store(static_cast<uint32_t>(ln.queue.size()), std::memory_order_relaxed);
 }
 
-void GifArbiter::takeQueue(std::vector<GifArbiterPacket> &out)
+static thread_local bool t_gifWorkerLane = false;   // [giflane]
+void GifArbiter::markWorkerThread() { t_gifWorkerLane = true; }
+GifArbiter::Lane &GifArbiter::lane() { return m_lanes[t_gifWorkerLane ? 1 : 0]; }
+uint32_t GifArbiter::pending() const { return m_lanes[t_gifWorkerLane ? 1 : 0].pending.load(std::memory_order_relaxed); }
+
+void GifArbiter::takeQueue(GifArbiterBatch &out)
 {   // [vu1pipe] the ordering drain() applies, without processing
     static const bool s_sort = [](){ const char *v = std::getenv("PS2X_GIF_SORT"); return v && v[0] && v[0] != '0'; }();
     static const bool s_stat = [](){ const char *v = std::getenv("PS2X_GIFLOCKSTAT"); return !(v && v[0] == '0'); }();
+    Lane &ln = lane();
+    std::vector<GifArbiterPacket> &q = ln.queue;
     CountedLock lk(m_qMtx, m_lockWaits, m_lockWaitNs);
     if (s_sort)
-        std::stable_sort(m_queue.begin(), m_queue.end(),
+        std::stable_sort(q.begin(), q.end(),
                          [](const GifArbiterPacket &a, const GifArbiterPacket &b)
                          {
                              if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
@@ -78,8 +179,16 @@ void GifArbiter::takeQueue(std::vector<GifArbiterPacket> &out)
                              }
                              return pathPriority(a.pathId) < pathPriority(b.pathId);
                          });
-    out.swap(m_queue);
-    m_queue.clear();
+    out.pkts.swap(q);
+    q.clear();
+    if (!out.pkts.empty())
+    {   // [gifarena] the arena is final now: resolve the views, then hand the buffer over by move
+        std::vector<uint8_t> arena;
+        arena.swap(ln.arena);
+        for (GifArbiterPacket &p : out.pkts) p.data = arena.data() + p.offset;
+        out.arenas.push_back(std::move(arena));
+    }
+    ln.pending.store(0u, std::memory_order_relaxed);
     if (s_stat)
     {
         static auto s_t0 = std::chrono::steady_clock::now(); static uint64_t s_w0 = 0, s_n0 = 0;
@@ -95,32 +204,32 @@ void GifArbiter::takeQueue(std::vector<GifArbiterPacket> &out)
 }
 void GifArbiter::process(const GifArbiterPacket &pkt)
 {
-    if (!m_processFn || pkt.data.empty()) return;
+    if (!m_processFn || !pkt.data || pkt.size == 0u) return;
     if (ps2x_pgs::enabled())
     {   // [pgs] the paraLLEl-GS backend consumes the same packet, on its own path index. Pack mode: OUR parse first, so the
         // VRAM and palettes its replacement hook hashes already include this packet's uploads.
         if (ps2x_pgs::packMode())
         {
             g_gifArbCurPath = static_cast<uint8_t>(pkt.pathId);
-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            m_processFn(pkt.data, pkt.size);
             g_gifArbCurPath = 0;
-            ps2x_pgs::gifTransfer(static_cast<uint8_t>(pkt.pathId), pkt.data.data(), pkt.data.size());
+            ps2x_pgs::gifTransfer(static_cast<uint8_t>(pkt.pathId), pkt.data, pkt.size);
             return;
         }
-        const bool consumed = ps2x_pgs::gifTransfer(static_cast<uint8_t>(pkt.pathId), pkt.data.data(), pkt.data.size());
+        const bool consumed = ps2x_pgs::gifTransfer(static_cast<uint8_t>(pkt.pathId), pkt.data, pkt.size);
         if (consumed && ps2x_pgs::exclusive()) return;   // not consumed (backend unavailable): our parse takes it
     }
     g_gifArbCurPath = static_cast<uint8_t>(pkt.pathId);
-    m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+    m_processFn(pkt.data, pkt.size);
     g_gifArbCurPath = 0;
 }
 void GifArbiter::drain()
 {
     if (!m_processFn)
         return;
-    std::vector<GifArbiterPacket> q;
-    takeQueue(q);
-    for (const auto &pkt : q) process(pkt);
+    GifArbiterBatch b;
+    takeQueue(b);
+    for (const auto &pkt : b.pkts) process(pkt);
 }
 
 uint8_t GifArbiter::pathPriority(GifPathId id)

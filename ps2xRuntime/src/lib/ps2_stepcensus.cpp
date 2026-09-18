@@ -23,7 +23,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-std::atomic<int> g_ps2StepCensus{0};
+Ps2ArmedAtomic<int> g_ps2StepCensus{0};   // [tracearm]
 extern std::atomic<uint64_t> g_bt3FrameCount;
 
 namespace
@@ -85,6 +85,10 @@ static uint32_t g_addrWatchList[6] = {0}; static int g_addrWatchCnt = 0;
 // attributed to the pc of the last branch -- several distinct stores share one site id and cannot be told apart by
 // pc. An address rule targets one guest slot exactly.
 static uint32_t g_hsAddr[16] = {0}; static char g_hsAddrKind[16] = {0}; static int g_hsAddrN = 0; static int g_hsAddrLog = 0;
+// [hclip] "0x1c4550 h 1": the seconds-timed clip setter FUN_001c4520 serves every clip; halving all of them broke
+// the teleport slam (its event-track query read the half-speed clip). The optional third token restricts the 'h'
+// rule to stores whose animation block carries that clip slot id ([component+0xC], the block being component+0xB40).
+static std::unordered_map<uint32_t, uint32_t> g_hsHClip;
 static uint32_t g_awTrigAddr = 0; static float g_awTrigDelta = 0.f; static uint32_t g_awTrigAddr2 = 0;
 static void parseTrig()
 {
@@ -175,7 +179,8 @@ void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint6
                     if ((ctx->pc >= g_stRange[r][0] && ctx->pc < g_stRange[r][1]) || (ra >= g_stRange[r][0] && ra < g_stRange[r][1])
                         || (g_stAddrHi && a + size > g_stAddrLo && a < g_stAddrHi) || (g_stAddrHi2 && a + size > g_stAddrLo2 && a < g_stAddrHi2))
                     {
-                        if (s_perPc[ctx->pc ^ (ra << 8)]++ < 8u && g_stLines.fetch_add(1, std::memory_order_relaxed) < 60000u)
+                        static const uint32_t s_stCap = [](){ const char *v = std::getenv("PS2X_STORETRACE_CAP"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 10) : 60000u; }();   // total lines (default 60000)
+                        if (s_perPc[ctx->pc ^ (ra << 8)]++ < 8u && g_stLines.fetch_add(1, std::memory_order_relaxed) < s_stCap)
                         {
                             uint32_t ov = 0; std::memcpy(&ov, rdram + a, size < 4 ? size : 4); float fo, fn; const uint32_t nv = (uint32_t)valueLo;
                             std::memcpy(&fo, &ov, 4); std::memcpy(&fn, &nv, 4);
@@ -365,13 +370,21 @@ bool ps2HalfStepFightActive()
     const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
     return fr - g_ps2HalfStepLogicFrame.load(std::memory_order_relaxed) <= 2u && g_hsStreak.load(std::memory_order_relaxed) >= 60u;
 }
+// [wshudmenu] the fight update ran within the last 2 render frames, WITHOUT the 60-frame streak: the widescreen HUD
+// squeeze needs a gate that is already true on the fight's first frame (with the streak the HUD sat unsqueezed for
+// the first second of every fight), and menus never run the update at all.
+bool ps2FightUpdateRecent()
+{
+    const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+    return fr - g_ps2HalfStepLogicFrame.load(std::memory_order_relaxed) <= 2u;
+}
 namespace
 {
     uint8_t *g_hs = nullptr;                      // 0 none, 1 float-halve, 2 int-every-other-frame
     std::unordered_set<uint64_t> g_hsVec;         // vector sites: (pc << 32) | ra
     // one-shot guard keyed per (site, address): a hash table over all addresses (fd11: a smoke-particle lifetime
     // site touches 29 slots, >10 per frame -- an 8-entry per-site ring thrashed and re-doubled live particles)
-    struct HsEntry { uint32_t addr, frame, pc; };
+    struct HsEntry { uint32_t addr, frame, pc; uint32_t halfRate; uint32_t val; };   // halfRate: this (site, address) stores only every other frame ([uparity]); val: what this site last stored there ([dcont])
     constexpr uint32_t kHsBits = 22, kHsSize = 1u << kHsBits;
     HsEntry *g_hsLast = nullptr;
     std::atomic<uint64_t> g_hsOneShot{0};
@@ -382,6 +395,7 @@ namespace
 uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint32_t value, const R5900Context *ctx)
 {
     if (!g_hs || !ctx || ctx != g_hsCtx.load(std::memory_order_relaxed)) return value;
+    uint8_t kForce = 0;   // [addrkind] an address rule of kind 'u' runs the ordinary up-counter logic below, whatever the pc
     if (g_hsAddrN)
     {
         const uint32_t aa = guestAddr & 0x1FFFFFFFu;
@@ -400,12 +414,29 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
                     return (uint32_t)(v * 2);
                 }
             }
+            // [addrkind] '@addr u': a per-fighter up-counter whose increment shares its site id with stores that must
+            // not be paced (the state-age counter fighter+0x964 at 0x1e23ac). Pace it by address instead.
+            if (g_hsAddrKind[i] == 'u' || g_hsAddrKind[i] == 'a')
+            {   // only a +1 increment is paced; an assignment to the same field (a sub-phase index) lands as is
+                const uint32_t o = readOld(rdram, aa, size);
+                const uint32_t mask = size == 1 ? 0xFFu : size == 2 ? 0xFFFFu : 0xFFFFFFFFu;
+                if (((o + 1u) & mask) != (value & mask)) return value;
+                if (g_hsAddrKind[i] == 'a')
+                {   // 'a' = the fighter's state-age counter (fighter+0x964) with the IDLE state (0xB) exempt. TESTED AND
+                    // NOT USABLE (2026-09-18): even with idle exempt the transformation locks after the flash -- the
+                    // handlers fire `age == N` events, and a paced counter shows each value for two frames. Kept as
+                    // the record of what was tried; the age stays unpaced (idle taunt and hit reactions run 2x).
+                    uint32_t st = 0; if (const uint8_t *q = rdram + ((aa - 0x964u + 0x948u) & 0x1FFFFFFFu)) std::memcpy(&st, q, 4);
+                    if (st == 0xBu) return value;
+                }
+                kForce = 2; break;
+            }
             return value;
         }
     }
     const uint32_t pc = ctx->pc;
     if (pc < kBase || pc >= kEnd) return value;
-    const uint8_t k = g_hs[(pc - kBase) >> 2];
+    const uint8_t k = kForce ? kForce : g_hs[(pc - kBase) >> 2];
     if (!k) return value;
     const uint32_t a = guestAddr & 0x1FFFFFFFu;
     if (a + size > 32u * 1024u * 1024u) return value;
@@ -420,7 +451,21 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
         if (size != 4) return value;
         float f; std::memcpy(&f, &value, 4);
         if (!std::isfinite(f) || std::fabs(f) > 1e6f) return value;
-        f *= 0.5f; uint32_t bits; std::memcpy(&bits, &f, 4); g_hsFloat.fetch_add(1, std::memory_order_relaxed); return bits;
+        if (auto it = g_hsHClip.find(pc); it != g_hsHClip.end())
+        {   // [hclip]
+            uint32_t clip = 0xFFFFFFFFu; const uint32_t comp = a - 0xB40u - 0x140u;
+            if (comp + 16u < 32u * 1024u * 1024u) std::memcpy(&clip, rdram + comp + 0xC, 4);
+            if (clip != it->second) return value;
+        }
+        f *= 0.5f; uint32_t bits; std::memcpy(&bits, &f, 4); g_hsFloat.fetch_add(1, std::memory_order_relaxed);
+        {   // the anim block is at component+0xB40 and the speed at +0x140 of it: log the clip id [component+0xC]
+            static uint16_t *s_hLog = [](){ return new uint16_t[(kEnd - kBase) >> 2](); }();
+            static const uint32_t s_hFrom = [](){ const char *v = std::getenv("PS2X_HSLOG_FROM"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 10) : 0u; }();
+            uint16_t &n = s_hLog[(pc - kBase) >> 2];
+            if (frame >= s_hFrom && n < 120u) { ++n; uint32_t clip = 0; const uint32_t comp = a - 0xB40u - 0x140u; if (comp + 16u < 32u * 1024u * 1024u) std::memcpy(&clip, rdram + comp + 0xC, 4);
+                std::fprintf(stderr, "[halfstep-mod] h pc=0x%06x addr=0x%x value=%g -> %g clip=%u frame=%u\n", pc, a, f * 2.0f, f, clip, frame); }
+        }
+        return bits;
     }
     if (k == 6)
     {   // 'D': a frame-count DURATION written next to a countdown we double ('d'). The game derives progress as
@@ -439,10 +484,21 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
     // unmodified: skipping it on an odd frame LOSES it (the half2 freeze: the fight intro polled a flag whose
     // one increment fell on an odd frame). The first tick after a gap therefore passes through at full rate.
     static uint16_t *s_siteLog = [](){ return new uint16_t[(kEnd - kBase) >> 2](); }();   // [halfstep] per-site log cap
-    auto logOk = [&](uint32_t p) { uint16_t &n = s_siteLog[(p - kBase) >> 2]; return n < 60u ? (++n, true) : false; };
+    // PS2X_HSLOG_FROM=<frame>: the per-site cap (60 lines) is spent in the first second of a fight; this starts the
+    // count at a later frame so a sequence deep in the fight (a transformation) can be read. Same cap after it.
+    static const uint32_t s_logFrom = [](){ const char *v = std::getenv("PS2X_HSLOG_FROM"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 10) : 0u; }();
+    auto logOk = [&](uint32_t p) { if (frame < s_logFrom) return false; uint16_t &n = s_siteLog[(p - kBase) >> 2]; return n < 60u ? (++n, true) : false; };
     HsEntry &e = g_hsLast[((a * 2654435761u) ^ (pc * 40503u)) >> (32u - kHsBits)];
     uint32_t last = 0xFFFF0000u;
     if (e.addr == a && e.pc == pc) last = e.frame;
+    else { e.halfRate = 0u; e.val = 0xFFFFFFFFu; }
+    // [uparity] A site the game itself only runs on alternate frames (its handler is gated by the engine's 30 Hz
+    // parity, func_23D160) is ALREADY at the 30 fps pace at step 1. The integer rule's "skip on odd render
+    // frames" then lands on one phase or the other for the whole sequence: every store lost (a counter frozen --
+    // the transformation power-up that never ended, 0x17be30/0x17c624 on 0x1a478e8/ec) or none (double rate),
+    // by luck of the frame the sequence started on. Detect it from the store cadence -- the first store of a
+    // frame arriving exactly two frames after the previous one -- and leave every store of that frame alone.
+    if (last != frame) e.halfRate = (frame - last == 2u) ? 1u : 0u;
     e.addr = a; e.pc = pc; e.frame = frame;
     const bool firstAfterGap = frame - last > 1u;
     if (k == 5)
@@ -461,17 +517,30 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
     {   // countdown timer ('d'): exact half rate with NO register/memory mismatch. The first decrement after a gap
         // is the first tick after the timer was armed with `old`; storing 2*old + delta makes the countdown take
         // twice as many 60 Hz frames. Every later tick lands unmodified.
-        if (!firstAfterGap) return value;
+        // [uparity] A countdown the game ticks only every other frame sees EVERY tick as "first after a gap": it was
+        // doubled on every tick (2*old - 1: exponential growth, the countdown never ends). Such a site is already at
+        // the 30 fps pace -- once its cadence is known (halfRate) its ticks pass through; only the first tick after
+        // arming (a longer gap) is doubled.
+        // [dcont] "First tick after arming" is decided by CONTINUITY, not by the gap: if the value this tick starts
+        // from is the one this site stored last time (`old == e.val`), the countdown is ticking on from our own
+        // store -- whatever the gap (the transformation timer 0x19b9b8 ticks only on the frames func_12CE88 lets
+        // through, so every tick was a "gap" and it was doubled again and again: 2*old-1, never reaching 0).
+        // A tick starting from a value we did not store is a re-armed timer: double once.
+        const bool cont = (last != 0xFFFF0000u) && e.val == old;
+        if (!firstAfterGap || e.halfRate || cont) { e.val = value; return value; }
         const int32_t o = sext(old, size), n = sext(value, size), d = n - o;
-        if (d >= 0 || o <= 0 || o > 100000) return value;
+        if (d >= 0 || o <= 0 || o > 100000) { e.val = value; return value; }
         const int32_t doubled = 2 * o + d;
         const uint32_t limit = size == 1 ? 0x7Fu : size == 2 ? 0x7FFFu : 0x7FFFFFFFu;
-        if ((uint32_t)doubled > limit) return value;
+        if ((uint32_t)doubled > limit) { e.val = value; return value; }
+        e.val = (uint32_t)doubled;
         g_hsOneShot.fetch_add(1, std::memory_order_relaxed);
         if (logOk(pc))
             std::fprintf(stderr, "[halfstep-mod] d pc=0x%06x addr=0x%x armed=%d first-tick %d -> stored %d frame=%u\n", pc, a, o, n, doubled, frame);
         return (uint32_t)doubled;
     }
+    // [ucount] 'u' run position since the first store after a gap (bit 31 = the decision taken for this frame)
+    if (k == 2 && firstAfterGap) e.val = 0u;
     // an address this site did not touch on the previous frame (or never): a one-shot event, land it unmodified
     if (firstAfterGap) { g_hsOneShot.fetch_add(1, std::memory_order_relaxed); return value; }
     if (k == 1)
@@ -491,8 +560,21 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
             std::fprintf(stderr, "[halfstep-mod] f pc=0x%06x addr=0x%x old=%g new=%g stored=%g frame=%u\n", pc, a, fo, fn, h, frame);
         return bits;
     }
-    // integer counter: keep the old value on odd render frames
-    const bool skip = (frame & 1u) != 0u;
+    // integer counter: keep the old value on alternate render frames -- unless the site runs at half rate already ([uparity])
+    if (e.halfRate) { g_hsOneShot.fetch_add(1, std::memory_order_relaxed); return value; }
+    // [ucount] The skip pattern is phased from the sequence's own start, not from the absolute frame parity: the
+    // first store after a gap lands (a one-shot increment must not be lost), then the next TWO consecutive-frame
+    // stores are skipped, then every other one. A count to N therefore takes exactly 2N frames for N >= 2
+    // (values 1,1,1,2,2,3,3,4 over 8 frames); with absolute parity it took 2N-1 or 2N-2 depending on the frame the
+    // state started on, which cut the slam's 4-step rise to 7 or 6 frames. Stores within one frame share the decision.
+    bool skip;
+    if (last == frame) skip = (e.val & 0x80000000u) != 0u;
+    else
+    {
+        const uint32_t run = (e.val == 0xFFFFFFFFu) ? 1u : ((e.val & 0x7FFFFFFFu) + 1u);
+        skip = (run == 1u) || ((run & 1u) == 0u);
+        e.val = (run & 0x7FFFFFFFu) | (skip ? 0x80000000u : 0u);
+    }
     if (logOk(pc))
         std::fprintf(stderr, "[halfstep-mod] i pc=0x%06x addr=0x%x old=%d new=%d %s frame=%u\n", pc, a, sext(old, size), sext(value, size), skip ? "SKIPPED" : "passed", frame);
     if (skip) { g_hsIntSkip.fetch_add(1, std::memory_order_relaxed); return old; }
@@ -587,7 +669,7 @@ void ps2HalfStepEnable(const char *sitesPath)
     if (!f) { std::fprintf(stderr, "[halfstep] cannot read %s\n", sitesPath); return; }
     g_hs = new uint8_t[(kEnd - kBase) >> 2]();
     g_hsLast = new HsEntry[kHsSize];
-    for (uint32_t i = 0; i < kHsSize; ++i) { g_hsLast[i].addr = 0xFFFFFFFFu; g_hsLast[i].frame = 0xFFFF0000u; g_hsLast[i].pc = 0; }
+    for (uint32_t i = 0; i < kHsSize; ++i) { g_hsLast[i].addr = 0xFFFFFFFFu; g_hsLast[i].frame = 0xFFFF0000u; g_hsLast[i].pc = 0; g_hsLast[i].halfRate = 0; g_hsLast[i].val = 0; }
     char line[128]; unsigned nf = 0, ni = 0, nd = 0, nv = 0;
     while (std::fgets(line, sizeof line, f))
     {
@@ -602,7 +684,9 @@ void ps2HalfStepEnable(const char *sitesPath)
             kind = 0;
         }
         if (std::sscanf(line, "%x:%x %c", &pc, &ra, &kind) == 3) { if (pc >= kBase && pc < kEnd && kind == 'f') { g_hsVec.insert(((uint64_t)pc << 32) | ra); ++nv; } continue; }
-        if (std::sscanf(line, "%x %c", &pc, &kind) != 2 || pc < kBase || pc >= kEnd) continue;
+        unsigned clip = 0xFFFFFFFFu;
+        if (std::sscanf(line, "%x %c %u", &pc, &kind, &clip) < 2 || pc < kBase || pc >= kEnd) continue;
+        if (kind == 'h' && clip != 0xFFFFFFFFu) g_hsHClip[pc] = clip;   // [hclip] halve only when the clip slot id matches
         if (kind == 'f') { g_hs[(pc - kBase) >> 2] = 1; ++nf; }
         else if (kind == 'i' || kind == 'u') { g_hs[(pc - kBase) >> 2] = 2; ++ni; }
         else if (kind == 'd') { g_hs[(pc - kBase) >> 2] = 3; ++nd; }

@@ -23,6 +23,9 @@ void ps2HalfStepNoteLogic(uint64_t frame);
 void ps2AddrWatchEnable(const char *hex);
 void ps2StoreTraceEnable(const char *spec);
 extern std::atomic<uint64_t> g_workerFrameNs;   // [framegate] kick worker busy ns, last frame
+extern std::atomic<uint64_t> g_cdLoadReads, g_cdLoadBytes;   // [cdload] CD.cpp (file scope: a block-scope extern inside the namespace mangles into it)
+extern std::atomic<uint32_t> g_bt3StateLive;    // [fightgate] BT3's top-level state, as seen by the status probe (ps2_runtime.cpp)
+extern std::atomic<uint64_t> g_vu1PairCount;    // [fightgate] VU1 instruction pairs run by the fight's programs (ps2_vu1.cpp)
 // [syncrelax] true while the frame gate is engaged (async kick on, gate on, worker frame > one vblank): the gate
 // then owns the frame rate, so the busy-bit pacing and the sceGsSyncPath drain can let the guest run ahead.
 std::atomic<bool> g_ps2xFrameGateHeavy{false};
@@ -1563,7 +1566,18 @@ void bt3NoteSeBankHeader(uint32_t dst, const uint8_t *data, uint32_t size)
             // Anything else is a per-character bank (56 in every bank seen, but a character with
             // a different count must still land in 4 then 5 rather than be dropped).
             why = "per-character";
-            if (g_sePerChar < kSeSlots)
+            // [sebankaddr] A TRANSFORMATION re-uploads the fighter's voice bank mid-fight to the SAME
+            // header address its original bank used (SSJ Goku's bank at 0x129880 = base Goku's slot 4;
+            // seen 2026-09-17 in every replay). The group counter cannot know that and filed it as a
+            // third per-character bank -> slot 5 -> the OPPONENT spoke with P1's transformed voice.
+            // Within a fight the header address IS the identity of a per-character bank: reuse that slot.
+            slot = kSeSlots;
+            for (uint32_t k = 4u; k < kSeSlots; ++k)
+                if (!g_seSlot[k].hdr.empty() && g_seSlot[k].addr == dst) { slot = k; why = "per-character, same address = same fighter"; break; }
+            if (slot < kSeSlots)
+            {
+            }
+            else if (g_sePerChar < kSeSlots)
             {
                 slot = g_sePerChar++;   // 4, then 5
             }
@@ -3172,6 +3186,11 @@ namespace
         if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] CDTICK tid=%d pc=0x%x\n", ps2xSchedTid(), ctx ? ctx->pc : 0u);
         g_lastCdTickNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);   // [dispatchpump]
         g_lastCdTickFrame.store(g_bt3FrameCount.load(std::memory_order_relaxed), std::memory_order_relaxed);   // [detsound]
+        // [cdload] PS2X_CDLOAD=1: what a load is made of, per second -- CD file-server ticks (count + guest time inside
+        // them), sceCdRead requests (count + MB, counted in CD.cpp) and the current bt3state. The datum for "would
+        // dropping the CD model speed loads up": the tick is the game's own state machine, run inline per poll.
+        static const bool s_cdload = [](){ const char *v = std::getenv("PS2X_CDLOAD"); return v && v[0] && v[0] != '0'; }();
+        const auto _t0 = s_cdload ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         R5900Context tctx = *ctx;             // inherit gp/sp
         tctx.r[31] = _mm_setzero_si128();     // ra = 0 => run until return
         tctx.pc = 0x0028a3b0u;                // CD file-server tick
@@ -3181,6 +3200,24 @@ namespace
             PS2Runtime::RecompiledFunction step = runtime->lookupFunction(tctx.pc);
             if (!step) break;
             step(rdram, &tctx, runtime);
+        }
+        if (s_cdload)
+        {
+            static std::atomic<uint64_t> s_ticks{0}, s_tickNs{0};
+            static std::atomic<int64_t> s_last{0};
+            const auto now = std::chrono::steady_clock::now();
+            s_ticks.fetch_add(1u, std::memory_order_relaxed);
+            s_tickNs.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now - _t0).count(), std::memory_order_relaxed);
+            const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+            int64_t last = s_last.load(std::memory_order_relaxed);
+            if (last == 0) s_last.store(nowNs, std::memory_order_relaxed);
+            else if (nowNs - last >= 1000000000LL && s_last.compare_exchange_strong(last, nowNs, std::memory_order_relaxed))
+            {
+                const double dt = (nowNs - last) / 1e9;
+                const uint64_t t = s_ticks.exchange(0), tn = s_tickNs.exchange(0), rd = g_cdLoadReads.exchange(0), by = g_cdLoadBytes.exchange(0);
+                std::fprintf(stderr, "[cdload] state=0x%x: ticks %.0f/s (%.1f ms/s inside), reads %.0f/s (%.2f MB/s), %.1f ticks/read\n",
+                             g_bt3StateLive.load(std::memory_order_relaxed), t / dt, tn / 1e6 / dt, rd / dt, by / 1048576.0 / dt, rd ? (double)t / rd : 0.0);
+            }
         }
     }
     // [spinpump] Called by the dispatch loop when a guest thread has re-dispatched at the same pc for
@@ -3942,6 +3979,21 @@ namespace
         static const bool s_always = [](){ const char *v = std::getenv("PS2X_VSTEP_ALWAYS"); return v && v[0] && v[0] != '0'; }();
         if (s_step > 0 && getRegU32(ctx, 4) == 2u && (s_always || ps2HalfStepFightActive())) ctx->r[4] = _mm_set_epi64x(0, (int64_t)s_step);   // $a0 = step
         if (g_orig102060) g_orig102060(rdram, ctx, runtime);
+    }
+    // [fps60 predict] FUN_001de8a8(obj, out, ..., f12 = own speed/frame, f13, f14 = reach frames, f15 = N frames):
+    // the slam-dive setup (state 0x30, FUN_001f3668) aims at "opponent position + opponent velocity/frame * N".
+    // At 60 fps the per-frame velocity is halved by the pacing table while N is a frame count the game never
+    // scales, so the aim point fell short (the teleport slam missed a sliding victim). Double N in 60 fps mode.
+    PS2Runtime::RecompiledFunction g_orig1de8a8 = nullptr;
+    void bt3PredictAhead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static std::atomic<uint32_t> s_n{0}; const uint32_t n = s_n.fetch_add(1u);
+        const bool on = ps2VStepActive() && ps2HalfStepFightActive();
+        if (n < 8u)
+            std::fprintf(stderr, "[fps60] predict f12=%g f13=%g f14=%g f15=%g %s frame=%llu\n", ctx->f[12], ctx->f[13], ctx->f[14], ctx->f[15],
+                         on ? "(N doubled)" : "", (unsigned long long)g_bt3FrameCount.load());
+        if (on) ctx->f[15] *= 2.0f;
+        if (g_orig1de8a8) g_orig1de8a8(rdram, ctx, runtime);
     }
     // [vstepprobe] func_264D98(a0): the frame wait. Print a0, the per-frame vblank counter [gp-0x5148] at entry,
     // and the vsync ticks elapsed inside the call, for the first calls and then every 300th.
@@ -5571,10 +5623,36 @@ namespace
             // PS2X_FRAMEGATE_FORCEHEAVY=1 (dev): treat every frame as heavy on a fast box, to exercise the gated +
             // relaxed-pacing path that slow machines take (the vblank period itself stays real).
             static const bool s_forceHeavy = [](){ const char *v = std::getenv("PS2X_FRAMEGATE_FORCEHEAVY"); return v && v[0] && v[0] != '0'; }();
-            const bool heavy = s_forceHeavy || g_workerFrameNs.load(std::memory_order_relaxed) > s_vsyncNs;
+            // PS2X_FRAMEGATE_FORCELIGHT=1 (dev): the opposite -- treat every frame as light, to reproduce on a
+            // slow box what a fast one does when the render fits in a vsync.
+            static const bool s_forceLight = [](){ const char *v = std::getenv("PS2X_FRAMEGATE_FORCELIGHT"); return v && v[0] && v[0] != '0'; }();
+            const bool heavy = s_forceHeavy || (!s_forceLight && g_workerFrameNs.load(std::memory_order_relaxed) > s_vsyncNs);
+            // [fightgate] The heavy test alone ties GAME SPEED to host performance: a machine whose render
+            // fits in one vsync (a 3070 Ti, 2026-09-17, right after the native VU1 kernels lightened the
+            // worker) is never "heavy", so the fight loop runs every vblank -- 40-60 fps of game logic,
+            // i.e. fast-forward, exactly the async failure described above, now on the fast machines. The
+            // console's 30 in fights is a property of the FIGHT, not of the load, so gate on the state:
+            // 0x27 (fight), 0x28 (team/DP battle), 0x2d (in-fight). Menus (0x04) stay ungated at 60.
+            // PS2X_FRAMEGATE_FIGHT=0 restores the load-only rule.
+            static const bool s_fightGate = [](){ const char *v = std::getenv("PS2X_FRAMEGATE_FIGHT"); return !(v && v[0] == '0'); }();
+            const uint32_t stLive = g_bt3StateLive.load(std::memory_order_relaxed);
+            const bool fightState = (stLive == 0x27u || stLive == 0x2du);
+            // The FIGHT-LOAD shares state 0x27 with the fight, and gating it halved the loader (its CD
+            // pump is per frame): 13 s at 29 fps instead of 6 s at 60 (2026-09-17). What separates them
+            // is the guest's own render work: a loading/minigame frame runs none of the fight's VU1
+            // programs (vu1pairs = 0), a fight frame runs ~3M pairs. Latch "the fight is rendering" on
+            // the first frame with real VU1 work and hold it for the rest of the fight state.
+            static uint64_t s_lastPairs = 0; static bool s_fightRendering = false;
+            {
+                const uint64_t pairs = g_vu1PairCount.load(std::memory_order_relaxed);
+                const uint64_t delta = pairs - s_lastPairs; s_lastPairs = pairs;
+                if (!fightState) s_fightRendering = false;
+                else if (delta > 200000ull) s_fightRendering = true;
+            }
+            const bool inFight = s_fightGate && fightState && s_fightRendering;
             g_ps2xFrameGateHeavy.store(s_gate && heavy && PS2Memory::asyncKickEnabled(), std::memory_order_relaxed);   // [syncrelax]
             // [rollback] in frame-stepped mode the controller paces vblanks; a host sleep here would only starve them
-            if (s_gate && heavy && PS2Memory::asyncKickEnabled() && !ps2xFrameStepOn())
+            if (s_gate && (heavy || inFight) && PS2Memory::asyncKickEnabled() && !ps2xFrameStepOn())
             {
                 static uint64_t s_lastTick = 0;
                 // [fps60gate] The 2-tick target IS a 30 fps lock: two vsyncs at 60 Hz = 33.3 ms. That is
@@ -6276,6 +6354,8 @@ namespace
             std::fprintf(stderr, "[clipguard] armed (0x121d48 %s, 0x11f548 %s)\n", g_orig121d48 ? "ok" : "MISSING", g_orig11f548 ? "ok" : "MISSING");
             g_orig264d98 = runtime.lookupFunction(0x00264d98u);
             if (g_orig264d98) runtime.replaceFunction(0x00264d98u, &bt3WaitProbe);   // [vstepprobe]
+            g_orig1de8a8 = runtime.lookupFunction(0x001de8a8u);   // [fps60 predict]
+            if (g_orig1de8a8) runtime.replaceFunction(0x001de8a8u, &bt3PredictAhead);
             if (g_orig115950) runtime.replaceFunction(0x00115950u, &bt3LogicRate);
             std::fprintf(stderr, "[vstep] step override armed (0x102060 %s, 0x115950 %s)\n", g_orig102060 ? "ok" : "MISSING", g_orig115950 ? "ok" : "MISSING");
         }

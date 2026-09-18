@@ -1,8 +1,8 @@
 #include "Common.h"
 #include "RPC.h"
 
-extern std::atomic<uint32_t> g_ps2WatchLo;
-extern std::atomic<uint32_t> g_ps2WatchHi;
+extern Ps2ArmedAtomic<uint32_t> g_ps2WatchLo;   // [tracearm] (Common.h pulls in ps2_runtime.h)
+extern Ps2ArmedAtomic<uint32_t> g_ps2WatchHi;
 
 namespace ps2_syscalls
 {

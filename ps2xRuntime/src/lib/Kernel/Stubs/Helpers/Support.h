@@ -1,4 +1,5 @@
 #include "ps2_waitprof.h"   // [waitprof]
+#include "runtime/ps2_gs_pgs.h"   // [s1fence] streamPriv
 #include <algorithm>
 #include <vector>
 #include <functional>
@@ -2247,13 +2248,13 @@ namespace
     // cutscene-heavy streaming). Drain the queue first so direct access happens at a
     // stream boundary, matching hardware where these calls imply the path is idle.
     // PS2X_ASYNC_GSFENCE=0 disables (A/B kill-switch).
-    static void fenceAsyncKickForGsAccess(PS2Runtime *runtime, int waitSite = WP_KICK_DRAIN)
+    static void fenceAsyncKickForGsAccess(PS2Runtime *runtime, int waitSite = WP_KICK_DRAIN, bool stage1Only = false)
     {
         static const bool s_off = [](){ const char *v = std::getenv("PS2X_ASYNC_GSFENCE"); return v && v[0] == '0'; }();
         if (s_off || !runtime || !PS2Memory::asyncKickEnabled())
             return;
         Ps2xWaitScope w(waitSite);   // [waitprof] per-site: the drain itself is bracketed too, this names the caller
-        runtime->memory().drainKickQueue();
+        runtime->memory().drainKickQueue(stage1Only);   // [s1fence] stage1Only is honoured only when that mode is on
     }
 
     // [gsqueue] A direct GS-state WRITE from a sceGs* stub does not need the worker's queue drained; it needs
@@ -2286,6 +2287,25 @@ namespace
         if (!runtime || !runtime->syncCoreSubsystems())
             return;
         const GsDispEnvMem e = env;
+        if (PS2Memory::stage1FenceEnabled())
+        {   // [s1fence] the display env is a stream event like the game's own bus stores: the live block is written
+            // now (the guest may read it back), the presenter's stream block when stage 2 gets there, in order
+            // with the frame it belongs to. No drain.
+            auto &regs = runtime->memory().gs();
+            regs.pmode = e.pmode; regs.smode2 = e.smode2; regs.dispfb1 = e.dispfb; regs.display1 = e.display;
+            regs.dispfb2 = e.dispfb; regs.display2 = e.display; regs.bgcolor = e.bgcolor;
+            PS2Memory::KickJob j; j.kind = PS2Memory::KickJob::GsApply;
+            j.fn = [e]()
+            {
+                ps2x_pgs::streamPriv(0x00u, e.pmode);   ps2x_pgs::streamPriv(0x20u, e.smode2);
+                ps2x_pgs::streamPriv(0x70u, e.dispfb);  ps2x_pgs::streamPriv(0x80u, e.display);
+                ps2x_pgs::streamPriv(0x90u, e.dispfb);  ps2x_pgs::streamPriv(0xA0u, e.display);
+                ps2x_pgs::streamPriv(0xE0u, e.bgcolor);
+                ps2xGsDisplayFlipHook(e.dispfb);   // [displatch]
+            };
+            runtime->memory().enqueueKickJob(std::move(j));
+            return;
+        }
         applyGsOnStream(runtime, [runtime, e]()
         {
             auto &regs = runtime->memory().gs();

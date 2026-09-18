@@ -2,6 +2,7 @@
 #include "runtime/ps2_guestprof.h"
 #include <cstdio>
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_armed_atomic.h"   // [tracearm]
 #include <cstring>
 #include <cmath>
 #include <chrono>
@@ -746,7 +747,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                                 std::fprintf(stderr, "[upsrc2] SHEET payload found in RAM at 0x%08x (qwc=%u)\n", a, qwCount);
                                 // [sheetwriters] aim the global store-watch at THIS run's staging buffer:
                                 // next frame's rebuild reports its writer pcs as [camwrite].
-                                extern std::atomic<uint32_t> g_ps2WatchLo, g_ps2WatchHi;
+                                extern Ps2ArmedAtomic<uint32_t> g_ps2WatchLo, g_ps2WatchHi;   // [tracearm]
                                 g_ps2WatchLo.store(a, std::memory_order_relaxed);
                                 g_ps2WatchHi.store(a + 0x80u, std::memory_order_relaxed);
                                 std::fprintf(stderr, "[upsrc2] store-watch re-aimed to 0x%08x..0x%08x\n", a, a + 0x80u);

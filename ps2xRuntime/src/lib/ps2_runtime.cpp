@@ -301,8 +301,9 @@ static inline bool ps2xTraceEnabled()
 // function that writes the battle camera-target vector.
 extern "C" { extern unsigned long long g_rlglDrawCalls, g_rlglBatchFlushes; extern double g_rlglFlushNs; }   // [glcalls] raylib rlgl batch counters (patched rlgl.h)
 extern "C" { extern unsigned long long g_rlglVbRingWaits, g_rlglVbRingWraps, g_rlglVbRingMvpSkips; extern int g_rlglVbRingOn; }   // [vbring]
-std::atomic<uint32_t> g_ps2WatchLo{0};
-std::atomic<uint32_t> g_ps2WatchHi{0};
+std::atomic<uint32_t> g_ps2TraceArmed{0};   // [tracearm]
+Ps2ArmedAtomic<uint32_t> g_ps2WatchLo{0};
+Ps2ArmedAtomic<uint32_t> g_ps2WatchHi{0};
 std::atomic<uint32_t> g_ps2WatchAll{0};
 uint8_t *g_ps2WatchRdram = nullptr;   // [wispsrc] guest RAM base (set at bind) for ps2WatchReport
 void ps2WatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
@@ -413,7 +414,7 @@ void ps2WatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_
 std::atomic<uint32_t> g_watchReportN{0};
 uint32_t g_txBad[8] = {}; // texwatch: stale-copy addresses to skip on rescan
 int g_txBadN = 0;
-std::atomic<uint32_t> g_ps2ValueWatch{0};
+Ps2ArmedAtomic<uint32_t> g_ps2ValueWatch{0};
 std::atomic<uint32_t> g_bt3FillObj{0};
 std::atomic<uint32_t> g_bt3DrawMethod{0};
 void ps2ValueWatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo,

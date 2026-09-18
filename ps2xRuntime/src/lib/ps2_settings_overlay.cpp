@@ -394,6 +394,8 @@ void PS2SettingsOverlay::initialize()
     // overlay is opened for the first time (m_deviceList is otherwise only populated
     // when the overlay opens via resetCaptureState/buildDeviceList).
     buildDeviceList();
+    if (m_selectedDevice > 0) applyDeviceToPlayer(0, m_selectedDevice);   // [paddev] legacy single ini index = P1's
+    m_selectedDevice = deviceIndexForPlayer(m_editPlayer);
     // Apply all loaded settings (glow, volume, etc.) at startup.
     applySettings();
     // Snapshot the persisted settings so shutdown() only rewrites the ini when the
@@ -458,6 +460,7 @@ void PS2SettingsOverlay::resetCaptureState()
     m_prevBtnDown = {};
     m_prevAxis = {};
     buildDeviceList();
+    m_selectedDevice = deviceIndexForPlayer(m_editPlayer);   // [paddev]
 }
 
 void PS2SettingsOverlay::toggleVisible()
@@ -465,9 +468,11 @@ void PS2SettingsOverlay::toggleVisible()
     m_visible = !m_visible;
     ps2_stubs::PadConfig::setInputSuspended(m_visible);
     if (m_visible)
-    {
-        saveSettings();
         resetCaptureState();
+    else
+    {   // [noapply] closing = save (settings + per-action bindings)
+        saveSettings();
+        ps2_stubs::PadConfig::instance().save();
     }
 }
 
@@ -731,7 +736,7 @@ void PS2SettingsOverlay::saveSettings() const
     os << "offset_right = " << fmtInt(m_settings.hudOffR) << "\n\n";
 
     os << "[controllers]\n";
-    os << "device = " << fmtInt(m_selectedDevice) << "\n";
+    os << "device = " << fmtInt(deviceIndexForPlayer(0)) << "\n";   // [paddev] P1 (the launcher has one picker)
     os << "deadzone = " << fmtDbl(m_settings.deadzone) << "\n";
     os << "overlay_enabled = " << fmtBool(m_settings.overlayEnabled) << "\n\n";
 
@@ -831,32 +836,9 @@ void PS2SettingsOverlay::applySettings()
     pushHudLayout(m_settings);
     applyDeadzone();
 
-    // Apply selected device to PadConfig
-    if (m_selectedDevice >= 0 && m_selectedDevice < static_cast<int>(m_deviceList.size()))
-    {
-        auto &dev = m_deviceList[m_selectedDevice];
-        auto &pcfg = ps2_stubs::PadConfig::instance();
-        for (size_t p = 0; p < ps2_stubs::PadConfig::kPlayerCount; ++p)
-        {
-            auto cfg = pcfg.snapshot(p);
-            // Persist the launcher's index convention ("Gamepad N"), never the raw
-            // GLFW slot: the slot layout (1 for the Xbox here) != what pad_pN.conf
-            // names, and a bare slot made pad_pN.conf point at a dead controller.
-            int idx = ps2_stubs::padGamepadIndex(dev.glfwSlot);
-            if (dev.kind == ps2_stubs::PadDeviceKind::Gamepad && idx < 0)
-            {
-                continue; // slot not (yet) a controller; leave the player alone
-            }
-            if (cfg.device.kind != dev.kind)
-            {   // [padbinds] a different KIND of device gets that kind's default bindings (keyboard keys vs
-                // gamepad buttons) instead of the old ones, which no longer refer to anything on it
-                pcfg.setPlayerDefaults(p, dev.kind);
-                pcfg.setDevice(p, ps2_stubs::PadDevice{dev.kind, idx});
-            }
-            else if (cfg.device.gamepad != idx)
-                pcfg.setDevice(p, ps2_stubs::PadDevice{dev.kind, idx});
-        }
-    }
+    // [paddev] The Device combo is applied per player from the Controllers tab (applyDeviceToPlayer); it used
+    // to be applied to EVERY player here -- picking a pad for P2 rebound P1 as well, and each boot re-applied
+    // the single ini index over pad_pN.conf. At startup only P1 follows the ini's legacy `device` index.
 
     // Dump current settings whenever they're applied.
     dumpSettingsToFile();
@@ -867,7 +849,7 @@ void PS2SettingsOverlay::buildDeviceList()
     m_deviceList.clear();
 
     // 0: Auto (Any)
-    m_deviceList.push_back({"Auto (Any gamepad + keyboard)", -1, false, ps2_stubs::PadDeviceKind::None});
+    m_deviceList.push_back({"Auto (gamepads in order, keyboard fallback)", -1, false, ps2_stubs::PadDeviceKind::None});
 
     // 1: Keyboard
     m_deviceList.push_back({"Keyboard", -1, false, ps2_stubs::PadDeviceKind::Keyboard});
@@ -916,6 +898,42 @@ void PS2SettingsOverlay::buildDeviceList()
     // Clamp selection
     if (m_selectedDevice < 0 || m_selectedDevice >= static_cast<int>(m_deviceList.size()))
         m_selectedDevice = 0;
+}
+
+int PS2SettingsOverlay::deviceIndexForPlayer(int player) const
+{   // [paddev]
+    if (player < 0 || player >= (int)ps2_stubs::PadConfig::kPlayerCount) return 0;
+    const auto cfg = ps2_stubs::PadConfig::instance().snapshot((size_t)player);
+    if (cfg.device.kind == ps2_stubs::PadDeviceKind::None) return 0;
+    for (int i = 0; i < (int)m_deviceList.size(); ++i)
+    {
+        const auto &d = m_deviceList[i];
+        if (d.kind != cfg.device.kind) continue;
+        if (d.kind == ps2_stubs::PadDeviceKind::Keyboard) return i;
+        if (ps2_stubs::padGamepadIndex(d.glfwSlot) == cfg.device.gamepad) return i;
+    }
+    return 0;   // assigned pad not present right now: show Auto rather than someone else's device
+}
+
+void PS2SettingsOverlay::applyDeviceToPlayer(int player, int devIdx)
+{   // [paddev]
+    if (player < 0 || player >= (int)ps2_stubs::PadConfig::kPlayerCount) return;
+    if (devIdx < 0 || devIdx >= (int)m_deviceList.size()) return;
+    const auto &dev = m_deviceList[devIdx];
+    auto &pcfg = ps2_stubs::PadConfig::instance();
+    const size_t p = (size_t)player;
+    const auto cfg = pcfg.snapshot(p);
+    // Persist the launcher's index convention ("Gamepad N"), never the raw slot: the slot layout != what
+    // pad_pN.conf names, and a bare slot made pad_pN.conf point at a dead controller.
+    const int idx = ps2_stubs::padGamepadIndex(dev.glfwSlot);
+    if (dev.kind == ps2_stubs::PadDeviceKind::Gamepad && idx < 0) return;   // slot not (yet) a controller
+    if (cfg.device.kind != dev.kind)
+    {   // [padbinds] a different KIND of device gets that kind's default bindings
+        pcfg.setPlayerDefaults(p, dev.kind);
+        pcfg.setDevice(p, ps2_stubs::PadDevice{dev.kind, idx});
+    }
+    else if (cfg.device.gamepad != idx)
+        pcfg.setDevice(p, ps2_stubs::PadDevice{dev.kind, idx});
 }
 
 void PS2SettingsOverlay::readGamepadStateForDevice(
@@ -1058,15 +1076,13 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
         m_prevToggleCombo = comboDown;
     }
 
-    // Apply GPU/audio settings on change
+    // [noapply] Every change applies in full the moment it is made (this used to apply only volume /
+    // renderer / glow here and leave the rest to an Apply button, so some switches worked instantly and
+    // others waited). Settings are written to the ini when the overlay closes and at shutdown; the
+    // startup-only items (renderer, glow fix, OpenGL render scale) say so next to their controls.
     if (m_dirty)
     {
-        PS2AudioBackend::setMasterVolume(m_settings.masterVolume);
-        PS2AudioBackend::setMusicVolume(m_settings.musicVolume);
-        PS2AudioBackend::setSfxVolume(m_settings.sfxVolume);
-        m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);   // [renderer]
-        GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
-        GsGpuRenderer::setGlow(m_settings.glow);
+        applySettings();
         m_dirty = false;
     }
 
@@ -1218,22 +1234,7 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
                 ImGui::TextUnformatted(hint);
             }
 
-            ImGui::SameLine(ImGui::GetWindowWidth() - 170);
-            {
-                ScopedStyleColor c0(ImGuiCol_Button, dbz(0.15f, 0.30f, 0.55f));
-                ScopedStyleColor c1(ImGuiCol_ButtonHovered, dbz(0.20f, 0.40f, 0.70f));
-                ScopedStyleColor c2(ImGuiCol_ButtonActive, dbz(0.18f, 0.35f, 0.60f));
-                if (ImGui::Button("Apply", ImVec2(64, 0)))
-                    applySettings();
-            }
-            ImGui::SameLine();
-            {
-                ScopedStyleColor c0(ImGuiCol_Button, dbz(0.45f, 0.12f, 0.10f));
-                ScopedStyleColor c1(ImGuiCol_ButtonHovered, dbz(0.60f, 0.16f, 0.12f));
-                ScopedStyleColor c2(ImGuiCol_ButtonActive, dbz(0.50f, 0.14f, 0.11f));
-                if (ImGui::Button("Close", ImVec2(64, 0)))
-                    m_visible = false;
-            }
+            // [noapply] no Apply / Close buttons: changes apply as they are made, the hotkey closes and saves
         }
 
         // Bindings / Overlay-settings sub-window (opened from the Controllers tab).
@@ -1323,29 +1324,10 @@ void PS2SettingsOverlay::drawVideoTab()
     ImGui::TextDisabled("Takes full effect after restart.");
     if (toggleSwitch("Cel Outline", &m_settings.outline))
         m_dirty = true;
-    {   // [texreplace] Only offer the switch when a pack is actually indexed -- PS2X_TEXREPLACE
-        // points at the directory, and with no pack the toggle would do nothing and read as broken.
-        const bool havePack = ps2tex::replacementsEnabled();
-        if (!havePack) ImGui::BeginDisabled();
-        if (toggleSwitch("Texture Replacement", &m_settings.texPack))
-        {   // Applies LIVE: setTexPack flushes the texture cache so everything re-decodes.
-            GsGpuRenderer::setTexPack(m_settings.texPack);
-            ps2x_pgs::setPackEnabled(m_settings.texPack);   // [pgslive] backend: hook gated + cached textures dropped
-            m_dirty = true;
-        }
-        if (!havePack)
-        {
-            ImGui::EndDisabled();
-            ImGui::TextDisabled("Set PS2X_TEXREPLACE=<dir> to enable.");
-        }
-    }
-    if (toggleSwitch("60 FPS (experimental)", &m_settings.fps60))
-    {   // [fps60] step 1 + the pacing table; the runtime applies it between fights, never mid-fight
-        ps2Set60Fps(m_settings.fps60, nullptr);
-        m_dirty = true;
-    }
     if (m_settings.outline)
-    {   // [inkstrength] how hard the outline darkener subtracts. 199% is the exact GS
+    {   // the ink controls belong to the outline: shown under it, only while it is on
+        ImGui::Indent(12.0f);
+        // [inkstrength] how hard the outline darkener subtracts. 199% is the exact GS
         // strength (it divides Ad by 128 where GL divides by 255); 100% is the old,
         // washed-out line. Applies live -- it is a single shader uniform.
         ImGui::Text("Ink Strength");
@@ -1386,6 +1368,28 @@ void PS2SettingsOverlay::drawVideoTab()
                 ImGui::TextDisabled("Exact on light backgrounds; darker scenes tint toward it (paraLLEl-GS only).");
             }
         }
+        ImGui::Unindent(12.0f);
+    }
+    {   // [texreplace] Only offer the switch when a pack is actually indexed -- PS2X_TEXREPLACE
+        // points at the directory, and with no pack the toggle would do nothing and read as broken.
+        const bool havePack = ps2tex::replacementsEnabled();
+        if (!havePack) ImGui::BeginDisabled();
+        if (toggleSwitch("Texture Replacement", &m_settings.texPack))
+        {   // Applies LIVE: setTexPack flushes the texture cache so everything re-decodes.
+            GsGpuRenderer::setTexPack(m_settings.texPack);
+            ps2x_pgs::setPackEnabled(m_settings.texPack);   // [pgslive] backend: hook gated + cached textures dropped
+            m_dirty = true;
+        }
+        if (!havePack)
+        {
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Set PS2X_TEXREPLACE=<dir> to enable.");
+        }
+    }
+    if (toggleSwitch("60 FPS (experimental)", &m_settings.fps60))
+    {   // [fps60] step 1 + the pacing table; the runtime applies it between fights, never mid-fight
+        ps2Set60Fps(m_settings.fps60, nullptr);
+        m_dirty = true;
     }
     if (toggleSwitch("Character Shadows", &m_settings.shadows))
         m_dirty = true;
@@ -1435,11 +1439,9 @@ void PS2SettingsOverlay::drawVideoTab()
     if (toggleSwitch("Fullscreen", &m_settings.fullscreen))
     {
         ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
-        // [builtin-res] the internal render scale follows the resolution: 720p=1x,
-        // 1080p=2x, 1440p+=3x. Derive it from the current screen in fullscreen.
-        const int h = bt3GetScreenHeight();
-        m_settings.renderScale = ps2xRenderScaleForHeight(h);
-        if (!envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive]
+        // The [builtin-res] block that derived the render scale from the screen height on this toggle
+        // is gone on purpose: upstream turned the render scale into its own setting again (see the
+        // [rscale] block below), because deriving it meant a 1080p window could never render at 1x or 4x.
         m_dirty = true;
     }
     if (toggleSwitch("Widescreen (true FOV)", &m_settings.widescreen))
@@ -1472,6 +1474,24 @@ void PS2SettingsOverlay::drawVideoTab()
             ImGui::TextDisabled("note: in stretched layouts the damage flash can briefly show at both bar ends");
     }
 
+    {   // [rscale] Internal resolution, its own setting again (2026-09-17): it used to be derived from the
+        // window size (720p=1x, 1080p=2x, 1440p+=3x), so a 1080p window could never render at 1x or 4x.
+        // paraLLEl-GS re-creates the backend live at 1/4/8/16 samples per pixel; OpenGL applies on restart.
+        static const char *kScales[] = {"Native (1x)", "2x", "3x", "4x"};
+        int rsIdx = std::clamp(m_settings.renderScale, 1, 4) - 1;
+        ImGui::TextUnformatted("Internal Resolution");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        if (ImGui::Combo("##renderscale", &rsIdx, kScales, 4))
+        {
+            m_settings.renderScale = rsIdx + 1;
+            ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive] (the combo outranks a launcher SSAA once touched)
+            m_dirty = true;
+        }
+        if (m_settings.renderer == 2)
+            ImGui::TextDisabled("paraLLEl-GS: 1x / 2x / 3x / 4x = 1 / 4 / 8 / 16 samples per pixel, applies live.");
+        else if (m_settings.renderScale != GsGpuRenderer::renderScale())
+            ImGui::TextDisabled("(applies on restart)");
+    }
     // Window-size presets. The projection FOV follows the window aspect (see [truews]
     // in ps2_runtime.cpp), so wider windows genuinely show more stage.
     {
@@ -1500,10 +1520,6 @@ void PS2SettingsOverlay::drawVideoTab()
                     bt3SetWindowSize(kRes[i][0], kRes[i][1]);
                     m_settings.windowW = kRes[i][0];
                     m_settings.windowH = kRes[i][1];
-                    // [builtin-res] the internal render scale is built into the resolution:
-                    // 720p=1x, 1080p=2x, 1440p+=3x. paraLLEl-GS replays live at the new SSAA.
-                    m_settings.renderScale = ps2xRenderScaleForHeight(kRes[i][1]);
-                    if (!envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive]
                     m_dirty = true;
                 }
             }
@@ -1527,7 +1543,8 @@ void PS2SettingsOverlay::drawControllersTab()
         ImGui::SameLine(90);
         ImGui::SetNextItemWidth(110);
         const char *playerNames[] = {"P1", "P2"};
-        ImGui::Combo("##player", &m_editPlayer, playerNames, 2);
+        if (ImGui::Combo("##player", &m_editPlayer, playerNames, 2))
+            m_selectedDevice = deviceIndexForPlayer(m_editPlayer);   // [paddev] show THIS player's device, not the last pick
     }
 
     // Device
@@ -1541,8 +1558,11 @@ void PS2SettingsOverlay::drawControllersTab()
         if (!labels.empty() &&
             ImGui::Combo("##device", &m_selectedDevice, labels.data(), static_cast<int>(labels.size())))
         {
-            applySettings();
+            applyDeviceToPlayer(m_editPlayer, m_selectedDevice);   // [paddev] this player only
+            m_dirty = true;
         }
+        ImGui::TextDisabled(m_editPlayer == 0 ? "Auto: the first gamepad, or the keyboard if none is plugged in."
+                                              : "Auto: the second gamepad, or the keyboard if there is only one.");
     }
 
     // Deadzone
@@ -1704,38 +1724,16 @@ void PS2SettingsOverlay::drawControllersTab()
     sectionHeader("GAMEPAD TEST");
     drawGamepadTestArea(curBtnDown, curAxis);
 
-    // --- Apply / Save / Reload buttons ---
+    // --- Reload (re-scan devices) ---
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-
-    const float totalW = 100.0f * 3 + 12 * 2;
-    ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x / 2.0f - totalW / 2.0f);
-
+    ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x / 2.0f - 50.0f);
     ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.30f, 0.30f, 0.36f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.40f, 0.40f, 0.46f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, dbz(0.35f, 0.35f, 0.40f));
-    if (ImGui::Button("Reload", ImVec2(100, 30)))
+    if (ImGui::Button("Reload devices", ImVec2(100, 30)))
         resetCaptureState();
-    ImGui::PopStyleColor(3);
-
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.15f, 0.30f, 0.55f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.20f, 0.40f, 0.70f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, dbz(0.18f, 0.35f, 0.60f));
-    if (ImGui::Button("Apply", ImVec2(100, 30)))
-        applySettings();
-    ImGui::PopStyleColor(3);
-
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.15f, 0.45f, 0.25f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.20f, 0.55f, 0.32f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, dbz(0.18f, 0.50f, 0.28f));
-    if (ImGui::Button("Save", ImVec2(100, 30)))
-    {
-        applySettings();
-        saveSettings();
-    }
     ImGui::PopStyleColor(3);
 
     ImGui::Spacing();
@@ -1956,23 +1954,14 @@ void PS2SettingsOverlay::drawBindingsPopup()
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(1.00f, 0.62f, 0.10f, 0.18f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, dbz(1.00f, 0.62f, 0.10f, 0.30f));
         if (ImGui::Button("Close", ImVec2(100, 30)))
+        {   // [noapply] closing the popup saves: settings + per-action bindings (pad.conf), so bindings
+            // edited here survive a restart and reach the Qt launcher's Bindings tab.
             m_showBindingsPopup = false;
-        ImGui::PopStyleColor(3);
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button, accent(0.85f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, accent());
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, gold());
-        ImGui::PushStyleColor(ImGuiCol_Text, dbz(0.05f, 0.03f, 0.01f));
-        if (ImGui::Button("Save", ImVec2(100, 30)))
-        {
             applySettings();
             saveSettings();
-            // [launcher] persist per-action bindings too (pad.conf), not just the
-            // overlay-side cfg: bindings edited here must survive a restart and be
-            // visible to the Qt launcher's Bindings tab.
             ps2_stubs::PadConfig::instance().save();
         }
-        ImGui::PopStyleColor(4);
+        ImGui::PopStyleColor(3);
 
         ImGui::EndPopup();
     }
@@ -2012,9 +2001,10 @@ void PS2SettingsOverlay::drawNetplayTab()
                       bt == 2 ? " / " : "", (bt == 2 && dp >= 0 && dp < 3) ? dn[dp] : "",
                       (tl >= 0 && tl < 5) ? tn[tl] : "?"); }
         if (ps2NetAutoJump()) ImGui::TextUnformatted("Will jump to character select on connect.");
+        // [rollback] not shipped: the connected view says nothing about it unless a developer turned it on
+        // through the environment (then the line is true and worth seeing).
         if (ps2NetRollbackWindow()) ImGui::Text("Rollback window: %u frames%s", ps2NetRollbackWindow(),
                                                 ps2NetSyncPending() ? "   |   state sync in progress..." : (ps2NetSyncOn() ? "   |   state synced" : ""));
-        else ImGui::TextUnformatted("Lockstep (no rollback)");
         ImGui::Separator();
         if (ImGui::Button("Disconnect"))
             ps2NetDisconnect("overlay");
@@ -2031,22 +2021,13 @@ void PS2SettingsOverlay::drawNetplayTab()
     static int  s_time = 3;
     static int  s_dp = 0;          // DP Battle budget: 0 = 10 DP, 1 = 15, 2 = 20
     static bool s_jump = true;
-    static int  s_rollback = ps2NetRollbackSetting();   // [rollback] env default, 0 = lockstep
-    static bool s_sync = ps2NetSyncSetting();            // [statesync]
-    const bool syncLive = s_sync && s_rollback > 0;
+    // [rollback] The rollback window and state-sync controls are hidden until rollback ships (2026-09-17):
+    // netplay is lockstep. The environment defaults (PS2X_NETROLLBACK / state sync) still reach the
+    // connect calls below, so developers can keep testing without the UI advertising it.
+    static int  s_rollback = ps2NetRollbackSetting();
+    static bool s_sync = ps2NetSyncSetting();
     ImGui::Checkbox("Go to character select once connected", &s_jump);
-    if (syncLive) ImGui::TextDisabled("The HOST's choice applies to both. Both sides jump, then the host's state is synced into the joiner.");
-    else          ImGui::TextDisabled("The HOST's choice applies to both; the menus are hidden while it happens.");
-    ImGui::Separator();
-    ImGui::SliderInt("Rollback window (frames)", &s_rollback, 0, 30);
-    ImGui::TextDisabled("0 = lockstep (every frame waits for the peer's input). 4-8 = rollback: a missing input is");
-    ImGui::TextDisabled("predicted and the game rewinds when the real one differs. Needs PS2X_FIBERS=1.");
-    if (s_rollback > 0)
-    {
-        ImGui::Checkbox("Sync game state on connect", &s_sync);
-        ImGui::TextDisabled("The host sends its game state (40 MB) to the joiner, so both play the same match from");
-        ImGui::TextDisabled("wherever the host is. Connect while both are on the same screen (title or main menu).");
-    }
+    ImGui::TextDisabled("The HOST's choice applies to both; the menus are hidden while it happens.");
     ImGui::Separator();
     // Only Join uses the address: hosting binds the port and learns the peer from its first
     // packet, which is why only one side needs a reachable port.

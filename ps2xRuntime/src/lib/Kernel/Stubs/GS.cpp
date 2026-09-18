@@ -1497,6 +1497,28 @@ namespace ps2_stubs
     {
         int32_t mode = static_cast<int32_t>(getRegU32(ctx, 4));
         auto &mem = runtime->memory();
+        {   // [syncsite] PS2X_SYNCSITE=1: who calls sceGsSyncPath, how often, with what mode -- the fence
+            // here is the whole remaining serialization of the 60 fps fight on the i5-12400 (2026-09-17),
+            // and whether it can be relaxed depends on what each caller does right after it.
+            static const bool s_on = [](){ const char *v = std::getenv("PS2X_SYNCSITE"); return v && v[0] && v[0] != '0'; }();
+            if (s_on)
+            {
+                static std::map<uint64_t, unsigned long> s_hist;   // (ra << 8 | mode) -> calls
+                static unsigned long s_calls = 0;
+                static auto s_t0 = std::chrono::steady_clock::now();
+                ++s_hist[((uint64_t)getRegU32(ctx, 31) << 8) | (uint64_t)(mode & 0xFF)];
+                ++s_calls;
+                const auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(now - s_t0).count() >= 5.0)
+                {
+                    std::fprintf(stderr, "[syncsite] %.1f calls/s:", s_calls / 5.0);
+                    for (auto &kv : s_hist)
+                        std::fprintf(stderr, " ra=0x%llx mode=%llu x%lu", (unsigned long long)(kv.first >> 8), (unsigned long long)(kv.first & 0xFF), kv.second);
+                    std::fprintf(stderr, "\n");
+                    s_hist.clear(); s_calls = 0; s_t0 = now;
+                }
+            }
+        }
 
         if (mode == 0)
         {
@@ -1511,7 +1533,7 @@ namespace ps2_stubs
             // [syncrelax] ...unless the frame gate is engaged: then the gate paces, the busy bit reads idle
             // (see readIORegister) and the guest may run ahead of the worker -- see ps2xAsyncPaceRelaxed.
             if (!ps2xAsyncPaceRelaxedForStubs())
-                fenceAsyncKickForGsAccess(runtime, WP_FENCE_SYNCPATH);
+                fenceAsyncKickForGsAccess(runtime, WP_FENCE_SYNCPATH, /*stage1Only=*/true);   // [s1fence] a no-op flag unless that mode is on
 
             uint32_t count = 0;
             constexpr uint32_t kTimeout = 0x1000000;

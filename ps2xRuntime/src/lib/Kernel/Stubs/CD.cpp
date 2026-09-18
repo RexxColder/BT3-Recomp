@@ -7,6 +7,8 @@
 #include "CD.h"
 #include "MPEG.h"
 
+std::atomic<uint64_t> g_cdLoadReads{0}, g_cdLoadBytes{0};   // [cdload] sceCdRead requests + bytes since the last report (game_overrides.cpp prints)
+
 namespace ps2_stubs
 {
 
@@ -94,6 +96,7 @@ namespace ps2_stubs
         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
         const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
         const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
+        g_cdLoadReads.fetch_add(1u, std::memory_order_relaxed); g_cdLoadBytes.fetch_add((uint64_t)a1 * kCdSectorSize, std::memory_order_relaxed);   // [cdload]
         {
             static std::atomic<uint32_t> s_cdrd{0};
             if (s_cdrd.fetch_add(1) < 40u)

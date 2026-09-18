@@ -44,6 +44,7 @@ private:
     QSlider *m_offL = nullptr, *m_offC = nullptr, *m_offR = nullptr;
     QLabel *m_offLVal = nullptr, *m_offCVal = nullptr, *m_offRVal = nullptr;
     QComboBox *m_winSize = nullptr;
+    QComboBox *m_renderScale = nullptr;   // [rscale]
 
     QWidget *makeTogglePair(const QString &label, QCheckBox **cb);
 };

@@ -33,6 +33,8 @@ bool ps2xGsRegionDrawnSinceWrite(const GS *gs, uint32_t bp, uint32_t bw, uint8_t
 extern float g_ps2xWsHudInv;   // [wshud] per-frame HUD squeeze factor from the present (1.0 = off), ps2_runtime.cpp
 extern std::atomic<int> g_wsHudLayout;   // overlay: 0 centered, 1 edge-pinned, 2 custom (-1 = unset)
 extern std::atomic<int> g_wsHudOffLQ, g_wsHudOffCQ, g_wsHudOffRQ;   // custom offsets x16
+bool ps2FightUpdateRecent();   // ps2_stepcensus.cpp [wshudmenu]: the fight update ran within the last 2 render frames (menus: never)
+
 namespace ps2x_pgs
 {
 static std::atomic<int> g_enabled{-1};
@@ -321,6 +323,7 @@ struct State
     SlowCall slowCalls[3] = {};
     uint32_t slowOver1ms = 0;
     uint64_t streamDispfb1 = 0; bool haveStreamFlip = false;   // the game's DISPFB1 flip, carried in stream order ([displatch] job)
+    uint64_t streamLo[0x10] = {}; uint32_t streamHave = 0;    // [s1fence] the stream-ordered display block (slot = regOff >> 4), bit set once written
     uint64_t streamFlips = 0, flipMismatch = 0, lastFb1 = 0, lastLive1 = 0, lastLive2 = 0;   // [pgsflip] diagnostics
     uint32_t privHist[0x20] = {};   // privileged stores per 16-byte slot since the last stats line (bus + pseudo regs)
     uint64_t pseudoSeen = 0;        // in-stream pseudo A+D registers applied (exclusive mode)
@@ -331,6 +334,10 @@ struct State
 State &st() { static State *s = new State; return *s; }   // leaked on purpose: never destroy the device behind a running thread
 
 bool envOn(const char *name) { const char *v = std::getenv(name); return v && v[0] && v[0] != '0'; }
+}
+extern "C" bool ps2xStage1FenceC();   // [s1fence] ps2_memory.cpp (C linkage, declared inside ps2x_pgs on purpose)
+namespace
+{
 
 void registerThread()
 {   // Granite keys per-thread command pools by a registered index; unregistered threads log an error per call.
@@ -394,6 +401,24 @@ void copyPrivLocked(State &s)
         put(&p.pmode, r->pmode);     put(&p.smode1, r->smode1 ? r->smode1 : 0x0000000740814504ULL);   put(&p.smode2, r->smode2);   // NTSC default when the CRTC was never programmed
         put(&p.srfsh, r->srfsh);     put(&p.synch1, r->synch1);   put(&p.synch2, r->synch2);
         static const bool s_useStream = !envOn("PS2X_PGS_LIVEFLIP");   // PS2X_PGS_LIVEFLIP=1: scan out whatever the bus says right now
+        if (ps2xStage1FenceC())
+        {   // [s1fence] the display block in STREAM order: whichever of the three writers (bus store, display-env
+            // stub, parse pseudo-register) came last IN THE STREAM wins, not whichever thread ran last. Registers
+            // never written on the stream fall back to the live block (boot, before the first frame).
+            auto pick = [&](uint32_t slot, uint64_t live) { return (s.streamHave & (1u << slot)) ? s.streamLo[slot] : live; };
+            const uint64_t pm = pick(0, r->pmode), sm2 = pick(2, r->smode2), fb1 = pick(7, r->dispfb1), d1 = pick(8, r->display1);
+            const uint64_t fb2 = pick(9, r->dispfb2), d2 = pick(10, r->display2), bg = pick(14, r->bgcolor);
+            put(&p.pmode, pm); put(&p.smode2, sm2);
+            if (fb1 != r->dispfb1) s.flipMismatch++;
+            s.lastFb1 = fb1; s.lastLive1 = r->dispfb1; s.lastLive2 = r->dispfb2;
+            put(&p.syncv, r->syncv);     put(&p.dispfb1, fb1);        put(&p.display1, d1);
+            put(&p.dispfb2, fb2);        put(&p.display2, d2);        put(&p.extbuf, r->extbuf);
+            put(&p.extdata, r->extdata); put(&p.extwrite, r->extwrite); put(&p.bgcolor, bg);
+            put(&p.csr, r->csr.load(std::memory_order_relaxed)); put(&p.imr, r->imr); put(&p.busdir, r->busdir);
+            put(&p.siglblid, r->siglblid);
+            s.privLo[0] = pm; s.privLo[2] = sm2; s.privLo[7] = fb1; s.privLo[8] = d1; s.privLo[9] = fb2; s.privLo[10] = d2;   // for the stats line
+            return;
+        }
         const uint64_t fb1 = (s_useStream && s.haveStreamFlip) ? s.streamDispfb1 : r->dispfb1;
         const uint64_t fb2 = (s_useStream && s.haveStreamFlip && r->dispfb2 == r->dispfb1) ? s.streamDispfb1 : r->dispfb2;
         if (fb1 != r->dispfb1) s.flipMismatch++;
@@ -673,7 +698,30 @@ static void wsHudKickLocked(State &s, uint8_t *data, float inv)
         }
         h.rgbaN = 0;
     }
-    if (!h.active || inv >= 0.999f) return;
+    {   // [primlog] PS2X_PGS_PRIMLOG=<swap>: every textured primitive in the top band (y1 < 110) from that swap on --
+        // box, projection type (fst: 1 = UV sprite, 0 = STQ / 3D-projected) -- to compare a menu row at rest vs scrolling.
+        // Placed before the scene/HUD gates on purpose: menus have no 3D-tested scene and the gates close.
+        static const unsigned long long s_from = [](){ const char *v = std::getenv("PS2X_PGS_PRIMLOG"); return v && v[0] ? std::strtoull(v, nullptr, 10) : ~0ull; }();
+        static unsigned s_n = 0;
+        const int np = isSprite ? 2 : (isTri ? 3 : 0);
+        if (np && s.swaps >= s_from && s_n < 1500000u && ((attr >> 4) & 1u) && h.qn >= np)
+        {
+            float bx0 = 1e9f, bx1 = -1e9f, by0 = 1e9f, by1 = -1e9f;
+            for (int i = 0; i < np; i++) { const float x = h.q[i].x / 16.0f - c.ofx, y = h.q[i].y / 16.0f - c.ofy; bx0 = std::min(bx0, x); bx1 = std::max(bx1, x); by0 = std::min(by0, y); by1 = std::max(by1, y); }
+            if (by1 < 110.f && by0 > -10.f && bx1 - bx0 > 4.f)
+            {
+                s_n++;
+                std::fprintf(stderr, "[primlog] swap=%llu prim=%u fst=%d ctx=%u fbp=%u fbw=%u zte=%u ztst=%u z=%u/%u/%u active=%d inv=%.3f box=(%.1f,%.1f)-(%.1f,%.1f) w=%.1f h=%.1f tex0=%llx\n",
+                             (unsigned long long)s.swaps, primType, fst ? 1 : 0, ci, c.fbp, c.fbw, c.zte, c.ztst, h.q[0].z, h.q[1].z, np > 2 ? h.q[2].z : 0u, h.active ? 1 : 0, inv, bx0, by0, bx1, by1, bx1 - bx0, by1 - by0, (unsigned long long)(c.tex0 & 0xFFFFFFFFFFull));
+            }
+        }
+    }
+    // [wshudmenu] the squeeze is for the FIGHT HUD only. The scene gate (h.active) also opens in the character
+    // select, whose 3D model preview counts as a scene, and then the row tiles of the roster (64x64 top-band
+    // strips) were mapped whenever the gate happened to be on -- the row visibly narrowed while it scrolled and
+    // snapped back at rest (user, widescreen). Menus never run the fight update, so gate on it -- on the plain
+    // "ran recently" form: the 60-frame streak gate left the HUD unsqueezed for the fight's first second (user).
+    if (!h.active || inv >= 0.999f || !::ps2FightUpdateRecent()) return;
     if (!(isTri || isSprite)) return;
     if (!(c.fbp == 0u || c.fbp == 112u) || !(c.fpsm == 0u || c.fpsm == 1u)) return;
     const float W = (c.fbw * 64u >= 320u && c.fbw * 64u <= 1024u) ? float(c.fbw * 64u) : 512.0f;
@@ -1529,20 +1577,21 @@ void applyPseudoRegsLocked(State &s, const uint8_t *data, size_t size)
                             // (0x7f23, the value actually presented) lands after it once the kick
                             // queue is drained -- reorder anything on this path and the garbage
                             // reaches the scanout as black and squished frames. Drop it at source.
-                            if (v <= 0xFFFFull) { r->pmode = v; }
+                            if (v <= 0xFFFFull) { r->pmode = v; s.streamLo[0] = v; s.streamHave |= 1u << 0; }
                             s.privHist[0x00 >> 4]++; s.pseudoSeen++; break;
                         case 0x42:
                             // [smode2guard] Same defect on SMODE2, which has four meaningful bits
                             // (INT, FFMD, DPMS). This path writes 0x44 -- bit 6 is undefined -- and
                             // it reaches the scanout as "640x224", i.e. half height. Same reason it
                             // normally stays invisible: the drain lets the real writer land last.
-                            if (v <= 0xFull) { r->smode2 = v; }
+                            if (v <= 0xFull) { r->smode2 = v; s.streamLo[2] = v; s.streamHave |= 1u << 2; }
                             s.privHist[0x20 >> 4]++; s.pseudoSeen++; break;
-                        case 0x59: r->dispfb1 = v; s.privHist[0x70 >> 4]++; s.pseudoSeen++; break;
-                        case 0x5a: r->display1 = v; s.privHist[0x80 >> 4]++; s.pseudoSeen++; break;
-                        case 0x5b: r->dispfb2 = v; s.privHist[0x90 >> 4]++; s.pseudoSeen++; break;
-                        case 0x5c: r->display2 = v; s.privHist[0xA0 >> 4]++; s.pseudoSeen++; break;
-                        case 0x5f: r->bgcolor = v; s.privHist[0xE0 >> 4]++; s.pseudoSeen++; break;
+                        // [s1fence] the parse runs on stage 2, so its writes are stream-ordered by construction: stamp the block too
+                        case 0x59: r->dispfb1 = v;  s.streamLo[7] = v;  s.streamHave |= 1u << 7;  s.privHist[0x70 >> 4]++; s.pseudoSeen++; break;
+                        case 0x5a: r->display1 = v; s.streamLo[8] = v;  s.streamHave |= 1u << 8;  s.privHist[0x80 >> 4]++; s.pseudoSeen++; break;
+                        case 0x5b: r->dispfb2 = v;  s.streamLo[9] = v;  s.streamHave |= 1u << 9;  s.privHist[0x90 >> 4]++; s.pseudoSeen++; break;
+                        case 0x5c: r->display2 = v; s.streamLo[10] = v; s.streamHave |= 1u << 10; s.privHist[0xA0 >> 4]++; s.pseudoSeen++; break;
+                        case 0x5f: r->bgcolor = v;  s.streamLo[14] = v; s.streamHave |= 1u << 14; s.privHist[0xE0 >> 4]++; s.pseudoSeen++; break;
                         default: break;
                         }
                     }
@@ -1716,6 +1765,16 @@ void streamFlip(uint64_t dispfb1)
     std::lock_guard<std::mutex> lk(s.mtx);
     s.streamDispfb1 = dispfb1; s.haveStreamFlip = true;
     s.streamFlips++;
+}
+
+void streamPriv(uint32_t regOff, uint64_t value)
+{   // [s1fence] GsApply job on stage 2: a display register in stream order (see the header)
+    State &s = st();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    const uint32_t slot = regOff >> 4;
+    if (slot >= 0x10u) return;
+    s.streamLo[slot] = value; s.streamHave |= 1u << slot;
+    if (slot == 7u) { s.streamDispfb1 = value; s.haveStreamFlip = true; }
 }
 
 void setInkColor(uint32_t rgb)

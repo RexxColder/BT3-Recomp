@@ -152,6 +152,10 @@ private:
     void applySettings();
     void applyDeadzone();
     void buildDeviceList();
+    // [paddev] the Device combo edits ONE player: the combo index for the player's current assignment,
+    // and the assignment for a combo index (applied to that player only)
+    int deviceIndexForPlayer(int player) const;
+    void applyDeviceToPlayer(int player, int devIdx);
     void readGamepadStateForDevice(const DeviceInfo &dev,
                                    std::array<uint8_t, 32> &btnDown,
                                    std::array<float, 6> &axis);

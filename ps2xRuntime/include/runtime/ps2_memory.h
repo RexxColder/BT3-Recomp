@@ -330,8 +330,13 @@ public:
     // [vu1pipe] second stage of the kick pipeline (PS2X_VU1PIPE=1): the kick worker keeps VIF unpack + VU1 execution
     // and hands every GIF packet, frame swap, register apply and end-of-job marker to this thread IN STREAM ORDER;
     // it owns the GS state, VRAM and the draw list exactly as the worker did. Drains cover both stages.
-    struct Stage2Item { uint8_t kind = 0; uint8_t chan = 0; std::vector<GifArbiterPacket> pkts; std::function<void()> fn; };   // kind 0 packets, 1 swap, 2 apply, 3 job end
+    struct Stage2Item { uint8_t kind = 0; uint8_t chan = 0; GifArbiterBatch batch; std::function<void()> fn; };   // kind 0 packets, 1 swap, 2 apply, 3 job end
     static bool vu1PipeEnabled();
+    // [s1fence] DEFAULT ON (PS2X_S1FENCE=0 disables): sceGsSyncPath fences STAGE 1 ONLY (guest RAM is consumed once the worker ran the
+    // job; the GS-side work keeps flowing on stage 2), the channel-busy bit is released at stage-1 job end, every
+    // guest-thread GIF submission and privileged display-register store travels the kick queue in stream order,
+    // and the paraLLEl-GS presenter scans out from the stream-ordered display block. Needs [vu1pipe] + paraLLEl-GS.
+    static bool stage1FenceEnabled();
     void stage2Push(Stage2Item &&item);
     void stage2FlushArbiter();
     void arbiterDrainOrHandoff();
@@ -380,8 +385,9 @@ public:
     // Enqueue the GPU frame-boundary publish (GsGpuRenderer::swapFrame) so it lands in
     // stream order between this frame's and next frame's kick jobs.
     void enqueueGpuSwapMarker();
-    // Block until the worker has consumed and finished every queued job (fence).
-    void drainKickQueue();
+    // Block until the worker has consumed and finished every queued job (fence). stage1Only: do not wait for
+    // stage 2 ([s1fence]; VRAM readbacks must never pass true).
+    void drainKickQueue(bool stage1Only = false);
 
     int pollDmaRegisters();
 

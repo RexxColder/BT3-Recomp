@@ -508,6 +508,7 @@ src/lib/ps2_host_window.cpp  # [B] native HWND from raylib's window handle (SDL 
     src/lib/ps2_interp.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/ps2_vu1.cpp
+    src/lib/ps2_vu1_native.cpp   # [vunative] hand-written kernels for the hot VU1 microprograms
     src/lib/games_database.cpp
 )
 

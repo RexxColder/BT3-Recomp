@@ -26,6 +26,7 @@
 
 #include "ps2_log.h"
 #include "runtime/ps2_gif_arbiter.h"
+#include "runtime/ps2_armed_atomic.h"   // [tracearm]
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_iop.h"
@@ -233,12 +234,12 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
 // PS2X_CAMPROBE write-watch: when armed (lo!=0), log any guest write whose address
 // falls in [lo,hi) together with the writing ctx->pc. Used to find who writes (or fails
 // to write) the battle camera-target vector. Zero overhead when disarmed.
-extern std::atomic<uint32_t> g_ps2WatchLo;
-extern std::atomic<uint32_t> g_ps2WatchHi;
+extern Ps2ArmedAtomic<uint32_t> g_ps2WatchLo;   // [tracearm] see runtime/ps2_armed_atomic.h
+extern Ps2ArmedAtomic<uint32_t> g_ps2WatchHi;
 // Value-watch: when non-zero, log any guest write whose low 32 bits == this value, with the
 // target address + writing pc. Finds who stores a specific pointer (e.g. 0x103fa3c) that
 // aliases/corrupts a structure. Zero overhead when disarmed.
-extern std::atomic<uint32_t> g_ps2ValueWatch;
+extern Ps2ArmedAtomic<uint32_t> g_ps2ValueWatch;
 void ps2WatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
                     const char *op, const R5900Context *ctx);
 // BT3 HUD debug: the fill (FUN_00227468) publishes the overlay-descriptor object it wrote;
@@ -251,7 +252,7 @@ void ps2ValueWatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo,
                          const char *op, const R5900Context *ctx);
 
 // [stepcensus] per-store-site census (see ps2_stepcensus.cpp); zero cost when off.
-extern std::atomic<int> g_ps2StepCensus;
+extern Ps2ArmedAtomic<int> g_ps2StepCensus;
 void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const R5900Context *ctx);
 void ps2StepCensusEnable(const char *outPath);
 void ps2StepCensusFrame(const R5900Context *ctx);
@@ -278,6 +279,7 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
+    if (g_ps2TraceArmed.load(std::memory_order_relaxed) == 0u) return;   // [tracearm] nothing armed: one load per store
     if (g_ps2StepCensus.load(std::memory_order_relaxed) != 0) ps2StepCensusStore(rdram, guestAddr, size, valueLo, valueHi, ctx);   // [stepcensus]
     const uint32_t _wlo = g_ps2WatchLo.load(std::memory_order_relaxed);
     if (_wlo != 0u)

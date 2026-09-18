@@ -1,8 +1,8 @@
 #include "tab_video.h"
+#include <algorithm>
 
 #include "settings_manager.h"
 
-#include "runtime/ps2_render_scale.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -184,11 +184,14 @@ VideoTab::VideoTab(QWidget *parent)
     root->addWidget(m_hudCustom);
     m_hudCustom->setVisible(s.widescreen() && s.hudLayout() == 2);
 
-    // The internal render scale is built-in: it follows the chosen window size
-    // (720p=1x, 1080p=2x, 1440p+=3x). Re-derive here so a stale INI value from the
-    // old 1x/2x/3x/4x dropdowns cannot outlive its resolution.
-    if (s.windowH() > 0)
-        s.setRenderScale(ps2xRenderScaleForHeight(s.windowH()));
+    // [rscale] Internal resolution is its own setting again (2026-09-17), no longer derived from
+    // the window size: 1x-4x, paraLLEl-GS = 1/4/8/16 samples per pixel. The overlay has the same combo.
+    {
+        QStringList scales = {QStringLiteral("Native (1x)"), QStringLiteral("2x"), QStringLiteral("3x"), QStringLiteral("4x")};
+        const int cur = std::clamp(s.renderScale(), 1, 4) - 1;
+        root->addWidget(comboRow(QStringLiteral("Internal Resolution"), &m_renderScale, scales, cur));
+        root->addWidget(hintRow(QStringLiteral("paraLLEl-GS: 1x / 2x / 3x / 4x = 1 / 4 / 8 / 16 samples per pixel. Independent of the window size.")));
+    }
 
     QStringList winItems = {
         QStringLiteral("1024 x 768 (4:3)"), QStringLiteral("1280 x 720"),
@@ -262,9 +265,10 @@ VideoTab::VideoTab(QWidget *parent)
             SettingsManager::instance().hudOffL(), SettingsManager::instance().hudOffC(), v);
     });
     connect(m_winSize, &QComboBox::currentIndexChanged, this, [](int i) {
-        SettingsManager &s = SettingsManager::instance();
-        s.setWindowSize(kWinW[i], kWinH[i]);
-        s.setRenderScale(ps2xRenderScaleForHeight(kWinH[i]));
+        SettingsManager::instance().setWindowSize(kWinW[i], kWinH[i]);
+    });
+    connect(m_renderScale, &QComboBox::currentIndexChanged, this, [](int i) {
+        SettingsManager::instance().setRenderScale(i + 1);   // [rscale]
     });
 }
 

@@ -8,8 +8,9 @@
 
 // [clwatch] guest write-watch controls (defined in ps2_runtime.cpp) — file scope: a block-scope
 // extern inside the anonymous/named namespace mangles into it and fails to link (3rd occurrence).
-extern std::atomic<uint32_t> g_ps2WatchLo;
-extern std::atomic<uint32_t> g_ps2WatchHi;
+#include "runtime/ps2_armed_atomic.h"   // [tracearm]
+extern Ps2ArmedAtomic<uint32_t> g_ps2WatchLo;
+extern Ps2ArmedAtomic<uint32_t> g_ps2WatchHi;
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
