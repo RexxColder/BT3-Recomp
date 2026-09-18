@@ -13,7 +13,8 @@
 #endif
 
 #include "imgui.h"
-#include "gfx/ps2x_ui.h"   // UiSetup/Begin/End: rlImGui (GL) or imgui_impl_dx11 (PS2X_D3D11)
+#include "gfx/ps2x_ui.h"
+#include "runtime/ps2_video_status.h"   // [video] the status dots   // UiSetup/Begin/End: rlImGui (GL) or imgui_impl_dx11 (PS2X_D3D11)
 #include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 
 #include "runtime/ps2_toml.h"
@@ -1296,6 +1297,41 @@ void PS2SettingsOverlay::drawVideoTab()
     ImGui::Spacing();
 
     // Renderer + Effects (flat, compact — no card borders)
+    // [video] STATUS: what is ACTUALLY running (see runtime/ps2_video_status.h). Green = as configured,
+    // amber = running but downgraded (another renderer, a clamped monitor/resolution, or a change that
+    // needs a restart), red = unavailable. The launcher shows the same four rows as its summary.
+    {
+        sectionHeader("STATUS");
+        const ps2x::VideoStatus vs = ps2x::GetVideoStatus();
+        auto dot = [](ps2x::VideoState st, const char *label, const char *value, const char *note)
+        {
+            const ImVec4 col = st == ps2x::VideoState::Ok       ? ImVec4(0.25f, 0.73f, 0.31f, 1.0f)
+                             : st == ps2x::VideoState::Fallback ? ImVec4(0.82f, 0.60f, 0.13f, 1.0f)
+                                                                : ImVec4(0.97f, 0.32f, 0.29f, 1.0f);
+            ImGui::TextColored(col, "*");   // filled dot; ASCII so it never depends on the font's glyphs
+            ImGui::SameLine(0.0f, 8.0f);
+            ImGui::Text("%-11s %-18s", label, value);
+            ImGui::SameLine(0.0f, 8.0f);
+            ImGui::TextDisabled("%s", note);
+        };
+        char val[128], note[128];
+        dot(vs.renderer, "Renderer", vs.rendererName,
+            vs.renderer == ps2x::VideoState::Fallback ? "fell back to another renderer"
+          : vs.renderer == ps2x::VideoState::Ok       ? "present ok" : "no present");
+        std::snprintf(val, sizeof val, "Monitor %d - %s", vs.monitorIndex + 1, vs.monitorName);
+        std::snprintf(note, sizeof note, "%dx%d @%dHz%s", vs.monitorWidth, vs.monitorHeight, vs.monitorRefresh,
+                      vs.monitorRequested != vs.monitorIndex ? "  (requested monitor missing: clamped)" : "");
+        dot(vs.monitor, "Monitor", val, note);
+        std::snprintf(val, sizeof val, "%dx%d", vs.winW, vs.winH);
+        dot(vs.resolution, "Resolution", val, vs.resolution == ps2x::VideoState::Ok ? "matches the configured window"
+                                                                                    : "does not match (clamped or custom)");
+        std::snprintf(val, sizeof val, "x%d", vs.scaleActive);
+        dot(vs.upscale, "Upscale", val,
+            vs.upscale == ps2x::VideoState::Ok ? "active"
+          : vs.scaleNeedsRestart               ? "applies on restart"
+                                               : "not available (software renderer)");
+    }
+
     sectionHeader("RENDERER");
     {   // [renderer] backend dropdown
         static const char *const kLabels[] = { "OpenGL (New)", "Software rasterizer",
