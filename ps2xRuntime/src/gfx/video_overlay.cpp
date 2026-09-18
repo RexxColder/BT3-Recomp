@@ -19,7 +19,10 @@ namespace ps2x::gfx
             bool Ensure(int w, int h) override
             {
                 if (w <= 0 || h <= 0 || !gl::ContextReady()) return false;
-                if (!m_shader.Compile(gl::Device(), gl::kGlBlitVertexShader, gl::kGlBlitFragmentShader))
+                // [fmvfix] Compile ONCE: Ensure runs every video frame, and Shader::Compile creates a new
+                // program without deleting the old one (a compile+link per frame and a program leak).
+                if (!m_shader.Valid() &&
+                    !m_shader.Compile(gl::Device(), gl::kGlBlitVertexShader, gl::kGlBlitFragmentShader))
                 { std::fprintf(stderr, "[video] blit shader compile failed\n"); return false; }
                 if (!m_tex.Valid() || w != m_w || h != m_h)
                 {

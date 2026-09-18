@@ -1284,9 +1284,9 @@ void PS2SettingsOverlay::drawAudioTab()
     ImGui::TextDisabled("Global output volume.");
 
     sectionHeader("MIXER");
-    volumeSlider("bt3Music", &m_settings.musicVolume);
+    volumeSlider("Music", &m_settings.musicVolume);
     volumeSlider("SFX", &m_settings.sfxVolume);
-    ImGui::TextDisabled("bt3Music = BGM streams. SFX = voices, effects and one-shots.");
+    ImGui::TextDisabled("Music = BGM streams. SFX = voices, effects and one-shots.");
 
     ImGui::Spacing();
 }

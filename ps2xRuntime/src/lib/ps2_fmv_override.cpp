@@ -62,6 +62,10 @@ namespace
     // driven by the native frame counter (one source frame per native frame -> exact sync with the
     // game's playback and its skip). If the native capture stalls, it free-runs on wall time.
     uint64_t g_clockNative = 0;        // last g_fmvCapGen seen
+    // [fmvfix] g_fmvCapGen counts captured movie frames since BOOT and is never reset, so the timeline
+    // must be relative to this movie: frames captured up to the end of the previous session belong
+    // to earlier movies (without this a second movie started its video that many seconds in).
+    uint64_t g_clockBase = 0;
     double g_clockT = 0.0;             // presentation time (seconds) in the video timeline
     std::chrono::steady_clock::time_point g_clockLast;
 
@@ -296,6 +300,7 @@ namespace
         g_queue.clear();
         g_current = Frame{};
         g_eof = false;
+        g_clockBase = g_fmvCapGen;   // [fmvfix] the next movie's timeline starts after this one's frames
         // [fmvoverride] restore the user's Texture Replacement setting for menus/fights.
         if (ps2x_pgs::packMode()) ps2x_pgs::setPackEnabled(GsGpuRenderer::texPackEnabled());
     }
@@ -342,7 +347,7 @@ bool tick(bool movieActive, FmvOverrideFrame &out)
         const uint64_t nf = g_fmvCapGen;
         const double dt = std::chrono::duration<double>(now - g_clockLast).count();
         g_clockLast = now;
-        if (nf != g_clockNative) { g_clockNative = nf; g_clockT = (double)nf / g_fps; }
+        if (nf != g_clockNative) { g_clockNative = nf; g_clockT = (double)(nf - g_clockBase) / g_fps; }
         else g_clockT += (dt > 0.0 && dt < 0.5) ? dt : 0.0;
         static auto s_lastLog = now;
         if (std::chrono::duration<double>(now - s_lastLog).count() >= 5.0)

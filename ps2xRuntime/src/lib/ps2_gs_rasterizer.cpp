@@ -3758,7 +3758,9 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                 if (s_id)
                 {
                     static std::unordered_set<uint32_t> s_seen;
+                    static std::mutex s_seenMx;   // [texfix] reached from the GS thread AND the DecPool workers
                     const uint32_t kk = ((uint32_t)tex0.psm << 24) | ((uint32_t)tex0.tw << 12) | (uint32_t)tex0.th;
+                    std::lock_guard<std::mutex> seenLk(s_seenMx);
                     if (s_seen.size() < 200u && s_seen.insert(kk).second)
                         std::fprintf(stderr, "[texrepdiag] NOTID psm=%u %ux%u tbp0=%u tbw=%u\n",
                                      tex0.psm, 1u << tex0.tw, 1u << tex0.th, tex0.tbp0, tex0.tbw);
