@@ -1,7 +1,7 @@
 # altGL — standalone OpenGL layer and frame present (F3a)
 
 > **Status update (2026-09-17)**: raylib is now **vendored 1:1** in
-> `ps2xRuntime/third_party/raylib/` and compiled by a local target, so it is no longer a dependency;
+> `ps2xRuntime/third_party/bt3gl/` and compiled by a local target, so it is no longer a dependency;
 > the window/input/GL context come from **SDL2** (`PLATFORM_DESKTOP_SDL`, GLFW removed) and the
 > renamed `gsrl` copy is **dormant** (`-DPS2X_USE_GSRL`, OFF). The authoritative write-up is
 > `docs/ALTGL-RAYLIB-REMOVAL.md` (see "Resolution").

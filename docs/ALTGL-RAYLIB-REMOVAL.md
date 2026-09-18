@@ -92,7 +92,7 @@ Planned alternatives (to pick when we resume):
 ## Resolution (2026-09-17): raylib is vendored in-tree, GLFW is gone
 
 The endgame changed: instead of re-implementing rlgl/raylib piece by piece (A2/A3/A4/D), **raylib's
-source tree was vendored 1:1** into `ps2xRuntime/third_party/raylib/` and compiled by our own target
+source tree was vendored 1:1** into `ps2xRuntime/third_party/bt3gl/` and compiled by our own target
 (`VENDORED.md` documents the provenance: upstream 5.5, commit c1ab645, zlib, with
 `patches/raylib-5.5-ps2x.patch` already applied). raylib is no longer a dependency: no FetchContent,
 no patch step, no network. The vendored copy IS our code, and the replay keeps submitting through

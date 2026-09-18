@@ -71,35 +71,35 @@ else()
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
 
-    # [vendor] raylib is VENDORED 1:1 at third_party/raylib (see VENDORED.md): no FetchContent, no
+    # [vendor] raylib is VENDORED 1:1 at third_party/bt3gl (see VENDORED.md): no FetchContent, no
     # patch step (the copy already carries patches/raylib-5.5-ps2x.patch, and its config.h already has
-    # MAX_GAMEPADS=16) and no network at configure time. The target keeps the name `raylib` so every
-    # existing target_link_libraries(... raylib) and ${raylib_SOURCE_DIR} use keeps working.
-    set(raylib_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/raylib")
+    # MAX_GAMEPADS=16) and no network at configure time. The target is named `bt3gl` (our vendored raylib),
+    # so every link and ${bt3gl_SOURCE_DIR} use below is local and patch-free.
+    set(bt3gl_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bt3gl")
 
     # Only what the runtime uses: rcore.c also carries rlgl's implementation (upstream 5.5 layout).
     # rtext.c (fonts: DrawText/TextFormat/GetFontDefault, used by the overlay/UI) and raudio.c (the
     # PS2X_HOSTAUDIO=raylib fallback) are needed as well; rmodels.c is the only module left out.
-    add_library(raylib STATIC
-        "${raylib_SOURCE_DIR}/src/rcore.c"
-        "${raylib_SOURCE_DIR}/src/rshapes.c"
-        "${raylib_SOURCE_DIR}/src/rtextures.c"
-        "${raylib_SOURCE_DIR}/src/rtext.c"
-        "${raylib_SOURCE_DIR}/src/raudio.c"
-        "${raylib_SOURCE_DIR}/src/utils.c")
-    target_include_directories(raylib PUBLIC
-        "${raylib_SOURCE_DIR}/src"
-        "${raylib_SOURCE_DIR}/src/external")
+    add_library(bt3gl STATIC
+        "${bt3gl_SOURCE_DIR}/src/rcore.c"
+        "${bt3gl_SOURCE_DIR}/src/rshapes.c"
+        "${bt3gl_SOURCE_DIR}/src/rtextures.c"
+        "${bt3gl_SOURCE_DIR}/src/rtext.c"
+        "${bt3gl_SOURCE_DIR}/src/raudio.c"
+        "${bt3gl_SOURCE_DIR}/src/utils.c")
+    target_include_directories(bt3gl PUBLIC
+        "${bt3gl_SOURCE_DIR}/src"
+        "${bt3gl_SOURCE_DIR}/src/external")
     # [B] The window/input/GL-context come from SDL2 (platforms/rcore_desktop_sdl.c), not GLFW: GLFW is
     # gone from the build entirely. SDL2 is fetched and built further down for hostio; the window uses
     # the same static build (linked after that block, see PS2X_SDL2_TARGET).
-    target_compile_definitions(raylib PUBLIC PLATFORM_DESKTOP_SDL GRAPHICS_API_OPENGL_33)
+    target_compile_definitions(bt3gl PUBLIC PLATFORM_DESKTOP_SDL GRAPHICS_API_OPENGL_33)
 
     if(WIN32)
-        target_link_libraries(raylib PUBLIC opengl32 winmm)
+        target_link_libraries(bt3gl PUBLIC opengl32 winmm)
     else()
         find_package(OpenGL REQUIRED)
-        target_link_libraries(raylib PUBLIC OpenGL::GL ${CMAKE_DL_LIBS} pthread m)
+        target_link_libraries(bt3gl PUBLIC OpenGL::GL ${CMAKE_DL_LIBS} pthread m)
     endif()
 
 
@@ -156,7 +156,7 @@ else()
         "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
     )
     target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
-    target_link_libraries(rlImGui PUBLIC raylib imgui)
+    target_link_libraries(rlImGui PUBLIC bt3gl imgui)
 
     # [hostio] SDL2 for gamepads and audio output (the window and keyboard stay raylib's). Built
     # static from source so every platform gets the same version; PS2X_HOSTPAD=raylib /
@@ -196,9 +196,9 @@ endif()
 # [B] The vendored raylib takes its window/input/GL context from SDL2 (PLATFORM_DESKTOP_SDL), so the
 # platform needs SDL2 linked here -- after the fetch above, whose target name depends on how SDL2 was
 # built. raylib is linked against the same SDL2 the hostio backend uses.
-if(TARGET raylib AND DEFINED PS2X_SDL2_TARGET)
-    target_link_libraries(raylib PUBLIC ${PS2X_SDL2_TARGET})
-    message(STATUS "[B] raylib window backend: SDL2 (${PS2X_SDL2_TARGET})")
+if(TARGET bt3gl AND DEFINED PS2X_SDL2_TARGET)
+    target_link_libraries(bt3gl PUBLIC ${PS2X_SDL2_TARGET})
+    message(STATUS "[B] bt3gl (vendored raylib) window backend: SDL2 (${PS2X_SDL2_TARGET})")
 endif()
 
 # [d3d11 probe] Native Direct3D 11 video on raylib's HWND, buildable on its own so the
@@ -211,7 +211,7 @@ if(WIN32 AND NOT PS2X_IS_VITA)
         src/gfx/d3d11/D3D11Gfx.cpp
     )
     target_include_directories(ps2xD3D11Probe PRIVATE src)
-    target_link_libraries(ps2xD3D11Probe PRIVATE raylib d3d11 dxgi d3dcompiler dxguid)
+    target_link_libraries(ps2xD3D11Probe PRIVATE bt3gl d3d11 dxgi d3dcompiler dxguid)
     if(MSVC)
         target_compile_options(ps2xD3D11Probe PRIVATE /W4)
     else()
@@ -231,10 +231,10 @@ if(NOT PS2X_IS_VITA)
     )
     target_include_directories(ps2xGlProbe PRIVATE src)
     if(WIN32)
-        target_link_libraries(ps2xGlProbe PRIVATE raylib opengl32)
+        target_link_libraries(ps2xGlProbe PRIVATE bt3gl opengl32)
     else()
         find_package(OpenGL REQUIRED)
-        target_link_libraries(ps2xGlProbe PRIVATE raylib OpenGL::GL ${CMAKE_DL_LIBS})
+        target_link_libraries(ps2xGlProbe PRIVATE bt3gl OpenGL::GL ${CMAKE_DL_LIBS})
     endif()
     if(MSVC)
         target_compile_options(ps2xGlProbe PRIVATE /W4)
@@ -345,7 +345,7 @@ if(PS2X_IS_VITA)
         pthread
     )
 else()
-    target_link_libraries(ps2_host_backend INTERFACE raylib)
+    target_link_libraries(ps2_host_backend INTERFACE bt3gl)
 endif()
 
 if(WIN32)
@@ -666,7 +666,7 @@ if(PS2X_USE_GSRL)
     target_compile_definitions(ps2_runtime PRIVATE PS2X_USE_GSRL=1)
     message(STATUS "[gsrl] experiment ON: the replay submits through the renamed vendored rlgl copy")
 endif()
-target_include_directories(ps2_runtime PRIVATE "${raylib_SOURCE_DIR}/src/external")   # [A4] stb_image(_write)
+target_include_directories(ps2_runtime PRIVATE "${bt3gl_SOURCE_DIR}/src/external")   # [A4] stb_image(_write)
 if(WIN32)
     target_link_libraries(ps2_runtime PUBLIC opengl32)
 else()
