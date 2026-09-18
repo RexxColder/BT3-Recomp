@@ -644,8 +644,11 @@ int main(int argc, char *argv[])
                 if (std::freopen(lf, "w", stderr))
                     std::fprintf(stderr, "[logfile] stderr -> %s\n", lf);
             }
-            else if (lvl > 0 && ps2xStderrIsTerminal())   // [mergefix] a captured stderr (rig run.log, a user's "> log 2>&1") keeps its lines
+            else if (lvl > 0)   // [mergefix] a captured stderr (rig run.log, a user's "> log 2>&1") keeps its lines
             {
+                // Always keep a log file next to the deploy, not only when stderr is a console: the
+                // launcher starts the runner without one, and a report like "the window is the wrong
+                // size until I maximize" is only diagnosable from a log (the [winlog] lines).
                 std::error_code ec;
                 const auto logsDir = exeDir / "logs";
                 std::filesystem::create_directories(logsDir, ec);
