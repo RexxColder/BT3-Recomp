@@ -634,6 +634,12 @@ def stage_deps(ctx: "Context") -> None:
     if ctx.args.dry_run or ctx.args.no_deps:
         print("(not installing: --dry-run/--no-deps)")
         return
+    # Non-interactive means "never guess": without -y/--install-deps, stop and print the exact commands
+    # instead of silently mutating the machine (a container/WSL run once apt-installed Qt on its own).
+    if not ctx.interactive and not ctx.args.yes and not ctx.args.install_deps:
+        die("missing dependencies and no interactive prompt available.\n"
+            "  install them and re-run, or pass -y / --install-deps:\n"
+            + "\n".join(f"    {d.name}: {d.hint}" for d in missing), 2)
     for d in missing:
         if d.install is None:
             die(f"cannot install automatically: {d.name}\n  install manually: {d.hint}", 2)
