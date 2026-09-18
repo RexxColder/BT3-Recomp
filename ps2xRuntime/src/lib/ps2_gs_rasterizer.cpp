@@ -3647,10 +3647,14 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                         if (s_miss < 300)
                         {
                             const uint32_t *cl = pal ? clut : nullptr;
-                            std::fprintf(stderr, "[texrepdiag] MISS %s tbp0=%u tbw=%u psm=%u %ux%u clut4=%08x %08x %08x %08x clutKey=%llx\n",
+                            // [texrepdiag] sameTex0: a pack entry with the same TEX0 hash but any
+                            // CLUT. If it exists, the miss is ours (palette mismatch), not the pack's.
+                            const char *same = ps2tex::findByTex0Hash(id.tex0Hash);
+                            const bool inPack = ps2tex::hasPair(id.tex0Hash, id.hasClut ? id.clutHash : 0);
+                            std::fprintf(stderr, "[texrepdiag] MISS %s tbp0=%u tbw=%u psm=%u %ux%u clut4=%08x %08x %08x %08x clutKey=%llx inPack=%d sameTex0=%s\n",
                                          id.name().c_str(), tex0.tbp0, tex0.tbw, tex0.psm, 1u << tex0.tw, 1u << tex0.th,
                                          cl ? cl[0] : 0u, cl ? cl[1] : 0u, cl ? cl[2] : 0u, cl ? cl[3] : 0u,
-                                         (unsigned long long)clutKey);
+                                         (unsigned long long)clutKey, inPack ? 1 : 0, same ? same : "none");
                         }
                         else if (s_miss == 300)
                             std::fprintf(stderr, "[texrepdiag] ... (miss list truncated)\n");
@@ -3666,9 +3670,9 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                     // else would sample wrong, so refuse it rather than render it
                     // stretched -- a skipped texture is a non-event, a stretched one
                     // is a visible bug.
-                    const int sX = (subW > 0 && rw % subW == 0) ? rw / subW : 0;
+                    int useScale = (subW > 0 && rw % subW == 0) ? rw / subW : 0;
                     const int sY = (texH > 0 && rh % texH == 0) ? rh / texH : 0;
-                    if (sX <= 0 || sX != sY)
+                    if (useScale <= 0 || useScale != sY)
                     {
                         static std::atomic<unsigned long> s_bad{0};
                         if (s_bad.fetch_add(1) < 5)
@@ -3711,19 +3715,37 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                     // there is no decoder here. For a compressed one, keep the game's own
                     // texture: a native-resolution gauge is right, an upscaled one that
                     // breaks the health bar is not.
+                    bool usable = true;
                     if (gateAlpha && rfmt != 0)
-                    {
-                        static std::atomic<unsigned long> s_skip{0};
-                        if (s_skip.fetch_add(1) < 5)
-                            std::fprintf(stderr, "[texreplace] SKIP %s: alpha is a DATE gate and the "
-                                         "replacement is compressed (fmt %d) -- keeping the native decode\n",
-                                         id.name().c_str(), rfmt);
+                    {   // [texreplace] The gate alpha must be rewritten byte by byte, but this payload
+                        // is compressed (a DDS). Decompress JUST this one -- character-select icons and
+                        // other rare gate-alpha art -- instead of leaving the game's texture in place,
+                        // which is what kept a handful of icons un-replaced.
+                        std::vector<uint8_t> dec; int dw = 0, dh = 0;
+                        bool ok = ps2tex::loadReplacementRgba(id, dec, dw, dh) && dw > 0 && dh > 0;
+                        if (ok)
+                        {
+                            const int nX = (subW > 0 && dw % subW == 0) ? dw / subW : 0;
+                            const int nY = (texH > 0 && dh % texH == 0) ? dh / texH : 0;
+                            if (nX > 0 && nX == nY) { rep = std::move(dec); rw = dw; rh = dh; rfmt = 0; useScale = nX; }
+                            else ok = false;
+                        }
+                        if (!ok)
+                        {
+                            static std::atomic<unsigned long> s_skip{0};
+                            if (s_skip.fetch_add(1) < 5)
+                                std::fprintf(stderr, "[texreplace] SKIP %s: alpha is a DATE gate and the "
+                                             "replacement could not be decompressed -- keeping the native decode\n",
+                                             id.name().c_str());
+                            usable = false;
+                        }
                     }
+                    if (!usable) { /* keep the native decode */ }
                     else {
                     if (gateAlpha)
                         for (size_t i = 3; i < rep.size(); i += 4)
                             rep[i] = (uint8_t)((std::min<unsigned>(rep[i] * 255u / 128u, 255u) >= 128u) ? 255u : 0u);
-                    rgba = std::move(rep); upW = rw; upH = rh; upFmt = rfmt; upScale = sX;
+                    rgba = std::move(rep); upW = rw; upH = rh; upFmt = rfmt; upScale = useScale;
                     // [texreplace] Alpha range. decodeTexRGBA expanded PS2 alpha
                     // (0x80 == opaque) to 0..255 via kAlpha128To255, but these bytes
                     // came straight out of the pack and skipped that -- and a
@@ -3738,9 +3760,23 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                     const unsigned long k = s_hits.fetch_add(1) + 1ul;
                     if (k <= 5 || (k % 100ul) == 0ul)
                         std::fprintf(stderr, "[texreplace] hit #%lu %s -> %dx%d (%dx)\n",
-                                     k, id.name().c_str(), rw, rh, sX);
+                                     k, id.name().c_str(), rw, rh, useScale);
                     }
                     }
+                }
+            }
+            else
+            {   // [texrepdiag] Never identified: the format is not PSMT8/PSMT4 and the pack holds ONLY
+                // those two, so no replacement can exist for it. One line per distinct (psm,tw,th)
+                // tells a screen's un-replaced element apart from a hash/palette mismatch.
+                static const bool s_id = [](){ const char *v = std::getenv("PS2X_TEXREPDIAG"); return !(v && v[0] == '0'); }();
+                if (s_id)
+                {
+                    static std::unordered_set<uint32_t> s_seen;
+                    const uint32_t kk = ((uint32_t)tex0.psm << 24) | ((uint32_t)tex0.tw << 12) | (uint32_t)tex0.th;
+                    if (s_seen.size() < 200u && s_seen.insert(kk).second)
+                        std::fprintf(stderr, "[texrepdiag] NOTID psm=%u %ux%u tbp0=%u tbw=%u\n",
+                                     tex0.psm, 1u << tex0.tw, 1u << tex0.th, tex0.tbp0, tex0.tbw);
                 }
             }
         }
@@ -4506,10 +4542,9 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
             {
                 static std::atomic<uint64_t> s_prims{0}, s_decodes{0}, s_texels{0};
                 s_prims.fetch_add(1, std::memory_order_relaxed);
-                // [texpackasync] a replacement that finished decoding since this texture was cached forces ONE
-                // re-resolve so the decode path below swaps it in (the cache entry is re-put under the same key).
-                const bool miss = !r.hasTexture(texKey, texPageLo, texPageHi)
-                               || (GsGpuRenderer::texPackEnabled() && ps2tex::takeReadySwap(texKey));
+                // [texpackasync] (counting only: the real swap trigger lives further down, outside this
+                // diagnostic, so it also works with PS2X_GPU_DIAG off)
+                const bool miss = !r.hasTexture(texKey, texPageLo, texPageHi);
                 if (miss) { s_decodes.fetch_add(1, std::memory_order_relaxed); s_texels.fetch_add(static_cast<uint64_t>(texW) * texH, std::memory_order_relaxed); }
                 static std::mutex s_dm; static std::chrono::steady_clock::time_point s_t = std::chrono::steady_clock::now();
                 // Which textures are churning: sum re-decoded texels per (tbp0,psm,w,h).
@@ -4561,6 +4596,14 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
                                  || ((ctx.frame.fbmsk & 0x00ffffffu) == 0x00ffffffu); }
         const uint64_t texKeyBase = texKey;   // [dectime] pre-version key (material + CLUT content)
         if (!gaServedRead) texKey = r.resolveTextureVersion(texKey, texPageLo, texPageHi, in.vram, in.vramSize, texNeedDecode);
+        // [texpackasync] A replacement that finished decoding since this texture was cached forces ONE
+        // re-resolve, so the decode path below puts the cache entry again and swaps the art in.
+        // THIS USED TO LIVE INSIDE THE PS2X_GPU_DIAG BLOCK above: with diagnostics off (the default)
+        // the ready-swap flag was never consumed, so any texture that had already been resolved before
+        // its replacement finished decoding kept drawing the ORIGINAL forever -- the pack looked
+        // half-applied (183 lookups, 182 of them "in the pack" and none applied, per [texrepdiag]).
+        if (!texNeedDecode && GsGpuRenderer::texPackEnabled() && ps2tex::takeReadySwap(texKey))
+            texNeedDecode = true;
         if (deferTex || deferClut) texNeedDecode = true;   // [deferdec] GL-dirty source: the record-time hash saw stale VRAM
         // [deferpend] a page whose deferred flush is still queued is stale in VRAM: a read that needs a decode
         // (a different view / key of the same page) must queue behind that flush, never decode synchronously.

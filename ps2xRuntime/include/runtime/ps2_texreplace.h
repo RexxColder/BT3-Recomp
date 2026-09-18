@@ -37,6 +37,20 @@ namespace ps2tex
     // True once a replacement directory has been indexed (PS2X_TEXREPLACE=<dir>).
     bool replacementsEnabled();
 
+    // [texrepdiag] A pack entry that has this TEX0 hash, whatever its CLUT: a lookup miss whose hash
+    // pair differs ONLY in the palette comes back here. Returns the file stem (name without extension)
+    // or nullptr. Used to tell "the pack does not have this texture" from "our CLUT differs".
+    const char *findByTex0Hash(uint64_t tex0Hash);
+
+    // [texrepdiag] Is there a pack entry for this exact hash PAIR (what the lookup keys on)? A miss
+    // with hasPair=true is not "absent from the pack": it is queued for decode or failed to decode.
+    bool hasPair(uint64_t tex0Hash, uint64_t clutHash);
+
+    // [texreplace] The pack file for this hash pair, ALWAYS as RGBA8: compressed DDS (DXT1/DXT5) is
+    // decompressed on the spot. Only used for the rare alpha-as-DATE-gate replacements, whose packed
+    // alpha has to be rewritten byte by byte and therefore cannot stay compressed.
+    bool loadReplacementRgba(const TexIdent &id, std::vector<uint8_t> &rgba, int &w, int &h);
+
     // Look up a replacement for `id` and decode it to RGBA8. Matches on the HASH PAIR only --
     // the bits field is advisory (a real pack was built by an older PCSX2 whose TEXA convention
     // differs, so an exact-name match would silently find nothing). Returns false if absent.

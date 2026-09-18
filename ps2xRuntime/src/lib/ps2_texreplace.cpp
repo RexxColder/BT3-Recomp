@@ -21,6 +21,8 @@
 #include <chrono>
 #include <map>
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 extern "C" const char *ps2xExeDirC();   // [mergefix] main.cpp
 
@@ -133,6 +135,8 @@ namespace
     // in the pack -- identical hashes, bits differing by 0x4000. Keying on the full name would
     // load NOTHING from a working pack and look like the feature is broken.
     std::unordered_map<uint64_t, std::string> g_index;   // (tex0Hash ^ rotl(clutHash)) -> path
+    // [texrepdiag] tex0Hash -> a pack entry's stem, for "same art, different palette" misses.
+    std::unordered_map<uint64_t, std::string> g_byTex0;
     std::once_flag g_once;
     bool g_on = false;
 
@@ -183,9 +187,15 @@ namespace
             unsigned long long a = 0, b = 0; unsigned bits = 0;
             const char *cs = stem.c_str();
             if (std::sscanf(cs, "%llx-%llx-%8x", &a, &b, &bits) == 3)
+            {
                 g_index.emplace(pairKey(a, b), it->path().string());
+                g_byTex0.emplace(a, stem);   // [texrepdiag]
+            }
             else if (std::sscanf(cs, "%llx-%8x", &a, &bits) == 2)
+            {
                 g_index.emplace(pairKey(a, 0), it->path().string());
+                g_byTex0.emplace(a, stem);   // [texrepdiag]
+            }
             else { ++skipped; continue; }
             ++n;
         }
@@ -203,6 +213,136 @@ bool replacementsEnabled()
 {
     std::call_once(g_once, buildIndex);
     return g_on;
+}
+
+const char *findByTex0Hash(uint64_t tex0Hash)
+{
+    std::call_once(g_once, buildIndex);
+    auto it = g_byTex0.find(tex0Hash);
+    return it == g_byTex0.end() ? nullptr : it->second.c_str();
+}
+
+// [texreplace] Minimal DDS/BC decoder (DXT1/DXT5). It exists for ONE case: a replacement whose alpha
+// the shader cannot fix (the game uses alpha as a DATE gate and the pack's upscaled edges are
+// interpolated), where the file is compressed and the bytes therefore cannot be rewritten. Rare
+// (character-select icons), small (32x32 -> 128x128), so a synchronous decode is fine.
+namespace
+{
+    struct Reader
+    {
+        const uint8_t *p; const uint8_t *end;
+        bool get(void *dst, size_t n) { if (p + n > end) return false; std::memcpy(dst, p, n); p += n; return true; }
+    };
+
+    inline void bcColor(const uint8_t *blk, int out[4][3])
+    {
+        const uint16_t c0 = (uint16_t)(blk[0] | (blk[1] << 8)), c1 = (uint16_t)(blk[2] | (blk[3] << 8));
+        auto expand = [](uint16_t c) {
+            return std::array<int, 3>{ ((c >> 11) & 0x1F) * 255 / 31, ((c >> 5) & 0x3F) * 255 / 63, (c & 0x1F) * 255 / 31 };
+        };
+        const auto a = expand(c0), b = expand(c1);
+        for (int i = 0; i < 3; ++i)
+        {
+            out[0][i] = a[i]; out[1][i] = b[i];
+            out[2][i] = (c0 > c1) ? (2 * a[i] + b[i]) / 3 : (a[i] + b[i]) / 2;
+            out[3][i] = (c0 > c1) ? (a[i] + 2 * b[i]) / 3 : 0;
+        }
+    }
+
+    // DXT1: 8 bytes/block. DXT5: 16 (8 alpha + 8 colour).
+    void decodeBlock(const uint8_t *blk, bool dxt5, uint8_t *dst, int stride, int bw, int bh)
+    {
+        int col[4][3];
+        const uint8_t *colBlk = dxt5 ? blk + 8 : blk;
+        bcColor(colBlk, col);
+        const uint32_t bits = (uint32_t)(colBlk[4] | (colBlk[5] << 8) | (colBlk[6] << 16) | ((uint32_t)colBlk[7] << 24));
+        uint8_t alpha[4];
+        if (dxt5)
+        {
+            const uint8_t a0 = blk[0], a1 = blk[1];
+            uint8_t a[8]; a[0] = a0; a[1] = a1;
+            if (a0 > a1) { for (int i = 1; i <= 6; ++i) a[i + 1] = (uint8_t)(((7 - i) * a0 + i * a1) / 7); }
+            else { for (int i = 1; i <= 4; ++i) a[i + 1] = (uint8_t)(((5 - i) * a0 + i * a1) / 5); a[6] = 0; a[7] = 255; }
+            uint64_t idx = 0;
+            for (int i = 2; i < 8; ++i) idx |= (uint64_t)blk[i] << ((i - 2) * 8);
+            for (int i = 0; i < 4; ++i) alpha[i] = a[(idx >> (3 * i)) & 7];
+        }
+        else { alpha[0] = alpha[1] = alpha[2] = 255; alpha[3] = 0; }
+        for (int y = 0; y < bh; ++y)
+            for (int x = 0; x < bw; ++x)
+            {
+                const int i = y * 4 + x;
+                const int ci = (bits >> (2 * i)) & 3;
+                uint8_t *o = dst + (size_t)y * stride + (size_t)x * 4;
+                o[0] = (uint8_t)col[ci][0]; o[1] = (uint8_t)col[ci][1]; o[2] = (uint8_t)col[ci][2];
+                o[3] = (!dxt5 && ci == 3) ? 0 : alpha[i];
+            }
+    }
+
+    bool decodeDdsToRgba(const std::string &path, std::vector<uint8_t> &out, int &w, int &h)
+    {
+        FILE *f = std::fopen(path.c_str(), "rb");
+        if (!f) return false;
+        std::vector<uint8_t> buf;
+        {
+            std::fseek(f, 0, SEEK_END); const long sz = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+            if (sz <= 128) { std::fclose(f); return false; }
+            buf.resize((size_t)sz);
+            const size_t got = std::fread(buf.data(), 1, buf.size(), f);
+            std::fclose(f);
+            if (got != buf.size()) return false;
+        }
+        if (std::memcmp(buf.data(), "DDS ", 4) != 0) return false;
+        uint32_t hh = 0, ww = 0, fourCC = 0;
+        std::memcpy(&hh, buf.data() + 12, 4); std::memcpy(&ww, buf.data() + 16, 4);
+        std::memcpy(&fourCC, buf.data() + 84, 4);
+        const int bw = (int)ww, bh = (int)hh;
+        if (bw <= 0 || bh <= 0 || bw > 4096 || bh > 4096) return false;
+        const bool dxt1 = (fourCC == 0x31545844u /*DXT1*/);
+        const bool dxt5 = (fourCC == 0x35545844u /*DXT5*/);
+        if (!dxt1 && !dxt5) return false;   // BC7/ASTC/...: no decoder here
+        const size_t blocksPerRow = (size_t)((bw + 3) / 4);
+        const size_t rows = (size_t)((bh + 3) / 4);
+        const size_t blockBytes = dxt5 ? 16 : 8;
+        if (128 + blocksPerRow * rows * blockBytes > buf.size()) return false;
+        out.assign((size_t)bw * bh * 4, 0);
+        const uint8_t *p = buf.data() + 128;
+        for (size_t by = 0; by < rows; ++by)
+            for (size_t bx = 0; bx < blocksPerRow; ++bx)
+            {
+                const int px = (int)(bx * 4), py = (int)(by * 4);
+                decodeBlock(p, dxt5, out.data() + (size_t)py * bw * 4 + (size_t)px * 4, bw * 4,
+                            std::min(4, bw - px), std::min(4, bh - py));
+                p += blockBytes;
+            }
+        w = bw; h = bh;
+        return true;
+    }
+}
+
+// Defined further down (same unnamed namespace): declared here because loadReplacementRgba needs it.
+namespace { bool decodeFile(const std::string &path, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt); }
+
+bool loadReplacementRgba(const TexIdent &id, std::vector<uint8_t> &rgba, int &w, int &h)
+{
+    std::call_once(g_once, buildIndex);
+    auto it = g_index.find(pairKey(id.tex0Hash, id.hasClut ? id.clutHash : 0));
+    if (it == g_index.end()) return false;
+    const std::string &path = it->second;
+    const bool isDds = path.size() >= 4 && (path.compare(path.size() - 4, 4, ".dds") == 0 ||
+                                            path.compare(path.size() - 4, 4, ".DDS") == 0);
+    if (!isDds)
+    {
+        int fmt = 0;
+        return decodeFile(path, rgba, w, h, fmt) && fmt == BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    }
+    return decodeDdsToRgba(path, rgba, w, h);
+}
+
+bool hasPair(uint64_t tex0Hash, uint64_t clutHash)
+{
+    std::call_once(g_once, buildIndex);
+    return g_index.find(pairKey(tex0Hash, clutHash)) != g_index.end();
 }
 
 namespace
@@ -288,7 +428,20 @@ namespace
             const bool ok = decodeFile(job.path, b.rgba, b.w, b.h, b.fmt);
             std::lock_guard<std::mutex> lk(st->mtx);
             st->pending.erase(job.key);
-            if (!ok) { st->failed.insert(job.key); continue; }
+            if (!ok)
+            {
+                // [texrepdiag] A pack entry that EXISTS but will not decode: the texture keeps drawing
+                // the original even though the pack has art for it.
+                static const bool s_df = [](){ const char *v = std::getenv("PS2X_TEXREPDIAG"); return !(v && v[0] == '0'); }();
+                if (s_df)
+                {
+                    static int s_n = 0;
+                    if (s_n++ < 40)
+                        std::fprintf(stderr, "[texrepdiag] DECODEFAIL %s\n", job.path.c_str());
+                }
+                st->failed.insert(job.key);
+                continue;
+            }
             // Byte cap: a texture that is never resolved again would otherwise pin its blob
             // forever. Oldest-first eviction; 384 MB default, PS2X_TEXPACK_CACHE_MB overrides.
             static const size_t s_capBytes = [](){ const char *v = std::getenv("PS2X_TEXPACK_CACHE_MB");

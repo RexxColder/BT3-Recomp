@@ -195,6 +195,21 @@ namespace
     }
 
     // Returns true when gfx::gl drew the frame (the caller then skips the raylib present).
+    // [texmega] PS2X_TEXMEGA=1 (default ON): F9 arms a 6-second texture-replacement mega dump
+    // (every lookup HIT/MISS + originals/replacements + the pack index) into <exeDir>/logs/texmega.
+    // Shared by BOTH present paths: it used to live inside the D3D11 branch only, so the ALTGL
+    // present -- the one that is actually used -- could never trigger it.
+    void texmegaHotkey()
+    {
+        static const bool s_tm = [](){ const char *v = std::getenv("PS2X_TEXMEGA"); return !(v && v[0] == '0'); }();
+        if (!s_tm || !bt3IsKeyPressed(BT3_KEY_F9)) return;
+        const char *xd = ps2xExeDirC();
+        const std::string d = std::string((xd && xd[0]) ? xd : ".") + "/logs/texmega";
+        ps2tex::megaArm(d.c_str(), 6.0);
+        ps2tex::megaDumpIndex();
+        std::fprintf(stderr, "[texmega] armed -> %s\n", d.c_str());
+    }
+
     bool AltGlPresent(bt3Texture2D &tex, const bt3Rectangle &src, const bt3Rectangle &dst, bool bilinear)
     {
         if (!AltGlEnabled() || !tex.id || !AltGlInit()) return false;
@@ -6677,19 +6692,8 @@ void PS2Runtime::run()
                     }
                 }
             }
-            {   // [texmega] PS2X_TEXMEGA=1: F9 arms a 6-second texture-replacement mega dump
-                // (lookups + originals/replacements + pack index) into <exeDir>/logs/texmega.
-                // [texmega] ON by default so the Launcher (no env) can trigger it: press F9.
-                // PS2X_TEXMEGA=0 disables.
-                static const bool s_tm = [](){ const char *v = std::getenv("PS2X_TEXMEGA"); return !(v && v[0] == '0'); }();
-                if (s_tm && bt3IsKeyPressed(BT3_KEY_F9))
-                {
-                    const char *xd = ps2xExeDirC();
-                    const std::string d = std::string((xd && xd[0]) ? xd : ".") + "/logs/texmega";
-                    ps2tex::megaArm(d.c_str(), 6.0);
-                    ps2tex::megaDumpIndex();
-                    std::fprintf(stderr, "[texmega] armed -> %s\n", d.c_str());
-                }
+            {   // [texmega] F9 arms the texture-replacement mega dump (shared with the ALTGL path).
+                texmegaHotkey();
             }
             static const bool s_uiTest = [](){ const char *v = std::getenv("PS2X_UI_TEST"); return v && v[0] && v[0] != '0'; }();
             const ps2x::gfx::Color d3dClear = s_uiTest
@@ -6853,6 +6857,7 @@ void PS2Runtime::run()
         {
 #endif
         bt3BeginDrawing();
+        texmegaHotkey();   // [texmega] F9 works here too (the D3D11 branch has its own call)
         {   // [winlog] Log every size the window takes, so a "wrong at startup, right after maximize"
             // report can be read straight from the log: the first line plus any later change.
             static int s_lastW = -1, s_lastH = -1;
