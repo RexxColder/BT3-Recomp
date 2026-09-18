@@ -1413,7 +1413,21 @@ bool PS2Runtime::initialize(const char *title)
         int hostWinW = HOST_WINDOW_WIDTH, hostWinH = HOST_WINDOW_HEIGHT;
         if (const char *w = std::getenv("PS2X_WINDOW_W")) { const int v = std::atoi(w); if (v > 0) hostWinW = v; }
         if (const char *h = std::getenv("PS2X_WINDOW_H")) { const int v = std::atoi(h); if (v > 0) hostWinH = v; }
+        ps2xHostPrepareWindow();   // [window] DPI hints must precede the window (SDL init happens inside)
         bt3InitWindow(hostWinW, hostWinH, title);
+        {   // [winlog] what we asked for vs what the framework reports vs the REAL client area. The SDL
+            // platform sizes the window differently than GLFW did: on a DPI-scaled display the logical
+            // and physical sizes disagree, and the picture only lines up after a resize event.
+            int cw = 0, ch = 0, lw = 0, lh = 0, pw = 0, ph = 0;
+            const bool gotClient = ps2xNativeWindowClientSize(bt3GetWindowHandle(), &cw, &ch);
+            const bool gotSdl = ps2xSdlWindowSizeInfo(bt3GetWindowHandle(), &lw, &lh, &pw, &ph);
+            std::fprintf(stderr, "[winlog] requested=%dx%d screen=%dx%d render=%dx%d client=%dx%d sdl=%dx%d px=%dx%d%s\n",
+                         hostWinW, hostWinH,
+                         bt3GetScreenWidth(), bt3GetScreenHeight(),
+                         bt3GetRenderWidth(), bt3GetRenderHeight(),
+                         cw, ch, lw, lh, pw, ph,
+                         (gotClient && gotSdl) ? "" : " (partial)");
+        }
         {   // [monitor] PS2X_MONITOR=<index>: move the window to that monitor (0 = primary).
             const char *mon = std::getenv("PS2X_MONITOR");
             if (mon && mon[0]) { const int idx = std::atoi(mon); if (idx >= 0 && idx < bt3GetMonitorCount()) bt3SetWindowMonitor(idx); }
@@ -6839,6 +6853,20 @@ void PS2Runtime::run()
         {
 #endif
         bt3BeginDrawing();
+        {   // [winlog] Log every size the window takes, so a "wrong at startup, right after maximize"
+            // report can be read straight from the log: the first line plus any later change.
+            static int s_lastW = -1, s_lastH = -1;
+            const int nw = bt3GetScreenWidth(), nh = bt3GetScreenHeight();
+            if (nw != s_lastW || nh != s_lastH)
+            {
+                s_lastW = nw; s_lastH = nh;
+                int cw = 0, ch = 0, lw = 0, lh = 0, pw = 0, ph = 0;
+                ps2xNativeWindowClientSize(bt3GetWindowHandle(), &cw, &ch);
+                ps2xSdlWindowSizeInfo(bt3GetWindowHandle(), &lw, &lh, &pw, &ph);
+                std::fprintf(stderr, "[winlog] frame size screen=%dx%d render=%dx%d client=%dx%d sdl=%dx%d px=%dx%d\n",
+                             nw, nh, bt3GetRenderWidth(), bt3GetRenderHeight(), cw, ch, lw, lh, pw, ph);
+            }
+        }
         {   // [presentstate] pre-render chunks and barrier services run GL work between presents and
             // leave the GS emulation state behind (blend off / GS blend factors, scissor, colour mask,
             // custom shader, texture unit). The frame blit and the ImGui overlay assume raylib's

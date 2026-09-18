@@ -136,6 +136,8 @@ using bt3AudioStream = AudioStream;
 #define bt3WaitTime WaitTime
 #define bt3WindowShouldClose WindowShouldClose
 
+#define bt3GetWindowHandle GetWindowHandle   // returns void*: the declaration regex missed the extra star
+
 // ---- constants ---------------------------------------------------------------------
 #define BT3_BLEND_ALPHA BLEND_ALPHA
 #define BT3_BLEND_CUSTOM BLEND_CUSTOM

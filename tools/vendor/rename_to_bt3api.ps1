@@ -36,7 +36,9 @@ $sources = $allSources |
     Where-Object { (Get-Content -Raw $_.FullName) -match '#include\s+"(raylib|rlgl)\.h"' }
 $code = ($sources | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
 
-$declaredFn = [regex]::Matches($headerText, '\b(?:RAYAPI|RLAPI)\s+[A-Za-z_][\w\*]*\s+(\w+)\s*\(') |
+# Pointer-returning declarations (`RAYAPI void *GetWindowHandle(void);`) need the extra star or they
+# are missed entirely -- GetWindowHandle was, and the build failed on bt3GetWindowHandle.
+$declaredFn = [regex]::Matches($headerText, '\b(?:RAYAPI|RLAPI)\s+[A-Za-z_][\w\*]*\s*\*?\s*(\w+)\s*\(') |
     ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
 $declaredConst = [regex]::Matches($headerText, '\b((?:RL_|KEY_|GAMEPAD_|PIXELFORMAT_|BLEND_|MOUSE_|GESTURES_|TOUCH_|FONT_|TEXT_|LOG_|MATERIAL_|SHADER_|CUBEMAP_|MAP_|AUTOMATION_)[A-Z0-9_]+)') |
     ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
