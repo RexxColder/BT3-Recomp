@@ -93,3 +93,29 @@ quedó abandonado por decisión del usuario; la validación Windows es dual-boot
 - Tarball release nuevo en `~/Escritorio/` (BT3-Recomp-x86_64.tar.gz 1.9G + .sha256), regenerado del flujo docker.
 - Portal del Escritorio ahora con launcher contenedor (glibc 2.35) reemplazado.
 - Queda como tarea futura: build Windows real via dual-boot del usuario, y PR con todo esto.
+
+
+---
+
+# setup.py multi-stage rewrite — 2026-09-18
+
+## Contexto
+- Un solo `games/bt3/setup.py` multi-stage: 1 detect, 2 deps (interactivo, prompts en ingles),
+  3 pipeline original, 4 deploy + packaging por plataforma. Reutiliza los helpers existentes.
+- Scripts de root movidos a `scripts/` como wrappers finos; `Launcher.bat` eliminado (layout plano con
+  `qt.conf` + DLLs junto a los exes) y unificado para el flujo nativo y el contenedor.
+
+## Elementos verificables
+- [x] Stage 1 detecta OS/arch/distro/pkg-manager/contenedor y el toolchain real (CMake>=3.21, MSVC fuera
+      del dev prompt, kit Qt, Mesa lavapipe); `--report json`.
+- [x] Stage 2 lista deps por plataforma con el comando exacto y las instala (winget/pip/aqt/download en
+      Windows; apt/dnf/pacman/zypper en Linux; brew/xcode-select en macOS) con `-y`/`--non-interactive`.
+- [x] Stage 3 = pipeline historico sin cambios; `--skip-setup`/`--gen-only`/`--jobs` compatibles.
+- [x] Stage 4 Windows: ejecutado completo (launcher Qt + bundling + gate PE + zip 97.9 MB + sha256).
+- [x] Stage 4 Linux: `ldd` closure + plugins Qt + tar.gz + gate glibc (dry-run validado en WSL; falta
+      corrida completa en el contenedor).
+- [x] `Launcher.bat` fuera: entrypoint escribe `qt.conf` + aplana DLLs; `package.sh` y el gate PE piden
+      `qt.conf`.
+- [ ] Corrida completa Linux en `bt3-release:jammy` + diff del tarball contra el actual.
+- [ ] macOS: `--dry-run` solamente (lo pule otro dev).
+- [ ] Commit de docs + wrappers.

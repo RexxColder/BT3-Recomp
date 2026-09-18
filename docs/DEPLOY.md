@@ -44,18 +44,18 @@ Python script that hosts the build pipeline (and is the base for Windows).
 
 | Script | Platform | Role |
 |---|---|---|
-| `build_and_deploy.sh` | Linux | Interactive build + deploy. Asks for the ISO and output dir, runs the full `setup.py` pipeline, bundles the runner's `ldd` library closure into `OUT/lib`, renames the runner to `bt3-runner`, builds the launcher (Qt 6 + GLFW, pulled via FetchContent), copies the release assets and writes `install game.sh`. |
-| `games/bt3/setup.py` | All (container on Windows) | The build pipeline: extract/verify ISO, build the recompiler, generate ~7,800 runner sources, apply patches, build the runner. Also has `--deploy` to assemble the playable tree. On Windows it runs inside the release container (`--gen-only`, the codegen is target-agnostic) rather than natively on the shell. |
-| `build_and_deploy_macos.sh` | macOS (experimental) | Interactive build + deploy for macOS: runs the same `setup.py` pipeline, then assembles a self-contained `.app` (relocated dylibs, `Info.plist`, ad-hoc signing) via `tools/macos/deploy.py`. |
+| `scripts/build-linux.sh` | Linux | Thin wrapper: `setup.py <iso> --package`. The script itself detects the platform, installs missing dependencies (stage 2), builds (stage 3) and assembles the portable tree + `tar.gz` (stage 4): `ldd` closure minus the glibc/C++ core, Qt platform plugins, `bt3-runner` rename, assets, `install game.sh`, glibc floor gate. |
+| `games/bt3/setup.py` | All | The single entry point. Four stages: **1 detect** (platform/toolchain/deps, `--report json`), **2 deps** (interactive install of what is missing), **3 build** (extract/verify ISO, VU1, recompiler, ~7,800 sources, patches, overlay, runner), **4 package** (Qt launcher, portable tree, PE/glibc gate, zip/tar.gz/`.app` + sha256). The release containers call it with `--gen-only` and package the stage themselves. |
+| `scripts/build-macos.sh` | macOS (experimental) | Thin wrapper: `setup.py <iso> --package`. Stage 4 hands the bundle over to `tools/macos/deploy.py --skip-build` (relocated dylibs, `Info.plist`, icudata, ad-hoc signing). |
 | `tools/release/package.sh` | Linux | Wrap a finished deploy tree into `BT3-Recomp-x86_64.tar.gz` + `.sha256`. This is the only artifact that leaves the machine. |
 | `tools/release-windows/build-windows.sh` (+ `.bat`) | Windows (Docker) | Host driver: builds the Windows cross-build image, prompts for the ISO, cross-compiles the runner + Qt launcher (clang-cl/xwin/lld-link), bundles `stage/` and runs the PE gate. `.bat` = double-click entry point (auto-starts Docker Desktop). |
 
 ## Build + deploy (Linux)
 
 ```sh
-./build_and_deploy.sh                          # prompts for ISO + output dir
-./build_and_deploy.sh --iso /path/game.iso --output /path/deploy
-./build_and_deploy.sh --skip-setup --output /path/deploy   # reuse existing work/, rebuild runner only
+./scripts/build-linux.sh                          # prompts for ISO + output dir
+./scripts/build-linux.sh --iso /path/game.iso --output /path/deploy
+./scripts/build-linux.sh --skip-setup --output /path/deploy   # reuse existing work/, rebuild runner only
 ```
 
 `--skip-setup` skips ISO extraction and source generation, rebuilding only the
@@ -104,7 +104,7 @@ The container generates the generated sources natively (`setup.py --gen-only` �
 the codegen is target-agnostic), cross-compiles the runner and the Qt 6
 launcher, bundles Qt, FFmpeg and the VC++ runtime DLLs into `lib/`, writes the
 portable tree to `build/release-windows/out/stage/` (`Launcher.exe`,
-`bt3-runner.exe`, `Launcher.bat`, `assets/`, `savedata/`, licences,
+`bt3-runner.exe`, `qt.conf`, `assets/`, `savedata/`, licences,
 `settings.toml`) and runs a PE gate — `check_windows_deps.py` (pefile) verifies
 that every PE import resolves either from `lib/` or to a Windows OS component,
 and that the layout is complete. `package.sh` then zips the tree into
@@ -118,11 +118,11 @@ Use a Mac with Xcode Command Line Tools and `brew install cmake ninja pkg-config
 The Linux self-extracting ELF script is not used on macOS.
 
 ```sh
-./build_and_deploy_macos.sh --iso /path/game.iso --jobs 3
+./scripts/build-macos.sh --iso /path/game.iso --jobs 3
 # Reuse the generated sources and rebuild into a new output path:
-./build_and_deploy_macos.sh --skip-setup --output /path/BT3-Recomp-new.app
+./scripts/build-macos.sh --skip-setup --output /path/BT3-Recomp-new.app
 # Package existing runner + Launcher.app without rebuilding:
-./build_and_deploy_macos.sh --skip-build --output /path/BT3-Recomp-test.app
+./scripts/build-macos.sh --skip-build --output /path/BT3-Recomp-test.app
 ```
 
 Output defaults to `build/macos-dist/BT3-Recomp.app`. An existing destination is
@@ -156,17 +156,31 @@ settings overlay. The EE sampling profiler is unavailable on macOS; the phase
 profiler (`PS2X_GUESTPROF=1`) uses the native monotonic counter. OpenGL uses the
 existing fallbacks for unsupported persistent-buffer and texture-barrier extensions.
 
-## `setup.py` flags
+## `setup.py` stages and flags
 
 ```
-python3 games/bt3/setup.py <iso|elf> [--jobs N] [--deploy OUT] [--skip-setup]
+python3 games/bt3/setup.py <iso|elf> [--stage N] [--jobs N] [-y] [--deploy OUT] [--package]
 ```
+
+| Stage | What it does |
+|---|---|
+| 1 `detect` | platform, arch, distro, package manager, toolchain and build inputs (`--report json`) |
+| 2 `deps` | reports the per-platform dependencies and installs the missing ones (interactive; `-y`, `--no-deps`, `--deps-only`) |
+| 3 `build` | extract + verify the ISO, VU1 microprograms, recompiler, source generation, patches, overlay module, runner build |
+| 4 `package` | builds the Qt launcher, assembles the portable tree, runs the release gate and writes the archive + `.sha256` |
 
 | Flag | Effect |
 |---|---|
+| `--stage N`, `--stages A-B`, `--list-stages` | run only part of the pipeline |
+| `--dry-run` | stage 1 + a report of what would run; changes nothing |
+| `-y`, `--non-interactive` | answer yes to every prompt / never prompt (no TTY implies non-interactive) |
 | `--jobs N` | runner build parallelism (default 3 — generated TUs are RAM-hungry) |
-| `--deploy OUT` | after a successful build, assemble the playable tree in `OUT` |
-| `--skip-setup` | reuse `games/bt3/work/` + generated sources; rebuild runner only |
+| `--deploy OUT` | assemble the playable tree in `OUT` (no archive) |
+| `--package` | also write the release artifact for this OS + `.sha256` |
+| `--output DIR` | where the stage tree and the artifact go (default `build/release-<os>/out`) |
+| `--skip-launcher`, `--no-gate`, `--no-desktop-copy` | developer escapes |
+| `--skip-setup` | reuse `games/bt3/work/` + generated sources; rebuild the runner only |
+| `--gen-only` | stop after generation/patches (used by the release containers) |
 
 ## Input handling (launcher)
 

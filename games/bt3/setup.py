@@ -359,6 +359,25 @@ class PlatformInfo:
         """True when this shell has the MSVC environment loaded (vcvars) or clang-cl available."""
         return bool(os.environ.get("VCToolsInstallDir") or os.environ.get("INCLUDE"))
 
+    def windows_generator_flags(self, build_dir: Path) -> list:
+        """Generator/toolset flags for a Windows configure. An existing cache dictates the generator:
+        a Ninja cache must not get -T (Visual Studio only), and a VS cache must not get -G Ninja."""
+        cache = build_dir / "CMakeCache.txt"
+        if cache.exists():
+            gen = ""
+            for line in cache.read_text(errors="replace").splitlines():
+                if line.startswith("CMAKE_GENERATOR:"):
+                    gen = line.split("=", 1)[1]
+                    break
+            if "Visual Studio" not in gen:
+                return []
+        # Prefer Ninja + clang-cl in a developer prompt: Ninja compiles every file in parallel,
+        # whereas the Visual Studio generator hands the runner's ~1000 unity units to MSBuild.
+        if (os.environ.get("PS2X_SETUP_GENERATOR", "ninja").lower() != "vs"
+                and self.vs_dev_prompt() and shutil.which("ninja") and shutil.which("clang-cl")):
+            return ["-G", "Ninja", "-DCMAKE_C_COMPILER=clang-cl", "-DCMAKE_CXX_COMPILER=clang-cl"]
+        return ["-T", os.environ.get("PS2X_SETUP_TOOLSET", "ClangCL")]
+
     def configure_extra(self, build_dir: Path) -> list:
         """CMake flags for this platform. Mirrors the historical setup.py behaviour."""
         extra = ["-DCMAKE_BUILD_TYPE=Release"]   # a Windows Ninja/clang-cl configure once came up Debug
@@ -376,21 +395,7 @@ class PlatformInfo:
                 extra += ["-G", "Ninja"]
         if not self.is_windows:
             return extra
-        cache = build_dir / "CMakeCache.txt"
-        if cache.exists():
-            gen = ""
-            for line in cache.read_text(errors="replace").splitlines():
-                if line.startswith("CMAKE_GENERATOR:"):
-                    gen = line.split("=", 1)[1]
-                    break
-            if "Visual Studio" not in gen:
-                return extra
-        # Prefer Ninja + clang-cl in a developer prompt: Ninja compiles every file in parallel,
-        # whereas the Visual Studio generator hands the runner's ~1000 unity units to MSBuild.
-        if (os.environ.get("PS2X_SETUP_GENERATOR", "ninja").lower() != "vs"
-                and self.vs_dev_prompt() and shutil.which("ninja") and shutil.which("clang-cl")):
-            return extra + ["-G", "Ninja", "-DCMAKE_C_COMPILER=clang-cl", "-DCMAKE_CXX_COMPILER=clang-cl"]
-        return extra + ["-T", os.environ.get("PS2X_SETUP_TOOLSET", "ClangCL")]
+        return extra + self.windows_generator_flags(build_dir)
 
 
 def detect_platform() -> PlatformInfo:
@@ -650,6 +655,80 @@ def stage_deps(ctx: "Context") -> None:
 # ------------------------------------------------------------------------------------------------
 # Stage 3: build pipeline
 # ------------------------------------------------------------------------------------------------
+def _vs_env_loaded() -> bool:
+    return bool(os.environ.get("VCToolsInstallDir") or os.environ.get("INCLUDE"))
+
+
+_VS_ENV_TRIED = False
+
+
+def ensure_msvc_env(ctx: "Context") -> None:
+    """Import the MSVC environment (vcvars64.bat) into this process so CMake/clang-cl work from a
+    plain shell -- the launcher/runtime configure fails with -T ClangCL without it. No-op off Windows
+    and when a developer prompt is already loaded."""
+    global _VS_ENV_TRIED
+    if not ctx.platform.is_windows or _vs_env_loaded():
+        return
+    if _VS_ENV_TRIED:
+        return
+    _VS_ENV_TRIED = True
+    cands = []
+    vswhere = _vswhere()
+    if vswhere:
+        txt = run_capture([vswhere, "-latest", "-products", "*", "-requires",
+                           "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                           "-property", "installationPath"])
+        install = txt.strip().splitlines()[0].strip() if txt.strip() else ""
+        if install:
+            cands.append(Path(install) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat")
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")):
+        if not base:
+            continue
+        for edition in ("BuildTools", "Community", "Professional", "Enterprise"):
+            cands.append(Path(base) / "Microsoft Visual Studio" / "2022" / edition /
+                         "VC" / "Auxiliary" / "Build" / "vcvars64.bat")
+    vcvars = next((c for c in cands if c.exists()), None)
+    if not vcvars:
+        warn("vcvars64.bat not found; if the configure fails, open an 'x64 Native Tools Command Prompt'")
+        return
+    step(f"loading the MSVC environment ({vcvars})")
+    # A temporary .bat that calls vcvars and dumps the environment: quoting a path with spaces through
+    # `cmd /c` silently produces nothing, which left INCLUDE unset and forced the MSBuild fallback.
+    import tempfile
+    bat = Path(tempfile.gettempdir()) / "bt3_vcenv.bat"
+    bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul 2>&1\r\nset\r\n', encoding="ascii")
+    try:
+        out = run_capture([str(bat)])
+    finally:
+        bat.unlink(missing_ok=True)
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            os.environ[k] = v
+    # clang-cl lives in the VS LLVM toolset, which vcvars64 does not add to PATH. Without it the
+    # Windows configure falls back to the Visual Studio generator + -T ClangCL (and, when the ClangCL
+    # integration is absent, fails with MSB8020).
+    if not shutil.which("clang-cl"):
+        bin_dirs = []
+        if vswhere:
+            for hit in run_capture([vswhere, "-latest", "-products", "*", "-find",
+                                    r"VC\Tools\Llvm\x64\bin\clang-cl.exe"]).splitlines():
+                hit = hit.strip()
+                if hit:
+                    bin_dirs.append(Path(hit).parent)
+        install = vcvars.parents[3]
+        bin_dirs += [install / "VC" / "Tools" / "Llvm" / "x64" / "bin",
+                     install / "VC" / "Tools" / "Llvm" / "bin"]
+        for b in bin_dirs:
+            if (b / "clang-cl.exe").exists():
+                os.environ["PATH"] = str(b) + os.pathsep + os.environ.get("PATH", "")
+                print(f"  clang-cl: added {b} to PATH")
+                break
+        else:
+            warn("clang-cl not found; the configure will fall back to MSBuild + -T ClangCL "
+                 "(install the 'C++ Clang Compiler for Windows' component)")
+
+
 def configured(build_dir: Path, info: PlatformInfo) -> bool:
     """True when the build dir holds a COMPLETED configure. CMakeCache.txt alone is not enough:
     a half-failed configure leaves the cache behind and `cmake --build` then dies."""
@@ -808,6 +887,7 @@ def build_runner(ctx: "Context", jobs: str) -> Path:
 
 def stage_build(ctx: "Context") -> None:
     step("stage 3: build")
+    ensure_msvc_env(ctx)
     if ctx.args.skip_setup:
         if not (WORK / "SLUS_216.78").is_file():
             die("--skip-setup requires an existing games/bt3/work/ (no SLUS_216.78 found)")
@@ -885,11 +965,7 @@ def build_launcher(ctx: "Context") -> Optional[Path]:
     if ctx.platform.qt_prefix:
         extra.append("-DCMAKE_PREFIX_PATH=" + str(ctx.platform.qt_prefix))
     if ctx.platform.is_windows:
-        if (os.environ.get("PS2X_SETUP_GENERATOR", "ninja").lower() != "vs" and ctx.platform.vs_dev_prompt()
-                and shutil.which("ninja") and shutil.which("clang-cl")):
-            extra += ["-G", "Ninja", "-DCMAKE_C_COMPILER=clang-cl", "-DCMAKE_CXX_COMPILER=clang-cl"]
-        else:
-            extra += ["-T", os.environ.get("PS2X_SETUP_TOOLSET", "ClangCL")]
+        extra += ctx.platform.windows_generator_flags(bdir)
     run(["cmake", "-S", src, "-B", bdir] + extra)
     cmake_build(ctx.platform, bdir, "Launcher", ctx.jobs)
     exe = bdir / ctx.platform.exe("Launcher")
@@ -1180,6 +1256,7 @@ def package_artifact(ctx: "Context", out_root: Path, stage: Path) -> None:
 
 def stage_package(ctx: "Context") -> None:
     step("stage 4: deploy/package")
+    ensure_msvc_env(ctx)
     if ctx.runner is None:
         ctx.runner = find_binary("ps2EntryRunner")
 
