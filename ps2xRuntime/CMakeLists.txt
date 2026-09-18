@@ -136,29 +136,21 @@ else()
     # video path instead of rlImGui/rlgl when PS2X_D3D11=1 is active.
     if(WIN32)
         target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_dx11.cpp")
-        target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}/backends")
+    target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}/backends")
+
+    # [C] ImGui's SDL2 PLATFORM backend: the overlay's window/input glue. It replaces rlImGui (raylib's
+    # ecosystem) while the renderers stay ours -- imgui_impl_opengl3 for gfx::gl and imgui_impl_dx11 for
+    # the native path. SDL event WATCHING (see ui_sdl.cpp) lets ImGui see every event without consuming
+    # it, so raylib keeps its own input. The SDL2 link is added after the SDL2 target exists, below.
+    if(PS2X_HOST_SDL2)
+        target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp")
+    endif()
         target_link_libraries(imgui PUBLIC d3d11 dxgi)
     endif()
 
-    FetchContent_Declare(
-        rlImGui
-        GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
-        GIT_TAG "Raylib_5_5"
-        GIT_SHALLOW TRUE
-    )
-    FetchContent_GetProperties(rlImGui)
-
-    if(NOT rlimgui_POPULATED)
-        FetchContent_Populate(rlImGui)
-    endif()
-
-    set(PS2X_RLIMGUI_SOURCE_DIR "${rlimgui_SOURCE_DIR}")
-
-    add_library(rlImGui STATIC
-        "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
-    )
-    target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
-    target_link_libraries(rlImGui PUBLIC bt3gl imgui)
+    # [C] rlImGui is GONE: the overlay is ImGui over our own backends (imgui_impl_sdl2 for the platform
+    # and imgui_impl_opengl3 / imgui_impl_dx11 to draw), so raylib's ecosystem is no longer a build
+    # dependency. See src/lib/ui_sdl.cpp for the event-watch trick that keeps raylib's input working.
 
     # [hostio] SDL2 for gamepads and audio output (the window and keyboard stay raylib's). Built
     # static from source so every platform gets the same version; PS2X_HOSTPAD=raylib /
@@ -201,6 +193,10 @@ endif()
 if(TARGET bt3gl AND DEFINED PS2X_SDL2_TARGET)
     target_link_libraries(bt3gl PUBLIC ${PS2X_SDL2_TARGET})
     message(STATUS "[B] bt3gl (vendored raylib) window backend: SDL2 (${PS2X_SDL2_TARGET})")
+    # [C] imgui_impl_sdl2.cpp (the overlay's platform backend) needs SDL2's headers and symbols.
+    if(TARGET imgui)
+        target_link_libraries(imgui PUBLIC ${PS2X_SDL2_TARGET})
+    endif()
 else()
     # The window/input/GL context come from SDL2 now (PLATFORM_DESKTOP_SDL), so there is no fallback:
     # fail here with a clear message instead of a wall of undefined SDL_* symbols at link time.
@@ -487,6 +483,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_audio_vag.cpp
     src/lib/ps2_host_audio.cpp   # [hostio] audio device: SDL2 mixer or raylib/miniaudio
 src/lib/ps2_host_window.cpp  # [B] native HWND from raylib's window handle (SDL returns the SDL_Window*)
+src/lib/ui_sdl.cpp          # [C] ImGui platform glue on SDL2 (replaces rlImGui)
     src/lib/ps2_host_pad.cpp     # [hostio] gamepads: SDL2 gamecontroller (default) or raylib's own API
     src/lib/ps2_gs_gpu.cpp
     src/lib/ps2_gs_gpu_renderer.cpp
@@ -675,6 +672,8 @@ if(PS2X_USE_GSRL)
     message(STATUS "[gsrl] experiment ON: the replay submits through the renamed vendored rlgl copy")
 endif()
 target_include_directories(ps2_runtime PRIVATE "${bt3gl_SOURCE_DIR}/src/external")   # [A4] stb_image(_write)
+# [C] ui_sdl.cpp includes imgui_impl_sdl2.h: the backend headers come from the imgui target (PUBLIC).
+target_link_libraries(ps2_runtime PRIVATE imgui)
 if(WIN32)
     target_link_libraries(ps2_runtime PUBLIC opengl32)
 else()
@@ -818,7 +817,7 @@ if(NOT PS2X_IS_VITA)
             src/gfx/d3d11/ui_d3d11.cpp   # imgui_impl_dx11 backend (needs windows.h)
         )
     endif()
-    target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
+    target_link_libraries(ps2EntryRunner PRIVATE imgui)
     # gamemode: request CPU governor / IO priority optimisations at startup
     # (auto-release on exit; harmless no-op if the daemon isn't running).
     find_library(GAMEMODE_LIB NAMES libgamemodeauto.so gamemodeauto NAMES_PER_DIR)

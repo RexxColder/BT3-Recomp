@@ -134,6 +134,16 @@ names byte-for-byte so `VENDORED.md` stays true and updates stay mechanical; sym
 defines (`Color`, `Sound`, the `Renderer::*` members) are detected and left alone, and TUs that pull
 `<windows.h>` never get the bridge (raylib's `Rectangle` clashes with wingdi's).
 
+### C: the overlay
+
+`rlImGui` is gone from the build. The overlay is ImGui over our own backends: `imgui_impl_sdl2` for the
+platform/input and `imgui_impl_opengl3` (or `imgui_impl_dx11` on the native path) to draw, so it no
+longer draws through rlgl either — which removes the class of state fights where the overlay followed our
+raw-GL draws with rlgl's stale cache. `src/lib/ui_sdl.{h,cpp}` feeds ImGui from an SDL event WATCH: a
+watch sees every event while it is pumped and leaves it queued, so ImGui gets its input while raylib
+keeps receiving the game's. The raylib-fed input (`feedImGuiInput`) stays as the fallback when the SDL
+platform is unavailable (`PS2X_UISDL=0` forces it).
+
 
 ## Stages (each keeps the game rendering and is A/B-able)
 
