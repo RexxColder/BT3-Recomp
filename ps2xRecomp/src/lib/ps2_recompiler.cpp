@@ -955,6 +955,15 @@ namespace ps2recomp
                     m_reporter.info("iop", "resolved " + std::to_string(imports.size()) +
                                               " IRX import stub(s) to HLE calls");
                 }
+
+                // Per-module registration symbol, e.g. SIO2MAN.IRX -> ps2x_register_sio2man.
+                std::string base = fs::path(m_config.inputPath).stem().string();
+                std::string sym = "ps2x_register_";
+                for (char c : base)
+                    sym.push_back(std::isalnum(static_cast<unsigned char>(c))
+                                      ? static_cast<char>(std::tolower(static_cast<unsigned char>(c)))
+                                      : '_');
+                m_codeGenerator->setIopRegistrationSymbol(sym);
             }
 
             fs::create_directories(m_config.outputPath);

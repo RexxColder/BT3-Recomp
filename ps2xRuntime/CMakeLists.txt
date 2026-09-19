@@ -606,6 +606,8 @@ add_executable(ps2EntryRunner
 target_sources(ps2EntryRunner PRIVATE
     src/iop_native/sio2man/ps2_recompiled_functions.cpp
     src/iop_native/sio2man/register_functions.cpp
+    src/iop_native/sio2d/ps2_recompiled_functions.cpp
+    src/iop_native/sio2d/register_functions.cpp
 )
 
 # The overlay's single 20MB TU and its register file must not be unity-batched

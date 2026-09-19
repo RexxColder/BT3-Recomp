@@ -2513,9 +2513,15 @@ namespace
     }
 }
 
+// [r3000] Per-module IOP registration functions emitted by the recompiler. Declared weak so a
+// module that isn't linked in simply resolves to null.
+extern "C" {
+void ps2x_register_sio2man() __attribute__((weak));
+void ps2x_register_sio2d() __attribute__((weak));
+}
+
 bool PS2Runtime::registerIopFunction(uint32_t address, RecompiledFunction func)
-{
-    if (!func) return false;
+{    if (!func) return false;
     std::lock_guard<std::mutex> lk(iopTableMx());
     iopFuncTable()[address] = func;
     return true;
@@ -2564,6 +2570,22 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
     {
         std::fprintf(stderr, "[iop-run] cannot load IRX: %s\n", path);
         return false;
+    }
+
+    // Select this module's function table: reset it and register the module's recompiled
+    // functions (each module has its own registration symbol; modules run one at a time).
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        iopFuncTable().clear();
+    }
+    const std::string bn = mod.name;
+    if (bn.find("SIO2MAN") != std::string::npos)
+    {
+        if (ps2x_register_sio2man) ps2x_register_sio2man();
+    }
+    else if (bn.find("SIO2D") != std::string::npos)
+    {
+        if (ps2x_register_sio2d) ps2x_register_sio2d();
     }
 
     size_t ramSize = 0;

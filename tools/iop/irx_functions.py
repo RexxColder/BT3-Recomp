@@ -15,6 +15,7 @@ Output CSV format (consumed by ps2xRecomp's ghidra_output):
 """
 import struct
 import sys
+import os
 
 IMPORT_MAGIC = 0x41E00000
 EXPORT_MAGIC = 0x41C00000
@@ -98,6 +99,9 @@ def _jal_targets(code, base):
 
 def build_map(path):
     data = open(path, "rb").read()
+    # Per-module function-name prefix so several IRX modules can coexist in one binary.
+    base = os.path.basename(path).rsplit(".", 1)[0]
+    prefix = "".join(c if c.isalnum() else "_" for c in base).lower() + "_"
     entry, _phdrs, shdrs, shstrndx = _parse(data)
     sec = _text_section(data, shdrs, shstrndx)
     if not sec:
@@ -121,7 +125,7 @@ def build_map(path):
     for i, st in enumerate(starts):
         end = starts[i + 1] if i + 1 < len(starts) else code_end
         if end > st:
-            rows.append(("sub_%08x" % st, st, end))
+            rows.append((prefix + "%08x" % st, st, end))
     return rows, exports, imports
 
 

@@ -1453,9 +1453,10 @@ namespace ps2_syscalls
         }
         logSifModuleAction("load", moduleId, modulePath, refs);
 
-        // [r3000] SIO2MAN is recompiled: when the game loads it, map the IRX into IOP RAM and
-        // run its entry natively instead of the HLE shim.
-        if (modulePath.find("SIO2MAN") != std::string::npos)
+        // [r3000] Recompiled IOP modules: when the game loads one, map the IRX into IOP RAM and
+        // run its entry natively instead of only faking the HLE load.
+        if (modulePath.find("SIO2MAN") != std::string::npos ||
+            modulePath.find("SIO2D") != std::string::npos)
         {
             std::string dir = "data/IRX/";
             if (const char *d = std::getenv("PS2X_IOP_DIR"); d && d[0]) dir = d;

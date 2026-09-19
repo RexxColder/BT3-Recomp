@@ -163,19 +163,18 @@ namespace ps2recomp
 
         // [r3000] IOP modules load at vaddr 0, so they register into the dedicated IOP table
         // instead of the EE's g_ps2RecompiledFunctionTable (which uses the same low addresses).
+        // Emit a named registration function the loader calls (resetting the table each time).
         if (cg.arch() == Arch::R3000)
         {
-            ss << "namespace {\n";
-            ss << "struct GeneratedIopFunctionTableInitializer {\n";
-            ss << "    GeneratedIopFunctionTableInitializer() {\n";
+            const std::string sym = cg.iopRegistrationSymbol().empty()
+                                        ? std::string("ps2x_register_iop_module")
+                                        : cg.iopRegistrationSymbol();
+            ss << "extern \"C\" void " << sym << "()\n{\n";
             for (const auto &[address, name] : entries)
             {
-                ss << "        PS2Runtime::registerIopFunction(0x" << std::hex << address << "u, "
+                ss << "    PS2Runtime::registerIopFunction(0x" << std::hex << address << "u, "
                    << name << ");\n" << std::dec;
             }
-            ss << "    }\n";
-            ss << "};\n";
-            ss << "static const GeneratedIopFunctionTableInitializer g_generatedIopFunctionTableInitializer;\n";
             ss << "}\n";
             return ss.str();
         }

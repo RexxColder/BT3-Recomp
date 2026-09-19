@@ -10,11 +10,11 @@
 #include "ps2_log.h"
 #endif
 
-// Function: sub_00000000
+// Function: sio2man_00000000
 // Address: 0x0 - 0x14
-void sub_00000000_0x0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000000_0x0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000000_0x0");
+    PS_LOG_ENTRY("sio2man_00000000_0x0");
 #endif
 
     ctx->pc = 0x0u;
@@ -42,11 +42,11 @@ void sub_00000000_0x0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 }
 
 
-// Function: sub_00000014
+// Function: sio2man_00000014
 // Address: 0x14 - 0x28
-void sub_00000014_0x14(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000014_0x14(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000014_0x14");
+    PS_LOG_ENTRY("sio2man_00000014_0x14");
 #endif
 
     ctx->pc = 0x14u;
@@ -74,11 +74,11 @@ void sub_00000014_0x14(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 }
 
 
-// Function: sub_00000028
+// Function: sio2man_00000028
 // Address: 0x28 - 0x3c
-void sub_00000028_0x28(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000028_0x28(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000028_0x28");
+    PS_LOG_ENTRY("sio2man_00000028_0x28");
 #endif
 
     ctx->pc = 0x28u;
@@ -106,11 +106,11 @@ void sub_00000028_0x28(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 }
 
 
-// Function: sub_0000003C
+// Function: sio2man_0000003c
 // Address: 0x3c - 0x6c
-void sub_0000003C_0x3c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_0000003c_0x3c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_0000003C_0x3c");
+    PS_LOG_ENTRY("sio2man_0000003c_0x3c");
 #endif
 
     ctx->pc = 0x3cu;
@@ -162,11 +162,11 @@ void sub_0000003C_0x3c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 }
 
 
-// Function: sub_0000006C
+// Function: sio2man_0000006c
 // Address: 0x6c - 0x9c
-void sub_0000006C_0x6c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_0000006c_0x6c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_0000006C_0x6c");
+    PS_LOG_ENTRY("sio2man_0000006c_0x6c");
 #endif
 
     ctx->pc = 0x6cu;
@@ -218,11 +218,11 @@ void sub_0000006C_0x6c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 }
 
 
-// Function: sub_0000009C
+// Function: sio2man_0000009c
 // Address: 0x9c - 0xb0
-void sub_0000009C_0x9c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_0000009c_0x9c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_0000009C_0x9c");
+    PS_LOG_ENTRY("sio2man_0000009c_0x9c");
 #endif
 
     ctx->pc = 0x9cu;
@@ -250,11 +250,11 @@ void sub_0000009C_0x9c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 }
 
 
-// Function: sub_000000B0
+// Function: sio2man_000000b0
 // Address: 0xb0 - 0xe0
-void sub_000000B0_0xb0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_000000b0_0xb0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_000000B0_0xb0");
+    PS_LOG_ENTRY("sio2man_000000b0_0xb0");
 #endif
 
     ctx->pc = 0xb0u;
@@ -306,11 +306,11 @@ void sub_000000B0_0xb0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 }
 
 
-// Function: sub_000000E0
+// Function: sio2man_000000e0
 // Address: 0xe0 - 0x144
-void sub_000000E0_0xe0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_000000e0_0xe0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_000000E0_0xe0");
+    PS_LOG_ENTRY("sio2man_000000e0_0xe0");
 #endif
 
     ctx->pc = 0xe0u;
@@ -418,11 +418,11 @@ void sub_000000E0_0xe0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 }
 
 
-// Function: sub_00000144
+// Function: sio2man_00000144
 // Address: 0x144 - 0x154
-void sub_00000144_0x144(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000144_0x144(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000144_0x144");
+    PS_LOG_ENTRY("sio2man_00000144_0x144");
 #endif
 
     ctx->pc = 0x144u;
@@ -448,11 +448,11 @@ void sub_00000144_0x144(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) 
 }
 
 
-// Function: sub_00000154
+// Function: sio2man_00000154
 // Address: 0x154 - 0x164
-void sub_00000154_0x154(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000154_0x154(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000154_0x154");
+    PS_LOG_ENTRY("sio2man_00000154_0x154");
 #endif
 
     ctx->pc = 0x154u;
@@ -478,11 +478,11 @@ void sub_00000154_0x154(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) 
 }
 
 
-// Function: sub_00000164
+// Function: sio2man_00000164
 // Address: 0x164 - 0x178
-void sub_00000164_0x164(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000164_0x164(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000164_0x164");
+    PS_LOG_ENTRY("sio2man_00000164_0x164");
 #endif
 
     ctx->pc = 0x164u;
@@ -510,11 +510,11 @@ void sub_00000164_0x164(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) 
 }
 
 
-// Function: sub_00000178
+// Function: sio2man_00000178
 // Address: 0x178 - 0x18c
-void sub_00000178_0x178(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000178_0x178(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000178_0x178");
+    PS_LOG_ENTRY("sio2man_00000178_0x178");
 #endif
 
     ctx->pc = 0x178u;
@@ -542,11 +542,11 @@ void sub_00000178_0x178(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) 
 }
 
 
-// Function: sub_0000018C
+// Function: sio2man_0000018c
 // Address: 0x18c - 0x1ac
-void sub_0000018C_0x18c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_0000018c_0x18c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_0000018C_0x18c");
+    PS_LOG_ENTRY("sio2man_0000018c_0x18c");
 #endif
 
     switch (ctx->pc) {
@@ -594,11 +594,11 @@ label_19c:
 }
 
 
-// Function: sub_000001AC
+// Function: sio2man_000001ac
 // Address: 0x1ac - 0x1d4
-void sub_000001AC_0x1ac(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_000001ac_0x1ac(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_000001AC_0x1ac");
+    PS_LOG_ENTRY("sio2man_000001ac_0x1ac");
 #endif
 
     switch (ctx->pc) {
@@ -656,11 +656,11 @@ label_1c4:
 }
 
 
-// Function: sub_000001D4
+// Function: sio2man_000001d4
 // Address: 0x1d4 - 0x2fc
-void sub_000001D4_0x1d4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_000001d4_0x1d4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_000001D4_0x1d4");
+    PS_LOG_ENTRY("sio2man_000001d4_0x1d4");
 #endif
 
     switch (ctx->pc) {
@@ -954,11 +954,11 @@ label_2e4:
 }
 
 
-// Function: sub_000002FC
+// Function: sio2man_000002fc
 // Address: 0x2fc - 0x324
-void sub_000002FC_0x2fc(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_000002fc_0x2fc(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_000002FC_0x2fc");
+    PS_LOG_ENTRY("sio2man_000002fc_0x2fc");
 #endif
 
     switch (ctx->pc) {
@@ -1016,11 +1016,11 @@ label_314:
 }
 
 
-// Function: sub_00000324
+// Function: sio2man_00000324
 // Address: 0x324 - 0x5c0
-void sub_00000324_0x324(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000324_0x324(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000324_0x324");
+    PS_LOG_ENTRY("sio2man_00000324_0x324");
 #endif
 
     switch (ctx->pc) {
@@ -1724,11 +1724,11 @@ label_5ac:
 }
 
 
-// Function: sub_000005C0
+// Function: sio2man_000005c0
 // Address: 0x5c0 - 0x5ec
-void sub_000005C0_0x5c0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_000005c0_0x5c0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_000005C0_0x5c0");
+    PS_LOG_ENTRY("sio2man_000005c0_0x5c0");
 #endif
 
     switch (ctx->pc) {
@@ -1782,11 +1782,11 @@ label_5dc:
 }
 
 
-// Function: sub_000005EC
+// Function: sio2man_000005ec
 // Address: 0x5ec - 0x634
-void sub_000005EC_0x5ec(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_000005ec_0x5ec(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_000005EC_0x5ec");
+    PS_LOG_ENTRY("sio2man_000005ec_0x5ec");
 #endif
 
     switch (ctx->pc) {
@@ -1854,11 +1854,11 @@ label_624:
 }
 
 
-// Function: sub_00000634
-// Address: 0x634 - 0x904
-void sub_00000634_0x634(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+// Function: sio2man_00000634
+// Address: 0x634 - 0x81c
+void sio2man_00000634_0x634(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000634_0x634");
+    PS_LOG_ENTRY("sio2man_00000634_0x634");
 #endif
 
     switch (ctx->pc) {
@@ -1882,19 +1882,6 @@ void sub_00000634_0x634(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) 
         case 0x7c8u: goto label_7c8;
         case 0x7e4u: goto label_7e4;
         case 0x7f8u: goto label_7f8;
-        case 0x82cu: goto label_82c;
-        case 0x834u: goto label_834;
-        case 0x840u: goto label_840;
-        case 0x848u: goto label_848;
-        case 0x854u: goto label_854;
-        case 0x85cu: goto label_85c;
-        case 0x864u: goto label_864;
-        case 0x88cu: goto label_88c;
-        case 0x894u: goto label_894;
-        case 0x8bcu: goto label_8bc;
-        case 0x8c4u: goto label_8c4;
-        case 0x8e4u: goto label_8e4;
-        case 0x8f4u: goto label_8f4;
         default: break;
     }
 
@@ -2349,253 +2336,14 @@ label_7fc:
         #endif
     }
     ctx->pc = 0x81Cu;
-    // 0x81c: 0x27bdffe0  addiu       $sp, $sp, -0x20
-    SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967264));
-    // 0x820: 0xafbf0018  sw          $ra, 0x18($sp)
-    WRITE32(ADD32(GPR_U32(ctx, 29), 24), GPR_U32(ctx, 31));
-    // 0x824: 0xc00039f  jal         func_000E7C
-    ctx->pc = 0x824u;
-    SET_GPR_U32(ctx, 31, 0x82Cu);
-    ctx->pc = 0xE7Cu;
-    if (!runtime->dispatchIopBranch(rdram, ctx, 0xE7Cu, 0x824u, 0x82Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
-        return;
-    }
-    ctx->pc = 0x82Cu;
-label_82c:
-    // 0x82c: 0xc000376  jal         func_000DD8
-    ctx->pc = 0x82Cu;
-    SET_GPR_U32(ctx, 31, 0x834u);
-    // 0x830: 0x27a40010  addiu       $a0, $sp, 0x10 (Delay Slot)
-    SET_GPR_S32(ctx, 4, (int32_t)ADD32(GPR_U32(ctx, 29), 16));
-    ctx->pc = 0xDD8u;
-    if (!runtime->dispatchIopBranch(rdram, ctx, 0xDD8u, 0x82Cu, 0x834u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
-        return;
-    }
-    ctx->pc = 0x834u;
-label_834:
-    // 0x834: 0x24040011  addiu       $a0, $zero, 0x11
-    SET_GPR_S32(ctx, 4, (int32_t)ADD32(GPR_U32(ctx, 0), 17));
-    // 0x838: 0xc000374  jal         func_000DD0
-    ctx->pc = 0x838u;
-    SET_GPR_U32(ctx, 31, 0x840u);
-    // 0x83c: 0x2821  addu        $a1, $zero, $zero (Delay Slot)
-    SET_GPR_S32(ctx, 5, (int32_t)ADD32(GPR_U32(ctx, 0), GPR_U32(ctx, 0)));
-    ctx->pc = 0xDD0u;
-    if (!runtime->dispatchIopBranch(rdram, ctx, 0xDD0u, 0x838u, 0x840u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
-        return;
-    }
-    ctx->pc = 0x840u;
-label_840:
-    // 0x840: 0xc000370  jal         func_000DC0
-    ctx->pc = 0x840u;
-    SET_GPR_U32(ctx, 31, 0x848u);
-    // 0x844: 0x24040011  addiu       $a0, $zero, 0x11 (Delay Slot)
-    SET_GPR_S32(ctx, 4, (int32_t)ADD32(GPR_U32(ctx, 0), 17));
-    ctx->pc = 0xDC0u;
-    if (!runtime->dispatchIopBranch(rdram, ctx, 0xDC0u, 0x840u, 0x848u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
-        return;
-    }
-    ctx->pc = 0x848u;
-label_848:
-    // 0x848: 0x8fa40010  lw          $a0, 0x10($sp)
-    SET_GPR_S32(ctx, 4, (int32_t)READ32(ADD32(GPR_U32(ctx, 29), 16)));
-    // 0x84c: 0xc000378  jal         func_000DE0
-    ctx->pc = 0x84Cu;
-    SET_GPR_U32(ctx, 31, 0x854u);
-    ctx->pc = 0xDE0u;
-    if (!runtime->dispatchIopBranch(rdram, ctx, 0xDE0u, 0x84Cu, 0x854u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
-        return;
-    }
-    ctx->pc = 0x854u;
-label_854:
-    // 0x854: 0xc000392  jal         func_000E48
-    ctx->pc = 0x854u;
-    SET_GPR_U32(ctx, 31, 0x85Cu);
-    // 0x858: 0x2404000b  addiu       $a0, $zero, 0xB (Delay Slot)
-    SET_GPR_S32(ctx, 4, (int32_t)ADD32(GPR_U32(ctx, 0), 11));
-    ctx->pc = 0xE48u;
-    if (!runtime->dispatchIopBranch(rdram, ctx, 0xE48u, 0x854u, 0x85Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
-        return;
-    }
-    ctx->pc = 0x85Cu;
-label_85c:
-    // 0x85c: 0xc000392  jal         func_000E48
-    ctx->pc = 0x85Cu;
-    SET_GPR_U32(ctx, 31, 0x864u);
-    // 0x860: 0x2404000c  addiu       $a0, $zero, 0xC (Delay Slot)
-    SET_GPR_S32(ctx, 4, (int32_t)ADD32(GPR_U32(ctx, 0), 12));
-    ctx->pc = 0xE48u;
-    if (!runtime->dispatchIopBranch(rdram, ctx, 0xE48u, 0x85Cu, 0x864u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
-        return;
-    }
-    ctx->pc = 0x864u;
-label_864:
-    // 0x864: 0x8fbf0018  lw          $ra, 0x18($sp)
-    SET_GPR_S32(ctx, 31, (int32_t)READ32(ADD32(GPR_U32(ctx, 29), 24)));
-    // 0x868: 0x0  nop
-    // NOP
-    // 0x86c: 0x3e00008  jr          $ra
-    ctx->pc = 0x86Cu;
-    {
-        const uint32_t jumpTarget = GPR_U32(ctx, 31);
-        // 0x870: 0x27bd0020  addiu       $sp, $sp, 0x20 (Delay Slot)
-        SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 32));
-        ctx->pc = jumpTarget;
-        #if defined(PS2X_STRICT_RETURN_DIAGNOSTICS) && PS2X_STRICT_RETURN_DIAGNOSTICS
-        (void)runtime->dispatchGuestBranch(rdram, ctx, jumpTarget, 0x86Cu, 0u, PS2Runtime::GuestBranchKind::Return, "JR $ra");
-        return;
-        #else
-        ctx->pc = jumpTarget;
-        return;
-        #endif
-    }
-    ctx->pc = 0x874u;
-    // 0x874: 0x3c040000  lui         $a0, 0x0
-    SET_GPR_S32(ctx, 4, (int32_t)((uint32_t)0 << 16));
-    // 0x878: 0x8c840fc0  lw          $a0, 0xFC0($a0)
-    SET_GPR_S32(ctx, 4, (int32_t)READ32(ADD32(GPR_U32(ctx, 4), 4032)));
-    // 0x87c: 0x27bdffe8  addiu       $sp, $sp, -0x18
-    SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967272));
-    // 0x880: 0xafbf0010  sw          $ra, 0x10($sp)
-    WRITE32(ADD32(GPR_U32(ctx, 29), 16), GPR_U32(ctx, 31));
-    // 0x884: 0xc0003bd  jal         func_000EF4
-    ctx->pc = 0x884u;
-    SET_GPR_U32(ctx, 31, 0x88Cu);
-    ctx->pc = 0xEF4u;
-    if (!runtime->dispatchIopBranch(rdram, ctx, 0xEF4u, 0x884u, 0x88Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
-        return;
-    }
-    ctx->pc = 0x88Cu;
-label_88c:
-    // 0x88c: 0xc000241  jal         func_000904
-    ctx->pc = 0x88Cu;
-    SET_GPR_U32(ctx, 31, 0x894u);
-    ctx->pc = 0x904u;
-    if (!runtime->dispatchIopBranch(rdram, ctx, 0x904u, 0x88Cu, 0x894u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
-        return;
-    }
-    ctx->pc = 0x894u;
-label_894:
-    // 0x894: 0x8fbf0010  lw          $ra, 0x10($sp)
-    SET_GPR_S32(ctx, 31, (int32_t)READ32(ADD32(GPR_U32(ctx, 29), 16)));
-    // 0x898: 0x0  nop
-    // NOP
-    // 0x89c: 0x3e00008  jr          $ra
-    ctx->pc = 0x89Cu;
-    {
-        const uint32_t jumpTarget = GPR_U32(ctx, 31);
-        // 0x8a0: 0x27bd0018  addiu       $sp, $sp, 0x18 (Delay Slot)
-        SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 24));
-        ctx->pc = jumpTarget;
-        #if defined(PS2X_STRICT_RETURN_DIAGNOSTICS) && PS2X_STRICT_RETURN_DIAGNOSTICS
-        (void)runtime->dispatchGuestBranch(rdram, ctx, jumpTarget, 0x89Cu, 0u, PS2Runtime::GuestBranchKind::Return, "JR $ra");
-        return;
-        #else
-        ctx->pc = jumpTarget;
-        return;
-        #endif
-    }
-    ctx->pc = 0x8A4u;
-    // 0x8a4: 0x3c040000  lui         $a0, 0x0
-    SET_GPR_S32(ctx, 4, (int32_t)((uint32_t)0 << 16));
-    // 0x8a8: 0x8c840fc0  lw          $a0, 0xFC0($a0)
-    SET_GPR_S32(ctx, 4, (int32_t)READ32(ADD32(GPR_U32(ctx, 4), 4032)));
-    // 0x8ac: 0x27bdffe8  addiu       $sp, $sp, -0x18
-    SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967272));
-    // 0x8b0: 0xafbf0010  sw          $ra, 0x10($sp)
-    WRITE32(ADD32(GPR_U32(ctx, 29), 16), GPR_U32(ctx, 31));
-    // 0x8b4: 0xc0003bd  jal         func_000EF4
-    ctx->pc = 0x8B4u;
-    SET_GPR_U32(ctx, 31, 0x8BCu);
-    ctx->pc = 0xEF4u;
-    if (!runtime->dispatchIopBranch(rdram, ctx, 0xEF4u, 0x8B4u, 0x8BCu, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
-        return;
-    }
-    ctx->pc = 0x8BCu;
-label_8bc:
-    // 0x8bc: 0xc000255  jal         func_000954
-    ctx->pc = 0x8BCu;
-    SET_GPR_U32(ctx, 31, 0x8C4u);
-    ctx->pc = 0x954u;
-    if (!runtime->dispatchIopBranch(rdram, ctx, 0x954u, 0x8BCu, 0x8C4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
-        return;
-    }
-    ctx->pc = 0x8C4u;
-label_8c4:
-    // 0x8c4: 0x8fbf0010  lw          $ra, 0x10($sp)
-    SET_GPR_S32(ctx, 31, (int32_t)READ32(ADD32(GPR_U32(ctx, 29), 16)));
-    // 0x8c8: 0x0  nop
-    // NOP
-    // 0x8cc: 0x3e00008  jr          $ra
-    ctx->pc = 0x8CCu;
-    {
-        const uint32_t jumpTarget = GPR_U32(ctx, 31);
-        // 0x8d0: 0x27bd0018  addiu       $sp, $sp, 0x18 (Delay Slot)
-        SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 24));
-        ctx->pc = jumpTarget;
-        #if defined(PS2X_STRICT_RETURN_DIAGNOSTICS) && PS2X_STRICT_RETURN_DIAGNOSTICS
-        (void)runtime->dispatchGuestBranch(rdram, ctx, jumpTarget, 0x8CCu, 0u, PS2Runtime::GuestBranchKind::Return, "JR $ra");
-        return;
-        #else
-        ctx->pc = jumpTarget;
-        return;
-        #endif
-    }
-    ctx->pc = 0x8D4u;
-    // 0x8d4: 0x27bdffe8  addiu       $sp, $sp, -0x18
-    SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967272));
-    // 0x8d8: 0xafbf0010  sw          $ra, 0x10($sp)
-    WRITE32(ADD32(GPR_U32(ctx, 29), 16), GPR_U32(ctx, 31));
-    // 0x8dc: 0xc0002bb  jal         func_000AEC
-    ctx->pc = 0x8DCu;
-    SET_GPR_U32(ctx, 31, 0x8E4u);
-    ctx->pc = 0xAECu;
-    if (!runtime->dispatchIopBranch(rdram, ctx, 0xAECu, 0x8DCu, 0x8E4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
-        return;
-    }
-    ctx->pc = 0x8E4u;
-label_8e4:
-    // 0x8e4: 0x3c040000  lui         $a0, 0x0
-    SET_GPR_S32(ctx, 4, (int32_t)((uint32_t)0 << 16));
-    // 0x8e8: 0x8c840fc0  lw          $a0, 0xFC0($a0)
-    SET_GPR_S32(ctx, 4, (int32_t)READ32(ADD32(GPR_U32(ctx, 4), 4032)));
-    // 0x8ec: 0xc0003bb  jal         func_000EEC
-    ctx->pc = 0x8ECu;
-    SET_GPR_U32(ctx, 31, 0x8F4u);
-    ctx->pc = 0xEECu;
-    if (!runtime->dispatchIopBranch(rdram, ctx, 0xEECu, 0x8ECu, 0x8F4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
-        return;
-    }
-    ctx->pc = 0x8F4u;
-label_8f4:
-    // 0x8f4: 0x8fbf0010  lw          $ra, 0x10($sp)
-    SET_GPR_S32(ctx, 31, (int32_t)READ32(ADD32(GPR_U32(ctx, 29), 16)));
-    // 0x8f8: 0x0  nop
-    // NOP
-    // 0x8fc: 0x3e00008  jr          $ra
-    ctx->pc = 0x8FCu;
-    {
-        const uint32_t jumpTarget = GPR_U32(ctx, 31);
-        // 0x900: 0x27bd0018  addiu       $sp, $sp, 0x18 (Delay Slot)
-        SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 24));
-        ctx->pc = jumpTarget;
-        #if defined(PS2X_STRICT_RETURN_DIAGNOSTICS) && PS2X_STRICT_RETURN_DIAGNOSTICS
-        (void)runtime->dispatchGuestBranch(rdram, ctx, jumpTarget, 0x8FCu, 0u, PS2Runtime::GuestBranchKind::Return, "JR $ra");
-        return;
-        #else
-        ctx->pc = jumpTarget;
-        return;
-        #endif
-    }
-    ctx->pc = 0x904u;
 }
 
 
-// Function: sub_0000081c
+// Function: sio2man_0000081c
 // Address: 0x81c - 0x904
-void sub_0000081c_0x81c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_0000081c_0x81c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_0000081c_0x81c");
+    PS_LOG_ENTRY("sio2man_0000081c_0x81c");
 #endif
 
     switch (ctx->pc) {
@@ -2859,11 +2607,11 @@ label_8f4:
 }
 
 
-// Function: sub_00000904
+// Function: sio2man_00000904
 // Address: 0x904 - 0x954
-void sub_00000904_0x904(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000904_0x904(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000904_0x904");
+    PS_LOG_ENTRY("sio2man_00000904_0x904");
 #endif
 
     switch (ctx->pc) {
@@ -2951,11 +2699,11 @@ label_944:
 }
 
 
-// Function: sub_00000954
+// Function: sio2man_00000954
 // Address: 0x954 - 0xaec
-void sub_00000954_0x954(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000954_0x954(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000954_0x954");
+    PS_LOG_ENTRY("sio2man_00000954_0x954");
 #endif
 
     switch (ctx->pc) {
@@ -3351,11 +3099,11 @@ label_ad8:
 }
 
 
-// Function: sub_00000AEC
+// Function: sio2man_00000aec
 // Address: 0xaec - 0xd94
-void sub_00000AEC_0xaec(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000aec_0xaec(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000AEC_0xaec");
+    PS_LOG_ENTRY("sio2man_00000aec_0xaec");
 #endif
 
     switch (ctx->pc) {
@@ -4470,297 +4218,297 @@ label_d90:
 }
 
 
-// Function: sub_00000D94
+// Function: sio2man_00000d94
 // Address: 0xd94 - 0xdb8
-void sub_00000D94_0xd94(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000d94_0xd94(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000D94_0xd94");
+    PS_LOG_ENTRY("sio2man_00000d94_0xd94");
 #endif
 
     runtime->iopImport(rdram, ctx, "loadcore", 6u);
 }
 
 
-// Function: sub_00000DB8
+// Function: sio2man_00000db8
 // Address: 0xdb8 - 0xdc0
-void sub_00000DB8_0xdb8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000db8_0xdb8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000DB8_0xdb8");
+    PS_LOG_ENTRY("sio2man_00000db8_0xdb8");
 #endif
 
     runtime->iopImport(rdram, ctx, "intrman", 4u);
 }
 
 
-// Function: sub_00000DC0
+// Function: sio2man_00000dc0
 // Address: 0xdc0 - 0xdc8
-void sub_00000DC0_0xdc0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000dc0_0xdc0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000DC0_0xdc0");
+    PS_LOG_ENTRY("sio2man_00000dc0_0xdc0");
 #endif
 
     runtime->iopImport(rdram, ctx, "intrman", 5u);
 }
 
 
-// Function: sub_00000DC8
+// Function: sio2man_00000dc8
 // Address: 0xdc8 - 0xdd0
-void sub_00000DC8_0xdc8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000dc8_0xdc8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000DC8_0xdc8");
+    PS_LOG_ENTRY("sio2man_00000dc8_0xdc8");
 #endif
 
     runtime->iopImport(rdram, ctx, "intrman", 6u);
 }
 
 
-// Function: sub_00000DD0
+// Function: sio2man_00000dd0
 // Address: 0xdd0 - 0xdd8
-void sub_00000DD0_0xdd0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000dd0_0xdd0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000DD0_0xdd0");
+    PS_LOG_ENTRY("sio2man_00000dd0_0xdd0");
 #endif
 
     runtime->iopImport(rdram, ctx, "intrman", 7u);
 }
 
 
-// Function: sub_00000DD8
+// Function: sio2man_00000dd8
 // Address: 0xdd8 - 0xde0
-void sub_00000DD8_0xdd8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000dd8_0xdd8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000DD8_0xdd8");
+    PS_LOG_ENTRY("sio2man_00000dd8_0xdd8");
 #endif
 
     runtime->iopImport(rdram, ctx, "intrman", 17u);
 }
 
 
-// Function: sub_00000DE0
+// Function: sio2man_00000de0
 // Address: 0xde0 - 0xe04
-void sub_00000DE0_0xde0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000de0_0xde0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000DE0_0xde0");
+    PS_LOG_ENTRY("sio2man_00000de0_0xde0");
 #endif
 
     runtime->iopImport(rdram, ctx, "intrman", 18u);
 }
 
 
-// Function: sub_00000E04
+// Function: sio2man_00000e04
 // Address: 0xe04 - 0xe28
-void sub_00000E04_0xe04(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000e04_0xe04(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000E04_0xe04");
+    PS_LOG_ENTRY("sio2man_00000e04_0xe04");
 #endif
 
     runtime->iopImport(rdram, ctx, "stdio", 4u);
 }
 
 
-// Function: sub_00000E28
+// Function: sio2man_00000e28
 // Address: 0xe28 - 0xe30
-void sub_00000E28_0xe28(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000e28_0xe28(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000E28_0xe28");
+    PS_LOG_ENTRY("sio2man_00000e28_0xe28");
 #endif
 
     runtime->iopImport(rdram, ctx, "dmacman", 28u);
 }
 
 
-// Function: sub_00000E30
+// Function: sio2man_00000e30
 // Address: 0xe30 - 0xe38
-void sub_00000E30_0xe30(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000e30_0xe30(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000E30_0xe30");
+    PS_LOG_ENTRY("sio2man_00000e30_0xe30");
 #endif
 
     runtime->iopImport(rdram, ctx, "dmacman", 32u);
 }
 
 
-// Function: sub_00000E38
+// Function: sio2man_00000e38
 // Address: 0xe38 - 0xe40
-void sub_00000E38_0xe38(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000e38_0xe38(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000E38_0xe38");
+    PS_LOG_ENTRY("sio2man_00000e38_0xe38");
 #endif
 
     runtime->iopImport(rdram, ctx, "dmacman", 33u);
 }
 
 
-// Function: sub_00000E40
+// Function: sio2man_00000e40
 // Address: 0xe40 - 0xe48
-void sub_00000E40_0xe40(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000e40_0xe40(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000E40_0xe40");
+    PS_LOG_ENTRY("sio2man_00000e40_0xe40");
 #endif
 
     runtime->iopImport(rdram, ctx, "dmacman", 34u);
 }
 
 
-// Function: sub_00000E48
+// Function: sio2man_00000e48
 // Address: 0xe48 - 0xe6c
-void sub_00000E48_0xe48(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000e48_0xe48(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000E48_0xe48");
+    PS_LOG_ENTRY("sio2man_00000e48_0xe48");
 #endif
 
     runtime->iopImport(rdram, ctx, "dmacman", 35u);
 }
 
 
-// Function: sub_00000E6C
+// Function: sio2man_00000e6c
 // Address: 0xe6c - 0xe74
-void sub_00000E6C_0xe6c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000e6c_0xe6c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000E6C_0xe6c");
+    PS_LOG_ENTRY("sio2man_00000e6c_0xe6c");
 #endif
 
     runtime->iopImport(rdram, ctx, "thbase", 4u);
 }
 
 
-// Function: sub_00000E74
+// Function: sio2man_00000e74
 // Address: 0xe74 - 0xe7c
-void sub_00000E74_0xe74(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000e74_0xe74(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000E74_0xe74");
+    PS_LOG_ENTRY("sio2man_00000e74_0xe74");
 #endif
 
     runtime->iopImport(rdram, ctx, "thbase", 6u);
 }
 
 
-// Function: sub_00000E7C
+// Function: sio2man_00000e7c
 // Address: 0xe7c - 0xea0
-void sub_00000E7C_0xe7c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000e7c_0xe7c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000E7C_0xe7c");
+    PS_LOG_ENTRY("sio2man_00000e7c_0xe7c");
 #endif
 
     runtime->iopImport(rdram, ctx, "thbase", 20u);
 }
 
 
-// Function: sub_00000EA0
+// Function: sio2man_00000ea0
 // Address: 0xea0 - 0xea8
-void sub_00000EA0_0xea0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000ea0_0xea0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000EA0_0xea0");
+    PS_LOG_ENTRY("sio2man_00000ea0_0xea0");
 #endif
 
     runtime->iopImport(rdram, ctx, "thevent", 4u);
 }
 
 
-// Function: sub_00000EA8
+// Function: sio2man_00000ea8
 // Address: 0xea8 - 0xeb0
-void sub_00000EA8_0xea8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000ea8_0xea8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000EA8_0xea8");
+    PS_LOG_ENTRY("sio2man_00000ea8_0xea8");
 #endif
 
     runtime->iopImport(rdram, ctx, "thevent", 6u);
 }
 
 
-// Function: sub_00000EB0
+// Function: sio2man_00000eb0
 // Address: 0xeb0 - 0xeb8
-void sub_00000EB0_0xeb0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000eb0_0xeb0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000EB0_0xeb0");
+    PS_LOG_ENTRY("sio2man_00000eb0_0xeb0");
 #endif
 
     runtime->iopImport(rdram, ctx, "thevent", 7u);
 }
 
 
-// Function: sub_00000EB8
+// Function: sio2man_00000eb8
 // Address: 0xeb8 - 0xec0
-void sub_00000EB8_0xeb8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000eb8_0xeb8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000EB8_0xeb8");
+    PS_LOG_ENTRY("sio2man_00000eb8_0xeb8");
 #endif
 
     runtime->iopImport(rdram, ctx, "thevent", 8u);
 }
 
 
-// Function: sub_00000EC0
+// Function: sio2man_00000ec0
 // Address: 0xec0 - 0xee4
-void sub_00000EC0_0xec0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000ec0_0xec0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000EC0_0xec0");
+    PS_LOG_ENTRY("sio2man_00000ec0_0xec0");
 #endif
 
     runtime->iopImport(rdram, ctx, "thevent", 10u);
 }
 
 
-// Function: sub_00000EE4
+// Function: sio2man_00000ee4
 // Address: 0xee4 - 0xeec
-void sub_00000EE4_0xee4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000ee4_0xee4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000EE4_0xee4");
+    PS_LOG_ENTRY("sio2man_00000ee4_0xee4");
 #endif
 
     runtime->iopImport(rdram, ctx, "thsemap", 4u);
 }
 
 
-// Function: sub_00000EEC
+// Function: sio2man_00000eec
 // Address: 0xeec - 0xef4
-void sub_00000EEC_0xeec(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000eec_0xeec(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000EEC_0xeec");
+    PS_LOG_ENTRY("sio2man_00000eec_0xeec");
 #endif
 
     runtime->iopImport(rdram, ctx, "thsemap", 6u);
 }
 
 
-// Function: sub_00000EF4
+// Function: sio2man_00000ef4
 // Address: 0xef4 - 0xefc
-void sub_00000EF4_0xef4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000ef4_0xef4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000EF4_0xef4");
+    PS_LOG_ENTRY("sio2man_00000ef4_0xef4");
 #endif
 
     runtime->iopImport(rdram, ctx, "thsemap", 8u);
 }
 
 
-// Function: sub_00000EFC
+// Function: sio2man_00000efc
 // Address: 0xefc - 0xf20
-void sub_00000EFC_0xefc(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000efc_0xefc(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000EFC_0xefc");
+    PS_LOG_ENTRY("sio2man_00000efc_0xefc");
 #endif
 
     runtime->iopImport(rdram, ctx, "thsemap", 11u);
 }
 
 
-// Function: sub_00000F20
+// Function: sio2man_00000f20
 // Address: 0xf20 - 0xf28
-void sub_00000F20_0xf20(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000f20_0xf20(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000F20_0xf20");
+    PS_LOG_ENTRY("sio2man_00000f20_0xf20");
 #endif
 
     runtime->iopImport(rdram, ctx, "sysclib", 8u);
 }
 
 
-// Function: sub_00000F28
+// Function: sio2man_00000f28
 // Address: 0xf28 - 0xf30
-void sub_00000F28_0xf28(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+void sio2man_00000f28_0xf28(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
-    PS_LOG_ENTRY("sub_00000F28_0xf28");
+    PS_LOG_ENTRY("sio2man_00000f28_0xf28");
 #endif
 
     runtime->iopImport(rdram, ctx, "sysclib", 29u);

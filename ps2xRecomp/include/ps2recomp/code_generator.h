@@ -62,6 +62,10 @@ namespace ps2recomp
         void setIopImports(const std::unordered_map<uint32_t, IopImport> &m) { m_importStubs = m; }
         const std::unordered_map<uint32_t, IopImport> &iopImports() const { return m_importStubs; }
 
+        // [r3000] Name of the extern "C" registration function emitted for this module's IOP table.
+        void setIopRegistrationSymbol(const std::string &s) { m_iopRegistrationSymbol = s; }
+        const std::string &iopRegistrationSymbol() const { return m_iopRegistrationSymbol; }
+
         AnalysisResult collectInternalBranchTargets(const Function &function,
                                                   const std::vector<Instruction> &instructions,
                                                   const std::vector<Function> *allFunctions = nullptr);
@@ -80,6 +84,7 @@ namespace ps2recomp
         void setPcStoresAll(bool v) { m_pcStoresAll = v; }
         Arch m_arch = Arch::R5900;    // [r3000] guest architecture
         std::unordered_map<uint32_t, IopImport> m_importStubs;   // [r3000] stub vaddr -> import
+        std::string m_iopRegistrationSymbol;                     // [r3000] per-module registration fn
         std::string m_currentFunctionName;
 
         std::string translateInstruction(const Instruction &inst);
