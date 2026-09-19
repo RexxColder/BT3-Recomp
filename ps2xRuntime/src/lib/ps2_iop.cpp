@@ -342,8 +342,8 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
         return true;
     }
 
-    // [r3000] Deliver DBCMAN RPCs to the native module's registered handler when enabled.
-    if (const char *nat = std::getenv("PS2X_IOP_NATIVE_DBCMAN"); nat && nat[0] && nat[0] != '0')
+    // [r3000] Deliver DBCMAN RPCs to the native module's registered handler (opt out with =0).
+    if (const char *nat = std::getenv("PS2X_IOP_NATIVE_DBCMAN"); !(nat && nat[0] == '0'))
     {
         if (ps2xInvokeIopRpc(runtime, sid, rpcNum, m_rdram, sendBufAddr, sendSize, recvBufAddr, recvSize))
         {

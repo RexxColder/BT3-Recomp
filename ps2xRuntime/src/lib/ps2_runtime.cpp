@@ -3050,7 +3050,7 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
 
     std::fprintf(stderr, "[iop-run] %s: entry returned\n", mod.name.c_str());
 
-    if (const char *s = std::getenv("PS2X_IOP_SCHED"); s && s[0] && s[0] != '0')
+    if (const char *s = std::getenv("PS2X_IOP_SCHED"); !(s && s[0] == '0'))
     {
         std::fprintf(stderr, "[iop-sched] running threads after %s\n", mod.name.c_str());
         runIopScheduler(this, iopBase);
