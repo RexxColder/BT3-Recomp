@@ -8,6 +8,7 @@
 //   ee_overlay <pc>            a MIPS pc interpreted by ps2_interp (no recompiled function)
 //   vu1 <hash> <extent>        a VU1 microprogram whose MPG hash is not in vujit::kPrograms
 //   vu0 <hash> <extent>        same for VU0
+//   iop <module> <rpc>         an IOP module still serviced by the HLE (not a recompiled IRX)
 //
 // Deduplicated and bounded; flushed at exit.
 
@@ -20,4 +21,5 @@ namespace ps2cov
 
     void noteEeOverlay(uint32_t pc);
     void noteVuProgram(int unit, uint64_t hash, uint32_t extent);   // unit: 0 = VU0, 1 = VU1
+    void noteIopModule(const char *module, uint32_t rpcNum);        // IOP module serviced by the HLE
 }

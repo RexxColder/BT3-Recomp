@@ -1,4 +1,5 @@
 #include "runtime/ps2_iop.h"
+#include "runtime/ps2_coverage.h"
 #include "runtime/ps2_iop_audio.h"
 #include "runtime/ps2_iop_cl.h"
 #include "runtime/ps2_iop_dbcman.h"
@@ -215,6 +216,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
             }
         }
         signalNowaitCompletion = true;
+        ps2cov::noteIopModule("DVCI", rpcNum);
         return true;
     }
 
@@ -317,6 +319,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
             resultPtr = recvBufAddr;
         }
         signalNowaitCompletion = true;
+        ps2cov::noteIopModule("DVCI", rpcNum);
         return true;
     }
 
@@ -331,6 +334,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                                   resultPtr,
                                                   signalNowaitCompletion))
     {
+        ps2cov::noteIopModule("SOUNDS", rpcNum);
         return true;
     }
 
@@ -343,6 +347,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                         recvSize,
                                         resultPtr))
     {
+        ps2cov::noteIopModule("DBCMAN", rpcNum);
         return true;
     }
 
@@ -356,6 +361,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                       recvSize,
                                       resultPtr))
     {
+        ps2cov::noteIopModule("LIBSD", rpcNum);
         return true;
     }
 
@@ -365,6 +371,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                    recvSize, resultPtr,
                                    signalNowaitCompletion))
     {
+        ps2cov::noteIopModule("CRI_ADXI", rpcNum);
         return true;
     }
 
@@ -373,6 +380,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                     sendSize, recvBufAddr,
                                     recvSize, resultPtr))
     {
+        ps2cov::noteIopModule("CRI_ADXI", rpcNum);
         return true;
     }
 
@@ -381,6 +389,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                         sendSize, recvBufAddr,
                                         recvSize, resultPtr))
     {
+        ps2cov::noteIopModule("SDRDRV", rpcNum);
         return true;
     }
 
