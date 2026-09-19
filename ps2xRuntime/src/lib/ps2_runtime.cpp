@@ -2438,9 +2438,15 @@ namespace
         static std::unordered_map<std::string, IopDevice> m;
         return m;
     }
-    std::unordered_map<int, std::string> &iomanFds()
+    std::unordered_map<int, std::string> &iomanFdsPath()
     {
         static std::unordered_map<int, std::string> m;
+        return m;
+    }
+    struct IopFile { IopDevice dev; uint32_t filePtr = 0; };
+    std::unordered_map<int, IopFile> &iomanFds()
+    {
+        static std::unordered_map<int, IopFile> m;
         return m;
     }
     std::atomic<int> &iomanNextFd()
@@ -2788,6 +2794,61 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
     }
     else if (mod == "ioman")
     {
+        auto callDevOp = [&](const IopDevice &dev, uint32_t opOff,
+                             uint32_t x0, uint32_t x1, uint32_t x2, uint32_t x3) -> uint32_t
+        {
+            if (!dev.ops || !iopBase) return 0;
+            const uint32_t fnAddr = rdU32(dev.ops + opOff);
+            if (!fnAddr) return 0;
+            PS2Runtime::RecompiledFunction fn = nullptr;
+            uint32_t savedMod = 0;
+            {
+                std::lock_guard<std::mutex> lk(iopTableMx());
+                savedMod = g_iopCurModule;
+                g_iopCurModule = dev.moduleId;
+                g_iopCurGp = dev.gp;
+                g_iopCurBase = dev.base;
+                auto mit = iopTables().find(dev.moduleId);
+                if (mit != iopTables().end())
+                {
+                    auto it = mit->second.find(fnAddr);
+                    if (it != mit->second.end()) fn = it->second;
+                }
+            }
+            uint32_t r = 0;
+            if (fn)
+            {
+                const uint32_t savedGp = getRegU32(ctx, 28);
+                ctx->r[28] = _mm_cvtsi32_si128(dev.gp);
+                ctx->r[4] = _mm_cvtsi32_si128(x0);
+                ctx->r[5] = _mm_cvtsi32_si128(x1);
+                ctx->r[6] = _mm_cvtsi32_si128(x2);
+                ctx->r[7] = _mm_cvtsi32_si128(x3);
+                try { fn(iopBase + dev.base, ctx, this); } catch (...) {}
+                r = getRegU32(ctx, 2);
+                ctx->r[28] = _mm_cvtsi32_si128(savedGp);
+            }
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            g_iopCurModule = savedMod;
+            return r;
+        };
+        auto findDevice = [&](const std::string &path) -> IopDevice
+        {
+            const size_t colon = path.find(':');
+            const std::string prefix = colon == std::string::npos ? path : path.substr(0, colon);
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            for (const auto &kv : iomanDevices())
+                if (prefix.rfind(kv.first, 0) == 0 || kv.first.rfind(prefix, 0) == 0)
+                    return kv.second;
+            return IopDevice{};
+        };
+        auto fdFile = [&](int fd) -> std::pair<IopFile, bool>
+        {
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            auto it = iomanFds().find(fd);
+            return it == iomanFds().end() ? std::make_pair(IopFile{}, false) : std::make_pair(it->second, true);
+        };
+
         if (ordinal == 20)   // AddDrv(iop_device_t*): name@0, ops@16
         {
             const std::string name = cstr(rdU32(a0));
@@ -2808,85 +2869,90 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
             iomanDevices().erase(cstr(a0));
             ret = 0;
         }
-        else if (ordinal == 4)    // open(name, mode): route to the device's ops->open
+        else if (ordinal == 4)    // open(name, mode) -> fd
         {
             const std::string path = cstr(a0);
-            const size_t colon = path.find(':');
-            const std::string prefix = colon == std::string::npos ? path : path.substr(0, colon);
-            IopDevice dev;
-            bool found = false;
+            const IopDevice dev = findDevice(path);
+            const uint32_t f = 0x1A0000u;   // iop_file_t scratch
+            uint32_t r = 0;
+            if (dev.ops)
             {
-                std::lock_guard<std::mutex> lk(iopTableMx());
-                for (const auto &kv : iomanDevices())
-                    if (prefix.rfind(kv.first, 0) == 0 || kv.first.rfind(prefix, 0) == 0)
-                    { dev = kv.second; found = true; break; }
+                wrU32(f + 0, a1); wrU32(f + 4, 0); wrU32(f + 8, dev.devPtr); wrU32(f + 12, 0);
+                r = callDevOp(dev, 12, f, a0, a1, 0);
             }
-            if (found && dev.ops && iopBase)
+            if (!dev.ops || r == 0)
             {
-                const uint32_t f = 0x1A0000u;   // iop_file_t scratch
-                wrU32(f + 0, a1);          // mode
-                wrU32(f + 4, 0);           // unit
-                wrU32(f + 8, dev.devPtr);  // device
-                wrU32(f + 12, 0);          // privdata
-                const uint32_t openFn = rdU32(dev.ops + 12);
-                uint32_t r = 0;
-                if (openFn)
-                {
-                    PS2Runtime::RecompiledFunction fn = nullptr;
-                    uint32_t savedMod = 0;
-                    {
-                        std::lock_guard<std::mutex> lk(iopTableMx());
-                        savedMod = g_iopCurModule;
-                        g_iopCurModule = dev.moduleId;
-                        g_iopCurGp = dev.gp;
-                        g_iopCurBase = dev.base;
-                        auto mit = iopTables().find(dev.moduleId);
-                        if (mit != iopTables().end())
-                        {
-                            auto it = mit->second.find(openFn);
-                            if (it != mit->second.end()) fn = it->second;
-                        }
-                    }
-                    const uint32_t savedGp = getRegU32(ctx, 28);
-                    ctx->r[28] = _mm_cvtsi32_si128(dev.gp);
-                    ctx->r[4] = _mm_cvtsi32_si128(f);
-                    ctx->r[5] = _mm_cvtsi32_si128(a0);
-                    ctx->r[6] = _mm_cvtsi32_si128(a1);
-                    if (fn) { try { fn(iopBase + dev.base, ctx, this); } catch (...) {} r = getRegU32(ctx, 2); }
-                    ctx->r[28] = _mm_cvtsi32_si128(savedGp);
-                    std::lock_guard<std::mutex> lk(iopTableMx());
-                    g_iopCurModule = savedMod;
-                }
-                if (r == 0)
-                {
-                    const int fd = iomanNextFd().fetch_add(1);
-                    iomanFds()[fd] = path;
-                    ret = static_cast<uint32_t>(fd);
-                }
-                else
-                {
-                    ret = r;
-                }
+                const int fd = iomanNextFd().fetch_add(1);
+                std::lock_guard<std::mutex> lk(iopTableMx());
+                iomanFds()[fd] = IopFile{dev, f};
+                ret = static_cast<uint32_t>(fd);
             }
             else
             {
-                const int fd = iomanNextFd().fetch_add(1);
-                iomanFds()[fd] = path;
-                ret = static_cast<uint32_t>(fd);
+                ret = r;
             }
         }
-        else if (ordinal == 13)   // dopen(name, mode) -> fd
+        else if (ordinal == 5)    // close(fd)
         {
-            const int fd = iomanNextFd().fetch_add(1);
-            iomanFds()[fd] = cstr(a0);
-            ret = static_cast<uint32_t>(fd);
-        }
-        else if (ordinal == 5 || ordinal == 14)   // close/dclose(fd)
-        {
-            iomanFds().erase(static_cast<int>(a0));
+            IopFile fl; bool found = false;
+            {
+                std::lock_guard<std::mutex> lk(iopTableMx());
+                auto it = iomanFds().find(static_cast<int>(a0));
+                if (it != iomanFds().end()) { fl = it->second; found = true; iomanFds().erase(it); }
+            }
+            if (found && fl.dev.ops) callDevOp(fl.dev, 16, fl.filePtr, 0, 0, 0);
             ret = 0;
         }
-        // read/write/lseek/ioctl/remove/mkdir/rmdir/dread/getstat/chstat/format -> 0
+        else if (ordinal >= 6 && ordinal <= 9)   // read/write/lseek/ioctl
+        {
+            static const uint32_t kOff[4] = {20, 24, 28, 32};
+            auto ff = fdFile(static_cast<int>(a0));
+            ret = ff.second ? callDevOp(ff.first.dev, kOff[ordinal - 6], ff.first.filePtr, a1, a2, a3) : 0u;
+        }
+        else if (ordinal == 13)   // dopen(path, mode) -> fd
+        {
+            const std::string path = cstr(a0);
+            const IopDevice dev = findDevice(path);
+            const uint32_t f = 0x1A0000u;
+            uint32_t r = 0;
+            if (dev.ops) r = callDevOp(dev, 48, f, a0, a1, 0);
+            if (!dev.ops || r == 0)
+            {
+                const int fd = iomanNextFd().fetch_add(1);
+                std::lock_guard<std::mutex> lk(iopTableMx());
+                iomanFds()[fd] = IopFile{dev, f};
+                ret = static_cast<uint32_t>(fd);
+            }
+            else ret = r;
+        }
+        else if (ordinal == 14)   // dclose(fd)
+        {
+            IopFile fl; bool found = false;
+            {
+                std::lock_guard<std::mutex> lk(iopTableMx());
+                auto it = iomanFds().find(static_cast<int>(a0));
+                if (it != iomanFds().end()) { fl = it->second; found = true; iomanFds().erase(it); }
+            }
+            if (found && fl.dev.ops) callDevOp(fl.dev, 52, fl.filePtr, 0, 0, 0);
+            ret = 0;
+        }
+        else if (ordinal == 15)   // dread(fd, dirent*)
+        {
+            auto ff = fdFile(static_cast<int>(a0));
+            ret = ff.second ? callDevOp(ff.first.dev, 56, ff.first.filePtr, a1, 0, 0) : 0u;
+        }
+        else if (ordinal == 16 || ordinal == 17)   // getstat/chstat(name, ...)
+        {
+            const IopDevice dev = findDevice(cstr(a0));
+            ret = dev.ops ? callDevOp(dev, ordinal == 16 ? 60u : 64u, 0, a0, a1, a2) : 0u;
+        }
+        else if (ordinal == 10 || ordinal == 11 || ordinal == 12)   // remove/mkdir/rmdir(name)
+        {
+            static const uint32_t kOff[3] = {36, 40, 44};
+            const IopDevice dev = findDevice(cstr(a0));
+            ret = dev.ops ? callDevOp(dev, kOff[ordinal - 10], 0, a0, 0, 0) : 0u;
+        }
+        // 18 format -> 0
     }
 
     setReturnU32(ctx, ret);
