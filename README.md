@@ -151,6 +151,26 @@ Known issues:
 - occasional arm-pose flip during ki charge
 - FMVs are skipped
 
+## Texture replacement & cache
+
+Textures are identified exactly like PCSX2 (`<TEX0Hash>-<CLUTHash>-<bits>`), so its
+existing packs work unchanged. Drop a pack in `<deploy>/data/Textures/` (see
+[textures/README.md](textures/README.md)) or set `PS2X_TEXREPLACE=<dir>`.
+
+In the launcher/overlay Video tab, **Texture Replacement…** shows the pack status plus
+**Video overlay (4K intro)** and **Buttons style (PS2/Xbox)**. Enabling and installing
+live in the launcher's **Misc** tab (**Pack Lite** = 2D only, **Pack Full** = 3D + 2D);
+the launcher opens the pack's download page (Open in browser / Copy link) and installs
+a locally downloaded archive with **Browse…**.
+
+The **texture cache** (`<deploy>/data/texcache.bin`) stores each texture once it is
+fully resolved (PSMT decode + pack replacement applied) so later runs skip the VRAM
+hash match, the pack lookup and the PNG/DDS decode — measured ~6x fewer texture
+decodes, a CPU/I-O saving (the GPU path is unchanged). It fills as you play and is
+rebuilt automatically when the pack, the Texture Replacement toggle or the button
+layout changes. Toggle it in **Misc → Texture Cache** (`[video] texcache`); delete it
+there (or set `PS2X_TEXCACHE_REGEN=1`) to force a rebuild.
+
 ## Repository layout
 
 | Path | What it is |
