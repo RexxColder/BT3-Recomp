@@ -90,3 +90,17 @@ visualmente que el juego progrese a FIGHT.
 3. **MC (MCMAN+MCSERV)**: atacarlos juntos; necesitan SIF real (EE↔IOP) y/o SIO2 + la cadena
    `ioman`/`secrman`/`cdvdman`.
 4. `IOPRP300.IMG`: módulos del kernel IOP aún sin tocar.
+
+## IOPRP300.IMG (kernel IOP + residentes)
+
+`tools/iop/ioprp.py` lista/extrae la imagen (ROMDIR): 16 módulos ELF:
+`SYSMEM LOADCORE SIFCMD SIFMAN THREADMAN IOMAN MODLOAD FILEIO CDVDMAN CDVDFSV LOADFILE TIMEMANI
+ROMDRV EESYNC SYSCLIB STDIO`. Nuestro **kernel HLE** cubre los del kernel
+(sysmem/loadcore/sifcmd/sifman/threadman/intrman/…).
+
+**Proveedores que faltan** (los importan los IRX del juego y ni los HLEamos ni están como módulo):
+- Residentes en IOPRP pero no HLE'd: **`ioman`, `cdvdman`, `modload`**.
+- No existen como módulo: **`secrman`, `heaplib`, `thmsgbx`, `timrman`, `vblank`**.
+
+Hoy esas llamadas devuelven 0 (el juego igual bootea y llega a FIGHT). Para fidelidad plena
+(M C, CD, timers, vblank) hay que HLE'arlos o recompilar los residentes de IOPRP.
