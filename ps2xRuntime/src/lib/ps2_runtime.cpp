@@ -2405,6 +2405,8 @@ namespace
         uint32_t handler = 0;    // native function address in the module
         uint32_t server = 0;     // sceSifRpcData_t* (opaque)
         uint32_t moduleId = 0;   // owning IOP module
+        uint32_t base = 0;       // module load base
+        uint32_t gp = 0;         // module gp
     };
     std::unordered_map<uint32_t, IopSifRpc> &sifRpcServers()
     {
@@ -2712,6 +2714,7 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
         {
             IopSifRpc r;
             r.server = a0; r.handler = a2; r.moduleId = g_iopCurModule;
+            r.base = g_iopCurBase; r.gp = g_iopCurGp;
             std::lock_guard<std::mutex> lk(iopTableMx());
             sifRpcServers()[a1] = r;
             std::fprintf(stderr, "[iop-sif] RegisterRpc sid=0x%08x handler=0x%08x\n", a1, a2);
@@ -2805,6 +2808,92 @@ static void runIopScheduler(PS2Runtime *rt, uint8_t *iopBase)
         catch (...) { t.status = 4; }
     }
     g_iopCurThread = 0;
+}
+
+// [r3000] Deliver an EE-side SIF RPC to a native module's registered handler (sifcmd
+// sceSifRegisterRpc). Copies the request from EE RAM into IOP RAM, calls the handler with
+// (command, data, size) and copies the result back. Returns false if no native server owns sid.
+bool ps2xInvokeIopRpc(PS2Runtime *rt, uint32_t sid, uint32_t command,
+                      uint8_t *eeRam, uint32_t sendAddr, uint32_t sendSize,
+                      uint32_t recvAddr, uint32_t recvSize)
+{
+    if (!rt) return false;
+    if (sid >= 0x80001300u && sid < 0x80001400u)
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        std::fprintf(stderr, "[iop-xrpc-probe] sid=0x%08x cmd=0x%x send=%u recv=%u servers=%zu found=%d\n",
+                     sid, command, sendSize, recvSize, sifRpcServers().size(),
+                     (int)sifRpcServers().count(sid));
+    }
+    IopSifRpc svc;
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        auto it = sifRpcServers().find(sid);
+        if (it == sifRpcServers().end() || !it->second.handler) return false;
+        svc = it->second;
+    }
+    PS2Runtime::RecompiledFunction fn = nullptr;
+    uint32_t savedMod = 0;
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        savedMod = g_iopCurModule;
+        g_iopCurModule = svc.moduleId;
+        g_iopCurGp = svc.gp;
+        g_iopCurBase = svc.base;
+        auto mit = iopTables().find(svc.moduleId);
+        if (mit != iopTables().end())
+        {
+            auto fit = mit->second.find(svc.handler);
+            if (fit != mit->second.end()) fn = fit->second;
+        }
+    }
+    if (!fn)
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        g_iopCurModule = savedMod;
+        return false;
+    }
+
+    size_t total = 0;
+    uint8_t *iopBase = iopGuestSpace(total);
+    if (!iopBase) return false;
+
+    constexpr uint32_t kScratch = 0x180000;   // IOP RAM scratch for the request/response
+    constexpr uint32_t kScratchSize = 0x8000;
+    const uint32_t n = sendSize < kScratchSize ? sendSize : kScratchSize;
+    if (n && eeRam)
+    {
+        if (uint8_t *s = getMemPtr(eeRam, sendAddr))
+            std::memcpy(iopBase + svc.base + kScratch, s, n);
+        else
+            std::memset(iopBase + svc.base + kScratch, 0, n);
+    }
+
+    R5900Context ctx{};
+    ctx.pc = svc.handler;
+    ctx.r[28] = _mm_cvtsi32_si128(svc.gp);
+    ctx.r[29] = _mm_cvtsi32_si128(0x1F0000u);
+    ctx.r[4] = _mm_cvtsi32_si128(command);
+    ctx.r[5] = _mm_cvtsi32_si128(kScratch);
+    ctx.r[6] = _mm_cvtsi32_si128(n);
+
+    std::fprintf(stderr, "[iop-xrpc] sid=0x%08x cmd=0x%x -> handler 0x%08x size=%u\n",
+                 sid, command, svc.handler, n);
+    try { fn(iopBase + svc.base, &ctx, rt); }
+    catch (...) { /* the handler unwound (yield/exit) */ }
+
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        g_iopCurModule = savedMod;
+    }
+
+    if (recvAddr && eeRam && recvSize)
+    {
+        if (uint8_t *d = getMemPtr(eeRam, recvAddr))
+            std::memcpy(d, iopBase + svc.base + kScratch,
+                        recvSize < kScratchSize ? recvSize : kScratchSize);
+    }
+    return true;
 }
 
 void PS2Runtime::reportMissingIopFunction(uint32_t targetPc, uint32_t sourcePc, const char *debugName)

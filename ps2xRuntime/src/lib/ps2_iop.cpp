@@ -16,6 +16,10 @@
 #include <atomic>
 #include <iostream>
 
+// [r3000] Native IOP RPC delivery (defined in ps2_runtime.cpp).
+extern bool ps2xInvokeIopRpc(PS2Runtime *rt, uint32_t sid, uint32_t command, uint8_t *eeRam,
+                             uint32_t sendAddr, uint32_t sendSize, uint32_t recvAddr, uint32_t recvSize);
+
 namespace
 {
     // Minimal ISO9660 path -> (LBN, size-bytes) resolver for the mounted CD image.
@@ -336,6 +340,17 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
     {
         ps2cov::noteIopModule("SOUNDS", rpcNum);
         return true;
+    }
+
+    // [r3000] Deliver DBCMAN RPCs to the native module's registered handler when enabled.
+    if (const char *nat = std::getenv("PS2X_IOP_NATIVE_DBCMAN"); nat && nat[0] && nat[0] != '0')
+    {
+        if (ps2xInvokeIopRpc(runtime, sid, rpcNum, m_rdram, sendBufAddr, sendSize, recvBufAddr, recvSize))
+        {
+            signalNowaitCompletion = true;
+            if (recvBufAddr) resultPtr = recvBufAddr;
+            return true;
+        }
     }
 
     if (ps2_iop_dbcman::handleDbcManRpc(m_rdram,
