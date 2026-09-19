@@ -66,8 +66,12 @@ namespace
                 load.address = static_cast<uint32_t>(vaddr);
                 load.size = static_cast<uint32_t>(fileSize);
                 load.offset = static_cast<uint32_t>(segment->get_offset());
-                load.isCode = (flags & ELFIO::PF_X) != 0;
-                load.isData = (flags & ELFIO::PF_W) != 0 || (flags & ELFIO::PF_R) != 0;
+                // [r3000] The IOP header segment (p_type 0x70000080) is module metadata, not
+                // code, even though it carries PF_X. It sits at vaddr 0 like .text and would
+                // otherwise shadow the real code for low addresses.
+                const bool isIopHeader = (segment->get_type() == 0x70000080);
+                load.isCode = !isIopHeader && (flags & ELFIO::PF_X) != 0;
+                load.isData = isIopHeader || (flags & ELFIO::PF_W) != 0 || (flags & ELFIO::PF_R) != 0;
                 load.isBSS = false;
                 load.isReadOnly = (flags & ELFIO::PF_W) == 0;
                 load.data = const_cast<uint8_t *>(
@@ -836,24 +840,34 @@ namespace ps2recomp
 
     uint32_t ElfParser::readWord(uint32_t address) const
     {
-        for (const auto &section : m_sections)
+        // Prefer executable sections: an IRX carries an IOP header segment at vaddr 0 (metadata)
+        // that overlaps .text, and reading it would corrupt low-address instructions.
+        // Fall back to any section for genuine data reads.
+        for (int pass = 0; pass < 2; ++pass)
         {
-            if (address < section.address || section.size < sizeof(uint32_t))
+            for (const auto &section : m_sections)
             {
-                continue;
-            }
+                if (pass == 0 && !section.isCode)
+                {
+                    continue;
+                }
+                if (address < section.address || section.size < sizeof(uint32_t))
+                {
+                    continue;
+                }
 
-            const uint32_t offset = address - section.address;
-            if (offset > section.size - static_cast<uint32_t>(sizeof(uint32_t)))
-            {
-                continue;
-            }
+                const uint32_t offset = address - section.address;
+                if (offset > section.size - static_cast<uint32_t>(sizeof(uint32_t)))
+                {
+                    continue;
+                }
 
-            if (section.data)
-            {
-                uint32_t word = 0;
-                std::memcpy(&word, section.data + offset, sizeof(word));
-                return word;
+                if (section.data)
+                {
+                    uint32_t word = 0;
+                    std::memcpy(&word, section.data + offset, sizeof(word));
+                    return word;
+                }
             }
         }
 
