@@ -5,6 +5,7 @@
 #include "archive_extract.h"
 #include "extract_worker.h"
 #include "iso9660.h"
+#include "pak_extract_worker.h"
 
 #include <QApplication>
 #include <QCoreApplication>
@@ -59,6 +60,24 @@ QStringList findAfsContainers(const QString &dataDir)
         it.next();
         const QString n = it.fileName().toUpper();
         if (n.startsWith(QLatin1String("PZS3US")) && n.endsWith(QLatin1String(".AFS")))
+            out << it.filePath();
+    }
+    out.sort();
+    return out;
+}
+
+// [pakunpack] Every PZS3US1/*.pak left after the AFS->folder conversion. These
+// carry the character/stage assets (models + `.dbt` textures) the runner's
+// texcache builder reads.
+QStringList findPakContainers(const QString &dataDir)
+{
+    QStringList out;
+    QDirIterator it(dataDir, QDir::Files, QDirIterator::Subdirectories);
+    while (it.hasNext())
+    {
+        it.next();
+        const QString n = it.fileName().toUpper();
+        if (n.endsWith(QLatin1String(".PAK")))
             out << it.filePath();
     }
     out.sort();
@@ -249,9 +268,13 @@ void InstallWizardDialog::buildUi()
         l->addSpacing(12);
 
         auto *body = new QLabel(
-            QStringLiteral("We strongly recommend installing the 4K texture pack. It replaces the "
-                           "game's textures with high-resolution ones and greatly improves the visuals.\n\n"
-                           "You can do it now, or later from Settings -> Misc -> Install texture pack."),
+            QStringLiteral(
+                "We strongly recommend installing a 4K texture pack. Two variants are available:\n\n"
+                "  •  Pack Lite — 2D textures only (HUD, menus, icons, posters, buttons). Lighter.\n"
+                "  •  Pack Full — all textures: 3D characters and stages plus the full 2D set.\n\n"
+                "The launcher no longer downloads the pack: the next window shows the download page "
+                "(with a Copy-link fallback). Download the archive, then use Browse… to install it.\n\n"
+                "You can also do this later from Settings -> Misc -> Install texture pack."),
             pageD);
         body->setWordWrap(true);
         body->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
@@ -271,14 +294,25 @@ void InstallWizardDialog::buildUi()
         });
         rowD->addWidget(recClose);
         rowD->addSpacing(8);
-        m_recNext = new QPushButton(QStringLiteral("Next"), pageD);
-        m_recNext->setObjectName(QStringLiteral("wizardButton"));
-        m_recNext->setCursor(Qt::PointingHandCursor);
-        connect(m_recNext, &QPushButton::clicked, this, [this] {
+        m_recLite = new QPushButton(QStringLiteral("Pack Lite"), pageD);
+        m_recLite->setObjectName(QStringLiteral("wizardButton"));
+        m_recLite->setCursor(Qt::PointingHandCursor);
+        connect(m_recLite, &QPushButton::clicked, this, [this] {
             m_wantTexPack = true;
+            m_packChoice = texpack::kPackLite;
             accept();
         });
-        rowD->addWidget(m_recNext);
+        rowD->addWidget(m_recLite);
+        rowD->addSpacing(8);
+        m_recFull = new QPushButton(QStringLiteral("Pack Full"), pageD);
+        m_recFull->setObjectName(QStringLiteral("wizardButton"));
+        m_recFull->setCursor(Qt::PointingHandCursor);
+        connect(m_recFull, &QPushButton::clicked, this, [this] {
+            m_wantTexPack = true;
+            m_packChoice = texpack::kPackFull;
+            accept();
+        });
+        rowD->addWidget(m_recFull);
         l->addLayout(rowD);
     }
     m_stack->addWidget(pageD);
@@ -407,6 +441,11 @@ void InstallWizardDialog::onRetryInstall()
         startAfsConversion();
         return;
     }
+    if (m_inPakPhase)
+    {
+        startPakConversion();
+        return;
+    }
     if (m_isoPath.isEmpty())
     {
         setIndex(1);
@@ -522,7 +561,75 @@ void InstallWizardDialog::onAfsDone(bool ok, const QString &msg)
     m_inAfsPhase = false;
     m_activity->clear();
     if (ok)
+    {
+        // [pakunpack] Chain into the PAK phase when the AFS conversion left any.
+        const QString dataDir = apppaths::userRoot() + QStringLiteral("/data");
+        if (!findPakContainers(dataDir).isEmpty())
+        {
+            startPakConversion();
+            return;
+        }
         applyInstallResult(true, QStringLiteral("Installation complete. Game data converted to folders."));
+        return;
+    }
+    applyInstallResult(false, msg);
+}
+
+void InstallWizardDialog::startPakConversion()
+{
+    const QString dataDir = apppaths::userRoot() + QStringLiteral("/data");
+    const QStringList paks = findPakContainers(dataDir);
+    if (paks.isEmpty())
+    {
+        applyInstallResult(true, QStringLiteral("Installation complete. Game disc validated."));
+        return;
+    }
+
+    m_inPakPhase = true;
+    m_retryInstall->setVisible(false);
+    m_close->setEnabled(false);
+    m_bar->setRange(0, 1);
+    m_bar->setValue(0);
+    m_progressText->setText(QStringLiteral("0 MB / 0 MB"));
+    m_doneLabel->setText(QStringLiteral("Unpacking game assets…"));
+    m_doneLabel->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
+    m_activity->setText(QStringLiteral("Preparing…"));
+    QCoreApplication::processEvents();
+
+    m_pakThread = new QThread;
+    m_pakWorker = new PakExtractWorker;
+    m_pakWorker->moveToThread(m_pakThread);
+    connect(m_pakThread, &QThread::finished, m_pakWorker, &QObject::deleteLater);
+    connect(m_pakThread, &QThread::finished, m_pakThread, &QObject::deleteLater);
+    connect(m_pakWorker, &PakExtractWorker::status, this, &InstallWizardDialog::onPakStatus);
+    connect(m_pakWorker, &PakExtractWorker::progress, this, &InstallWizardDialog::onPakProgress);
+    connect(m_pakWorker, &PakExtractWorker::done, this, &InstallWizardDialog::onPakDone);
+    connect(m_pakWorker, &PakExtractWorker::done, m_pakThread, &QThread::quit);
+    m_pakThread->start();
+
+    QMetaObject::invokeMethod(m_pakWorker, "doWork", Qt::QueuedConnection, Q_ARG(QStringList, paks));
+}
+
+void InstallWizardDialog::onPakStatus(const QString &text)
+{
+    m_activity->setText(text);
+}
+
+void InstallWizardDialog::onPakProgress(qint64 done, qint64 total)
+{
+    if (total > 0)
+        m_bar->setRange(0, static_cast<int>(total / (64 * 1024)));
+    m_bar->setValue(static_cast<int>(done / (64 * 1024)));
+    m_progressText->setText(
+        QStringLiteral("%1 MB / %2 MB").arg(fmtMb(done)).arg(fmtMb(total)));
+}
+
+void InstallWizardDialog::onPakDone(bool ok, const QString &msg)
+{
+    m_inPakPhase = false;
+    m_activity->clear();
+    if (ok)
+        applyInstallResult(true, QStringLiteral("Installation complete. Game assets unpacked."));
     else
         applyInstallResult(false, msg);
 }

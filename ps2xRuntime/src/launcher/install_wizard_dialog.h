@@ -2,6 +2,8 @@
 
 #include <QDialog>
 
+#include "tex_pack.h"
+
 class QLabel;
 class QProgressBar;
 class QPushButton;
@@ -10,6 +12,7 @@ class QThread;
 class QTemporaryDir;
 class ExtractWorker;
 class AfsExtractWorker;
+class PakExtractWorker;
 
 // End-user install wizard: detects missing/corrupt game data, lets the user
 // point at their own disc dump (ISO or a container that wraps the ISO) and,
@@ -23,9 +26,11 @@ public:
     ~InstallWizardDialog() override;
 
     bool installed() const { return m_installed; }
-    // True when the user chose to install the texture pack on the final
-    // recommendation page (Next). The caller opens the texture installer.
+    // True when the user chose to install a texture pack on the final
+    // recommendation page. The caller opens the texture installer.
     bool wantTexturePack() const { return m_wantTexPack; }
+    // Which variant was chosen: texpack::kPackLite (2D only) or texpack::kPackFull (3D + 2D).
+    int texturePackChoice() const { return m_packChoice; }
 
 private slots:
     void onNextMissing();
@@ -38,6 +43,9 @@ private slots:
     void onAfsStatus(const QString &text);
     void onAfsProgress(qint64 done, qint64 total);
     void onAfsDone(bool ok, const QString &msg);
+    void onPakStatus(const QString &text);
+    void onPakProgress(qint64 done, qint64 total);
+    void onPakDone(bool ok, const QString &msg);
 
 private:
     void buildUi();
@@ -51,6 +59,9 @@ private:
     // Second install phase: turn every extracted PZS3US*.AFS into folder slots
     // (+ .idx) and drop the container, leaving folders as the only data source.
     void startAfsConversion();
+    // Third install phase: unpack every PZS3US1/*.pak into <pak>/ folders
+    // (+ #info.idx) so the runner's texcache builder can read the textures.
+    void startPakConversion();
     void applyInstallResult(bool ok, const QString &msg);
 
     QStackedWidget *m_stack = nullptr;
@@ -71,7 +82,9 @@ private:
     QPushButton *m_retryInstall = nullptr;
 
     // Page D: post-install texture-pack recommendation (first install only).
-    QPushButton *m_recNext = nullptr;
+    QPushButton *m_recLite = nullptr;
+    QPushButton *m_recFull = nullptr;
+    int m_packChoice = texpack::kPackFull;
 
     QTemporaryDir *m_tmp = nullptr;
     QString m_dumpPath;
@@ -80,10 +93,13 @@ private:
     bool m_verified = false;
     bool m_installed = false;
     bool m_inAfsPhase = false; // retry re-runs the AFS phase only
+    bool m_inPakPhase = false; // retry re-runs the PAK phase only
     bool m_wantTexPack = false; // user pressed Next on the recommendation page
 
     QThread *m_thread = nullptr;
     ExtractWorker *m_worker = nullptr;
     QThread *m_afsThread = nullptr;
     AfsExtractWorker *m_afsWorker = nullptr;
+    QThread *m_pakThread = nullptr;
+    PakExtractWorker *m_pakWorker = nullptr;
 };

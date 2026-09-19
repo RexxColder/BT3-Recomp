@@ -13,6 +13,7 @@
 #include <QDir>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMenu>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSignalBlocker>
@@ -280,7 +281,15 @@ void MiscTab::onTexPackFolder()
 
 void MiscTab::onInstallPack()
 {
-    TexInstallDialog dlg(this);
+    // [texui] Pick the variant first; the dialog is per-pack (download page + Browse install).
+    QMenu menu(this);
+    QAction *lite = menu.addAction(QStringLiteral("Pack Lite (2D only)"));
+    menu.addAction(QStringLiteral("Pack Full (3D + 2D)"));
+    QAction *chosen = menu.exec(m_texInstall->mapToGlobal(QPoint(0, m_texInstall->height())));
+    if (!chosen)
+        return;
+    const int kind = (chosen == lite) ? texpack::kPackLite : texpack::kPackFull;
+    TexInstallDialog dlg(this, kind);
     connect(&dlg, &TexInstallDialog::installed, this, &MiscTab::refresh);
     dlg.exec();
     refresh();

@@ -37,6 +37,11 @@ namespace ps2tex
     // True once a replacement directory has been indexed (PS2X_TEXREPLACE=<dir>).
     bool replacementsEnabled();
 
+    // [texui] Pack status for the launcher/overlay "Texture Replacement" popup.
+    size_t replacementsCount();       // files actually indexed (0 = no pack)
+    const char *replacementsRoot();   // indexed root directory ("" if none)
+    bool replacementsHave3D();        // true = full pack (Characters/Body present); false = 2D-only Lite
+
     // [texrepdiag] A pack entry that has this TEX0 hash, whatever its CLUT: a lookup miss whose hash
     // pair differs ONLY in the palette comes back here. Returns the file stem (name without extension)
     // or nullptr. Used to tell "the pack does not have this texture" from "our CLUT differs".

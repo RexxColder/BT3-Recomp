@@ -6,9 +6,12 @@
 #include "thirdparty/xxhash.h"
 #include "gfx/image_io.h"
 
+#include "runtime/ps2_toml.h"   // [texui] button_layout from savedata/settings.toml
+
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <condition_variable>
 #include <deque>
@@ -139,10 +142,26 @@ namespace
     std::unordered_map<uint64_t, std::string> g_byTex0;
     std::once_flag g_once;
     bool g_on = false;
+    std::string g_root;   // [texui] the indexed pack root, for the launcher/overlay status
 
     inline uint64_t pairKey(uint64_t a, uint64_t b)
     {
         return a ^ (b << 1) ^ (b >> 63);
+    }
+
+    // [texui] Button layout preference: 0 = PS2 (Original Buttons), 1 = Xbox (Xbox Layout). Read from
+    // savedata/settings.toml [video] button_layout (default Xbox, matching the packs' replacements/
+    // Buttons). PS2X_BUTTONS=ps2|xbox overrides for A/B.
+    int packButtonLayout()
+    {
+        if (const char *v = std::getenv("PS2X_BUTTONS"); v && v[0])
+            return (v[0] == '0' || v[0] == 'p' || v[0] == 'P') ? 0 : 1;
+        const char *xd = ps2xExeDirC();
+        std::ifstream f(std::string((xd && xd[0]) ? xd : ".") + "/savedata/settings.toml");
+        if (!f.is_open()) return 1;
+        ps2x_toml::Document doc;
+        doc.parse(f);
+        return doc.getI("video.button_layout", 1);
     }
 
     void buildIndex()
@@ -171,34 +190,51 @@ namespace
             fs::create_directories(root, ec);   // harmless if it already exists
             ec.clear();
         }
+        g_root = root;   // [texui] expose the indexed root for status reporting
         const char *dir = root.c_str();
         if (!fs::is_directory(dir, ec)) { std::fprintf(stderr, "[texreplace] not a directory: %s\n", dir); return; }
         size_t n = 0, skipped = 0;
-        // RECURSIVE on purpose: PCSX2 searches replacements/ recursively, and real packs ship with
-        // their own nested textures/<SERIAL>/replacements/ path inside the archive.
-        for (fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
-             it != end && !ec; it.increment(ec))
+        std::unordered_set<std::string> seenPaths;   // the preferred pass may overlap the full scan
+        auto addFile = [&](const fs::path &path)
         {
-            if (!it->is_regular_file(ec)) continue;
-            const std::string stem = it->path().stem().string();
-            const std::string ext = it->path().extension().string();
-            if (ext != ".png" && ext != ".dds" && ext != ".DDS") continue;
+            if (!seenPaths.insert(path.string()).second) return;
+            const std::string stem = path.stem().string();
+            const std::string ext = path.extension().string();
+            if (ext != ".png" && ext != ".dds" && ext != ".DDS") return;
             // "<tex0hash>-<cluthash>-<bits>" or "<tex0hash>-<bits>" (no palette).
             unsigned long long a = 0, b = 0; unsigned bits = 0;
             const char *cs = stem.c_str();
             if (std::sscanf(cs, "%llx-%llx-%8x", &a, &b, &bits) == 3)
             {
-                g_index.emplace(pairKey(a, b), it->path().string());
+                g_index.emplace(pairKey(a, b), path.string());
                 g_byTex0.emplace(a, stem);   // [texrepdiag]
             }
             else if (std::sscanf(cs, "%llx-%8x", &a, &bits) == 2)
             {
-                g_index.emplace(pairKey(a, 0), it->path().string());
+                g_index.emplace(pairKey(a, 0), path.string());
                 g_byTex0.emplace(a, stem);   // [texrepdiag]
             }
-            else { ++skipped; continue; }
+            else { ++skipped; return; }
             ++n;
+        };
+        // RECURSIVE on purpose: PCSX2 searches replacements/ recursively, and real packs ship with
+        // their own nested textures/<SERIAL>/replacements/ path inside the archive.
+        auto scan = [&](const std::string &base)
+        {
+            std::error_code e2;
+            for (fs::recursive_directory_iterator it(base, fs::directory_options::skip_permission_denied, e2), end;
+                 it != end && !e2; it.increment(e2))
+                if (it->is_regular_file(e2)) addFile(it->path());
+        };
+        // [texui] Button layout: scan the chosen variant folder FIRST so its identically-keyed
+        // entries win over the other variant (g_index.emplace keeps the first). Both variants live
+        // in the pack side by side: "Original Buttons" (PS2) and "Xbox Layout" (Xbox).
+        {
+            const std::string pref = (packButtonLayout() == 0) ? "/Original Buttons" : "/Xbox Layout";
+            std::error_code e3;
+            if (fs::is_directory(root + pref, e3)) scan(root + pref);
         }
+        scan(root);
         g_on = n > 0;
         if (n)
             std::fprintf(stderr, "[texreplace] indexed %zu replacements from %s (%zu unparsed)\n", n, dir, skipped);
@@ -213,6 +249,27 @@ bool replacementsEnabled()
 {
     std::call_once(g_once, buildIndex);
     return g_on;
+}
+
+// [texui] Pack status for the launcher/overlay popup.
+size_t replacementsCount()
+{
+    std::call_once(g_once, buildIndex);
+    return g_index.size();
+}
+
+const char *replacementsRoot()
+{
+    std::call_once(g_once, buildIndex);
+    return g_root.c_str();
+}
+
+bool replacementsHave3D()
+{
+    std::call_once(g_once, buildIndex);
+    if (g_root.empty()) return false;
+    std::error_code ec;
+    return std::filesystem::is_directory(g_root + "/replacements/Characters/Body", ec);
 }
 
 const char *findByTex0Hash(uint64_t tex0Hash)
