@@ -62,6 +62,7 @@ public:
     bool forceBilinear() const { return m_forceBilinear; }
     bool texPack() const { return m_texPack; }   // [texreplace] shared with the in-game overlay
     bool introVideo() const { return m_introVideo; }   // [texui] 4K opening override (on restart)
+    bool texcache() const { return m_texcache; }       // [texcache] persistent texture cache
     int buttonLayout() const { return m_buttonLayout; } // [texui] 0 = PS2, 1 = Xbox (on restart)
     bool fps60() const { return m_fps60; }        // [fps60] set in-game; the launcher preserves it
     int hudLayout() const { return m_hudLayout; }
@@ -95,6 +96,7 @@ public:
     void setForceBilinear(bool v) { m_forceBilinear = v; }
     void setTexPack(bool v) { m_texPack = v; }   // [texreplace]
     void setIntroVideo(bool v) { m_introVideo = v; }   // [texui]
+    void setTexcache(bool v) { m_texcache = v; }       // [texcache]
     void setButtonLayout(int v) { m_buttonLayout = v; }   // [texui]
     void setFps60(bool v) { m_fps60 = v; }        // [fps60]
     void setHudLayout(int v) { m_hudLayout = v; }
@@ -141,6 +143,7 @@ private:
     int m_windowMode = 0, m_monitor = 0;   // [video.mode] shared with the in-game overlay
     bool m_texPack = false;   // [texreplace] default OFF
     bool m_introVideo = true; // [texui] default ON: use the pack's 4K opening when present
+    bool m_texcache = true;   // [texcache] default ON: persist resolved textures between runs
     int m_buttonLayout = 1;   // [texui] 0 = PS2 (Original Buttons), 1 = Xbox (Xbox Layout)
     bool m_fps60 = false;     // [fps60] default OFF
     int m_windowW = 0, m_windowH = 0;

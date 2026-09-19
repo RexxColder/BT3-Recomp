@@ -187,6 +187,18 @@ MiscTab::MiscTab(QWidget *parent)
     root->addSpacing(8);
     root->addWidget(section(QStringLiteral("TEXTURE CACHE")));
     {
+        auto *row = new QWidget;
+        auto *lay = new QHBoxLayout(row);
+        lay->setContentsMargins(8, 2, 8, 2);
+        auto *lbl = new QLabel(QStringLiteral("Enable Texture Cache"));
+        lbl->setObjectName(QStringLiteral("valueLabel"));
+        m_tcCheck = new QCheckBox;
+        m_tcCheck->setObjectName(QStringLiteral("reinstallModeCheck"));
+        lay->addWidget(lbl, 1);
+        lay->addWidget(m_tcCheck);
+        root->addWidget(row);
+    }
+    {
         auto *body = new QLabel(QStringLiteral(
             "The texture cache stores each texture once it is fully resolved (PSMT decode plus "
             "texture-pack replacement applied) in a single file. Later runs upload it directly: "
@@ -237,6 +249,7 @@ MiscTab::MiscTab(QWidget *parent)
     connect(m_texInstall, &QPushButton::clicked, this, &MiscTab::onInstallPack);
     connect(m_texFolder, &QPushButton::clicked, this, &MiscTab::onTexPackFolder);
     connect(m_tcDelete, &QPushButton::clicked, this, &MiscTab::onDeleteTexCache);
+    connect(m_tcCheck, &QCheckBox::toggled, this, &MiscTab::onTexCacheToggled);
 
     refresh();
 }
@@ -278,7 +291,12 @@ void MiscTab::refresh()
         m_texCheck->setChecked(SettingsManager::instance().texPack());
     }
 
-    // [texcache] file status (built size, or not built yet).
+    // [texcache] enable checkbox + file status (built size, or not built yet).
+    if (m_tcCheck)
+    {
+        QSignalBlocker block(m_tcCheck);
+        m_tcCheck->setChecked(SettingsManager::instance().texcache());
+    }
     if (m_tcStatus)
     {
         const QFileInfo fi(apppaths::userRoot() + QStringLiteral("/data/texcache.bin"));
@@ -331,6 +349,11 @@ void MiscTab::onTexPackFolder()
     if (!QDir().mkpath(d))
         return;
     QDesktopServices::openUrl(QUrl::fromLocalFile(d));
+}
+
+void MiscTab::onTexCacheToggled(bool on)
+{
+    SettingsManager::instance().setTexcache(on);
 }
 
 void MiscTab::onDeleteTexCache()

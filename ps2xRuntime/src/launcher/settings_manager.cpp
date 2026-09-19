@@ -187,6 +187,7 @@ bool SettingsManager::loadToml(const QString &path)
     m_texPack = doc.getB("video.texture_pack", m_texPack);
     m_introVideo = doc.getB("video.intro_video", m_introVideo);
     m_buttonLayout = doc.getI("video.button_layout", m_buttonLayout);
+    m_texcache = doc.getB("video.texcache", m_texcache);
     m_shadows = doc.getB("video.shadows", m_shadows);
     m_dofBlur = doc.getB("video.dof_blur", m_dofBlur);
     m_dofZFar = doc.getI("video.dof_zfar", m_dofZFar);
@@ -281,6 +282,7 @@ bool SettingsManager::loadIniLegacy(const QString &path)
             else if (key == "texture_pack") m_texPack = b;
             else if (key == "intro_video") m_introVideo = b;
             else if (key == "button_layout") m_buttonLayout = ist(val, 1);
+            else if (key == "texcache") m_texcache = b;
             else if (key == "fps60") m_fps60 = b;
             else if (key == "hud_layout") m_hudLayout = ist(val, 0);
             else if (key == "hud_off_l") m_hudOffL = ist(val, 0);
@@ -348,6 +350,7 @@ bool SettingsManager::save()
     os << "texture_pack = " << fmtBool(m_texPack) << "\n";
     os << "intro_video = " << fmtBool(m_introVideo) << "\n";
     os << "button_layout = " << fmtInt(m_buttonLayout) << "\n";
+    os << "texcache = " << fmtBool(m_texcache) << "\n";
     os << "shadows = " << fmtBool(m_shadows) << "\n";
     os << "dof_blur = " << fmtBool(m_dofBlur) << "\n";
     os << "dof_zfar = " << fmtInt(m_dofZFar) << "\n";

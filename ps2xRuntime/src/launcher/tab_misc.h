@@ -23,6 +23,7 @@ private slots:
     void onInstallPack();
     void onTexPackFolder();
     void onDeleteTexCache();
+    void onTexCacheToggled(bool on);
 
 private:
     QLabel *m_size = nullptr;
@@ -40,6 +41,7 @@ private:
     QPushButton *m_texFolder = nullptr;
 
     // [texcache]
+    QCheckBox *m_tcCheck = nullptr;
     QLabel *m_tcStatus = nullptr;
     QPushButton *m_tcDelete = nullptr;
 };
