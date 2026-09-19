@@ -169,7 +169,4 @@ add_custom_command(TARGET Launcher POST_BUILD
         "${LAUNCHER_ASSET_DIR}/icon.png"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/NOTICE"
-        "${LAUNCHER_ASSET_DIR}/NOTICE"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/assets/paklist.txt"
-        "${LAUNCHER_ASSET_DIR}/paklist.txt")
+        "${LAUNCHER_ASSET_DIR}/NOTICE")

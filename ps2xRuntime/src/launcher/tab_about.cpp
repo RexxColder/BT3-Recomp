@@ -63,7 +63,6 @@ AboutTab::AboutTab(QWidget *parent)
     thirdLay->addWidget(richLabel(QStringLiteral(
         "<a href=\"https://github.com/ran-j/PS2Recomp\">ran-j/PS2Recomp</a> — static recompiler (upstream, GPL-3.0)<br>"
         "ViveTheModder — NTSC-U AFS file lists (Apache-2.0)<br>"
-        "<a href=\"https://github.com/HiroTex/SpikeSoft\">HiroTex/SpikeSoft</a> — PAK container format + paklist name DB (GPL-3.0)<br>"
         "<a href=\"https://github.com/Arntzen-Software/parallel-gs\">Arntzen Software</a> — paraLLEl-GS (LGPL-3.0-or-later)")));
     root->addWidget(third);
 

@@ -2314,7 +2314,6 @@ void PS2SettingsOverlay::drawAboutTab()
     {
         ImGui::TextWrapped("ran-j/PS2Recomp - static recompiler (upstream, GPL-3.0)");
         ImGui::TextWrapped("ViveTheModder - NTSC-U AFS file lists (Apache-2.0)");
-        ImGui::TextWrapped("HiroTex/SpikeSoft - PAK container format + paklist name DB (GPL-3.0)");
         ImGui::TextWrapped("Arntzen Software - paraLLEl-GS (LGPL-3.0-or-later)");
         ImGui::Spacing();
     }
