@@ -193,11 +193,6 @@ else()
         else()
             set(PS2X_SDL2_TARGET SDL2::SDL2)
         endif()
-        # ps2xStudio (same tree) links SDL2::SDL2 and expects the shared build; give it the
-        # static one when this declaration won the FetchContent name.
-        if(NOT TARGET SDL2::SDL2 AND TARGET SDL2-static)
-            add_library(SDL2::SDL2 ALIAS SDL2-static)
-        endif()
         message(STATUS "[hostio] SDL2 gamepad/audio backend: ON (${PS2X_SDL2_TARGET})")
     else()
         message(STATUS "[hostio] SDL2 gamepad/audio backend: OFF (raylib only)")

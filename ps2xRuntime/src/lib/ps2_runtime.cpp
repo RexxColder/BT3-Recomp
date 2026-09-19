@@ -6238,7 +6238,7 @@ void PS2Runtime::run()
                           << std::dec << std::endl;
                 // ===================== [hstate] Readable state hierarchy =====================
                 // Translates bt3State (raw) to a human phase + sub-phase. BOOT and MENU are mapped
-                // with offsets already documented in tasks/main_menu_state_machine.md and tasks/ESTATUS.md.
+                // with the offsets already reverse-engineered for the menu state machine.
                 // FIGHT/IN_FIGHT do not yet have the "match type" offsets (player vs CPU / 2 players)
                 // identified -> see the [fightprobe] block below, which gathers the evidence to
                 // complete this switch.
@@ -6292,7 +6292,7 @@ void PS2Runtime::run()
                             const uint32_t menuState = (subStruct && subStruct != 0xffffffffu)
                                 ? r32safe(subStruct + 0x40u) : 0xffffffffu;
                             // Cursor/selection/state of the active item: *(0x3B38E8)+0x12C/0x138/0x13C
-                            // (offsets documented in tasks/ESTATUS.md and main_menu_state_machine.md).
+                            // (see the menu state-machine offsets above).
                             const uint32_t itemBase = r32safe(0x3B38E8u);
                             int32_t cursor = -1, selection = -1; uint32_t itemState = 0xffffffffu;
                             if (itemBase != 0u && itemBase != 0xffffffffu)
