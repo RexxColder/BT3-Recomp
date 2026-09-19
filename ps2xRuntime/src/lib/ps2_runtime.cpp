@@ -10,6 +10,7 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #include <link.h>
+#include <sys/mman.h>   // [r3000] sparse IOP guest address space
 #endif
 #if defined(PS2X_HAVE_LIBUNWIND)
 #define UNW_LOCAL_ONLY
@@ -2317,14 +2318,36 @@ std::vector<uint8_t> &PS2Runtime::iopRam()
 
 // [r3000] IRX import stub -> kernel/SIF HLE. `module`/`ordinal` identify the target
 // (ps2sdk ordinal tables); the handler result is left in v0, matching the IOP ABI.
+// [r3000] The IOP guest address space. IOP RAM is 2 MiB at 0, but modules also touch the
+// register range (0x1F80xxxx / 0xBF80xxxx). Back the whole space with a sparse mapping so
+// those accesses land somewhere valid instead of faulting (register semantics come later).
+static uint8_t *iopGuestSpace(size_t &sizeOut)
+{
+#if !defined(_WIN32)
+    static uint8_t *s = []() -> uint8_t * {
+        const size_t n = 0xC0000000ull;
+        void *p = ::mmap(nullptr, n, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        return p == MAP_FAILED ? nullptr : static_cast<uint8_t *>(p);
+    }();
+    sizeOut = 0xC0000000ull;
+    return s;
+#else
+    static std::vector<uint8_t> s(256u * 1024u * 1024u, 0u);
+    sizeOut = s.size();
+    return s.data();
+#endif
+}
+
 void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module, uint32_t ordinal)
 {
     (void)rdram;
-    auto &ram = iopRam();
+    size_t ramSize = 0;
+    uint8_t *ram = iopGuestSpace(ramSize);
     auto cstr = [&](uint32_t addr) -> std::string {
         std::string s;
-        if (addr >= ram.size()) return s;
-        for (size_t i = addr; i < ram.size(); ++i) { char c = (char)ram[i]; if (!c) break; s.push_back(c); }
+        if (!ram || addr >= ramSize) return s;
+        for (size_t i = addr; i < ramSize; ++i) { char c = (char)ram[i]; if (!c) break; s.push_back(c); }
         return s;
     };
     const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6), a3 = getRegU32(ctx, 7);
@@ -2376,10 +2399,10 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
     {
         static std::atomic<int> s_nextEf{1};
         if (ordinal == 4) ret = (uint32_t)s_nextEf.fetch_add(1);   // CreateEventFlag
-        else if (ordinal == 10 && a3 && (uint64_t)a3 + 4 <= ram.size())   // WaitEventFlag resbits
+        else if (ordinal == 10 && a3 && ram && (uint64_t)a3 + 4 <= ramSize)   // WaitEventFlag resbits
         {
             const uint32_t bits = ~0u;
-            std::memcpy(ram.data() + a3, &bits, 4);
+            std::memcpy(ram + a3, &bits, 4);
         }
     }
     else if (mod == "thsemap")
@@ -2460,15 +2483,21 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
         return false;
     }
 
-    auto &ram = iopRam();
-    std::fill(ram.begin(), ram.end(), 0u);
+    size_t ramSize = 0;
+    uint8_t *ram = iopGuestSpace(ramSize);
+    if (!ram)
+    {
+        std::fprintf(stderr, "[iop-run] cannot map the IOP guest space\n");
+        return false;
+    }
+    std::memset(ram, 0, 4u * 1024u * 1024u);   // clear IOP RAM (2 MiB + slack)
     for (const auto &seg : mod.segments)
     {
         if (seg.iopHeader || seg.data.empty())
             continue;
-        if (static_cast<uint64_t>(seg.vaddr) + seg.data.size() > ram.size())
+        if (static_cast<uint64_t>(seg.vaddr) + seg.data.size() > ramSize)
             continue;
-        std::memcpy(ram.data() + seg.vaddr, seg.data.data(), seg.data.size());
+        std::memcpy(ram + seg.vaddr, seg.data.data(), seg.data.size());
     }
 
     R5900Context ctx{};
@@ -2487,7 +2516,7 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
 
     std::fprintf(stderr, "[iop-run] %s: entry 0x%08x gp 0x%08x (native)\n",
                  mod.name.c_str(), mod.entry, mod.gp);
-    fn(ram.data(), &ctx, this);
+    fn(ram, &ctx, this);
     std::fprintf(stderr, "[iop-run] %s: entry returned\n", mod.name.c_str());
     return true;
 }
