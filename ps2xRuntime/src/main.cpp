@@ -697,6 +697,18 @@ int main(int argc, char *argv[])
             return 1;
         }
 
+        // [r3000] Optional: run a recompiled IOP module natively (diagnostic).
+        // PS2X_IOP_RUN=SIO2MAN.IRX  PS2X_IOP_DIR=<deploy>/data/IRX/
+        if (const char *iopRun = std::getenv("PS2X_IOP_RUN"); iopRun && iopRun[0])
+        {
+            std::string dir = "data/IRX/";
+            if (const char *d = std::getenv("PS2X_IOP_DIR"); d && d[0]) dir = d;
+            std::string path = dir + iopRun;
+            if (path.find('.') == std::string::npos) path += ".IRX";
+            runtime.loadAndRunIopModule(path.c_str());
+            return 0;
+        }
+
         runtime.run();
 
 #ifdef _DEBUG

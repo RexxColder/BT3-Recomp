@@ -601,6 +601,13 @@ add_executable(ps2EntryRunner
     ${RUNNER_RESOURCES}
 )
 
+# [r3000] Recompiled IOP modules are compiled straight into the runner (not a static lib) so
+# their function-table registration objects are never dropped by the linker.
+target_sources(ps2EntryRunner PRIVATE
+    src/iop_native/sio2man/ps2_recompiled_functions.cpp
+    src/iop_native/sio2man/register_functions.cpp
+)
+
 # The overlay's single 20MB TU and its register file must not be unity-batched
 # with the boot ELF's sources (anon-namespace initializer name clash + huge TU).
 if(RUNNER_OVERLAY_SRC_FILES)
