@@ -2748,6 +2748,26 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
         }
         // 14 sceSifInitRpc -> 0
     }
+    else if (mod == "vblank")
+    {
+        // WaitVblankStart/End (4/5), WaitVblank (6), WaitNonVblank (7): return immediately (no
+        // real vblank); Register/ReleaseVblankHandler -> 0.
+        ret = 0;
+    }
+    else if (mod == "timrman")
+    {
+        static std::atomic<int> s_nextTimer{1};
+        ret = (ordinal == 4) ? static_cast<uint32_t>(s_nextTimer.fetch_add(1)) : 0u;  // AllocHardTimer -> id
+        // Refer/Free/Set/Get* -> 0
+    }
+    else if (mod == "secrman" || mod == "heaplib" || mod == "thmsgbx")
+    {
+        // Providers not present in IOPRP nor as game IRX: keep returns sane so callers proceed.
+        if (mod == "heaplib" && (ordinal == 4 || ordinal == 5))   // heap create/alloc -> 0 (no heap)
+            ret = 0;
+        else
+            ret = 0;
+    }
 
     setReturnU32(ctx, ret);
 }
