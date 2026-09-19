@@ -2954,10 +2954,17 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
         return false;
     }
 
-    const uint32_t base = g_iopNextBase;
-    g_iopNextBase += 0x10000u;   // each small IRX gets its own 64 KiB slot
+    // Reserve space for the module's real size (text+data+bss). A fixed 64 KiB slot is too
+    // small: e.g. MCMAN is ~74 KiB and would overlap the next module's base.
+    uint32_t modSize = 0x10000u;
+    for (const auto &seg : mod.segments)
+        modSize = std::max(modSize, seg.vaddr + static_cast<uint32_t>(seg.memsz));
+    modSize = (modSize + 0xFFFu) & ~0xFFFu;
 
-    std::memset(iopBase + base, 0, 0x10000u);
+    const uint32_t base = g_iopNextBase;
+    g_iopNextBase += modSize;
+
+    std::memset(iopBase + base, 0, modSize);
     for (const auto &seg : mod.segments)
     {
         if (seg.iopHeader || seg.data.empty())

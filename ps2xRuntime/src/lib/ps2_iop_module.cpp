@@ -64,16 +64,19 @@ bool loadIrx(const std::string &path, Module &out)
             s.data.assign(d.begin() + pOffset, d.begin() + pOffset + pFilesz);
 
         // IOP module header (p_type 0x70000080): u32 total, entry, gp, text, data, bss,
-        // version(u16), name[8]. 34 bytes.
-        if (s.iopHeader && s.data.size() >= 34)
+        // version(u16), name[8]. Read it straight from the file at p_offset: some modules
+        // declare a smaller filesz than the 34 header bytes (e.g. MCMAN: 32), which would
+        // otherwise leave gp/text unparsed.
+        if (s.iopHeader && static_cast<uint64_t>(pOffset) + 34 <= d.size())
         {
-            out.entry = rdU32(s.data.data() + 4);
-            out.gp = rdU32(s.data.data() + 8);
-            out.hdrText = rdU32(s.data.data() + 12);
-            out.hdrData = rdU32(s.data.data() + 16);
-            out.hdrBss = rdU32(s.data.data() + 20);
+            const uint8_t *h = d.data() + pOffset;
+            out.entry = rdU32(h + 4);
+            out.gp = rdU32(h + 8);
+            out.hdrText = rdU32(h + 12);
+            out.hdrData = rdU32(h + 16);
+            out.hdrBss = rdU32(h + 20);
             char nm[9] = {0};
-            std::memcpy(nm, s.data.data() + 26, 8);
+            std::memcpy(nm, h + 26, 8);
             out.moduleName.assign(nm);
         }
 
