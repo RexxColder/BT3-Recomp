@@ -19,6 +19,7 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #include "ps2_host_window.h"   // [B] native window handle (SDL returns SDL_Window*, not the HWND)
 #include "runtime/ps2_texreplace.h"   // [texreplace]
 #include "runtime/ps2_texcache.h"     // [texcache]
+#include "runtime/ps2_toml.h"         // [texcache] settings.toml
 #include "runtime/ps2_video_status.h"   // [video] the Video-tab status the overlay polls
 #include "runtime/ps2_toml.h"   // [winmode] startup read of [video] window_mode / monitor
 #include "runtime/ps2_fmv_override.h"  // [fmvoverride]
@@ -1642,14 +1643,30 @@ bool PS2Runtime::initialize(const char *title)
         }
         {   // [texcache] Persistent write-back texture cache: configure + load at startup. Filled by
             // the write-back hook in putTexture (the FINAL payload: decode + pack replacement).
-            bool tcEnabled = true;
-            if (const char *v = std::getenv("PS2X_TEXCACHE_ON"); v && v[0] == '0') tcEnabled = false;
             const char *xd = ps2xExeDirC();
             const std::string base = (xd && xd[0]) ? xd : ".";
+            // Read the toggles that change WHAT the cache contains: texture_pack (originals vs
+            // replaced) and button_layout. They go into packHash so a change invalidates the file,
+            // otherwise a cache built with the pack OFF would keep serving originals after enabling.
+            bool tcEnabled = true, packOn = false;
+            int btnLayout = 1;
+            {
+                std::ifstream f(base + "/savedata/settings.toml");
+                if (f.is_open())
+                {
+                    ps2x_toml::Document doc; doc.parse(f);
+                    tcEnabled = doc.getB("video.texcache", true);
+                    packOn = doc.getB("video.texture_pack", false);
+                    btnLayout = doc.getI("video.button_layout", 1);
+                }
+            }
+            if (const char *v = std::getenv("PS2X_TEXCACHE_ON"); v && v[0] == '0') tcEnabled = false;
             uint64_t packHash = 1469598103934665603ull;
             for (const char *p = ps2tex::replacementsRoot(); p && *p; ++p)
                 packHash = (packHash ^ (uint8_t)*p) * 1099511628211ull;
             packHash ^= (uint64_t)ps2tex::replacementsCount();
+            packHash ^= packOn ? 0x9E3779B97F4A7C15ull : 0ull;
+            packHash ^= (uint64_t)(uint32_t)btnLayout * 0xC2B2AE3D27D4EB4Full;
             uint64_t dataHash = 1469598103934665603ull;
             for (const char *p = base.c_str(); p && *p; ++p)
                 dataHash = (dataHash ^ (uint8_t)*p) * 1099511628211ull;

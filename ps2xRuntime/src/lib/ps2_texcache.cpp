@@ -125,6 +125,13 @@ bool load()
     g_map.clear();
     g_added = 0;
     if (!g_enabled || g_path.empty()) return false;
+    // [texcache] Force a rebuild: ignore any existing file (PS2X_TEXCACHE_REGEN=1). Without this
+    // the previously sampled entries are reused even after the pack/settings changed.
+    if (const char *rg = std::getenv("PS2X_TEXCACHE_REGEN"); rg && rg[0] && rg[0] != '0')
+    {
+        std::fprintf(stderr, "[texcache] regen forced: ignoring %s\n", g_path.c_str());
+        return false;
+    }
 
     std::ifstream f(g_path, std::ios::binary);
     if (!f.is_open()) return false;   // no cache yet: a fresh one will be written on flush
@@ -133,8 +140,11 @@ bool load()
     if (data.size() < kHeaderSize) return false;
     if (std::memcmp(data.data(), kMagic, 8) != 0) return false;
     if (rdU32(data.data() + 8) != kVersion) return false;
-    if (rdU64(data.data() + 16) != g_packHash) return false;
-    if (rdU64(data.data() + 24) != g_dataHash) return false;
+    if (rdU64(data.data() + 16) != g_packHash || rdU64(data.data() + 24) != g_dataHash)
+    {
+        std::fprintf(stderr, "[texcache] stale (pack/data changed); rebuilding %s\n", g_path.c_str());
+        return false;
+    }
     const uint32_t count = rdU32(data.data() + 32);
     const uint64_t blobOff = rdU64(data.data() + 40);
     const size_t indexOff = kHeaderSize;
