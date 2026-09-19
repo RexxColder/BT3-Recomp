@@ -1,6 +1,7 @@
 static thread_local int g_subDx0 = 0, g_subDxW = 0;   // [subdecode] decode window of the texture being recorded (0 = whole)
 #include "runtime/ps2_guestprof.h"
 #include "runtime/ps2_texreplace.h"   // [texreplace]
+#include "runtime/ps2_texcache.h"     // [texcache]
 #include <map>
 #include <array>
 #include <set>
@@ -4594,6 +4595,20 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
         if (!texNeedDecode && GsGpuRenderer::texPackEnabled() && ps2tex::takeReadySwap(texKey))
             texNeedDecode = true;
         if (deferTex || deferClut) texNeedDecode = true;   // [deferdec] GL-dirty source: the record-time hash saw stale VRAM
+        // [texcache] Persistent write-back hit: the FINAL payload (original decode + pack replacement)
+        // was cached in a previous run. Upload it directly and skip the PSMT decode, the pack
+        // file scan/lookup and the file decode.
+        if (texNeedDecode && !gaServedRead)
+        {
+            const uint8_t *cdata = nullptr; size_t clen = 0;
+            int cw = 0, chh = 0, cfmt = 0, cscale = 1; float calpha = 1.0f;
+            if (ps2texcache::get(texKey, cdata, clen, cw, chh, cfmt, cscale, calpha))
+            {
+                std::vector<uint8_t> cached(cdata, cdata + clen);
+                r.putTexture(texKey, std::move(cached), cw, chh, texPageLo, texPageHi, cfmt, cscale, calpha);
+                texNeedDecode = false;
+            }
+        }
         // [deferpend] a page whose deferred flush is still queued is stale in VRAM: a read that needs a decode
         // (a different view / key of the same page) must queue behind that flush, never decode synchronously.
         // [defercover] PS2X_DEFERCOVER (default on, =0 old): the pending flush that covers the page is what the post must

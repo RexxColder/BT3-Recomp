@@ -18,6 +18,7 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #endif
 #include "ps2_host_window.h"   // [B] native window handle (SDL returns SDL_Window*, not the HWND)
 #include "runtime/ps2_texreplace.h"   // [texreplace]
+#include "runtime/ps2_texcache.h"     // [texcache]
 #include "runtime/ps2_video_status.h"   // [video] the Video-tab status the overlay polls
 #include "runtime/ps2_toml.h"   // [winmode] startup read of [video] window_mode / monitor
 #include "runtime/ps2_fmv_override.h"  // [fmvoverride]
@@ -1638,6 +1639,23 @@ bool PS2Runtime::initialize(const char *title)
             // (The pack lives in <exeDir>/data/Textures -- the deploy's data/ dir next to the
             // extracted ISO tree; the folder is created if absent.)
             ps2tex::replacementsEnabled();
+        }
+        {   // [texcache] Persistent write-back texture cache: configure + load at startup. Filled by
+            // the write-back hook in putTexture (the FINAL payload: decode + pack replacement).
+            bool tcEnabled = true;
+            if (const char *v = std::getenv("PS2X_TEXCACHE_ON"); v && v[0] == '0') tcEnabled = false;
+            const char *xd = ps2xExeDirC();
+            const std::string base = (xd && xd[0]) ? xd : ".";
+            uint64_t packHash = 1469598103934665603ull;
+            for (const char *p = ps2tex::replacementsRoot(); p && *p; ++p)
+                packHash = (packHash ^ (uint8_t)*p) * 1099511628211ull;
+            packHash ^= (uint64_t)ps2tex::replacementsCount();
+            uint64_t dataHash = 1469598103934665603ull;
+            for (const char *p = base.c_str(); p && *p; ++p)
+                dataHash = (dataHash ^ (uint8_t)*p) * 1099511628211ull;
+            const std::string tcPath = base + "/data/texcache.bin";
+            ps2texcache::setConfig(tcEnabled, packHash, dataHash, tcPath.c_str());
+            ps2texcache::load();
         }
         {   // [fps60] PS2X_FPS60=1: enable the 60-fps fight mode from the env (loads fps60_sites.txt,
             // staged next to the runner). Lets the perf A/B be run without touching settings.toml.

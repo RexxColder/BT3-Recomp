@@ -95,6 +95,9 @@ namespace
     }
 }
 
+// Defined below; the write path flushes on a threshold so the file survives a kill.
+bool flushLocked();
+
 void setConfig(bool enabled, uint64_t packHash, uint64_t dataHash, const char *path)
 {
     std::lock_guard<std::mutex> lk(g_mx);
@@ -103,6 +106,9 @@ void setConfig(bool enabled, uint64_t packHash, uint64_t dataHash, const char *p
     g_dataHash = dataHash;
     const char *env = std::getenv("PS2X_TEXCACHE");
     g_path = (env && env[0]) ? env : (path ? path : "");
+    // Persist on normal exit (atexit handlers run before the namespace statics are destroyed).
+    static bool s_atexit = false;
+    if (!s_atexit) { s_atexit = true; std::atexit([]{ ps2texcache::flush(); }); }
 }
 
 bool enabled()
@@ -185,6 +191,11 @@ void add(uint64_t texKey, const uint8_t *data, size_t len,
     g_blob.insert(g_blob.end(), data, data + len);
     g_map[texKey] = e;
     ++g_added;
+    static const size_t s_threshold = []() {
+        const char *v = std::getenv("PS2X_TEXCACHE_FLUSH");
+        return (size_t)((v && v[0]) ? std::atol(v) : 512L);
+    }();
+    if (s_threshold && g_added >= s_threshold) flushLocked();
 }
 
 size_t pending()
@@ -193,9 +204,8 @@ size_t pending()
     return g_added;
 }
 
-bool flush()
+bool flushLocked()
 {
-    std::lock_guard<std::mutex> lk(g_mx);
     if (!g_enabled || g_path.empty() || g_added == 0) return g_added == 0;
 
     const std::string tmp = g_path + ".tmp";
@@ -226,5 +236,11 @@ bool flush()
                  g_map.size(), g_blob.size(), g_added);
     g_added = 0;
     return true;
+}
+
+bool flush()
+{
+    std::lock_guard<std::mutex> lk(g_mx);
+    return flushLocked();
 }
 }
