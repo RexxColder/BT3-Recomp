@@ -65,11 +65,13 @@ defecto** vía DBCMAN.
 
 Default: `SIO2MAN,SIO2D,DBCMAN,LIBSD,SDRDRV,CDVDSTM,MCMAN,MCSERV,SOUNDS,MODHSYN,MODSESQ2,DS2U_D`.
 
-### Rotos / bloqueados (integrados pero NO habilitados por defecto)
-| módulo | síntoma | causa probable |
-|---|---|---|
-| `CRI_ADXI` | entry **retorna** pero el boot queda en UNKNOWN | corrompe estado (no es loop); investigar escrituras |
-| `DS2O_D`, `MODMIDI`, `MODSEIN`, `MODSESQ` | por confirmar (no se cargan en el boot, o requieren set) | medir con el set explícito |
+### Rotos / bloqueados
+Los 17 IRX integrados corren nativos. El bug del **deadlock por re-entrada** (`iopImport`
+mantenía un mutex no recursivo y re-entraba por la llamada cruzada) era la causa de los stalls
+de `MCMAN`/`MCSERV`/`DS2U_D`/`CRI_ADXI`. Corregido con `std::recursive_mutex`.
+
+`DS2O_D`, `MODMIDI`, `MODSEIN`, `MODSESQ` integrados y habilitados, pero el juego **no los carga
+en el boot** (se cargan después o vía `IOPRP300.IMG`).
 
 Probablemente funcionales (retornan y bootean): `SOUNDS`, `MODHSYN`, `MODSESQ2` — falta validar
 visualmente que el juego progrese a FIGHT.

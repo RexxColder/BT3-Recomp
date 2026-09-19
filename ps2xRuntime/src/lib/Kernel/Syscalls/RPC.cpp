@@ -1478,7 +1478,7 @@ namespace ps2_syscalls
             const size_t dot = stem.find('.');
             if (dot != std::string::npos) stem = stem.substr(0, dot);
 
-            std::string set = "SIO2MAN,SIO2D,DBCMAN,LIBSD,SDRDRV,CDVDSTM,MCMAN,MCSERV,SOUNDS,MODHSYN,MODSESQ2,DS2U_D";
+            std::string set = "all";   // every integrated IRX runs native; see tools/iop/README.md
             if (const char *m = std::getenv("PS2X_IOP_MODULES"); m && m[0]) set = m;
             bool wantNative = (set == "all");
             for (size_t p = 0; !wantNative && p <= set.size();)
