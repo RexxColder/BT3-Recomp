@@ -2322,6 +2322,20 @@ std::vector<uint8_t> &PS2Runtime::iopRam()
 
 // [r3000] IRX import stub -> kernel/SIF HLE. `module`/`ordinal` identify the target
 // (ps2sdk ordinal tables); the handler result is left in v0, matching the IOP ABI.
+#if !defined(_WIN32)
+#include <pthread.h>
+static std::atomic<void *> g_iopWdThread{nullptr};
+static std::atomic<bool> g_iopWdArmed{false};
+static void iopWdHandler(int)
+{
+    void *bt[48];
+    const int n = backtrace(bt, 48);
+    std::fprintf(stderr, "[iop-watchdog] entry stuck; backtrace:\n");
+    backtrace_symbols_fd(bt, n, 2);
+    std::_Exit(99);
+}
+#endif
+
 // [r3000] The IOP guest address space. IOP RAM is 2 MiB at 0, but modules also touch the
 // register range (0x1F80xxxx / 0xBF80xxxx). Back the whole space with a sparse mapping so
 // those accesses land somewhere valid instead of faulting (register semantics come later).
@@ -2455,14 +2469,14 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
     };
 
     // [r3000] Kernel object state (single-threaded best-effort model).
-    static std::mutex s_kernMx;
+    static std::recursive_mutex s_kernMx;   // recursive: iopImport can re-enter via cross-module calls
     static std::unordered_map<int, std::array<uint32_t, 4>> s_threads;   // id -> {entry,prio,status,stack}
     static std::unordered_map<int, std::pair<int, int>> s_semas;          // sem -> {count,max}
     static std::unordered_map<int, uint32_t> s_events;                    // ef -> bits
     static std::unordered_map<int, std::pair<uint32_t, uint32_t>> s_intrs; // irq -> {handler,arg}
     static int s_nextTid = 1, s_nextEf = 1, s_nextSema = 1, s_curTid = 0;
     static uint32_t s_ctypeAddr = 0;
-    std::lock_guard<std::mutex> klock(s_kernMx);
+    std::lock_guard<std::recursive_mutex> klock(s_kernMx);
 
     // [r3000] Cross-module import: another loaded recompiled IRX exports this name (e.g. SIO2D
     // imports the SIO2MAN library). Resolve fptr[ordinal] from the callee's export table in IOP
@@ -3114,18 +3128,26 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
     std::fprintf(stderr, "[iop-run] %s: entry 0x%08x gp 0x%08x base 0x%x (native)\n",
                  mod.name.c_str(), mod.entry, mod.gp, base);
     const char *wd = std::getenv("PS2X_IOP_WATCHDOG");
+#if !defined(_WIN32)
+    std::thread wdThread;
+#endif
     if (wd && wd[0])
     {
 #if !defined(_WIN32)
-        std::signal(SIGALRM, [](int)
-                    {
-                        void *bt[48];
-                        const int n = backtrace(bt, 48);
-                        std::fprintf(stderr, "[iop-watchdog] IOP entry stuck; backtrace:\n");
-                        backtrace_symbols_fd(bt, n, 2);
-                        std::_Exit(99);
-                    });
-        ::alarm((unsigned)std::atoi(wd));
+        std::signal(SIGALRM, iopWdHandler);
+        g_iopWdThread.store(reinterpret_cast<void *>(pthread_self()));
+        g_iopWdArmed.store(true);
+        const int secs = std::atoi(wd);
+        wdThread = std::thread([secs]()
+        {
+            for (int i = 0; i < secs * 20; ++i)
+            {
+                if (!g_iopWdArmed.load()) return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (g_iopWdArmed.load())
+                pthread_kill(reinterpret_cast<pthread_t>(g_iopWdThread.load()), SIGALRM);
+        });
 #endif
     }
     if (const char *noEntry = std::getenv("PS2X_IOP_NOENTRY");
@@ -3143,7 +3165,8 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
     if (wd && wd[0])
     {
 #if !defined(_WIN32)
-        ::alarm(0);
+        g_iopWdArmed.store(false);
+        if (wdThread.joinable()) wdThread.join();
 #endif
     }
     // [diagnostic] Exercise the cross-module path by calling SIO2D's sio2man import stubs.
