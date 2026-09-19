@@ -1457,7 +1457,9 @@ namespace ps2_syscalls
         // run its entry natively instead of only faking the HLE load.
         if (modulePath.find("SIO2MAN") != std::string::npos ||
             modulePath.find("SIO2D") != std::string::npos ||
-            modulePath.find("DBCMAN") != std::string::npos)
+            modulePath.find("DBCMAN") != std::string::npos ||
+            modulePath.find("LIBSD") != std::string::npos ||
+            modulePath.find("SDRDRV") != std::string::npos)
         {
             std::string dir = "data/IRX/";
             if (const char *d = std::getenv("PS2X_IOP_DIR"); d && d[0]) dir = d;

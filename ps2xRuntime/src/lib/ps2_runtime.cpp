@@ -2741,6 +2741,8 @@ extern "C" {
 void ps2x_register_sio2man() __attribute__((weak));
 void ps2x_register_sio2d() __attribute__((weak));
 void ps2x_register_dbcman() __attribute__((weak));
+void ps2x_register_libsd() __attribute__((weak));
+void ps2x_register_sdrdrv() __attribute__((weak));
 }
 
 bool PS2Runtime::registerIopFunction(uint32_t address, RecompiledFunction func)
@@ -2992,6 +2994,14 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
     else if (bn.find("DBCMAN") != std::string::npos)
     {
         if (ps2x_register_dbcman) ps2x_register_dbcman();
+    }
+    else if (bn.find("LIBSD") != std::string::npos)
+    {
+        if (ps2x_register_libsd) ps2x_register_libsd();
+    }
+    else if (bn.find("SDRDRV") != std::string::npos)
+    {
+        if (ps2x_register_sdrdrv) ps2x_register_sdrdrv();
     }
 
     RecompiledFunction fn = nullptr;
