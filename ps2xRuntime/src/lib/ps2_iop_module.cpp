@@ -164,6 +164,7 @@ bool loadIrx(const std::string &path, Module &out)
                 ex.module = nm;
                 ex.version = ver;
                 ex.mode = mode;
+                ex.tableVaddr = seg.vaddr + static_cast<uint32_t>(off);
                 while (q + 4 <= n && rdU32(p + q) != 0)
                 {
                     ex.fptrs.push_back(seg.vaddr + rdU32(p + q));

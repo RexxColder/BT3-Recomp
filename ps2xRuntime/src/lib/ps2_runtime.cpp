@@ -2340,11 +2340,50 @@ static uint8_t *iopGuestSpace(size_t &sizeOut)
 #endif
 }
 
+// [r3000] Loaded IOP modules and their per-module function tables. An IRX loads at its link
+// address relative to a per-module base; the generated code is passed a `rdram` view shifted
+// by that base, so its link-relative addresses map to the right place without codegen changes.
+namespace
+{
+    struct IopMod
+    {
+        std::string name;            // file basename
+        std::string exportName;      // e.g. "sio2man"
+        uint32_t id = 0;
+        uint32_t base = 0;
+        uint32_t gp = 0;
+        uint32_t entry = 0;
+        uint32_t exportVaddr = 0;    // link vaddr of the export table header (fptrs at +20)
+    };
+
+    std::unordered_map<uint32_t, std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction>> &iopTables()
+    {
+        static std::unordered_map<uint32_t, std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction>> t;
+        return t;
+    }
+    std::unordered_map<std::string, IopMod> &iopModulesByExport()
+    {
+        static std::unordered_map<std::string, IopMod> m;
+        return m;
+    }
+    std::mutex &iopTableMx()
+    {
+        static std::mutex m;
+        return m;
+    }
+    uint32_t g_iopRegModule = 0;   // module whose registration function is running
+    uint32_t g_iopCurModule = 0;   // module currently executing
+    uint32_t g_iopNextId = 1;
+    uint32_t g_iopNextBase = 0;
+}
+
 void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module, uint32_t ordinal)
 {
-    (void)rdram;
-    size_t ramSize = 0;
-    uint8_t *ram = iopGuestSpace(ramSize);
+    size_t totalSize = 0;
+    uint8_t *iopBase = iopGuestSpace(totalSize);
+    // Read/write through the caller's relocated view (rdram = iopBase + callerBase).
+    uint8_t *ram = rdram ? rdram : iopBase;
+    const size_t ramSize = iopBase ? (totalSize - static_cast<size_t>(ram - iopBase)) : 0;
     auto cstr = [&](uint32_t addr) -> std::string {
         std::string s;
         if (!ram || addr >= ramSize) return s;
@@ -2382,6 +2421,52 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
     static int s_nextTid = 1, s_nextEf = 1, s_nextSema = 1, s_curTid = 0;
     static uint32_t s_ctypeAddr = 0;
     std::lock_guard<std::mutex> klock(s_kernMx);
+
+    // [r3000] Cross-module import: another loaded recompiled IRX exports this name (e.g. SIO2D
+    // imports the SIO2MAN library). Resolve fptr[ordinal] from the callee's export table in IOP
+    // RAM and call its recompiled function with the callee's own base/gp.
+    if (iopBase)
+    {
+        IopMod target;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            auto it = iopModulesByExport().find(mod);
+            if (it != iopModulesByExport().end()) { target = it->second; found = true; }
+        }
+        if (found && target.exportVaddr)
+        {
+            const uint32_t fptrAddr = target.exportVaddr + 20u + ordinal * 4u;
+            uint32_t fptr = 0;
+            if (static_cast<uint64_t>(target.base) + fptrAddr + 4u <= totalSize)
+                std::memcpy(&fptr, iopBase + target.base + fptrAddr, 4);
+            if (fptr)
+            {
+                PS2Runtime::RecompiledFunction callee = nullptr;
+                {
+                    std::lock_guard<std::mutex> lk(iopTableMx());
+                    auto &t = iopTables()[target.id];
+                    auto fit = t.find(fptr);
+                    if (fit != t.end()) callee = fit->second;
+                }
+                if (callee)
+                {
+                    uint32_t savedCur = 0, savedGp = getRegU32(ctx, 28);
+                    {
+                        std::lock_guard<std::mutex> lk(iopTableMx());
+                        savedCur = g_iopCurModule;
+                        g_iopCurModule = target.id;
+                    }
+                    ctx->r[28] = _mm_cvtsi32_si128(target.gp);
+                    callee(iopBase + target.base, ctx, this);
+                    ctx->r[28] = _mm_cvtsi32_si128(savedGp);
+                    std::lock_guard<std::mutex> lk(iopTableMx());
+                    g_iopCurModule = savedCur;
+                    return;   // v0 holds the callee's return value
+                }
+            }
+        }
+    }
 
     if (mod == "loadcore")
     {
@@ -2498,21 +2583,6 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
     setReturnU32(ctx, ret);
 }
 
-namespace
-{
-    // [r3000] The IOP module's recompiled function table (separate from the EE's).
-    std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> &iopFuncTable()
-    {
-        static std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> t;
-        return t;
-    }
-    std::mutex &iopTableMx()
-    {
-        static std::mutex m;
-        return m;
-    }
-}
-
 // [r3000] Per-module IOP registration functions emitted by the recompiler. Declared weak so a
 // module that isn't linked in simply resolves to null.
 extern "C" {
@@ -2521,17 +2591,20 @@ void ps2x_register_sio2d() __attribute__((weak));
 }
 
 bool PS2Runtime::registerIopFunction(uint32_t address, RecompiledFunction func)
-{    if (!func) return false;
+{
+    if (!func) return false;
     std::lock_guard<std::mutex> lk(iopTableMx());
-    iopFuncTable()[address] = func;
+    iopTables()[g_iopRegModule][address] = func;
     return true;
 }
 
 PS2Runtime::RecompiledFunction PS2Runtime::lookupIopFunction(uint32_t address)
 {
     std::lock_guard<std::mutex> lk(iopTableMx());
-    auto it = iopFuncTable().find(address);
-    return it == iopFuncTable().end() ? nullptr : it->second;
+    auto mit = iopTables().find(g_iopCurModule);
+    if (mit == iopTables().end()) return nullptr;
+    auto it = mit->second.find(address);
+    return it == mit->second.end() ? nullptr : it->second;
 }
 
 void PS2Runtime::reportMissingIopFunction(uint32_t targetPc, uint32_t sourcePc, const char *debugName)
@@ -2560,7 +2633,7 @@ bool PS2Runtime::dispatchIopBranch(uint8_t *rdram, R5900Context *ctx, uint32_t t
     return true;
 }
 
-// [r3000] Map an IRX into IOP RAM, set up the R3000 context and call its entry natively.
+// [r3000] Load an IRX at the next IOP base, register its recompiled functions and run its entry.
 bool PS2Runtime::loadAndRunIopModule(const char *path)
 {
     if (!path || !path[0])
@@ -2572,11 +2645,51 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
         return false;
     }
 
-    // Select this module's function table: reset it and register the module's recompiled
-    // functions (each module has its own registration symbol; modules run one at a time).
+    size_t totalSize = 0;
+    uint8_t *iopBase = iopGuestSpace(totalSize);
+    if (!iopBase)
+    {
+        std::fprintf(stderr, "[iop-run] cannot map the IOP guest space\n");
+        return false;
+    }
+
+    const uint32_t base = g_iopNextBase;
+    g_iopNextBase += 0x10000u;   // each small IRX gets its own 64 KiB slot
+
+    std::memset(iopBase + base, 0, 0x10000u);
+    for (const auto &seg : mod.segments)
+    {
+        if (seg.iopHeader || seg.data.empty())
+            continue;
+        if (static_cast<uint64_t>(base) + seg.vaddr + seg.data.size() > totalSize)
+            continue;
+        std::memcpy(iopBase + base + seg.vaddr, seg.data.data(), seg.data.size());
+    }
+
+    IopMod m;
+    m.name = mod.name;
+    m.id = g_iopNextId++;
+    m.base = base;
+    m.gp = mod.gp;
+    m.entry = mod.entry;
+    for (const auto &exp : mod.exports)
+    {
+        if (!exp.module.empty())
+        {
+            m.exportName = exp.module;
+            m.exportVaddr = exp.tableVaddr;
+        }
+    }
+    if (!m.exportName.empty())
     {
         std::lock_guard<std::mutex> lk(iopTableMx());
-        iopFuncTable().clear();
+        iopModulesByExport()[m.exportName] = m;
+    }
+
+    // Register this module's recompiled functions into its own table.
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        g_iopRegModule = m.id;
     }
     const std::string bn = mod.name;
     if (bn.find("SIO2MAN") != std::string::npos)
@@ -2588,30 +2701,14 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
         if (ps2x_register_sio2d) ps2x_register_sio2d();
     }
 
-    size_t ramSize = 0;
-    uint8_t *ram = iopGuestSpace(ramSize);
-    if (!ram)
+    RecompiledFunction fn = nullptr;
     {
-        std::fprintf(stderr, "[iop-run] cannot map the IOP guest space\n");
-        return false;
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        g_iopCurModule = m.id;
+        auto &t = iopTables()[m.id];
+        auto it = t.find(m.entry);
+        if (it != t.end()) fn = it->second;
     }
-    std::memset(ram, 0, 4u * 1024u * 1024u);   // clear IOP RAM (2 MiB + slack)
-    for (const auto &seg : mod.segments)
-    {
-        if (seg.iopHeader || seg.data.empty())
-            continue;
-        if (static_cast<uint64_t>(seg.vaddr) + seg.data.size() > ramSize)
-            continue;
-        std::memcpy(ram + seg.vaddr, seg.data.data(), seg.data.size());
-    }
-
-    R5900Context ctx{};
-    ctx.pc = mod.entry;
-    ctx.r[29] = _mm_cvtsi32_si128(0x1F0000u);   // sp (top of IOP RAM, below scratchpad)
-    ctx.r[28] = _mm_cvtsi32_si128(mod.gp);      // gp
-    ctx.r[4] = _mm_cvtsi32_si128(0u);           // a0
-
-    RecompiledFunction fn = lookupIopFunction(mod.entry);
     if (!fn)
     {
         std::fprintf(stderr, "[iop-run] %s: no recompiled function at entry 0x%08x\n",
@@ -2619,9 +2716,15 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
         return false;
     }
 
-    std::fprintf(stderr, "[iop-run] %s: entry 0x%08x gp 0x%08x (native)\n",
-                 mod.name.c_str(), mod.entry, mod.gp);
-    fn(ram, &ctx, this);
+    R5900Context ctx{};
+    ctx.pc = mod.entry;
+    ctx.r[29] = _mm_cvtsi32_si128(0x1F0000u);   // sp (top of IOP RAM, below scratchpad)
+    ctx.r[28] = _mm_cvtsi32_si128(m.gp);        // gp
+    ctx.r[4] = _mm_cvtsi32_si128(0u);           // a0
+
+    std::fprintf(stderr, "[iop-run] %s: entry 0x%08x gp 0x%08x base 0x%x (native)\n",
+                 mod.name.c_str(), mod.entry, mod.gp, base);
+    fn(iopBase + base, &ctx, this);
     std::fprintf(stderr, "[iop-run] %s: entry returned\n", mod.name.c_str());
     return true;
 }

@@ -47,6 +47,7 @@ namespace ps2iop
         std::string module;
         uint16_t version = 0;
         uint16_t mode = 0;
+        uint32_t tableVaddr = 0;         // vaddr of the export table header (fptrs begin at +20)
         std::vector<uint32_t> fptrs;
     };
 
