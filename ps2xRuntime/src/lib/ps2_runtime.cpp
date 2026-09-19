@@ -3057,8 +3057,16 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
 
     std::fprintf(stderr, "[iop-run] %s: entry 0x%08x gp 0x%08x base 0x%x (native)\n",
                  mod.name.c_str(), mod.entry, mod.gp, base);
-    try { fn(iopBase + base, &ctx, this); }
-    catch (const IopYield &) { /* the entry itself yielded */ }
+    if (const char *noEntry = std::getenv("PS2X_IOP_NOENTRY");
+        !(noEntry && noEntry[0] && mod.name.find(noEntry) != std::string::npos))
+    {
+        try { fn(iopBase + base, &ctx, this); }
+        catch (const IopYield &) { /* the entry itself yielded */ }
+    }
+    else
+    {
+        std::fprintf(stderr, "[iop-run] %s: entry skipped (PS2X_IOP_NOENTRY)\n", mod.name.c_str());
+    }
     // [diagnostic] Exercise the cross-module path by calling SIO2D's sio2man import stubs.
     if (const char *xt = std::getenv("PS2X_IOP_XCALL_TEST"); xt && xt[0] && bn.find("SIO2D") != std::string::npos)
     {
