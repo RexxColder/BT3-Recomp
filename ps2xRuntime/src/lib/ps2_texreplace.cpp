@@ -78,7 +78,8 @@ std::string TexIdent::name() const
 
 bool identify(const uint8_t *vram, uint32_t tbp0, uint32_t tbw, uint8_t psm,
               uint8_t tw, uint8_t th, const uint32_t *clut,
-              uint8_t ta0, bool aem, uint8_t ta1, TexIdent &out)
+              uint8_t ta0, bool aem, uint8_t ta1, TexIdent &out,
+              uint32_t cbp, uint32_t csa, uint32_t csm, uint32_t cpsm)
 {
     if (!vram) return false;
     // Block dimensions in TEXELS: PSMT8 is 16x16, PSMT4 is 32x16.
@@ -122,6 +123,51 @@ bool identify(const uint8_t *vram, uint32_t tbp0, uint32_t tbw, uint8_t psm,
     const uint8_t eTa1 = paletted ? 0u : ta1;
     out.bits = (uint32_t)(psm & 0x3F) | ((uint32_t)(tw & 0xF) << 6) | ((uint32_t)(th & 0xF) << 10)
              | ((uint32_t)eTa0 << 14) | ((uint32_t)(eAem ? 1u : 0u) << 22) | ((uint32_t)eTa1 << 23);
+
+    // [texraw] Diagnostic: PS2X_TEXRAWD=<name|tex0Hash-prefix|*>: dump the exact bytes the hash reads
+    // (VRAM blocks in hash order + the CLUT) so the source container layout can be derived offline.
+    // Bounded by PS2X_TEXRAWD_MAX (default 4000). One file per identity in PS2X_TEXRAWD_DIR (or ".").
+    if (const char *want = std::getenv("PS2X_TEXRAWD"); want && want[0])
+    {
+        const std::string nm = out.name();
+        const bool all = (want[0] == '*' && want[1] == '\0');
+        if (all || nm.rfind(want, 0) == 0)
+        {
+            static std::mutex s_mx;
+            static std::unordered_set<std::string> s_done;
+            bool first = false;
+            {
+                std::lock_guard<std::mutex> lk(s_mx);
+                static size_t s_max = []() {
+                    const char *v = std::getenv("PS2X_TEXRAWD_MAX");
+                    return (size_t)((v && v[0]) ? std::atol(v) : 4000L);
+                }();
+                if (s_done.size() < s_max) first = s_done.insert(nm).second;
+            }
+            if (first)
+            {
+                const char *dir = std::getenv("PS2X_TEXRAWD_DIR");
+                const std::string path = std::string((dir && dir[0]) ? dir : ".") + "/texraw_" + nm + ".bin";
+                if (std::FILE *f = std::fopen(path.c_str(), "wb"))
+                {
+                    const int nclut = (psm == PSM_T4) ? 16 : 256;
+                    std::fprintf(f, "tbp0 %u tbw %u psm %u tw %u th %u clutN %d bits %08x tex0 %016llx clut %016llx cbp %u csa %u csm %u cpsm %u\n",
+                                 tbp0, tbw, psm, tw, th, nclut, out.bits,
+                                 (unsigned long long)out.tex0Hash, (unsigned long long)out.clutHash,
+                                 cbp, csa, csm, cpsm);
+                    for (uint32_t by = 0; by < by1; ++by)
+                        for (uint32_t bx = 0; bx < bx1; ++bx)
+                        {
+                            const uint32_t a = (psm == PSM_T8 ? blockAddr8(tbp0, tbw, bx, by)
+                                                              : blockAddr4(tbp0, tbw, bx, by)) & kVramMask;
+                            std::fwrite(vram + a, 1, kBlockBytes, f);
+                        }
+                    if (clut) std::fwrite(clut, sizeof(uint32_t), (size_t)nclut, f);
+                    std::fclose(f);
+                }
+            }
+        }
+    }
     return true;
 }
 }
@@ -249,6 +295,34 @@ bool replacementsEnabled()
 {
     std::call_once(g_once, buildIndex);
     return g_on;
+}
+
+// [texraw] Dump the resolved decoded RGBA (the texture as handed to the runner) for the identity
+// requested by PS2X_TEXRAWD (exact name prefix or "*"). Bounded to one file per identity.
+void maybeDumpResolved(const TexIdent &id, const uint8_t *rgba, int w, int h)
+{
+    const char *want = std::getenv("PS2X_TEXRAWD");
+    if (!rgba || !want || !want[0] || w <= 0 || h <= 0) return;
+    const std::string nm = id.name();
+    const bool all = (want[0] == '*' && want[1] == '\0');
+    if (!all && nm.rfind(want, 0) != 0) return;
+    static std::mutex s_mx;
+    static std::unordered_set<std::string> s_done;
+    {
+        std::lock_guard<std::mutex> lk(s_mx);
+        if (!s_done.insert(nm).second) return;
+    }
+    const char *dir = std::getenv("PS2X_TEXRAWD_DIR");
+    const std::string base = std::string((dir && dir[0]) ? dir : ".") + "/texrgba_" + nm;
+    if (std::FILE *f = std::fopen((base + ".bin").c_str(), "wb"))
+    {
+        std::fprintf(f, "w %d h %d\n", w, h);
+        std::fwrite(rgba, 1, (size_t)w * (size_t)h * 4u, f);
+        std::fclose(f);
+    }
+    bt3Image img(const_cast<void *>(static_cast<const void *>(rgba)), w, h, 1,
+                 BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    bt3ExportImage(img, (base + ".png").c_str());
 }
 
 // [texui] Pack status for the launcher/overlay popup.

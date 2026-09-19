@@ -30,12 +30,18 @@ namespace ps2tex
     };
 
     // vram: the 4 MB GS VRAM base. Returns false for formats we do not hash yet.
+    // cbp/csa/csm/cpsm are only used by the [texraw] diagnostic (CLUT layout provenance).
     bool identify(const uint8_t *vram, uint32_t tbp0, uint32_t tbw, uint8_t psm,
                   uint8_t tw, uint8_t th, const uint32_t *clut,
-                  uint8_t ta0, bool aem, uint8_t ta1, TexIdent &out);
+                  uint8_t ta0, bool aem, uint8_t ta1, TexIdent &out,
+                  uint32_t cbp = 0, uint32_t csa = 0, uint32_t csm = 0, uint32_t cpsm = 0);
 
     // True once a replacement directory has been indexed (PS2X_TEXREPLACE=<dir>).
     bool replacementsEnabled();
+
+    // [texraw] Diagnostic (PS2X_TEXRAWD=<name|*>, PS2X_TEXRAWD_DIR): dump the RESOLVED decoded RGBA
+    // (the texture as handed to the runner) so the source container layout can be derived offline.
+    void maybeDumpResolved(const TexIdent &id, const uint8_t *rgba, int w, int h);
 
     // [texui] Pack status for the launcher/overlay "Texture Replacement" popup.
     size_t replacementsCount();       // files actually indexed (0 = no pack)

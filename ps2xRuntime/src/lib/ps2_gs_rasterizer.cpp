@@ -3633,8 +3633,10 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
             const bool pal = (tex0.psm == 19 || tex0.psm == 20);
             if (ps2tex::identify(vram, tex0.tbp0, tex0.tbw, tex0.psm,
                                  tex0.tw, tex0.th, pal ? clut : nullptr,
-                                 texa.ta0, texa.aem, texa.ta1, id))
+                                 texa.ta0, texa.aem, texa.ta1, id,
+                                 tex0.cbp, tex0.csa, tex0.csm, tex0.cpsm))
             {
+                ps2tex::maybeDumpResolved(id, rgba.data(), subW, texH);   // [texraw]
                 std::vector<uint8_t> rep; int rw = 0, rh = 0, rfmt = 0;
                 const bool found = ps2tex::loadReplacement(id, texKey, rep, rw, rh, rfmt);   // [texpackasync]
                 {   // [texrepdiag] PS2X_TEXREPDIAG=1: log the MISSES only (bounded). A character
