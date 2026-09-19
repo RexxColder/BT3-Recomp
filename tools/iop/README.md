@@ -120,3 +120,8 @@ IOPRP** (CDVDFSV↔CDVDMAN↔FILEIO↔…), no del juego. Los módulos **del jue
 
 El default (0 para lo no manejado) **ya coincide** con esos valores de éxito, por eso el boot no
 se rompe. Sólo `timrman#4` (AllocHardTimer) devuelve un id nuevo.
+
+**Complementos añadidos**: `ioman` (registro de devices + todas las `ops` ruteadas a los drivers
+nativos), `cdvdman` (sync/break/nop→1, disktype→DVD, readclock), `modload`→0, `secrman`→0 (éxito),
+y **SIO2/PIO**: write a CTRL marca STAT "ready" (+STAT inicial en lectura) para que los drivers que
+hacen poll de transferencia SIO2 salgan.

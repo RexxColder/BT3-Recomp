@@ -6103,7 +6103,10 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     uint32_t n = 0;
     if (isIopRegisterAccess(rdram, vaddr, n))
     {
-        const uint32_t v = iopRegs()[n];
+        auto it = iopRegs().find(n);
+        const uint32_t v = (it != iopRegs().end())
+                               ? it->second
+                               : (n == 0x1F801044u ? 0x00000025u : n == 0x1F808244u ? 0x00000001u : 0u);
         iopRegLog(n, v, false);
         return v;
     }
@@ -6177,6 +6180,10 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     {
         iopRegs()[n] = value;
         iopRegLog(n, value, true);
+        // SIO0/PIO and SIO2: a write to the control register completes the transfer immediately
+        // (mark the status register ready), so drivers polling for completion can proceed.
+        if (n == 0x1F80104Au) iopRegs()[0x1F801044u] = 0x00000025u;   // SIO0 CTRL -> STAT (TX/RX ready)
+        if (n == 0x1F808240u) iopRegs()[0x1F808244u] = 0x00000001u;   // SIO2 CTRL -> STAT ready
         return;
     }
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
