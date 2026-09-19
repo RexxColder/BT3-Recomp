@@ -6,6 +6,10 @@
 
 extern "C" void ps2x_register_sio2d()
 {
+    PS2Runtime::registerIopFunction(0x0u, sio2d_00000000_0x0);
+    PS2Runtime::registerIopFunction(0x70u, sio2d_00000070_0x70);
+    PS2Runtime::registerIopFunction(0x128u, sio2d_00000070_0x70);
+    PS2Runtime::registerIopFunction(0x14cu, sio2d_0000014c_0x14c);
     PS2Runtime::registerIopFunction(0x198u, sio2d_00000198_0x198);
     PS2Runtime::registerIopFunction(0x19cu, sio2d_00000198_0x198);
     PS2Runtime::registerIopFunction(0x1a0u, sio2d_00000198_0x198);
@@ -197,9 +201,10 @@ extern "C" void ps2x_register_sio2d()
     PS2Runtime::registerIopFunction(0x1054u, sio2d_00000e7c_0xe7c);
     PS2Runtime::registerIopFunction(0x108cu, sio2d_0000108c_0x108c);
     PS2Runtime::registerIopFunction(0x10d4u, sio2d_000010d4_0x10d4);
-    PS2Runtime::registerIopFunction(0x1124u, sio2d_000010d4_0x10d4);
-    PS2Runtime::registerIopFunction(0x1138u, sio2d_000010d4_0x10d4);
-    PS2Runtime::registerIopFunction(0x114cu, sio2d_000010d4_0x10d4);
+    PS2Runtime::registerIopFunction(0x10f8u, sio2d_000010f8_0x10f8);
+    PS2Runtime::registerIopFunction(0x1124u, sio2d_000010f8_0x10f8);
+    PS2Runtime::registerIopFunction(0x1138u, sio2d_000010f8_0x10f8);
+    PS2Runtime::registerIopFunction(0x114cu, sio2d_000010f8_0x10f8);
     PS2Runtime::registerIopFunction(0x1170u, sio2d_00001170_0x1170);
     PS2Runtime::registerIopFunction(0x1350u, sio2d_00001350_0x1350);
     PS2Runtime::registerIopFunction(0x149cu, sio2d_00001350_0x1350);

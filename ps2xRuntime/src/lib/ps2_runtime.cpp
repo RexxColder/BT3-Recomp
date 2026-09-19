@@ -2451,6 +2451,14 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
                 }
                 if (callee)
                 {
+                    std::fprintf(stderr, "[iop-xcall] %s#%u -> %s 0x%08x\n",
+                                 mod.c_str(), ordinal, target.exportName.c_str(), fptr);
+                    static const bool s_resolveOnly = std::getenv("PS2X_IOP_XCALL_RESOLVE_ONLY") != nullptr;
+                    if (s_resolveOnly)
+                    {
+                        setReturnU32(ctx, 0);
+                        return;
+                    }
                     uint32_t savedCur = 0, savedGp = getRegU32(ctx, 28);
                     {
                         std::lock_guard<std::mutex> lk(iopTableMx());
@@ -2725,6 +2733,30 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
     std::fprintf(stderr, "[iop-run] %s: entry 0x%08x gp 0x%08x base 0x%x (native)\n",
                  mod.name.c_str(), mod.entry, mod.gp, base);
     fn(iopBase + base, &ctx, this);
+    // [diagnostic] Exercise the cross-module path by calling SIO2D's sio2man import stubs.
+    if (const char *xt = std::getenv("PS2X_IOP_XCALL_TEST"); xt && xt[0] && bn.find("SIO2D") != std::string::npos)
+    {
+        for (uint32_t stub : {0x1ac8u, 0x1ad0u, 0x1ad8u, 0x1ae0u})
+        {
+            RecompiledFunction sf = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(iopTableMx());
+                auto &t = iopTables()[m.id];
+                auto it = t.find(stub);
+                if (it != t.end()) sf = it->second;
+            }
+            if (sf)
+            {
+                R5900Context sc{};
+                sc.pc = stub;
+                sc.r[29] = _mm_cvtsi32_si128(0x1F0000u);
+                sc.r[28] = _mm_cvtsi32_si128(m.gp);
+                sc.r[4] = _mm_cvtsi32_si128(0u);
+                sf(iopBase + base, &sc, this);
+            }
+        }
+    }
+
     std::fprintf(stderr, "[iop-run] %s: entry returned\n", mod.name.c_str());
     return true;
 }

@@ -6,6 +6,9 @@
 struct R5900Context;
 class PS2Runtime;
 
+void sio2d_00000000_0x0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
+void sio2d_00000070_0x70(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
+void sio2d_0000014c_0x14c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2d_00000198_0x198(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2d_000003ac_0x3ac(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2d_000006c8_0x6c8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
@@ -17,6 +20,7 @@ void sio2d_00000e14_0xe14(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime
 void sio2d_00000e7c_0xe7c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2d_0000108c_0x108c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2d_000010d4_0x10d4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
+void sio2d_000010f8_0x10f8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2d_00001170_0x1170(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2d_00001350_0x1350(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2d_000014d8_0x14d8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);

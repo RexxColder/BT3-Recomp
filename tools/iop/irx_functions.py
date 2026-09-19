@@ -77,8 +77,14 @@ def _tables(text, text_vaddr, text_file_off):
             q += 8
         else:
             fptrs = []
-            while q + 4 <= len(text) and struct.unpack_from("<I", text, q)[0] != 0:
-                fptrs.append(text_vaddr + struct.unpack_from("<I", text, q)[0])
+            # The export table may have interior zero (unused) slots, so don't stop at the
+            # first 0: stop when a word is a non-zero value outside the code address range.
+            limit = text_vaddr + len(text) + 0x1000
+            while q + 4 <= len(text):
+                w = struct.unpack_from("<I", text, q)[0]
+                if w != 0 and w >= limit:
+                    break
+                fptrs.append(text_vaddr + w)
                 q += 4
             q += 4
             exports.append((name, fptrs))
