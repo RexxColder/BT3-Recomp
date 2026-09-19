@@ -5809,6 +5809,36 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
 }
 
+// [r3000] IOP register accesses (from IOP code): keep them out of the EE memory model and give
+// them a persistent register file. `rdram` identifies IOP code (it points into the IOP mapping).
+namespace
+{
+    std::unordered_map<uint32_t, uint32_t> &iopRegs()
+    {
+        static std::unordered_map<uint32_t, uint32_t> m;
+        return m;
+    }
+    bool isIopRegisterAccess(uint8_t *rdram, uint32_t vaddr, uint32_t &norm)
+    {
+        size_t sz = 0;
+        uint8_t *base = iopGuestSpace(sz);
+        if (!base || rdram < base || rdram >= base + sz) return false;
+        if (vaddr >= 0x1F801000u && vaddr < 0x1F810000u) { norm = vaddr; return true; }
+        if (vaddr >= 0xBF801000u && vaddr < 0xBF810000u) { norm = vaddr & 0x1FFFFFFFu; return true; }
+        return false;
+    }
+    void iopRegLog(uint32_t addr, uint32_t value, bool write)
+    {
+        static const bool on = []() { const char *v = std::getenv("PS2X_IOP_REGLOG"); return v && v[0] && v[0] != '0'; }();
+        if (!on) return;
+        static std::mutex mx;
+        static std::unordered_set<uint32_t> seen;
+        std::lock_guard<std::mutex> lk(mx);
+        if (seen.insert(addr).second)
+            std::fprintf(stderr, "[iop-reg] %s 0x%08x = 0x%08x\n", write ? "W" : "R", addr, value);
+    }
+}
+
 uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
@@ -5824,6 +5854,13 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    uint32_t n = 0;
+    if (isIopRegisterAccess(rdram, vaddr, n))
+    {
+        const uint32_t v = iopRegs()[n];
+        iopRegLog(n, v, false);
+        return v;
+    }
     try
     {
         return m_memory.read32(vaddr);
@@ -5889,6 +5926,13 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
+    uint32_t n = 0;
+    if (isIopRegisterAccess(rdram, vaddr, n))
+    {
+        iopRegs()[n] = value;
+        iopRegLog(n, value, true);
+        return;
+    }
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
     try
     {

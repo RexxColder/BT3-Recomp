@@ -1898,6 +1898,58 @@ namespace ps2recomp
         }
     }
 
+    // [r3000] Mark loads/stores to IOP registers (0x1F80xxxx / 0xBF80xxxx) as MMIO so the
+    // generated code routes them through runtime->Load/Store32 instead of raw IOP RAM. The
+    // address is recovered from a preceding lui + ori/addiu on the base register.
+    static void markR3000Mmio(std::vector<Instruction> &instructions)
+    {
+        uint32_t regVal[32] = {0};
+        bool regKnown[32] = {false};
+        auto isIopReg = [](uint32_t a)
+        {
+            return (a >= 0x1F800000u && a < 0x1F810000u) ||
+                   (a >= 0xBF800000u && a < 0xBF810000u);
+        };
+        for (auto &inst : instructions)
+        {
+            if (inst.isBranch || inst.isJump || inst.isCall ||
+                (inst.opcode == OPCODE_SPECIAL && (inst.function == 8u /*JR*/ || inst.function == 9u /*JALR*/)))
+            {
+                for (int i = 0; i < 32; ++i) regKnown[i] = false;
+                continue;
+            }
+            const uint32_t op = inst.opcode, rs = inst.rs, rt = inst.rt;
+            if (op == OPCODE_LUI)
+            {
+                regVal[rt] = inst.immediate << 16;
+                regKnown[rt] = true;
+                continue;
+            }
+            if (op == OPCODE_ORI && rs != 0 && regKnown[rs])
+            {
+                regVal[rt] = regVal[rs] | (inst.immediate & 0xFFFFu);
+                regKnown[rt] = true;
+                continue;
+            }
+            if (op == OPCODE_ADDIU && rs != 0 && regKnown[rs])
+            {
+                regVal[rt] = regVal[rs] + inst.simmediate;
+                regKnown[rt] = true;
+                continue;
+            }
+            if ((inst.isLoad || inst.isStore) && rs != 0 && regKnown[rs])
+            {
+                const uint32_t addr = regVal[rs] + inst.simmediate;
+                if (isIopReg(addr))
+                {
+                    inst.isMmio = true;
+                    inst.mmioAddress = addr;
+                }
+            }
+            if (rt != 0) regKnown[rt] = false;
+        }
+    }
+
     bool PS2Recompiler::decodeFunction(Function &function)
     {
         std::vector<Instruction> instructions;
@@ -1989,6 +2041,9 @@ namespace ps2recomp
         {
             function.end = instructions.back().address + 4;
         }
+
+        if (m_config.arch == Arch::R3000)
+            markR3000Mmio(instructions);
 
         m_decodedFunctions.insert_or_assign(function.start, std::move(instructions));
 

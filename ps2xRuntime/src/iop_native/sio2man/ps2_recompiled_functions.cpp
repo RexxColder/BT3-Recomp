@@ -24,7 +24,8 @@ void sio2man_00000000_0x0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime
     // 0x4: 0x34428268  ori         $v0, $v0, 0x8268
     SET_GPR_U64(ctx, 2, GPR_U64(ctx, 2) | (uint64_t)(uint16_t)33384);
     // 0x8: 0xac440000  sw          $a0, 0x0($v0)
-    WRITE32(ADD32(GPR_U32(ctx, 2), 0), GPR_U32(ctx, 4));
+    ctx->pc = 0x8u;
+    runtime->Store32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 0), GPR_U32(ctx, 4)); // MMIO: 0xbf808268
     // 0xc: 0x3e00008  jr          $ra
     ctx->pc = 0xCu;
     {
@@ -56,7 +57,8 @@ void sio2man_00000014_0x14(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtim
     // 0x18: 0x34428268  ori         $v0, $v0, 0x8268
     SET_GPR_U64(ctx, 2, GPR_U64(ctx, 2) | (uint64_t)(uint16_t)33384);
     // 0x1c: 0x8c420000  lw          $v0, 0x0($v0)
-    SET_GPR_S32(ctx, 2, (int32_t)READ32(ADD32(GPR_U32(ctx, 2), 0)));
+    ctx->pc = 0x1cu;
+    SET_GPR_S32(ctx, 2, (int32_t)runtime->Load32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 0))); // MMIO: 0xbf808268
     // 0x20: 0x3e00008  jr          $ra
     ctx->pc = 0x20u;
     {
@@ -88,7 +90,8 @@ void sio2man_00000028_0x28(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtim
     // 0x2c: 0x3442826c  ori         $v0, $v0, 0x826C
     SET_GPR_U64(ctx, 2, GPR_U64(ctx, 2) | (uint64_t)(uint16_t)33388);
     // 0x30: 0x8c420000  lw          $v0, 0x0($v0)
-    SET_GPR_S32(ctx, 2, (int32_t)READ32(ADD32(GPR_U32(ctx, 2), 0)));
+    ctx->pc = 0x30u;
+    SET_GPR_S32(ctx, 2, (int32_t)runtime->Load32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 0))); // MMIO: 0xbf80826c
     // 0x34: 0x3e00008  jr          $ra
     ctx->pc = 0x34u;
     {
@@ -122,7 +125,8 @@ void sio2man_0000003c_0x3c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtim
     // 0x44: 0x240821  addu        $at, $at, $a0
     SET_GPR_S32(ctx, 1, (int32_t)ADD32(GPR_U32(ctx, 1), GPR_U32(ctx, 4)));
     // 0x48: 0xac258240  sw          $a1, -0x7DC0($at)
-    WRITE32(ADD32(GPR_U32(ctx, 1), 4294935104), GPR_U32(ctx, 5));
+    ctx->pc = 0x48u;
+    runtime->Store32(rdram, ctx, ADD32(GPR_U32(ctx, 1), 4294935104), GPR_U32(ctx, 5)); // MMIO: 0xbf808240
     // 0x4c: 0x3e00008  jr          $ra
     ctx->pc = 0x4Cu;
     {
@@ -156,7 +160,8 @@ void sio2man_00000054_0x54(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtim
     // 0x5c: 0x441021  addu        $v0, $v0, $a0
     SET_GPR_S32(ctx, 2, (int32_t)ADD32(GPR_U32(ctx, 2), GPR_U32(ctx, 4)));
     // 0x60: 0x8c428240  lw          $v0, -0x7DC0($v0)
-    SET_GPR_S32(ctx, 2, (int32_t)READ32(ADD32(GPR_U32(ctx, 2), 4294935104)));
+    ctx->pc = 0x60u;
+    SET_GPR_S32(ctx, 2, (int32_t)runtime->Load32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 4294935104))); // MMIO: 0xbf808240
     // 0x64: 0x3e00008  jr          $ra
     ctx->pc = 0x64u;
     {
@@ -190,7 +195,8 @@ void sio2man_0000006c_0x6c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtim
     // 0x74: 0x240821  addu        $at, $at, $a0
     SET_GPR_S32(ctx, 1, (int32_t)ADD32(GPR_U32(ctx, 1), GPR_U32(ctx, 4)));
     // 0x78: 0xac258244  sw          $a1, -0x7DBC($at)
-    WRITE32(ADD32(GPR_U32(ctx, 1), 4294935108), GPR_U32(ctx, 5));
+    ctx->pc = 0x78u;
+    runtime->Store32(rdram, ctx, ADD32(GPR_U32(ctx, 1), 4294935108), GPR_U32(ctx, 5)); // MMIO: 0xbf808244
     // 0x7c: 0x3e00008  jr          $ra
     ctx->pc = 0x7Cu;
     {
@@ -224,7 +230,8 @@ void sio2man_00000084_0x84(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtim
     // 0x8c: 0x441021  addu        $v0, $v0, $a0
     SET_GPR_S32(ctx, 2, (int32_t)ADD32(GPR_U32(ctx, 2), GPR_U32(ctx, 4)));
     // 0x90: 0x8c428244  lw          $v0, -0x7DBC($v0)
-    SET_GPR_S32(ctx, 2, (int32_t)READ32(ADD32(GPR_U32(ctx, 2), 4294935108)));
+    ctx->pc = 0x90u;
+    SET_GPR_S32(ctx, 2, (int32_t)runtime->Load32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 4294935108))); // MMIO: 0xbf808244
     // 0x94: 0x3e00008  jr          $ra
     ctx->pc = 0x94u;
     {
@@ -256,7 +263,8 @@ void sio2man_0000009c_0x9c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtim
     // 0xa0: 0x34428270  ori         $v0, $v0, 0x8270
     SET_GPR_U64(ctx, 2, GPR_U64(ctx, 2) | (uint64_t)(uint16_t)33392);
     // 0xa4: 0x8c420000  lw          $v0, 0x0($v0)
-    SET_GPR_S32(ctx, 2, (int32_t)READ32(ADD32(GPR_U32(ctx, 2), 0)));
+    ctx->pc = 0xa4u;
+    SET_GPR_S32(ctx, 2, (int32_t)runtime->Load32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 0))); // MMIO: 0xbf808270
     // 0xa8: 0x3e00008  jr          $ra
     ctx->pc = 0xA8u;
     {
@@ -290,7 +298,8 @@ void sio2man_000000b0_0xb0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtim
     // 0xb8: 0x240821  addu        $at, $at, $a0
     SET_GPR_S32(ctx, 1, (int32_t)ADD32(GPR_U32(ctx, 1), GPR_U32(ctx, 4)));
     // 0xbc: 0xac258200  sw          $a1, -0x7E00($at)
-    WRITE32(ADD32(GPR_U32(ctx, 1), 4294935040), GPR_U32(ctx, 5));
+    ctx->pc = 0xbcu;
+    runtime->Store32(rdram, ctx, ADD32(GPR_U32(ctx, 1), 4294935040), GPR_U32(ctx, 5)); // MMIO: 0xbf808200
     // 0xc0: 0x3e00008  jr          $ra
     ctx->pc = 0xC0u;
     {
@@ -324,7 +333,8 @@ void sio2man_000000c8_0xc8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtim
     // 0xd0: 0x441021  addu        $v0, $v0, $a0
     SET_GPR_S32(ctx, 2, (int32_t)ADD32(GPR_U32(ctx, 2), GPR_U32(ctx, 4)));
     // 0xd4: 0x8c428200  lw          $v0, -0x7E00($v0)
-    SET_GPR_S32(ctx, 2, (int32_t)READ32(ADD32(GPR_U32(ctx, 2), 4294935040)));
+    ctx->pc = 0xd4u;
+    SET_GPR_S32(ctx, 2, (int32_t)runtime->Load32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 4294935040))); // MMIO: 0xbf808200
     // 0xd8: 0x3e00008  jr          $ra
     ctx->pc = 0xD8u;
     {
@@ -356,7 +366,8 @@ void sio2man_000000e0_0xe0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtim
     // 0xe4: 0x34428274  ori         $v0, $v0, 0x8274
     SET_GPR_U64(ctx, 2, GPR_U64(ctx, 2) | (uint64_t)(uint16_t)33396);
     // 0xe8: 0x8c420000  lw          $v0, 0x0($v0)
-    SET_GPR_S32(ctx, 2, (int32_t)READ32(ADD32(GPR_U32(ctx, 2), 0)));
+    ctx->pc = 0xe8u;
+    SET_GPR_S32(ctx, 2, (int32_t)runtime->Load32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 0))); // MMIO: 0xbf808274
     // 0xec: 0x3e00008  jr          $ra
     ctx->pc = 0xECu;
     {
@@ -388,7 +399,8 @@ void sio2man_000000f4_0xf4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtim
     // 0xf8: 0x34428278  ori         $v0, $v0, 0x8278
     SET_GPR_U64(ctx, 2, GPR_U64(ctx, 2) | (uint64_t)(uint16_t)33400);
     // 0xfc: 0xac440000  sw          $a0, 0x0($v0)
-    WRITE32(ADD32(GPR_U32(ctx, 2), 0), GPR_U32(ctx, 4));
+    ctx->pc = 0xfcu;
+    runtime->Store32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 0), GPR_U32(ctx, 4)); // MMIO: 0xbf808278
     // 0x100: 0x3e00008  jr          $ra
     ctx->pc = 0x100u;
     {
@@ -420,7 +432,8 @@ void sio2man_00000108_0x108(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runti
     // 0x10c: 0x34428278  ori         $v0, $v0, 0x8278
     SET_GPR_U64(ctx, 2, GPR_U64(ctx, 2) | (uint64_t)(uint16_t)33400);
     // 0x110: 0x8c420000  lw          $v0, 0x0($v0)
-    SET_GPR_S32(ctx, 2, (int32_t)READ32(ADD32(GPR_U32(ctx, 2), 0)));
+    ctx->pc = 0x110u;
+    SET_GPR_S32(ctx, 2, (int32_t)runtime->Load32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 0))); // MMIO: 0xbf808278
     // 0x114: 0x3e00008  jr          $ra
     ctx->pc = 0x114u;
     {
@@ -452,7 +465,8 @@ void sio2man_0000011c_0x11c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runti
     // 0x120: 0x3442827c  ori         $v0, $v0, 0x827C
     SET_GPR_U64(ctx, 2, GPR_U64(ctx, 2) | (uint64_t)(uint16_t)33404);
     // 0x124: 0xac440000  sw          $a0, 0x0($v0)
-    WRITE32(ADD32(GPR_U32(ctx, 2), 0), GPR_U32(ctx, 4));
+    ctx->pc = 0x124u;
+    runtime->Store32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 0), GPR_U32(ctx, 4)); // MMIO: 0xbf80827c
     // 0x128: 0x3e00008  jr          $ra
     ctx->pc = 0x128u;
     {
@@ -484,7 +498,8 @@ void sio2man_00000130_0x130(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runti
     // 0x134: 0x3442827c  ori         $v0, $v0, 0x827C
     SET_GPR_U64(ctx, 2, GPR_U64(ctx, 2) | (uint64_t)(uint16_t)33404);
     // 0x138: 0x8c420000  lw          $v0, 0x0($v0)
-    SET_GPR_S32(ctx, 2, (int32_t)READ32(ADD32(GPR_U32(ctx, 2), 0)));
+    ctx->pc = 0x138u;
+    SET_GPR_S32(ctx, 2, (int32_t)runtime->Load32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 0))); // MMIO: 0xbf80827c
     // 0x13c: 0x3e00008  jr          $ra
     ctx->pc = 0x13Cu;
     {
@@ -514,7 +529,8 @@ void sio2man_00000144_0x144(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runti
     // 0x144: 0x3c01bf81  lui         $at, 0xBF81
     SET_GPR_S32(ctx, 1, (int32_t)((uint32_t)49025 << 16));
     // 0x148: 0xa0248260  sb          $a0, -0x7DA0($at)
-    WRITE8(ADD32(GPR_U32(ctx, 1), 4294935136), (uint8_t)GPR_U32(ctx, 4));
+    ctx->pc = 0x148u;
+    runtime->Store8(rdram, ctx, ADD32(GPR_U32(ctx, 1), 4294935136), (uint8_t)GPR_U32(ctx, 4)); // MMIO: 0xbf808260
     // 0x14c: 0x3e00008  jr          $ra
     ctx->pc = 0x14Cu;
     {
@@ -544,7 +560,8 @@ void sio2man_00000154_0x154(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runti
     // 0x154: 0x3c02bf81  lui         $v0, 0xBF81
     SET_GPR_S32(ctx, 2, (int32_t)((uint32_t)49025 << 16));
     // 0x158: 0x90428264  lbu         $v0, -0x7D9C($v0)
-    SET_GPR_U32(ctx, 2, (uint8_t)READ8(ADD32(GPR_U32(ctx, 2), 4294935140)));
+    ctx->pc = 0x158u;
+    SET_GPR_U32(ctx, 2, (uint8_t)runtime->Load8(rdram, ctx, ADD32(GPR_U32(ctx, 2), 4294935140))); // MMIO: 0xbf808264
     // 0x15c: 0x3e00008  jr          $ra
     ctx->pc = 0x15Cu;
     {
@@ -576,7 +593,8 @@ void sio2man_00000164_0x164(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runti
     // 0x168: 0x34428280  ori         $v0, $v0, 0x8280
     SET_GPR_U64(ctx, 2, GPR_U64(ctx, 2) | (uint64_t)(uint16_t)33408);
     // 0x16c: 0xac440000  sw          $a0, 0x0($v0)
-    WRITE32(ADD32(GPR_U32(ctx, 2), 0), GPR_U32(ctx, 4));
+    ctx->pc = 0x16cu;
+    runtime->Store32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 0), GPR_U32(ctx, 4)); // MMIO: 0xbf808280
     // 0x170: 0x3e00008  jr          $ra
     ctx->pc = 0x170u;
     {
@@ -608,7 +626,8 @@ void sio2man_00000178_0x178(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runti
     // 0x17c: 0x34428280  ori         $v0, $v0, 0x8280
     SET_GPR_U64(ctx, 2, GPR_U64(ctx, 2) | (uint64_t)(uint16_t)33408);
     // 0x180: 0x8c420000  lw          $v0, 0x0($v0)
-    SET_GPR_S32(ctx, 2, (int32_t)READ32(ADD32(GPR_U32(ctx, 2), 0)));
+    ctx->pc = 0x180u;
+    SET_GPR_S32(ctx, 2, (int32_t)runtime->Load32(rdram, ctx, ADD32(GPR_U32(ctx, 2), 0))); // MMIO: 0xbf808280
     // 0x184: 0x3e00008  jr          $ra
     ctx->pc = 0x184u;
     {
