@@ -2762,6 +2762,7 @@ void ps2x_register_libsd() __attribute__((weak));
 void ps2x_register_sdrdrv() __attribute__((weak));
 void ps2x_register_cdvdstm() __attribute__((weak));
 void ps2x_register_mcman() __attribute__((weak));
+void ps2x_register_mcserv() __attribute__((weak));
 void ps2x_register_sounds() __attribute__((weak));
 void ps2x_register_cri_adxi() __attribute__((weak));
 void ps2x_register_ds2o_d() __attribute__((weak));
@@ -2972,14 +2973,6 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
         return false;
     }
 
-    // MCMAN's native entry still stalls the game's boot (isolated to its execution); keep its HLE
-    // until that is fixed so the default build boots.
-    if (mod.name.find("MCMAN") != std::string::npos)
-    {
-        std::fprintf(stderr, "[iop-run] %s: entry stalls boot -> keeping HLE\n", mod.name.c_str());
-        return false;
-    }
-
     size_t totalSize = 0;
     uint8_t *iopBase = iopGuestSpace(totalSize);
     if (!iopBase)
@@ -3061,6 +3054,10 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
     else if (bn.find("MCMAN") != std::string::npos)
     {
         if (ps2x_register_mcman) ps2x_register_mcman();
+    }
+    else if (bn.find("MCSERV") != std::string::npos)
+    {
+        if (ps2x_register_mcserv) ps2x_register_mcserv();
     }
     else if (bn.find("SOUNDS") != std::string::npos)
     {

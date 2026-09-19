@@ -618,6 +618,8 @@ target_sources(ps2EntryRunner PRIVATE
     src/iop_native/cdvdstm/register_functions.cpp
     src/iop_native/mcman/ps2_recompiled_functions.cpp
     src/iop_native/mcman/register_functions.cpp
+    src/iop_native/mcserv/ps2_recompiled_functions.cpp
+    src/iop_native/mcserv/register_functions.cpp
     src/iop_native/sounds/ps2_recompiled_functions.cpp
     src/iop_native/sounds/register_functions.cpp
     src/iop_native/cri_adxi/ps2_recompiled_functions.cpp

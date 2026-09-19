@@ -56,15 +56,20 @@ defecto** vía DBCMAN.
 | `LIBSD` | librería (no registra RPC) |
 | `SDRDRV` | entry 0x3a0 |
 | `CDVDSTM` | entry 0x15dc |
+| `MCMAN` | memory card manager (entry 0x178) |
+| `MCSERV` | servidor de memory card (entry 0x40) |
+| `DS2U_D` | driver DualShock 2 (entry 0x0) |
+| `SOUNDS` | driver de sonido |
+| `MODHSYN` | síntesis |
+| `MODSESQ2` | secuenciador |
+
+Default: `SIO2MAN,SIO2D,DBCMAN,LIBSD,SDRDRV,CDVDSTM,MCMAN,MCSERV,SOUNDS,MODHSYN,MODSESQ2,DS2U_D`.
 
 ### Rotos / bloqueados (integrados pero NO habilitados por defecto)
 | módulo | síntoma | causa probable |
 |---|---|---|
 | `CRI_ADXI` | entry **retorna** pero el boot queda en UNKNOWN | corrompe estado (no es loop); investigar escrituras |
-| `DS2U_D` | entry **no retorna** (cuelgue) | cadena SIO2 (`sio2d`/`sio2man`) esperando hardware/IRQ SIO2 |
-| `DS2O_D`, `MODMIDI`, `MODSEIN`, `MODSESQ` | entry **no retorna** | idem (wait bloqueante de hardware/SIO2) |
-| `MCMAN` | entry con header OK corre y **traba el boot** | área memory card; necesita SIF real / SIO2 / chain ioman |
-| `MCSERV` | pendiente de integrar (misma área que MCMAN) | idem |
+| `DS2O_D`, `MODMIDI`, `MODSEIN`, `MODSESQ` | por confirmar (no se cargan en el boot, o requieren set) | medir con el set explícito |
 
 Probablemente funcionales (retornan y bootean): `SOUNDS`, `MODHSYN`, `MODSESQ2` — falta validar
 visualmente que el juego progrese a FIGHT.
