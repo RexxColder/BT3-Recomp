@@ -15,7 +15,7 @@ namespace ps2texcache
 namespace
 {
     constexpr char kMagic[8] = {'B', 'T', '3', 'T', 'E', 'X', 'C', '\0'};
-    constexpr uint32_t kVersion = 1u;
+    constexpr uint32_t kVersion = 2u;   // v2: update-on-rewrite; invalidates caches built with originals
 
     struct Entry
     {
@@ -187,7 +187,8 @@ void add(uint64_t texKey, const uint8_t *data, size_t len,
     if (!data || !len) return;
     std::lock_guard<std::mutex> lk(g_mx);
     if (!g_enabled || g_path.empty()) return;
-    if (g_map.count(texKey)) return;   // already cached
+    // Insert OR update: the async pack replacement means the first decode caches the ORIGINAL and a
+    // later re-decode (with the replacement applied) must be able to overwrite it.
     if (g_blob.size() + len > maxBytes())
     {
         static bool warned = false;

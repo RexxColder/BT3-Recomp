@@ -545,6 +545,14 @@ bool takeReadySwap(uint64_t texKey)
     return true;
 }
 
+bool replacementPending(const TexIdent &id)
+{
+    if (!replacementsEnabled() || !g_async) return false;
+    const uint64_t key = pairKey(id.tex0Hash, id.hasClut ? id.clutHash : 0ull);
+    std::lock_guard<std::mutex> lk(g_async->mtx);
+    return g_async->pending.count(key) != 0;
+}
+
 // ---------------------------------------------------------------- [texmega]
 namespace
 {
