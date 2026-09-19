@@ -2391,6 +2391,62 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
     setReturnU32(ctx, ret);
 }
 
+namespace
+{
+    // [r3000] The IOP module's recompiled function table (separate from the EE's).
+    std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> &iopFuncTable()
+    {
+        static std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> t;
+        return t;
+    }
+    std::mutex &iopTableMx()
+    {
+        static std::mutex m;
+        return m;
+    }
+}
+
+bool PS2Runtime::registerIopFunction(uint32_t address, RecompiledFunction func)
+{
+    if (!func) return false;
+    std::lock_guard<std::mutex> lk(iopTableMx());
+    iopFuncTable()[address] = func;
+    return true;
+}
+
+PS2Runtime::RecompiledFunction PS2Runtime::lookupIopFunction(uint32_t address)
+{
+    std::lock_guard<std::mutex> lk(iopTableMx());
+    auto it = iopFuncTable().find(address);
+    return it == iopFuncTable().end() ? nullptr : it->second;
+}
+
+void PS2Runtime::reportMissingIopFunction(uint32_t targetPc, uint32_t sourcePc, const char *debugName)
+{
+    static std::mutex mx;
+    static std::unordered_set<uint32_t> seen;
+    std::lock_guard<std::mutex> lk(mx);
+    if (seen.insert(targetPc).second)
+        std::fprintf(stderr, "[iop-dispatch] missing IOP function 0x%08x (from 0x%08x, %s)\n",
+                     targetPc, sourcePc, debugName ? debugName : "?");
+}
+
+bool PS2Runtime::dispatchIopBranch(uint8_t *rdram, R5900Context *ctx, uint32_t targetPc,
+                                   uint32_t sourcePc, uint32_t fallthroughPc,
+                                   GuestBranchKind kind, const char *debugName)
+{
+    (void)fallthroughPc;
+    (void)kind;
+    RecompiledFunction fn = lookupIopFunction(targetPc);
+    if (!fn)
+    {
+        reportMissingIopFunction(targetPc, sourcePc, debugName);
+        return false;
+    }
+    fn(rdram, ctx, this);
+    return true;
+}
+
 void PS2Runtime::reportMissingFunction(uint8_t *rdram,
                                        R5900Context *ctx,
                                        uint32_t targetPc,

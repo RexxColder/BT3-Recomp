@@ -528,6 +528,14 @@ public:
     void iopImport(uint8_t *rdram, R5900Context *ctx, const char *module, uint32_t ordinal);
     std::vector<uint8_t> &iopRam();   // 2 MiB IOP RAM, lazily allocated
 
+    // [r3000] IOP module dispatch: an IRX loads at vaddr 0, so its functions live in a table
+    // separate from the EE's recompiled table. Registered by the module's registration unit.
+    static bool registerIopFunction(uint32_t address, RecompiledFunction func);
+    RecompiledFunction lookupIopFunction(uint32_t address);
+    bool dispatchIopBranch(uint8_t *rdram, R5900Context *ctx, uint32_t targetPc, uint32_t sourcePc,
+                           uint32_t fallthroughPc, GuestBranchKind kind, const char *debugName);
+    void reportMissingIopFunction(uint32_t targetPc, uint32_t sourcePc, const char *debugName);
+
     static const IoPaths &getIoPaths();
     static void setIoPaths(const IoPaths &paths);
     static void configureIoPathsFromElf(const std::string &elfPath);
