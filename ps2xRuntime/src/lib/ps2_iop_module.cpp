@@ -115,6 +115,67 @@ bool loadIrx(const std::string &path, Module &out)
         }
     }
 
+    // Import/export tables live inline in .text (ps2sdk irx.h): a table starts with a magic
+    // word and is followed by stubs (import) or function pointers (export). Scan the loaded
+    // segments for the magics; this also yields the exact export function roots.
+    constexpr uint32_t kImportMagic = 0x41e00000;
+    constexpr uint32_t kExportMagic = 0x41c00000;
+    for (const auto &seg : out.segments)
+    {
+        if (seg.iopHeader || seg.data.size() < 8)
+            continue;
+        const uint8_t *p = seg.data.data();
+        const size_t n = seg.data.size();
+        for (size_t off = 0; off + 8 <= n;)
+        {
+            const uint32_t magic = rdU32(p + off);
+            if (magic != kImportMagic && magic != kExportMagic)
+            {
+                off += 4;
+                continue;
+            }
+            if (off + 20 > n)
+                break;
+            char nm[9] = {0};
+            std::memcpy(nm, p + off + 12, 8);
+            const uint16_t ver = rdU16(p + off + 8);
+            const uint16_t mode = rdU16(p + off + 10);
+            size_t q = off + 20;
+            if (magic == kImportMagic)
+            {
+                // Stubs: {u32 jump=0x03e00008, u16 ordinal, u16 pad}, terminated by 8 zero bytes.
+                while (q + 8 <= n && rdU32(p + q) != 0)
+                {
+                    Import im;
+                    im.module = nm;
+                    im.version = ver;
+                    im.mode = mode;
+                    im.stub = seg.vaddr + (uint32_t)q;
+                    im.ordinal = rdU16(p + q + 4);
+                    out.imports.push_back(std::move(im));
+                    q += 8;
+                }
+                q += 8; // skip the terminator
+            }
+            else
+            {
+                // Exports: a list of function pointers (vaddrs), terminated by 0.
+                Export ex;
+                ex.module = nm;
+                ex.version = ver;
+                ex.mode = mode;
+                while (q + 4 <= n && rdU32(p + q) != 0)
+                {
+                    ex.fptrs.push_back(seg.vaddr + rdU32(p + q));
+                    q += 4;
+                }
+                q += 4;
+                out.exports.push_back(std::move(ex));
+            }
+            off = q;
+        }
+    }
+
     return !out.segments.empty();
 }
 }

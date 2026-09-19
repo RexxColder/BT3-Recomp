@@ -29,6 +29,27 @@ namespace ps2iop
         uint8_t type = 0;      // r_info & 0xff (R_MIPS_26=4, R_MIPS_HI16=5, R_MIPS_LO16=6, R_MIPS_32=2)
     };
 
+    // An imported function: the IRX has a stub in .text that the IOP loader patches to the
+    // real address. `stub` is the stub's vaddr; (module, ordinal) identify the target.
+    struct Import
+    {
+        std::string module;              // imported-from module (e.g. "loadcore", "intrman")
+        uint16_t version = 0;            // IRX_VER(major,minor) of the table
+        uint16_t mode = 0;
+        uint32_t stub = 0;               // vaddr of the 8-byte stub in .text
+        uint16_t ordinal = 0;            // function number within `module`
+    };
+
+    // An exported function table: fptrs are vaddrs of the module's public functions (roots
+    // for function-boundary detection).
+    struct Export
+    {
+        std::string module;
+        uint16_t version = 0;
+        uint16_t mode = 0;
+        std::vector<uint32_t> fptrs;
+    };
+
     struct Module
     {
         std::string name;                // basename of the file
@@ -39,6 +60,8 @@ namespace ps2iop
         std::vector<Segment> segments;   // PT_LOAD (+ IOP header)
         uint32_t textVaddr = 0, textSize = 0;   // the main loadable segment
         std::vector<Reloc> relocs;       // .rel.text / .rel.data
+        std::vector<Import> imports;     // IMPORT_MAGIC (0x41e00000) tables
+        std::vector<Export> exports;     // EXPORT_MAGIC (0x41c00000) tables
     };
 
     bool loadIrx(const std::string &path, Module &out);
