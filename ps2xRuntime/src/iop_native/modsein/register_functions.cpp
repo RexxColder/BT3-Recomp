@@ -1,0 +1,59 @@
+#include "ps2_runtime.h"
+#include "ps2_recompiled_functions.h"
+#include "ps2_stubs.h"
+#include "ps2_recompiled_stubs.h"//this will give duplicated erros because runtime maybe has it define already, just delete the TODOS ones
+#include "ps2_syscalls.h"
+
+extern "C" void ps2x_register_modsein()
+{
+    PS2Runtime::registerIopFunction(0x0u, modsein_00000000_0x0);
+    PS2Runtime::registerIopFunction(0x1cu, modsein_00000000_0x0);
+    PS2Runtime::registerIopFunction(0x2cu, modsein_00000000_0x0);
+    PS2Runtime::registerIopFunction(0x3cu, modsein_00000000_0x0);
+    PS2Runtime::registerIopFunction(0x70u, modsein_00000070_0x70);
+    PS2Runtime::registerIopFunction(0x144u, modsein_00000070_0x70);
+    PS2Runtime::registerIopFunction(0x200u, modsein_00000200_0x200);
+    PS2Runtime::registerIopFunction(0x228u, modsein_00000228_0x228);
+    PS2Runtime::registerIopFunction(0x250u, modsein_00000250_0x250);
+    PS2Runtime::registerIopFunction(0x268u, modsein_00000250_0x250);
+    PS2Runtime::registerIopFunction(0x2dcu, modsein_00000250_0x250);
+    PS2Runtime::registerIopFunction(0x344u, modsein_00000250_0x250);
+    PS2Runtime::registerIopFunction(0x3f0u, modsein_000003f0_0x3f0);
+    PS2Runtime::registerIopFunction(0x5d0u, modsein_000003f0_0x3f0);
+    PS2Runtime::registerIopFunction(0x664u, modsein_00000664_0x664);
+    PS2Runtime::registerIopFunction(0x6fcu, modsein_00000664_0x664);
+    PS2Runtime::registerIopFunction(0x778u, modsein_00000664_0x664);
+    PS2Runtime::registerIopFunction(0x808u, modsein_00000664_0x664);
+    PS2Runtime::registerIopFunction(0x828u, modsein_00000828_0x828);
+    PS2Runtime::registerIopFunction(0x9c0u, modsein_00000828_0x828);
+    PS2Runtime::registerIopFunction(0x9e0u, modsein_000009e0_0x9e0);
+    PS2Runtime::registerIopFunction(0xb90u, modsein_000009e0_0x9e0);
+    PS2Runtime::registerIopFunction(0xbb0u, modsein_00000bb0_0xbb0);
+    PS2Runtime::registerIopFunction(0xd48u, modsein_00000bb0_0xbb0);
+    PS2Runtime::registerIopFunction(0xd68u, modsein_00000d68_0xd68);
+    PS2Runtime::registerIopFunction(0xf18u, modsein_00000d68_0xd68);
+    PS2Runtime::registerIopFunction(0xf38u, modsein_00000f38_0xf38);
+    PS2Runtime::registerIopFunction(0xfd0u, modsein_00000f38_0xf38);
+    PS2Runtime::registerIopFunction(0xff0u, modsein_00000ff0_0xff0);
+    PS2Runtime::registerIopFunction(0x1234u, modsein_00000ff0_0xff0);
+    PS2Runtime::registerIopFunction(0x1254u, modsein_00001254_0x1254);
+    PS2Runtime::registerIopFunction(0x135cu, modsein_00001254_0x1254);
+    PS2Runtime::registerIopFunction(0x13e0u, modsein_00001254_0x1254);
+    PS2Runtime::registerIopFunction(0x1534u, modsein_00001254_0x1254);
+    PS2Runtime::registerIopFunction(0x1554u, modsein_00001254_0x1254);
+    PS2Runtime::registerIopFunction(0x1584u, modsein_00001254_0x1254);
+    PS2Runtime::registerIopFunction(0x15a4u, modsein_000015a4_0x15a4);
+    PS2Runtime::registerIopFunction(0x16d8u, modsein_000015a4_0x15a4);
+    PS2Runtime::registerIopFunction(0x175cu, modsein_000015a4_0x15a4);
+    PS2Runtime::registerIopFunction(0x177cu, modsein_0000177c_0x177c);
+    PS2Runtime::registerIopFunction(0x18b0u, modsein_0000177c_0x177c);
+    PS2Runtime::registerIopFunction(0x1944u, modsein_0000177c_0x177c);
+    PS2Runtime::registerIopFunction(0x1964u, modsein_00001964_0x1964);
+    PS2Runtime::registerIopFunction(0x1ab8u, modsein_00001964_0x1964);
+    PS2Runtime::registerIopFunction(0x1b50u, modsein_00001964_0x1964);
+    PS2Runtime::registerIopFunction(0x1b70u, modsein_00001b70_0x1b70);
+    PS2Runtime::registerIopFunction(0x1cc4u, modsein_00001b70_0x1b70);
+    PS2Runtime::registerIopFunction(0x1d4cu, modsein_00001b70_0x1b70);
+    PS2Runtime::registerIopFunction(0x1df4u, modsein_00001df4_0x1df4);
+    PS2Runtime::registerIopFunction(0x1dfcu, modsein_00001dfc_0x1dfc);
+}

@@ -11,6 +11,9 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #include <dlfcn.h>
 #include <link.h>
 #include <sys/mman.h>   // [r3000] sparse IOP guest address space
+#include <csignal>
+#include <unistd.h>
+#include <execinfo.h>
 #endif
 #if defined(PS2X_HAVE_LIBUNWIND)
 #define UNW_LOCAL_ONLY
@@ -2745,6 +2748,15 @@ void ps2x_register_libsd() __attribute__((weak));
 void ps2x_register_sdrdrv() __attribute__((weak));
 void ps2x_register_cdvdstm() __attribute__((weak));
 void ps2x_register_mcman() __attribute__((weak));
+void ps2x_register_sounds() __attribute__((weak));
+void ps2x_register_cri_adxi() __attribute__((weak));
+void ps2x_register_ds2o_d() __attribute__((weak));
+void ps2x_register_ds2u_d() __attribute__((weak));
+void ps2x_register_modhsyn() __attribute__((weak));
+void ps2x_register_modmidi() __attribute__((weak));
+void ps2x_register_modsein() __attribute__((weak));
+void ps2x_register_modsesq() __attribute__((weak));
+void ps2x_register_modsesq2() __attribute__((weak));
 }
 
 bool PS2Runtime::registerIopFunction(uint32_t address, RecompiledFunction func)
@@ -3036,6 +3048,42 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
     {
         if (ps2x_register_mcman) ps2x_register_mcman();
     }
+    else if (bn.find("SOUNDS") != std::string::npos)
+    {
+        if (ps2x_register_sounds) ps2x_register_sounds();
+    }
+    else if (bn.find("CRI_ADXI") != std::string::npos)
+    {
+        if (ps2x_register_cri_adxi) ps2x_register_cri_adxi();
+    }
+    else if (bn.find("DS2O_D") != std::string::npos)
+    {
+        if (ps2x_register_ds2o_d) ps2x_register_ds2o_d();
+    }
+    else if (bn.find("DS2U_D") != std::string::npos)
+    {
+        if (ps2x_register_ds2u_d) ps2x_register_ds2u_d();
+    }
+    else if (bn.find("MODHSYN") != std::string::npos)
+    {
+        if (ps2x_register_modhsyn) ps2x_register_modhsyn();
+    }
+    else if (bn.find("MODMIDI") != std::string::npos)
+    {
+        if (ps2x_register_modmidi) ps2x_register_modmidi();
+    }
+    else if (bn.find("MODSEIN") != std::string::npos)
+    {
+        if (ps2x_register_modsein) ps2x_register_modsein();
+    }
+    else if (bn.find("MODSESQ") != std::string::npos)
+    {
+        if (ps2x_register_modsesq) ps2x_register_modsesq();
+    }
+    else if (bn.find("MODSESQ2") != std::string::npos)
+    {
+        if (ps2x_register_modsesq2) ps2x_register_modsesq2();
+    }
 
     RecompiledFunction fn = nullptr;
     {
@@ -3065,15 +3113,38 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
 
     std::fprintf(stderr, "[iop-run] %s: entry 0x%08x gp 0x%08x base 0x%x (native)\n",
                  mod.name.c_str(), mod.entry, mod.gp, base);
+    const char *wd = std::getenv("PS2X_IOP_WATCHDOG");
+    if (wd && wd[0])
+    {
+#if !defined(_WIN32)
+        std::signal(SIGALRM, [](int)
+                    {
+                        void *bt[48];
+                        const int n = backtrace(bt, 48);
+                        std::fprintf(stderr, "[iop-watchdog] IOP entry stuck; backtrace:\n");
+                        backtrace_symbols_fd(bt, n, 2);
+                        std::_Exit(99);
+                    });
+        ::alarm((unsigned)std::atoi(wd));
+#endif
+    }
     if (const char *noEntry = std::getenv("PS2X_IOP_NOENTRY");
         !(noEntry && noEntry[0] && mod.name.find(noEntry) != std::string::npos))
     {
         try { fn(iopBase + base, &ctx, this); }
         catch (const IopYield &) { /* the entry itself yielded */ }
+        catch (const std::exception &e) { std::fprintf(stderr, "[iop-run] %s entry threw: %s\n", mod.name.c_str(), e.what()); }
+        catch (...) { std::fprintf(stderr, "[iop-run] %s entry threw (unknown)\n", mod.name.c_str()); }
     }
     else
     {
         std::fprintf(stderr, "[iop-run] %s: entry skipped (PS2X_IOP_NOENTRY)\n", mod.name.c_str());
+    }
+    if (wd && wd[0])
+    {
+#if !defined(_WIN32)
+        ::alarm(0);
+#endif
     }
     // [diagnostic] Exercise the cross-module path by calling SIO2D's sio2man import stubs.
     if (const char *xt = std::getenv("PS2X_IOP_XCALL_TEST"); xt && xt[0] && bn.find("SIO2D") != std::string::npos)

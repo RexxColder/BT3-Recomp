@@ -1454,14 +1454,8 @@ namespace ps2_syscalls
         logSifModuleAction("load", moduleId, modulePath, refs);
 
         // [r3000] Recompiled IOP modules: when the game loads one, map the IRX into IOP RAM and
-        // run its entry natively instead of only faking the HLE load.
-        if (modulePath.find("SIO2MAN") != std::string::npos ||
-            modulePath.find("SIO2D") != std::string::npos ||
-            modulePath.find("DBCMAN") != std::string::npos ||
-            modulePath.find("LIBSD") != std::string::npos ||
-            modulePath.find("SDRDRV") != std::string::npos ||
-            modulePath.find("CDVDSTM") != std::string::npos ||
-            modulePath.find("MCMAN") != std::string::npos)
+        // run its entry natively. Selectable with PS2X_IOP_MODULES (comma list of stems, or "all");
+        // default is the validated set. Lets us isolate which module breaks the boot.
         {
             std::string dir = "data/IRX/";
             if (const char *d = std::getenv("PS2X_IOP_DIR"); d && d[0]) dir = d;
@@ -1470,7 +1464,23 @@ namespace ps2_syscalls
             if (slash != std::string::npos) base = base.substr(slash + 1);
             const size_t semi = base.find(';');   // ISO9660 version suffix (";1")
             if (semi != std::string::npos) base = base.substr(0, semi);
-            runtime->loadAndRunIopModule((dir + base).c_str());
+            std::string stem = base;
+            const size_t dot = stem.find('.');
+            if (dot != std::string::npos) stem = stem.substr(0, dot);
+
+            std::string set = "SIO2MAN,SIO2D,DBCMAN,LIBSD,SDRDRV,CDVDSTM,MCMAN";
+            if (const char *m = std::getenv("PS2X_IOP_MODULES"); m && m[0]) set = m;
+            bool wantNative = (set == "all");
+            for (size_t p = 0; !wantNative && p <= set.size();)
+            {
+                const size_t c = set.find(',', p);
+                if (set.substr(p, c == std::string::npos ? std::string::npos : c - p) == stem)
+                    wantNative = true;
+                if (c == std::string::npos) break;
+                p = c + 1;
+            }
+            if (wantNative)
+                runtime->loadAndRunIopModule((dir + base).c_str());
         }
 
         setReturnS32(ctx, moduleId);

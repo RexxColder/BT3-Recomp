@@ -618,6 +618,24 @@ target_sources(ps2EntryRunner PRIVATE
     src/iop_native/cdvdstm/register_functions.cpp
     src/iop_native/mcman/ps2_recompiled_functions.cpp
     src/iop_native/mcman/register_functions.cpp
+    src/iop_native/sounds/ps2_recompiled_functions.cpp
+    src/iop_native/sounds/register_functions.cpp
+    src/iop_native/cri_adxi/ps2_recompiled_functions.cpp
+    src/iop_native/cri_adxi/register_functions.cpp
+    src/iop_native/ds2o_d/ps2_recompiled_functions.cpp
+    src/iop_native/ds2o_d/register_functions.cpp
+    src/iop_native/ds2u_d/ps2_recompiled_functions.cpp
+    src/iop_native/ds2u_d/register_functions.cpp
+    src/iop_native/modhsyn/ps2_recompiled_functions.cpp
+    src/iop_native/modhsyn/register_functions.cpp
+    src/iop_native/modmidi/ps2_recompiled_functions.cpp
+    src/iop_native/modmidi/register_functions.cpp
+    src/iop_native/modsein/ps2_recompiled_functions.cpp
+    src/iop_native/modsein/register_functions.cpp
+    src/iop_native/modsesq/ps2_recompiled_functions.cpp
+    src/iop_native/modsesq/register_functions.cpp
+    src/iop_native/modsesq2/ps2_recompiled_functions.cpp
+    src/iop_native/modsesq2/register_functions.cpp
 )
 
 # The overlay's single 20MB TU and its register file must not be unity-batched
