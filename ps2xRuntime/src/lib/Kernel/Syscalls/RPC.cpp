@@ -1453,6 +1453,16 @@ namespace ps2_syscalls
         }
         logSifModuleAction("load", moduleId, modulePath, refs);
 
+        // [r3000 diag] PS2X_IOP_LOADLOG: list every module the game loads (once each).
+        if (const char *ll = std::getenv("PS2X_IOP_LOADLOG"); ll && ll[0] && ll[0] != '0')
+        {
+            static std::mutex s_mx;
+            static std::unordered_set<std::string> s_seen;
+            std::lock_guard<std::mutex> lk(s_mx);
+            if (s_seen.insert(modulePath).second)
+                std::cerr << "[iop-load] " << modulePath << std::endl;
+        }
+
         // [r3000] Recompiled IOP modules: when the game loads one, map the IRX into IOP RAM and
         // run its entry natively. Selectable with PS2X_IOP_MODULES (comma list of stems, or "all");
         // default is the validated set. Lets us isolate which module breaks the boot.
