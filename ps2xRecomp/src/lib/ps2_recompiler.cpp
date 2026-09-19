@@ -20,6 +20,7 @@
 #include <limits>
 #include <functional>
 #include <thread>
+#include <cstring>
 
 namespace fs = std::filesystem;
 
@@ -915,6 +916,46 @@ namespace ps2recomp
             m_codeGenerator->setEmitInstructionComments(true);
             m_codeGenerator->setPcStoresAll(m_config.pcStoresAll);   // [pcstores]
             m_codeGenerator->setArch(m_config.arch);                  // [r3000] R5900 (default) or R3000 (IOP)
+
+            if (m_config.arch == Arch::R3000)
+            {
+                // Scan the input's code for IRX import tables (ps2sdk irx.h) and map each stub
+                // vaddr to its (module, ordinal), so import stubs become HLE calls in the output.
+                std::unordered_map<uint32_t, IopImport> imports;
+                constexpr uint32_t kImportMagic = 0x41e00000u;
+                for (const auto &sec : m_elfParser->getSections())
+                {
+                    if (!sec.isCode || !sec.data || sec.size < 20)
+                        continue;
+                    const uint8_t *p = sec.data;
+                    for (size_t off = 0; off + 20 <= sec.size;)
+                    {
+                        uint32_t magic = 0;
+                        std::memcpy(&magic, p + off, 4);
+                        if (magic != kImportMagic) { off += 4; continue; }
+                        char nm[9] = {0};
+                        std::memcpy(nm, p + off + 12, 8);
+                        size_t q = off + 20;
+                        while (q + 8 <= sec.size)
+                        {
+                            uint32_t jump = 0;
+                            std::memcpy(&jump, p + q, 4);
+                            if (jump == 0) break;
+                            uint16_t ord = 0;
+                            std::memcpy(&ord, p + q + 4, 2);
+                            imports[sec.address + static_cast<uint32_t>(q)] = IopImport{std::string(nm), ord};
+                            q += 8;
+                        }
+                        off = q + 8;
+                    }
+                }
+                m_codeGenerator->setIopImports(imports);
+                if (!imports.empty())
+                {
+                    m_reporter.info("iop", "resolved " + std::to_string(imports.size()) +
+                                              " IRX import stub(s) to HLE calls");
+                }
+            }
 
             fs::create_directories(m_config.outputPath);
 

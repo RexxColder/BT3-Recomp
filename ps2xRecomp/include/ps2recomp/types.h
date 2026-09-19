@@ -173,6 +173,13 @@ namespace ps2recomp
         R3000,
     };
 
+    // [r3000] An IRX import: the (module, ordinal) a .text import stub resolves to.
+    struct IopImport
+    {
+        std::string module;
+        uint16_t ordinal = 0;
+    };
+
     // Recompiler configuration
     struct RecompilerConfig
     {

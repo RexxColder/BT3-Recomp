@@ -110,6 +110,11 @@ def build_map(path):
     for _name, fptrs in exports:
         starts.update(f for f in fptrs if sec["vaddr"] <= f < code_end)
     starts.update(t for t in _jal_targets(code, sec["vaddr"]) if sec["vaddr"] <= t < code_end)
+    # Import stubs are leaf functions (jr ra / li v0,ordinal); keep them as explicit 8-byte
+    # functions so the recompiler emits an HLE call for each instead of a no-op body.
+    for _m, stub, _o in imports:
+        if stub >= sec["vaddr"]:
+            starts.add(stub)
     starts = sorted(starts)
 
     rows = []

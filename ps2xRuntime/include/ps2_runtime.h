@@ -522,6 +522,10 @@ public:
     MissingFunctionPolicy missingFunctionPolicy() const;
     void resetMissingFunctionReportOnce();
 
+    // [r3000] An IRX import stub resolved to a kernel/SIF call. `module`/`ordinal` identify the
+    // target; on return the handler result must land in v0 (ctx->r[2]), matching the IOP ABI.
+    void iopImport(R5900Context *ctx, const char *module, uint32_t ordinal);
+
     static const IoPaths &getIoPaths();
     static void setIoPaths(const IoPaths &paths);
     static void configureIoPathsFromElf(const std::string &elfPath);

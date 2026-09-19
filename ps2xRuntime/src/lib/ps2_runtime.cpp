@@ -2307,6 +2307,22 @@ void PS2Runtime::resetMissingFunctionReportOnce()
     m_missingFunctionReported.store(false, std::memory_order_release);
 }
 
+// [r3000] IRX import stub -> kernel/SIF HLE. Logs each distinct (module, ordinal) once; the
+// handler's result must be left in v0. The kernel dispatch is filled in progressively.
+void PS2Runtime::iopImport(R5900Context *ctx, const char *module, uint32_t ordinal)
+{
+    static std::mutex s_mx;
+    static std::unordered_set<std::string> s_seen;
+    {
+        std::lock_guard<std::mutex> lk(s_mx);
+        std::string key = std::string(module ? module : "?") + "#" + std::to_string(ordinal);
+        if (s_seen.insert(key).second)
+            std::fprintf(stderr, "[iop-import] %s\n", key.c_str());
+    }
+    if (ctx)
+        setReturnU32(ctx, 0);   // TODO: dispatch to the kernel/SIF HLE handler
+}
+
 void PS2Runtime::reportMissingFunction(uint8_t *rdram,
                                        R5900Context *ctx,
                                        uint32_t targetPc,

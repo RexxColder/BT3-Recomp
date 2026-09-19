@@ -58,6 +58,10 @@ namespace ps2recomp
         void setArch(Arch a) { m_arch = a; }
         Arch arch() const { return m_arch; }
 
+        // [r3000] Import stubs (stub vaddr -> module/ordinal) resolved to HLE calls.
+        void setIopImports(const std::unordered_map<uint32_t, IopImport> &m) { m_importStubs = m; }
+        const std::unordered_map<uint32_t, IopImport> &iopImports() const { return m_importStubs; }
+
         AnalysisResult collectInternalBranchTargets(const Function &function,
                                                   const std::vector<Instruction> &instructions,
                                                   const std::vector<Function> *allFunctions = nullptr);
@@ -75,6 +79,7 @@ namespace ps2recomp
         bool m_pcStoresAll = false;   // [pcstores] see RecompilerConfig::pcStoresAll
         void setPcStoresAll(bool v) { m_pcStoresAll = v; }
         Arch m_arch = Arch::R5900;    // [r3000] guest architecture
+        std::unordered_map<uint32_t, IopImport> m_importStubs;   // [r3000] stub vaddr -> import
         std::string m_currentFunctionName;
 
         std::string translateInstruction(const Instruction &inst);
