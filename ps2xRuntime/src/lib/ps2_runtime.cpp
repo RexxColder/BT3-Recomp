@@ -19,6 +19,7 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #include "ps2_host_window.h"   // [B] native window handle (SDL returns SDL_Window*, not the HWND)
 #include "runtime/ps2_texreplace.h"   // [texreplace]
 #include "runtime/ps2_texcache.h"     // [texcache]
+#include "runtime/ps2_coverage.h"     // [coverage]
 #include "runtime/ps2_toml.h"         // [texcache] settings.toml
 #include "runtime/ps2_video_status.h"   // [video] the Video-tab status the overlay polls
 #include "runtime/ps2_toml.h"   // [winmode] startup read of [video] window_mode / monitor
@@ -1641,6 +1642,7 @@ bool PS2Runtime::initialize(const char *title)
             // extracted ISO tree; the folder is created if absent.)
             ps2tex::replacementsEnabled();
         }
+        ps2cov::init();   // [coverage] PS2X_COVERAGE: capture interpreter fallbacks
         {   // [texcache] Persistent write-back texture cache: configure + load at startup. Filled by
             // the write-back hook in putTexture (the FINAL payload: decode + pack replacement).
             const char *xd = ps2xExeDirC();
