@@ -2954,6 +2954,26 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
         }
         // 18 format -> 0
     }
+    else if (mod == "cdvdman")
+    {
+        if (ordinal == 12)   // sceCdGetDiskType -> DVD-ROM
+            ret = 0x14u;
+        else if (ordinal == 24)   // sceCdReadClock(sceCdCLOCK*) -> fill a fixed date, success
+        {
+            if (ram && a0 && static_cast<uint64_t>(a0) + 8 <= ramSize)
+            {
+                const uint8_t clk[8] = {0, 0, 0, 12, 1, 1, 0x06, 0x20};   // 2020-01-01 12:00:00
+                std::memcpy(ram + a0, clk, 8);
+            }
+            ret = 1;
+        }
+        else   // sceCdSync/Break/Nop/StStop/StRead/... -> success
+            ret = 1;
+    }
+    else if (mod == "modload")
+    {
+        ret = 0;   // SetCheckKelfPathCallback / LoadModule* -> 0
+    }
 
     setReturnU32(ctx, ret);
 }
