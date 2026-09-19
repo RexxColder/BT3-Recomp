@@ -2432,7 +2432,7 @@ namespace
     }
 
     // [r3000] ioman device registry: AddDrv(name, device) -> devices; open() -> fd.
-    struct IopDevice { uint32_t ops = 0; uint32_t moduleId = 0; };
+    struct IopDevice { uint32_t ops = 0; uint32_t moduleId = 0; uint32_t base = 0; uint32_t gp = 0; uint32_t devPtr = 0; };
     std::unordered_map<std::string, IopDevice> &iomanDevices()
     {
         static std::unordered_map<std::string, IopDevice> m;
@@ -2794,6 +2794,9 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
             IopDevice d;
             d.ops = rdU32(a0 + 16);
             d.moduleId = g_iopCurModule;
+            d.base = g_iopCurBase;
+            d.gp = g_iopCurGp;
+            d.devPtr = a0;
             std::lock_guard<std::mutex> lk(iopTableMx());
             iomanDevices()[name] = d;
             std::fprintf(stderr, "[iop-ioman] AddDrv '%s' ops=0x%08x\n", name.c_str(), d.ops);
@@ -2805,7 +2808,74 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
             iomanDevices().erase(cstr(a0));
             ret = 0;
         }
-        else if (ordinal == 4 || ordinal == 13)   // open/dopen(name, mode) -> fd
+        else if (ordinal == 4)    // open(name, mode): route to the device's ops->open
+        {
+            const std::string path = cstr(a0);
+            const size_t colon = path.find(':');
+            const std::string prefix = colon == std::string::npos ? path : path.substr(0, colon);
+            IopDevice dev;
+            bool found = false;
+            {
+                std::lock_guard<std::mutex> lk(iopTableMx());
+                for (const auto &kv : iomanDevices())
+                    if (prefix.rfind(kv.first, 0) == 0 || kv.first.rfind(prefix, 0) == 0)
+                    { dev = kv.second; found = true; break; }
+            }
+            if (found && dev.ops && iopBase)
+            {
+                const uint32_t f = 0x1A0000u;   // iop_file_t scratch
+                wrU32(f + 0, a1);          // mode
+                wrU32(f + 4, 0);           // unit
+                wrU32(f + 8, dev.devPtr);  // device
+                wrU32(f + 12, 0);          // privdata
+                const uint32_t openFn = rdU32(dev.ops + 12);
+                uint32_t r = 0;
+                if (openFn)
+                {
+                    PS2Runtime::RecompiledFunction fn = nullptr;
+                    uint32_t savedMod = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(iopTableMx());
+                        savedMod = g_iopCurModule;
+                        g_iopCurModule = dev.moduleId;
+                        g_iopCurGp = dev.gp;
+                        g_iopCurBase = dev.base;
+                        auto mit = iopTables().find(dev.moduleId);
+                        if (mit != iopTables().end())
+                        {
+                            auto it = mit->second.find(openFn);
+                            if (it != mit->second.end()) fn = it->second;
+                        }
+                    }
+                    const uint32_t savedGp = getRegU32(ctx, 28);
+                    ctx->r[28] = _mm_cvtsi32_si128(dev.gp);
+                    ctx->r[4] = _mm_cvtsi32_si128(f);
+                    ctx->r[5] = _mm_cvtsi32_si128(a0);
+                    ctx->r[6] = _mm_cvtsi32_si128(a1);
+                    if (fn) { try { fn(iopBase + dev.base, ctx, this); } catch (...) {} r = getRegU32(ctx, 2); }
+                    ctx->r[28] = _mm_cvtsi32_si128(savedGp);
+                    std::lock_guard<std::mutex> lk(iopTableMx());
+                    g_iopCurModule = savedMod;
+                }
+                if (r == 0)
+                {
+                    const int fd = iomanNextFd().fetch_add(1);
+                    iomanFds()[fd] = path;
+                    ret = static_cast<uint32_t>(fd);
+                }
+                else
+                {
+                    ret = r;
+                }
+            }
+            else
+            {
+                const int fd = iomanNextFd().fetch_add(1);
+                iomanFds()[fd] = path;
+                ret = static_cast<uint32_t>(fd);
+            }
+        }
+        else if (ordinal == 13)   // dopen(name, mode) -> fd
         {
             const int fd = iomanNextFd().fetch_add(1);
             iomanFds()[fd] = cstr(a0);
