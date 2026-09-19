@@ -17,6 +17,7 @@ namespace
     size_t g_max = 200000;
     std::unordered_set<uint64_t> g_seenEe;
     std::unordered_set<uint64_t> g_seenVu[2];
+    std::unordered_set<std::string> g_seenIop;
 
     void closeFile()
     {
@@ -62,5 +63,14 @@ void noteVuProgram(int unit, uint64_t hash, uint32_t extent)
     if (!g_seenVu[unit].insert(hash).second) return;
     std::fprintf(g_f, "%s\t%016llx\t%u\n", unit == 1 ? "vu1" : "vu0",
                  (unsigned long long)hash, extent);
+}
+
+void noteIopModule(const char *module, uint32_t rpcNum)
+{
+    if (!g_on || !module || !module[0]) return;
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (g_seenIop.size() >= g_max) return;
+    if (!g_seenIop.insert(module).second) return;
+    std::fprintf(g_f, "iop\t%s\t%u\n", module, rpcNum);
 }
 }
