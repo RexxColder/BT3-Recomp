@@ -2946,6 +2946,14 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
         return false;
     }
 
+    // MCMAN's native entry still stalls the game's boot (isolated to its execution); keep its HLE
+    // until that is fixed so the default build boots.
+    if (mod.name.find("MCMAN") != std::string::npos)
+    {
+        std::fprintf(stderr, "[iop-run] %s: entry stalls boot -> keeping HLE\n", mod.name.c_str());
+        return false;
+    }
+
     size_t totalSize = 0;
     uint8_t *iopBase = iopGuestSpace(totalSize);
     if (!iopBase)
