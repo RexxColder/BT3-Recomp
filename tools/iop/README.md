@@ -104,3 +104,19 @@ ROMDRV EESYNC SYSCLIB STDIO`. Nuestro **kernel HLE** cubre los del kernel
 
 Hoy esas llamadas devuelven 0 (el juego igual bootea y llega a FIGHT). Para fidelidad plena
 (M C, CD, timers, vblank) hay que HLE'arlos o recompilar los residentes de IOPRP.
+
+### Confirmación por ordinal
+Casi todos los imports de `ioman`/`cdvdman`/`modload`/`fileio`/… son **entre módulos de
+IOPRP** (CDVDFSV↔CDVDMAN↔FILEIO↔…), no del juego. Los módulos **del juego** usan:
+
+| game module | import | ordinal | semántica | valor "sano" |
+|---|---|---|---|---|
+| `MCMAN`,`CDVDSTM` | `ioman` | 20/21 | `AddDrv`/`DelDrv` | **0** (éxito) |
+| `MCMAN`,`SIO2D` | `secrman` | 4/5/6 | Set handlers / `SecrAuthCard` | **0** (ok) |
+| `MCMAN` | `modload` | 13 | module load | 0 |
+| `MCMAN` | `cdvdman` | 24 | CD | 0 |
+| `SOUNDS` | `timrman` | 4/6/20/22/23/24 | timers | id/0 |
+| `CRI_ADXI`,`SIO2D` | `vblank` | 4/5 | Wait* | 0 |
+
+El default (0 para lo no manejado) **ya coincide** con esos valores de éxito, por eso el boot no
+se rompe. Sólo `timrman#4` (AllocHardTimer) devuelve un id nuevo.
