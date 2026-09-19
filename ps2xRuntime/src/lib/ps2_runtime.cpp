@@ -2437,9 +2437,9 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
     static std::unordered_set<std::string> s_seen;
     {
         std::lock_guard<std::mutex> lk(s_mx);
-        std::string key = mod + "#" + std::to_string(ordinal);
+        std::string key = std::to_string(g_iopCurModule) + ":" + mod + "#" + std::to_string(ordinal);
         if (s_seen.insert(key).second)
-            std::fprintf(stderr, "[iop-import] %s\n", key.c_str());
+            std::fprintf(stderr, "[iop-import] mod%u %s#%u\n", g_iopCurModule, mod.c_str(), ordinal);
     }
 
     auto rdU32 = [&](uint32_t addr) -> uint32_t {
