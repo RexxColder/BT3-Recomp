@@ -22,13 +22,23 @@ namespace ps2iop
         std::vector<uint8_t> data;       // filesz bytes from the image
     };
 
+    struct Reloc
+    {
+        uint32_t offset = 0;   // r_offset
+        uint32_t symbol = 0;   // r_info >> 8
+        uint8_t type = 0;      // r_info & 0xff (R_MIPS_26=4, R_MIPS_HI16=5, R_MIPS_LO16=6, R_MIPS_32=2)
+    };
+
     struct Module
     {
         std::string name;                // basename of the file
-        std::string moduleName;          // name from the IOP header, if present
-        uint32_t entry = 0;
+        std::string moduleName;          // name from the IOP header (34-byte .iopmod)
+        uint32_t entry = 0;              // IOP header entry (== e_entry)
+        uint32_t gp = 0;                 // IOP header global pointer
+        uint32_t hdrText = 0, hdrData = 0, hdrBss = 0;   // IOP header sizes
         std::vector<Segment> segments;   // PT_LOAD (+ IOP header)
         uint32_t textVaddr = 0, textSize = 0;   // the main loadable segment
+        std::vector<Reloc> relocs;       // .rel.text / .rel.data
     };
 
     bool loadIrx(const std::string &path, Module &out);

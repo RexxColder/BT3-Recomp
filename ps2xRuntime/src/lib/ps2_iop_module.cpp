@@ -63,9 +63,19 @@ bool loadIrx(const std::string &path, Module &out)
         if (pOffset + pFilesz <= d.size())
             s.data.assign(d.begin() + pOffset, d.begin() + pOffset + pFilesz);
 
-        // NOTE: the IOP header segment (p_type 0x70000080) carries the module metadata, but its
-        // layout is not a leading ASCII name; decode it when the R3000 runtime needs it. For now
-        // moduleName stays empty and the loader exposes only segments + entry.
+        // IOP module header (p_type 0x70000080): u32 total, entry, gp, text, data, bss,
+        // version(u16), name[8]. 34 bytes.
+        if (s.iopHeader && s.data.size() >= 34)
+        {
+            out.entry = rdU32(s.data.data() + 4);
+            out.gp = rdU32(s.data.data() + 8);
+            out.hdrText = rdU32(s.data.data() + 12);
+            out.hdrData = rdU32(s.data.data() + 16);
+            out.hdrBss = rdU32(s.data.data() + 20);
+            char nm[9] = {0};
+            std::memcpy(nm, s.data.data() + 26, 8);
+            out.moduleName.assign(nm);
+        }
 
         // The main loadable segment (largest filesz) is the code+data image.
         if (pType == PT_LOAD && pFilesz > bestFilesz)
@@ -76,6 +86,35 @@ bool loadIrx(const std::string &path, Module &out)
         }
         out.segments.push_back(std::move(s));
     }
+
+    // Section headers: collect SHT_REL (.rel.text / .rel.data). Each entry is Elf32_Rel:
+    // r_offset(u32) + r_info(u32), with r_sym = info >> 8 and r_type = info & 0xff.
+    const uint32_t shoff = rdU32(d.data() + 32);
+    const uint16_t shentsize = rdU16(d.data() + 46);
+    const uint16_t shnum = rdU16(d.data() + 48);
+    for (uint16_t i = 0; shoff && i < shnum; ++i)
+    {
+        const size_t off = shoff + (size_t)i * shentsize;
+        if (off + 40 > d.size()) break;
+        const uint32_t shType = rdU32(d.data() + off + 4);
+        const uint32_t shOffset = rdU32(d.data() + off + 16);
+        const uint32_t shSize = rdU32(d.data() + off + 20);
+        const uint32_t shEntsize = rdU32(d.data() + off + 36);
+        if (shType != 9) continue;   // SHT_REL
+        const uint32_t es = shEntsize ? shEntsize : 8;
+        for (uint32_t k = 0; k + 8 <= shSize; k += es)
+        {
+            const size_t e = (size_t)shOffset + k;
+            if (e + 8 > d.size()) break;
+            Reloc r;
+            r.offset = rdU32(d.data() + e);
+            const uint32_t info = rdU32(d.data() + e + 4);
+            r.symbol = info >> 8;
+            r.type = (uint8_t)(info & 0xff);
+            out.relocs.push_back(r);
+        }
+    }
+
     return !out.segments.empty();
 }
 }
