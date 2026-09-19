@@ -2679,6 +2679,7 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
 extern "C" {
 void ps2x_register_sio2man() __attribute__((weak));
 void ps2x_register_sio2d() __attribute__((weak));
+void ps2x_register_dbcman() __attribute__((weak));
 }
 
 bool PS2Runtime::registerIopFunction(uint32_t address, RecompiledFunction func)
@@ -2834,6 +2835,10 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
     else if (bn.find("SIO2D") != std::string::npos)
     {
         if (ps2x_register_sio2d) ps2x_register_sio2d();
+    }
+    else if (bn.find("DBCMAN") != std::string::npos)
+    {
+        if (ps2x_register_dbcman) ps2x_register_dbcman();
     }
 
     RecompiledFunction fn = nullptr;
