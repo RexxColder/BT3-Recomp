@@ -54,6 +54,10 @@ namespace ps2recomp
         void setEmitInstructionComments(bool emitInstructionComments);
         void setReporter(RecompilerReporter *reporter);
 
+        // [r3000] Guest architecture: R5900 (PS2 EE, default) or R3000 (IOP / IRX, MIPS I subset).
+        void setArch(Arch a) { m_arch = a; }
+        Arch arch() const { return m_arch; }
+
         AnalysisResult collectInternalBranchTargets(const Function &function,
                                                   const std::vector<Instruction> &instructions,
                                                   const std::vector<Function> *allFunctions = nullptr);
@@ -70,6 +74,7 @@ namespace ps2recomp
         RecompilerReporter *m_reporter = nullptr;
         bool m_pcStoresAll = false;   // [pcstores] see RecompilerConfig::pcStoresAll
         void setPcStoresAll(bool v) { m_pcStoresAll = v; }
+        Arch m_arch = Arch::R5900;    // [r3000] guest architecture
         std::string m_currentFunctionName;
 
         std::string translateInstruction(const Instruction &inst);

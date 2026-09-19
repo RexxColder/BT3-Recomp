@@ -166,9 +166,17 @@ namespace ps2recomp
         std::string calleeName;
     };
 
+    // Guest architecture. R5900 = PS2 EE (default); R3000 = PS2 IOP / IRX modules (MIPS I).
+    enum class Arch
+    {
+        R5900,
+        R3000,
+    };
+
     // Recompiler configuration
     struct RecompilerConfig
     {
+        Arch arch = Arch::R5900;   // [r3000] general.arch = "r3000" for IOP modules
         std::string inputPath;
         std::string outputPath;
         std::string ghidraMapPath;

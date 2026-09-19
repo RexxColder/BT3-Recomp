@@ -914,6 +914,7 @@ namespace ps2recomp
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
             m_codeGenerator->setEmitInstructionComments(true);
             m_codeGenerator->setPcStoresAll(m_config.pcStoresAll);   // [pcstores]
+            m_codeGenerator->setArch(m_config.arch);                  // [r3000] R5900 (default) or R3000 (IOP)
 
             fs::create_directories(m_config.outputPath);
 

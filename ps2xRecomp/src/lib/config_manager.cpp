@@ -65,6 +65,11 @@ namespace ps2recomp
             config.patchCop0 = toml::find_or<bool>(general, "patch_cop0", config.patchCop0);
             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);
             config.pcStoresAll = toml::find_or<bool>(general, "pc_stores_all", config.pcStoresAll);   // [pcstores]
+            {   // [r3000] general.arch = "r3000" | "iop" selects the IOP (MIPS I) backend.
+                const std::string archStr = toml::find_or<std::string>(general, "arch", "r5900");
+                config.arch = (archStr == "r3000" || archStr == "R3000" || archStr == "iop" || archStr == "IOP")
+                                  ? Arch::R3000 : Arch::R5900;
+            }
 
             if (general.contains("stubs") && general.at("stubs").is_array())
             {
