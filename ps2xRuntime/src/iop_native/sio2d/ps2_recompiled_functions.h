@@ -16,6 +16,7 @@ void sio2d_000007b4_0x7b4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime
 void sio2d_00000834_0x834(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2d_00000978_0x978(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2d_00000a1c_0xa1c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
+void sio2d_00000ae4_0xae4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2d_00000e14_0xe14(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2d_00000e7c_0xe7c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2d_0000108c_0x108c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);

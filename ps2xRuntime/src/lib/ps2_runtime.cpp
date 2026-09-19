@@ -2398,6 +2398,19 @@ namespace
     uint32_t g_iopCurThread = 0;
     uint32_t g_iopCurGp = 0;
     uint32_t g_iopCurBase = 0;
+
+    // [r3000] SIF RPC servers registered by native modules (sifcmd sceSifRegisterRpc).
+    struct IopSifRpc
+    {
+        uint32_t handler = 0;    // native function address in the module
+        uint32_t server = 0;     // sceSifRpcData_t* (opaque)
+        uint32_t moduleId = 0;   // owning IOP module
+    };
+    std::unordered_map<uint32_t, IopSifRpc> &sifRpcServers()
+    {
+        static std::unordered_map<uint32_t, IopSifRpc> m;
+        return m;
+    }
 }
 static void runIopScheduler(PS2Runtime *rt, uint8_t *iopBase);
 
@@ -2559,6 +2572,8 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
             t.id = id; t.entry = entry; t.gp = g_iopCurGp; t.base = g_iopCurBase;
             t.moduleId = g_iopCurModule; t.priority = static_cast<int>(prio);
             iopThreads()[id] = t;
+            std::fprintf(stderr, "[iop-thread] create id=%u entry=0x%08x gp=0x%08x mod=%u\n",
+                         id, entry, g_iopCurGp, g_iopCurModule);
             ret = id;
         }
         else if (ordinal == 5) iopThreads().erase(a0);              // DeleteThread
@@ -2574,6 +2589,7 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
                 t.ctx.r[28] = _mm_cvtsi32_si128(t.gp);
                 t.ctx.r[4] = _mm_cvtsi32_si128(a1);
                 t.status = 1;
+                std::fprintf(stderr, "[iop-thread] start id=%u entry=0x%08x arg=0x%x\n", a0, t.entry, a1);
             }
         }
         else if (ordinal == 8) throw IopYield{1};                   // ExitThread
@@ -2670,6 +2686,48 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
         else if (ordinal == 7) wrU32(a1, 0u);                              // DisableIntr(irq, res*)
         // EnableIntr / CpuSuspendIntr / CpuResumeIntr -> 0
     }
+    else if (mod == "sifman")
+    {
+        if (ordinal == 7 || ordinal == 32)   // sceSifSetDma / sceSifSetDmaIntr (immediate transfer)
+        {
+            const uint32_t count = (uint32_t)(int32_t)a1;
+            for (uint32_t k = 0; ram && k < count; ++k)
+            {
+                const uint32_t e = a0 + k * 16u;   // SifDmaTransfer_t {src,dest,size,attr}
+                const uint32_t src = rdU32(e), dst = rdU32(e + 4);
+                const int32_t sz = (int32_t)rdU32(e + 8);
+                if (sz > 0 && src && dst && static_cast<uint64_t>(src) + sz <= ramSize &&
+                    static_cast<uint64_t>(dst) + sz <= ramSize)
+                    std::memmove(ram + dst, ram + src, (size_t)sz);
+            }
+            ret = 1;                             // transfer id (completed immediately)
+        }
+        else if (ordinal == 8) ret = 0;          // sceSifDmaStat -> done
+        else if (ordinal == 29) ret = 1;         // sceSifCheckInit -> initialized
+        // 5 sceSifInit -> 0
+    }
+    else if (mod == "sifcmd")
+    {
+        if (ordinal == 17)                       // sceSifRegisterRpc(server, sid, handler, buf, size, ...)
+        {
+            IopSifRpc r;
+            r.server = a0; r.handler = a2; r.moduleId = g_iopCurModule;
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            sifRpcServers()[a1] = r;
+            std::fprintf(stderr, "[iop-sif] RegisterRpc sid=0x%08x handler=0x%08x\n", a1, a2);
+        }
+        else if (ordinal == 19)                  // sceSifSetRpcQueue(queue, thid)
+        {
+            std::fprintf(stderr, "[iop-sif] SetRpcQueue queue=0x%08x thid=%u\n", a0, a1);
+        }
+        else if (ordinal == 22)                  // sceSifRpcLoop(queue) -> park waiting for requests
+        {
+            IopThreadState &t = iopThreads()[g_iopCurThread];
+            t.status = 3; t.waitKind = 5; t.waitId = a0;
+            throw IopYield{0};
+        }
+        // 14 sceSifInitRpc -> 0
+    }
 
     setReturnU32(ctx, ret);
 }
@@ -2721,6 +2779,7 @@ static void runIopScheduler(PS2Runtime *rt, uint8_t *iopBase)
         g_iopCurBase = t.base;
         PS2Runtime::RecompiledFunction fn = rt->lookupIopFunction(t.ctx.pc);
         if (!fn) { t.status = 4; continue; }
+        std::fprintf(stderr, "[iop-sched] run tid=%u pc=0x%08x mod=%u\n", t.id, t.ctx.pc, t.moduleId);
         try
         {
             fn(iopBase + t.base, &t.ctx, rt);
@@ -2734,8 +2793,13 @@ static void runIopScheduler(PS2Runtime *rt, uint8_t *iopBase)
             }
             else
             {
-                if (t.status == 2) t.status = 1;   // plain yield: runnable again
-                else t.ctx.pc = getRegU32(&t.ctx, 31);   // park: resume at the return address
+                if (t.status == 2) { t.status = 1; }
+                else
+                {
+                    std::fprintf(stderr, "[iop-sched] park tid=%u wait=%d/0x%x ra=0x%08x\n",
+                                 t.id, t.waitKind, t.waitId, getRegU32(&t.ctx, 31));
+                    t.ctx.pc = getRegU32(&t.ctx, 31);   // resume at the return address
+                }
             }
         }
         catch (...) { t.status = 4; }

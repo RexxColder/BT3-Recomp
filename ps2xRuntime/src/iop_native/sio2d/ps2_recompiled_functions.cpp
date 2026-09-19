@@ -2394,7 +2394,7 @@ label_a08:
 
 
 // Function: sio2d_00000a1c
-// Address: 0xa1c - 0xe14
+// Address: 0xa1c - 0xae4
 void sio2d_00000a1c_0xa1c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
     PS_LOG_ENTRY("sio2d_00000a1c_0xa1c");
@@ -2404,22 +2404,11 @@ void sio2d_00000a1c_0xa1c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime
         case 0xa78u: goto label_a78;
         case 0xa9cu: goto label_a9c;
         case 0xabcu: goto label_abc;
-        case 0xaf8u: goto label_af8;
-        case 0xb10u: goto label_b10;
-        case 0xb20u: goto label_b20;
-        case 0xca8u: goto label_ca8;
-        case 0xce4u: goto label_ce4;
-        case 0xd14u: goto label_d14;
-        case 0xd3cu: goto label_d3c;
-        case 0xd74u: goto label_d74;
-        case 0xda0u: goto label_da0;
-        case 0xdf0u: goto label_df0;
         default: break;
     }
 
     ctx->pc = 0xa1cu;
 
-label_a1c:
     // 0xa1c: 0x27bdffb8  addiu       $sp, $sp, -0x48
     SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967224));
     // 0xa20: 0xafbf0044  sw          $ra, 0x44($sp)
@@ -2551,6 +2540,32 @@ label_ad0:
         #endif
     }
     ctx->pc = 0xAE4u;
+}
+
+
+// Function: sio2d_00000ae4
+// Address: 0xae4 - 0xe14
+void sio2d_00000ae4_0xae4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+#ifdef PS2_FUNCTION_LOG_TRACKER
+    PS_LOG_ENTRY("sio2d_00000ae4_0xae4");
+#endif
+
+    switch (ctx->pc) {
+        case 0xaf8u: goto label_af8;
+        case 0xb10u: goto label_b10;
+        case 0xb20u: goto label_b20;
+        case 0xca8u: goto label_ca8;
+        case 0xce4u: goto label_ce4;
+        case 0xd14u: goto label_d14;
+        case 0xd3cu: goto label_d3c;
+        case 0xd74u: goto label_d74;
+        case 0xda0u: goto label_da0;
+        case 0xdf0u: goto label_df0;
+        default: break;
+    }
+
+    ctx->pc = 0xae4u;
+
     // 0xae4: 0x27bdffb8  addiu       $sp, $sp, -0x48
     SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967224));
     // 0xae8: 0xafbf0044  sw          $ra, 0x44($sp)
@@ -3050,7 +3065,9 @@ label_d4c:
     ctx->pc = 0xD6Cu;
     SET_GPR_U32(ctx, 31, 0xD74u);
     ctx->pc = 0xA1Cu;
-    goto label_a1c;
+    if (!runtime->dispatchIopBranch(rdram, ctx, 0xA1Cu, 0xD6Cu, 0xD74u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
+        return;
+    }
     ctx->pc = 0xD74u;
 label_d74:
     // 0xd74: 0xafc20010  sw          $v0, 0x10($fp)

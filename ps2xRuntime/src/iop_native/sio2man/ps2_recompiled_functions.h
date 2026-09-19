@@ -30,6 +30,8 @@ void sio2man_000001ac_0x1ac(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runti
 void sio2man_000001d4_0x1d4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2man_000002fc_0x2fc(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2man_00000324_0x324(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
+void sio2man_0000039c_0x39c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
+void sio2man_00000584_0x584(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2man_000005c0_0x5c0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2man_000005ec_0x5ec(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void sio2man_00000634_0x634(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);

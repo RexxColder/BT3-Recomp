@@ -745,7 +745,7 @@ label_268:
 
 
 // Function: dbcman_00000280
-// Address: 0x280 - 0x31c
+// Address: 0x280 - 0x2f4
 void dbcman_00000280_0x280(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
     PS_LOG_ENTRY("dbcman_00000280_0x280");
@@ -756,7 +756,6 @@ void dbcman_00000280_0x280(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtim
         case 0x2a8u: goto label_2a8;
         case 0x2c8u: goto label_2c8;
         case 0x2d0u: goto label_2d0;
-        case 0x30cu: goto label_30c;
         default: break;
     }
 
@@ -873,6 +872,23 @@ label_2e4:
         #endif
     }
     ctx->pc = 0x2F4u;
+}
+
+
+// Function: dbcman_000002f4
+// Address: 0x2f4 - 0x31c
+void dbcman_000002f4_0x2f4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+#ifdef PS2_FUNCTION_LOG_TRACKER
+    PS_LOG_ENTRY("dbcman_000002f4_0x2f4");
+#endif
+
+    switch (ctx->pc) {
+        case 0x30cu: goto label_30c;
+        default: break;
+    }
+
+    ctx->pc = 0x2f4u;
+
     // 0x2f4: 0x3c040000  lui         $a0, 0x0
     SET_GPR_S32(ctx, 4, (int32_t)((uint32_t)0 << 16));
     // 0x2f8: 0x8c842770  lw          $a0, 0x2770($a0)
@@ -7766,7 +7782,7 @@ label_1b1c:
 
 
 // Function: dbcman_00001b34
-// Address: 0x1b34 - 0x1c28
+// Address: 0x1b34 - 0x1b70
 void dbcman_00001b34_0x1b34(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
     PS_LOG_ENTRY("dbcman_00001b34_0x1b34");
@@ -7774,10 +7790,6 @@ void dbcman_00001b34_0x1b34(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runti
 
     switch (ctx->pc) {
         case 0x1b58u: goto label_1b58;
-        case 0x1ba0u: goto label_1ba0;
-        case 0x1bb8u: goto label_1bb8;
-        case 0x1bfcu: goto label_1bfc;
-        case 0x1c14u: goto label_1c14;
         default: break;
     }
 
@@ -7832,6 +7844,24 @@ label_1b58:
         #endif
     }
     ctx->pc = 0x1B70u;
+}
+
+
+// Function: dbcman_00001b70
+// Address: 0x1b70 - 0x1bcc
+void dbcman_00001b70_0x1b70(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+#ifdef PS2_FUNCTION_LOG_TRACKER
+    PS_LOG_ENTRY("dbcman_00001b70_0x1b70");
+#endif
+
+    switch (ctx->pc) {
+        case 0x1ba0u: goto label_1ba0;
+        case 0x1bb8u: goto label_1bb8;
+        default: break;
+    }
+
+    ctx->pc = 0x1b70u;
+
     // 0x1b70: 0x27bdffe8  addiu       $sp, $sp, -0x18
     SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967272));
     // 0x1b74: 0xafb00010  sw          $s0, 0x10($sp)
@@ -7916,6 +7946,24 @@ label_1bb8:
         #endif
     }
     ctx->pc = 0x1BCCu;
+}
+
+
+// Function: dbcman_00001bcc
+// Address: 0x1bcc - 0x1c28
+void dbcman_00001bcc_0x1bcc(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+#ifdef PS2_FUNCTION_LOG_TRACKER
+    PS_LOG_ENTRY("dbcman_00001bcc_0x1bcc");
+#endif
+
+    switch (ctx->pc) {
+        case 0x1bfcu: goto label_1bfc;
+        case 0x1c14u: goto label_1c14;
+        default: break;
+    }
+
+    ctx->pc = 0x1bccu;
+
     // 0x1bcc: 0x27bdffe8  addiu       $sp, $sp, -0x18
     SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967272));
     // 0x1bd0: 0xafb00010  sw          $s0, 0x10($sp)
@@ -8064,7 +8112,7 @@ label_1c44:
 
 
 // Function: dbcman_00001c5c
-// Address: 0x1c5c - 0x1f98
+// Address: 0x1c5c - 0x1c88
 void dbcman_00001c5c_0x1c5c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
     PS_LOG_ENTRY("dbcman_00001c5c_0x1c5c");
@@ -8072,48 +8120,11 @@ void dbcman_00001c5c_0x1c5c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runti
 
     switch (ctx->pc) {
         case 0x1c70u: goto label_1c70;
-        case 0x1cd0u: goto label_1cd0;
-        case 0x1ce0u: goto label_1ce0;
-        case 0x1cf0u: goto label_1cf0;
-        case 0x1d00u: goto label_1d00;
-        case 0x1d10u: goto label_1d10;
-        case 0x1d20u: goto label_1d20;
-        case 0x1d30u: goto label_1d30;
-        case 0x1d40u: goto label_1d40;
-        case 0x1d50u: goto label_1d50;
-        case 0x1d60u: goto label_1d60;
-        case 0x1d70u: goto label_1d70;
-        case 0x1d80u: goto label_1d80;
-        case 0x1da4u: goto label_1da4;
-        case 0x1db8u: goto label_1db8;
-        case 0x1dc0u: goto label_1dc0;
-        case 0x1dc8u: goto label_1dc8;
-        case 0x1dd0u: goto label_1dd0;
-        case 0x1de4u: goto label_1de4;
-        case 0x1e14u: goto label_1e14;
-        case 0x1e1cu: goto label_1e1c;
-        case 0x1e3cu: goto label_1e3c;
-        case 0x1e50u: goto label_1e50;
-        case 0x1e58u: goto label_1e58;
-        case 0x1e60u: goto label_1e60;
-        case 0x1e68u: goto label_1e68;
-        case 0x1e7cu: goto label_1e7c;
-        case 0x1eacu: goto label_1eac;
-        case 0x1eb4u: goto label_1eb4;
-        case 0x1edcu: goto label_1edc;
-        case 0x1ef0u: goto label_1ef0;
-        case 0x1ef8u: goto label_1ef8;
-        case 0x1f00u: goto label_1f00;
-        case 0x1f08u: goto label_1f08;
-        case 0x1f28u: goto label_1f28;
-        case 0x1f7cu: goto label_1f7c;
-        case 0x1f84u: goto label_1f84;
         default: break;
     }
 
     ctx->pc = 0x1c5cu;
 
-label_1c5c:
     // 0x1c5c: 0x27bdffe8  addiu       $sp, $sp, -0x18
     SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967272));
     // 0x1c60: 0xafb00010  sw          $s0, 0x10($sp)
@@ -8155,6 +8166,34 @@ label_1c70:
         #endif
     }
     ctx->pc = 0x1C88u;
+}
+
+
+// Function: dbcman_00001c88
+// Address: 0x1c88 - 0x1d94
+void dbcman_00001c88_0x1c88(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+#ifdef PS2_FUNCTION_LOG_TRACKER
+    PS_LOG_ENTRY("dbcman_00001c88_0x1c88");
+#endif
+
+    switch (ctx->pc) {
+        case 0x1cd0u: goto label_1cd0;
+        case 0x1ce0u: goto label_1ce0;
+        case 0x1cf0u: goto label_1cf0;
+        case 0x1d00u: goto label_1d00;
+        case 0x1d10u: goto label_1d10;
+        case 0x1d20u: goto label_1d20;
+        case 0x1d30u: goto label_1d30;
+        case 0x1d40u: goto label_1d40;
+        case 0x1d50u: goto label_1d50;
+        case 0x1d60u: goto label_1d60;
+        case 0x1d70u: goto label_1d70;
+        case 0x1d80u: goto label_1d80;
+        default: break;
+    }
+
+    ctx->pc = 0x1c88u;
+
     // 0x1c88: 0x27bdffe8  addiu       $sp, $sp, -0x18
     SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967272));
     // 0x1c8c: 0xafb00010  sw          $s0, 0x10($sp)
@@ -8414,7 +8453,9 @@ label_1d68:
     // 0x1d6c: 0x2002821  addu        $a1, $s0, $zero (Delay Slot)
     SET_GPR_S32(ctx, 5, (int32_t)ADD32(GPR_U32(ctx, 16), GPR_U32(ctx, 0)));
     ctx->pc = 0x1C5Cu;
-    goto label_1c5c;
+    if (!runtime->dispatchIopBranch(rdram, ctx, 0x1C5Cu, 0x1D68u, 0x1D70u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
+        return;
+    }
     ctx->pc = 0x1D70u;
 label_1d70:
     // 0x1d70: 0x8000761  j           func_001D84
@@ -8459,6 +8500,30 @@ label_1d84:
         #endif
     }
     ctx->pc = 0x1D94u;
+}
+
+
+// Function: dbcman_00001d94
+// Address: 0x1d94 - 0x1e2c
+void dbcman_00001d94_0x1d94(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+#ifdef PS2_FUNCTION_LOG_TRACKER
+    PS_LOG_ENTRY("dbcman_00001d94_0x1d94");
+#endif
+
+    switch (ctx->pc) {
+        case 0x1da4u: goto label_1da4;
+        case 0x1db8u: goto label_1db8;
+        case 0x1dc0u: goto label_1dc0;
+        case 0x1dc8u: goto label_1dc8;
+        case 0x1dd0u: goto label_1dd0;
+        case 0x1de4u: goto label_1de4;
+        case 0x1e14u: goto label_1e14;
+        case 0x1e1cu: goto label_1e1c;
+        default: break;
+    }
+
+    ctx->pc = 0x1d94u;
+
     // 0x1d94: 0x27bdffd8  addiu       $sp, $sp, -0x28
     SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967256));
     // 0x1d98: 0xafbf0024  sw          $ra, 0x24($sp)
@@ -8605,6 +8670,30 @@ label_1e1c:
         #endif
     }
     ctx->pc = 0x1E2Cu;
+}
+
+
+// Function: dbcman_00001e2c
+// Address: 0x1e2c - 0x1ec4
+void dbcman_00001e2c_0x1e2c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+#ifdef PS2_FUNCTION_LOG_TRACKER
+    PS_LOG_ENTRY("dbcman_00001e2c_0x1e2c");
+#endif
+
+    switch (ctx->pc) {
+        case 0x1e3cu: goto label_1e3c;
+        case 0x1e50u: goto label_1e50;
+        case 0x1e58u: goto label_1e58;
+        case 0x1e60u: goto label_1e60;
+        case 0x1e68u: goto label_1e68;
+        case 0x1e7cu: goto label_1e7c;
+        case 0x1eacu: goto label_1eac;
+        case 0x1eb4u: goto label_1eb4;
+        default: break;
+    }
+
+    ctx->pc = 0x1e2cu;
+
     // 0x1e2c: 0x27bdffd8  addiu       $sp, $sp, -0x28
     SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967256));
     // 0x1e30: 0xafbf0024  sw          $ra, 0x24($sp)
@@ -8751,6 +8840,30 @@ label_1eb4:
         #endif
     }
     ctx->pc = 0x1EC4u;
+}
+
+
+// Function: dbcman_00001ec4
+// Address: 0x1ec4 - 0x1f98
+void dbcman_00001ec4_0x1ec4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+#ifdef PS2_FUNCTION_LOG_TRACKER
+    PS_LOG_ENTRY("dbcman_00001ec4_0x1ec4");
+#endif
+
+    switch (ctx->pc) {
+        case 0x1edcu: goto label_1edc;
+        case 0x1ef0u: goto label_1ef0;
+        case 0x1ef8u: goto label_1ef8;
+        case 0x1f00u: goto label_1f00;
+        case 0x1f08u: goto label_1f08;
+        case 0x1f28u: goto label_1f28;
+        case 0x1f7cu: goto label_1f7c;
+        case 0x1f84u: goto label_1f84;
+        default: break;
+    }
+
+    ctx->pc = 0x1ec4u;
+
     // 0x1ec4: 0x27bdffd0  addiu       $sp, $sp, -0x30
     SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967248));
     // 0x1ec8: 0xafb10024  sw          $s1, 0x24($sp)

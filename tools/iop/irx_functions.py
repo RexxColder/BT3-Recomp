@@ -103,6 +103,31 @@ def _jal_targets(code, base):
     return seeds
 
 
+def _ptr_targets(code, base, code_end):
+    """Function pointers built with lui + ori/addiu (thread entries, callbacks), which are
+    data references, not JALs, so branch analysis misses them."""
+    lui = {}
+    targets = set()
+    for i in range(0, len(code) - 3, 4):
+        w = struct.unpack_from("<I", code, i)[0]
+        op = w >> 26
+        rs = (w >> 21) & 31
+        rt = (w >> 16) & 31
+        imm = w & 0xFFFF
+        if op == 0x0F:  # lui rt, imm
+            lui[rt] = imm << 16
+        elif op == 0x0D and rs in lui:  # ori rt, rs, imm
+            v = (lui[rs] | imm) & 0xFFFFFFFF
+            if base + 0x100 <= v < code_end and (v & 3) == 0:
+                targets.add(v)
+        elif op == 0x09 and rs in lui:  # addiu rt, rs, imm (sign-extended)
+            si = imm - 0x10000 if (imm & 0x8000) else imm
+            v = (lui[rs] + si) & 0xFFFFFFFF
+            if base + 0x100 <= v < code_end and (v & 3) == 0:
+                targets.add(v)
+    return targets
+
+
 def build_map(path):
     data = open(path, "rb").read()
     # Per-module function-name prefix so several IRX modules can coexist in one binary.
@@ -120,6 +145,7 @@ def build_map(path):
     for _name, fptrs in exports:
         starts.update(f for f in fptrs if sec["vaddr"] <= f < code_end)
     starts.update(t for t in _jal_targets(code, sec["vaddr"]) if sec["vaddr"] <= t < code_end)
+    starts.update(_ptr_targets(code, sec["vaddr"], code_end))
     # Import stubs are leaf functions (jr ra / li v0,ordinal); keep them as explicit 8-byte
     # functions so the recompiler emits an HLE call for each instead of a no-op body.
     for _m, stub, _o in imports:

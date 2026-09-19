@@ -1101,7 +1101,7 @@ label_314:
 
 
 // Function: sio2man_00000324
-// Address: 0x324 - 0x5c0
+// Address: 0x324 - 0x39c
 void sio2man_00000324_0x324(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
 #ifdef PS2_FUNCTION_LOG_TRACKER
     PS_LOG_ENTRY("sio2man_00000324_0x324");
@@ -1113,38 +1113,11 @@ void sio2man_00000324_0x324(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runti
         case 0x34cu: goto label_34c;
         case 0x35cu: goto label_35c;
         case 0x364u: goto label_364;
-        case 0x3b4u: goto label_3b4;
-        case 0x3c4u: goto label_3c4;
-        case 0x3e8u: goto label_3e8;
-        case 0x404u: goto label_404;
-        case 0x414u: goto label_414;
-        case 0x41cu: goto label_41c;
-        case 0x428u: goto label_428;
-        case 0x444u: goto label_444;
-        case 0x464u: goto label_464;
-        case 0x484u: goto label_484;
-        case 0x4a4u: goto label_4a4;
-        case 0x4c8u: goto label_4c8;
-        case 0x4dcu: goto label_4dc;
-        case 0x4e4u: goto label_4e4;
-        case 0x4ecu: goto label_4ec;
-        case 0x500u: goto label_500;
-        case 0x520u: goto label_520;
-        case 0x528u: goto label_528;
-        case 0x534u: goto label_534;
-        case 0x53cu: goto label_53c;
-        case 0x550u: goto label_550;
-        case 0x55cu: goto label_55c;
-        case 0x568u: goto label_568;
-        case 0x598u: goto label_598;
-        case 0x5a0u: goto label_5a0;
-        case 0x5acu: goto label_5ac;
         default: break;
     }
 
     ctx->pc = 0x324u;
 
-label_324:
     // 0x324: 0x27bdffe0  addiu       $sp, $sp, -0x20
     SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967264));
     // 0x328: 0xafb10014  sw          $s1, 0x14($sp)
@@ -1262,6 +1235,45 @@ label_388:
         #endif
     }
     ctx->pc = 0x39Cu;
+}
+
+
+// Function: sio2man_0000039c
+// Address: 0x39c - 0x584
+void sio2man_0000039c_0x39c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+#ifdef PS2_FUNCTION_LOG_TRACKER
+    PS_LOG_ENTRY("sio2man_0000039c_0x39c");
+#endif
+
+    switch (ctx->pc) {
+        case 0x3b4u: goto label_3b4;
+        case 0x3c4u: goto label_3c4;
+        case 0x3e8u: goto label_3e8;
+        case 0x404u: goto label_404;
+        case 0x414u: goto label_414;
+        case 0x41cu: goto label_41c;
+        case 0x428u: goto label_428;
+        case 0x444u: goto label_444;
+        case 0x464u: goto label_464;
+        case 0x484u: goto label_484;
+        case 0x4a4u: goto label_4a4;
+        case 0x4c8u: goto label_4c8;
+        case 0x4dcu: goto label_4dc;
+        case 0x4e4u: goto label_4e4;
+        case 0x4ecu: goto label_4ec;
+        case 0x500u: goto label_500;
+        case 0x520u: goto label_520;
+        case 0x528u: goto label_528;
+        case 0x534u: goto label_534;
+        case 0x53cu: goto label_53c;
+        case 0x550u: goto label_550;
+        case 0x55cu: goto label_55c;
+        case 0x568u: goto label_568;
+        default: break;
+    }
+
+    ctx->pc = 0x39cu;
+
     // 0x39c: 0x27bdffc0  addiu       $sp, $sp, -0x40
     SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967232));
     // 0x3a0: 0xafb00038  sw          $s0, 0x38($sp)
@@ -1706,7 +1718,9 @@ label_55c:
     ctx->pc = 0x560u;
     SET_GPR_U32(ctx, 31, 0x568u);
     ctx->pc = 0x324u;
-    goto label_324;
+    if (!runtime->dispatchIopBranch(rdram, ctx, 0x324u, 0x560u, 0x568u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
+        return;
+    }
     ctx->pc = 0x568u;
 label_568:
     // 0x568: 0x8e040000  lw          $a0, 0x0($s0)
@@ -1742,6 +1756,25 @@ label_574:
         #endif
     }
     ctx->pc = 0x584u;
+}
+
+
+// Function: sio2man_00000584
+// Address: 0x584 - 0x5c0
+void sio2man_00000584_0x584(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+#ifdef PS2_FUNCTION_LOG_TRACKER
+    PS_LOG_ENTRY("sio2man_00000584_0x584");
+#endif
+
+    switch (ctx->pc) {
+        case 0x598u: goto label_598;
+        case 0x5a0u: goto label_5a0;
+        case 0x5acu: goto label_5ac;
+        default: break;
+    }
+
+    ctx->pc = 0x584u;
+
     // 0x584: 0x27bdffe8  addiu       $sp, $sp, -0x18
     SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967272));
     // 0x588: 0xafb00010  sw          $s0, 0x10($sp)

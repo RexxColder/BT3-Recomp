@@ -13,6 +13,7 @@ void dbcman_00000158_0x158(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtim
 void dbcman_00000188_0x188(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void dbcman_000001bc_0x1bc(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void dbcman_00000280_0x280(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
+void dbcman_000002f4_0x2f4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void dbcman_0000031c_0x31c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void dbcman_00000428_0x428(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void dbcman_0000054c_0x54c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
@@ -69,8 +70,14 @@ void dbcman_00001a7c_0x1a7c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runti
 void dbcman_00001aac_0x1aac(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void dbcman_00001af8_0x1af8(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void dbcman_00001b34_0x1b34(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
+void dbcman_00001b70_0x1b70(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
+void dbcman_00001bcc_0x1bcc(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void dbcman_00001c28_0x1c28(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void dbcman_00001c5c_0x1c5c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
+void dbcman_00001c88_0x1c88(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
+void dbcman_00001d94_0x1d94(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
+void dbcman_00001e2c_0x1e2c(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
+void dbcman_00001ec4_0x1ec4(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void dbcman_00001f98_0x1f98(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void dbcman_00002124_0x2124(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
 void dbcman_00002148_0x2148(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);
