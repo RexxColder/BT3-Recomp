@@ -31,6 +31,7 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #include "runtime/ps2_gs_pgs.h"   // [pgs]
 #include <iomanip>
 #include <cstdlib>
+#include <array>
 #if !defined(_WIN32)
 #include <execinfo.h> // glibc backtrace for the bad-jump diagnostic
 #endif
@@ -2363,6 +2364,25 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
             std::fprintf(stderr, "[iop-import] %s\n", key.c_str());
     }
 
+    auto rdU32 = [&](uint32_t addr) -> uint32_t {
+        uint32_t v = 0;
+        if (ram && static_cast<uint64_t>(addr) + 4 <= ramSize) std::memcpy(&v, ram + addr, 4);
+        return v;
+    };
+    auto wrU32 = [&](uint32_t addr, uint32_t v) {
+        if (ram && static_cast<uint64_t>(addr) + 4 <= ramSize) std::memcpy(ram + addr, &v, 4);
+    };
+
+    // [r3000] Kernel object state (single-threaded best-effort model).
+    static std::mutex s_kernMx;
+    static std::unordered_map<int, std::array<uint32_t, 4>> s_threads;   // id -> {entry,prio,status,stack}
+    static std::unordered_map<int, std::pair<int, int>> s_semas;          // sem -> {count,max}
+    static std::unordered_map<int, uint32_t> s_events;                    // ef -> bits
+    static std::unordered_map<int, std::pair<uint32_t, uint32_t>> s_intrs; // irq -> {handler,arg}
+    static int s_nextTid = 1, s_nextEf = 1, s_nextSema = 1, s_curTid = 0;
+    static uint32_t s_ctypeAddr = 0;
+    std::lock_guard<std::mutex> klock(s_kernMx);
+
     if (mod == "loadcore")
     {
         ret = 0;   // RegisterLibraryEntries / FlushIcache / FlushDcache
@@ -2379,9 +2399,33 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
             const std::string x = cstr(a0), y = cstr(a1);
             ret = (uint32_t)(int32_t)std::strncmp(x.c_str(), y.c_str(), a2);
         }
-        else if (ordinal == 8 || ordinal == 36)   // look_ctype_table / strtol
+        else if (ordinal == 36)   // strtol(s, endptr, base)
         {
-            ret = 0;   // TODO: valid ctype table / full strtol
+            const std::string s = cstr(a0);
+            char *end = nullptr;
+            const long v = std::strtol(s.c_str(), &end, a2 ? (int)a2 : 10);
+            if (a1 && ram && static_cast<uint64_t>(a1) + 4 <= ramSize)
+            {
+                const uint32_t off = (uint32_t)(end - s.c_str()) + a0;
+                std::memcpy(ram + a1, &off, 4);
+            }
+            ret = (uint32_t)v;
+        }
+        else if (ordinal == 8)   // look_ctype_table -> pointer to a 256-byte table in IOP RAM
+        {
+            if (!s_ctypeAddr && ram)
+            {
+                s_ctypeAddr = 0x100000u;   // unused IOP RAM above the module image
+                for (int i = 0; i < 256; ++i)
+                {
+                    uint8_t f = 0;
+                    if (i >= '0' && i <= '9') f = 0x04;              // _C_DIGIT
+                    else if ((i >= 'a' && i <= 'z') || (i >= 'A' && i <= 'Z')) f = 0x03;  // _C_ALPHA
+                    else if (i == ' ' || (i >= 9 && i <= 13)) f = 0x01;  // _C_SPACE
+                    ram[s_ctypeAddr + i] = f;
+                }
+            }
+            ret = s_ctypeAddr;
         }
     }
     else if (mod == "dmacman")
@@ -2390,27 +2434,66 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
     }
     else if (mod == "thbase")
     {
-        static std::atomic<int> s_nextTid{1};
-        if (ordinal == 4) ret = (uint32_t)s_nextTid.fetch_add(1);   // CreateThread
-        else if (ordinal == 20) ret = 1;                            // GetThreadId
-        // StartThread(6) etc. -> 0
+        if (ordinal == 4)   // CreateThread(iop_thread_t*)
+        {
+            const uint32_t entry = rdU32(a0 + 8), stackSize = rdU32(a0 + 12), prio = rdU32(a0 + 16);
+            const int id = s_nextTid++;
+            s_threads[id] = {entry, prio, 0u /*dormant*/, stackSize};
+            if (!s_curTid) s_curTid = id;
+            ret = (uint32_t)id;
+        }
+        else if (ordinal == 5) s_threads.erase((int)a0);            // DeleteThread
+        else if (ordinal == 6 && s_threads.count((int)a0))          // StartThread -> ready
+            s_threads[(int)a0][2] = 0x02u;
+        else if (ordinal == 20) ret = (uint32_t)(s_curTid ? s_curTid : 1);   // GetThreadId
+        else if (ordinal == 22) { wrU32(a1 + 0, 0u); wrU32(a1 + 4, 2u); }     // ReferThreadStatus (THS_RUN)
     }
     else if (mod == "thevent")
     {
-        static std::atomic<int> s_nextEf{1};
-        if (ordinal == 4) ret = (uint32_t)s_nextEf.fetch_add(1);   // CreateEventFlag
-        else if (ordinal == 10 && a3 && ram && (uint64_t)a3 + 4 <= ramSize)   // WaitEventFlag resbits
+        if (ordinal == 4)   // CreateEventFlag(iop_event_t*)
         {
-            const uint32_t bits = ~0u;
-            std::memcpy(ram + a3, &bits, 4);
+            const int id = s_nextEf++;
+            s_events[id] = rdU32(a0 + 8);
+            ret = (uint32_t)id;
         }
+        else if (ordinal == 5) s_events.erase((int)a0);                    // DeleteEventFlag
+        else if (ordinal == 6 || ordinal == 7)                             // Set / iSet
+            s_events[(int)a0] |= a1;
+        else if (ordinal == 8 || ordinal == 9)                             // Clear / iClear
+            s_events[(int)a0] &= ~a1;
+        else if (ordinal == 10 || ordinal == 11)                           // Wait / Poll
+            wrU32(a3, s_events[(int)a0]);
+        else if (ordinal == 13) { wrU32(a1 + 0, 0u); wrU32(a1 + 12, s_events[(int)a0]); }
     }
     else if (mod == "thsemap")
     {
-        static std::atomic<int> s_nextSema{1};
-        if (ordinal == 4) ret = (uint32_t)s_nextSema.fetch_add(1);  // CreateSema
+        if (ordinal == 4)   // CreateSema(iop_sema_t*)
+        {
+            const int init = (int)rdU32(a0 + 8), max = (int)rdU32(a0 + 12);
+            const int id = s_nextSema++;
+            s_semas[id] = {init, max};
+            ret = (uint32_t)id;
+        }
+        else if (ordinal == 5) s_semas.erase((int)a0);                     // DeleteSema
+        else if (ordinal == 6)                                             // SignalSema
+        {
+            auto it = s_semas.find((int)a0);
+            if (it != s_semas.end() && it->second.first < it->second.second) it->second.first++;
+        }
+        else if (ordinal == 8)                                             // WaitSema
+        {
+            auto it = s_semas.find((int)a0);
+            if (it != s_semas.end() && it->second.first > 0) it->second.first--;
+        }
+        else if (ordinal == 11) { wrU32(a1 + 0, 0u); wrU32(a1 + 12, (uint32_t)s_semas[(int)a0].first); }
     }
-    // intrman (RegisterIntrHandler/EnableIntr/...), stdio others, etc. -> 0
+    else if (mod == "intrman")
+    {
+        if (ordinal == 4) s_intrs[(int)a0] = {a2, a3};                     // RegisterIntrHandler
+        else if (ordinal == 5) s_intrs.erase((int)a0);                     // ReleaseIntrHandler
+        else if (ordinal == 7) wrU32(a1, 0u);                              // DisableIntr(irq, res*)
+        // EnableIntr / CpuSuspendIntr / CpuResumeIntr -> 0
+    }
 
     setReturnU32(ctx, ret);
 }
