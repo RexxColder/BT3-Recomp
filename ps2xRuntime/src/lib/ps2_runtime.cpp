@@ -20,6 +20,7 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #include "runtime/ps2_texreplace.h"   // [texreplace]
 #include "runtime/ps2_texcache.h"     // [texcache]
 #include "runtime/ps2_coverage.h"     // [coverage]
+#include "runtime/ps2_iop_module.h"   // [r3000] IRX loader
 #include "runtime/ps2_toml.h"         // [texcache] settings.toml
 #include "runtime/ps2_video_status.h"   // [video] the Video-tab status the overlay polls
 #include "runtime/ps2_toml.h"   // [winmode] startup read of [video] window_mode / monitor
@@ -2444,6 +2445,50 @@ bool PS2Runtime::dispatchIopBranch(uint8_t *rdram, R5900Context *ctx, uint32_t t
         return false;
     }
     fn(rdram, ctx, this);
+    return true;
+}
+
+// [r3000] Map an IRX into IOP RAM, set up the R3000 context and call its entry natively.
+bool PS2Runtime::loadAndRunIopModule(const char *path)
+{
+    if (!path || !path[0])
+        return false;
+    ps2iop::Module mod;
+    if (!ps2iop::loadIrx(path, mod))
+    {
+        std::fprintf(stderr, "[iop-run] cannot load IRX: %s\n", path);
+        return false;
+    }
+
+    auto &ram = iopRam();
+    std::fill(ram.begin(), ram.end(), 0u);
+    for (const auto &seg : mod.segments)
+    {
+        if (seg.iopHeader || seg.data.empty())
+            continue;
+        if (static_cast<uint64_t>(seg.vaddr) + seg.data.size() > ram.size())
+            continue;
+        std::memcpy(ram.data() + seg.vaddr, seg.data.data(), seg.data.size());
+    }
+
+    R5900Context ctx{};
+    ctx.pc = mod.entry;
+    ctx.r[29] = _mm_cvtsi32_si128(0x1F0000u);   // sp (top of IOP RAM, below scratchpad)
+    ctx.r[28] = _mm_cvtsi32_si128(mod.gp);      // gp
+    ctx.r[4] = _mm_cvtsi32_si128(0u);           // a0
+
+    RecompiledFunction fn = lookupIopFunction(mod.entry);
+    if (!fn)
+    {
+        std::fprintf(stderr, "[iop-run] %s: no recompiled function at entry 0x%08x\n",
+                     mod.name.c_str(), mod.entry);
+        return false;
+    }
+
+    std::fprintf(stderr, "[iop-run] %s: entry 0x%08x gp 0x%08x (native)\n",
+                 mod.name.c_str(), mod.entry, mod.gp);
+    fn(ram.data(), &ctx, this);
+    std::fprintf(stderr, "[iop-run] %s: entry returned\n", mod.name.c_str());
     return true;
 }
 
