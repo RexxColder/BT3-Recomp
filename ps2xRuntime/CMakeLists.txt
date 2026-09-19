@@ -505,6 +505,7 @@ src/lib/ui_sdl.cpp          # [C] ImGui platform glue on SDL2 (replaces rlImGui)
     src/lib/ps2_texreplace.cpp   # [texreplace] PCSX2-compatible texture identity
     src/lib/ps2_texcache.cpp     # [texcache] persistent write-back texture cache
     src/lib/ps2_coverage.cpp     # [coverage] interpreter-fallback capture for the orchestrator
+    src/lib/ps2_iop_module.cpp   # [iop] IRX (IOP module) loader
     src/lib/ps2_fmv_override.cpp # [fmvoverride] inject a user 4K video as the opening FMV
     src/lib/ps2_netplay.cpp      # [netplay] deterministic lockstep transport
     src/lib/ps2_iop.cpp
