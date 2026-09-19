@@ -2430,6 +2430,24 @@ namespace
         static std::unordered_map<uint32_t, IopSifRpc> m;
         return m;
     }
+
+    // [r3000] ioman device registry: AddDrv(name, device) -> devices; open() -> fd.
+    struct IopDevice { uint32_t ops = 0; uint32_t moduleId = 0; };
+    std::unordered_map<std::string, IopDevice> &iomanDevices()
+    {
+        static std::unordered_map<std::string, IopDevice> m;
+        return m;
+    }
+    std::unordered_map<int, std::string> &iomanFds()
+    {
+        static std::unordered_map<int, std::string> m;
+        return m;
+    }
+    std::atomic<int> &iomanNextFd()
+    {
+        static std::atomic<int> n{3};
+        return n;
+    }
 }
 static void runIopScheduler(PS2Runtime *rt, uint8_t *iopBase);
 
@@ -2767,6 +2785,38 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
             ret = 0;
         else
             ret = 0;
+    }
+    else if (mod == "ioman")
+    {
+        if (ordinal == 20)   // AddDrv(iop_device_t*): name@0, ops@16
+        {
+            const std::string name = cstr(rdU32(a0));
+            IopDevice d;
+            d.ops = rdU32(a0 + 16);
+            d.moduleId = g_iopCurModule;
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            iomanDevices()[name] = d;
+            std::fprintf(stderr, "[iop-ioman] AddDrv '%s' ops=0x%08x\n", name.c_str(), d.ops);
+            ret = 0;
+        }
+        else if (ordinal == 21)   // DelDrv(const char*)
+        {
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            iomanDevices().erase(cstr(a0));
+            ret = 0;
+        }
+        else if (ordinal == 4 || ordinal == 13)   // open/dopen(name, mode) -> fd
+        {
+            const int fd = iomanNextFd().fetch_add(1);
+            iomanFds()[fd] = cstr(a0);
+            ret = static_cast<uint32_t>(fd);
+        }
+        else if (ordinal == 5 || ordinal == 14)   // close/dclose(fd)
+        {
+            iomanFds().erase(static_cast<int>(a0));
+            ret = 0;
+        }
+        // read/write/lseek/ioctl/remove/mkdir/rmdir/dread/getstat/chstat/format -> 0
     }
 
     setReturnU32(ctx, ret);
