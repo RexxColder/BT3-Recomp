@@ -2375,7 +2375,31 @@ namespace
     uint32_t g_iopCurModule = 0;   // module currently executing
     uint32_t g_iopNextId = 1;
     uint32_t g_iopNextBase = 0;
+
+    // [r3000] IOP threads (cooperative). A blocking kernel call throws IopYield to unwind back to
+    // the scheduler; resuming re-enters the owning module's function at the saved pc (the
+    // recompiler emits `switch (ctx->pc)` resume labels for that).
+    struct IopYield { int kind; };   // 0 = yield/park, 1 = exit
+    struct IopThreadState
+    {
+        uint32_t id = 0, entry = 0, gp = 0, base = 0, moduleId = 0;
+        R5900Context ctx{};
+        int status = 0;              // 0 dormant, 1 runnable, 2 running, 3 waiting, 4 done
+        int priority = 0;
+        uint32_t waitId = 0;         // sema/event id it waits on
+        int waitKind = 0;            // 3 = sema, 4 = event flag, 1 = delay/sleep
+    };
+    std::unordered_map<uint32_t, IopThreadState> &iopThreads()
+    {
+        static std::unordered_map<uint32_t, IopThreadState> t;
+        return t;
+    }
+    uint32_t g_iopNextThread = 1;
+    uint32_t g_iopCurThread = 0;
+    uint32_t g_iopCurGp = 0;
+    uint32_t g_iopCurBase = 0;
 }
+static void runIopScheduler(PS2Runtime *rt, uint8_t *iopBase);
 
 void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module, uint32_t ordinal)
 {
@@ -2529,17 +2553,38 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
     {
         if (ordinal == 4)   // CreateThread(iop_thread_t*)
         {
-            const uint32_t entry = rdU32(a0 + 8), stackSize = rdU32(a0 + 12), prio = rdU32(a0 + 16);
-            const int id = s_nextTid++;
-            s_threads[id] = {entry, prio, 0u /*dormant*/, stackSize};
-            if (!s_curTid) s_curTid = id;
-            ret = (uint32_t)id;
+            const uint32_t entry = rdU32(a0 + 8), prio = rdU32(a0 + 16);
+            const uint32_t id = g_iopNextThread++;
+            IopThreadState t;
+            t.id = id; t.entry = entry; t.gp = g_iopCurGp; t.base = g_iopCurBase;
+            t.moduleId = g_iopCurModule; t.priority = static_cast<int>(prio);
+            iopThreads()[id] = t;
+            ret = id;
         }
-        else if (ordinal == 5) s_threads.erase((int)a0);            // DeleteThread
-        else if (ordinal == 6 && s_threads.count((int)a0))          // StartThread -> ready
-            s_threads[(int)a0][2] = 0x02u;
-        else if (ordinal == 20) ret = (uint32_t)(s_curTid ? s_curTid : 1);   // GetThreadId
-        else if (ordinal == 22) { wrU32(a1 + 0, 0u); wrU32(a1 + 4, 2u); }     // ReferThreadStatus (THS_RUN)
+        else if (ordinal == 5) iopThreads().erase(a0);              // DeleteThread
+        else if (ordinal == 6)                                      // StartThread(id, arg) -> runnable
+        {
+            auto it = iopThreads().find(a0);
+            if (it != iopThreads().end())
+            {
+                IopThreadState &t = it->second;
+                t.ctx = R5900Context{};
+                t.ctx.pc = t.entry;
+                t.ctx.r[29] = _mm_cvtsi32_si128(0x1F0000u);
+                t.ctx.r[28] = _mm_cvtsi32_si128(t.gp);
+                t.ctx.r[4] = _mm_cvtsi32_si128(a1);
+                t.status = 1;
+            }
+        }
+        else if (ordinal == 8) throw IopYield{1};                   // ExitThread
+        else if (ordinal == 20) ret = g_iopCurThread ? g_iopCurThread : 1;   // GetThreadId
+        else if (ordinal == 24 || ordinal == 33) throw IopYield{0}; // SleepThread / DelayThread
+        else if (ordinal == 25 || ordinal == 26)                   // WakeupThread / iWakeupThread
+        {
+            auto it = iopThreads().find(a0);
+            if (it != iopThreads().end() && it->second.status == 3) it->second.status = 1;
+        }
+        else if (ordinal == 22) { wrU32(a1 + 0, 0u); wrU32(a1 + 4, 2u); }   // ReferThreadStatus (THS_RUN)
     }
     else if (mod == "thevent")
     {
@@ -2551,11 +2596,34 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
         }
         else if (ordinal == 5) s_events.erase((int)a0);                    // DeleteEventFlag
         else if (ordinal == 6 || ordinal == 7)                             // Set / iSet
+        {
             s_events[(int)a0] |= a1;
+            for (auto &kv : iopThreads())
+                if (kv.second.status == 3 && kv.second.waitKind == 4 && kv.second.waitId == a0)
+                {
+                    kv.second.status = 1;
+                    break;
+                }
+        }
         else if (ordinal == 8 || ordinal == 9)                             // Clear / iClear
             s_events[(int)a0] &= ~a1;
-        else if (ordinal == 10 || ordinal == 11)                           // Wait / Poll
+        else if (ordinal == 11)                                            // PollEventFlag
             wrU32(a3, s_events[(int)a0]);
+        else if (ordinal == 10)                                            // WaitEventFlag(ef, bits, mode, resbits)
+        {
+            const uint32_t cur = s_events[(int)a0];
+            const bool ok = (a2 & 1u) ? ((cur & a1) != 0u) : ((cur & a1) == a1);
+            if (ok)
+            {
+                wrU32(a3, cur);
+            }
+            else
+            {
+                IopThreadState &t = iopThreads()[g_iopCurThread];
+                t.status = 3; t.waitKind = 4; t.waitId = a0;
+                throw IopYield{0};
+            }
+        }
         else if (ordinal == 13) { wrU32(a1 + 0, 0u); wrU32(a1 + 12, s_events[(int)a0]); }
     }
     else if (mod == "thsemap")
@@ -2572,11 +2640,26 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
         {
             auto it = s_semas.find((int)a0);
             if (it != s_semas.end() && it->second.first < it->second.second) it->second.first++;
+            for (auto &kv : iopThreads())
+                if (kv.second.status == 3 && kv.second.waitKind == 3 && kv.second.waitId == a0)
+                {
+                    kv.second.status = 1;
+                    break;
+                }
         }
         else if (ordinal == 8)                                             // WaitSema
         {
             auto it = s_semas.find((int)a0);
-            if (it != s_semas.end() && it->second.first > 0) it->second.first--;
+            if (it != s_semas.end() && it->second.first > 0)
+            {
+                it->second.first--;
+            }
+            else
+            {
+                IopThreadState &t = iopThreads()[g_iopCurThread];
+                t.status = 3; t.waitKind = 3; t.waitId = a0;
+                throw IopYield{0};
+            }
         }
         else if (ordinal == 11) { wrU32(a1 + 0, 0u); wrU32(a1 + 12, (uint32_t)s_semas[(int)a0].first); }
     }
@@ -2613,6 +2696,50 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupIopFunction(uint32_t address)
     if (mit == iopTables().end()) return nullptr;
     auto it = mit->second.find(address);
     return it == mit->second.end() ? nullptr : it->second;
+}
+
+// [r3000] Run runnable IOP threads cooperatively. A blocking kernel call throws IopYield and
+// unwinds here; the thread resumes later by re-entering its module's function at ctx.pc (the
+// return address it stored in ra, which the recompiler emits as a resume target).
+static void runIopScheduler(PS2Runtime *rt, uint8_t *iopBase)
+{
+    if (!iopBase) return;
+    uint64_t guard = 2000000ull;
+    while (guard-- > 0)
+    {
+        uint32_t pickId = 0;
+        for (auto &kv : iopThreads())
+            if (kv.second.status == 1) { pickId = kv.first; break; }
+        if (!pickId) break;
+
+        IopThreadState &t = iopThreads()[pickId];
+        t.status = 2;
+        g_iopCurThread = t.id;
+        g_iopCurModule = t.moduleId;
+        g_iopCurGp = t.gp;
+        g_iopCurBase = t.base;
+        PS2Runtime::RecompiledFunction fn = rt->lookupIopFunction(t.ctx.pc);
+        if (!fn) { t.status = 4; continue; }
+        try
+        {
+            fn(iopBase + t.base, &t.ctx, rt);
+            t.status = 4;
+        }
+        catch (const IopYield &y)
+        {
+            if (y.kind == 1)
+            {
+                t.status = 4;
+            }
+            else
+            {
+                if (t.status == 2) t.status = 1;   // plain yield: runnable again
+                else t.ctx.pc = getRegU32(&t.ctx, 31);   // park: resume at the return address
+            }
+        }
+        catch (...) { t.status = 4; }
+    }
+    g_iopCurThread = 0;
 }
 
 void PS2Runtime::reportMissingIopFunction(uint32_t targetPc, uint32_t sourcePc, const char *debugName)
@@ -2730,9 +2857,15 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
     ctx.r[28] = _mm_cvtsi32_si128(m.gp);        // gp
     ctx.r[4] = _mm_cvtsi32_si128(0u);           // a0
 
+    g_iopCurThread = 0;
+    g_iopCurModule = m.id;
+    g_iopCurGp = m.gp;
+    g_iopCurBase = base;
+
     std::fprintf(stderr, "[iop-run] %s: entry 0x%08x gp 0x%08x base 0x%x (native)\n",
                  mod.name.c_str(), mod.entry, mod.gp, base);
-    fn(iopBase + base, &ctx, this);
+    try { fn(iopBase + base, &ctx, this); }
+    catch (const IopYield &) { /* the entry itself yielded */ }
     // [diagnostic] Exercise the cross-module path by calling SIO2D's sio2man import stubs.
     if (const char *xt = std::getenv("PS2X_IOP_XCALL_TEST"); xt && xt[0] && bn.find("SIO2D") != std::string::npos)
     {
@@ -2758,6 +2891,13 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
     }
 
     std::fprintf(stderr, "[iop-run] %s: entry returned\n", mod.name.c_str());
+
+    if (const char *s = std::getenv("PS2X_IOP_SCHED"); s && s[0] && s[0] != '0')
+    {
+        std::fprintf(stderr, "[iop-sched] running threads after %s\n", mod.name.c_str());
+        runIopScheduler(this, iopBase);
+        std::fprintf(stderr, "[iop-sched] threads drained\n");
+    }
     return true;
 }
 
