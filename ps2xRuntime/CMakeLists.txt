@@ -614,6 +614,10 @@ target_sources(ps2EntryRunner PRIVATE
     src/iop_native/libsd/register_functions.cpp
     src/iop_native/sdrdrv/ps2_recompiled_functions.cpp
     src/iop_native/sdrdrv/register_functions.cpp
+    src/iop_native/cdvdstm/ps2_recompiled_functions.cpp
+    src/iop_native/cdvdstm/register_functions.cpp
+    src/iop_native/mcman/ps2_recompiled_functions.cpp
+    src/iop_native/mcman/register_functions.cpp
 )
 
 # The overlay's single 20MB TU and its register file must not be unity-batched

@@ -2743,6 +2743,8 @@ void ps2x_register_sio2d() __attribute__((weak));
 void ps2x_register_dbcman() __attribute__((weak));
 void ps2x_register_libsd() __attribute__((weak));
 void ps2x_register_sdrdrv() __attribute__((weak));
+void ps2x_register_cdvdstm() __attribute__((weak));
+void ps2x_register_mcman() __attribute__((weak));
 }
 
 bool PS2Runtime::registerIopFunction(uint32_t address, RecompiledFunction func)
@@ -2936,6 +2938,14 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
         return false;
     }
 
+    // [guard] A malformed IOP header (unparsed text size) would run the module with a bogus gp
+    // and corrupt state; falling back to the HLE path is safer.
+    if (mod.hdrText == 0)
+    {
+        std::fprintf(stderr, "[iop-run] %s: IOP header text=0 (invalid) -> keeping HLE\n", mod.name.c_str());
+        return false;
+    }
+
     size_t totalSize = 0;
     uint8_t *iopBase = iopGuestSpace(totalSize);
     if (!iopBase)
@@ -3002,6 +3012,14 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
     else if (bn.find("SDRDRV") != std::string::npos)
     {
         if (ps2x_register_sdrdrv) ps2x_register_sdrdrv();
+    }
+    else if (bn.find("CDVDSTM") != std::string::npos)
+    {
+        if (ps2x_register_cdvdstm) ps2x_register_cdvdstm();
+    }
+    else if (bn.find("MCMAN") != std::string::npos)
+    {
+        if (ps2x_register_mcman) ps2x_register_mcman();
     }
 
     RecompiledFunction fn = nullptr;

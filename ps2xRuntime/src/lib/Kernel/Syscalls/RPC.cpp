@@ -1459,7 +1459,9 @@ namespace ps2_syscalls
             modulePath.find("SIO2D") != std::string::npos ||
             modulePath.find("DBCMAN") != std::string::npos ||
             modulePath.find("LIBSD") != std::string::npos ||
-            modulePath.find("SDRDRV") != std::string::npos)
+            modulePath.find("SDRDRV") != std::string::npos ||
+            modulePath.find("CDVDSTM") != std::string::npos ||
+            modulePath.find("MCMAN") != std::string::npos)
         {
             std::string dir = "data/IRX/";
             if (const char *d = std::getenv("PS2X_IOP_DIR"); d && d[0]) dir = d;
