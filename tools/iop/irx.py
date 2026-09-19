@@ -37,6 +37,7 @@ def parse_elf32(data):
         phdrs.append(dict(type=p_type, offset=p_offset, vaddr=p_vaddr, paddr=p_paddr,
                           filesz=p_filesz, memsz=p_memsz, flags=p_flags, align=p_align))
 
+    sections = []
     symbols = []
     if e_shoff and e_shnum:
         shdrs = []
@@ -50,6 +51,13 @@ def parse_elf32(data):
             shstr = data[sh[4]:sh[4] + sh[5]]
         else:
             shstr = b""
+        SHT = {0: "NULL", 1: "PROGBITS", 2: "SYMTAB", 3: "STRTAB", 8: "NOBITS"}
+        for sh in shdrs:
+            nm_off = sh[0]
+            end = shstr.find(b"\x00", nm_off) if nm_off < len(shstr) else -1
+            nm = shstr[nm_off:end].decode("ascii", "replace") if nm_off < len(shstr) and end > 0 else ""
+            sections.append(dict(name=nm, type=SHT.get(sh[1], str(sh[1])), addr=sh[3],
+                                 offset=sh[4], size=sh[5], flags=sh[2]))
         for sh in shdrs:
             if sh[1] != 2 and sh[1] != 11:   # SHT_SYMTAB / SHT_DYNSYM
                 continue
@@ -67,7 +75,7 @@ def parse_elf32(data):
                 stype = st_info & 0xF
                 if stype == 2:   # STT_FUNC
                     symbols.append(dict(name=name, value=st_value, size=st_size, shndx=st_shndx))
-    return dict(entry=e_entry, flags=e_flags, phdrs=phdrs, symbols=symbols)
+    return dict(entry=e_entry, flags=e_flags, phdrs=phdrs, sections=sections, symbols=symbols)
 
 
 def summarize(path):
@@ -80,6 +88,8 @@ def summarize(path):
         segments=[dict(vaddr=f"0x{p['vaddr']:08x}", filesz=p["filesz"], memsz=p["memsz"],
                        flags=p["flags"], iop=(p["type"] == PT_PS2_IOP)) for p in e["phdrs"]],
         functions=len(e["symbols"]),
+        sections=[dict(name=s["name"], type=s["type"], addr=f"0x{s['addr']:08x}",
+                       offset=s["offset"], size=s["size"], flags=s["flags"]) for s in e["sections"]],
         symbols=sorted(e["symbols"], key=lambda s: s["value"])[:64],
     )
 
@@ -114,6 +124,9 @@ def main():
             continue
         segs = " ".join(f"{s['vaddr']}({s['filesz']}{'*' if s['iop'] else ''})" for s in m["segments"])
         print(f"{m['name']:14} entry={m['entry']} funcs={m['functions']:4} segs: {segs}")
+        for s in m["sections"]:
+            if s["name"]:
+                print(f"    sect {s['name']:12} {s['type']:8} addr={s['addr']} off={s['offset']} size={s['size']}")
     return 0
 
 
