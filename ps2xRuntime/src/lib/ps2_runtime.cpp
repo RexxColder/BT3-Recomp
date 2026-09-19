@@ -2307,20 +2307,88 @@ void PS2Runtime::resetMissingFunctionReportOnce()
     m_missingFunctionReported.store(false, std::memory_order_release);
 }
 
-// [r3000] IRX import stub -> kernel/SIF HLE. Logs each distinct (module, ordinal) once; the
-// handler's result must be left in v0. The kernel dispatch is filled in progressively.
-void PS2Runtime::iopImport(R5900Context *ctx, const char *module, uint32_t ordinal)
+// [r3000] 2 MiB IOP RAM. Recompiled IRX modules run against this, not the EE's rdram.
+std::vector<uint8_t> &PS2Runtime::iopRam()
 {
+    static std::vector<uint8_t> ram(2u * 1024u * 1024u, 0u);
+    return ram;
+}
+
+// [r3000] IRX import stub -> kernel/SIF HLE. `module`/`ordinal` identify the target
+// (ps2sdk ordinal tables); the handler result is left in v0, matching the IOP ABI.
+void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module, uint32_t ordinal)
+{
+    (void)rdram;
+    auto &ram = iopRam();
+    auto cstr = [&](uint32_t addr) -> std::string {
+        std::string s;
+        if (addr >= ram.size()) return s;
+        for (size_t i = addr; i < ram.size(); ++i) { char c = (char)ram[i]; if (!c) break; s.push_back(c); }
+        return s;
+    };
+    const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6), a3 = getRegU32(ctx, 7);
+    const std::string mod = module ? module : "";
+    uint32_t ret = 0;
+
     static std::mutex s_mx;
     static std::unordered_set<std::string> s_seen;
     {
         std::lock_guard<std::mutex> lk(s_mx);
-        std::string key = std::string(module ? module : "?") + "#" + std::to_string(ordinal);
+        std::string key = mod + "#" + std::to_string(ordinal);
         if (s_seen.insert(key).second)
             std::fprintf(stderr, "[iop-import] %s\n", key.c_str());
     }
-    if (ctx)
-        setReturnU32(ctx, 0);   // TODO: dispatch to the kernel/SIF HLE handler
+
+    if (mod == "loadcore")
+    {
+        ret = 0;   // RegisterLibraryEntries / FlushIcache / FlushDcache
+    }
+    else if (mod == "stdio" && ordinal == 4)   // printf(fmt, ...)
+    {
+        std::fprintf(stderr, "[iop-printf] %s\n", cstr(a0).c_str());
+        ret = 0;
+    }
+    else if (mod == "sysclib")
+    {
+        if (ordinal == 29)   // strncmp(a, b, n)
+        {
+            const std::string x = cstr(a0), y = cstr(a1);
+            ret = (uint32_t)(int32_t)std::strncmp(x.c_str(), y.c_str(), a2);
+        }
+        else if (ordinal == 8 || ordinal == 36)   // look_ctype_table / strtol
+        {
+            ret = 0;   // TODO: valid ctype table / full strtol
+        }
+    }
+    else if (mod == "dmacman")
+    {
+        ret = (ordinal == 28) ? 1u : 0u;   // sceSetSliceDMA -> 1, others void
+    }
+    else if (mod == "thbase")
+    {
+        static std::atomic<int> s_nextTid{1};
+        if (ordinal == 4) ret = (uint32_t)s_nextTid.fetch_add(1);   // CreateThread
+        else if (ordinal == 20) ret = 1;                            // GetThreadId
+        // StartThread(6) etc. -> 0
+    }
+    else if (mod == "thevent")
+    {
+        static std::atomic<int> s_nextEf{1};
+        if (ordinal == 4) ret = (uint32_t)s_nextEf.fetch_add(1);   // CreateEventFlag
+        else if (ordinal == 10 && a3 && (uint64_t)a3 + 4 <= ram.size())   // WaitEventFlag resbits
+        {
+            const uint32_t bits = ~0u;
+            std::memcpy(ram.data() + a3, &bits, 4);
+        }
+    }
+    else if (mod == "thsemap")
+    {
+        static std::atomic<int> s_nextSema{1};
+        if (ordinal == 4) ret = (uint32_t)s_nextSema.fetch_add(1);  // CreateSema
+    }
+    // intrman (RegisterIntrHandler/EnableIntr/...), stdio others, etc. -> 0
+
+    setReturnU32(ctx, ret);
 }
 
 void PS2Runtime::reportMissingFunction(uint8_t *rdram,

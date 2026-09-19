@@ -524,7 +524,9 @@ public:
 
     // [r3000] An IRX import stub resolved to a kernel/SIF call. `module`/`ordinal` identify the
     // target; on return the handler result must land in v0 (ctx->r[2]), matching the IOP ABI.
-    void iopImport(R5900Context *ctx, const char *module, uint32_t ordinal);
+    // Operates on the dedicated IOP RAM (see iopRam()), not the EE's rdram.
+    void iopImport(uint8_t *rdram, R5900Context *ctx, const char *module, uint32_t ordinal);
+    std::vector<uint8_t> &iopRam();   // 2 MiB IOP RAM, lazily allocated
 
     static const IoPaths &getIoPaths();
     static void setIoPaths(const IoPaths &paths);

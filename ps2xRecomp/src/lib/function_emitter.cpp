@@ -91,7 +91,7 @@ namespace ps2recomp
         auto impIt = cg.m_importStubs.find(function.start);
         if (impIt != cg.m_importStubs.end())
         {
-            ss << "    runtime->iopImport(ctx, \"" << impIt->second.module << "\", "
+            ss << "    runtime->iopImport(rdram, ctx, \"" << impIt->second.module << "\", "
                << impIt->second.ordinal << "u);\n";
             ss << "}\n";
             return ss.str();
