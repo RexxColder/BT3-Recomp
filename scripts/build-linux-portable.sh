@@ -44,11 +44,21 @@ echo "[portable] $BASE_IMAGE, glibc floor $FLOOR, engine $ENGINE"
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
         apt-get install -y --no-install-recommends \
-            python3 ca-certificates clang cmake ninja-build pkg-config git bash file \
+            python3 ca-certificates clang g++ cmake ninja-build pkg-config git bash file \
             libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev \
             libgl1-mesa-dev libglu1-mesa-dev libarchive-tools p7zip-full \
             libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev \
             qt6-base-dev ccache mold
+        # The repo is owned by the host user but we run as root in the container; without this,
+        # git refuses to operate ("dubious ownership") and the parallel-gs submodule is skipped.
+        git config --global --add safe.directory /src
+        # Build with the distro GCC, the same compiler family as the native dev builds. The clang
+        # this package list pulls in on 22.04 is clang-14, which lacks __builtin_source_location, so
+        # libstdc++-12 does not define std::source_location and the bundled toml11 fails to compile.
+        export CC=gcc CXX=g++
+        # Use a fresh build dir: any existing repo build/ has a CMakeCache.txt recorded with the
+        # host path, which CMake rejects when the tree is mounted at /src inside the container.
+        export PS2X_BUILD_DIR="${PS2X_BUILD_DIR:-/src/build/portable}"
         python3 games/bt3/setup.py "$@" --package
     ' _ "${ARGS[@]}"
 
