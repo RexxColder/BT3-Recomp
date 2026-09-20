@@ -138,6 +138,19 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
     resultPtr = 0u;
     signalNowaitCompletion = false;
 
+    // [r3000] When the native IOPRP file service (CDVDFSV) is brought up, prefer its handler for
+    // the DVCI RPCs instead of the HLE resolver.
+    if (const char *e = std::getenv("PS2X_IOP_IOPRP"); e && e[0] && e[0] != '0')
+    {
+        if ((sid == 0x80000597u || sid == 0x2000004u) &&
+            ps2xInvokeIopRpc(runtime, sid, rpcNum, m_rdram, sendBufAddr, sendSize, recvBufAddr, recvSize))
+        {
+            signalNowaitCompletion = true;
+            if (recvBufAddr) resultPtr = recvBufAddr;
+            return true;
+        }
+    }
+
     // Dragon Ball Z: Budokai Tenkaichi 3 (SLUS_216.78) DVCI disc file-resolver.
     // sid 0x80000597, cmd 0 = "find file": the guest sends a path string at
     // sendBuf+0x24 (e.g. "\DATA\PZS3US.DIR;1") in a 300-byte buffer and expects

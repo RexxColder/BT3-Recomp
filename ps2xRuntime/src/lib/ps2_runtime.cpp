@@ -3015,6 +3015,8 @@ void ps2x_register_modmidi() PS2X_WEAK;
 void ps2x_register_modsein() PS2X_WEAK;
 void ps2x_register_modsesq() PS2X_WEAK;
 void ps2x_register_modsesq2() PS2X_WEAK;
+void ps2x_register_cdvdman() PS2X_WEAK;
+void ps2x_register_cdvdfsv() PS2X_WEAK;
 }
 
 bool PS2Runtime::registerIopFunction(uint32_t address, RecompiledFunction func)
@@ -3301,6 +3303,14 @@ bool PS2Runtime::loadAndRunIopModule(const char *path)
     else if (bn.find("MCSERV") != std::string::npos)
     {
         if (ps2x_register_mcserv) ps2x_register_mcserv();
+    }
+    else if (bn.find("CDVDMAN") != std::string::npos)
+    {
+        if (ps2x_register_cdvdman) ps2x_register_cdvdman();
+    }
+    else if (bn.find("CDVDFSV") != std::string::npos)
+    {
+        if (ps2x_register_cdvdfsv) ps2x_register_cdvdfsv();
     }
     else if (bn.find("SOUNDS") != std::string::npos)
     {
