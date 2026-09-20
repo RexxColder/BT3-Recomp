@@ -13,6 +13,7 @@
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ps2_coverage.h"   // [coverage]
 
 #include <atomic>
 #include <cstdint>
@@ -502,6 +503,7 @@ namespace
 bool PS2Runtime::interpretUntil(uint8_t *rdram, R5900Context *ctx, uint32_t returnPc)
 {
     PS2Runtime *runtime = this;
+    ps2cov::noteEeOverlay(ctx->pc);   // [coverage] overlay entry point that has no recompiled function
     uint64_t guard = 0;
     const uint64_t kGuardLimit = 2000000000ull; // runaway backstop
 

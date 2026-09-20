@@ -10,6 +10,10 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #include <link.h>
+#include <sys/mman.h>   // [r3000] sparse IOP guest address space
+#include <csignal>
+#include <unistd.h>
+#include <execinfo.h>
 #endif
 #if defined(PS2X_HAVE_LIBUNWIND)
 #define UNW_LOCAL_ONLY
@@ -19,6 +23,8 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #include "ps2_host_window.h"   // [B] native window handle (SDL returns SDL_Window*, not the HWND)
 #include "runtime/ps2_texreplace.h"   // [texreplace]
 #include "runtime/ps2_texcache.h"     // [texcache]
+#include "runtime/ps2_coverage.h"     // [coverage]
+#include "runtime/ps2_iop_module.h"   // [r3000] IRX loader
 #include "runtime/ps2_toml.h"         // [texcache] settings.toml
 #include "runtime/ps2_video_status.h"   // [video] the Video-tab status the overlay polls
 #include "runtime/ps2_toml.h"   // [winmode] startup read of [video] window_mode / monitor
@@ -28,6 +34,7 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #include "runtime/ps2_gs_pgs.h"   // [pgs]
 #include <iomanip>
 #include <cstdlib>
+#include <array>
 #if !defined(_WIN32)
 #include <execinfo.h> // glibc backtrace for the bad-jump diagnostic
 #endif
@@ -1641,6 +1648,7 @@ bool PS2Runtime::initialize(const char *title)
             // extracted ISO tree; the folder is created if absent.)
             ps2tex::replacementsEnabled();
         }
+        ps2cov::init();   // [coverage] PS2X_COVERAGE: capture interpreter fallbacks
         {   // [texcache] Persistent write-back texture cache: configure + load at startup. Filled by
             // the write-back hook in putTexture (the FINAL payload: decode + pack replacement).
             const char *xd = ps2xExeDirC();
@@ -2303,6 +2311,1147 @@ PS2Runtime::MissingFunctionPolicy PS2Runtime::missingFunctionPolicy() const
 void PS2Runtime::resetMissingFunctionReportOnce()
 {
     m_missingFunctionReported.store(false, std::memory_order_release);
+}
+
+// [r3000] 2 MiB IOP RAM. Recompiled IRX modules run against this, not the EE's rdram.
+std::vector<uint8_t> &PS2Runtime::iopRam()
+{
+    static std::vector<uint8_t> ram(2u * 1024u * 1024u, 0u);
+    return ram;
+}
+
+// [r3000] IRX import stub -> kernel/SIF HLE. `module`/`ordinal` identify the target
+// (ps2sdk ordinal tables); the handler result is left in v0, matching the IOP ABI.
+#if !defined(_WIN32)
+#include <pthread.h>
+static std::atomic<void *> g_iopWdThread{nullptr};
+static std::atomic<bool> g_iopWdArmed{false};
+static void iopWdHandler(int)
+{
+    void *bt[48];
+    const int n = backtrace(bt, 48);
+    std::fprintf(stderr, "[iop-watchdog] entry stuck; backtrace:\n");
+    backtrace_symbols_fd(bt, n, 2);
+    std::_Exit(99);
+}
+#endif
+
+// [r3000] The IOP guest address space. IOP RAM is 2 MiB at 0, but modules also touch the
+// register range (0x1F80xxxx / 0xBF80xxxx). Back the whole space with a sparse mapping so
+// those accesses land somewhere valid instead of faulting (register semantics come later).
+static uint8_t *iopGuestSpace(size_t &sizeOut)
+{
+#if !defined(_WIN32)
+    static uint8_t *s = []() -> uint8_t * {
+        const size_t n = 0xC0000000ull;
+        void *p = ::mmap(nullptr, n, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        return p == MAP_FAILED ? nullptr : static_cast<uint8_t *>(p);
+    }();
+    sizeOut = 0xC0000000ull;
+    return s;
+#else
+    static std::vector<uint8_t> s(256u * 1024u * 1024u, 0u);
+    sizeOut = s.size();
+    return s.data();
+#endif
+}
+
+// [r3000] Loaded IOP modules and their per-module function tables. An IRX loads at its link
+// address relative to a per-module base; the generated code is passed a `rdram` view shifted
+// by that base, so its link-relative addresses map to the right place without codegen changes.
+namespace
+{
+    struct IopMod
+    {
+        std::string name;            // file basename
+        std::string exportName;      // e.g. "sio2man"
+        uint32_t id = 0;
+        uint32_t base = 0;
+        uint32_t gp = 0;
+        uint32_t entry = 0;
+        uint32_t exportVaddr = 0;    // link vaddr of the export table header (fptrs at +20)
+    };
+
+    std::unordered_map<uint32_t, std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction>> &iopTables()
+    {
+        static std::unordered_map<uint32_t, std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction>> t;
+        return t;
+    }
+    std::unordered_map<std::string, IopMod> &iopModulesByExport()
+    {
+        static std::unordered_map<std::string, IopMod> m;
+        return m;
+    }
+    std::mutex &iopTableMx()
+    {
+        static std::mutex m;
+        return m;
+    }
+    uint32_t g_iopRegModule = 0;   // module whose registration function is running
+    uint32_t g_iopCurModule = 0;   // module currently executing
+    uint32_t g_iopNextId = 1;
+    uint32_t g_iopNextBase = 0;
+
+    // [r3000] IOP threads (cooperative). A blocking kernel call throws IopYield to unwind back to
+    // the scheduler; resuming re-enters the owning module's function at the saved pc (the
+    // recompiler emits `switch (ctx->pc)` resume labels for that).
+    struct IopYield { int kind; };   // 0 = yield/park, 1 = exit
+    struct IopThreadState
+    {
+        uint32_t id = 0, entry = 0, gp = 0, base = 0, moduleId = 0;
+        R5900Context ctx{};
+        int status = 0;              // 0 dormant, 1 runnable, 2 running, 3 waiting, 4 done
+        int priority = 0;
+        uint32_t waitId = 0;         // sema/event id it waits on
+        int waitKind = 0;            // 3 = sema, 4 = event flag, 1 = delay/sleep
+    };
+    std::unordered_map<uint32_t, IopThreadState> &iopThreads()
+    {
+        static std::unordered_map<uint32_t, IopThreadState> t;
+        return t;
+    }
+    uint32_t g_iopNextThread = 1;
+    uint32_t g_iopCurThread = 0;
+    uint32_t g_iopCurGp = 0;
+    uint32_t g_iopCurBase = 0;
+
+    // [r3000] SIF RPC servers registered by native modules (sifcmd sceSifRegisterRpc).
+    struct IopSifRpc
+    {
+        uint32_t handler = 0;    // native function address in the module
+        uint32_t server = 0;     // sceSifRpcData_t* (opaque)
+        uint32_t moduleId = 0;   // owning IOP module
+        uint32_t base = 0;       // module load base
+        uint32_t gp = 0;         // module gp
+    };
+    std::unordered_map<uint32_t, IopSifRpc> &sifRpcServers()
+    {
+        static std::unordered_map<uint32_t, IopSifRpc> m;
+        return m;
+    }
+
+    // [r3000] ioman device registry: AddDrv(name, device) -> devices; open() -> fd.
+    struct IopDevice { uint32_t ops = 0; uint32_t moduleId = 0; uint32_t base = 0; uint32_t gp = 0; uint32_t devPtr = 0; };
+    std::unordered_map<std::string, IopDevice> &iomanDevices()
+    {
+        static std::unordered_map<std::string, IopDevice> m;
+        return m;
+    }
+    std::unordered_map<int, std::string> &iomanFdsPath()
+    {
+        static std::unordered_map<int, std::string> m;
+        return m;
+    }
+    struct IopFile { IopDevice dev; uint32_t filePtr = 0; };
+    std::unordered_map<int, IopFile> &iomanFds()
+    {
+        static std::unordered_map<int, IopFile> m;
+        return m;
+    }
+    std::atomic<int> &iomanNextFd()
+    {
+        static std::atomic<int> n{3};
+        return n;
+    }
+}
+static void runIopScheduler(PS2Runtime *rt, uint8_t *iopBase);
+
+void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module, uint32_t ordinal)
+{
+    size_t totalSize = 0;
+    uint8_t *iopBase = iopGuestSpace(totalSize);
+    // Read/write through the caller's relocated view (rdram = iopBase + callerBase).
+    uint8_t *ram = rdram ? rdram : iopBase;
+    const size_t ramSize = iopBase ? (totalSize - static_cast<size_t>(ram - iopBase)) : 0;
+    auto cstr = [&](uint32_t addr) -> std::string {
+        std::string s;
+        if (!ram || addr >= ramSize) return s;
+        for (size_t i = addr; i < ramSize; ++i) { char c = (char)ram[i]; if (!c) break; s.push_back(c); }
+        return s;
+    };
+    const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6), a3 = getRegU32(ctx, 7);
+    const std::string mod = module ? module : "";
+    uint32_t ret = 0;
+
+    static std::mutex s_mx;
+    static std::unordered_set<std::string> s_seen;
+    {
+        std::lock_guard<std::mutex> lk(s_mx);
+        std::string key = std::to_string(g_iopCurModule) + ":" + mod + "#" + std::to_string(ordinal);
+        if (s_seen.insert(key).second)
+            std::fprintf(stderr, "[iop-import] mod%u %s#%u\n", g_iopCurModule, mod.c_str(), ordinal);
+    }
+
+    auto rdU32 = [&](uint32_t addr) -> uint32_t {
+        uint32_t v = 0;
+        if (ram && static_cast<uint64_t>(addr) + 4 <= ramSize) std::memcpy(&v, ram + addr, 4);
+        return v;
+    };
+    auto wrU32 = [&](uint32_t addr, uint32_t v) {
+        if (ram && static_cast<uint64_t>(addr) + 4 <= ramSize) std::memcpy(ram + addr, &v, 4);
+    };
+
+    // [r3000] Kernel object state (single-threaded best-effort model).
+    static std::recursive_mutex s_kernMx;   // recursive: iopImport can re-enter via cross-module calls
+    static std::unordered_map<int, std::array<uint32_t, 4>> s_threads;   // id -> {entry,prio,status,stack}
+    static std::unordered_map<int, std::pair<int, int>> s_semas;          // sem -> {count,max}
+    static std::unordered_map<int, uint32_t> s_events;                    // ef -> bits
+    static std::unordered_map<int, std::pair<uint32_t, uint32_t>> s_intrs; // irq -> {handler,arg}
+    static int s_nextTid = 1, s_nextEf = 1, s_nextSema = 1, s_curTid = 0;
+    static uint32_t s_ctypeAddr = 0;
+    std::lock_guard<std::recursive_mutex> klock(s_kernMx);
+
+    // [r3000] Cross-module import: another loaded recompiled IRX exports this name (e.g. SIO2D
+    // imports the SIO2MAN library). Resolve fptr[ordinal] from the callee's export table in IOP
+    // RAM and call its recompiled function with the callee's own base/gp.
+    if (iopBase)
+    {
+        IopMod target;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            auto it = iopModulesByExport().find(mod);
+            if (it != iopModulesByExport().end()) { target = it->second; found = true; }
+        }
+        if (found && target.exportVaddr)
+        {
+            const uint32_t fptrAddr = target.exportVaddr + 20u + ordinal * 4u;
+            uint32_t fptr = 0;
+            if (static_cast<uint64_t>(target.base) + fptrAddr + 4u <= totalSize)
+                std::memcpy(&fptr, iopBase + target.base + fptrAddr, 4);
+            if (fptr)
+            {
+                PS2Runtime::RecompiledFunction callee = nullptr;
+                {
+                    std::lock_guard<std::mutex> lk(iopTableMx());
+                    auto &t = iopTables()[target.id];
+                    auto fit = t.find(fptr);
+                    if (fit != t.end()) callee = fit->second;
+                }
+                if (callee)
+                {
+                    std::fprintf(stderr, "[iop-xcall] %s#%u -> %s 0x%08x\n",
+                                 mod.c_str(), ordinal, target.exportName.c_str(), fptr);
+                    static const bool s_resolveOnly = std::getenv("PS2X_IOP_XCALL_RESOLVE_ONLY") != nullptr;
+                    if (s_resolveOnly)
+                    {
+                        setReturnU32(ctx, 0);
+                        return;
+                    }
+                    uint32_t savedCur = 0, savedGp = getRegU32(ctx, 28);
+                    {
+                        std::lock_guard<std::mutex> lk(iopTableMx());
+                        savedCur = g_iopCurModule;
+                        g_iopCurModule = target.id;
+                    }
+                    ctx->r[28] = _mm_cvtsi32_si128(target.gp);
+                    callee(iopBase + target.base, ctx, this);
+                    ctx->r[28] = _mm_cvtsi32_si128(savedGp);
+                    std::lock_guard<std::mutex> lk(iopTableMx());
+                    g_iopCurModule = savedCur;
+                    return;   // v0 holds the callee's return value
+                }
+            }
+        }
+    }
+
+    if (mod == "loadcore")
+    {
+        ret = 0;   // RegisterLibraryEntries / FlushIcache / FlushDcache
+    }
+    else if (mod == "stdio" && ordinal == 4)   // printf(fmt, ...)
+    {
+        std::fprintf(stderr, "[iop-printf] %s\n", cstr(a0).c_str());
+        ret = 0;
+    }
+    else if (mod == "sysclib")
+    {
+        if (ordinal == 29)   // strncmp(a, b, n)
+        {
+            const std::string x = cstr(a0), y = cstr(a1);
+            ret = (uint32_t)(int32_t)std::strncmp(x.c_str(), y.c_str(), a2);
+        }
+        else if (ordinal == 36)   // strtol(s, endptr, base)
+        {
+            const std::string s = cstr(a0);
+            char *end = nullptr;
+            const long v = std::strtol(s.c_str(), &end, a2 ? (int)a2 : 10);
+            if (a1 && ram && static_cast<uint64_t>(a1) + 4 <= ramSize)
+            {
+                const uint32_t off = (uint32_t)(end - s.c_str()) + a0;
+                std::memcpy(ram + a1, &off, 4);
+            }
+            ret = (uint32_t)v;
+        }
+        else if (ordinal == 8)   // look_ctype_table -> pointer to a 256-byte table in IOP RAM
+        {
+            if (!s_ctypeAddr && ram)
+            {
+                s_ctypeAddr = 0x100000u;   // unused IOP RAM above the module image
+                for (int i = 0; i < 256; ++i)
+                {
+                    uint8_t f = 0;
+                    if (i >= '0' && i <= '9') f = 0x04;              // _C_DIGIT
+                    else if ((i >= 'a' && i <= 'z') || (i >= 'A' && i <= 'Z')) f = 0x03;  // _C_ALPHA
+                    else if (i == ' ' || (i >= 9 && i <= 13)) f = 0x01;  // _C_SPACE
+                    ram[s_ctypeAddr + i] = f;
+                }
+            }
+            ret = s_ctypeAddr;
+        }
+    }
+    else if (mod == "dmacman")
+    {
+        ret = (ordinal == 28) ? 1u : 0u;   // sceSetSliceDMA -> 1, others void
+    }
+    else if (mod == "thbase")
+    {
+        if (ordinal == 4)   // CreateThread(iop_thread_t*)
+        {
+            const uint32_t entry = rdU32(a0 + 8), prio = rdU32(a0 + 16);
+            const uint32_t id = g_iopNextThread++;
+            IopThreadState t;
+            t.id = id; t.entry = entry; t.gp = g_iopCurGp; t.base = g_iopCurBase;
+            t.moduleId = g_iopCurModule; t.priority = static_cast<int>(prio);
+            iopThreads()[id] = t;
+            std::fprintf(stderr, "[iop-thread] create id=%u entry=0x%08x gp=0x%08x mod=%u\n",
+                         id, entry, g_iopCurGp, g_iopCurModule);
+            ret = id;
+        }
+        else if (ordinal == 5) iopThreads().erase(a0);              // DeleteThread
+        else if (ordinal == 6)                                      // StartThread(id, arg) -> runnable
+        {
+            auto it = iopThreads().find(a0);
+            if (it != iopThreads().end())
+            {
+                IopThreadState &t = it->second;
+                t.ctx = R5900Context{};
+                t.ctx.pc = t.entry;
+                t.ctx.r[29] = _mm_cvtsi32_si128(0x1F0000u);
+                t.ctx.r[28] = _mm_cvtsi32_si128(t.gp);
+                t.ctx.r[4] = _mm_cvtsi32_si128(a1);
+                t.status = 1;
+                std::fprintf(stderr, "[iop-thread] start id=%u entry=0x%08x arg=0x%x\n", a0, t.entry, a1);
+            }
+        }
+        else if (ordinal == 8) throw IopYield{1};                   // ExitThread
+        else if (ordinal == 20) ret = g_iopCurThread ? g_iopCurThread : 1;   // GetThreadId
+        else if (ordinal == 24 || ordinal == 33) throw IopYield{0}; // SleepThread / DelayThread
+        else if (ordinal == 25 || ordinal == 26)                   // WakeupThread / iWakeupThread
+        {
+            auto it = iopThreads().find(a0);
+            if (it != iopThreads().end() && it->second.status == 3) it->second.status = 1;
+        }
+        else if (ordinal == 22) { wrU32(a1 + 0, 0u); wrU32(a1 + 4, 2u); }   // ReferThreadStatus (THS_RUN)
+    }
+    else if (mod == "thevent")
+    {
+        if (ordinal == 4)   // CreateEventFlag(iop_event_t*)
+        {
+            const int id = s_nextEf++;
+            s_events[id] = rdU32(a0 + 8);
+            ret = (uint32_t)id;
+        }
+        else if (ordinal == 5) s_events.erase((int)a0);                    // DeleteEventFlag
+        else if (ordinal == 6 || ordinal == 7)                             // Set / iSet
+        {
+            s_events[(int)a0] |= a1;
+            for (auto &kv : iopThreads())
+                if (kv.second.status == 3 && kv.second.waitKind == 4 && kv.second.waitId == a0)
+                {
+                    kv.second.status = 1;
+                    break;
+                }
+        }
+        else if (ordinal == 8 || ordinal == 9)                             // Clear / iClear
+            s_events[(int)a0] &= ~a1;
+        else if (ordinal == 11)                                            // PollEventFlag
+            wrU32(a3, s_events[(int)a0]);
+        else if (ordinal == 10)                                            // WaitEventFlag(ef, bits, mode, resbits)
+        {
+            const uint32_t cur = s_events[(int)a0];
+            const bool ok = (a2 & 1u) ? ((cur & a1) != 0u) : ((cur & a1) == a1);
+            if (ok)
+            {
+                wrU32(a3, cur);
+            }
+            else
+            {
+                IopThreadState &t = iopThreads()[g_iopCurThread];
+                t.status = 3; t.waitKind = 4; t.waitId = a0;
+                throw IopYield{0};
+            }
+        }
+        else if (ordinal == 13) { wrU32(a1 + 0, 0u); wrU32(a1 + 12, s_events[(int)a0]); }
+    }
+    else if (mod == "thsemap")
+    {
+        if (ordinal == 4)   // CreateSema(iop_sema_t*)
+        {
+            const int init = (int)rdU32(a0 + 8), max = (int)rdU32(a0 + 12);
+            const int id = s_nextSema++;
+            s_semas[id] = {init, max};
+            ret = (uint32_t)id;
+        }
+        else if (ordinal == 5) s_semas.erase((int)a0);                     // DeleteSema
+        else if (ordinal == 6)                                             // SignalSema
+        {
+            auto it = s_semas.find((int)a0);
+            if (it != s_semas.end() && it->second.first < it->second.second) it->second.first++;
+            for (auto &kv : iopThreads())
+                if (kv.second.status == 3 && kv.second.waitKind == 3 && kv.second.waitId == a0)
+                {
+                    kv.second.status = 1;
+                    break;
+                }
+        }
+        else if (ordinal == 8)                                             // WaitSema
+        {
+            auto it = s_semas.find((int)a0);
+            if (it != s_semas.end() && it->second.first > 0)
+            {
+                it->second.first--;
+            }
+            else
+            {
+                IopThreadState &t = iopThreads()[g_iopCurThread];
+                t.status = 3; t.waitKind = 3; t.waitId = a0;
+                throw IopYield{0};
+            }
+        }
+        else if (ordinal == 11) { wrU32(a1 + 0, 0u); wrU32(a1 + 12, (uint32_t)s_semas[(int)a0].first); }
+    }
+    else if (mod == "intrman")
+    {
+        if (ordinal == 4) s_intrs[(int)a0] = {a2, a3};                     // RegisterIntrHandler
+        else if (ordinal == 5) s_intrs.erase((int)a0);                     // ReleaseIntrHandler
+        else if (ordinal == 7) wrU32(a1, 0u);                              // DisableIntr(irq, res*)
+        // EnableIntr / CpuSuspendIntr / CpuResumeIntr -> 0
+    }
+    else if (mod == "sifman")
+    {
+        if (ordinal == 7 || ordinal == 32)   // sceSifSetDma / sceSifSetDmaIntr (immediate transfer)
+        {
+            const uint32_t count = (uint32_t)(int32_t)a1;
+            for (uint32_t k = 0; ram && k < count; ++k)
+            {
+                const uint32_t e = a0 + k * 16u;   // SifDmaTransfer_t {src,dest,size,attr}
+                const uint32_t src = rdU32(e), dst = rdU32(e + 4);
+                const int32_t sz = (int32_t)rdU32(e + 8);
+                if (sz > 0 && src && dst && static_cast<uint64_t>(src) + sz <= ramSize &&
+                    static_cast<uint64_t>(dst) + sz <= ramSize)
+                    std::memmove(ram + dst, ram + src, (size_t)sz);
+            }
+            ret = 1;                             // transfer id (completed immediately)
+        }
+        else if (ordinal == 8) ret = 0;          // sceSifDmaStat -> done
+        else if (ordinal == 29) ret = 1;         // sceSifCheckInit -> initialized
+        // 5 sceSifInit -> 0
+    }
+    else if (mod == "sifcmd")
+    {
+        if (ordinal == 17)                       // sceSifRegisterRpc(server, sid, handler, buf, size, ...)
+        {
+            IopSifRpc r;
+            r.server = a0; r.handler = a2; r.moduleId = g_iopCurModule;
+            r.base = g_iopCurBase; r.gp = g_iopCurGp;
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            sifRpcServers()[a1] = r;
+            std::fprintf(stderr, "[iop-sif] RegisterRpc sid=0x%08x handler=0x%08x\n", a1, a2);
+        }
+        else if (ordinal == 19)                  // sceSifSetRpcQueue(queue, thid)
+        {
+            std::fprintf(stderr, "[iop-sif] SetRpcQueue queue=0x%08x thid=%u\n", a0, a1);
+        }
+        else if (ordinal == 22)                  // sceSifRpcLoop(queue) -> park waiting for requests
+        {
+            IopThreadState &t = iopThreads()[g_iopCurThread];
+            t.status = 3; t.waitKind = 5; t.waitId = a0;
+            throw IopYield{0};
+        }
+        // 14 sceSifInitRpc -> 0
+    }
+    else if (mod == "vblank")
+    {
+        // WaitVblankStart/End (4/5), WaitVblank (6), WaitNonVblank (7): return immediately (no
+        // real vblank); Register/ReleaseVblankHandler -> 0.
+        ret = 0;
+    }
+    else if (mod == "timrman")
+    {
+        static std::atomic<int> s_nextTimer{1};
+        ret = (ordinal == 4) ? static_cast<uint32_t>(s_nextTimer.fetch_add(1)) : 0u;  // AllocHardTimer -> id
+        // Refer/Free/Set/Get* -> 0
+    }
+    else if (mod == "secrman" || mod == "heaplib" || mod == "thmsgbx")
+    {
+        // Providers not present in IOPRP nor as game IRX: keep returns sane so callers proceed.
+        if (mod == "heaplib" && (ordinal == 4 || ordinal == 5))   // heap create/alloc -> 0 (no heap)
+            ret = 0;
+        else
+            ret = 0;
+    }
+    else if (mod == "ioman")
+    {
+        auto callDevOp = [&](const IopDevice &dev, uint32_t opOff,
+                             uint32_t x0, uint32_t x1, uint32_t x2, uint32_t x3) -> uint32_t
+        {
+            if (!dev.ops || !iopBase) return 0;
+            const uint32_t fnAddr = rdU32(dev.ops + opOff);
+            if (!fnAddr) return 0;
+            PS2Runtime::RecompiledFunction fn = nullptr;
+            uint32_t savedMod = 0;
+            {
+                std::lock_guard<std::mutex> lk(iopTableMx());
+                savedMod = g_iopCurModule;
+                g_iopCurModule = dev.moduleId;
+                g_iopCurGp = dev.gp;
+                g_iopCurBase = dev.base;
+                auto mit = iopTables().find(dev.moduleId);
+                if (mit != iopTables().end())
+                {
+                    auto it = mit->second.find(fnAddr);
+                    if (it != mit->second.end()) fn = it->second;
+                }
+            }
+            uint32_t r = 0;
+            if (fn)
+            {
+                const uint32_t savedGp = getRegU32(ctx, 28);
+                ctx->r[28] = _mm_cvtsi32_si128(dev.gp);
+                ctx->r[4] = _mm_cvtsi32_si128(x0);
+                ctx->r[5] = _mm_cvtsi32_si128(x1);
+                ctx->r[6] = _mm_cvtsi32_si128(x2);
+                ctx->r[7] = _mm_cvtsi32_si128(x3);
+                try { fn(iopBase + dev.base, ctx, this); } catch (...) {}
+                r = getRegU32(ctx, 2);
+                ctx->r[28] = _mm_cvtsi32_si128(savedGp);
+            }
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            g_iopCurModule = savedMod;
+            return r;
+        };
+        auto findDevice = [&](const std::string &path) -> IopDevice
+        {
+            const size_t colon = path.find(':');
+            const std::string prefix = colon == std::string::npos ? path : path.substr(0, colon);
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            for (const auto &kv : iomanDevices())
+                if (prefix.rfind(kv.first, 0) == 0 || kv.first.rfind(prefix, 0) == 0)
+                    return kv.second;
+            return IopDevice{};
+        };
+        auto fdFile = [&](int fd) -> std::pair<IopFile, bool>
+        {
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            auto it = iomanFds().find(fd);
+            return it == iomanFds().end() ? std::make_pair(IopFile{}, false) : std::make_pair(it->second, true);
+        };
+
+        if (ordinal == 20)   // AddDrv(iop_device_t*): name@0, ops@16
+        {
+            const std::string name = cstr(rdU32(a0));
+            IopDevice d;
+            d.ops = rdU32(a0 + 16);
+            d.moduleId = g_iopCurModule;
+            d.base = g_iopCurBase;
+            d.gp = g_iopCurGp;
+            d.devPtr = a0;
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            iomanDevices()[name] = d;
+            std::fprintf(stderr, "[iop-ioman] AddDrv '%s' ops=0x%08x\n", name.c_str(), d.ops);
+            ret = 0;
+        }
+        else if (ordinal == 21)   // DelDrv(const char*)
+        {
+            std::lock_guard<std::mutex> lk(iopTableMx());
+            iomanDevices().erase(cstr(a0));
+            ret = 0;
+        }
+        else if (ordinal == 4)    // open(name, mode) -> fd
+        {
+            const std::string path = cstr(a0);
+            const IopDevice dev = findDevice(path);
+            const uint32_t f = 0x1A0000u;   // iop_file_t scratch
+            uint32_t r = 0;
+            if (dev.ops)
+            {
+                wrU32(f + 0, a1); wrU32(f + 4, 0); wrU32(f + 8, dev.devPtr); wrU32(f + 12, 0);
+                r = callDevOp(dev, 12, f, a0, a1, 0);
+            }
+            if (!dev.ops || r == 0)
+            {
+                const int fd = iomanNextFd().fetch_add(1);
+                std::lock_guard<std::mutex> lk(iopTableMx());
+                iomanFds()[fd] = IopFile{dev, f};
+                ret = static_cast<uint32_t>(fd);
+            }
+            else
+            {
+                ret = r;
+            }
+        }
+        else if (ordinal == 5)    // close(fd)
+        {
+            IopFile fl; bool found = false;
+            {
+                std::lock_guard<std::mutex> lk(iopTableMx());
+                auto it = iomanFds().find(static_cast<int>(a0));
+                if (it != iomanFds().end()) { fl = it->second; found = true; iomanFds().erase(it); }
+            }
+            if (found && fl.dev.ops) callDevOp(fl.dev, 16, fl.filePtr, 0, 0, 0);
+            ret = 0;
+        }
+        else if (ordinal >= 6 && ordinal <= 9)   // read/write/lseek/ioctl
+        {
+            static const uint32_t kOff[4] = {20, 24, 28, 32};
+            auto ff = fdFile(static_cast<int>(a0));
+            ret = ff.second ? callDevOp(ff.first.dev, kOff[ordinal - 6], ff.first.filePtr, a1, a2, a3) : 0u;
+        }
+        else if (ordinal == 13)   // dopen(path, mode) -> fd
+        {
+            const std::string path = cstr(a0);
+            const IopDevice dev = findDevice(path);
+            const uint32_t f = 0x1A0000u;
+            uint32_t r = 0;
+            if (dev.ops) r = callDevOp(dev, 48, f, a0, a1, 0);
+            if (!dev.ops || r == 0)
+            {
+                const int fd = iomanNextFd().fetch_add(1);
+                std::lock_guard<std::mutex> lk(iopTableMx());
+                iomanFds()[fd] = IopFile{dev, f};
+                ret = static_cast<uint32_t>(fd);
+            }
+            else ret = r;
+        }
+        else if (ordinal == 14)   // dclose(fd)
+        {
+            IopFile fl; bool found = false;
+            {
+                std::lock_guard<std::mutex> lk(iopTableMx());
+                auto it = iomanFds().find(static_cast<int>(a0));
+                if (it != iomanFds().end()) { fl = it->second; found = true; iomanFds().erase(it); }
+            }
+            if (found && fl.dev.ops) callDevOp(fl.dev, 52, fl.filePtr, 0, 0, 0);
+            ret = 0;
+        }
+        else if (ordinal == 15)   // dread(fd, dirent*)
+        {
+            auto ff = fdFile(static_cast<int>(a0));
+            ret = ff.second ? callDevOp(ff.first.dev, 56, ff.first.filePtr, a1, 0, 0) : 0u;
+        }
+        else if (ordinal == 16 || ordinal == 17)   // getstat/chstat(name, ...)
+        {
+            const IopDevice dev = findDevice(cstr(a0));
+            ret = dev.ops ? callDevOp(dev, ordinal == 16 ? 60u : 64u, 0, a0, a1, a2) : 0u;
+        }
+        else if (ordinal == 10 || ordinal == 11 || ordinal == 12)   // remove/mkdir/rmdir(name)
+        {
+            static const uint32_t kOff[3] = {36, 40, 44};
+            const IopDevice dev = findDevice(cstr(a0));
+            ret = dev.ops ? callDevOp(dev, kOff[ordinal - 10], 0, a0, 0, 0) : 0u;
+        }
+        // 18 format -> 0
+    }
+    else if (mod == "cdvdman")
+    {
+        if (ordinal == 12)   // sceCdGetDiskType -> DVD-ROM
+            ret = 0x14u;
+        else if (ordinal == 24)   // sceCdReadClock(sceCdCLOCK*) -> fill a fixed date, success
+        {
+            if (ram && a0 && static_cast<uint64_t>(a0) + 8 <= ramSize)
+            {
+                const uint8_t clk[8] = {0, 0, 0, 12, 1, 1, 0x06, 0x20};   // 2020-01-01 12:00:00
+                std::memcpy(ram + a0, clk, 8);
+            }
+            ret = 1;
+        }
+        else   // sceCdSync/Break/Nop/StStop/StRead/... -> success
+            ret = 1;
+    }
+    else if (mod == "modload")
+    {
+        ret = 0;   // SetCheckKelfPathCallback / LoadModule* -> 0
+    }
+
+    setReturnU32(ctx, ret);
+}
+
+// [r3000] Per-module IOP registration functions emitted by the recompiler. Declared weak so a
+// module that isn't linked in simply resolves to null.
+// [portability] Weak declarations for optional IOP module registrations. GCC/Clang use
+// __attribute__((weak)); MSVC has no weak symbols, so map any absent registration to a no-op via
+// /alternatename (avoids an unresolved-symbol link error).
+#if defined(_MSC_VER)
+extern "C" void ps2x_noop_register() {}
+#define PS2X_WEAK
+#define PS2X_WEAK_MSVC(sym) __pragma(comment(linker, "/alternatename:" #sym "=ps2x_noop_register"))
+PS2X_WEAK_MSVC(ps2x_register_sio2man); PS2X_WEAK_MSVC(ps2x_register_sio2d); PS2X_WEAK_MSVC(ps2x_register_dbcman);
+PS2X_WEAK_MSVC(ps2x_register_libsd); PS2X_WEAK_MSVC(ps2x_register_sdrdrv); PS2X_WEAK_MSVC(ps2x_register_cdvdstm);
+PS2X_WEAK_MSVC(ps2x_register_mcman); PS2X_WEAK_MSVC(ps2x_register_mcserv); PS2X_WEAK_MSVC(ps2x_register_sounds);
+PS2X_WEAK_MSVC(ps2x_register_cri_adxi); PS2X_WEAK_MSVC(ps2x_register_ds2o_d); PS2X_WEAK_MSVC(ps2x_register_ds2u_d);
+PS2X_WEAK_MSVC(ps2x_register_modhsyn); PS2X_WEAK_MSVC(ps2x_register_modmidi); PS2X_WEAK_MSVC(ps2x_register_modsein);
+PS2X_WEAK_MSVC(ps2x_register_modsesq); PS2X_WEAK_MSVC(ps2x_register_modsesq2);
+#else
+#define PS2X_WEAK __attribute__((weak))
+#endif
+
+extern "C" {
+void ps2x_register_sio2man() PS2X_WEAK;
+void ps2x_register_sio2d() PS2X_WEAK;
+void ps2x_register_dbcman() PS2X_WEAK;
+void ps2x_register_libsd() PS2X_WEAK;
+void ps2x_register_sdrdrv() PS2X_WEAK;
+void ps2x_register_cdvdstm() PS2X_WEAK;
+void ps2x_register_mcman() PS2X_WEAK;
+void ps2x_register_mcserv() PS2X_WEAK;
+void ps2x_register_sounds() PS2X_WEAK;
+void ps2x_register_cri_adxi() PS2X_WEAK;
+void ps2x_register_ds2o_d() PS2X_WEAK;
+void ps2x_register_ds2u_d() PS2X_WEAK;
+void ps2x_register_modhsyn() PS2X_WEAK;
+void ps2x_register_modmidi() PS2X_WEAK;
+void ps2x_register_modsein() PS2X_WEAK;
+void ps2x_register_modsesq() PS2X_WEAK;
+void ps2x_register_modsesq2() PS2X_WEAK;
+void ps2x_register_cdvdman() PS2X_WEAK;
+void ps2x_register_cdvdfsv() PS2X_WEAK;
+}
+
+bool PS2Runtime::registerIopFunction(uint32_t address, RecompiledFunction func)
+{
+    if (!func) return false;
+    std::lock_guard<std::mutex> lk(iopTableMx());
+    iopTables()[g_iopRegModule][address] = func;
+    return true;
+}
+
+PS2Runtime::RecompiledFunction PS2Runtime::lookupIopFunction(uint32_t address)
+{
+    std::lock_guard<std::mutex> lk(iopTableMx());
+    auto mit = iopTables().find(g_iopCurModule);
+    if (mit == iopTables().end()) return nullptr;
+    auto it = mit->second.find(address);
+    return it == mit->second.end() ? nullptr : it->second;
+}
+
+// [r3000] Run runnable IOP threads cooperatively. A blocking kernel call throws IopYield and
+// unwinds here; the thread resumes later by re-entering its module's function at ctx.pc (the
+// return address it stored in ra, which the recompiler emits as a resume target).
+static void runIopScheduler(PS2Runtime *rt, uint8_t *iopBase)
+{
+    if (!iopBase) return;
+    uint64_t guard = 2000000ull;
+    while (guard-- > 0)
+    {
+        uint32_t pickId = 0;
+        for (auto &kv : iopThreads())
+            if (kv.second.status == 1) { pickId = kv.first; break; }
+        if (!pickId) break;
+
+        IopThreadState &t = iopThreads()[pickId];
+        t.status = 2;
+        g_iopCurThread = t.id;
+        g_iopCurModule = t.moduleId;
+        g_iopCurGp = t.gp;
+        g_iopCurBase = t.base;
+        PS2Runtime::RecompiledFunction fn = rt->lookupIopFunction(t.ctx.pc);
+        if (!fn) { t.status = 4; continue; }
+        std::fprintf(stderr, "[iop-sched] run tid=%u pc=0x%08x mod=%u\n", t.id, t.ctx.pc, t.moduleId);
+        try
+        {
+            fn(iopBase + t.base, &t.ctx, rt);
+            t.status = 4;
+        }
+        catch (const IopYield &y)
+        {
+            if (y.kind == 1)
+            {
+                t.status = 4;
+            }
+            else
+            {
+                if (t.status == 2) { t.status = 1; }
+                else
+                {
+                    std::fprintf(stderr, "[iop-sched] park tid=%u wait=%d/0x%x ra=0x%08x\n",
+                                 t.id, t.waitKind, t.waitId, getRegU32(&t.ctx, 31));
+                    t.ctx.pc = getRegU32(&t.ctx, 31);   // resume at the return address
+                }
+            }
+        }
+        catch (...) { t.status = 4; }
+    }
+    g_iopCurThread = 0;
+}
+
+// [r3000] Deliver an EE-side SIF RPC to a native module's registered handler (sifcmd
+// sceSifRegisterRpc). Copies the request from EE RAM into IOP RAM, calls the handler with
+// (command, data, size) and copies the result back. Returns false if no native server owns sid.
+bool ps2xInvokeIopRpc(PS2Runtime *rt, uint32_t sid, uint32_t command,
+                      uint8_t *eeRam, uint32_t sendAddr, uint32_t sendSize,
+                      uint32_t recvAddr, uint32_t recvSize)
+{
+    if (!rt) return false;
+    if (sid >= 0x80001300u && sid < 0x80001400u)
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        std::fprintf(stderr, "[iop-xrpc-probe] sid=0x%08x cmd=0x%x send=%u recv=%u servers=%zu found=%d\n",
+                     sid, command, sendSize, recvSize, sifRpcServers().size(),
+                     (int)sifRpcServers().count(sid));
+    }
+    IopSifRpc svc;
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        auto it = sifRpcServers().find(sid);
+        if (it == sifRpcServers().end() || !it->second.handler) return false;
+        svc = it->second;
+    }
+    PS2Runtime::RecompiledFunction fn = nullptr;
+    uint32_t savedMod = 0;
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        savedMod = g_iopCurModule;
+        g_iopCurModule = svc.moduleId;
+        g_iopCurGp = svc.gp;
+        g_iopCurBase = svc.base;
+        auto mit = iopTables().find(svc.moduleId);
+        if (mit != iopTables().end())
+        {
+            auto fit = mit->second.find(svc.handler);
+            if (fit != mit->second.end()) fn = fit->second;
+        }
+    }
+    if (!fn)
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        g_iopCurModule = savedMod;
+        return false;
+    }
+
+    size_t total = 0;
+    uint8_t *iopBase = iopGuestSpace(total);
+    if (!iopBase) return false;
+
+    constexpr uint32_t kScratch = 0x180000;   // IOP RAM scratch for the request/response
+    constexpr uint32_t kScratchSize = 0x8000;
+    const uint32_t n = sendSize < kScratchSize ? sendSize : kScratchSize;
+    if (n && eeRam)
+    {
+        if (uint8_t *s = getMemPtr(eeRam, sendAddr))
+            std::memcpy(iopBase + svc.base + kScratch, s, n);
+        else
+            std::memset(iopBase + svc.base + kScratch, 0, n);
+    }
+
+    R5900Context ctx{};
+    ctx.pc = svc.handler;
+    ctx.r[28] = _mm_cvtsi32_si128(svc.gp);
+    ctx.r[29] = _mm_cvtsi32_si128(0x1F0000u);
+    ctx.r[4] = _mm_cvtsi32_si128(command);
+    ctx.r[5] = _mm_cvtsi32_si128(kScratch);
+    ctx.r[6] = _mm_cvtsi32_si128(n);
+
+    std::fprintf(stderr, "[iop-xrpc] sid=0x%08x cmd=0x%x -> handler 0x%08x size=%u\n",
+                 sid, command, svc.handler, n);
+    try { fn(iopBase + svc.base, &ctx, rt); }
+    catch (...) { /* the handler unwound (yield/exit) */ }
+
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        g_iopCurModule = savedMod;
+    }
+
+    if (recvAddr && eeRam && recvSize)
+    {
+        if (uint8_t *d = getMemPtr(eeRam, recvAddr))
+            std::memcpy(d, iopBase + svc.base + kScratch,
+                        recvSize < kScratchSize ? recvSize : kScratchSize);
+    }
+    return true;
+}
+
+void PS2Runtime::reportMissingIopFunction(uint32_t targetPc, uint32_t sourcePc, const char *debugName)
+{
+    static std::mutex mx;
+    static std::unordered_set<uint32_t> seen;
+    std::lock_guard<std::mutex> lk(mx);
+    if (seen.insert(targetPc).second)
+        std::fprintf(stderr, "[iop-dispatch] missing IOP function 0x%08x (from 0x%08x, %s)\n",
+                     targetPc, sourcePc, debugName ? debugName : "?");
+}
+
+bool PS2Runtime::dispatchIopBranch(uint8_t *rdram, R5900Context *ctx, uint32_t targetPc,
+                                   uint32_t sourcePc, uint32_t fallthroughPc,
+                                   GuestBranchKind kind, const char *debugName)
+{
+    (void)fallthroughPc;
+    (void)kind;
+    RecompiledFunction fn = lookupIopFunction(targetPc);
+    if (!fn)
+    {
+        reportMissingIopFunction(targetPc, sourcePc, debugName);
+        return false;
+    }
+    fn(rdram, ctx, this);
+    return true;
+}
+
+// [r3000] Load an IRX at the next IOP base, register its recompiled functions and run its entry.
+bool PS2Runtime::loadAndRunIopModule(const char *path)
+{
+    if (!path || !path[0])
+        return false;
+    ps2iop::Module mod;
+    if (!ps2iop::loadIrx(path, mod))
+    {
+        std::fprintf(stderr, "[iop-run] cannot load IRX: %s\n", path);
+        return false;
+    }
+
+    // [guard] A malformed IOP header (unparsed text size) would run the module with a bogus gp
+    // and corrupt state; falling back to the HLE path is safer.
+    if (mod.hdrText == 0)
+    {
+        std::fprintf(stderr, "[iop-run] %s: IOP header text=0 (invalid) -> keeping HLE\n", mod.name.c_str());
+        return false;
+    }
+
+    size_t totalSize = 0;
+    uint8_t *iopBase = iopGuestSpace(totalSize);
+    if (!iopBase)
+    {
+        std::fprintf(stderr, "[iop-run] cannot map the IOP guest space\n");
+        return false;
+    }
+
+    // Reserve space for the module's real size (text+data+bss). A fixed 64 KiB slot is too
+    // small: e.g. MCMAN is ~74 KiB and would overlap the next module's base.
+    uint32_t modSize = 0x10000u;
+    for (const auto &seg : mod.segments)
+        modSize = std::max(modSize, seg.vaddr + static_cast<uint32_t>(seg.memsz));
+    modSize = (modSize + 0xFFFu) & ~0xFFFu;
+
+    const uint32_t base = g_iopNextBase;
+    g_iopNextBase += modSize;
+
+    std::memset(iopBase + base, 0, modSize);
+    for (const auto &seg : mod.segments)
+    {
+        if (seg.iopHeader || seg.data.empty())
+            continue;
+        if (static_cast<uint64_t>(base) + seg.vaddr + seg.data.size() > totalSize)
+            continue;
+        std::memcpy(iopBase + base + seg.vaddr, seg.data.data(), seg.data.size());
+    }
+
+    IopMod m;
+    m.name = mod.name;
+    m.id = g_iopNextId++;
+    m.base = base;
+    m.gp = mod.gp;
+    m.entry = mod.entry;
+    for (const auto &exp : mod.exports)
+    {
+        if (!exp.module.empty())
+        {
+            m.exportName = exp.module;
+            m.exportVaddr = exp.tableVaddr;
+        }
+    }
+    if (!m.exportName.empty())
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        iopModulesByExport()[m.exportName] = m;
+    }
+
+    // Register this module's recompiled functions into its own table.
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        g_iopRegModule = m.id;
+    }
+    const std::string bn = mod.name;
+    if (bn.find("SIO2MAN") != std::string::npos)
+    {
+        if (ps2x_register_sio2man) ps2x_register_sio2man();
+    }
+    else if (bn.find("SIO2D") != std::string::npos)
+    {
+        if (ps2x_register_sio2d) ps2x_register_sio2d();
+    }
+    else if (bn.find("DBCMAN") != std::string::npos)
+    {
+        if (ps2x_register_dbcman) ps2x_register_dbcman();
+    }
+    else if (bn.find("LIBSD") != std::string::npos)
+    {
+        if (ps2x_register_libsd) ps2x_register_libsd();
+    }
+    else if (bn.find("SDRDRV") != std::string::npos)
+    {
+        if (ps2x_register_sdrdrv) ps2x_register_sdrdrv();
+    }
+    else if (bn.find("CDVDSTM") != std::string::npos)
+    {
+        if (ps2x_register_cdvdstm) ps2x_register_cdvdstm();
+    }
+    else if (bn.find("MCMAN") != std::string::npos)
+    {
+        if (ps2x_register_mcman) ps2x_register_mcman();
+    }
+    else if (bn.find("MCSERV") != std::string::npos)
+    {
+        if (ps2x_register_mcserv) ps2x_register_mcserv();
+    }
+    else if (bn.find("CDVDMAN") != std::string::npos)
+    {
+        if (ps2x_register_cdvdman) ps2x_register_cdvdman();
+    }
+    else if (bn.find("CDVDFSV") != std::string::npos)
+    {
+        if (ps2x_register_cdvdfsv) ps2x_register_cdvdfsv();
+    }
+    else if (bn.find("SOUNDS") != std::string::npos)
+    {
+        if (ps2x_register_sounds) ps2x_register_sounds();
+    }
+    else if (bn.find("CRI_ADXI") != std::string::npos)
+    {
+        if (ps2x_register_cri_adxi) ps2x_register_cri_adxi();
+    }
+    else if (bn.find("DS2O_D") != std::string::npos)
+    {
+        if (ps2x_register_ds2o_d) ps2x_register_ds2o_d();
+    }
+    else if (bn.find("DS2U_D") != std::string::npos)
+    {
+        if (ps2x_register_ds2u_d) ps2x_register_ds2u_d();
+    }
+    else if (bn.find("MODHSYN") != std::string::npos)
+    {
+        if (ps2x_register_modhsyn) ps2x_register_modhsyn();
+    }
+    else if (bn.find("MODMIDI") != std::string::npos)
+    {
+        if (ps2x_register_modmidi) ps2x_register_modmidi();
+    }
+    else if (bn.find("MODSEIN") != std::string::npos)
+    {
+        if (ps2x_register_modsein) ps2x_register_modsein();
+    }
+    else if (bn.find("MODSESQ") != std::string::npos)
+    {
+        if (ps2x_register_modsesq) ps2x_register_modsesq();
+    }
+    else if (bn.find("MODSESQ2") != std::string::npos)
+    {
+        if (ps2x_register_modsesq2) ps2x_register_modsesq2();
+    }
+
+    RecompiledFunction fn = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(iopTableMx());
+        g_iopCurModule = m.id;
+        auto &t = iopTables()[m.id];
+        auto it = t.find(m.entry);
+        if (it != t.end()) fn = it->second;
+    }
+    if (!fn)
+    {
+        std::fprintf(stderr, "[iop-run] %s: no recompiled function at entry 0x%08x\n",
+                     mod.name.c_str(), mod.entry);
+        return false;
+    }
+
+    R5900Context ctx{};
+    ctx.pc = mod.entry;
+    ctx.r[29] = _mm_cvtsi32_si128(0x1F0000u);   // sp (top of IOP RAM, below scratchpad)
+    ctx.r[28] = _mm_cvtsi32_si128(m.gp);        // gp
+    ctx.r[4] = _mm_cvtsi32_si128(0u);           // a0
+
+    g_iopCurThread = 0;
+    g_iopCurModule = m.id;
+    g_iopCurGp = m.gp;
+    g_iopCurBase = base;
+
+    std::fprintf(stderr, "[iop-run] %s: entry 0x%08x gp 0x%08x base 0x%x (native)\n",
+                 mod.name.c_str(), mod.entry, mod.gp, base);
+    const char *wd = std::getenv("PS2X_IOP_WATCHDOG");
+#if !defined(_WIN32)
+    std::thread wdThread;
+#endif
+    if (wd && wd[0])
+    {
+#if !defined(_WIN32)
+        std::signal(SIGALRM, iopWdHandler);
+        g_iopWdThread.store(reinterpret_cast<void *>(pthread_self()));
+        g_iopWdArmed.store(true);
+        const int secs = std::atoi(wd);
+        wdThread = std::thread([secs]()
+        {
+            for (int i = 0; i < secs * 20; ++i)
+            {
+                if (!g_iopWdArmed.load()) return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (g_iopWdArmed.load())
+                pthread_kill(reinterpret_cast<pthread_t>(g_iopWdThread.load()), SIGALRM);
+        });
+#endif
+    }
+    if (const char *noEntry = std::getenv("PS2X_IOP_NOENTRY");
+        !(noEntry && noEntry[0] && mod.name.find(noEntry) != std::string::npos))
+    {
+        try { fn(iopBase + base, &ctx, this); }
+        catch (const IopYield &) { /* the entry itself yielded */ }
+        catch (const std::exception &e) { std::fprintf(stderr, "[iop-run] %s entry threw: %s\n", mod.name.c_str(), e.what()); }
+        catch (...) { std::fprintf(stderr, "[iop-run] %s entry threw (unknown)\n", mod.name.c_str()); }
+    }
+    else
+    {
+        std::fprintf(stderr, "[iop-run] %s: entry skipped (PS2X_IOP_NOENTRY)\n", mod.name.c_str());
+    }
+    if (wd && wd[0])
+    {
+#if !defined(_WIN32)
+        g_iopWdArmed.store(false);
+        if (wdThread.joinable()) wdThread.join();
+#endif
+    }
+    // [diagnostic] Exercise the cross-module path by calling SIO2D's sio2man import stubs.
+    if (const char *xt = std::getenv("PS2X_IOP_XCALL_TEST"); xt && xt[0] && bn.find("SIO2D") != std::string::npos)
+    {
+        for (uint32_t stub : {0x1ac8u, 0x1ad0u, 0x1ad8u, 0x1ae0u})
+        {
+            RecompiledFunction sf = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(iopTableMx());
+                auto &t = iopTables()[m.id];
+                auto it = t.find(stub);
+                if (it != t.end()) sf = it->second;
+            }
+            if (sf)
+            {
+                R5900Context sc{};
+                sc.pc = stub;
+                sc.r[29] = _mm_cvtsi32_si128(0x1F0000u);
+                sc.r[28] = _mm_cvtsi32_si128(m.gp);
+                sc.r[4] = _mm_cvtsi32_si128(0u);
+                sf(iopBase + base, &sc, this);
+            }
+        }
+    }
+
+    std::fprintf(stderr, "[iop-run] %s: entry returned\n", mod.name.c_str());
+
+    if (const char *s = std::getenv("PS2X_IOP_SCHED"); !(s && s[0] == '0'))
+    {
+        std::fprintf(stderr, "[iop-sched] running threads after %s\n", mod.name.c_str());
+        runIopScheduler(this, iopBase);
+        std::fprintf(stderr, "[iop-sched] threads drained\n");
+    }
+    return true;
 }
 
 void PS2Runtime::reportMissingFunction(uint8_t *rdram,
@@ -4933,6 +6082,36 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
 }
 
+// [r3000] IOP register accesses (from IOP code): keep them out of the EE memory model and give
+// them a persistent register file. `rdram` identifies IOP code (it points into the IOP mapping).
+namespace
+{
+    std::unordered_map<uint32_t, uint32_t> &iopRegs()
+    {
+        static std::unordered_map<uint32_t, uint32_t> m;
+        return m;
+    }
+    bool isIopRegisterAccess(uint8_t *rdram, uint32_t vaddr, uint32_t &norm)
+    {
+        size_t sz = 0;
+        uint8_t *base = iopGuestSpace(sz);
+        if (!base || rdram < base || rdram >= base + sz) return false;
+        if (vaddr >= 0x1F801000u && vaddr < 0x1F810000u) { norm = vaddr; return true; }
+        if (vaddr >= 0xBF801000u && vaddr < 0xBF810000u) { norm = vaddr & 0x1FFFFFFFu; return true; }
+        return false;
+    }
+    void iopRegLog(uint32_t addr, uint32_t value, bool write)
+    {
+        static const bool on = []() { const char *v = std::getenv("PS2X_IOP_REGLOG"); return v && v[0] && v[0] != '0'; }();
+        if (!on) return;
+        static std::mutex mx;
+        static std::unordered_set<uint32_t> seen;
+        std::lock_guard<std::mutex> lk(mx);
+        if (seen.insert(addr).second)
+            std::fprintf(stderr, "[iop-reg] %s 0x%08x = 0x%08x\n", write ? "W" : "R", addr, value);
+    }
+}
+
 uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
@@ -4948,6 +6127,16 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    uint32_t n = 0;
+    if (isIopRegisterAccess(rdram, vaddr, n))
+    {
+        auto it = iopRegs().find(n);
+        const uint32_t v = (it != iopRegs().end())
+                               ? it->second
+                               : (n == 0x1F801044u ? 0x00000025u : n == 0x1F808244u ? 0x00000001u : 0u);
+        iopRegLog(n, v, false);
+        return v;
+    }
     try
     {
         return m_memory.read32(vaddr);
@@ -5013,6 +6202,17 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
+    uint32_t n = 0;
+    if (isIopRegisterAccess(rdram, vaddr, n))
+    {
+        iopRegs()[n] = value;
+        iopRegLog(n, value, true);
+        // SIO0/PIO and SIO2: a write to the control register completes the transfer immediately
+        // (mark the status register ready), so drivers polling for completion can proceed.
+        if (n == 0x1F80104Au) iopRegs()[0x1F801044u] = 0x00000025u;   // SIO0 CTRL -> STAT (TX/RX ready)
+        if (n == 0x1F808240u) iopRegs()[0x1F808244u] = 0x00000001u;   // SIO2 CTRL -> STAT ready
+        return;
+    }
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
     try
     {

@@ -161,6 +161,24 @@ namespace ps2recomp
         ss << "#include \"ps2_recompiled_stubs.h\"//this will give duplicated erros because runtime maybe has it define already, just delete the TODOS ones\n";
         ss << "#include \"ps2_syscalls.h\"\n\n";
 
+        // [r3000] IOP modules load at vaddr 0, so they register into the dedicated IOP table
+        // instead of the EE's g_ps2RecompiledFunctionTable (which uses the same low addresses).
+        // Emit a named registration function the loader calls (resetting the table each time).
+        if (cg.arch() == Arch::R3000)
+        {
+            const std::string sym = cg.iopRegistrationSymbol().empty()
+                                        ? std::string("ps2x_register_iop_module")
+                                        : cg.iopRegistrationSymbol();
+            ss << "extern \"C\" void " << sym << "()\n{\n";
+            for (const auto &[address, name] : entries)
+            {
+                ss << "    PS2Runtime::registerIopFunction(0x" << std::hex << address << "u, "
+                   << name << ");\n" << std::dec;
+            }
+            ss << "}\n";
+            return ss.str();
+        }
+
         ss << "extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x" << std::hex << tableBase << "u;\n";
         ss << "extern const uint32_t g_ps2RecompiledFunctionTableEnd = 0x" << std::hex << tableEnd << "u;\n";
         ss << "extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = " << std::dec << slotCount << "u;\n";

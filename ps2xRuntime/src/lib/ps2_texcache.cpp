@@ -241,6 +241,10 @@ bool flushLocked()
         if (!o.good()) { std::fprintf(stderr, "[texcache] write failed for %s\n", tmp.c_str()); return false; }
     }
     std::error_code ec;
+#if defined(_WIN32)
+    std::filesystem::remove(g_path, ec);   // Windows rename fails if the destination exists
+    ec.clear();
+#endif
     std::filesystem::rename(tmp, g_path, ec);
     if (ec) { std::fprintf(stderr, "[texcache] rename failed: %s\n", ec.message().c_str()); return false; }
     std::fprintf(stderr, "[texcache] flushed %zu entries (%zu bytes), +%zu new\n",

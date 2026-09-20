@@ -5,6 +5,7 @@
 #include "ps2_compat.h"
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_vu1_native.h"   // [vunative]
+#include "runtime/ps2_coverage.h"     // [coverage]
 extern std::atomic<uint64_t> g_vu1PairCount;   // defined below; the [vunative] hook binds it before that point
 thread_local uint32_t g_vu1CensusProg = 0;    // [gifcensus] low 32 bits of the hash of the program this thread last selected (read by the arbiter for PATH1)
 #include "runtime/ps2_guestprof.h"
@@ -1349,6 +1350,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 std::lock_guard<std::mutex> lk(s_mdMtx);
                 if (s_mdSeen.insert(h).second)
                 {
+                    ps2cov::noteVuProgram(1, h, codeSize);   // [coverage] un-recompiled VU1 microprogram
                     char path[512]; vumicroDumpPath(path, sizeof path, h);
                     FILE *f = std::fopen(path, "wb"); if (f) { std::fwrite(vuCode, 1, codeSize, f); std::fclose(f); }
                     std::fprintf(stderr, "[vu1jit] uncompiled microcode %016llx extent 0x%x (gen %u) %s %s\n", (unsigned long long)h,

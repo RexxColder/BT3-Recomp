@@ -1,4 +1,5 @@
 #include "runtime/ps2_iop.h"
+#include "runtime/ps2_coverage.h"
 #include "runtime/ps2_iop_audio.h"
 #include "runtime/ps2_iop_cl.h"
 #include "runtime/ps2_iop_dbcman.h"
@@ -14,6 +15,10 @@
 #include <algorithm>
 #include <atomic>
 #include <iostream>
+
+// [r3000] Native IOP RPC delivery (defined in ps2_runtime.cpp).
+extern bool ps2xInvokeIopRpc(PS2Runtime *rt, uint32_t sid, uint32_t command, uint8_t *eeRam,
+                             uint32_t sendAddr, uint32_t sendSize, uint32_t recvAddr, uint32_t recvSize);
 
 namespace
 {
@@ -133,6 +138,19 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
     resultPtr = 0u;
     signalNowaitCompletion = false;
 
+    // [r3000] When the native IOPRP file service (CDVDFSV) is brought up, prefer its handler for
+    // the DVCI RPCs instead of the HLE resolver.
+    if (const char *e = std::getenv("PS2X_IOP_IOPRP"); e && e[0] && e[0] != '0')
+    {
+        if ((sid == 0x80000597u || sid == 0x2000004u) &&
+            ps2xInvokeIopRpc(runtime, sid, rpcNum, m_rdram, sendBufAddr, sendSize, recvBufAddr, recvSize))
+        {
+            signalNowaitCompletion = true;
+            if (recvBufAddr) resultPtr = recvBufAddr;
+            return true;
+        }
+    }
+
     // Dragon Ball Z: Budokai Tenkaichi 3 (SLUS_216.78) DVCI disc file-resolver.
     // sid 0x80000597, cmd 0 = "find file": the guest sends a path string at
     // sendBuf+0x24 (e.g. "\DATA\PZS3US.DIR;1") in a 300-byte buffer and expects
@@ -215,6 +233,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
             }
         }
         signalNowaitCompletion = true;
+        ps2cov::noteIopModule("DVCI", rpcNum);
         return true;
     }
 
@@ -317,6 +336,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
             resultPtr = recvBufAddr;
         }
         signalNowaitCompletion = true;
+        ps2cov::noteIopModule("DVCI", rpcNum);
         return true;
     }
 
@@ -331,7 +351,19 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                                   resultPtr,
                                                   signalNowaitCompletion))
     {
+        ps2cov::noteIopModule("SOUNDS", rpcNum);
         return true;
+    }
+
+    // [r3000] Deliver DBCMAN RPCs to the native module's registered handler (opt out with =0).
+    if (const char *nat = std::getenv("PS2X_IOP_NATIVE_DBCMAN"); !(nat && nat[0] == '0'))
+    {
+        if (ps2xInvokeIopRpc(runtime, sid, rpcNum, m_rdram, sendBufAddr, sendSize, recvBufAddr, recvSize))
+        {
+            signalNowaitCompletion = true;
+            if (recvBufAddr) resultPtr = recvBufAddr;
+            return true;
+        }
     }
 
     if (ps2_iop_dbcman::handleDbcManRpc(m_rdram,
@@ -343,6 +375,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                         recvSize,
                                         resultPtr))
     {
+        ps2cov::noteIopModule("DBCMAN", rpcNum);
         return true;
     }
 
@@ -356,6 +389,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                       recvSize,
                                       resultPtr))
     {
+        ps2cov::noteIopModule("LIBSD", rpcNum);
         return true;
     }
 
@@ -365,6 +399,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                    recvSize, resultPtr,
                                    signalNowaitCompletion))
     {
+        ps2cov::noteIopModule("CRI_ADXI", rpcNum);
         return true;
     }
 
@@ -373,6 +408,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                     sendSize, recvBufAddr,
                                     recvSize, resultPtr))
     {
+        ps2cov::noteIopModule("CRI_ADXI", rpcNum);
         return true;
     }
 
@@ -381,6 +417,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                         sendSize, recvBufAddr,
                                         recvSize, resultPtr))
     {
+        ps2cov::noteIopModule("SDRDRV", rpcNum);
         return true;
     }
 

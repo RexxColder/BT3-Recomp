@@ -58,3 +58,7 @@ launcher-build-log.txt
 # runtime-generated game save data + imgui layout (local only)
 games/bt3/savedata/
 imgui.ini
+
+# orchestrator runtime state (dev-local corpus)
+tools/orchestrator/state.json
+tools/orchestrator/corpus/

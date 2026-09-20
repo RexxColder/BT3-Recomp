@@ -522,6 +522,23 @@ public:
     MissingFunctionPolicy missingFunctionPolicy() const;
     void resetMissingFunctionReportOnce();
 
+    // [r3000] An IRX import stub resolved to a kernel/SIF call. `module`/`ordinal` identify the
+    // target; on return the handler result must land in v0 (ctx->r[2]), matching the IOP ABI.
+    // Operates on the dedicated IOP RAM (see iopRam()), not the EE's rdram.
+    void iopImport(uint8_t *rdram, R5900Context *ctx, const char *module, uint32_t ordinal);
+    std::vector<uint8_t> &iopRam();   // 2 MiB IOP RAM, lazily allocated
+
+    // [r3000] IOP module dispatch: an IRX loads at vaddr 0, so its functions live in a table
+    // separate from the EE's recompiled table. Registered by the module's registration unit.
+    static bool registerIopFunction(uint32_t address, RecompiledFunction func);    RecompiledFunction lookupIopFunction(uint32_t address);
+    bool dispatchIopBranch(uint8_t *rdram, R5900Context *ctx, uint32_t targetPc, uint32_t sourcePc,
+                           uint32_t fallthroughPc, GuestBranchKind kind, const char *debugName);
+    void reportMissingIopFunction(uint32_t targetPc, uint32_t sourcePc, const char *debugName);
+    // [r3000] Map an IRX into IOP RAM, set up the R3000 context (gp/sp) and call its entry
+    // through the IOP table. Relocations are identity while the module loads at its link
+    // address (vaddr 0). Returns false if the IRX or the entry function is unavailable.
+    bool loadAndRunIopModule(const char *path);
+
     static const IoPaths &getIoPaths();
     static void setIoPaths(const IoPaths &paths);
     static void configureIoPathsFromElf(const std::string &elfPath);

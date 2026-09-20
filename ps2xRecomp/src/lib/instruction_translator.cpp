@@ -19,6 +19,23 @@ namespace ps2recomp
 
     std::string InstructionTranslator::translate(const Instruction &inst)
     {
+        // [r3000] The IOP (R3000) is MIPS I: reject the R5900-only classes instead of emitting them.
+        if (m_codeGenerator.arch() == Arch::R3000)
+        {
+            if (inst.isMMI || inst.isVU)
+                return m_codeGenerator.emitUnhandledInstruction(inst, "R5900-only (MMI/VU) instruction in an R3000 build");
+            switch (inst.opcode)
+            {
+            case OPCODE_COP1: case OPCODE_COP2:
+            case OPCODE_LQ: case OPCODE_SQ: case OPCODE_LD: case OPCODE_SD:
+            case OPCODE_LDL: case OPCODE_LDR: case OPCODE_SDL: case OPCODE_SDR:
+            case OPCODE_LWC1: case OPCODE_SWC1: case OPCODE_LDC2: case OPCODE_SDC2:
+            case OPCODE_DADDI: case OPCODE_DADDIU:
+                return m_codeGenerator.emitUnhandledInstruction(inst, "R5900-only instruction in an R3000 build");
+            default: break;
+            }
+        }
+
         if (inst.isMMI)
         {
             return m_codeGenerator.translateMMIInstruction(inst);

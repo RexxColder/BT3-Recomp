@@ -504,6 +504,8 @@ src/lib/ui_sdl.cpp          # [C] ImGui platform glue on SDL2 (replaces rlImGui)
     src/lib/ps2_gs_rasterizer.cpp
     src/lib/ps2_texreplace.cpp   # [texreplace] PCSX2-compatible texture identity
     src/lib/ps2_texcache.cpp     # [texcache] persistent write-back texture cache
+    src/lib/ps2_coverage.cpp     # [coverage] interpreter-fallback capture for the orchestrator
+    src/lib/ps2_iop_module.cpp   # [iop] IRX (IOP module) loader
     src/lib/ps2_fmv_override.cpp # [fmvoverride] inject a user 4K video as the opening FMV
     src/lib/ps2_netplay.cpp      # [netplay] deterministic lockstep transport
     src/lib/ps2_iop.cpp
@@ -597,6 +599,49 @@ endif()
 add_executable(ps2EntryRunner
     ${RUNNER_SRC_FILES}
     ${RUNNER_RESOURCES}
+)
+
+# [r3000] Recompiled IOP modules are compiled straight into the runner (not a static lib) so
+# their function-table registration objects are never dropped by the linker.
+target_sources(ps2EntryRunner PRIVATE
+    src/iop_native/sio2man/ps2_recompiled_functions.cpp
+    src/iop_native/sio2man/register_functions.cpp
+    src/iop_native/sio2d/ps2_recompiled_functions.cpp
+    src/iop_native/sio2d/register_functions.cpp
+    src/iop_native/dbcman/ps2_recompiled_functions.cpp
+    src/iop_native/dbcman/register_functions.cpp
+    src/iop_native/libsd/ps2_recompiled_functions.cpp
+    src/iop_native/libsd/register_functions.cpp
+    src/iop_native/sdrdrv/ps2_recompiled_functions.cpp
+    src/iop_native/sdrdrv/register_functions.cpp
+    src/iop_native/cdvdstm/ps2_recompiled_functions.cpp
+    src/iop_native/cdvdstm/register_functions.cpp
+    src/iop_native/mcman/ps2_recompiled_functions.cpp
+    src/iop_native/mcman/register_functions.cpp
+    src/iop_native/mcserv/ps2_recompiled_functions.cpp
+    src/iop_native/mcserv/register_functions.cpp
+    src/iop_native/sounds/ps2_recompiled_functions.cpp
+    src/iop_native/sounds/register_functions.cpp
+    src/iop_native/cri_adxi/ps2_recompiled_functions.cpp
+    src/iop_native/cri_adxi/register_functions.cpp
+    src/iop_native/ds2o_d/ps2_recompiled_functions.cpp
+    src/iop_native/ds2o_d/register_functions.cpp
+    src/iop_native/ds2u_d/ps2_recompiled_functions.cpp
+    src/iop_native/ds2u_d/register_functions.cpp
+    src/iop_native/modhsyn/ps2_recompiled_functions.cpp
+    src/iop_native/modhsyn/register_functions.cpp
+    src/iop_native/modmidi/ps2_recompiled_functions.cpp
+    src/iop_native/modmidi/register_functions.cpp
+    src/iop_native/modsein/ps2_recompiled_functions.cpp
+    src/iop_native/modsein/register_functions.cpp
+    src/iop_native/modsesq/ps2_recompiled_functions.cpp
+    src/iop_native/modsesq/register_functions.cpp
+    src/iop_native/modsesq2/ps2_recompiled_functions.cpp
+    src/iop_native/modsesq2/register_functions.cpp
+    src/iop_native/cdvdman/ps2_recompiled_functions.cpp
+    src/iop_native/cdvdman/register_functions.cpp
+    src/iop_native/cdvdfsv/ps2_recompiled_functions.cpp
+    src/iop_native/cdvdfsv/register_functions.cpp
 )
 
 # The overlay's single 20MB TU and its register file must not be unity-batched

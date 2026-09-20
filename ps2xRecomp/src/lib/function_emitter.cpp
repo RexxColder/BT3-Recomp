@@ -85,6 +85,18 @@ namespace ps2recomp
         ss << "    PS_LOG_ENTRY(\"" << sanitizedName << "\");\n";
         ss << "#endif\n";
         ss << "\n";
+
+        // [r3000] IRX import stub (jr ra; li v0,ordinal): resolve to the HLE handler instead of
+        // emitting the stub body, so the recompiled module actually calls the kernel/SIF.
+        auto impIt = cg.m_importStubs.find(function.start);
+        if (impIt != cg.m_importStubs.end())
+        {
+            ss << "    runtime->iopImport(rdram, ctx, \"" << impIt->second.module << "\", "
+               << impIt->second.ordinal << "u);\n";
+            ss << "}\n";
+            return ss.str();
+        }
+
         if (!resumeTargets.empty())
         {
             ss << "    switch (ctx->pc) {\n";

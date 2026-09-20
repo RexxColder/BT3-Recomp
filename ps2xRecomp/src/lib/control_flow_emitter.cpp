@@ -191,9 +191,13 @@ namespace ps2recomp
                                                        std::string_view indent,
                                                        bool returnOnTransfer)
     {
+        // [r3000] IOP modules use their own dispatch/function table: the IRX loads at vaddr 0,
+        // which would collide with the EE's recompiled table (also low addresses).
+        const char *dispatchFn = (m_gen.arch() == Arch::R3000) ? "dispatchIopBranch" : "dispatchGuestBranch";
         m_ss << fmt::format(
-            "{}if (!runtime->dispatchGuestBranch(rdram, ctx, {}, 0x{:X}u, 0x{:X}u, PS2Runtime::GuestBranchKind::{}, \"{}\")) {{\n",
+            "{}if (!runtime->{}(rdram, ctx, {}, 0x{:X}u, 0x{:X}u, PS2Runtime::GuestBranchKind::{}, \"{}\")) {{\n",
             indent,
+            dispatchFn,
             targetExpression,
             sourcePc,
             returnPc,

@@ -20,6 +20,7 @@
 #include <limits>
 #include <functional>
 #include <thread>
+#include <cstring>
 
 namespace fs = std::filesystem;
 
@@ -914,6 +915,56 @@ namespace ps2recomp
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
             m_codeGenerator->setEmitInstructionComments(true);
             m_codeGenerator->setPcStoresAll(m_config.pcStoresAll);   // [pcstores]
+            m_codeGenerator->setArch(m_config.arch);                  // [r3000] R5900 (default) or R3000 (IOP)
+
+            if (m_config.arch == Arch::R3000)
+            {
+                // Scan the input's code for IRX import tables (ps2sdk irx.h) and map each stub
+                // vaddr to its (module, ordinal), so import stubs become HLE calls in the output.
+                std::unordered_map<uint32_t, IopImport> imports;
+                constexpr uint32_t kImportMagic = 0x41e00000u;
+                for (const auto &sec : m_elfParser->getSections())
+                {
+                    if (!sec.isCode || !sec.data || sec.size < 20)
+                        continue;
+                    const uint8_t *p = sec.data;
+                    for (size_t off = 0; off + 20 <= sec.size;)
+                    {
+                        uint32_t magic = 0;
+                        std::memcpy(&magic, p + off, 4);
+                        if (magic != kImportMagic) { off += 4; continue; }
+                        char nm[9] = {0};
+                        std::memcpy(nm, p + off + 12, 8);
+                        size_t q = off + 20;
+                        while (q + 8 <= sec.size)
+                        {
+                            uint32_t jump = 0;
+                            std::memcpy(&jump, p + q, 4);
+                            if (jump == 0) break;
+                            uint16_t ord = 0;
+                            std::memcpy(&ord, p + q + 4, 2);
+                            imports[sec.address + static_cast<uint32_t>(q)] = IopImport{std::string(nm), ord};
+                            q += 8;
+                        }
+                        off = q + 8;
+                    }
+                }
+                m_codeGenerator->setIopImports(imports);
+                if (!imports.empty())
+                {
+                    m_reporter.info("iop", "resolved " + std::to_string(imports.size()) +
+                                              " IRX import stub(s) to HLE calls");
+                }
+
+                // Per-module registration symbol, e.g. SIO2MAN.IRX -> ps2x_register_sio2man.
+                std::string base = fs::path(m_config.inputPath).stem().string();
+                std::string sym = "ps2x_register_";
+                for (char c : base)
+                    sym.push_back(std::isalnum(static_cast<unsigned char>(c))
+                                      ? static_cast<char>(std::tolower(static_cast<unsigned char>(c)))
+                                      : '_');
+                m_codeGenerator->setIopRegistrationSymbol(sym);
+            }
 
             fs::create_directories(m_config.outputPath);
 
@@ -1847,6 +1898,58 @@ namespace ps2recomp
         }
     }
 
+    // [r3000] Mark loads/stores to IOP registers (0x1F80xxxx / 0xBF80xxxx) as MMIO so the
+    // generated code routes them through runtime->Load/Store32 instead of raw IOP RAM. The
+    // address is recovered from a preceding lui + ori/addiu on the base register.
+    static void markR3000Mmio(std::vector<Instruction> &instructions)
+    {
+        uint32_t regVal[32] = {0};
+        bool regKnown[32] = {false};
+        auto isIopReg = [](uint32_t a)
+        {
+            return (a >= 0x1F800000u && a < 0x1F810000u) ||
+                   (a >= 0xBF800000u && a < 0xBF810000u);
+        };
+        for (auto &inst : instructions)
+        {
+            if (inst.isBranch || inst.isJump || inst.isCall ||
+                (inst.opcode == OPCODE_SPECIAL && (inst.function == 8u /*JR*/ || inst.function == 9u /*JALR*/)))
+            {
+                for (int i = 0; i < 32; ++i) regKnown[i] = false;
+                continue;
+            }
+            const uint32_t op = inst.opcode, rs = inst.rs, rt = inst.rt;
+            if (op == OPCODE_LUI)
+            {
+                regVal[rt] = inst.immediate << 16;
+                regKnown[rt] = true;
+                continue;
+            }
+            if (op == OPCODE_ORI && rs != 0 && regKnown[rs])
+            {
+                regVal[rt] = regVal[rs] | (inst.immediate & 0xFFFFu);
+                regKnown[rt] = true;
+                continue;
+            }
+            if (op == OPCODE_ADDIU && rs != 0 && regKnown[rs])
+            {
+                regVal[rt] = regVal[rs] + inst.simmediate;
+                regKnown[rt] = true;
+                continue;
+            }
+            if ((inst.isLoad || inst.isStore) && rs != 0 && regKnown[rs])
+            {
+                const uint32_t addr = regVal[rs] + inst.simmediate;
+                if (isIopReg(addr))
+                {
+                    inst.isMmio = true;
+                    inst.mmioAddress = addr;
+                }
+            }
+            if (rt != 0) regKnown[rt] = false;
+        }
+    }
+
     bool PS2Recompiler::decodeFunction(Function &function)
     {
         std::vector<Instruction> instructions;
@@ -1938,6 +2041,9 @@ namespace ps2recomp
         {
             function.end = instructions.back().address + 4;
         }
+
+        if (m_config.arch == Arch::R3000)
+            markR3000Mmio(instructions);
 
         m_decodedFunctions.insert_or_assign(function.start, std::move(instructions));
 
