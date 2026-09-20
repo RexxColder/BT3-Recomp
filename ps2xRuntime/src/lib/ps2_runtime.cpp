@@ -2980,24 +2980,41 @@ void PS2Runtime::iopImport(uint8_t *rdram, R5900Context *ctx, const char *module
 
 // [r3000] Per-module IOP registration functions emitted by the recompiler. Declared weak so a
 // module that isn't linked in simply resolves to null.
+// [portability] Weak declarations for optional IOP module registrations. GCC/Clang use
+// __attribute__((weak)); MSVC has no weak symbols, so map any absent registration to a no-op via
+// /alternatename (avoids an unresolved-symbol link error).
+#if defined(_MSC_VER)
+extern "C" void ps2x_noop_register() {}
+#define PS2X_WEAK
+#define PS2X_WEAK_MSVC(sym) __pragma(comment(linker, "/alternatename:" #sym "=ps2x_noop_register"))
+PS2X_WEAK_MSVC(ps2x_register_sio2man); PS2X_WEAK_MSVC(ps2x_register_sio2d); PS2X_WEAK_MSVC(ps2x_register_dbcman);
+PS2X_WEAK_MSVC(ps2x_register_libsd); PS2X_WEAK_MSVC(ps2x_register_sdrdrv); PS2X_WEAK_MSVC(ps2x_register_cdvdstm);
+PS2X_WEAK_MSVC(ps2x_register_mcman); PS2X_WEAK_MSVC(ps2x_register_mcserv); PS2X_WEAK_MSVC(ps2x_register_sounds);
+PS2X_WEAK_MSVC(ps2x_register_cri_adxi); PS2X_WEAK_MSVC(ps2x_register_ds2o_d); PS2X_WEAK_MSVC(ps2x_register_ds2u_d);
+PS2X_WEAK_MSVC(ps2x_register_modhsyn); PS2X_WEAK_MSVC(ps2x_register_modmidi); PS2X_WEAK_MSVC(ps2x_register_modsein);
+PS2X_WEAK_MSVC(ps2x_register_modsesq); PS2X_WEAK_MSVC(ps2x_register_modsesq2);
+#else
+#define PS2X_WEAK __attribute__((weak))
+#endif
+
 extern "C" {
-void ps2x_register_sio2man() __attribute__((weak));
-void ps2x_register_sio2d() __attribute__((weak));
-void ps2x_register_dbcman() __attribute__((weak));
-void ps2x_register_libsd() __attribute__((weak));
-void ps2x_register_sdrdrv() __attribute__((weak));
-void ps2x_register_cdvdstm() __attribute__((weak));
-void ps2x_register_mcman() __attribute__((weak));
-void ps2x_register_mcserv() __attribute__((weak));
-void ps2x_register_sounds() __attribute__((weak));
-void ps2x_register_cri_adxi() __attribute__((weak));
-void ps2x_register_ds2o_d() __attribute__((weak));
-void ps2x_register_ds2u_d() __attribute__((weak));
-void ps2x_register_modhsyn() __attribute__((weak));
-void ps2x_register_modmidi() __attribute__((weak));
-void ps2x_register_modsein() __attribute__((weak));
-void ps2x_register_modsesq() __attribute__((weak));
-void ps2x_register_modsesq2() __attribute__((weak));
+void ps2x_register_sio2man() PS2X_WEAK;
+void ps2x_register_sio2d() PS2X_WEAK;
+void ps2x_register_dbcman() PS2X_WEAK;
+void ps2x_register_libsd() PS2X_WEAK;
+void ps2x_register_sdrdrv() PS2X_WEAK;
+void ps2x_register_cdvdstm() PS2X_WEAK;
+void ps2x_register_mcman() PS2X_WEAK;
+void ps2x_register_mcserv() PS2X_WEAK;
+void ps2x_register_sounds() PS2X_WEAK;
+void ps2x_register_cri_adxi() PS2X_WEAK;
+void ps2x_register_ds2o_d() PS2X_WEAK;
+void ps2x_register_ds2u_d() PS2X_WEAK;
+void ps2x_register_modhsyn() PS2X_WEAK;
+void ps2x_register_modmidi() PS2X_WEAK;
+void ps2x_register_modsein() PS2X_WEAK;
+void ps2x_register_modsesq() PS2X_WEAK;
+void ps2x_register_modsesq2() PS2X_WEAK;
 }
 
 bool PS2Runtime::registerIopFunction(uint32_t address, RecompiledFunction func)
