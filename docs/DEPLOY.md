@@ -68,6 +68,22 @@ Stage 4 then produces the single release artifact (the tarball) and asks where t
 send it. Its integrity is verified by the `.sha256` sibling; release users can
 also re-verify with `sha256sum -c`.
 
+### Portable release (LTS / anything you distribute)
+
+On an LTS (Ubuntu/Kubuntu 22.04 or 24.04) — or whenever the artifact has to run on
+another LTS — build **inside the container** so it links the 22.04 glibc:
+
+```sh
+./scripts/build-linux-portable.sh /path/to/game.iso   # needs Docker or Podman
+```
+
+Same pipeline, `ubuntu:22.04` base, `BT3_GLIBC_MAX=2.35` (built with the distro
+GCC). Stage 4's glibc gate then asserts `max GLIBC_ <= 2.35`, so the tree starts on
+22.04 (2.35) and 24.04 (2.39). A native `build-linux.sh` links the host glibc — on
+24.04 that is 2.39 and on rolling distros 2.4x — and refuses to start on an older
+LTS. The script installs the required build dependencies (including
+`libarchive-dev`) inside the container itself.
+
 ## Install (Linux desktop integration)
 
 Inside the unpacked folder, `install game.sh` (copy made from

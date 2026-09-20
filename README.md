@@ -59,6 +59,19 @@ pipeline produces the release artifact (`BT3-Recomp-x86_64.tar.gz` + `.sha256`)
 and asks where to send it (`--no-package` assembles the deploy tree only).
 See `docs/DEPLOY.md` for the full picture.
 
+> **On an LTS (Ubuntu/Kubuntu 22.04 or 24.04), use the Docker flow.** It runs the
+> same pipeline inside `ubuntu:22.04` so the artifact links glibc 2.35 and starts on
+> every LTS:
+>
+> ```sh
+> ./scripts/build-linux-portable.sh /path/to/your/bt3-usa.iso   # needs Docker or Podman
+> ```
+>
+> A native `build-linux.sh` links *your* host glibc: one built on 24.04 (glibc 2.39)
+> or a rolling distro (e.g. Arch, 2.44) aborts on another LTS with
+> ``libm.so.6: version `GLIBC_2.43' not found``. Build natively only if the game is
+> for the same machine you built on.
+
 The pipeline extracts and sha256-verifies the game files from your ISO, builds the
 recompiler, generates ~7,800 C++ sources from the game's executable and overlay,
 applies the committed patches, and builds the final binary. The compile is quick
