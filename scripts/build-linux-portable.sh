@@ -46,7 +46,7 @@ echo "[portable] $BASE_IMAGE, glibc floor $FLOOR, engine $ENGINE"
         apt-get install -y --no-install-recommends \
             python3 ca-certificates clang g++ cmake ninja-build pkg-config git bash file \
             libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev \
-            libgl1-mesa-dev libglu1-mesa-dev libarchive-tools p7zip-full \
+            libgl1-mesa-dev libglu1-mesa-dev libarchive-tools libarchive-dev p7zip-full \
             libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev \
             qt6-base-dev ccache mold
         # The repo is owned by the host user but we run as root in the container; without this,
