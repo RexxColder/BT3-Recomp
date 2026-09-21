@@ -42,7 +42,7 @@ image** — this repository contains no game code, assets, or media.
 | **Target** | 30 fps @ 1x | 60 fps @ 2x–3x |
 
 - x86-64 CPU with **SSE4.1**.
-- **Your own legally obtained BT3 USA ISO (SLUS-21678).** Other regions are not
+- **Your own BT3 USA Disc Dump (SLUS-21678).** Other regions are not
   supported — the committed function maps are for the USA executable. The
   launcher's install wizard extracts the game from your ISO; no game data is
   distributed.

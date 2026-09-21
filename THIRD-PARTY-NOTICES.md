@@ -3,7 +3,7 @@
 BT3-Recomp bundles or builds against the third-party components listed below.
 This file is a summary for attribution; the **full license texts** ship with each
 component and at the links provided. Nothing here is game content — the game is
-recompiled at build time from the user's own disc image.
+recompiled at build time from the user's own disc dump.
 
 If you redistribute a release, keep this file (and the license texts it points
 to) alongside it.
@@ -63,6 +63,6 @@ Used to build from source; not necessarily shipped:
 *Dragon Ball Z: Budokai Tenkaichi 3* © Spike / Bandai Namco Entertainment. This
 project is **not affiliated with or endorsed by** them. It exists for
 preservation and interoperability, and distributes **no game content**: the game
-is recompiled at build time from the user's own legally obtained disc image
+is recompiled at build time from the user's own disc dump
 (PS2, USA, SLUS-21678). "Dragon Ball", "Budokai Tenkaichi" and related marks are
 the property of their respective owners and are used descriptively.
