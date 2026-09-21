@@ -1775,10 +1775,9 @@ int InitPlatform(void)
 {
     // Initialize SDL internal global state, only required systems
     // NOTE: Not all systems need to be initialized, SDL_INIT_AUDIO is not required, managed by miniaudio
-    // [bootspeed] GAMECONTROLLER is initialized by the host pad layer (ps2_host_pad.cpp) later;
-    // enumerating HID devices here cost ~200 ms of boot for nothing.
+    // [bootspeed] timing only; the subsystem list is unchanged from upstream.
     unsigned int _bt0 = SDL_GetTicks();
-    int result = SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_EVENTS);
+    int result = SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER);
     fprintf(stderr, "[bootw] SDL_Init: %u ms\n", SDL_GetTicks() - _bt0);
     if (result < 0) { TRACELOG(LOG_WARNING, "SDL: Failed to initialize SDL"); return -1; }
 
