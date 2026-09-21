@@ -15,6 +15,7 @@ public slots:
     void doWork(const QString &isoPath, const QString &dataDir);
 
 signals:
+    void file(const QString &path);   // [verbose] the file currently being extracted
     void progress(qint64 done, qint64 total);
     void done(bool ok, const QString &msg);
 };

@@ -366,14 +366,18 @@ endif()
 if(WIN32)
     include(ExternalProject)
 
-    set(FFMPEG_PREBUILT_TAG "n7.1-241205")
+    # FFmpeg MSVC prebuilt (System233). The chosen build must be one whose LGPL variant
+    # enables the vcpkg 'dav1d' feature (AV1 software decode). The old n7.1-241205 tag did
+    # NOT include libdav1d, so the AV1 4K intro overlay decoded zero frames (black video).
+    set(FFMPEG_PREBUILT_TAG "ffmpeg-7.1.5")
+    set(FFMPEG_PREBUILT_ASSET "ffmpeg-7.1.5_x64-windows-shared-lgpl.zip")
     set(FFMPEG_PREBUILT_URL
-        "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/${FFMPEG_PREBUILT_TAG}/ffmpeg-${FFMPEG_PREBUILT_TAG}-lgpl-amd64-shared.zip")
+        "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/${FFMPEG_PREBUILT_TAG}/${FFMPEG_PREBUILT_ASSET}")
 
     set(FFMPEG_PREFIX_DIR "${CMAKE_BINARY_DIR}/ThirdParty/ffmpeg-prefix")
     set(FFMPEG_SOURCE_DIR "${FFMPEG_PREFIX_DIR}/src/ffmpeg_external")
     set(FFMPEG_INCLUDE_DIR "${FFMPEG_SOURCE_DIR}/include")
-    set(FFMPEG_LIB_DIR "${FFMPEG_SOURCE_DIR}/bin")
+    set(FFMPEG_LIB_DIR "${FFMPEG_SOURCE_DIR}/lib")
     set(FFMPEG_BIN_DIR "${FFMPEG_SOURCE_DIR}/bin")
 
     ExternalProject_Add(ffmpeg_external

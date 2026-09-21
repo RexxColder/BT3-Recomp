@@ -4,8 +4,7 @@
 #include "install_wizard_dialog.h"
 #include "iso9660.h"
 #include "settings_manager.h"
-#include "tex_install_dialog.h"
-#include "tex_pack.h"
+#include "view_host.h"
 
 #include <QApplication>
 #include <QCheckBox>
@@ -15,7 +14,6 @@
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QLabel>
-#include <QMenu>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSignalBlocker>
@@ -127,64 +125,6 @@ MiscTab::MiscTab(QWidget *parent)
     root->addWidget(m_wizardBtn);
 
     root->addSpacing(8);
-    root->addWidget(section(QStringLiteral("TEXTURE PACK")));
-
-    // [texreplace] Enable toggle (shared key with the in-game overlay).
-    {
-        auto *row = new QWidget;
-        auto *lay = new QHBoxLayout(row);
-        lay->setContentsMargins(8, 2, 8, 2);
-        auto *lbl = new QLabel(QStringLiteral("Texture Replacement"));
-        lbl->setObjectName(QStringLiteral("valueLabel"));
-        m_texCheck = new QCheckBox;
-        m_texCheck->setObjectName(QStringLiteral("reinstallModeCheck"));
-        lay->addWidget(lbl, 1);
-        lay->addWidget(m_texCheck);
-        root->addWidget(row);
-    }
-
-    // Status row: green dot = Installed, red = Missing.
-    {
-        auto *row = new QWidget;
-        auto *lay = new QHBoxLayout(row);
-        lay->setContentsMargins(8, 2, 8, 2);
-        auto *lbl = new QLabel(QStringLiteral("Status"));
-        lbl->setObjectName(QStringLiteral("valueLabel"));
-        lbl->setMinimumWidth(110);
-        m_texDot = new QLabel(QStringLiteral("●"));
-        m_texDot->setStyleSheet(QStringLiteral("font-size: 15px; color: #8b93a3;"));
-        m_texDotText = new QLabel;
-        m_texDotText->setObjectName(QStringLiteral("hintLabel"));
-        lay->addWidget(lbl);
-        lay->addWidget(m_texDot);
-        lay->addWidget(m_texDotText, 1);
-        root->addWidget(row);
-    }
-
-    // Folder row: opens the pack folder.
-    {
-        auto *row = new QWidget;
-        auto *lay = new QHBoxLayout(row);
-        lay->setContentsMargins(8, 2, 8, 2);
-        auto *lbl = new QLabel(QStringLiteral("Folder"));
-        lbl->setObjectName(QStringLiteral("valueLabel"));
-        lbl->setMinimumWidth(110);
-        m_texFolder = new QPushButton(QStringLiteral("Open"), row);
-        m_texFolder->setObjectName(QStringLiteral("wizardButton"));
-        m_texFolder->setCursor(Qt::PointingHandCursor);
-        lay->addWidget(lbl);
-        lay->addStretch(1);
-        lay->addWidget(m_texFolder);
-        root->addWidget(row);
-    }
-
-    m_texInstall = new QPushButton(QStringLiteral("Install texture pack…"), content);
-    m_texInstall->setObjectName(QStringLiteral("wizardButton"));
-    m_texInstall->setCursor(Qt::PointingHandCursor);
-    root->addWidget(m_texInstall);
-
-    // [texcache] Explanation + the one-shot "delete the cache file" action.
-    root->addSpacing(8);
     root->addWidget(section(QStringLiteral("TEXTURE CACHE")));
     {
         auto *row = new QWidget;
@@ -245,9 +185,6 @@ MiscTab::MiscTab(QWidget *parent)
     connect(m_reinstall, &QCheckBox::toggled, this, &MiscTab::onReinstallMode);
     connect(m_wizardBtn, &QPushButton::clicked, this, &MiscTab::onInstallWizard);
     connect(m_browse, &QPushButton::clicked, this, &MiscTab::onOpenFolder);
-    connect(m_texCheck, &QCheckBox::toggled, this, &MiscTab::onTexPackToggled);
-    connect(m_texInstall, &QPushButton::clicked, this, &MiscTab::onInstallPack);
-    connect(m_texFolder, &QPushButton::clicked, this, &MiscTab::onTexPackFolder);
     connect(m_tcDelete, &QPushButton::clicked, this, &MiscTab::onDeleteTexCache);
     connect(m_tcCheck, &QCheckBox::toggled, this, &MiscTab::onTexCacheToggled);
 
@@ -281,16 +218,6 @@ void MiscTab::refresh()
     m_dot->setStyleSheet(QStringLiteral("font-size: 15px; color: %1;").arg(color));
     m_dotText->setText(text);
 
-    // [texreplace] Pack status + enable toggle (state synced from the INI at init).
-    const quint64 reps = texpack::countReplacements();
-    m_texDot->setStyleSheet(QStringLiteral("font-size: 15px; color: %1;")
-                                .arg(reps > 0 ? QStringLiteral("#22c55e") : QStringLiteral("#ef4444")));
-    m_texDotText->setText(reps > 0 ? QStringLiteral("Installed") : QStringLiteral("Missing"));
-    {
-        QSignalBlocker block(m_texCheck);   // sync only; do not write the setting back
-        m_texCheck->setChecked(SettingsManager::instance().texPack());
-    }
-
     // [texcache] enable checkbox + file status (built size, or not built yet).
     if (m_tcCheck)
     {
@@ -318,9 +245,13 @@ void MiscTab::onReinstallMode(bool on)
 
 void MiscTab::onInstallWizard()
 {
-    InstallWizardDialog dlg(this, /*reinstall=*/true);
-    if (dlg.exec() == QDialog::Accepted)
+    auto *view = new InstallWizardView(nullptr, /*reinstall=*/true);
+    view->onFinished = [this, view](bool) {
+        view->deleteLater();
+        viewhost::pop();
         refresh();
+    };
+    viewhost::show(view);
 }
 
 void MiscTab::onOpenFolder()
@@ -330,25 +261,6 @@ void MiscTab::onOpenFolder()
     if (!QDir().mkpath(target))
         return;
     QDesktopServices::openUrl(QUrl::fromLocalFile(target));
-}
-
-// ---------------------------------------------------------------------------
-// [texreplace] Texture pack: enable toggle + install dialog.
-// ---------------------------------------------------------------------------
-
-void MiscTab::onTexPackToggled(bool on)
-{
-    // Live-write into SettingsManager (persisted on the dialog's Save), same as
-    // the other tabs. Shares the [video] texture_pack key with the in-game overlay.
-    SettingsManager::instance().setTexPack(on);
-}
-
-void MiscTab::onTexPackFolder()
-{
-    const QString d = texpack::dir();
-    if (!QDir().mkpath(d))
-        return;
-    QDesktopServices::openUrl(QUrl::fromLocalFile(d));
 }
 
 void MiscTab::onTexCacheToggled(bool on)
@@ -362,21 +274,5 @@ void MiscTab::onDeleteTexCache()
     const QString tc = apppaths::userRoot() + QStringLiteral("/data/texcache.bin");
     QFile::remove(tc);
     QFile::remove(tc + QStringLiteral(".tmp"));
-    refresh();
-}
-
-void MiscTab::onInstallPack()
-{
-    // [texui] Pick the variant first; the dialog is per-pack (download page + Browse install).
-    QMenu menu(this);
-    QAction *lite = menu.addAction(QStringLiteral("Pack Lite (2D only)"));
-    menu.addAction(QStringLiteral("Pack Full (3D + 2D)"));
-    QAction *chosen = menu.exec(m_texInstall->mapToGlobal(QPoint(0, m_texInstall->height())));
-    if (!chosen)
-        return;
-    const int kind = (chosen == lite) ? texpack::kPackLite : texpack::kPackFull;
-    TexInstallDialog dlg(this, kind);
-    connect(&dlg, &TexInstallDialog::installed, this, &MiscTab::refresh);
-    dlg.exec();
     refresh();
 }

@@ -1073,6 +1073,12 @@ def stage_deps(ctx: "Context") -> None:
         else:
             LOG.info(f"  installed: {d.name}")
 
+    # detect_platform() cached qt_prefix before deps ran; aqt may have just fetched Qt into
+    # build/qt, so refresh it for the rest of this run (launcher config / Windows bundle).
+    ctx.platform.qt_prefix = _qt_prefix() or ctx.platform.qt_prefix
+    if ctx.platform.qt_prefix:
+        ctx.platform.tools["qt"] = str(ctx.platform.qt_prefix)
+
 
 # ------------------------------------------------------------------------------------------------
 # Stage 3: build pipeline
@@ -1746,6 +1752,9 @@ def _copy_log_next_to_artifact(ctx: "Context") -> None:
 
 def stage_package(ctx: "Context") -> None:
     step("stage 4: deploy/package")
+    # detect_platform() cached qt_prefix before deps ran; a stage 2 (or an external aqt/brew install)
+    # may have made Qt available since, so re-detect before the launcher/bundle steps use it.
+    ctx.platform.qt_prefix = _qt_prefix() or ctx.platform.qt_prefix
     ensure_msvc_env(ctx)
     if ctx.runner is None:
         ctx.runner = find_binary("ps2EntryRunner")

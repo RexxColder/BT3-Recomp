@@ -16,17 +16,17 @@ public:
     {
         float masterVolume = 1.0f;
         float musicVolume = 1.0f;
-        float sfxVolume = 1.0f;
+        float sfxVolume = 0.4f;
         bool gpuRenderer = true;
         // [renderer] 0 = OpenGL (New: our own gfx::gl present), 1 = software rasterizer, 2 = paraLLEl-GS
         // (Vulkan compute; only when the backend is built in), 3 = Direct3D 11 (native Windows present;
         // RETIRED for now -- kept only so old settings can be migrated). gpuRenderer stays in sync
         // (renderer != 1) for the code that still reads it.
         static constexpr int kRendererOpenGL = 0, kRendererSoftware = 1, kRendererParallelGS = 2, kRendererD3D11 = 3;
-#if defined(PS2X_HAVE_PGS)
+#if defined(PS2X_HAVE_PGS) && !defined(_WIN32)
         static constexpr int kRendererDefault = 2;   // [pgs] Vulkan compute backend
 #else
-        static constexpr int kRendererDefault = 0;   // [opengl-new] our own present
+        static constexpr int kRendererDefault = 0;   // [opengl-new] our own present (Windows default)
 #endif
         int renderer = kRendererDefault;
         int windowMode = 0;   // [display] 0 = windowed (resizable), 1 = borderless, 2 = fullscreen
@@ -41,7 +41,7 @@ public:
         float deadzone = 0.15f;
         bool fullscreen = false;  // [defaults-sync] do not force fullscreen on first launch (rig + user surprise); one toggle away in the overlay
         bool widescreen = false;
-        bool outline = true;
+        bool outline = false;
         bool texPack = false;   // [texreplace] use the PCSX2 replacement pack when one is indexed (default OFF)
         bool introVideo = true; // [texui] 4K opening-video override when the pack ships it (applies on restart)
         int buttonLayout = 1;   // [texui] 0 = PS2 (Original Buttons), 1 = Xbox (Xbox Layout); applies on restart
@@ -50,7 +50,7 @@ public:
         int inkWidth = 100;      // [pgsink] paraLLEl-GS: outline stroke width, % of a PS2 texel (100 = native, 25 = thinnest)
         unsigned inkColor = 0;   // [pgsink] paraLLEl-GS: outline colour 0xRRGGBB (0 = the game's black)
         bool shadows = true;
-        bool dofBlur = true;
+        bool dofBlur = false;
         int dofZFar = 200000;
         int windowW = 0, windowH = 0; // 0 = keep the default host window size
         bool forceBilinear = true;    // PCSX2-style forced texture filtering (default ON)

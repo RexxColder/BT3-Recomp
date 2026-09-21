@@ -45,6 +45,7 @@ Python script that hosts the build pipeline (and is the base for Windows).
 | Script | Platform | Role |
 |---|---|---|
 | `scripts/build-linux.sh` | Linux | Thin wrapper: `setup.py <iso> --package`. The script itself detects the platform, installs missing dependencies (stage 2), builds (stage 3) and assembles the portable tree + `tar.gz` (stage 4): `ldd` closure minus the glibc/C++ core, Qt platform plugins, `bt3-runner` rename, assets, `install game.sh`, glibc floor gate. |
+| `scripts/build-linux-portable.sh` | Linux | **Portable release**: runs the same build inside `ubuntu:22.04` with `BT3_GLIBC_MAX=2.35`, so the artifact runs on Ubuntu/Kubuntu 22.04 and 24.04 (glibc 2.35 / 2.39). Use this for **anything you distribute**; a native `build-linux.sh` on a rolling distro (e.g. Arch, glibc 2.44) produces a binary that aborts on 24.04 with ``libm.so.6: version `GLIBC_2.43' not found``. Self-builds on a user's own distro are unaffected (they link their own glibc). |
 | `games/bt3/setup.py` | All | The single entry point. Four stages: **1 detect** (platform/toolchain/deps, `--report json`), **2 deps** (interactive install of what is missing), **3 build** (extract/verify ISO, VU1, recompiler, ~7,800 sources, patches, overlay, runner), **4 package** (Qt launcher, portable tree, PE/glibc gate, zip/tar.gz/`.app` + sha256), then asks where to send the artifact. |
 | `scripts/build-macos.sh` | macOS (experimental) | Thin wrapper: `setup.py <iso> --package`. Stage 4 hands the bundle over to `tools/macos/deploy.py --skip-build` (relocated dylibs, `Info.plist`, icudata, ad-hoc signing). |
 | `scripts/build-windows.ps1` / `package-windows.ps1` | Windows | Native build + package wrappers: `setup.py <iso> --package` with VS Build Tools + ClangCL + Ninja and Qt 6 fetched via aqtinstall. |
@@ -66,6 +67,22 @@ conservative fallback.
 Stage 4 then produces the single release artifact (the tarball) and asks where to
 send it. Its integrity is verified by the `.sha256` sibling; release users can
 also re-verify with `sha256sum -c`.
+
+### Portable release (LTS / anything you distribute)
+
+On an LTS (Ubuntu/Kubuntu 22.04 or 24.04) — or whenever the artifact has to run on
+another LTS — build **inside the container** so it links the 22.04 glibc:
+
+```sh
+./scripts/build-linux-portable.sh /path/to/game.iso   # needs Docker or Podman
+```
+
+Same pipeline, `ubuntu:22.04` base, `BT3_GLIBC_MAX=2.35` (built with the distro
+GCC). Stage 4's glibc gate then asserts `max GLIBC_ <= 2.35`, so the tree starts on
+22.04 (2.35) and 24.04 (2.39). A native `build-linux.sh` links the host glibc — on
+24.04 that is 2.39 and on rolling distros 2.4x — and refuses to start on an older
+LTS. The script installs the required build dependencies (including
+`libarchive-dev`) inside the container itself.
 
 ## Install (Linux desktop integration)
 

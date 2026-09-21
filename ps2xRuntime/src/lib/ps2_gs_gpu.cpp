@@ -1658,9 +1658,9 @@ static inline uint32_t wbPack16(uint32_t c)
 static inline uint32_t wbUnpack16(uint32_t v)
 { const uint32_t r = v & 0x1Fu, g = (v >> 5) & 0x1Fu, b = (v >> 10) & 0x1Fu, a = (v >> 15) & 1u;
   return ((r << 3) | (r >> 2)) | (((g << 3) | (g >> 2)) << 8) | (((b << 3) | (b >> 2)) << 16) | ((a ? 0x80u : 0u) << 24); }
-int g_wbRectX0 = -1, g_wbRectY0 = -1, g_wbRectX1 = -1, g_wbRectY1 = -1;   // [flushrect] -1 = whole buffer
+thread_local int g_wbRectX0 = -1, g_wbRectY0 = -1, g_wbRectX1 = -1, g_wbRectY1 = -1;   // [flushrect] -1 = whole buffer   // [wbthreadsafe] thread_local: the VRAM writeback runs on BOTH the GL thread (flushPageToVram) and the stage-2/kick worker (swapFrame -> applyStagedWritebacks); plain globals let one thread clobber the other's rect/mirror/mask -> OOB write
 int g_wbLastWrittenRows = 0;   // [flushdiff] rows written by the last masked writeback
-const uint8_t *g_wbSkipMask = nullptr;   // [flushdiff] per-pixel: 0 = unchanged since the last flush, skip the write
+thread_local const uint8_t *g_wbSkipMask = nullptr;   // [flushdiff] per-pixel: 0 = unchanged since the last flush, skip the write   // [wbthreadsafe]
 static const bool s_wbPack16 = [](){ const char *v = std::getenv("PS2X_WBPACK16"); return !(v && v[0] == '0'); }();
 // Masked variant: GS FBMSK protects bits, so a writeback that ignores it destroys data the
 // hardware keeps. BT3's CT16 stripes pass writes fbp0 through FBMSK=0x00003fff -- bits 0..13 are
@@ -1694,8 +1694,8 @@ void ps2xVramReadBackT8H(uint32_t fbp, uint32_t tbw)
 // (guest) stream position. Runs the SAME writeback functions with staging off.
 unsigned long g_ps2xWbGen = 0;
 unsigned long g_wbPixelsWritten = 0;   // [shstat]
-const std::pair<int,int> *g_wbRowRange = nullptr;   // [flushrows] per-row [x0,x1) to write, or null
-int g_wbFlipY = 0;   // [noflip] 1 = px rows are bottom-up (buffer row for VRAM row y is h-1-y)   // [hashmemo] bumped by every VRAM writeback (WBSTAMP is off by default, so m_contentSeq does not see them)
+thread_local const std::pair<int,int> *g_wbRowRange = nullptr;   // [flushrows] per-row [x0,x1) to write, or null   // [wbthreadsafe]
+thread_local int g_wbFlipY = 0;   // [noflip] 1 = px rows are bottom-up (buffer row for VRAM row y is h-1-y)   // [wbthreadsafe]
 
 static void wbHudLog(const char *who, uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h, uint32_t base, uint32_t bw);   // [wbhud]
 void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
@@ -1890,7 +1890,7 @@ void ps2xVramAlphaStats(const char *tag, uint32_t fbp, uint32_t fbw, uint32_t ps
 // which console already has in that memory -- lives in our FBO. Protecting alpha entirely
 // (BARKEEPA) keeps only the bands, and writing it wholesale destroys them. Filling the gaps
 // keeps both, with no dependence on when the game's full-screen alpha wipe lands.
-bool g_wbAlphaFillOnly = false;
+thread_local bool g_wbAlphaFillOnly = false;
 
 // Inverse of ps2xWritebackToVramMasked: read a framebuffer page OUT of VRAM into a linear
 // RGBA buffer, top-down. Needed because BT3's cel/outline pass has to run in the SOFTWARE
@@ -1927,9 +1927,9 @@ extern "C" unsigned ps2xVramDiffOutside(uint32_t fbp, uint32_t fbw, uint32_t psm
 }
 // [ddmirror] when set, every pixel the masked writeback lands in VRAM is ALSO written into this buffer (same swizzle,
 // no page-skip mask): the deferred decode's private copy = post-time snapshots + the read-time flush, live VRAM untouched.
-uint8_t *g_wbMirror = nullptr;
+thread_local uint8_t *g_wbMirror = nullptr;
 // [linvram] when set, every value the writeback stores also lands in this LINEAR image (row-major, stride g_wbLinearStride)
-uint32_t *g_wbLinear = nullptr; int g_wbLinearStride = 0;
+thread_local uint32_t *g_wbLinear = nullptr; thread_local int g_wbLinearStride = 0;
 void ps2xWritebackToVramMasked(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h,
                                const uint32_t *px, uint32_t fbmsk)
 {

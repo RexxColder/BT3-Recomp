@@ -44,15 +44,24 @@ namespace GSMem
 		u32 y{ 0 };
 	};
 
-	// GCC 11/12 ICE (tsubst_copy, cp/pt.cc) when Extent.x/Extent.y are used directly as
-	// std::array extent NTTPs; extract the dimensions as plain usz first to avoid it.
 	namespace detail {
 		template<typename T, usz W, usz H>
 		struct LookupTableStorage { using type = std::array<std::array<T, W>, H>; };
+
+		// GCC 11/12 ICE (tsubst_copy, cp/pt.cc) when a cast expression is substituted as a
+		// std::array extent NTTP. Bind the dimensions to constexpr members first and forward those
+		// as plain values, which keeps the substitution off the buggy path.
+		template<typename T, Extent2D Extent>
+		struct LookupTableStorageFor
+		{
+			static constexpr usz WIDTH  = Extent.x;
+			static constexpr usz HEIGHT = Extent.y;
+			using type = typename LookupTableStorage<T, WIDTH, HEIGHT>::type;
+		};
 	}
 
 	template<typename T, Extent2D Extent>
-	using LookupTable = typename detail::LookupTableStorage<T, static_cast<usz>(Extent.x), static_cast<usz>(Extent.y)>::type;
+	using LookupTable = typename detail::LookupTableStorageFor<T, Extent>::type;
 
 	constexpr bool IsValidPsm(PixelStorageMode psm)
 	{

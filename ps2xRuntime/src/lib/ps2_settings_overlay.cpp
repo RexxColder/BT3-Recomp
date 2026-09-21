@@ -514,7 +514,7 @@ void PS2SettingsOverlay::loadSettings()
 
     m_settings.masterVolume = std::clamp((float)doc.getD("audio.master_volume", m_settings.masterVolume), 0.0f, 1.0f);
     m_settings.musicVolume = std::clamp((float)doc.getD("audio.music_volume", m_settings.musicVolume), 0.0f, 1.0f);
-    m_settings.sfxVolume = std::clamp((float)doc.getD("audio.sfx_volume", m_settings.sfxVolume), 0.0f, 1.0f);
+    m_settings.sfxVolume = std::clamp((float)doc.getD("audio.sfx_volume", m_settings.sfxVolume), 0.0f, 0.4f);
 
     {
             int r = nameToRenderer(doc.getS("video.renderer", rendererName(m_settings.renderer)), m_settings.renderer);

@@ -2,11 +2,13 @@
 #include "launcher_window.h"
 
 #include "dbz_theme.h"
+#include "hardware_probe.h"
 #include "install_wizard_dialog.h"
 #include "iso9660.h"
 #include "settings_dialog.h"
 #include "settings_manager.h"
 #include "tex_install_dialog.h"
+#include "view_host.h"
 
 #include <QApplication>
 #include <QColor>
@@ -16,6 +18,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QGraphicsDropShadowEffect>
+#include <QGraphicsOpacityEffect>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QIcon>
@@ -26,8 +29,11 @@
 #include <QPropertyAnimation>
 #include <QPushButton>
 #include <QScreen>
+#include <QShortcut>
 #include <QShowEvent>
+#include <QStackedWidget>
 #include <QStandardPaths>
+#include <QThread>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -54,8 +60,8 @@ LauncherWindow::LauncherWindow(QWidget *parent)
     : QMainWindow(parent)
 {
     setWindowTitle(QStringLiteral("Dragon Ball Budokai Tenkaichi 3 Launcher"));
-    resize(900, 500);
-    setMinimumSize(700, 420);
+    resize(1080, 640);
+    setMinimumSize(820, 500);
 
     // The launcher lives in the deploy root; savedata/ is the shared settings dir.
     m_savedataDir = QDir(apppaths::userRoot()).filePath(QStringLiteral("savedata"));
@@ -96,8 +102,11 @@ LauncherWindow::LauncherWindow(QWidget *parent)
         "QWidget#bottomBar { background-color: #0b0f13; border-top: 1px solid #1e2830; }"));
     m_bottomBar = bottomBar;
 
-    auto *barLayout = new QHBoxLayout(bottomBar);
-    barLayout->setContentsMargins(24, 14, 24, 14);
+    auto *barCol = new QVBoxLayout(bottomBar);
+    barCol->setContentsMargins(24, 12, 24, 10);
+    barCol->setSpacing(8);
+    auto *barLayout = new QHBoxLayout;
+    barLayout->setContentsMargins(0, 0, 0, 0);
 
     m_play = new QPushButton(QStringLiteral("PLAY"), bottomBar);
     m_play->setObjectName(QStringLiteral("playButton"));
@@ -112,10 +121,35 @@ LauncherWindow::LauncherWindow(QWidget *parent)
     barLayout->addWidget(m_play, 0, Qt::AlignVCenter);
     barLayout->addStretch(1);
     barLayout->addWidget(m_settings, 0, Qt::AlignVCenter);
+    barCol->addLayout(barLayout);
 
+    // [hwprobe] bottom row: detected specs (left, under PLAY) | game-data status
+    // (right, under SETTINGS). Small and unobtrusive.
+    auto *subRow = new QHBoxLayout;
+    subRow->setContentsMargins(2, 0, 2, 0);
+    m_specs = new QLabel(bottomBar);
+    m_specs->setObjectName(QStringLiteral("specsLabel"));
+    m_specs->setStyleSheet(QStringLiteral("color: #6b7280; background: transparent; font-size: 11px;"));
+    m_hw = hw::detect();
+    m_specs->setText(hw::summary(m_hw));
+    m_specs->setToolTip(QStringLiteral("Detected hardware"));
+    // [tier] Silent single-thread benchmark; the specs banner gains a tier chip.
+    m_benchThread = QThread::create([this] { m_cpuR.store(hw::benchSingleThreadR()); });
+    connect(m_benchThread, &QThread::finished, this, [this] {
+        if (!m_specs)
+            return;
+        const hw::Recommendation r = hw::recommend(m_hw, m_cpuR.load());
+        m_specs->setText(QStringLiteral("%1   \u00b7   [%2]").arg(hw::summary(m_hw), r.tierName));
+        m_specs->setToolTip(QStringLiteral("Detected hardware \u2014 recommended tier: %1").arg(r.tierName));
+    });
+    m_benchThread->start();
     m_hint = new QLabel(bottomBar);
     m_hint->setObjectName(QStringLiteral("hintLabel"));
-    m_hint->setStyleSheet(QStringLiteral("color: #9999b3; background: transparent;"));
+    m_hint->setStyleSheet(QStringLiteral("color: #9999b3; background: transparent; font-size: 11px;"));
+    subRow->addWidget(m_specs, 0, Qt::AlignLeft | Qt::AlignVCenter);
+    subRow->addStretch(1);
+    subRow->addWidget(m_hint, 0, Qt::AlignRight | Qt::AlignVCenter);
+    barCol->addLayout(subRow);
 
     auto *root = new QWidget(this);
     root->setObjectName(QStringLiteral("launcherRoot"));
@@ -129,12 +163,28 @@ LauncherWindow::LauncherWindow(QWidget *parent)
     layout->setSpacing(0);
     layout->addStretch(1);
     layout->addWidget(bottomBar);
-    setCentralWidget(root);
+    // [inwindow] The launcher is page 0 of a stack; views (settings, wizard, ...)
+    // become the other pages and replace the whole window content. The stack itself
+    // must be transparent so the window's paintEvent() background shows through on
+    // page 0 (the global QSS otherwise paints an opaque background over it).
+    m_stack = new QStackedWidget(this);
+    m_stack->setStyleSheet(QStringLiteral("QStackedWidget { background: transparent; }"));
+    m_stack->addWidget(root);
+    setCentralWidget(m_stack);
+    // [inwindow] Let nested views (Video-tab dialogs) push/pop pages.
+    viewhost::setHandlers([this](QWidget *v) { showView(v); }, [this] { popView(); });
 
     connect(m_play, &QPushButton::clicked, this, &LauncherWindow::onPlayClicked);
     connect(m_settings, &QPushButton::clicked, this, &LauncherWindow::onSettingsClicked);
 
-    barLayout->insertWidget(1, m_hint, 1, Qt::AlignVCenter | Qt::AlignLeft);
+    // [inwindow] Esc returns from a view to the previous page.
+    {
+        auto *esc = new QShortcut(QKeySequence(Qt::Key_Escape), this);
+        connect(esc, &QShortcut::activated, this, [this] {
+            if (m_stack && m_stack->currentIndex() != 0)
+                popView();
+        });
+    }
 
     checkGameData();
 
@@ -148,6 +198,15 @@ LauncherWindow::LauncherWindow(QWidget *parent)
     const bool firstBoot = !QFile::exists(SettingsManager::instance().configpath());
     if (firstBoot)
         startSettingsGlow();
+}
+
+LauncherWindow::~LauncherWindow()
+{
+    if (m_benchThread)
+    {
+        m_benchThread->wait(1000);
+        m_benchThread->deleteLater();
+    }
 }
 
 // Release deploy: no SELFX next to us, but a plain ps2EntryRunner from the
@@ -216,9 +275,10 @@ void LauncherWindow::onPlayClicked()
     // Game data must be present and validated before the runner can boot.
     if (!m_gameDataValid)
     {
-        // The install wizard restores data on success.
-        if (!openInstallWizard())
-            return;
+        // The install wizard (in-window view) restores data on success; the user
+        // presses PLAY again once it finishes.
+        openInstallWizard();
+        return;
     }
 
     // Save any pending settings so the game boots with the launcher's config.
@@ -406,18 +466,21 @@ void LauncherWindow::updateHint()
                             .arg(color, text));
 }
 
-bool LauncherWindow::openInstallWizard()
+void LauncherWindow::openInstallWizard()
 {
-    InstallWizardDialog dlg(this);
-    const bool installed = dlg.exec() == QDialog::Accepted;
-    checkGameData();
-    if (installed && dlg.wantTexturePack())
-    {
-        // The wizard's final page recommended the pack and the user chose a variant.
-        TexInstallDialog tex(this, dlg.texturePackChoice());
-        tex.exec();
-    }
-    return installed && m_gameDataValid;
+    auto *view = new InstallWizardView(this, /*reinstall=*/false);
+    view->onFinished = [this, view](bool accepted) {
+        const bool openSettings = view->openSettingsRequested();
+        const bool play = view->playRequested();
+        view->deleteLater();
+        checkGameData();
+        showLauncher();
+        if (accepted && openSettings)
+            onSettingsClicked();
+        else if (accepted && play && m_gameDataValid)
+            onPlayClicked();
+    };
+    showView(view);
 }
 
 void LauncherWindow::showEvent(QShowEvent *e)
@@ -439,8 +502,50 @@ void LauncherWindow::showEvent(QShowEvent *e)
 void LauncherWindow::onSettingsClicked()
 {
     stopSettingsGlow();
-    SettingsDialog dlg(this);
-    dlg.exec();
+    auto *view = new SettingsView(this);
+    view->onBack = [this] { popView(); };
+    showView(view);
+}
+
+void LauncherWindow::showView(QWidget *view)
+{
+    if (!m_stack || !view)
+        return;
+    if (m_stack->indexOf(view) < 0)
+        m_stack->addWidget(view);
+    m_stack->setCurrentWidget(view);
+    // [fade] Subtle fade-in when a view takes over the window.
+    auto *fx = new QGraphicsOpacityEffect(view);
+    view->setGraphicsEffect(fx);
+    auto *anim = new QPropertyAnimation(fx, "opacity", view);
+    anim->setDuration(140);
+    anim->setStartValue(0.0);
+    anim->setEndValue(1.0);
+    anim->setEasingCurve(QEasingCurve::OutCubic);
+    connect(anim, &QPropertyAnimation::finished, view, [view] { view->setGraphicsEffect(nullptr); });
+    anim->start(QAbstractAnimation::DeleteWhenStopped);
+    update();
+}
+
+void LauncherWindow::showLauncher()
+{
+    if (m_stack)
+        m_stack->setCurrentIndex(0);
+    checkGameData();
+    update();
+}
+
+void LauncherWindow::popView()
+{
+    if (!m_stack || m_stack->count() <= 1)
+        return;
+    QWidget *cur = m_stack->currentWidget();
+    if (!cur || cur == m_stack->widget(0))
+        return;
+    m_stack->removeWidget(cur);
+    cur->deleteLater();   // the view owns no external refs
+    m_stack->setCurrentIndex(m_stack->count() - 1);
+    update();
 }
 
 void LauncherWindow::startSettingsGlow()
@@ -499,6 +604,10 @@ void LauncherWindow::loadBackground() { /* bg applied in paintEvent */ }
 
 void LauncherWindow::paintEvent(QPaintEvent *)
 {
+    // [inwindow] A view (settings/wizard/...) is showing: it paints its own opaque
+    // background, so skip the launcher background.
+    if (m_stack && m_stack->currentIndex() != 0)
+        return;
     // The background image only fills the area above the (opaque) bottom bar.
     const int barY = m_bottomBar ? m_bottomBar->y() : height();
     const QRect bgArea(0, 0, width(), barY);

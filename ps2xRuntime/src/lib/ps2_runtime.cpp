@@ -1338,6 +1338,8 @@ double g_fpPresent = 0, g_fpBar = 0, g_fpPre = 0, g_fpWait = 0, g_fpLoop = 0; in
 // 18.81 ms loop) with bar/pre/wait all 0.00 -- real work nobody has named, larger than every
 // tracked guest phase except VU1. Everything optimised so far lived in already-named buckets.
 double g_fpSbb = 0, g_fpPad = 0, g_fpBegin = 0, g_fpBlit = 0, g_fpUi = 0, g_fpAudio = 0, g_fpRender = 0;   // [frameprof2]
+std::chrono::steady_clock::time_point g_ps2xBootT0;   // [boot] set by main.cpp at process start
+bool g_ps2xBootLogged = false;                        // [boot] one-shot first-frame marker
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
                                      DebugUiCallback drawCallback,
                                      DebugUiCallback shutdownCallback,
@@ -1464,17 +1466,26 @@ bool PS2Runtime::initialize(const char *title)
     }
     try
     {
+        auto _bt = std::chrono::steady_clock::now();
+        auto _mark = [&](const char *what) {
+            const auto now = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[boot]   init %-22s %6.1f ms\n", what,
+                         std::chrono::duration<double, std::milli>(now - _bt).count());
+            _bt = now;
+        };
         if (!m_memory.initialize())
         {
             std::cerr << "Failed to initialize PS2 memory" << std::endl;
             return false;
         }
+        _mark("memory");
 
         if (!syncCoreSubsystems())
         {
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
         }
+        _mark("core subsystems");
 
 #if defined(PLATFORM_VITA)
         bt3InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
@@ -1523,7 +1534,9 @@ bool PS2Runtime::initialize(const char *title)
                          winMode, winMonitor, hostWinW, hostWinH);
         }
         ps2xHostPrepareWindow();   // [window] DPI hints must precede the window (SDL init happens inside)
+        _mark("sdl hints");
         bt3InitWindow(hostWinW, hostWinH, title);
+        _mark("init window");
         {   // [winlog] what we asked for vs what the framework reports vs the REAL client area. The SDL
             // platform sizes the window differently than GLFW did: on a DPI-scaled display the logical
             // and physical sizes disagree, and the picture only lines up after a resize event.
@@ -1559,6 +1572,7 @@ bool PS2Runtime::initialize(const char *title)
             else
                 bt3SetWindowSize(hostWinW, hostWinH);   // moving monitors can leave the window fitted
         }
+        _mark("window+monitor");
         // [icon] Carry the launcher's icon onto the runner window. Same asset
         // convention as the overlay font (<exeDir>/assets/icon.png); exeDir is
         // PS2X_EXEDIR (deploy root) else the executable's own directory.
@@ -1609,12 +1623,15 @@ bool PS2Runtime::initialize(const char *title)
         if (AltGlEnabled()) AltGlInit();
         else ps2xGlEnsureContext();
 #endif
+        _mark("gl context");
         // [hostio] audio and gamepads go through the host layers (SDL2 by default, raylib on
         // PS2X_HOSTAUDIO=raylib / PS2X_HOSTPAD=raylib); the window and keyboard stay raylib's.
         ps2x_audio::init();
         m_audioBackend.setAudioReady(ps2x_audio::ready());
+        _mark("audio");
         ps2x_pad::init();
 #endif
+        _mark("pad");
 #if defined(_WIN32)
         {   // [d3d11] Native D3D11 present is the DEFAULT on Windows (PS2X_D3D11=0 disables it).
             // raylib keeps the window, input and audio; the video present is native.
@@ -1682,6 +1699,7 @@ bool PS2Runtime::initialize(const char *title)
             ps2texcache::setConfig(tcEnabled, packHash, dataHash, tcPath.c_str());
             ps2texcache::load();
         }
+        _mark("texcache");
         {   // [fps60] PS2X_FPS60=1: enable the 60-fps fight mode from the env (loads fps60_sites.txt,
             // staged next to the runner). Lets the perf A/B be run without touching settings.toml.
             const char *f60 = std::getenv("PS2X_FPS60");
@@ -1713,6 +1731,7 @@ bool PS2Runtime::initialize(const char *title)
             m_debugUiInitCallback(*this, m_debugUiUserData);
             m_debugUiInitialized = true;
         }
+        _mark("overlay ui");
 
         // PS2X_REPLAY=1: standalone VU1 replay of the spike snapshot (work/spike_{micro,
         // data,state}.bin) through the full normal kick path, then exit. Lets the popup
@@ -1762,6 +1781,7 @@ bool PS2Runtime::initialize(const char *title)
             std::exit(0);
         }
 
+        _mark("done");
         return true;
     }
     catch (const std::exception &e)
@@ -7985,6 +8005,29 @@ void PS2Runtime::run()
           if (gpuMode) ps2GpuRenderer().serviceBlockingBarriers();   // [barblock]
           extern double g_fpSbb; g_fpSbb += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t).count(); }
         const auto _tBegin = std::chrono::steady_clock::now();
+        {   // [fmvpath] PS2X_FMVPATH=1: which present path is live on THIS platform (Windows has
+            // three -- D3D11, AltGL, raylib-GL -- Linux only raylib-GL). The 4K intro override
+            // draws through the same presenter as the game frame, so a wrong-path/FMV-draw miss
+            // shows as the black dummy movie. One-shot per run + on the first active movie frame.
+            static const bool s_fp = [](){ const char *v = std::getenv("PS2X_FMVPATH"); return v && v[0] && v[0] != '0'; }();
+            if (s_fp)
+            {
+                extern std::atomic<uint32_t> g_ps2MovieActive;   // [movsync]
+                static bool s_logged = false;
+                static bool s_movLogged = false;
+                const bool mov = g_ps2MovieActive.load(std::memory_order_relaxed) != 0u;
+                if (!s_logged || (mov && !s_movLogged))
+                {
+                    s_logged = true; if (mov) s_movLogged = true;
+#if defined(_WIN32)
+                    const char *mode = g_ps2xD3D11Mode ? "D3D11" : (AltGlEnabled() && ps2x::gfx::gl::ContextReady() ? "AltGL" : "raylib-GL");
+#else
+                    const char *mode = "raylib-GL";
+#endif
+                    std::fprintf(stderr, "[fmvpath] movie=%d mode=%s\n", (int)mov, mode);
+                }
+            }
+        }
 #if defined(_WIN32)
         if (g_ps2xD3D11Mode)
         {   // [d3d11] Native video frame. The GS replay already ran (renderAndGetTextureId
@@ -8051,8 +8094,19 @@ void PS2Runtime::run()
                 bool d3dFmvDrew = false;
                 {
                     extern std::atomic<uint32_t> g_ps2MovieActive;
+                    static int s_tickN = 0;   // [fmvdbg] first N tick() results under PS2X_FMVDBG
+                    static const bool s_dbg = [](){ const char *v = std::getenv("PS2X_FMVDBG"); return v && v[0] && v[0] != '0'; }();
+                    const bool mov = g_ps2MovieActive.load(std::memory_order_relaxed) != 0u;
                     ps2x_fmv::FmvOverrideFrame of{};
-                    if (ps2x_fmv::tick(g_ps2MovieActive.load(std::memory_order_relaxed) != 0u, of))
+                    const bool ticked = ps2x_fmv::tick(mov, of);
+                    if (s_dbg && s_tickN < 16 && (ticked || mov))
+                    {
+                        ++s_tickN;
+                        std::fprintf(stderr, "[fmvdbg] D3D11 tick mov=%d ret=%d w=%d h=%d gen=%llu\n",
+                                     (int)mov, (int)ticked, of.w, of.h,
+                                     (unsigned long long)(ticked ? of.gen : 0));
+                    }
+                    if (ticked)
                     {
                         static ps2x::gfx::Texture s_fmvTex;
                         static int s_tw = 0, s_th = 0;
@@ -8315,8 +8369,22 @@ void PS2Runtime::run()
 #endif
         {
             extern std::atomic<uint32_t> g_ps2MovieActive;   // [movsync]
+            // [fmvdbg] PS2X_FMVDBG=1: mirror of the D3D11 tick() probe for this (GL/AltGL) path --
+            // confirm the override engages on THIS presenter too (a GL-only black-dummy symptom
+            // would show as ret=0 here while D3D11 succeeded, or vice versa).
+            static int s_glTickN = 0;
+            static const bool s_dbg = [](){ const char *v = std::getenv("PS2X_FMVDBG"); return v && v[0] && v[0] != '0'; }();
+            const bool mov = g_ps2MovieActive.load(std::memory_order_relaxed) != 0u;
             ps2x_fmv::FmvOverrideFrame of{};
-            if (ps2x_fmv::tick(g_ps2MovieActive.load(std::memory_order_relaxed) != 0u, of))
+            const bool ticked = ps2x_fmv::tick(mov, of);
+            if (s_dbg && s_glTickN < 16 && (ticked || mov))
+            {
+                ++s_glTickN;
+                std::fprintf(stderr, "[fmvdbg] GL tick mov=%d ret=%d w=%d h=%d gen=%llu\n",
+                             (int)mov, (int)ticked, of.w, of.h,
+                             (unsigned long long)(ticked ? of.gen : 0));
+            }
+            if (ticked)
             {
                 {   // [fmvdiag] decode vs draw: is the decoded frame carrying pixels?
                     static int s_dbg = 0;
@@ -8468,14 +8536,21 @@ void PS2Runtime::run()
             }
             const auto tP0 = std::chrono::steady_clock::now();
             bt3EndDrawing();
+            // [boot] First presented frame: process start -> boot. One-shot.
+            if (!g_ps2xBootLogged && g_ps2xBootT0.time_since_epoch().count() != 0)
+            {
+                g_ps2xBootLogged = true;
+                std::fprintf(stderr, "[boot] start -> first frame: %.1f ms\n",
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_ps2xBootT0).count());
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            g_fpPresent += std::chrono::duration<double, std::milli>(t1 - tP0).count();
+            ++g_fpN;
+            static auto lastLoop = t1;
+            g_fpLoop += std::chrono::duration<double, std::milli>(t1 - lastLoop).count(); lastLoop = t1;
             if (s_fp)
             {
-                const auto t1 = std::chrono::steady_clock::now();
-                g_fpPresent += std::chrono::duration<double, std::milli>(t1 - tP0).count();
-                ++g_fpN;
                 static auto lastPrint = t1;
-                static auto lastLoop = t1;
-                g_fpLoop += std::chrono::duration<double, std::milli>(t1 - lastLoop).count(); lastLoop = t1;
                 if (std::chrono::duration<double>(t1 - lastPrint).count() >= 1.0)
                 {
                     lastPrint = t1;
@@ -8521,6 +8596,37 @@ void PS2Runtime::run()
                     std::fprintf(stderr, "[ftspike] n=%d max=%.1fms  >26:%d >34.5:%d >40:%d >50:%d >80:%d\n",
                                  n, mx, b25, b33, b40, b50, b80);
                     mx = 0; n = 0; b25 = b33 = b40 = b50 = b80 = 0;
+                }
+            }
+        }
+        {   // [fphase] PS2X_FRAMEPHASE=1: per-SPIKE phase breakdown. [frameprof2] averages per second,
+            // which hides the composition of the worst frames; this logs the phase deltas of any frame
+            // whose inter-present gap reaches PS2X_FRAMEPHASE_MS (default 40 ms), so a single hitch can be
+            // attributed: present / bar / pre / wait / sbb / pad / begin / blit / ui / audio / render / other.
+            static const bool s_fph = [](){ const char *v = std::getenv("PS2X_FRAMEPHASE"); return v && v[0] && v[0] != '0'; }();
+            if (s_fph)
+            {
+                extern double g_fpPresent, g_fpBar, g_fpPre, g_fpWait;
+                extern double g_fpSbb, g_fpPad, g_fpBegin, g_fpBlit, g_fpUi, g_fpAudio, g_fpRender;
+                static const double thr = [](){ const char *v = std::getenv("PS2X_FRAMEPHASE_MS");
+                    const double d = v ? std::atof(v) : 40.0; return (d > 0.0) ? d : 40.0; }();
+                static auto last = std::chrono::steady_clock::now();
+                static double pP = 0, pB = 0, pPre = 0, pW = 0, pSbb = 0, pPad = 0, pBe = 0, pBl = 0, pUi = 0, pAu = 0, pRen = 0;
+                const auto now = std::chrono::steady_clock::now();
+                const double dt = std::chrono::duration<double, std::milli>(now - last).count();
+                last = now;
+                const double dP = g_fpPresent - pP, dB = g_fpBar - pB, dPre = g_fpPre - pPre, dW = g_fpWait - pW;
+                const double dSbb = g_fpSbb - pSbb, dPad = g_fpPad - pPad, dBe = g_fpBegin - pBe, dBl = g_fpBlit - pBl;
+                const double dUi = g_fpUi - pUi, dAu = g_fpAudio - pAu, dRen = g_fpRender - pRen;
+                pP = g_fpPresent; pB = g_fpBar; pPre = g_fpPre; pW = g_fpWait; pSbb = g_fpSbb; pPad = g_fpPad;
+                pBe = g_fpBegin; pBl = g_fpBlit; pUi = g_fpUi; pAu = g_fpAudio; pRen = g_fpRender;
+                // A negative delta means the per-second [frameprof] reset ran (FRAMEPROF also on): skip it.
+                if (dt >= thr && dP >= 0.0 && dB >= 0.0 && dPre >= 0.0 && dW >= 0.0 && dSbb >= 0.0 && dAu >= 0.0)
+                {
+                    const double named = dP + dB + dPre + dW + dSbb + dPad + dBe + dBl + dUi + dAu + dRen;
+                    std::fprintf(stderr, "[fphase] dt=%.1fms present=%.1f bar=%.1f pre=%.1f wait=%.1f "
+                                         "sbb=%.1f pad=%.1f begin=%.1f blit=%.1f ui=%.1f audio=%.1f render=%.1f other=%.1f\n",
+                                 dt, dP, dB, dPre, dW, dSbb, dPad, dBe, dBl, dUi, dAu, dRen, dt - named);
                 }
             }
         }

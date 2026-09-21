@@ -130,12 +130,16 @@ private:
 
     bool m_sawRenderer = false;   // [renderer] set when the ini had an explicit `renderer` key
     QString m_dir;
-    float m_master = 1.0f, m_music = 1.0f, m_sfx = 1.0f;
-    int m_renderer = kRendererParallelGS;   // [pgswin] every platform, as the Video tab's hint says
+    float m_master = 1.0f, m_music = 1.0f, m_sfx = 0.4f;
+#if defined(_WIN32)
+    int m_renderer = kRendererOpenGL;   // [win] OpenGL (New) is the Windows default (no Vulkan/lavapipe dependency)
+#else
+    int m_renderer = kRendererParallelGS;   // [pgswin] Linux/macOS keep paraLLEl-GS by default
+#endif
     bool m_glow = true, m_glowFix = true;
     bool m_bilinear = true, m_halfTexel = true, m_skipPost = true, m_skipStaleVram = true;
     int m_renderScale = 1;
-    bool m_outline = true, m_shadows = true, m_dofBlur = true;
+    bool m_outline = false, m_shadows = true, m_dofBlur = false;
     int m_inkStrength = 199, m_dofZFar = 200000;
     int m_inkWidth = 100;
     unsigned m_inkColor = 0;

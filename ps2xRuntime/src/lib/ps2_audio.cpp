@@ -12,7 +12,7 @@
 
 float PS2AudioBackend::s_masterVolume = 1.0f;
 float PS2AudioBackend::s_musicVolume = 1.0f;
-float PS2AudioBackend::s_sfxVolume = 1.0f;
+float PS2AudioBackend::s_sfxVolume = 0.4f;
 
 namespace ps2_vag
 {

@@ -47,6 +47,7 @@ AudioTab::AudioTab(QWidget *parent)
     root->addWidget(gameLabel);
     auto *musicRow = sliderRow(QStringLiteral("Music"), &m_music, &m_musicVal);
     auto *sfxRow = sliderRow(QStringLiteral("SFX"), &m_sfx, &m_sfxVal);
+    m_sfx->setRange(0, 40);   // SFX is capped at 40%: voices/effects clip and overpower the mix above that
     root->addWidget(musicRow);
     root->addWidget(sfxRow);
 

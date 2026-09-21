@@ -1775,7 +1775,10 @@ int InitPlatform(void)
 {
     // Initialize SDL internal global state, only required systems
     // NOTE: Not all systems need to be initialized, SDL_INIT_AUDIO is not required, managed by miniaudio
+    // [bootspeed] timing only; the subsystem list is unchanged from upstream.
+    unsigned int _bt0 = SDL_GetTicks();
     int result = SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER);
+    fprintf(stderr, "[bootw] SDL_Init: %u ms\n", SDL_GetTicks() - _bt0);
     if (result < 0) { TRACELOG(LOG_WARNING, "SDL: Failed to initialize SDL"); return -1; }
 
     // Initialize graphic device: display/window and graphic context
@@ -1861,11 +1864,15 @@ int InitPlatform(void)
 #ifdef PLATFORM_DESKTOP_SDL3
     platform.window = SDL_CreateWindow(CORE.Window.title, CORE.Window.screen.width, CORE.Window.screen.height, flags);
 #else
+    unsigned int _bt1 = SDL_GetTicks();
     platform.window = SDL_CreateWindow(CORE.Window.title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, CORE.Window.screen.width, CORE.Window.screen.height, flags);
+    fprintf(stderr, "[bootw] SDL_CreateWindow: %u ms\n", SDL_GetTicks() - _bt1);
 #endif
 
     // Init OpenGL context
+    unsigned int _bt2 = SDL_GetTicks();
     platform.glContext = SDL_GL_CreateContext(platform.window);
+    fprintf(stderr, "[bootw] SDL_GL_CreateContext: %u ms\n", SDL_GetTicks() - _bt2);
 
     // Check window and glContext have been initialized successfully
     if ((platform.window != NULL) && (platform.glContext != NULL))

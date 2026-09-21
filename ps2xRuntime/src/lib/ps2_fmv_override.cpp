@@ -54,6 +54,7 @@ namespace
     bool g_started = false;
     bool g_skipPoked = false;
     bool g_halted = false;   // [fmvoverride] stopped this session (safety/end): don't re-inject
+    bool s_dbgLogged = false;   // [fmvdbg] one-shot: enabled() precondition diagnostics (PS2X_FMVDBG)
     std::string g_path;
     double g_duration = 0.0;
     double g_fps = 30000.0 / 1001.0;   // [videoclk] source frame rate (native-progress clock unit)
@@ -138,7 +139,11 @@ namespace
             std::lock_guard<std::mutex> lk(g_mx); g_eof = true; g_cv.notify_all(); return;
         }
         AVStream *st = fmt->streams[vs];
-        const AVCodec *dec = avcodec_find_decoder(st->codecpar->codec_id);
+        const AVCodec *dec = nullptr;
+        if (st->codecpar->codec_id == AV_CODEC_ID_AV1)
+            dec = avcodec_find_decoder_by_name("libdav1d");   // prefer fast AV1 SW decoder when present
+        if (!dec)
+            dec = avcodec_find_decoder(st->codecpar->codec_id);
         AVCodecContext *cc = avcodec_alloc_context3(dec);
         if (!dec || !cc || avcodec_parameters_to_context(cc, st->codecpar) < 0)
         {
@@ -164,17 +169,19 @@ namespace
             else if (st->r_frame_rate.num > 0 && st->r_frame_rate.den > 0)
                 g_fps = (double)st->r_frame_rate.num / (double)st->r_frame_rate.den;
             if (g_fps < 1.0 || g_fps > 240.0) g_fps = 30000.0 / 1001.0;
-            std::fprintf(stderr, "[fmvoverride] decoding %dx%d, dur=%.2fs, codec=%s\n",
-                         cc->width, cc->height, g_duration, avcodec_get_name(st->codecpar->codec_id));
+            const bool dav1dActive = dec && dec->name && std::strcmp(dec->name, "libdav1d") == 0;
+            std::fprintf(stderr, "[fmvoverride] decoding %dx%d, dur=%.2fs, codec=%s, decoder=%s\n",
+                         cc->width, cc->height, g_duration, avcodec_get_name(st->codecpar->codec_id),
+                         dec && dec->name ? dec->name : "?");
             // [fmvguard] Warn loudly when the clip is very unlikely to decode in software in this
-            // process: AV1 has no hwaccel here, and >1440p software decode rarely keeps up. A wrong
+            // process: AV1 with no fast SW decoder, or >1440p without one, rarely keeps up. A wrong
             // clip otherwise just shows as a silent black movie.
             {
                 const char *cn = avcodec_get_name(st->codecpar->codec_id);
                 const bool av1 = (st->codecpar->codec_id == AV_CODEC_ID_AV1) ||
                                  (cn && std::strstr(cn, "av1") != nullptr);
                 const bool huge = (cc->width > 2560 || cc->height > 1440);
-                if (av1 || huge)
+                if ((av1 || huge) && !dav1dActive)
                     std::fprintf(stderr, "[fmvguard] WARNING: %s%s%s -> software decode may produce NO frames "
                                          "(black video). Use H.264 High 8-bit yuv420p at <=2560x1440, 30fps, CRF 16.\n",
                                  av1 ? "AV1 has no hardware decode on this platform" : "",
@@ -316,9 +323,21 @@ bool enabled()
 {
     if (!envOverridePath().empty()) return true;                 // PS2X_FMV_OVERRIDE wins
     const PackToggles &t = tomlPackToggles();
+    const bool hasMp4 = fileExists(packVideoDir() + "/ZS3USOP_4k.mp4");
+    // [fmvdbg] PS2X_FMVDBG=1: WHY is the 4K intro override not engaging on Windows? Logs the
+    // four enablement preconditions once per run. (The black "dummy" opening movie = the native
+    // PSS not decoding; the 4K paint should sit on top via ps2_fmv_override::tick.)
+    static const bool s_dbg = [](){ const char *v = std::getenv("PS2X_FMVDBG"); return v && v[0] && v[0] != '0'; }();
+    if (s_dbg && !s_dbgLogged)
+    {
+        s_dbgLogged = true;
+        std::fprintf(stderr, "[fmvdbg] envOverride='%s' texPack=%d introVideo=%d mp4_exists=%d path='%s'\n",
+                     envOverridePath().c_str(), (int)t.texPack, (int)t.introVideo, (int)hasMp4,
+                     (packVideoDir() + "/ZS3USOP_4k.mp4").c_str());
+    }
     if (!t.texPack) return false;                                // [video] texture_pack must be on
     if (!t.introVideo) return false;                             // [video] intro_video off = no override
-    return fileExists(packVideoDir() + "/ZS3USOP_4k.mp4");       // ...and the pack ships the video
+    return hasMp4;                                               // ...and the pack ships the video
 }
 
 std::string videoPath()
@@ -405,12 +424,28 @@ bool tick(bool movieActive, FmvOverrideFrame &out)
     float alpha = 1.0f;
     if (dur > 0.0 && s_fade > 0.0)
     {
-        const double rem = dur - el;
+        // [fade] Drive the dissolve from the monotonic wall clock (el0): g_clockT snaps to native
+        // movie frame boundaries, which makes alpha step/jitter. el0 tracks it within ~20ms.
+        const double rem = dur - el0;
         if (rem <= s_fade)
         {
             alpha = (float)(rem / s_fade);
             if (alpha < 0.0f) alpha = 0.0f;
             if (alpha > 1.0f) alpha = 1.0f;
+            // [fmvfade] PS2X_FMVFADE=1: per-present trace of the dissolve -- dt (present gap),
+            // queue depth and gen (whether the video frame advances or is being repeated).
+            static const bool s_fadeDbg = [](){ const char *v = std::getenv("PS2X_FMVFADE"); return v && v[0] && v[0] != '0'; }();
+            if (s_fadeDbg)
+            {
+                static auto s_prev = std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
+                const double dt = std::chrono::duration<double>(now - s_prev).count();
+                s_prev = now;
+                size_t q = 0; uint64_t gen = 0;
+                { std::lock_guard<std::mutex> lk(g_mx); q = g_queue.size(); gen = g_gen; }
+                std::fprintf(stderr, "[fmvfade] el0=%.3f rem=%.3f alpha=%.3f dt=%.4f q=%zu gen=%llu\n",
+                             el0, rem, alpha, dt, q, (unsigned long long)gen);
+            }
         }
     }
 
@@ -419,6 +454,9 @@ bool tick(bool movieActive, FmvOverrideFrame &out)
         const double d = v ? std::atof(v) : 0.5;
         return (d >= 0.0 && d < 5.0) ? d : 0.5; }();
     static uint32_t s_pulse = 0u;
+    // [fade] Keep poking from a little before the end (legacy lead): the guest's skip is
+    // edge-triggered and needs enough pulses before the native movie ends, otherwise the
+    // transition to the next scene is flaky (sometimes it never advances).
     if (dur > 0.0 && el >= dur - s_lead)
     {
         // Pulse the skip button (short press + release) instead of holding it down forever:

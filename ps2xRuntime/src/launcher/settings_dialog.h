@@ -1,30 +1,29 @@
 #pragma once
 
-#include <QDialog>
+#include <QWidget>
+#include <functional>
 
-class QGraphicsOpacityEffect;
-class QPropertyAnimation;
-class QTabWidget;
+class QListWidget;
+class QStackedWidget;
 class BindingsTab;
 
-class SettingsDialog : public QDialog
+// [inwindow] Settings is an in-window VIEW (not a popup): the launcher swaps its
+// whole content for this widget and back. onBack returns to the launcher page.
+// [sidebar] Left list + stacked pages instead of a QTabWidget.
+class SettingsView : public QWidget
 {
     Q_OBJECT
 public:
-    explicit SettingsDialog(QWidget *parent = nullptr);
+    explicit SettingsView(QWidget *parent = nullptr);
 
-protected:
-    void showEvent(QShowEvent *) override;
-    void closeEvent(QCloseEvent *) override;
+    std::function<void()> onBack;
 
 private slots:
     void onSave();
     void onClose();
 
 private:
-    QTabWidget *m_tabs = nullptr;
+    QListWidget *m_side = nullptr;
+    QStackedWidget *m_pages = nullptr;
     BindingsTab *m_bindings = nullptr;
-    QGraphicsOpacityEffect *m_fx = nullptr;
-    QPropertyAnimation *m_anim = nullptr;
-    bool m_animClosing = false;
 };
