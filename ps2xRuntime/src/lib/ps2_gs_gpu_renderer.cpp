@@ -345,7 +345,7 @@ void GsGpuRenderer::setRenderScale(int s)
 }
 void GsGpuRenderer::setEnabled(bool v)     { g_uiGpu.store(v ? 1 : 0); }
 namespace { std::atomic<int> g_uiOutline{-1}, g_uiShadows{-1}; }
-bool GsGpuRenderer::outlineEnabled()       { return uiFlag(g_uiOutline, "PS2X_OUTLINE", true); }
+bool GsGpuRenderer::outlineEnabled()       { return uiFlag(g_uiOutline, "PS2X_OUTLINE", false); }
 void GsGpuRenderer::setOutline(bool v)     { g_uiOutline.store(v ? 1 : 0); }
 bool GsGpuRenderer::shadowsEnabled()       { return uiFlag(g_uiShadows, "PS2X_SHADOWS", true); }
 namespace { std::atomic<int> g_uiDofBlur{-1}, g_uiDofZFar{-1}; }

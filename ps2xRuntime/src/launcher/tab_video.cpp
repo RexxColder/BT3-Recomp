@@ -385,7 +385,7 @@ namespace
     private:
         struct Snap
         {
-            bool outline = true, shadows = true, dof = true, glow = true, bilinear = true, force = true;
+            bool outline = false, shadows = true, dof = false, glow = true, bilinear = true, force = true;
             int ink = 199, reach = 200;
         };
 

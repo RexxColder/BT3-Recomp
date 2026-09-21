@@ -16,7 +16,7 @@ public:
     {
         float masterVolume = 1.0f;
         float musicVolume = 1.0f;
-        float sfxVolume = 1.0f;
+        float sfxVolume = 0.4f;
         bool gpuRenderer = true;
         // [renderer] 0 = OpenGL (New: our own gfx::gl present), 1 = software rasterizer, 2 = paraLLEl-GS
         // (Vulkan compute; only when the backend is built in), 3 = Direct3D 11 (native Windows present;
@@ -41,7 +41,7 @@ public:
         float deadzone = 0.15f;
         bool fullscreen = false;  // [defaults-sync] do not force fullscreen on first launch (rig + user surprise); one toggle away in the overlay
         bool widescreen = false;
-        bool outline = true;
+        bool outline = false;
         bool texPack = false;   // [texreplace] use the PCSX2 replacement pack when one is indexed (default OFF)
         bool introVideo = true; // [texui] 4K opening-video override when the pack ships it (applies on restart)
         int buttonLayout = 1;   // [texui] 0 = PS2 (Original Buttons), 1 = Xbox (Xbox Layout); applies on restart
@@ -50,7 +50,7 @@ public:
         int inkWidth = 100;      // [pgsink] paraLLEl-GS: outline stroke width, % of a PS2 texel (100 = native, 25 = thinnest)
         unsigned inkColor = 0;   // [pgsink] paraLLEl-GS: outline colour 0xRRGGBB (0 = the game's black)
         bool shadows = true;
-        bool dofBlur = true;
+        bool dofBlur = false;
         int dofZFar = 200000;
         int windowW = 0, windowH = 0; // 0 = keep the default host window size
         bool forceBilinear = true;    // PCSX2-style forced texture filtering (default ON)
