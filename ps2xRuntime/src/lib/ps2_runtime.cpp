@@ -7985,6 +7985,29 @@ void PS2Runtime::run()
           if (gpuMode) ps2GpuRenderer().serviceBlockingBarriers();   // [barblock]
           extern double g_fpSbb; g_fpSbb += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t).count(); }
         const auto _tBegin = std::chrono::steady_clock::now();
+        {   // [fmvpath] PS2X_FMVPATH=1: which present path is live on THIS platform (Windows has
+            // three -- D3D11, AltGL, raylib-GL -- Linux only raylib-GL). The 4K intro override
+            // draws through the same presenter as the game frame, so a wrong-path/FMV-draw miss
+            // shows as the black dummy movie. One-shot per run + on the first active movie frame.
+            static const bool s_fp = [](){ const char *v = std::getenv("PS2X_FMVPATH"); return v && v[0] && v[0] != '0'; }();
+            if (s_fp)
+            {
+                extern std::atomic<uint32_t> g_ps2MovieActive;   // [movsync]
+                static bool s_logged = false;
+                static bool s_movLogged = false;
+                const bool mov = g_ps2MovieActive.load(std::memory_order_relaxed) != 0u;
+                if (!s_logged || (mov && !s_movLogged))
+                {
+                    s_logged = true; if (mov) s_movLogged = true;
+#if defined(_WIN32)
+                    const char *mode = g_ps2xD3D11Mode ? "D3D11" : (AltGlEnabled() && ps2x::gfx::gl::ContextReady() ? "AltGL" : "raylib-GL");
+#else
+                    const char *mode = "raylib-GL";
+#endif
+                    std::fprintf(stderr, "[fmvpath] movie=%d mode=%s\n", (int)mov, mode);
+                }
+            }
+        }
 #if defined(_WIN32)
         if (g_ps2xD3D11Mode)
         {   // [d3d11] Native video frame. The GS replay already ran (renderAndGetTextureId
@@ -8051,8 +8074,19 @@ void PS2Runtime::run()
                 bool d3dFmvDrew = false;
                 {
                     extern std::atomic<uint32_t> g_ps2MovieActive;
+                    static int s_tickN = 0;   // [fmvdbg] first N tick() results under PS2X_FMVDBG
+                    static const bool s_dbg = [](){ const char *v = std::getenv("PS2X_FMVDBG"); return v && v[0] && v[0] != '0'; }();
+                    const bool mov = g_ps2MovieActive.load(std::memory_order_relaxed) != 0u;
                     ps2x_fmv::FmvOverrideFrame of{};
-                    if (ps2x_fmv::tick(g_ps2MovieActive.load(std::memory_order_relaxed) != 0u, of))
+                    const bool ticked = ps2x_fmv::tick(mov, of);
+                    if (s_dbg && s_tickN < 16 && (ticked || mov))
+                    {
+                        ++s_tickN;
+                        std::fprintf(stderr, "[fmvdbg] D3D11 tick mov=%d ret=%d w=%d h=%d gen=%llu\n",
+                                     (int)mov, (int)ticked, of.w, of.h,
+                                     (unsigned long long)(ticked ? of.gen : 0));
+                    }
+                    if (ticked)
                     {
                         static ps2x::gfx::Texture s_fmvTex;
                         static int s_tw = 0, s_th = 0;
@@ -8315,8 +8349,22 @@ void PS2Runtime::run()
 #endif
         {
             extern std::atomic<uint32_t> g_ps2MovieActive;   // [movsync]
+            // [fmvdbg] PS2X_FMVDBG=1: mirror of the D3D11 tick() probe for this (GL/AltGL) path --
+            // confirm the override engages on THIS presenter too (a GL-only black-dummy symptom
+            // would show as ret=0 here while D3D11 succeeded, or vice versa).
+            static int s_glTickN = 0;
+            static const bool s_dbg = [](){ const char *v = std::getenv("PS2X_FMVDBG"); return v && v[0] && v[0] != '0'; }();
+            const bool mov = g_ps2MovieActive.load(std::memory_order_relaxed) != 0u;
             ps2x_fmv::FmvOverrideFrame of{};
-            if (ps2x_fmv::tick(g_ps2MovieActive.load(std::memory_order_relaxed) != 0u, of))
+            const bool ticked = ps2x_fmv::tick(mov, of);
+            if (s_dbg && s_glTickN < 16 && (ticked || mov))
+            {
+                ++s_glTickN;
+                std::fprintf(stderr, "[fmvdbg] GL tick mov=%d ret=%d w=%d h=%d gen=%llu\n",
+                             (int)mov, (int)ticked, of.w, of.h,
+                             (unsigned long long)(ticked ? of.gen : 0));
+            }
+            if (ticked)
             {
                 {   // [fmvdiag] decode vs draw: is the decoded frame carrying pixels?
                     static int s_dbg = 0;
@@ -8468,14 +8516,14 @@ void PS2Runtime::run()
             }
             const auto tP0 = std::chrono::steady_clock::now();
             bt3EndDrawing();
+            const auto t1 = std::chrono::steady_clock::now();
+            g_fpPresent += std::chrono::duration<double, std::milli>(t1 - tP0).count();
+            ++g_fpN;
+            static auto lastLoop = t1;
+            g_fpLoop += std::chrono::duration<double, std::milli>(t1 - lastLoop).count(); lastLoop = t1;
             if (s_fp)
             {
-                const auto t1 = std::chrono::steady_clock::now();
-                g_fpPresent += std::chrono::duration<double, std::milli>(t1 - tP0).count();
-                ++g_fpN;
                 static auto lastPrint = t1;
-                static auto lastLoop = t1;
-                g_fpLoop += std::chrono::duration<double, std::milli>(t1 - lastLoop).count(); lastLoop = t1;
                 if (std::chrono::duration<double>(t1 - lastPrint).count() >= 1.0)
                 {
                     lastPrint = t1;
@@ -8521,6 +8569,37 @@ void PS2Runtime::run()
                     std::fprintf(stderr, "[ftspike] n=%d max=%.1fms  >26:%d >34.5:%d >40:%d >50:%d >80:%d\n",
                                  n, mx, b25, b33, b40, b50, b80);
                     mx = 0; n = 0; b25 = b33 = b40 = b50 = b80 = 0;
+                }
+            }
+        }
+        {   // [fphase] PS2X_FRAMEPHASE=1: per-SPIKE phase breakdown. [frameprof2] averages per second,
+            // which hides the composition of the worst frames; this logs the phase deltas of any frame
+            // whose inter-present gap reaches PS2X_FRAMEPHASE_MS (default 40 ms), so a single hitch can be
+            // attributed: present / bar / pre / wait / sbb / pad / begin / blit / ui / audio / render / other.
+            static const bool s_fph = [](){ const char *v = std::getenv("PS2X_FRAMEPHASE"); return v && v[0] && v[0] != '0'; }();
+            if (s_fph)
+            {
+                extern double g_fpPresent, g_fpBar, g_fpPre, g_fpWait;
+                extern double g_fpSbb, g_fpPad, g_fpBegin, g_fpBlit, g_fpUi, g_fpAudio, g_fpRender;
+                static const double thr = [](){ const char *v = std::getenv("PS2X_FRAMEPHASE_MS");
+                    const double d = v ? std::atof(v) : 40.0; return (d > 0.0) ? d : 40.0; }();
+                static auto last = std::chrono::steady_clock::now();
+                static double pP = 0, pB = 0, pPre = 0, pW = 0, pSbb = 0, pPad = 0, pBe = 0, pBl = 0, pUi = 0, pAu = 0, pRen = 0;
+                const auto now = std::chrono::steady_clock::now();
+                const double dt = std::chrono::duration<double, std::milli>(now - last).count();
+                last = now;
+                const double dP = g_fpPresent - pP, dB = g_fpBar - pB, dPre = g_fpPre - pPre, dW = g_fpWait - pW;
+                const double dSbb = g_fpSbb - pSbb, dPad = g_fpPad - pPad, dBe = g_fpBegin - pBe, dBl = g_fpBlit - pBl;
+                const double dUi = g_fpUi - pUi, dAu = g_fpAudio - pAu, dRen = g_fpRender - pRen;
+                pP = g_fpPresent; pB = g_fpBar; pPre = g_fpPre; pW = g_fpWait; pSbb = g_fpSbb; pPad = g_fpPad;
+                pBe = g_fpBegin; pBl = g_fpBlit; pUi = g_fpUi; pAu = g_fpAudio; pRen = g_fpRender;
+                // A negative delta means the per-second [frameprof] reset ran (FRAMEPROF also on): skip it.
+                if (dt >= thr && dP >= 0.0 && dB >= 0.0 && dPre >= 0.0 && dW >= 0.0 && dSbb >= 0.0 && dAu >= 0.0)
+                {
+                    const double named = dP + dB + dPre + dW + dSbb + dPad + dBe + dBl + dUi + dAu + dRen;
+                    std::fprintf(stderr, "[fphase] dt=%.1fms present=%.1f bar=%.1f pre=%.1f wait=%.1f "
+                                         "sbb=%.1f pad=%.1f begin=%.1f blit=%.1f ui=%.1f audio=%.1f render=%.1f other=%.1f\n",
+                                 dt, dP, dB, dPre, dW, dSbb, dPad, dBe, dBl, dUi, dAu, dRen, dt - named);
                 }
             }
         }

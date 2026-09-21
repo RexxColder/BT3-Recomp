@@ -96,6 +96,8 @@ OS_COMPONENTS = {
     # ODBC driver manager (ships with Windows; Qt SQL plugin imports it)
     "odbc32.dll",
     "odbcint.dll",
+    # XML parser shipped with Windows (ffmpeg avfilter imports it)
+    "xmllite.dll",
 }
 OS_COMPONENTS = {name.lower() for name in OS_COMPONENTS}
 

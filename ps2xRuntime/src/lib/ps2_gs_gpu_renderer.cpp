@@ -426,7 +426,7 @@ static inline std::chrono::steady_clock::time_point psxNow() { return g_timingOn
 
 struct LinImg { std::mutex m; int w = 0, h = 0; uint32_t fbp = 0, fbw = 0, psm = 0; std::vector<uint32_t> px; std::vector<uint32_t> pageSeq; bool init = false; };
 static std::mutex g_linMx; static std::unordered_map<uint32_t, LinImg*> g_linImgs;   // key (fbp<<8)|viewPsm
-extern uint32_t *g_wbLinear; extern int g_wbLinearStride;
+extern thread_local uint32_t *g_wbLinear; extern thread_local int g_wbLinearStride;
 unsigned long g_linFetch = 0, g_linMiss = 0, g_linRefresh = 0;
 
 extern "C" void glBlitFramebuffer(int, int, int, int, int, int, int, int, unsigned mask, unsigned filter);
@@ -2869,7 +2869,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
     // so the software rebuild's bands survive AND the geometry's alpha fills the gaps.
     static const bool s_mergeA = [](){ const char *v = std::getenv("PS2X_BARMERGEA");
                                        return v && v[0] && v[0] != '0'; }();
-    extern bool g_wbAlphaFillOnly;
+    extern thread_local bool g_wbAlphaFillOnly;
     g_wbAlphaFillOnly = s_mergeA && (fbp == 0u || fbp == 112u);
 
     // Alpha-only when the depth has just been written to the same words: the mask composites
@@ -2895,7 +2895,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
     }
     { std::lock_guard<std::mutex> bk(g_barMx); if (wbMask & 0xFF000000u) g_barAlphaStale.insert(fbp); else g_barAlphaStale.erase(fbp); }   // [bargate2]
     { const auto tW0 = std::chrono::steady_clock::now();
-    { extern int g_wbRectX0, g_wbRectY0, g_wbRectX1, g_wbRectY1; if (rectUsed) { g_wbRectX0 = rX0; g_wbRectY0 = rY0; g_wbRectX1 = rX1; g_wbRectY1 = rY1; } }
+    { extern thread_local int g_wbRectX0, g_wbRectY0, g_wbRectX1, g_wbRectY1; if (rectUsed) { g_wbRectX0 = rX0; g_wbRectY0 = rY0; g_wbRectX1 = rX1; g_wbRectY1 = rY1; } }
     {   // [flushdiff] PS2X_FLUSHDIFF (default ON, =0 off): write only pixels that changed since
         // this page's last flush in the same format/mask. The scene pages are flushed ~5x per
         // frame and only a column strip changes between flushes; the per-pixel VRAM write was
@@ -2904,7 +2904,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
         static const bool s_fdiff = [](){ const char *v = std::getenv("PS2X_FLUSHDIFF"); return !(v && v[0] == '0'); }();
         struct Shadow { uint32_t psm = 0, mask = 0; int w = 0, h = 0; uint32_t seq = 0; std::vector<uint32_t> px; std::vector<uint8_t> unk; /* [shrows] 1 = row content unknown */ };
         static std::unordered_map<uint32_t, Shadow> s_shadow; static std::vector<uint8_t> s_skip;
-        extern const uint8_t *g_wbSkipMask; g_wbSkipMask = nullptr;
+        extern thread_local const uint8_t *g_wbSkipMask; g_wbSkipMask = nullptr;
         // [shview] one shadow per (fbp, psm) view: a flush through the other format stamps the pages it
         // wrote (onVramWriteback), which the band logic below turns into forced rows -- so the
         // format alternation costs a band write instead of a full page.
@@ -2920,7 +2920,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
             if (cseqSnap && p >= fbp && p - fbp < (uint32_t)cseqSnap->size()) return (*cseqSnap)[p - fbp];
             return m_contentSeq[p]; };
         auto pageSeqMax = [&]() { uint32_t mx = 0; for (uint32_t p = fbp; p < fbp + nPagesF && p < kVramPages; ++p) mx = std::max(mx, contentSeqAt(p)); return mx; };
-        extern const std::pair<int,int> *g_wbRowRange; g_wbRowRange = nullptr;
+        extern thread_local const std::pair<int,int> *g_wbRowRange; g_wbRowRange = nullptr;
         static const bool s_frows = [](){ const char *v = std::getenv("PS2X_FLUSHROWS"); return !(v && v[0] == '0'); }();
         static std::vector<std::pair<int,int>> s_rows;
         // [flushrectdiff] PS2X_FLUSHRECTDIFF (default ON, =0 off): dirty-rect flushes used to bypass
@@ -3029,7 +3029,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
             }
         }
     { extern double g_flWrite; const auto tw = std::chrono::steady_clock::now();
-    { extern int g_wbFlipY; g_wbFlipY = s_noflip ? 1 : 0; }
+    { extern thread_local int g_wbFlipY; g_wbFlipY = s_noflip ? 1 : 0; }
     if (m_pageSkipSeq)
     {   // [pageskip] a deferred flush must not overwrite pages the guest wrote (uploads / copies) AFTER the read it
         // serves -- with a blocking barrier those writes always came after the flush. Mask their 64xN blocks out.
@@ -3117,9 +3117,9 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
             }
         }
     }
-    { extern int g_wbFlipY; g_wbFlipY = 0; }
+    { extern thread_local int g_wbFlipY; g_wbFlipY = 0; }
       g_flWrite += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count(); }
-        { extern const uint8_t *g_wbSkipMask; g_wbSkipMask = nullptr; }
+        { extern thread_local const uint8_t *g_wbSkipMask; g_wbSkipMask = nullptr; }
         g_wbRowRange = nullptr;
         if (s_fdiff)
         {
@@ -3145,7 +3145,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
         }
         { extern int g_wbLastWrittenRows; extern long g_bsRowsWritten; extern int g_bsZeroFlush; g_bsRowsWritten += g_wbLastWrittenRows; if (g_wbLastWrittenRows == 0) ++g_bsZeroFlush; }
     }
-    { extern int g_wbRectX0, g_wbRectY0, g_wbRectX1, g_wbRectY1; g_wbRectX0 = g_wbRectY0 = g_wbRectX1 = g_wbRectY1 = -1; }
+    { extern thread_local int g_wbRectX0, g_wbRectY0, g_wbRectX1, g_wbRectY1; g_wbRectX0 = g_wbRectY0 = g_wbRectX1 = g_wbRectY1 = -1; }
       extern double g_bsWrite; g_bsWrite += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tW0).count(); }
     {   // A flush REPLACES this page's bytes in VRAM, so any cached texture decode of it is now
         // stale -- exactly the hazard the software path already handles by calling
@@ -3677,7 +3677,7 @@ void GsGpuRenderer::serviceDecodeReq(TexDecodeReq &q)
     // missing panels, black frames live).
     static const bool s_mir = [](){ const char *v = std::getenv("PS2X_DDMIRROR"); return !(v && v[0] == '0'); }();   // default ON since 2026-08-30 21:00: free at 40k posts, and the only path that gives "post-time snapshot + this flush's rows" (scene alpha, CT16 view)
     static std::vector<uint8_t> s_scratch;
-    extern uint8_t *g_wbMirror;
+    extern thread_local uint8_t *g_wbMirror;
     if (s_mir && g_gsWb)
     {
         const size_t vsz = g_gsWb->vramSize(); const uint8_t *vr = g_gsWb->vramData();
@@ -3712,7 +3712,7 @@ void GsGpuRenderer::serviceDecodeReq(TexDecodeReq &q)
         }
         g_wbMirror = s_scratch.data();
     }
-    struct MirrorScope { ~MirrorScope() { extern uint8_t *g_wbMirror; g_wbMirror = nullptr; } } mirrorScope;
+    struct MirrorScope { ~MirrorScope() { extern thread_local uint8_t *g_wbMirror; g_wbMirror = nullptr; } } mirrorScope;
     static const bool s_ss3wb = [](){ const char *v = std::getenv("PS2X_SRCSNAP3WB"); return v && v[0] && v[0] != '0'; }();   // opt-in: writes old bytes into LIVE VRAM (raced the guest: white gi / black frames)
     if (s_ss3 && s_ss3wb && !s_mir && g_gsWb)
     {   // [srcsnap3] texture pages the guest re-wrote since the post: put the READ's bytes back for the flush + decode,
@@ -4958,24 +4958,13 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
     ++g_texClob.puts;
     ct.needsUpload = true;
     m_upQueue.push_back(key);   // [upqueue] O(1) here instead of an O(cache) scan per chunk render
-    // Flag near-black textures (sampled): a fully stale/empty VRAM region decodes to black.
-    // Used to skip fullscreen black WIPES of un-rendered regions in GPU mode (PS2X_SKIP_STALE_VRAM).
-    {
-        bool black = true;
-        const std::vector<uint8_t> &v = ct.rgba;
-        for (size_t i = 0; i + 2 < v.size(); i += 64) // every 16th pixel; check RGB (ignore alpha)
-            if (v[i] > 14 || v[i + 1] > 14 || v[i + 2] > 14) { black = false; break; }
-        g_texBlack[key] = black;
-    }
-    // Binary-alpha classification for the DATE emulation: gradient-alpha textures (terrain
-    // crossfades, soft shadows) must NOT get the dest-alpha-lerp + discard treatment.
-    {
-        bool binA = true;
-        const std::vector<uint8_t> &v = ct.rgba;
-        for (size_t i = 3; i < v.size(); i += 64)
-            if (v[i] > 32 && v[i] < 224) { binA = false; break; }
-        g_texAlphaBinary[key] = binA;
-    }
+    // [texblackrace] g_texBlack is filled on the GL thread (see the s_ups upload pass in
+    // renderAndGetTextureId), NOT here: putTexture runs on decode/worker threads, and the draw
+    // loop reads g_texBlack WITHOUT m_mtx. A concurrent rehash there corrupted the map and
+    // crashed the renderer (Windows-only, occasional; AV in _Hash::find). Keep it single-threaded.
+    // [texblackrace] g_texAlphaBinary is filled on the GL thread (see the s_ups upload pass in
+    // renderAndGetTextureId), NOT here: putTexture runs on decode/worker threads and the draw
+    // loop reads it WITHOUT m_mtx (PS2X_DATE, default on). A concurrent rehash crashed the map.
     // [texcache] Write-back lives in GSRasterizer::applyTexReplacement (it knows whether the pack
     // replacement is final vs still pending). See the comment there.
 }
@@ -7796,7 +7785,16 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             // the missing-texture drop (menu elements vanished). Needs upload-before-use ordering
             // before it can default on.
             static const size_t s_budget = [](){ const char *v = std::getenv("PS2X_UPBUDGET_KB");
-                                                 return (size_t)(v && v[0] ? std::atol(v) : 0) * 1024u; }();
+#if defined(_WIN32)
+                // [upbudget] Windows default 2048 KB: terrain/scene texture bursts otherwise upload
+                // tens of MB inside one render call and freeze the frame (measured 100-370 ms hitches
+                // on the AltGL/GL path). Leftovers stay queued and go out on the next calls.
+                // PS2X_UPBUDGET_KB=0 restores the unbounded behaviour.
+                const long kb = (v && v[0]) ? std::atol(v) : 2048;
+#else
+                const long kb = (v && v[0]) ? std::atol(v) : 0;
+#endif
+                return (size_t)(kb > 0 ? kb : 0) * 1024u; }();
             size_t spent = 0, taken = 0;
             for (uint64_t qk : m_upQueue)
             {
@@ -8353,7 +8351,22 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
 
         }
     };
-    for (PendingUp &u : s_ups) { glUploadOne(u); g_glTexGen[u.key] = u.gen; }   // [texclobber]
+    for (PendingUp &u : s_ups)
+    {   // [texblackrace] Fill g_texBlack + g_texAlphaBinary HERE (GL thread -- the SAME thread as
+        // the draw loop that reads them at the [skv] / [DATE] gates). putTexture used to write
+        // both from decode/worker threads while this thread traversed them unlocked -> rehash
+        // during find -> corrupted map -> AV (Windows-only, occasional).
+        { const std::vector<uint8_t> &v = u.rgba;
+          bool black = true;
+          for (size_t i = 0; i + 2 < v.size(); i += 64)
+              if (v[i] > 14 || v[i + 1] > 14 || v[i + 2] > 14) { black = false; break; }
+          g_texBlack[u.key] = black;
+          bool binA = true;
+          for (size_t i = 3; i < v.size(); i += 64)
+              if (v[i] > 32 && v[i] < 224) { binA = false; break; }
+          g_texAlphaBinary[u.key] = binA; }
+        glUploadOne(u); g_glTexGen[u.key] = u.gen;   // [texclobber]
+    }
     if (!s_ups.empty())
     {
         std::lock_guard<std::mutex> lk(m_mtx);
