@@ -16,7 +16,7 @@ image** — this repository contains no game code, assets, or media.
 ## Contents
 
 - [For players](#for-players) — requirements, download & run
-- [For developers](#for-developers) — build from source
+- [For developers](#for-developers) — build from source, project structure & docs
 - [Features](#features) — texture packs, cache, widescreen, the 4K intro
 - [Status & known issues](#status--known-issues)
 - [Repository layout](#repository-layout)
@@ -185,6 +185,38 @@ set PS2X_CD_IMAGE=C:\path\to\your\bt3-usa.iso
 bt3-runner.exe ..\..\..\games\bt3\work\SLUS_216.78
 ```
 
+### Project structure & developer docs
+
+The pipeline is built from a few components:
+
+| Component | What it is |
+| --- | --- |
+| `ps2xRecomp/` | the static recompiler (MIPS → C++), with EE FPU/VU semantics fixes |
+| `ps2xRuntime/` | the runtime: memory, GS/GPU renderer, VU1, scheduler, game overrides |
+| `ps2xAnalyzer/` | PS2 ELF analyzer that feeds the recompiler |
+| `tools/iop/` | native IOP (R3000) service |
+| `tools/orchestrator/` | progressive, coverage-driven recompilation orchestrator |
+| `games/bt3/` | game-specific setup, generators and patches (`setup.py`, `gen_overlay.py`, `apply_patches.py`) |
+
+Developer notes live in [`docs/`](docs/):
+
+- [`docs/DEPLOY.md`](docs/DEPLOY.md) — deploy tree & cross-platform packaging
+- [`docs/CONTRIBUTORS.md`](docs/CONTRIBUTORS.md) — contributors & roles
+- [`docs/MACOS-PORT.md`](docs/MACOS-PORT.md) — macOS status & plan
+- [`docs/WINDOWS-SUBMODULES.md`](docs/WINDOWS-SUBMODULES.md) — Windows submodule checkout fixes
+- [`docs/ALTGL-PRESENT-STATUS.md`](docs/ALTGL-PRESENT-STATUS.md) · [`docs/ALTGL-RAYLIB-REMOVAL.md`](docs/ALTGL-RAYLIB-REMOVAL.md) — standalone OpenGL layer & raylib removal
+- [`docs/D3D11-NATIVE-STATUS.md`](docs/D3D11-NATIVE-STATUS.md) — native D3D11 port status
+- [`docs/BOTTLENECK-INVESTIGATION.md`](docs/BOTTLENECK-INVESTIGATION.md) — Windows performance bottlenecks
+- [`docs/CROSSPLATFORM-REPRO.md`](docs/CROSSPLATFORM-REPRO.md) — cross-platform reproducibility
+- [`docs/VIDEO-CONTROLLERS-UI.md`](docs/VIDEO-CONTROLLERS-UI.md) — video & controllers UI
+
+Component READMEs: [`games/bt3/README.md`](games/bt3/README.md) ·
+[`ps2xRuntime/Readme.md`](ps2xRuntime/Readme.md) ·
+[`ps2xAnalyzer/Readme.md`](ps2xAnalyzer/Readme.md) ·
+[`tools/iop/README.md`](tools/iop/README.md) ·
+[`tools/orchestrator/README.md`](tools/orchestrator/README.md) ·
+[`textures/README.md`](textures/README.md) · [`mods/README.md`](mods/README.md).
+
 ---
 
 ## Features
@@ -303,12 +335,29 @@ the combination is distributed under GPL-3.0. Its licence text is
 
 ## Credits & license
 
-- Built on [ran-j/PS2Recomp](https://github.com/ran-j/PS2Recomp) — thank you!
-  Licensed GPL-3.0, as is this repository (see `LICENSE`).
-- NTSC-U AFS file lists (`PZS3US1.AFL`/`PZS3US2.AFL`) by
-  [ViveTheModder](https://github.com/ViveTheModder/vivethemodder.github.io),
-  distributed under the Apache License 2.0 (see
-  `ps2xRuntime/src/launcher/assets/NOTICE`).
-- *Dragon Ball Z: Budokai Tenkaichi 3* © Spike / Bandai Namco. This project is
-  not affiliated with or endorsed by them; it exists for preservation and
-  interoperability, and distributes no game content.
+### Developers
+
+| Dev | Role | Areas |
+| --- | --- | --- |
+| **z3xox** | Owner / Lead developer | recompiler (`ps2xRecomp`), runtime (EE/GS/VU1/scheduler), OpenGL + paraLLEl-GS renderer, game overrides, generators, docs |
+| **RexxColder** | Collaborator | optimization (perf/async, batching), Qt 6 launcher + install wizard + ISO9660, input & gamepads, build/release (floor gate, packaging), deploy layout, game data (AFS/AFL), docs |
+| **valenvivaldi** | Collaborator | macOS arm64 port, packaging, audio |
+
+### Third-party
+
+| Author | Contribution | License |
+| --- | --- | --- |
+| **ran-j** | [PS2Recomp](https://github.com/ran-j/PS2Recomp) — static recompiler (upstream) | GPL-3.0 |
+| **ViveTheModder** | NTSC-U AFS file lists (`PZS3US1.AFL`/`PZS3US2.AFL`) | Apache-2.0 |
+| **Arntzen Software** | [paraLLEl-GS](https://github.com/Arntzen-Software/parallel-gs) — GS in Vulkan compute | LGPL-3.0-or-later |
+
+### License
+
+This repository is **GPL-3.0** (see [`LICENSE`](LICENSE)). *Dragon Ball Z:
+Budokai Tenkaichi 3* © Spike / Bandai Namco. This project is not affiliated with
+or endorsed by them; it exists for preservation and interoperability, and
+distributes no game content — the game is recompiled at build time from the
+user's own disc image.
+
+Full list: [`docs/CONTRIBUTORS.md`](docs/CONTRIBUTORS.md) · bundled
+components & licenses: [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
