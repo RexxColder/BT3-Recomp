@@ -1,8 +1,11 @@
 #pragma once
 
-#include <QDialog>
+#include <QWidget>
+#include <QElapsedTimer>
+#include <atomic>
+#include <functional>
 
-#include "tex_pack.h"
+#include "hardware_probe.h"
 
 class QLabel;
 class QProgressBar;
@@ -13,23 +16,24 @@ class QTemporaryDir;
 class ExtractWorker;
 class AfsExtractWorker;
 
-// End-user install wizard: detects missing/corrupt game data, lets the user
-// point at their own disc dump (ISO or a container that wraps the ISO) and,
-// after the embedded SHA-256 of SLUS_216.78 matches, extracts the game data
-// tree into the deployment folder so the runner can boot it.
-class InstallWizardDialog : public QDialog
+// [inwindow] End-user install wizard as an in-window VIEW (not a popup): the launcher
+// swaps its whole content for this widget. It detects missing/corrupt game data, lets
+// the user point at their own disc dump, verifies the embedded SHA-256 of SLUS_216.78,
+// extracts the game data tree, and returns via onFinished.
+class InstallWizardView : public QWidget
 {
     Q_OBJECT
 public:
-    explicit InstallWizardDialog(QWidget *parent = nullptr, bool reinstall = false);
-    ~InstallWizardDialog() override;
+    explicit InstallWizardView(QWidget *parent = nullptr, bool reinstall = false);
+    ~InstallWizardView() override;
+
+    // [inwindow] Called when the wizard is done: accepted = installed OK.
+    std::function<void(bool accepted)> onFinished;
 
     bool installed() const { return m_installed; }
-    // True when the user chose to install a texture pack on the final
-    // recommendation page. The caller opens the texture installer.
-    bool wantTexturePack() const { return m_wantTexPack; }
-    // Which variant was chosen: texpack::kPackLite (2D only) or texpack::kPackFull (3D + 2D).
-    int texturePackChoice() const { return m_packChoice; }
+    // [summary] Page D actions.
+    bool playRequested() const { return m_playRequested; }
+    bool openSettingsRequested() const { return m_openSettings; }
 
 private slots:
     void onNextMissing();
@@ -56,6 +60,7 @@ private:
     // (+ .idx) and drop the container, leaving folders as the only data source.
     void startAfsConversion();
     void applyInstallResult(bool ok, const QString &msg);
+    void finish(bool accepted);   // [inwindow] leave the view
 
     QStackedWidget *m_stack = nullptr;
 
@@ -74,10 +79,14 @@ private:
     QPushButton *m_close = nullptr;
     QPushButton *m_retryInstall = nullptr;
 
-    // Page D: post-install texture-pack recommendation (first install only).
-    QPushButton *m_recLite = nullptr;
-    QPushButton *m_recFull = nullptr;
-    int m_packChoice = texpack::kPackFull;
+    // Page D: post-install summary + hardware + recommendation.
+    QLabel *m_summary = nullptr;
+    QLabel *m_hwLabel = nullptr;
+    QLabel *m_recLabel = nullptr;
+    QPushButton *m_openSettingsBtn = nullptr;
+    QPushButton *m_playBtn = nullptr;
+    QPushButton *m_applyBtn = nullptr;
+    hw::Recommendation m_rec;   // [tier] computed on Page D, applied by m_applyBtn
 
     QTemporaryDir *m_tmp = nullptr;
     QString m_dumpPath;
@@ -86,10 +95,17 @@ private:
     bool m_verified = false;
     bool m_installed = false;
     bool m_inAfsPhase = false; // retry re-runs the AFS phase only
-    bool m_wantTexPack = false; // user pressed Next on the recommendation page
+    bool m_playRequested = false;
+    bool m_openSettings = false;
 
     QThread *m_thread = nullptr;
     ExtractWorker *m_worker = nullptr;
     QThread *m_afsThread = nullptr;
     AfsExtractWorker *m_afsWorker = nullptr;
+    QElapsedTimer m_timer;   // [verbose] for the ETA
+
+    // [tier] silent single-thread benchmark, started when Page B is entered.
+    hw::Info m_hw;
+    std::atomic<double> m_cpuR{0.0};
+    QThread *m_benchThread = nullptr;
 };

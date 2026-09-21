@@ -5,16 +5,21 @@
 #include "archive_extract.h"
 #include "extract_worker.h"
 #include "iso9660.h"
+#include "recommendation.h"
 
 #include <QApplication>
+#include <QColor>
 #include <QCoreApplication>
 #include <QDir>
 #include <QDirIterator>
+#include <QEasingCurve>
 #include <QFile>
 #include <QFileDialog>
+#include <QGraphicsDropShadowEffect>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QProgressBar>
+#include <QPropertyAnimation>
 #include <QPushButton>
 #include <QStackedWidget>
 #include <QTemporaryDir>
@@ -30,6 +35,21 @@ constexpr qint64 kMiB = 1024 * 1024;
 QString fmtMb(qint64 bytes)
 {
     return QString::number(bytes / kMiB);
+}
+
+// [verbose] ETA from the bytes-per-ms rate observed so far.
+QString fmtEta(qint64 done, qint64 total, qint64 elapsedMs)
+{
+    if (done <= 0 || total <= done || elapsedMs <= 0)
+        return QString();
+    const double rate = static_cast<double>(done) / static_cast<double>(elapsedMs);
+    if (rate <= 0.0)
+        return QString();
+    qint64 remainMs = static_cast<qint64>(static_cast<double>(total - done) / rate);
+    if (remainMs < 0)
+        remainMs = 0;
+    const qint64 sec = remainMs / 1000;
+    return QStringLiteral("~%1:%2 remaining").arg(sec / 60).arg(sec % 60, 2, 10, QLatin1Char('0'));
 }
 
 QString findImageRecursive(const QString &root, int depth)
@@ -67,24 +87,37 @@ QStringList findAfsContainers(const QString &dataDir)
 
 } // namespace
 
-InstallWizardDialog::InstallWizardDialog(QWidget *parent, bool reinstall)
-    : QDialog(parent)
+InstallWizardView::InstallWizardView(QWidget *parent, bool reinstall)
+    : QWidget(parent)
 {
-    setWindowTitle(QStringLiteral("Install Wizard"));
-    resize(520, 330);
-    setModal(true);
+    // [inwindow] Fills the launcher window (opaque) instead of a popup dialog.
+    setAttribute(Qt::WA_StyledBackground, true);
+    setStyleSheet(QStringLiteral("InstallWizardView { background-color: #0a1014; }"));
+    setMinimumSize(520, 330);
+    m_hw = hw::detect();   // [tier] probe once, reused for the Page D summary
     buildUi();
     m_reinstall = reinstall;
     if (reinstall)
         setIndex(1); // straight to the disc dump selection
 }
 
-InstallWizardDialog::~InstallWizardDialog()
+InstallWizardView::~InstallWizardView()
 {
+    if (m_benchThread)
+    {
+        m_benchThread->wait(1000);
+        m_benchThread->deleteLater();
+    }
     delete m_tmp;
 }
 
-void InstallWizardDialog::buildUi()
+void InstallWizardView::finish(bool accepted)
+{
+    if (onFinished)
+        onFinished(accepted);
+}
+
+void InstallWizardView::buildUi()
 {
     auto *mainLayout = new QVBoxLayout(this);
     mainLayout->setContentsMargins(0, 0, 0, 0);
@@ -92,18 +125,28 @@ void InstallWizardDialog::buildUi()
     m_stack = new QStackedWidget(this);
     mainLayout->addWidget(m_stack);
 
-    // --- Page A: missing / corrupt data -------------------------------------
+    // --- Page A: welcome / (re)install --------------------------------------
     auto *pageA = new QWidget;
     {
         auto *l = new QVBoxLayout(pageA);
         l->setContentsMargins(28, 24, 28, 24);
-        auto *head = new QLabel(QStringLiteral("Game Data file are missing or corrupted"), pageA);
+        auto *kicker = new QLabel(QStringLiteral("INSTALLATION WIZARD"), pageA);
+        kicker->setStyleSheet(QStringLiteral("font-size: 12px; font-weight: 600; color: #8b93a3; letter-spacing: 1px;"));
+        l->addWidget(kicker);
+        l->addSpacing(4);
+        auto *head = new QLabel(QStringLiteral("Welcome to Budokai Tenkaichi 3 Recompiled"), pageA);
         head->setWordWrap(true);
-        head->setStyleSheet(QStringLiteral("font-size: 17px; font-weight: 600; color: #ffd9a0;"));
+        head->setStyleSheet(QStringLiteral("font-size: 18px; font-weight: 600; color: #ffd9a0;"));
         l->addWidget(head);
-        l->addSpacing(8);
-        auto *body = new QLabel(QStringLiteral("The game will need to reinstall game files."), pageA);
+        l->addSpacing(10);
+        auto *body = new QLabel(QStringLiteral(
+            "Before you play, we'll install the game files from <b>your own disc dump</b>.<br><br>"
+            "<b>Next steps:</b><br>"
+            "&nbsp;&nbsp;1.&nbsp; Point the wizard at your BT3 disc dump (ISO or archive).<br>"
+            "&nbsp;&nbsp;2.&nbsp; We verify it and extract the game data into this folder.<br><br>"
+            "This runs <b>once</b>; your saves and settings are kept."), pageA);
         body->setWordWrap(true);
+        body->setTextFormat(Qt::RichText);
         body->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
         l->addWidget(body);
         l->addStretch(1);
@@ -113,7 +156,7 @@ void InstallWizardDialog::buildUi()
         m_nextMissing = new QPushButton(QStringLiteral("Next"), pageA);
         m_nextMissing->setObjectName(QStringLiteral("wizardButton"));
         m_nextMissing->setCursor(Qt::PointingHandCursor);
-        connect(m_nextMissing, &QPushButton::clicked, this, &InstallWizardDialog::onNextMissing);
+        connect(m_nextMissing, &QPushButton::clicked, this, &InstallWizardView::onNextMissing);
         row->addWidget(m_nextMissing);
         l->addLayout(row);
     }
@@ -144,7 +187,7 @@ void InstallWizardDialog::buildUi()
         m_browse = new QPushButton(QStringLiteral("Browse…"), pageB);
         m_browse->setObjectName(QStringLiteral("wizardButton"));
         m_browse->setCursor(Qt::PointingHandCursor);
-        connect(m_browse, &QPushButton::clicked, this, &InstallWizardDialog::onBrowse);
+        connect(m_browse, &QPushButton::clicked, this, &InstallWizardView::onBrowse);
         row->addWidget(m_browse);
         l->addLayout(row);
         l->addSpacing(12);
@@ -161,19 +204,24 @@ void InstallWizardDialog::buildUi()
         l->addStretch(1);
 
         auto *rowB = new QHBoxLayout;
+        auto *backB = new QPushButton(QStringLiteral("Back"), pageB);
+        backB->setObjectName(QStringLiteral("wizardButton"));
+        backB->setCursor(Qt::PointingHandCursor);
+        connect(backB, &QPushButton::clicked, this, [this] { setIndex(0); });
+        rowB->addWidget(backB);
         rowB->addStretch(1);
         m_retryDump = new QPushButton(QStringLiteral("Retry"), pageB);
         m_retryDump->setObjectName(QStringLiteral("wizardButton"));
         m_retryDump->setCursor(Qt::PointingHandCursor);
         m_retryDump->setVisible(false);
-        connect(m_retryDump, &QPushButton::clicked, this, &InstallWizardDialog::onRetryDump);
+        connect(m_retryDump, &QPushButton::clicked, this, &InstallWizardView::onRetryDump);
         rowB->addWidget(m_retryDump);
         rowB->addSpacing(8);
         m_nextDump = new QPushButton(QStringLiteral("Next"), pageB);
         m_nextDump->setObjectName(QStringLiteral("wizardButton"));
         m_nextDump->setCursor(Qt::PointingHandCursor);
         m_nextDump->setEnabled(false);
-        connect(m_nextDump, &QPushButton::clicked, this, &InstallWizardDialog::onInstall);
+        connect(m_nextDump, &QPushButton::clicked, this, &InstallWizardView::onInstall);
         rowB->addWidget(m_nextDump);
         l->addLayout(rowB);
     }
@@ -221,7 +269,7 @@ void InstallWizardDialog::buildUi()
         m_retryInstall->setObjectName(QStringLiteral("wizardButton"));
         m_retryInstall->setCursor(Qt::PointingHandCursor);
         m_retryInstall->setVisible(false);
-        connect(m_retryInstall, &QPushButton::clicked, this, &InstallWizardDialog::onRetryInstall);
+        connect(m_retryInstall, &QPushButton::clicked, this, &InstallWizardView::onRetryInstall);
         rowC->addWidget(m_retryInstall);
         rowC->addSpacing(8);
         m_close = new QPushButton(QStringLiteral("Close"), pageC);
@@ -229,89 +277,133 @@ void InstallWizardDialog::buildUi()
         m_close->setCursor(Qt::PointingHandCursor);
         connect(m_close, &QPushButton::clicked, this, [this] {
             if (m_installed)
-                accept();
+                finish(true);
             else
-                reject();
+                finish(false);
         });
         rowC->addWidget(m_close);
         l->addLayout(rowC);
     }
     m_stack->addWidget(pageC);
 
-    // --- Page D: post-install texture-pack recommendation (first install) ----
+    // --- Page D: post-install summary + hardware + recommendation -----------
     auto *pageD = new QWidget;
     {
         auto *l = new QVBoxLayout(pageD);
         l->setContentsMargins(28, 24, 28, 24);
-        auto *head = new QLabel(QStringLiteral("Recommended: 4K Texture Pack"), pageD);
-        head->setStyleSheet(QStringLiteral("font-size: 17px; font-weight: 600; color: #ffd9a0;"));
+        auto *kicker = new QLabel(QStringLiteral("INSTALLATION COMPLETE"), pageD);
+        kicker->setStyleSheet(QStringLiteral("font-size: 12px; font-weight: 600; color: #8b93a3; letter-spacing: 1px;"));
+        l->addWidget(kicker);
+        l->addSpacing(4);
+        auto *head = new QLabel(QStringLiteral("Summary"), pageD);
+        head->setStyleSheet(QStringLiteral("font-size: 18px; font-weight: 600; color: #ffd9a0;"));
         l->addWidget(head);
+        l->addSpacing(10);
+
+        m_summary = new QLabel(pageD);
+        m_summary->setWordWrap(true);
+        m_summary->setTextFormat(Qt::RichText);
+        m_summary->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
+        l->addWidget(m_summary);
         l->addSpacing(12);
 
-        auto *body = new QLabel(
-            QStringLiteral(
-                "We strongly recommend installing a 4K texture pack. Two variants are available:\n\n"
-                "  •  Pack Lite — 2D textures only (HUD, menus, icons, posters, buttons). Lighter.\n"
-                "  •  Pack Full — all textures: 3D characters and stages plus the full 2D set.\n\n"
-                "The launcher no longer downloads the pack: the next window shows the download page "
-                "(with a Copy-link fallback). Download the archive, then use Browse… to install it.\n\n"
-                "You can also do this later from Settings -> Misc -> Install texture pack."),
-            pageD);
-        body->setWordWrap(true);
-        body->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
-        l->addWidget(body);
+        m_hwLabel = new QLabel(pageD);
+        m_hwLabel->setWordWrap(true);
+        m_hwLabel->setTextFormat(Qt::RichText);
+        m_hwLabel->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
+        l->addWidget(m_hwLabel);
+        l->addSpacing(6);
+
+        m_recLabel = new QLabel(pageD);
+        m_recLabel->setWordWrap(true);
+        m_recLabel->setTextFormat(Qt::RichText);
+        m_recLabel->setStyleSheet(QStringLiteral("font-size: 13px; color: #ffd9a0;"));
+        l->addWidget(m_recLabel);
+        l->addSpacing(8);
+
+        m_applyBtn = new QPushButton(QStringLiteral("Apply recommended settings"), pageD);
+        m_applyBtn->setObjectName(QStringLiteral("wizardButton"));
+        m_applyBtn->setCursor(Qt::PointingHandCursor);
+        connect(m_applyBtn, &QPushButton::clicked, this, [this] {
+            rec::apply(m_rec);
+            m_applyBtn->setText(QStringLiteral("Applied \u2713"));
+            m_applyBtn->setEnabled(false);
+        });
+        l->addWidget(m_applyBtn);
+        l->addSpacing(12);
+
+        auto *tip = new QLabel(QStringLiteral(
+            "Tip: you can download a <b>4K texture pack</b> any time from "
+            "<b>Settings &rarr; Video &rarr; Texture Replacement…</b>"), pageD);
+        tip->setWordWrap(true);
+        tip->setTextFormat(Qt::RichText);
+        tip->setStyleSheet(QStringLiteral("font-size: 12px; color: #8b93a3;"));
+        l->addWidget(tip);
         l->addStretch(1);
 
         auto *rowD = new QHBoxLayout;
+        m_openSettingsBtn = new QPushButton(QStringLiteral("Open Settings"), pageD);
+        m_openSettingsBtn->setObjectName(QStringLiteral("wizardButton"));
+        m_openSettingsBtn->setCursor(Qt::PointingHandCursor);
+        connect(m_openSettingsBtn, &QPushButton::clicked, this, [this] {
+            m_openSettings = true;
+            finish(true);
+        });
+        auto *closeD = new QPushButton(QStringLiteral("Close"), pageD);
+        closeD->setObjectName(QStringLiteral("wizardButton"));
+        closeD->setCursor(Qt::PointingHandCursor);
+        connect(closeD, &QPushButton::clicked, this, [this] { finish(true); });
+        m_playBtn = new QPushButton(QStringLiteral("Play"), pageD);
+        m_playBtn->setObjectName(QStringLiteral("saveButton"));   // accent
+        m_playBtn->setCursor(Qt::PointingHandCursor);
+        connect(m_playBtn, &QPushButton::clicked, this, [this] {
+            m_playRequested = true;
+            finish(true);
+        });
+        rowD->addWidget(m_openSettingsBtn);
         rowD->addStretch(1);
-        auto *recClose = new QPushButton(QStringLiteral("Close"), pageD);
-        recClose->setObjectName(QStringLiteral("wizardButton"));
-        recClose->setCursor(Qt::PointingHandCursor);
-        connect(recClose, &QPushButton::clicked, this, [this] {
-            if (m_installed)
-                accept();
-            else
-                reject();
-        });
-        rowD->addWidget(recClose);
+        rowD->addWidget(closeD);
         rowD->addSpacing(8);
-        m_recLite = new QPushButton(QStringLiteral("Pack Lite"), pageD);
-        m_recLite->setObjectName(QStringLiteral("wizardButton"));
-        m_recLite->setCursor(Qt::PointingHandCursor);
-        connect(m_recLite, &QPushButton::clicked, this, [this] {
-            m_wantTexPack = true;
-            m_packChoice = texpack::kPackLite;
-            accept();
-        });
-        rowD->addWidget(m_recLite);
-        rowD->addSpacing(8);
-        m_recFull = new QPushButton(QStringLiteral("Pack Full"), pageD);
-        m_recFull->setObjectName(QStringLiteral("wizardButton"));
-        m_recFull->setCursor(Qt::PointingHandCursor);
-        connect(m_recFull, &QPushButton::clicked, this, [this] {
-            m_wantTexPack = true;
-            m_packChoice = texpack::kPackFull;
-            accept();
-        });
-        rowD->addWidget(m_recFull);
+        rowD->addWidget(m_playBtn);
         l->addLayout(rowD);
+
+        // [glow] Pulse the "Open Settings" button.
+        auto *fx = new QGraphicsDropShadowEffect(m_openSettingsBtn);
+        fx->setColor(QColor(255, 158, 26, 200));
+        fx->setBlurRadius(18);
+        fx->setOffset(0, 0);
+        m_openSettingsBtn->setGraphicsEffect(fx);
+        auto *anim = new QPropertyAnimation(fx, "blurRadius", m_openSettingsBtn);
+        anim->setDuration(1100);
+        anim->setStartValue(8.0);
+        anim->setEndValue(28.0);
+        anim->setEasingCurve(QEasingCurve::InOutSine);
+        anim->setLoopCount(-1);
+        anim->start();
     }
     m_stack->addWidget(pageD);
 }
 
-void InstallWizardDialog::setIndex(int index)
+void InstallWizardView::setIndex(int index)
 {
     if (index == 1)
         m_retryDump->setVisible(false);
+    if (index == 1 && !m_benchThread)
+    {
+        // [tier] Silent single-thread CPU benchmark while the user picks/verifies the
+        // dump; the result feeds the Page D recommendation.
+        m_benchThread = QThread::create([this] { m_cpuR.store(hw::benchSingleThreadR()); });
+        m_benchThread->start();
+    }
     m_stack->setCurrentIndex(index);
 }
 
-void InstallWizardDialog::onNextMissing()
+void InstallWizardView::onNextMissing()
 {
     setIndex(1);
 }
 
-void InstallWizardDialog::onBrowse()
+void InstallWizardView::onBrowse()
 {
     static const QString kFilter =
         QStringLiteral("Game disc dump (*.iso *.img *.rar *.7z *.zip *.tar *.tar.gz);;All files (*)");
@@ -326,12 +418,12 @@ void InstallWizardDialog::onBrowse()
     attemptVerify(path);
 }
 
-void InstallWizardDialog::onRetryDump()
+void InstallWizardView::onRetryDump()
 {
     attemptVerify(m_dumpPath);
 }
 
-void InstallWizardDialog::setVerified(bool ok, const QString &text)
+void InstallWizardView::setVerified(bool ok, const QString &text)
 {
     m_verified = ok;
     m_dot->setStyleSheet(QStringLiteral("font-size: 15px; color: %1;")
@@ -342,14 +434,16 @@ void InstallWizardDialog::setVerified(bool ok, const QString &text)
     m_nextDump->setEnabled(ok);
 }
 
-void InstallWizardDialog::attemptVerify(const QString &dumpPath)
+void InstallWizardView::attemptVerify(const QString &dumpPath)
 {
     m_dumpPath = dumpPath;
     m_retryDump->setVisible(false);
-    m_dot->setStyleSheet(QStringLiteral("font-size: 15px; color: #8b93a3;"));
-    m_dotText->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
-    m_dotText->setText(QStringLiteral("Checking disc dump…"));
-    QCoreApplication::processEvents();
+    auto status = [this](const QString &t) {
+        m_dot->setStyleSheet(QStringLiteral("font-size: 15px; color: #8b93a3;"));
+        m_dotText->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
+        m_dotText->setText(t);
+        QCoreApplication::processEvents();
+    };
 
     const QString lower = dumpPath.toLower();
     const bool isImage = lower.endsWith(QLatin1String(".iso")) || lower.endsWith(QLatin1String(".img"));
@@ -359,6 +453,8 @@ void InstallWizardDialog::attemptVerify(const QString &dumpPath)
         if (!m_tmp)
             m_tmp = new QTemporaryDir;
         QString err;
+        status(QStringLiteral("Opening archive…"));
+        status(QStringLiteral("Extracting archive…"));
         m_isoPath = resolveInnerImage(dumpPath, &err);
         if (m_isoPath.isEmpty())
         {
@@ -366,19 +462,22 @@ void InstallWizardDialog::attemptVerify(const QString &dumpPath)
             m_retryDump->setVisible(true);
             return;
         }
+        status(QStringLiteral("Disc image found: %1").arg(QDir::toNativeSeparators(m_isoPath)));
     }
     else
     {
         m_isoPath = dumpPath;
+        status(QStringLiteral("Disc image selected."));
     }
 
+    status(QStringLiteral("Verifying game disc (SLUS_216.78)…"));
     if (DiscVerify::verifySlusFromIso(m_isoPath))
         setVerified(true, QStringLiteral("Game Disc Validated"));
     else
         setVerified(false, QStringLiteral("Cannot verify game disc. Is it the right version?"));
 }
 
-QString InstallWizardDialog::resolveInnerImage(const QString &dumpPath, QString *err)
+QString InstallWizardView::resolveInnerImage(const QString &dumpPath, QString *err)
 {
     const QString unpackDir = m_tmp->path() + QStringLiteral("/unpack");
     if (!QDir().mkpath(unpackDir))
@@ -408,14 +507,14 @@ QString InstallWizardDialog::resolveInnerImage(const QString &dumpPath, QString 
     return image;
 }
 
-void InstallWizardDialog::onInstall()
+void InstallWizardView::onInstall()
 {
     if (!m_verified || m_isoPath.isEmpty())
         return;
     startExtraction();
 }
 
-void InstallWizardDialog::onRetryInstall()
+void InstallWizardView::onRetryInstall()
 {
     if (m_inAfsPhase)
     {
@@ -430,12 +529,13 @@ void InstallWizardDialog::onRetryInstall()
     startExtraction();
 }
 
-void InstallWizardDialog::startExtraction()
+void InstallWizardView::startExtraction()
 {
     m_bar->setRange(0, 1);
     m_bar->setValue(0);
     m_progressText->setText(QStringLiteral("0 MB / 0 MB"));
     m_activity->clear();
+    m_timer.restart();   // [verbose] ETA base
     m_doneLabel->setText(QStringLiteral("Installation in progress…"));
     m_doneLabel->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
     m_retryInstall->setVisible(false);
@@ -448,8 +548,11 @@ void InstallWizardDialog::startExtraction()
     m_worker->moveToThread(m_thread);
     connect(m_thread, &QThread::finished, m_worker, &QObject::deleteLater);
     connect(m_thread, &QThread::finished, m_thread, &QObject::deleteLater);
-    connect(m_worker, &ExtractWorker::progress, this, &InstallWizardDialog::onExtractProgress);
-    connect(m_worker, &ExtractWorker::done, this, &InstallWizardDialog::onExtractDone);
+    connect(m_worker, &ExtractWorker::file, this, [this](const QString &p) {
+        m_activity->setText(QStringLiteral("Extracting %1").arg(p));
+    });
+    connect(m_worker, &ExtractWorker::progress, this, &InstallWizardView::onExtractProgress);
+    connect(m_worker, &ExtractWorker::done, this, &InstallWizardView::onExtractDone);
     connect(m_worker, &ExtractWorker::done, m_thread, &QThread::quit);
     m_thread->start();
 
@@ -458,16 +561,19 @@ void InstallWizardDialog::startExtraction()
                               Q_ARG(QString, dataDir));
 }
 
-void InstallWizardDialog::onExtractProgress(qint64 done, qint64 total)
+void InstallWizardView::onExtractProgress(qint64 done, qint64 total)
 {
     if (total > 0)
         m_bar->setRange(0, static_cast<int>(total / (64 * 1024)));
     m_bar->setValue(static_cast<int>(done / (64 * 1024)));
-    m_progressText->setText(
-        QStringLiteral("%1 MB / %2 MB").arg(fmtMb(done)).arg(fmtMb(total)));
+    QString t = QStringLiteral("%1 MB / %2 MB").arg(fmtMb(done)).arg(fmtMb(total));
+    const QString eta = fmtEta(done, total, m_timer.elapsed());
+    if (!eta.isEmpty())
+        t += QStringLiteral("   ·   ") + eta;
+    m_progressText->setText(t);
 }
 
-void InstallWizardDialog::onExtractDone(bool ok, const QString &msg)
+void InstallWizardView::onExtractDone(bool ok, const QString &msg)
 {
     if (ok)
     {
@@ -483,7 +589,7 @@ void InstallWizardDialog::onExtractDone(bool ok, const QString &msg)
     applyInstallResult(false, msg);
 }
 
-void InstallWizardDialog::startAfsConversion()
+void InstallWizardView::startAfsConversion()
 {
     const QString dataDir = apppaths::userRoot() + QStringLiteral("/data");
     const QStringList afs = findAfsContainers(dataDir);
@@ -502,6 +608,7 @@ void InstallWizardDialog::startAfsConversion()
     m_doneLabel->setText(QStringLiteral("Converting game data to folders…"));
     m_doneLabel->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
     m_activity->setText(QStringLiteral("Preparing…"));
+    m_timer.restart();   // [verbose] ETA base
     QCoreApplication::processEvents();
 
     m_afsThread = new QThread;
@@ -509,30 +616,33 @@ void InstallWizardDialog::startAfsConversion()
     m_afsWorker->moveToThread(m_afsThread);
     connect(m_afsThread, &QThread::finished, m_afsWorker, &QObject::deleteLater);
     connect(m_afsThread, &QThread::finished, m_afsThread, &QObject::deleteLater);
-    connect(m_afsWorker, &AfsExtractWorker::status, this, &InstallWizardDialog::onAfsStatus);
-    connect(m_afsWorker, &AfsExtractWorker::progress, this, &InstallWizardDialog::onAfsProgress);
-    connect(m_afsWorker, &AfsExtractWorker::done, this, &InstallWizardDialog::onAfsDone);
+    connect(m_afsWorker, &AfsExtractWorker::status, this, &InstallWizardView::onAfsStatus);
+    connect(m_afsWorker, &AfsExtractWorker::progress, this, &InstallWizardView::onAfsProgress);
+    connect(m_afsWorker, &AfsExtractWorker::done, this, &InstallWizardView::onAfsDone);
     connect(m_afsWorker, &AfsExtractWorker::done, m_afsThread, &QThread::quit);
     m_afsThread->start();
 
     QMetaObject::invokeMethod(m_afsWorker, "doWork", Qt::QueuedConnection, Q_ARG(QStringList, afs));
 }
 
-void InstallWizardDialog::onAfsStatus(const QString &text)
+void InstallWizardView::onAfsStatus(const QString &text)
 {
     m_activity->setText(text);
 }
 
-void InstallWizardDialog::onAfsProgress(qint64 done, qint64 total)
+void InstallWizardView::onAfsProgress(qint64 done, qint64 total)
 {
     if (total > 0)
         m_bar->setRange(0, static_cast<int>(total / (64 * 1024)));
     m_bar->setValue(static_cast<int>(done / (64 * 1024)));
-    m_progressText->setText(
-        QStringLiteral("%1 MB / %2 MB").arg(fmtMb(done)).arg(fmtMb(total)));
+    QString t = QStringLiteral("%1 MB / %2 MB").arg(fmtMb(done)).arg(fmtMb(total));
+    const QString eta = fmtEta(done, total, m_timer.elapsed());
+    if (!eta.isEmpty())
+        t += QStringLiteral("   ·   ") + eta;
+    m_progressText->setText(t);
 }
 
-void InstallWizardDialog::onAfsDone(bool ok, const QString &msg)
+void InstallWizardView::onAfsDone(bool ok, const QString &msg)
 {
     m_inAfsPhase = false;
     m_activity->clear();
@@ -542,7 +652,7 @@ void InstallWizardDialog::onAfsDone(bool ok, const QString &msg)
         applyInstallResult(false, msg);
 }
 
-void InstallWizardDialog::applyInstallResult(bool ok, const QString &msg)
+void InstallWizardView::applyInstallResult(bool ok, const QString &msg)
 {
     if (ok)
     {
@@ -552,7 +662,31 @@ void InstallWizardDialog::applyInstallResult(bool ok, const QString &msg)
         m_bar->setValue(m_bar->maximum());
         m_close->setEnabled(true);
         if (!m_reinstall)
-            setIndex(3); // offer the texture pack on the first install
+        {
+            // [summary] Page D: install summary + hardware + recommendation.
+            if (m_benchThread && !m_benchThread->isFinished())
+                m_benchThread->wait(500);
+            const QString dataDir = apppaths::userRoot() + QStringLiteral("/data");
+            const double gb = DiscVerify::dataSize(dataDir) / (1024.0 * 1024.0 * 1024.0);
+            m_summary->setText(QStringLiteral(
+                "<b>&#10004; Installed</b><br>"
+                "&nbsp;&nbsp;&bull; Game data &mdash; %1 GB &rarr; %2<br>"
+                "&nbsp;&nbsp;&bull; Game disc validated (SLUS_216.78)<br>"
+                "&nbsp;&nbsp;&bull; AFS containers converted to folders")
+                    .arg(QString::number(gb, 'f', 2), QDir::toNativeSeparators(dataDir)));
+            m_rec = hw::recommend(m_hw, m_cpuR.load());
+            m_hwLabel->setText(QStringLiteral("<b>Your hardware</b><br>&nbsp;&nbsp;%1").arg(hw::summary(m_hw)));
+            m_recLabel->setText(QStringLiteral(
+                "<b>Recommended settings</b> (%1)<br>"
+                "&nbsp;&nbsp;Render scale %2x &nbsp;&middot;&nbsp; Widescreen %3 &nbsp;&middot;&nbsp; "
+                "Texture pack %4 &nbsp;&middot;&nbsp; %5 fps")
+                    .arg(m_rec.tierName)
+                    .arg(m_rec.renderScale)
+                    .arg(m_rec.widescreen ? QStringLiteral("ON") : QStringLiteral("OFF"))
+                    .arg(m_rec.texPackFull ? QStringLiteral("Full") : QStringLiteral("Off/Lite"))
+                    .arg(m_rec.fps60 ? 60 : 30));
+            setIndex(3); // summary page (first install only)
+        }
         return;
     }
     else

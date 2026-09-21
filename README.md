@@ -17,7 +17,7 @@ image** — this repository contains no game code, assets, or media.
 
 - [For players](#for-players) — requirements, download & run
 - [For developers](#for-developers) — build from source, project structure & docs
-- [Features](#features) — texture packs, cache, widescreen, the 4K intro
+- [Features](#features) — texture packs, cache, widescreen
 - [Status & known issues](#status--known-issues)
 - [Repository layout](#repository-layout)
 - [Experimental: paraLLEl-GS backend](#experimental-parallelgs-backend)
@@ -226,8 +226,6 @@ Component READMEs: [`games/bt3/README.md`](games/bt3/README.md) ·
 - **Qt 6 launcher** — install wizard, per-game settings, gamepad support, and a
   built-in overlay in the runner.
 - **Widescreen** and selectable render scale.
-- **Video overlay (4K intro)** — replace the intro movie with a higher-quality
-  clip from a texture pack.
 - **Texture replacement & cache** — see below.
 
 ### Texture replacement & cache

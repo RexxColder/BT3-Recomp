@@ -7,6 +7,7 @@ class QLabel;
 class QPushButton;
 class QProcess;
 class QWidget;
+class QStackedWidget;
 class QGraphicsDropShadowEffect;
 class QPropertyAnimation;
 
@@ -33,7 +34,12 @@ private:
     void resolveLaunchTarget();
     void updateHint();
     void checkGameData();
-    bool openInstallWizard();
+    void openInstallWizard();
+    // [inwindow] Swap the whole window content for a view (settings, wizard, ...)
+    // and back to the launcher page.
+    void showView(QWidget *view);
+    void showLauncher();
+    void popView();
     // [vulkan] Windows: append a line to logs/vulkan-fallback.log so the
     // auto-fallback (vendor Vulkan driver crash -> OpenGL) is diagnosable.
     void logVulkanFallback(const QString &msg);
@@ -47,6 +53,8 @@ private:
                        QPropertyAnimation *&anim, bool on);
 
     QLabel *m_hint = nullptr;
+    QLabel *m_specs = nullptr;   // [hwprobe] detected hardware banner (bottom-left)
+    QStackedWidget *m_stack = nullptr;   // [inwindow] page 0 = launcher, others = views
     QPushButton *m_play = nullptr;
     QPushButton *m_settings = nullptr;
     QWidget *m_bottomBar = nullptr;

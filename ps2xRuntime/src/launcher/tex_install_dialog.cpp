@@ -19,11 +19,13 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
-TexInstallDialog::TexInstallDialog(QWidget *parent, int pack)
-    : QDialog(parent)
+TexInstallView::TexInstallView(QWidget *parent, int pack)
+    : QWidget(parent)
     , m_pack(pack)
 {
-    setWindowTitle(QStringLiteral("Install texture pack"));
+    // [inwindow] Fills the launcher window (opaque) instead of a popup dialog.
+    setAttribute(Qt::WA_StyledBackground, true);
+    setStyleSheet(QStringLiteral("TexInstallView { background-color: #0a1014; }"));
     setMinimumWidth(480);
 
     auto *root = new QVBoxLayout(this);
@@ -79,23 +81,26 @@ TexInstallDialog::TexInstallDialog(QWidget *parent, int pack)
     row->addWidget(m_close);
     root->addLayout(row);
 
-    connect(m_browse, &QPushButton::clicked, this, &TexInstallDialog::onBrowse);
-    connect(m_openWeb, &QPushButton::clicked, this, &TexInstallDialog::onOpenBrowser);
-    connect(m_copy, &QPushButton::clicked, this, &TexInstallDialog::onCopyLink);
-    connect(m_close, &QPushButton::clicked, this, &QDialog::close);
+    connect(m_browse, &QPushButton::clicked, this, &TexInstallView::onBrowse);
+    connect(m_openWeb, &QPushButton::clicked, this, &TexInstallView::onOpenBrowser);
+    connect(m_copy, &QPushButton::clicked, this, &TexInstallView::onCopyLink);
+    connect(m_close, &QPushButton::clicked, this, [this] {
+        abortExtract();
+        if (onBack) onBack();
+    });
 }
 
-TexInstallDialog::~TexInstallDialog()
+TexInstallView::~TexInstallView()
 {
     abortExtract();
 }
 
-void TexInstallDialog::setStatus(const QString &text)
+void TexInstallView::setStatus(const QString &text)
 {
     m_status->setText(text);
 }
 
-void TexInstallDialog::fail(const QString &text)
+void TexInstallView::fail(const QString &text)
 {
     setStatus(text);
     QMessageBox::warning(this, QStringLiteral("Install texture pack"), text);
@@ -107,14 +112,14 @@ void TexInstallDialog::fail(const QString &text)
 // Link helpers
 // ---------------------------------------------------------------------------
 
-void TexInstallDialog::onOpenBrowser()
+void TexInstallView::onOpenBrowser()
 {
     QDesktopServices::openUrl(QUrl(QString::fromLatin1(texpack::packUrl(m_pack))));
     setStatus(QStringLiteral("Opened the download page. Save %1, then click Browse… to install it.")
                   .arg(QString::fromLatin1(texpack::packFileName(m_pack))));
 }
 
-void TexInstallDialog::onCopyLink()
+void TexInstallView::onCopyLink()
 {
     QApplication::clipboard()->setText(QString::fromLatin1(texpack::packUrl(m_pack)));
     setStatus(QStringLiteral("Link copied to the clipboard: %1")
@@ -125,7 +130,7 @@ void TexInstallDialog::onCopyLink()
 // Browse + extract (the only install path now)
 // ---------------------------------------------------------------------------
 
-void TexInstallDialog::onBrowse()
+void TexInstallView::onBrowse()
 {
     const QString file = QFileDialog::getOpenFileName(
         this, QStringLiteral("Select the downloaded texture pack"), QDir::homePath(),
@@ -135,7 +140,7 @@ void TexInstallDialog::onBrowse()
     beginExtract(file);
 }
 
-void TexInstallDialog::beginExtract(const QString &archivePath)
+void TexInstallView::beginExtract(const QString &archivePath)
 {
     m_dest = texpack::dir();
     QDir().mkpath(m_dest);
@@ -153,8 +158,8 @@ void TexInstallDialog::beginExtract(const QString &archivePath)
     m_worker->moveToThread(m_extThread);
     connect(m_extThread, &QThread::finished, m_worker, &QObject::deleteLater);
     connect(m_extThread, &QThread::finished, m_extThread, &QObject::deleteLater);
-    connect(m_worker, &ArchiveExtractWorker::progress, this, &TexInstallDialog::onExtractProgress);
-    connect(m_worker, &ArchiveExtractWorker::done, this, &TexInstallDialog::onExtractDone);
+    connect(m_worker, &ArchiveExtractWorker::progress, this, &TexInstallView::onExtractProgress);
+    connect(m_worker, &ArchiveExtractWorker::done, this, &TexInstallView::onExtractDone);
     connect(m_worker, &ArchiveExtractWorker::done, m_extThread, &QThread::quit);
     m_extThread->start();
 
@@ -162,7 +167,7 @@ void TexInstallDialog::beginExtract(const QString &archivePath)
                               Q_ARG(QString, archivePath), Q_ARG(QString, m_dest));
 }
 
-void TexInstallDialog::onExtractProgress(qint64 done, qint64 total)
+void TexInstallView::onExtractProgress(qint64 done, qint64 total)
 {
     if (total <= 0)
         return;
@@ -171,7 +176,7 @@ void TexInstallDialog::onExtractProgress(qint64 done, qint64 total)
     m_exBar->setValue(static_cast<int>(done * 100 / total));
 }
 
-void TexInstallDialog::onExtractDone(bool ok, const QString &msg)
+void TexInstallView::onExtractDone(bool ok, const QString &msg)
 {
     // The thread and worker self-delete via finished() -> deleteLater().
     m_worker = nullptr;
@@ -200,7 +205,7 @@ void TexInstallDialog::onExtractDone(bool ok, const QString &msg)
 // Cancellation
 // ---------------------------------------------------------------------------
 
-void TexInstallDialog::abortExtract()
+void TexInstallView::abortExtract()
 {
     if (!m_worker && !m_extThread)
         return;
@@ -214,10 +219,4 @@ void TexInstallDialog::abortExtract()
     }
     m_worker = nullptr;
     m_extThread = nullptr;
-}
-
-void TexInstallDialog::closeEvent(QCloseEvent *e)
-{
-    abortExtract();
-    e->accept();
 }

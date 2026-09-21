@@ -144,6 +144,11 @@ bool SettingsManager::load()
         std::remove(QFile::encodeName(legacy).constData());
         return ok;
     }
+
+    // No settings.toml and no legacy INI: write the default base now, so the file
+    // exists from the very first launch (the runtime and the in-game overlay read
+    // the same file). Returns false: the in-memory values stay at their defaults.
+    save();
     return false;
 }
 

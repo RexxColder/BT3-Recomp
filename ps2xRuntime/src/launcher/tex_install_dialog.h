@@ -1,10 +1,11 @@
 #pragma once
-// [texui] Install dialog: the launcher no longer downloads the archive. It shows the
+// [texui] Install view: the launcher no longer downloads the archive. It shows the
 // hardcoded download page for the chosen variant (Lite/Full), offers "Open in browser"
 // and a clipboard copy as a fallback, and installs a locally downloaded archive with
-// Browse (verified + extracted into data/Textures).
+// Browse (verified + extracted into data/Textures). [inwindow] It is an in-window VIEW.
 
-#include <QDialog>
+#include <QWidget>
+#include <functional>
 
 #include "archive_extract.h"
 #include "tex_pack.h"
@@ -14,18 +15,17 @@ class QProgressBar;
 class QPushButton;
 class QThread;
 
-class TexInstallDialog : public QDialog
+class TexInstallView : public QWidget
 {
     Q_OBJECT
 public:
-    explicit TexInstallDialog(QWidget *parent = nullptr, int pack = texpack::kPackFull);
-    ~TexInstallDialog() override;
+    explicit TexInstallView(QWidget *parent = nullptr, int pack = texpack::kPackFull);
+    ~TexInstallView() override;
+
+    std::function<void()> onBack;   // [inwindow] return to the previous view
 
 signals:
     void installed();   // emitted once an extraction finished successfully
-
-protected:
-    void closeEvent(QCloseEvent *e) override;
 
 private slots:
     void onBrowse();

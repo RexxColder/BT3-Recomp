@@ -38,6 +38,7 @@ void ExtractWorker::doWork(const QString &isoPath, const QString &dataDir)
         if (f.dir)
             continue;
         const QString dest = dataDir + QLatin1Char('/') + f.path;
+        emit file(f.path);   // [verbose] show the file being extracted
         const QFileInfo fi(dest);
         if (!QDir().mkpath(fi.absolutePath()))
         {

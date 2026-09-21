@@ -1,12 +1,15 @@
 #include "tab_video.h"
 
 #include "dbz_theme.h"
+#include "recommendation.h"
 #include "settings_manager.h"
+#include "tex_install_dialog.h"   // [texreplace] pack install dialog (moved from Misc)
 #include "tex_pack.h"   // [texui] pack status for the Texture Replacement dialog
+#include "view_host.h"  // [inwindow] push nested views
 
 #include <QCheckBox>
 #include <QComboBox>
-#include <QDialog>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFileInfo>
 #include <QFrame>
@@ -14,11 +17,15 @@
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMenu>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QScreen>
 #include <QScrollArea>
+#include <QSignalBlocker>
 #include <QSlider>
+#include <QUrl>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -149,19 +156,21 @@ namespace
         return items;
     }
 
-    // Shared shell for the two settings dialogs: Apply = write through to SettingsManager (in memory),
-    // Save = + persist, Reset = back to the values it opened with, Close = discard and close.
-    class VideoDialog : public QDialog
+    // [inwindow] Shared shell for the Video-tab settings views (no longer popups): Apply =
+    // write through to SettingsManager (in memory), Save = + persist, Reset = back to the
+    // values it opened with, Back = return to the previous page.
+    class VideoView : public QWidget
     {
     public:
-        VideoDialog(const QString &title, QWidget *parent) : QDialog(parent)
+        explicit VideoView(QWidget *parent) : QWidget(parent)
         {
-            setWindowTitle(title);
-            setModal(true);
+            setAttribute(Qt::WA_StyledBackground, true);
+            setStyleSheet(QStringLiteral("VideoView { background-color: #0a1014; }"));
             setMinimumWidth(520);
         }
 
         std::function<void()> onApplied;
+        std::function<void()> onBack;
 
     protected:
         virtual void loadOpened() = 0;       // snapshot -> widgets
@@ -172,12 +181,12 @@ namespace
         {
             auto *row = new QHBoxLayout;
             auto *reset = new QPushButton(QStringLiteral("Reset"));
-            auto *closeBtn = new QPushButton(QStringLiteral("Close"));
+            auto *back = new QPushButton(QStringLiteral("Back"));
             auto *apply = new QPushButton(QStringLiteral("Apply"));
             auto *save = new QPushButton(QStringLiteral("Save"));
-            for (auto *b : {reset, closeBtn, apply, save}) b->setMinimumWidth(96);
+            for (auto *b : {reset, back, apply, save}) b->setMinimumWidth(96);
             connect(reset, &QPushButton::clicked, this, [this] { loadOpened(); });
-            connect(closeBtn, &QPushButton::clicked, this, [this] { loadOpened(); close(); });
+            connect(back, &QPushButton::clicked, this, [this] { if (onBack) onBack(); });
             connect(apply, &QPushButton::clicked, this, [this] {
                 writeThrough();
                 if (onApplied) onApplied();
@@ -186,10 +195,10 @@ namespace
                 writeThrough();
                 SettingsManager::instance().save();
                 if (onApplied) onApplied();
-                close();
+                if (onBack) onBack();
             });
             row->addWidget(reset);
-            row->addWidget(closeBtn);
+            row->addWidget(back);
             row->addStretch(1);
             row->addWidget(apply);
             row->addWidget(save);
@@ -200,10 +209,10 @@ namespace
     // ---------------------------------------------------------------------------------------------
     // Display settings: resolution, render scale, monitor, window mode.
     // ---------------------------------------------------------------------------------------------
-    class DisplayDialog : public VideoDialog
+    class DisplayView : public VideoView
     {
     public:
-        explicit DisplayDialog(QWidget *parent) : VideoDialog(QStringLiteral("Display settings"), parent)
+        explicit DisplayView(QWidget *parent) : VideoView(parent)
         {
             auto &s = SettingsManager::instance();
             auto *root = new QVBoxLayout(this);
@@ -338,10 +347,10 @@ namespace
     // ---------------------------------------------------------------------------------------------
     // Visual effects: the renderer effects (same names as the overlay) + the filtering toggles.
     // ---------------------------------------------------------------------------------------------
-    class EffectsDialog : public VideoDialog
+    class EffectsView : public VideoView
     {
     public:
-        explicit EffectsDialog(QWidget *parent) : VideoDialog(QStringLiteral("Visual Effects"), parent)
+        explicit EffectsView(QWidget *parent) : VideoView(parent)
         {
             auto &s = SettingsManager::instance();
             auto *root = new QVBoxLayout(this);
@@ -441,83 +450,137 @@ namespace
     };
 
     // ---------------------------------------------------------------------------------------------
-    // [texui] Texture Replacement: pack status + the pack options. The install/activate flow stays
-    // in the Misc tab; this dialog configures the already-installed pack.
+    // [texui] Texture Replacement: pack status + enable + install + the pack options. The whole
+    // texture-pack flow lives here now (moved out of Misc).
     // ---------------------------------------------------------------------------------------------
-    class TexPackDialog : public VideoDialog
+    class TexPackView : public VideoView
     {
     public:
-        explicit TexPackDialog(QWidget *parent) : VideoDialog(QStringLiteral("Texture Replacement"), parent)
+        explicit TexPackView(QWidget *parent) : VideoView(parent)
         {
             auto &s = SettingsManager::instance();
             auto *root = new QVBoxLayout(this);
 
             root->addWidget(sectionLabel(QStringLiteral("PACK STATUS")));
-
-            const quint64 n = texpack::countReplacements();
-            const QString texDir = texpack::dir();
-            const bool installed = n > 0;
             {
                 auto *row = new QWidget;
                 auto *lay = new QHBoxLayout(row);
                 lay->setContentsMargins(8, 2, 8, 2);
                 lay->setSpacing(8);
-                auto *dot = new QLabel(QStringLiteral("*"));
-                dot->setFixedWidth(12);
-                dot->setStyleSheet(QStringLiteral("color:%1;font-weight:bold;")
-                                       .arg(installed ? QStringLiteral("#22c55e") : QStringLiteral("#ef4444")));
-                auto *txt = valueLabel(installed
-                                           ? QStringLiteral("Installed - %1 replacements").arg(n)
-                                           : QStringLiteral("No texture pack indexed"));
-                lay->addWidget(dot);
-                lay->addWidget(txt, 1);
+                m_statusDot = new QLabel(QStringLiteral("*"));
+                m_statusDot->setFixedWidth(12);
+                m_statusDot->setStyleSheet(QStringLiteral("font-weight:bold;"));
+                m_statusTxt = valueLabel();
+                lay->addWidget(m_statusDot);
+                lay->addWidget(m_statusTxt, 1);
                 root->addWidget(row);
             }
-            if (installed)
+            m_statusNote = hintRow(QString());
+            root->addWidget(m_statusNote);
+            root->addWidget(hintRow(texpack::dir()));
+
+            root->addWidget(sectionLabel(QStringLiteral("PACK")));
+            root->addWidget(toggleRow(QStringLiteral("Enable Texture Replacement"), &m_enable, s.texPack(),
+                                      QStringLiteral("Use the installed pack (shares the key with the in-game overlay).")));
             {
-                const bool full = QDir(texDir + QStringLiteral("/replacements/Characters/Body")).exists();
-                root->addWidget(hintRow(full ? QStringLiteral("Full pack: 3D + 2D")
-                                             : QStringLiteral("Lite pack: 2D only")));
+                auto *row = new QHBoxLayout;
+                m_install = new QPushButton(QStringLiteral("Install texture pack..."));
+                auto *folder = new QPushButton(QStringLiteral("Open folder"));
+                m_install->setObjectName(QStringLiteral("wizardButton"));
+                folder->setObjectName(QStringLiteral("wizardButton"));
+                m_install->setCursor(Qt::PointingHandCursor);
+                folder->setCursor(Qt::PointingHandCursor);
+                connect(m_install, &QPushButton::clicked, this, [this] { openInstall(); });
+                connect(folder, &QPushButton::clicked, this, [this] {
+                    const QString d = texpack::dir();
+                    if (QDir().mkpath(d)) QDesktopServices::openUrl(QUrl::fromLocalFile(d));
+                });
+                row->addWidget(m_install);
+                row->addWidget(folder);
+                row->addStretch(1);
+                root->addLayout(row);
             }
-            root->addWidget(hintRow(texDir));
-            if (!installed)
-                root->addWidget(hintRow(QStringLiteral(
-                    "Install one from the Misc tab, or point PS2X_TEXREPLACE=<dir> at a pack.")));
 
             root->addWidget(sectionLabel(QStringLiteral("OPTIONS")));
-            auto *box = new QWidget;
-            auto *bl = new QVBoxLayout(box);
+            m_optsBox = new QWidget;
+            auto *bl = new QVBoxLayout(m_optsBox);
             bl->setContentsMargins(0, 0, 0, 0);
             bl->addWidget(toggleRow(QStringLiteral("Video overlay (4K intro)"), &m_intro, s.introVideo()));
             bl->addWidget(comboRow(QStringLiteral("Buttons style"), &m_buttons,
                                    {QStringLiteral("PS2"), QStringLiteral("Xbox")}, s.buttonLayout()));
-            box->setEnabled(installed);
-            root->addWidget(box);
+            root->addWidget(m_optsBox);
             root->addWidget(hintRow(QStringLiteral(
                 "Video overlay replaces the opening movie with the pack's 4K clip. Both options "
-                "apply on restart. Enable/disable the pack from the Misc tab.")));
+                "apply on restart.")));
 
             root->addLayout(buttonRow());
+
+            refreshStatus();
             m_opened = capture();
             loadOpened();
         }
 
     private:
-        struct Snap { bool intro = true; int buttons = 1; };
+        struct Snap { bool enable = false, intro = true; int buttons = 1; };
 
-        Snap capture() const { return { m_intro->isChecked(), m_buttons->currentIndex() }; }
-        void loadOpened() override { m_intro->setChecked(m_opened.intro); m_buttons->setCurrentIndex(m_opened.buttons); }
+        void refreshStatus()
+        {
+            const quint64 n = texpack::countReplacements();
+            const bool installed = n > 0;
+            m_statusDot->setStyleSheet(QStringLiteral("font-weight:bold; color:%1;")
+                                           .arg(installed ? QStringLiteral("#22c55e") : QStringLiteral("#ef4444")));
+            m_statusTxt->setText(installed
+                                     ? QStringLiteral("Installed - %1 replacements").arg(n)
+                                     : QStringLiteral("No texture pack indexed"));
+            if (installed)
+            {
+                const bool full = QDir(texpack::dir() + QStringLiteral("/replacements/Characters/Body")).exists();
+                m_statusNote->setText(full ? QStringLiteral("Full pack: 3D + 2D")
+                                           : QStringLiteral("Lite pack: 2D only"));
+            }
+            else
+                m_statusNote->setText(QStringLiteral(
+                    "Install one below, or point PS2X_TEXREPLACE=<dir> at a pack."));
+            m_optsBox->setEnabled(installed);
+        }
+
+        void openInstall()
+        {
+            QMenu menu(this);
+            QAction *lite = menu.addAction(QStringLiteral("Pack Lite (2D only)"));
+            menu.addAction(QStringLiteral("Pack Full (3D + 2D)"));
+            QAction *chosen = menu.exec(m_install->mapToGlobal(QPoint(0, m_install->height())));
+            if (!chosen)
+                return;
+            const int kind = (chosen == lite) ? texpack::kPackLite : texpack::kPackFull;
+            auto *view = new TexInstallView(this, kind);
+            connect(view, &TexInstallView::installed, this, [this] { refreshStatus(); });
+            view->onBack = [] { viewhost::pop(); };
+            viewhost::show(view);
+        }
+
+        Snap capture() const { return { m_enable->isChecked(), m_intro->isChecked(), m_buttons->currentIndex() }; }
+        void loadOpened() override
+        {
+            m_enable->setChecked(m_opened.enable);
+            m_intro->setChecked(m_opened.intro);
+            m_buttons->setCurrentIndex(m_opened.buttons);
+        }
         void snapshot() override { m_opened = capture(); }
         void writeThrough() override
         {
             auto &s = SettingsManager::instance();
             const Snap v = capture();
+            s.setTexPack(v.enable);
             s.setIntroVideo(v.intro);
             s.setButtonLayout(v.buttons);
         }
 
-        QCheckBox *m_intro = nullptr;
+        QLabel *m_statusDot = nullptr, *m_statusTxt = nullptr, *m_statusNote = nullptr;
+        QCheckBox *m_enable = nullptr, *m_intro = nullptr;
         QComboBox *m_buttons = nullptr;
+        QPushButton *m_install = nullptr;
+        QWidget *m_optsBox = nullptr;
         Snap m_opened;
     };
 } // namespace
@@ -602,6 +665,27 @@ VideoTab::VideoTab(QWidget *parent)
         "unavailable). OpenGL (New) presents through our own GL layer; Software uses the CPU rasterizer "
         "and has no upscale.")));
     root->addWidget(hintRow(QStringLiteral("Takes full effect after restart.")));
+
+    // [tier] Detect & Recommend: probe hardware + benchmark, apply the ceiling.
+    root->addWidget(sectionLabel(QStringLiteral("RECOMMENDED")));
+    {
+        auto *recBtn = new QPushButton(QStringLiteral("Detect & Recommend settings"));
+        recBtn->setObjectName(QStringLiteral("wizardButton"));
+        recBtn->setCursor(Qt::PointingHandCursor);
+        connect(recBtn, &QPushButton::clicked, this, [this] {
+            const hw::Recommendation r = rec::detectAndApply();
+            refreshStatus();
+            QMessageBox::information(this, QStringLiteral("Recommended settings"),
+                QStringLiteral("Applied: render scale %1x  \u00b7  widescreen %2  \u00b7  texture pack %3  \u00b7  %4 fps")
+                    .arg(r.renderScale)
+                    .arg(r.widescreen ? QStringLiteral("ON") : QStringLiteral("OFF"))
+                    .arg(r.texPackFull ? QStringLiteral("Full") : QStringLiteral("Off/Lite"))
+                    .arg(r.fps60 ? 60 : 30));
+        });
+        root->addWidget(recBtn);
+        root->addWidget(hintRow(QStringLiteral(
+            "Detects your CPU/RAM/GPU, benchmarks single-thread, and applies the recommended ceiling.")));
+    }
 
     root->addStretch(1);
     scroll->setWidget(content);
@@ -694,21 +778,24 @@ void VideoTab::refreshStatus()
 
 void VideoTab::openDisplayDialog()
 {
-    DisplayDialog dlg(this);
-    dlg.onApplied = [this] { refreshStatus(); };
-    dlg.exec();
+    auto *view = new DisplayView(this);
+    view->onApplied = [this] { refreshStatus(); };
+    view->onBack = [] { viewhost::pop(); };
+    viewhost::show(view);
 }
 
 void VideoTab::openVisualEffectsDialog()
 {
-    EffectsDialog dlg(this);
-    dlg.onApplied = [this] { refreshStatus(); };
-    dlg.exec();
+    auto *view = new EffectsView(this);
+    view->onApplied = [this] { refreshStatus(); };
+    view->onBack = [] { viewhost::pop(); };
+    viewhost::show(view);
 }
 
 void VideoTab::openTexPackDialog()
 {
-    TexPackDialog dlg(this);
-    dlg.onApplied = [this] { refreshStatus(); };
-    dlg.exec();
+    auto *view = new TexPackView(this);
+    view->onApplied = [this] { refreshStatus(); };
+    view->onBack = [] { viewhost::pop(); };
+    viewhost::show(view);
 }
