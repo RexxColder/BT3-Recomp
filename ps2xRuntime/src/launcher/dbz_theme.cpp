@@ -145,6 +145,11 @@ namespace dbz
         QCheckBox::indicator:checked { background-color: %5; border-color: %5; }
         QCheckBox::indicator:hover { border-color: %5; }
 
+        QRadioButton { color: %4; background: transparent; spacing: 8px; }
+        QRadioButton::indicator { width: 16px; height: 16px; border: 1px solid %3; border-radius: 8px; background-color: %2; }
+        QRadioButton::indicator:hover { border-color: %5; }
+        QRadioButton::indicator:checked { background-color: %5; border: 1px solid %5; }
+
         QTableWidget {
             background-color: %1;
             border: 1px solid %3;

@@ -2,6 +2,8 @@
 
 #include <QWidget>
 
+#include "hardware_probe.h"
+
 class QComboBox;
 class QLabel;
 
@@ -29,4 +31,5 @@ private:
     QLabel *m_dot[4] = {};
     QLabel *m_val[4] = {};
     QLabel *m_note[4] = {};
+    hw::Recommendation m_rec;   // [tier] last detected recommendation (Detect -> Apply)
 };

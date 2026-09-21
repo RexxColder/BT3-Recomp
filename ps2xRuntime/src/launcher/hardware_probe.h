@@ -35,6 +35,7 @@ namespace hw
         bool widescreen  = true;
         bool texPackFull = false;
         bool fps60       = false;
+        int  windowMode  = 1;   // [resolution] 0 windowed, 1 borderless (default), 2 fullscreen
     };
     // Map detected hardware + the CPU R to the settings ceiling (see the estimate doc).
     Recommendation recommend(const Info &info, double cpuR);

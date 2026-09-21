@@ -23,10 +23,10 @@ public:
         // RETIRED for now -- kept only so old settings can be migrated). gpuRenderer stays in sync
         // (renderer != 1) for the code that still reads it.
         static constexpr int kRendererOpenGL = 0, kRendererSoftware = 1, kRendererParallelGS = 2, kRendererD3D11 = 3;
-#if defined(PS2X_HAVE_PGS)
+#if defined(PS2X_HAVE_PGS) && !defined(_WIN32)
         static constexpr int kRendererDefault = 2;   // [pgs] Vulkan compute backend
 #else
-        static constexpr int kRendererDefault = 0;   // [opengl-new] our own present
+        static constexpr int kRendererDefault = 0;   // [opengl-new] our own present (Windows default)
 #endif
         int renderer = kRendererDefault;
         int windowMode = 0;   // [display] 0 = windowed (resizable), 1 = borderless, 2 = fullscreen

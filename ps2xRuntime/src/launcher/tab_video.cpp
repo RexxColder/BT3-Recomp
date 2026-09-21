@@ -18,7 +18,6 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMenu>
-#include <QMessageBox>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QScreen>
@@ -666,25 +665,50 @@ VideoTab::VideoTab(QWidget *parent)
         "and has no upscale.")));
     root->addWidget(hintRow(QStringLiteral("Takes full effect after restart.")));
 
-    // [tier] Detect & Recommend: probe hardware + benchmark, apply the ceiling.
+    // [tier] RECOMMENDED: Detect (probe + benchmark) then Apply (write the ceiling).
     root->addWidget(sectionLabel(QStringLiteral("RECOMMENDED")));
     {
-        auto *recBtn = new QPushButton(QStringLiteral("Detect & Recommend settings"));
-        recBtn->setObjectName(QStringLiteral("wizardButton"));
-        recBtn->setCursor(Qt::PointingHandCursor);
-        connect(recBtn, &QPushButton::clicked, this, [this] {
-            const hw::Recommendation r = rec::detectAndApply();
-            refreshStatus();
-            QMessageBox::information(this, QStringLiteral("Recommended settings"),
-                QStringLiteral("Applied: render scale %1x  \u00b7  widescreen %2  \u00b7  texture pack %3  \u00b7  %4 fps")
-                    .arg(r.renderScale)
-                    .arg(r.widescreen ? QStringLiteral("ON") : QStringLiteral("OFF"))
-                    .arg(r.texPackFull ? QStringLiteral("Full") : QStringLiteral("Off/Lite"))
-                    .arg(r.fps60 ? 60 : 30));
+        auto *row = new QHBoxLayout;
+        row->setContentsMargins(8, 2, 8, 2);
+        auto *detectBtn = new QPushButton(QStringLiteral("Detect"));
+        detectBtn->setObjectName(QStringLiteral("wizardButton"));
+        detectBtn->setCursor(Qt::PointingHandCursor);
+        auto *applyBtn = new QPushButton(QStringLiteral("Apply"));
+        applyBtn->setObjectName(QStringLiteral("wizardButton"));
+        applyBtn->setCursor(Qt::PointingHandCursor);
+        applyBtn->setEnabled(false);
+        auto *recText = new QLabel;
+        recText->setObjectName(QStringLiteral("hintLabel"));
+        recText->setWordWrap(true);
+        connect(detectBtn, &QPushButton::clicked, this, [this, applyBtn, recText] {
+            const hw::Info info = hw::detect();
+            const double r = hw::benchSingleThreadR();
+            m_rec = hw::recommend(info, r);
+            const QString mode = m_rec.windowMode == 2 ? QStringLiteral("Fullscreen")
+                               : m_rec.windowMode == 1 ? QStringLiteral("Borderless")
+                                                       : QStringLiteral("Windowed");
+            recText->setText(QStringLiteral("%1 \u2014 %2x \u00b7 widescreen %3 \u00b7 pack %4 \u00b7 %5 fps \u00b7 %6")
+                                 .arg(m_rec.tierName)
+                                 .arg(m_rec.renderScale)
+                                 .arg(m_rec.widescreen ? QStringLiteral("ON") : QStringLiteral("OFF"))
+                                 .arg(m_rec.texPackFull ? QStringLiteral("Full") : QStringLiteral("Off/Lite"))
+                                 .arg(m_rec.fps60 ? 60 : 30)
+                                 .arg(mode));
+            applyBtn->setEnabled(true);
         });
-        root->addWidget(recBtn);
+        connect(applyBtn, &QPushButton::clicked, this, [this, applyBtn, recText] {
+            rec::apply(m_rec);
+            refreshStatus();
+            recText->setText(QStringLiteral("Applied \u2713"));
+            applyBtn->setEnabled(false);
+        });
+        row->addWidget(detectBtn);
+        row->addWidget(applyBtn);
+        row->addWidget(recText, 1);
+        root->addLayout(row);
         root->addWidget(hintRow(QStringLiteral(
-            "Detects your CPU/RAM/GPU, benchmarks single-thread, and applies the recommended ceiling.")));
+            "Detect probes your CPU/RAM/GPU and benchmarks single-thread; Apply writes the "
+            "recommended ceiling (render scale, window mode, texture pack, fps) to the settings.")));
     }
 
     root->addStretch(1);

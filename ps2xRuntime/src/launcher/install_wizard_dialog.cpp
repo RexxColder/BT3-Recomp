@@ -19,12 +19,14 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QGraphicsDropShadowEffect>
+#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMimeData>
 #include <QProgressBar>
 #include <QPropertyAnimation>
 #include <QPushButton>
+#include <QScreen>
 #include <QStackedWidget>
 #include <QTemporaryDir>
 #include <QThread>
@@ -727,15 +729,23 @@ void InstallWizardView::applyInstallResult(bool ok, const QString &msg)
                     .arg(QString::number(gb, 'f', 2), QDir::toNativeSeparators(dataDir)));
             m_rec = hw::recommend(m_hw, m_cpuR.load());
             m_hwLabel->setText(QStringLiteral("<b>Your hardware</b><br>&nbsp;&nbsp;%1").arg(hw::summary(m_hw)));
+            const QString mode = m_rec.windowMode == 2 ? QStringLiteral("Fullscreen")
+                               : m_rec.windowMode == 1 ? QStringLiteral("Borderless")
+                                                       : QStringLiteral("Windowed");
+            QString res;
+            if (const QScreen *sc = QGuiApplication::primaryScreen())
+                res = QStringLiteral(" @ %1\u00d7%2").arg(sc->geometry().width()).arg(sc->geometry().height());
             m_recLabel->setText(QStringLiteral(
                 "<b>Recommended settings</b> (%1)<br>"
                 "&nbsp;&nbsp;Render scale %2x &nbsp;&middot;&nbsp; Widescreen %3 &nbsp;&middot;&nbsp; "
-                "Texture pack %4 &nbsp;&middot;&nbsp; %5 fps")
+                "Texture pack %4 &nbsp;&middot;&nbsp; %5 fps<br>"
+                "&nbsp;&nbsp;%6%7")
                     .arg(m_rec.tierName)
                     .arg(m_rec.renderScale)
                     .arg(m_rec.widescreen ? QStringLiteral("ON") : QStringLiteral("OFF"))
                     .arg(m_rec.texPackFull ? QStringLiteral("Full") : QStringLiteral("Off/Lite"))
-                    .arg(m_rec.fps60 ? 60 : 30));
+                    .arg(m_rec.fps60 ? 60 : 30)
+                    .arg(mode, res));
             setIndex(3); // summary page (first install only)
         }
         return;
