@@ -11,12 +11,14 @@
 #endif
 
 #include <array>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
+#include <thread>
 
 namespace ps2x_pad
 {
@@ -30,7 +32,7 @@ namespace ps2x_pad
         constexpr int kAxLX = 0, kAxLY = 1, kAxRX = 2, kAxRY = 3, kAxLT = 4, kAxRT = 5;
         constexpr int kMaxButtons = 32, kMaxAxes = 8;
 
-        Backend s_backend = Backend::Raylib;
+        std::atomic<Backend> s_backend{Backend::Raylib};
         bool s_inited = false;
 
         bool envFlag(const char *name)
@@ -115,7 +117,10 @@ namespace ps2x_pad
             };
             std::array<Slot, kMaxSlots> s_slots;
             std::set<SDL_JoystickID> s_rejected;   // instance ids that failed the controller test
-            bool s_up = false;
+            // Set once the background init thread finishes populating s_slots; the pad API returns
+            // no input until then. Atomic so the store (init thread) happens-before the loads
+            // (render/guest threads) -- see ps2x_pad::init().
+            std::atomic<bool> s_up{false};
 
             void log(const char *fmt, ...)
             {
@@ -146,11 +151,14 @@ namespace ps2x_pad
                 // We poll; no event traffic wanted (an unread queue just fills to its cap).
                 SDL_JoystickEventState(SDL_IGNORE);
                 SDL_GameControllerEventState(SDL_IGNORE);
-                s_up = true;
                 std::fprintf(stderr, "[hostpad] SDL2 %d.%d.%d gamecontroller backend (PS2X_HOSTPAD=raylib restores GLFW)\n",
                              SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_PATCHLEVEL);
                 return true;
             }
+
+            // Called on the init thread once s_slots is populated and mappings are loaded. The
+            // release pairs with the acquire loads in update()/slot() on the render/guest threads.
+            void setUp() { s_up.store(true, std::memory_order_release); }
 
             void closeSlot(Slot &s)
             {
@@ -319,7 +327,8 @@ namespace ps2x_pad
 
             void addMappings(const char *text)
             {
-                if (!s_up || !text) return;
+                // No s_up gate: this runs on the init thread before the pad goes live.
+                if (!text) return;
                 // One mapping per line; SDL_GameControllerAddMapping takes exactly one.
                 std::string line;
                 int added = 0;
@@ -349,23 +358,9 @@ namespace ps2x_pad
     Backend backend() { return s_backend; }
     const char *backendName() { return s_backend == Backend::Sdl2 ? "sdl2" : "raylib"; }
 
-    void init()
+    // PS2X_PAD_MAPPINGS: a file of SDL-format mappings for pads neither database knows.
+    void loadMappingsFromEnv()
     {
-        if (s_inited) return;
-        s_inited = true;
-        s_backend = pickBackend();
-#if defined(PS2X_HAVE_SDL2)
-        if (s_backend == Backend::Sdl2 && !sdl::init())
-            s_backend = Backend::Raylib;
-#endif
-        if (s_backend == Backend::Raylib)
-            rl::init();
-#if defined(__linux__)
-        // The evdev reader exists for pads GLFW cannot map; SDL reads evdev itself, so with the
-        // SDL backend it would just be a second reader of the same device.
-        ps2_stubs::PadEvdevLinux::setEnabled(s_backend == Backend::Raylib);
-#endif
-        // PS2X_PAD_MAPPINGS: a file of SDL-format mappings for pads neither database knows.
         if (const char *mf = std::getenv("PS2X_PAD_MAPPINGS"))
         {
             if (FILE *f = std::fopen(mf, "rb"))
@@ -382,6 +377,56 @@ namespace ps2x_pad
                 std::fclose(f);
             }
         }
+    }
+
+    void init()
+    {
+        if (s_inited) return;
+        s_inited = true;
+        const Backend want = pickBackend();
+        s_backend.store(want, std::memory_order_relaxed);
+#if defined(PS2X_HAVE_SDL2)
+        if (want == Backend::Sdl2)
+        {
+#if defined(__linux__)
+            // SDL reads evdev itself; the GLFW-era reader would be a second reader of the same device.
+            ps2_stubs::PadEvdevLinux::setEnabled(false);
+#endif
+#if defined(_WIN32)
+            // [bootspeed] SDL gamecontroller enumeration costs ~200 ms on Windows. Run it (and the
+            // mapping load) on a background thread so it overlaps the guest boot; the pad API
+            // returns no input until sdl::setUp() flips s_up (release) at the end. Linux keeps the
+            // synchronous path below (reference behaviour).
+            std::thread([] {
+                if (!sdl::init())
+                {
+                    s_backend.store(Backend::Raylib, std::memory_order_release);
+                    rl::init();
+                    return;
+                }
+                loadMappingsFromEnv();
+                sdl::setUp();   // publish s_slots to the render/guest threads
+            }).detach();
+            return;
+#else
+            if (!sdl::init())
+            {
+                s_backend.store(Backend::Raylib);
+                rl::init();
+                return;
+            }
+            loadMappingsFromEnv();
+            sdl::setUp();
+            return;
+#endif
+        }
+#endif
+        if (want == Backend::Raylib)
+            rl::init();
+#if defined(__linux__)
+        ps2_stubs::PadEvdevLinux::setEnabled(want == Backend::Raylib);
+#endif
+        loadMappingsFromEnv();
     }
 
     void shutdown()

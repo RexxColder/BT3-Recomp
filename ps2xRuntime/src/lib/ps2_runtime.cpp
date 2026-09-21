@@ -1338,6 +1338,8 @@ double g_fpPresent = 0, g_fpBar = 0, g_fpPre = 0, g_fpWait = 0, g_fpLoop = 0; in
 // 18.81 ms loop) with bar/pre/wait all 0.00 -- real work nobody has named, larger than every
 // tracked guest phase except VU1. Everything optimised so far lived in already-named buckets.
 double g_fpSbb = 0, g_fpPad = 0, g_fpBegin = 0, g_fpBlit = 0, g_fpUi = 0, g_fpAudio = 0, g_fpRender = 0;   // [frameprof2]
+std::chrono::steady_clock::time_point g_ps2xBootT0;   // [boot] set by main.cpp at process start
+bool g_ps2xBootLogged = false;                        // [boot] one-shot first-frame marker
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
                                      DebugUiCallback drawCallback,
                                      DebugUiCallback shutdownCallback,
@@ -1464,17 +1466,26 @@ bool PS2Runtime::initialize(const char *title)
     }
     try
     {
+        auto _bt = std::chrono::steady_clock::now();
+        auto _mark = [&](const char *what) {
+            const auto now = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[boot]   init %-22s %6.1f ms\n", what,
+                         std::chrono::duration<double, std::milli>(now - _bt).count());
+            _bt = now;
+        };
         if (!m_memory.initialize())
         {
             std::cerr << "Failed to initialize PS2 memory" << std::endl;
             return false;
         }
+        _mark("memory");
 
         if (!syncCoreSubsystems())
         {
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
         }
+        _mark("core subsystems");
 
 #if defined(PLATFORM_VITA)
         bt3InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
@@ -1523,7 +1534,9 @@ bool PS2Runtime::initialize(const char *title)
                          winMode, winMonitor, hostWinW, hostWinH);
         }
         ps2xHostPrepareWindow();   // [window] DPI hints must precede the window (SDL init happens inside)
+        _mark("sdl hints");
         bt3InitWindow(hostWinW, hostWinH, title);
+        _mark("init window");
         {   // [winlog] what we asked for vs what the framework reports vs the REAL client area. The SDL
             // platform sizes the window differently than GLFW did: on a DPI-scaled display the logical
             // and physical sizes disagree, and the picture only lines up after a resize event.
@@ -1559,6 +1572,7 @@ bool PS2Runtime::initialize(const char *title)
             else
                 bt3SetWindowSize(hostWinW, hostWinH);   // moving monitors can leave the window fitted
         }
+        _mark("window+monitor");
         // [icon] Carry the launcher's icon onto the runner window. Same asset
         // convention as the overlay font (<exeDir>/assets/icon.png); exeDir is
         // PS2X_EXEDIR (deploy root) else the executable's own directory.
@@ -1609,12 +1623,15 @@ bool PS2Runtime::initialize(const char *title)
         if (AltGlEnabled()) AltGlInit();
         else ps2xGlEnsureContext();
 #endif
+        _mark("gl context");
         // [hostio] audio and gamepads go through the host layers (SDL2 by default, raylib on
         // PS2X_HOSTAUDIO=raylib / PS2X_HOSTPAD=raylib); the window and keyboard stay raylib's.
         ps2x_audio::init();
         m_audioBackend.setAudioReady(ps2x_audio::ready());
+        _mark("audio");
         ps2x_pad::init();
 #endif
+        _mark("pad");
 #if defined(_WIN32)
         {   // [d3d11] Native D3D11 present is the DEFAULT on Windows (PS2X_D3D11=0 disables it).
             // raylib keeps the window, input and audio; the video present is native.
@@ -1682,6 +1699,7 @@ bool PS2Runtime::initialize(const char *title)
             ps2texcache::setConfig(tcEnabled, packHash, dataHash, tcPath.c_str());
             ps2texcache::load();
         }
+        _mark("texcache");
         {   // [fps60] PS2X_FPS60=1: enable the 60-fps fight mode from the env (loads fps60_sites.txt,
             // staged next to the runner). Lets the perf A/B be run without touching settings.toml.
             const char *f60 = std::getenv("PS2X_FPS60");
@@ -1713,6 +1731,7 @@ bool PS2Runtime::initialize(const char *title)
             m_debugUiInitCallback(*this, m_debugUiUserData);
             m_debugUiInitialized = true;
         }
+        _mark("overlay ui");
 
         // PS2X_REPLAY=1: standalone VU1 replay of the spike snapshot (work/spike_{micro,
         // data,state}.bin) through the full normal kick path, then exit. Lets the popup
@@ -1762,6 +1781,7 @@ bool PS2Runtime::initialize(const char *title)
             std::exit(0);
         }
 
+        _mark("done");
         return true;
     }
     catch (const std::exception &e)
@@ -8516,6 +8536,13 @@ void PS2Runtime::run()
             }
             const auto tP0 = std::chrono::steady_clock::now();
             bt3EndDrawing();
+            // [boot] First presented frame: process start -> boot. One-shot.
+            if (!g_ps2xBootLogged && g_ps2xBootT0.time_since_epoch().count() != 0)
+            {
+                g_ps2xBootLogged = true;
+                std::fprintf(stderr, "[boot] start -> first frame: %.1f ms\n",
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_ps2xBootT0).count());
+            }
             const auto t1 = std::chrono::steady_clock::now();
             g_fpPresent += std::chrono::duration<double, std::milli>(t1 - tP0).count();
             ++g_fpN;

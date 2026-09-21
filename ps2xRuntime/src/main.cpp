@@ -535,6 +535,10 @@ extern "C" const char *ps2xExeDirC()
 }
 int main(int argc, char *argv[])
 {
+    // [boot] process/main start: the runtime logs start -> first frame on its first present.
+    extern std::chrono::steady_clock::time_point g_ps2xBootT0;
+    g_ps2xBootT0 = std::chrono::steady_clock::now();
+    const auto t_boot = g_ps2xBootT0;
 #if defined(_WIN32)
     ps2xWinTimerBegin();   // [wintimer] 1 ms tick: timed waits stop rounding to 15.6 ms
     ps2xWinCrashHandlerInstall();
@@ -687,6 +691,8 @@ int main(int argc, char *argv[])
             std::cerr << "Failed to initialize PS2 runtime" << std::endl;
             return 1;
         }
+        std::fprintf(stderr, "[boot] start -> runtime init: %.1f ms\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_boot).count());
 
         if (const char *rp = std::getenv("PS2X_GS_REPLAY"))
             return runGsReplay(runtime, rp);
@@ -696,6 +702,8 @@ int main(int argc, char *argv[])
             std::cerr << "Failed to load ELF file: " << filePathStr << std::endl;
             return 1;
         }
+        std::fprintf(stderr, "[boot] start -> ELF loaded: %.1f ms\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_boot).count());
 
         // [r3000] Optional: run a recompiled IOP module natively (diagnostic).
         // PS2X_IOP_RUN=SIO2MAN.IRX  PS2X_IOP_DIR=<deploy>/data/IRX/
