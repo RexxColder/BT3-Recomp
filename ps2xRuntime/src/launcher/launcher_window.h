@@ -2,12 +2,16 @@
 
 #include <QMainWindow>
 #include <QString>
+#include <atomic>
+
+#include "hardware_probe.h"
 
 class QLabel;
 class QPushButton;
 class QProcess;
 class QWidget;
 class QStackedWidget;
+class QThread;
 class QGraphicsDropShadowEffect;
 class QPropertyAnimation;
 
@@ -16,6 +20,7 @@ class LauncherWindow : public QMainWindow
     Q_OBJECT
 public:
     explicit LauncherWindow(QWidget *parent = nullptr);
+    ~LauncherWindow() override;
 
     // Absolute path to the playable game ELF (self-extracting BT3SELFX binary)
     // found next to the launcher. Empty if none detected.
@@ -72,4 +77,9 @@ private:
     QPropertyAnimation *m_settingsGlowAnim = nullptr;
     QGraphicsDropShadowEffect *m_playGlow = nullptr;
     QPropertyAnimation *m_playGlowAnim = nullptr;
+
+    // [tier] hardware probe + silent CPU benchmark for the specs banner chip.
+    hw::Info m_hw;
+    std::atomic<double> m_cpuR{0.0};
+    QThread *m_benchThread = nullptr;
 };

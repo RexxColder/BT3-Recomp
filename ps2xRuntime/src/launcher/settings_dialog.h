@@ -3,11 +3,13 @@
 #include <QWidget>
 #include <functional>
 
-class QTabWidget;
+class QListWidget;
+class QStackedWidget;
 class BindingsTab;
 
 // [inwindow] Settings is an in-window VIEW (not a popup): the launcher swaps its
 // whole content for this widget and back. onBack returns to the launcher page.
+// [sidebar] Left list + stacked pages instead of a QTabWidget.
 class SettingsView : public QWidget
 {
     Q_OBJECT
@@ -21,6 +23,7 @@ private slots:
     void onClose();
 
 private:
-    QTabWidget *m_tabs = nullptr;
+    QListWidget *m_side = nullptr;
+    QStackedWidget *m_pages = nullptr;
     BindingsTab *m_bindings = nullptr;
 };

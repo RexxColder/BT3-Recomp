@@ -10,14 +10,18 @@
 #include <QApplication>
 #include <QColor>
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
+#include <QDragEnterEvent>
+#include <QDropEvent>
 #include <QEasingCurve>
 #include <QFile>
 #include <QFileDialog>
 #include <QGraphicsDropShadowEffect>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMimeData>
 #include <QProgressBar>
 #include <QPropertyAnimation>
 #include <QPushButton>
@@ -50,6 +54,21 @@ QString fmtEta(qint64 done, qint64 total, qint64 elapsedMs)
         remainMs = 0;
     const qint64 sec = remainMs / 1000;
     return QStringLiteral("~%1:%2 remaining").arg(sec / 60).arg(sec % 60, 2, 10, QLatin1Char('0'));
+}
+
+// [installlog] Append a timestamped line to <deploy>/logs/install.log.
+void logInstall(const QString &line)
+{
+    const QString dir = apppaths::userRoot() + QStringLiteral("/logs");
+    QDir().mkpath(dir);
+    QFile f(dir + QStringLiteral("/install.log"));
+    if (f.open(QIODevice::Append | QIODevice::Text))
+    {
+        f.write(QDateTime::currentDateTime().toString(Qt::ISODate).toUtf8());
+        f.write("  ");
+        f.write(line.toUtf8());
+        f.write("\n");
+    }
 }
 
 QString findImageRecursive(const QString &root, int depth)
@@ -94,9 +113,11 @@ InstallWizardView::InstallWizardView(QWidget *parent, bool reinstall)
     setAttribute(Qt::WA_StyledBackground, true);
     setStyleSheet(QStringLiteral("InstallWizardView { background-color: #0a1014; }"));
     setMinimumSize(520, 330);
+    setAcceptDrops(true);   // [dnd]
     m_hw = hw::detect();   // [tier] probe once, reused for the Page D summary
     buildUi();
     m_reinstall = reinstall;
+    logInstall(QStringLiteral("wizard opened (reinstall=%1)").arg(reinstall ? 1 : 0));
     if (reinstall)
         setIndex(1); // straight to the disc dump selection
 }
@@ -113,8 +134,29 @@ InstallWizardView::~InstallWizardView()
 
 void InstallWizardView::finish(bool accepted)
 {
+    logInstall(QStringLiteral("wizard finished (accepted=%1)").arg(accepted ? 1 : 0));
     if (onFinished)
         onFinished(accepted);
+}
+
+void InstallWizardView::dragEnterEvent(QDragEnterEvent *e)
+{
+    if (e->mimeData() && e->mimeData()->hasUrls())
+        e->acceptProposedAction();
+}
+
+void InstallWizardView::dropEvent(QDropEvent *e)
+{
+    if (!e->mimeData() || !e->mimeData()->hasUrls())
+        return;
+    const QString path = e->mimeData()->urls().first().toLocalFile();
+    if (path.isEmpty())
+        return;
+    setIndex(1);   // disc-dump page
+    m_selected->setText(QDir::toNativeSeparators(path));
+    logInstall(QStringLiteral("dropped: %1").arg(path));
+    attemptVerify(path);
+    e->acceptProposedAction();
 }
 
 void InstallWizardView::buildUi()
@@ -471,8 +513,12 @@ void InstallWizardView::attemptVerify(const QString &dumpPath)
     }
 
     status(QStringLiteral("Verifying game disc (SLUS_216.78)…"));
-    if (DiscVerify::verifySlusFromIso(m_isoPath))
-        setVerified(true, QStringLiteral("Game Disc Validated"));
+    const bool verifiedOk = DiscVerify::verifySlusFromIso(m_isoPath);
+    const QString sha = QString::fromLatin1(DiscVerify::kExpectedDiscElfSha256);
+    logInstall(QStringLiteral("verify %1: %2  sha256=%3")
+                   .arg(verifiedOk ? QStringLiteral("OK") : QStringLiteral("FAIL"), m_isoPath, sha));
+    if (verifiedOk)
+        setVerified(true, QStringLiteral("Game Disc Validated  \u00b7  SHA-256 %1\u2026").arg(sha.left(16)));
     else
         setVerified(false, QStringLiteral("Cannot verify game disc. Is it the right version?"));
 }
@@ -540,6 +586,7 @@ void InstallWizardView::startExtraction()
     m_doneLabel->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
     m_retryInstall->setVisible(false);
     m_close->setEnabled(false);
+    logInstall(QStringLiteral("extract start: %1").arg(m_isoPath));
     setIndex(2);
     QCoreApplication::processEvents();
 
@@ -575,6 +622,7 @@ void InstallWizardView::onExtractProgress(qint64 done, qint64 total)
 
 void InstallWizardView::onExtractDone(bool ok, const QString &msg)
 {
+    logInstall(QStringLiteral("extract done: ok=%1 %2").arg(ok ? 1 : 0).arg(msg));
     if (ok)
     {
         const QString dataDir = apppaths::userRoot() + QStringLiteral("/data");
@@ -600,6 +648,7 @@ void InstallWizardView::startAfsConversion()
     }
 
     m_inAfsPhase = true;
+    logInstall(QStringLiteral("afs convert start: %1 container(s)").arg(afs.size()));
     m_retryInstall->setVisible(false);
     m_close->setEnabled(false);
     m_bar->setRange(0, 1);
@@ -645,6 +694,7 @@ void InstallWizardView::onAfsProgress(qint64 done, qint64 total)
 void InstallWizardView::onAfsDone(bool ok, const QString &msg)
 {
     m_inAfsPhase = false;
+    logInstall(QStringLiteral("afs done: ok=%1 %2").arg(ok ? 1 : 0).arg(msg));
     m_activity->clear();
     if (ok)
         applyInstallResult(true, QStringLiteral("Installation complete. Game data converted to folders."));
@@ -654,6 +704,7 @@ void InstallWizardView::onAfsDone(bool ok, const QString &msg)
 
 void InstallWizardView::applyInstallResult(bool ok, const QString &msg)
 {
+    logInstall(QStringLiteral("result: ok=%1 %2").arg(ok ? 1 : 0).arg(msg));
     if (ok)
     {
         m_installed = true;

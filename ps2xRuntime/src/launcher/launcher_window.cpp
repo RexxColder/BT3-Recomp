@@ -18,6 +18,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QGraphicsDropShadowEffect>
+#include <QGraphicsOpacityEffect>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QIcon>
@@ -32,6 +33,7 @@
 #include <QShowEvent>
 #include <QStackedWidget>
 #include <QStandardPaths>
+#include <QThread>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -128,8 +130,19 @@ LauncherWindow::LauncherWindow(QWidget *parent)
     m_specs = new QLabel(bottomBar);
     m_specs->setObjectName(QStringLiteral("specsLabel"));
     m_specs->setStyleSheet(QStringLiteral("color: #6b7280; background: transparent; font-size: 11px;"));
-    m_specs->setText(hw::summary(hw::detect()));
+    m_hw = hw::detect();
+    m_specs->setText(hw::summary(m_hw));
     m_specs->setToolTip(QStringLiteral("Detected hardware"));
+    // [tier] Silent single-thread benchmark; the specs banner gains a tier chip.
+    m_benchThread = QThread::create([this] { m_cpuR.store(hw::benchSingleThreadR()); });
+    connect(m_benchThread, &QThread::finished, this, [this] {
+        if (!m_specs)
+            return;
+        const hw::Recommendation r = hw::recommend(m_hw, m_cpuR.load());
+        m_specs->setText(QStringLiteral("%1   \u00b7   [%2]").arg(hw::summary(m_hw), r.tierName));
+        m_specs->setToolTip(QStringLiteral("Detected hardware \u2014 recommended tier: %1").arg(r.tierName));
+    });
+    m_benchThread->start();
     m_hint = new QLabel(bottomBar);
     m_hint->setObjectName(QStringLiteral("hintLabel"));
     m_hint->setStyleSheet(QStringLiteral("color: #9999b3; background: transparent; font-size: 11px;"));
@@ -185,6 +198,15 @@ LauncherWindow::LauncherWindow(QWidget *parent)
     const bool firstBoot = !QFile::exists(SettingsManager::instance().configpath());
     if (firstBoot)
         startSettingsGlow();
+}
+
+LauncherWindow::~LauncherWindow()
+{
+    if (m_benchThread)
+    {
+        m_benchThread->wait(1000);
+        m_benchThread->deleteLater();
+    }
 }
 
 // Release deploy: no SELFX next to us, but a plain ps2EntryRunner from the
@@ -492,6 +514,16 @@ void LauncherWindow::showView(QWidget *view)
     if (m_stack->indexOf(view) < 0)
         m_stack->addWidget(view);
     m_stack->setCurrentWidget(view);
+    // [fade] Subtle fade-in when a view takes over the window.
+    auto *fx = new QGraphicsOpacityEffect(view);
+    view->setGraphicsEffect(fx);
+    auto *anim = new QPropertyAnimation(fx, "opacity", view);
+    anim->setDuration(140);
+    anim->setStartValue(0.0);
+    anim->setEndValue(1.0);
+    anim->setEasingCurve(QEasingCurve::OutCubic);
+    connect(anim, &QPropertyAnimation::finished, view, [view] { view->setGraphicsEffect(nullptr); });
+    anim->start(QAbstractAnimation::DeleteWhenStopped);
     update();
 }
 

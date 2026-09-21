@@ -13,6 +13,8 @@ class QPushButton;
 class QStackedWidget;
 class QThread;
 class QTemporaryDir;
+class QDragEnterEvent;
+class QDropEvent;
 class ExtractWorker;
 class AfsExtractWorker;
 
@@ -34,6 +36,11 @@ public:
     // [summary] Page D actions.
     bool playRequested() const { return m_playRequested; }
     bool openSettingsRequested() const { return m_openSettings; }
+
+protected:
+    // [dnd] Accept a disc dump / archive dropped onto the window.
+    void dragEnterEvent(QDragEnterEvent *e) override;
+    void dropEvent(QDropEvent *e) override;
 
 private slots:
     void onNextMissing();

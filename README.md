@@ -13,6 +13,16 @@ image** — this repository contains no game code, assets, or media.
 > recompiled into a native, portable game tree with an OpenGL renderer. Ships
 > with a Qt 6 launcher (GLFW gamepad support) for Linux, Windows and macOS.
 
+## Screenshots
+
+<!-- Drop PNGs into docs/screenshots/ and uncomment:
+![Launcher](docs/screenshots/launcher.png)
+![Fight](docs/screenshots/fight.png)
+![Install wizard](docs/screenshots/wizard.png)
+-->
+
+_Screenshots are on the way._
+
 ## Contents
 
 - [For players](#for-players) — requirements, download & run
