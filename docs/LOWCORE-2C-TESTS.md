@@ -3,8 +3,7 @@
 > **Status: discarded.** The low-core ("2-core mode") work was reverted to the backup point
 > (`1d4f45e`, tag `backup-pre-raylib-plan`). This document keeps the record: what was tested, on
 > which hardware, and the conclusion, so the experiment is not repeated blindly.
-> The discarded code itself is preserved in the branch **`wip-2core-experiments`** (tip `3fd8773`),
-> not on `main`.
+> The discarded code is gone: the branch that held it (`wip-2core-experiments`) was deleted.
 
 ## 1. Hardware
 

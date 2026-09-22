@@ -20,17 +20,14 @@ kept so the plan can be reverted to a known-good state in one step.
 
 The raylib-removal work — S1/S2/S7 (`gsrl` routing, `AltGlPresent` default ON, elapsed-time),
 the overlay-crash fix (`UiEnd` flushed a null rlgl batch), the `[ovldbg]` tracing and the session
-log — is **preserved in the branch `raylib-plan-wip`** (tip `591f18c`), not on `main`.
+log — was **discarded**: the branch that held it (`raylib-plan-wip`) has been deleted.
 
 Reason for reverting: **S1 (`gsrl` dual-rlgl-stack routing) is not viable** — with the vendored
 `gsrl` initialised it still crashes (`memcpy` from a null vertex buffer inside the vendored rlgl)
 and shows a black screen, matching the dual-stack hazard documented in
 `docs/ALTGL-RAYLIB-REMOVAL.md`.
 
-## How to restore the plan work
+## Restoring
 
-```
-git checkout raylib-plan-wip     # bring the reverted work back
-# or, to bring individual commits onto main:
-git cherry-pick f757ed6 591f18c
-```
+No longer possible: the branch `raylib-plan-wip` was deleted, so that work is gone. The tag
+`backup-pre-raylib-plan` on `1d4f45e` still marks this point, so `main` can be reset back to it.
