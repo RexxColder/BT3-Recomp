@@ -1,6 +1,7 @@
 static thread_local int g_subDx0 = 0, g_subDxW = 0;   // [subdecode] decode window of the texture being recorded (0 = whole)
 #include "runtime/ps2_guestprof.h"
 #include "runtime/ps2_texreplace.h"   // [texreplace]
+#include "runtime/ps2x_dueldump.h"    // [dueldump] texture-sample capture (PS2X_DUELDUMP=1)
 #include "runtime/ps2_texcache.h"     // [texcache]
 #include <map>
 #include <array>
@@ -4713,6 +4714,11 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
                 float upAlpha = 1.0f;                                 // [texreplace] see PS2X_TEXPACKALPHA
                 applyTexReplacement(in.vram, ctx.tex0, in.clut, in.clutKey, (*in.texa), texKey, subW, texH,
                                     g_subDxW == 0 && !rawAlphaDec, rgba, upW, upH, upFmt, upScale, upAlpha);   // [texreplace] shared with the decode pool
+                // [dueldump] total capture: record the sample + offer the decode for a PNG
+                ps2x_dueldump::offerTextureSample(in.vram, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm,
+                    ctx.tex0.tw, ctx.tex0.th, in.clut, in.texa->ta0, in.texa->aem, in.texa->ta1,
+                    ctx.tex0.cbp, ctx.tex0.csa, ctx.tex0.csm, ctx.tex0.cpsm, texKey, subW, texH,
+                    rgba.data(), "inline");
                 r.putTexture(texKey, std::move(rgba), upW, upH, texPageLo, texPageHi, upFmt, upScale, upAlpha);
             }
             if (s_dcs)

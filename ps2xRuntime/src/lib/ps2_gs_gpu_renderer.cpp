@@ -9,6 +9,7 @@
 
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "runtime/ps2_gs_pgs.h"   // [pgs]
+#include "runtime/ps2x_dueldump.h"   // [dueldump] texture-sample capture (PS2X_DUELDUMP=1)
 
 #include <cstdlib>
 #include <cstdio>
@@ -4782,8 +4783,13 @@ void decPoolWorker()
         int subW = 0; std::vector<uint8_t> rgba;
         job->ras->decodeSnapshot(*job, scratch.data(), scratch.size(), subW, rgba);
         int upW = subW, upH = job->texH, upFmt = 0, upScale = 1; float upAlpha = 1.0f;
-        GSRasterizer::applyTexReplacement(scratch.data(), job->tex0, job->clut, job->clutKey, job->texa, job->texKey, subW, job->texH,
-                                          job->subDxW == 0 && !job->rawAlphaDec, rgba, upW, upH, upFmt, upScale, upAlpha);
+                GSRasterizer::applyTexReplacement(scratch.data(), job->tex0, job->clut, job->clutKey, job->texa, job->texKey, subW, job->texH,
+                                                   job->subDxW == 0 && !job->rawAlphaDec, rgba, upW, upH, upFmt, upScale, upAlpha);
+                // [dueldump] total capture: record the sample + offer the decode for a PNG
+                ps2x_dueldump::offerTextureSample(scratch.data(), job->tex0.tbp0, job->tex0.tbw, job->tex0.psm,
+                    job->tex0.tw, job->tex0.th, job->clut, job->texa.ta0, job->texa.aem, job->texa.ta1,
+                    job->tex0.cbp, job->tex0.csa, job->tex0.csm, job->tex0.cpsm, job->texKey, subW, job->texH,
+                    rgba.data(), "pool");
         job->rend->putTexture(job->texKey, std::move(rgba), upW, upH, job->pageLo, job->pageHi, upFmt, upScale, upAlpha, (int64_t)job->seq);
         g_decPool.nsDecode.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
         g_decPool.nJobs.fetch_add(1u, std::memory_order_relaxed);

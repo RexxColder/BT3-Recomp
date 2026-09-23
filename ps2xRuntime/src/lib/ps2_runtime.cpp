@@ -7381,6 +7381,171 @@ void PS2Runtime::run()
                     g_bt3StateLive.store(st, std::memory_order_relaxed);
                 }
             }
+            {   // [bt3state] Report the human-readable screen the player is in, once per transition:
+                //   [bt3state] 0x3e OPTIONS (was 0x04 MAIN_MENU)
+                //   [bt3state] 0x26 DUEL_MENU vs=1P_VS_CPU type=SINGLE dp=? (init)
+                // Names come from the retail main-menu order crossed with the reverse-engineered
+                // entry tables (menu jump table at 0x3B1100 -> per-row handler -> target state;
+                // see docs/MAIN-MENU.md). States with a '?' are provisional: verify by detonating
+                // them with PS2X_MENU_JUMP=<decimal state>.
+                // PS2X_STATE_NAMES=0 silences it.
+                static const bool s_stateNames = [](){
+                    const char *v = std::getenv("PS2X_STATE_NAMES");
+                    return !(v && v[0] && v[0] == '0');
+                }();
+                if (s_stateNames)
+                {
+                    static const auto stateName = [](uint32_t s) -> const char* {
+                        switch (s)
+                        {
+                        case 0x01u: return "BOOT";
+                        case 0x04u: return "MAIN_MENU";
+                        case 0x06u: return "LOADING";
+                        case 0x0Du: return "ULTIMATE_BATTLE";
+                        case 0x21u: return "DRAGON_WORLD_TOUR";
+                        case 0x26u: return "DUEL_MENU";
+                        case 0x27u: return "CHARACTER_SELECT";
+                        case 0x28u: return "PREFIGHT_SETUP(0x28)";
+                        case 0x29u: return "PREFIGHT_SETUP(0x29)";
+                        case 0x2Cu: return "ULTIMATE_TRAINING";
+                        case 0x2Du: return "IN_FIGHT";
+                        case 0x30u: return "EVOLUTION_Z";
+                        case 0x35u: return "DATA_CENTER";
+                        case 0x38u: return "POST_FIGHT";
+                        case 0x3Cu: return "CHARACTER_REFERENCE";
+                        case 0x3Eu: return "OPTIONS";
+                        case 0x46u: return "EXTRA(0x46)?";
+                        default:    return nullptr;
+                        }
+                    };
+                    // Duel setup sub-type (the "type inside the state"): read live from the duel
+                    // object [0x3b38e8] -- +0x110 opponent mode, +0x114 battle type, +0x118 DP limit.
+                    static const auto duelSub = [](uint32_t s, const uint8_t *rd, uint32_t &vs, uint32_t &type, uint32_t &dp) -> std::string {
+                        vs = type = dp = 0xffffffffu;
+                        if (!(s == 0x26u || s == 0x27u || s == 0x28u || s == 0x29u)) return std::string();
+                        uint32_t d = 0u;
+                        std::memcpy(&d, rd + (0x3b38e8u & PS2_RAM_MASK), 4);
+                        d &= 0x1FFFFFFFu;
+                        if (!d) return std::string(" (duelObj not up)");
+                        std::memcpy(&vs,   rd + ((d + 0x110u) & PS2_RAM_MASK), 4);
+                        std::memcpy(&type, rd + ((d + 0x114u) & PS2_RAM_MASK), 4);
+                        std::memcpy(&dp,   rd + ((d + 0x118u) & PS2_RAM_MASK), 4);
+                        // Duel decode (measured from a full capture, see dumps/duel_*):
+                        //   +0x110 vs   : 0=1P vs CPU, 1=1P vs 2P, 2=CPU vs CPU, 3=Battle Settings
+                        //   +0x114 type : 0=Single, 1=Team, 2=DP
+                        //   +0x118 dp   : DP variant when type==2 -- 0=10, 1=15, 2=20
+                        // The five combat subtypes are therefore SINGLE, TEAM, DP10, DP15, DP20.
+                        static const char *kV[4] = { "1P_VS_CPU", "1P_VS_2P", "CPU_VS_CPU", "BATTLE_SETTINGS" };
+                        static const char *kT[3] = { "SINGLE", "TEAM", "DP" };
+                        static const char *kDp[3] = { "DP10", "DP15", "DP20" };
+                        std::ostringstream o;
+                        o << " vs=";
+                        if (vs < 4u) o << kV[vs]; else o << "0x" << std::hex << vs << std::dec;
+                        o << " type=";
+                        if (type < 3u) o << kT[type]; else o << "0x" << std::hex << type << std::dec;
+                        o << " subtype=";
+                        if (type == 0u)      o << "SINGLE";
+                        else if (type == 1u) o << "TEAM";
+                        else if (type == 2u) o << (dp < 3u ? kDp[dp] : "DP") << '(' << dp << ')';
+                        else                 o << '?';
+                        o << " dp=";
+                        if (dp <= 100u) o << dp; else o << "0x" << std::hex << dp << std::dec;
+                        return o.str();
+                    };
+                    static uint32_t s_prevState = 0xffffffffu;
+                    if (const uint8_t *rd = m_memory.getRDRAM())
+                    {
+                        uint32_t p = 0u, st = 0xffffffffu;
+                        std::memcpy(&p, rd + (0x2ff10cu & PS2_RAM_MASK), 4);
+                        if (p) std::memcpy(&st, rd + (((p & 0x1FFFFFFFu) + 0x18u) & PS2_RAM_MASK), 4);
+                        if (st != 0xffffffffu && st != s_prevState)
+                        {
+                            const char *nm = stateName(st);
+                            std::ostringstream o;
+                            o << "[bt3state] 0x" << std::hex << st << std::dec << ' ' << (nm ? nm : "UNKNOWN");
+                            if (s_prevState != 0xffffffffu)
+                            {
+                                const char *pm = stateName(s_prevState);
+                                o << " (was 0x" << std::hex << s_prevState << std::dec << ' '
+                                  << (pm ? pm : "UNKNOWN") << ')';
+                            }
+                            uint32_t vs = 0u, type = 0u, dp = 0u;
+                            o << duelSub(st, rd, vs, type, dp);
+                            std::fprintf(stderr, "%s\n", o.str().c_str());
+                            s_prevState = st;
+                        }
+                    }
+                }
+            }
+            {   // [bt3cursor] Inside the main menu (0x04): report which entry the cursor is pointing at
+                // and where that entry goes, using the game's own formula (0x33643C..0x33648C):
+                //   row   = (menuObj+0x10C + menuObj+0x148 + 1) % menuObj+0x144
+                //   idx   = *(menuObj + 0x118 + 4*row)          (0..10, the jump-table index)
+                //   entry = 0x3B1100 + 4*idx                    (jump table, RAM)
+                //   handler = *(entry)                          (the per-row confirm handler)
+                // so the line is exactly the pointer/handler the game would use on confirm:
+                //   [bt3cursor] row=3 idx=3 entry=0x3B110C handler=0x3364E0 target=0x26 Duel (verified)
+                // PS2X_STATE_NAMES=0 silences it (shared switch with [bt3state]).
+                static const bool s_cursor = [](){
+                    const char *v = std::getenv("PS2X_STATE_NAMES");
+                    return !(v && v[0] && v[0] == '0');
+                }();
+                if (s_cursor)
+                {
+                    static const char *kRowName[11] = {
+                        "Dragon History?", "Ultimate Battle?", "Dragon World Tour?", "Duel (verified)",
+                        "Network Battle (hidden, no state)", "Evolution Z?", "Ultimate Training?",
+                        "Data Center?", "Character Reference?", "Options?", "Extra 0x46?" };
+                    static const uint32_t kRowState[11] = {
+                        0x06u, 0x0Du, 0x21u, 0x26u, 0xFFFFFFFFu, 0x30u, 0x2Cu, 0x35u, 0x3Cu, 0x3Eu, 0x46u };
+                    static uint32_t s_row = 0xffffffffu, s_idx = 0xffffffffu;
+                    if (const uint8_t *rd = m_memory.getRDRAM())
+                    {
+                        uint32_t p = 0u, st = 0xffffffffu;
+                        std::memcpy(&p, rd + (0x2ff10cu & PS2_RAM_MASK), 4);
+                        if (p) std::memcpy(&st, rd + (((p & 0x1FFFFFFFu) + 0x18u) & PS2_RAM_MASK), 4);
+                        if (st == 0x04u)
+                        {
+                            uint32_t mo = 0u;
+                            std::memcpy(&mo, rd + (0x3b0e80u & PS2_RAM_MASK), 4);
+                            mo &= 0x1FFFFFFFu;
+                            if (mo)
+                            {
+                                auto r32 = [&](uint32_t a) -> uint32_t {
+                                    uint32_t v = 0; std::memcpy(&v, rd + (a & PS2_RAM_MASK), 4); return v; };
+                                const uint32_t base  = r32(mo + 0x10Cu);
+                                const uint32_t cur   = r32(mo + 0x148u);
+                                const uint32_t count = r32(mo + 0x144u);
+                                if (count)
+                                {
+                                    const uint32_t row = (base + cur + 1u) % count;
+                                    const uint32_t idx = r32(mo + 0x118u + 4u * row);
+                                    if (row != s_row || idx != s_idx)
+                                    {
+                                        s_row = row; s_idx = idx;
+                                        const uint32_t entryAddr = 0x3B1100u + 4u * idx;
+                                        uint32_t handler = 0u;
+                                        if (idx < 0x100u) std::memcpy(&handler, rd + (entryAddr & PS2_RAM_MASK), 4);
+                                        std::ostringstream o;
+                                        o << "[bt3cursor] row=" << row << " idx=" << idx
+                                          << " entry=0x" << std::hex << entryAddr
+                                          << " handler=0x" << handler;
+                                        if (idx < 11u)
+                                        {
+                                            if (kRowState[idx] != 0xFFFFFFFFu)
+                                                o << " target=0x" << kRowState[idx];
+                                            o << " " << kRowName[idx];
+                                        }
+                                        o << std::dec << " sel=0x" << std::hex << (p ? r32(p + 0x2Cu) : 0u)
+                                          << std::dec;
+                                        std::fprintf(stderr, "%s\n", o.str().c_str());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             {   // [movprobe] PS2X_MOVIEPROBE=1: log the movie state block (0x00301048) and
                 // g_ps2FmvActive on every change, every heartbeat (bit3 = finished/skipped).
                 static const bool s_mp = [](){ const char *v = std::getenv("PS2X_MOVIEPROBE"); return v && v[0] && v[0] != '0'; }();
@@ -7628,7 +7793,7 @@ void PS2Runtime::run()
                                 o << std::dec;
                             }
                         }
-                        std::cerr << o.str() << std::endl;
+                        std::fprintf(stderr, "%s\n", o.str().c_str());
                     }
                 }
                 // ===================== [menuhex] Main menu state =====================

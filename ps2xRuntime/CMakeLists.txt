@@ -490,7 +490,10 @@ function(ps2x_stage_ffmpeg_runtime_dlls target_name)
 endfunction()
 
 add_library(ps2_runtime STATIC
-    src/lib/game_overrides.cpp
+src/lib/game_overrides.cpp
+src/lib/ps2x_net_menu.cpp       # [netmenu] custom New Dragon Net Menu (logic; draw lives in the runner target)
+src/lib/ps2x_dueldump.cpp       # [dueldump] total capture of the Duel menu flow
+src/lib/ps2x_duel_fields.cpp    # [duelfields] the complete Duel-setup field map + write methods
     src/lib/ps2_eeprof.cpp
     src/lib/ps2_stepcensus.cpp
     src/lib/ps2_fiber.cpp
@@ -889,6 +892,7 @@ target_link_libraries(ps2EntryRunner
 if(NOT PS2X_IS_VITA)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_settings_overlay.cpp
+        src/lib/ps2x_net_menu_draw.cpp   # [netmenu] ImGui half (must stay out of ps2_runtime)
         src/gfx/ps2x_ui.cpp          # overlay backend bridge (rlImGui or imgui_impl_dx11)
     )
     if(WIN32)

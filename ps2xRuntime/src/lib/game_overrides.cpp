@@ -44,6 +44,9 @@ extern "C" unsigned long long ps2xWinThreadCpuNs();
 #include "ps2_log.h"
 #include "runtime/pad_config.h"
 #include "runtime/ps2_memory.h"
+#include "Kernel/Stubs/MemoryCard.h"   // [savestate] getMemoryCardDebugSnapshot (deferred quickload)
+#include "runtime/ps2x_net_menu.h"     // [netmenu] custom New Dragon Net Menu page
+#include "runtime/ps2x_dueldump.h"     // [dueldump] total capture of the Duel menu flow
 #include "runtime/ps2_netplay.h"   // [netplay]
 
 // [netjump] Frames of display HOLD remaining. While non-zero, GsGpuRenderer::swapFrame() returns
@@ -444,6 +447,12 @@ namespace
     // module polls it -- it completes on a press, and no amount of variable writing substitutes
     // for that loading. One press at a state we chose and can verify, not menu navigation.
     std::atomic<int> g_netJumpPressCross{0};
+// [netmenu] frames of synthetic CROSS remaining for the custom page's direct-subtype start.
+// Same seam as the netjump's press, but NOT gated by netplay: BT3 never calls libpad, so the
+// only pad the game sees is built in writeNeutralPadPacket below.
+std::atomic<int> g_netMenuPressCross{0};
+extern "C" void ps2xNetMenuPressCross(int frames)
+{ g_netMenuPressCross.store(frames, std::memory_order_relaxed); }   // [netmenu] cross-TU setter
     // [statesync] 0 = no jump this session, 1 = jumping, 2 = settled / gave up. The state sync waits for
     // 2 on both sides: the host publishes AFTER its jump (so the joiner adopts character select), the
     // joiner adopts only once its own jump has it in the same screen (comparable call chains).
@@ -535,7 +544,14 @@ namespace
         // pad and are sent to the peer; the REMOTE player's arrive over UDP. The game reads two
         // pads and cannot tell the difference. Input sampled now is applied delay frames later,
         // so the packet has that long to cross the network.
-        if (ps2NetActive())
+        // [netmenu] synthetic CROSS for the direct-subtype start (player 1 / socket 0). Applied here
+    // and NOT inside the netplay block, so it works offline too.
+    if ((socket & 3u) == 0u && g_netMenuPressCross.load(std::memory_order_relaxed) > 0)
+    {
+        g_netMenuPressCross.fetch_sub(1, std::memory_order_relaxed);
+        b1 = static_cast<uint8_t>(b1 & ~0x40u);   // CROSS (active low), bit 14
+    }
+    if (ps2NetActive())
         {
             const uint32_t frame = static_cast<uint32_t>(g_bt3FrameCount.load(std::memory_order_relaxed));
             const int pl = static_cast<int>(socket & 3u) + 1;          // socket 0/1 -> player 1/2
@@ -5144,6 +5160,84 @@ namespace
         return true;
     }
 
+    // [menujump] PS2X_MENU_JUMP=<state>: hold the host combo (keyboard P+L, or both mouse buttons held)
+    // to "detonate" a screen transition by code instead of navigating. One-shot per press.
+    // The env value is the target top-level state, decimal (4 = main menu, 38 = versus/duel,
+    // 39 = character select, ...). Forcing it while the game is still booting bypasses the intro
+    // FMV / title / splash logos: the state is written and the game's own transition (func_10D878
+    // through bt3MenuGoto) is re-run as soon as the menu object exists.
+    extern "C" bool IsKeyDown(int key);             // raylib; KEY_P == 80, KEY_L == 76
+    extern "C" bool IsMouseButtonDown(int button);  // raylib; MOUSE_BUTTON_LEFT == 0, RIGHT == 1
+    static void bt3MenuJumpFrame(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const int s_target = [](){
+            const char *v = std::getenv("PS2X_MENU_JUMP");
+            return (v && v[0]) ? std::atoi(v) : 0;      // target top-level state (4 = main menu)
+        }();
+        static const bool s_auto = [](){
+            const char *v = std::getenv("PS2X_MENU_AUTO");
+            return v && v[0] && v[0] != '0';            // PS2X_MENU_AUTO=1: fire automatically
+        }();
+        if (s_target <= 0 || !rdram || !ctx || !runtime) return;
+
+        const uint32_t stateObj = rd32(rdram, 0x2ff10cu) & 0x1FFFFFFFu;
+        if (!stateObj) return;
+        const uint32_t cur     = rd32(rdram, stateObj + 0x18u);
+        const uint32_t menuObj = rd32(rdram, 0x3b0e80u) & 0x1FFFFFFFu;
+        const uint64_t fr      = g_bt3FrameCount.load(std::memory_order_relaxed);
+        // Boot markers: intro timer (*(*(0x3b0eb8)+0xc4) counts to 0x708) and the splash gate.
+        uint32_t introT = 0u;
+        if (const uint32_t ivp = rd32(rdram, 0x3b0eb8u) & 0x1FFFFFFFu)
+            introT = rd32(rdram, (ivp + 0xc4u) & 0x1FFFFFFFu);
+
+        // [menujump-diag] heartbeat: shows the boot flow (top-level state + whether the main-menu
+        // object exists yet) so a long boot is visibly alive and we can see the exact moment the
+        // menu comes up. Every 2 s.
+        static uint64_t s_lastLog = ~0ull;
+        if (fr != s_lastLog && (fr % 120u) == 0u)
+        {
+            s_lastLog = fr;
+            std::fprintf(stderr, "[menujump] frame=%llu cur=0x%02x menuObj=0x%x introT=%u/1800 target=0x%02x\n",
+                         (unsigned long long)fr, cur, menuObj, introT, s_target);
+        }
+
+        const char *why = nullptr;
+        if (s_auto)
+        {
+            // The main-menu object [0x3b0e80] exists ONLY while the main menu is displayed: the
+            // game frees it when leaving 0x04 (see the netjump notes below). So the primitive can
+            // only fire from 0x04 with the object alive -- exactly the state PS2X_NET_JUMP uses.
+            // Forcing a state before that (e.g. during boot) writes a value nobody reads and the
+            // menu is never built (measured: 0x01 -> 0x04 flips the state, menuObj stays 0).
+            static bool s_fired = false;
+            if (!s_fired && cur == 0x04u && menuObj)
+            {
+                s_fired = true;
+                std::fprintf(stderr, "[menujump] AUTO-VALIDATE: main menu up (menuObj=0x%x introT=%u fr=%llu) -> 0x%02x\n",
+                             menuObj, introT, (unsigned long long)fr, s_target);
+                why = "AUTO-VALIDATE(0x04)";
+            }
+        }
+        else
+        {
+            const bool kb = IsKeyDown(80) && IsKeyDown(76);
+            const bool ms = IsMouseButtonDown(0) && IsMouseButtonDown(1);
+            static bool s_armed = false;
+            if (!(kb || ms)) { s_armed = false; }
+            else if (!s_armed) { s_armed = true; why = "COMBO"; }
+        }
+        if (!why) return;
+
+        std::fprintf(stderr, "[menujump] %s: target=0x%02x cur=0x%02x menuObj=0x%x introT=%u fr=%llu\n",
+                     why, s_target, cur, menuObj, introT, (unsigned long long)fr);
+        if (!menuObj)
+        {   // no menu object: nothing to drive (forcing the state would be a no-op)
+            std::fprintf(stderr, "[menujump] no menuObj (cur=0x%02x) -- primitive needs the menu up\n", cur);
+            return;
+        }
+        bt3MenuGoto(rdram, ctx, runtime, (uint32_t)s_target);
+    }
+
     static void bt3NetJumpCharSelect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         // PS2X_NET_JUMP=1  go via the versus menu (0x04 -> 0x26 -> 0x27), the path the game
@@ -5518,8 +5612,91 @@ namespace
             {
                 const char *c = std::strchr(s_save, ':');
                 const unsigned long long at = std::strtoull(s_save, nullptr, 10);
-                if (c && g_bt3FrameCount.load(std::memory_order_relaxed) >= at) { s_saved = true; bt3SaveState(c + 1, rdram, ctx, runtime); }
-            }
+                    if (c && g_bt3FrameCount.load(std::memory_order_relaxed) >= at) { s_saved = true; bt3SaveState(c + 1, rdram, ctx, runtime); }
+                }
+                // [savestate] hotkeys: F6 = quicksave, F7 = quickload. Edge-triggered (one action
+                // per press), same file for both. PS2X_SAVESTATE_PATH overrides it; default is the
+                // deploy's savedata folder. This is what lets the intro be skipped: boot, F6 once
+                // the menu is up, then on a later run press F7 (or leave PS2X_LOADSTATE set) and
+                // the snapshot's frame counter jumps the host straight past the FMV/title.
+                {
+                    // [savestate] quick keys (F6 quicksave / F7 quickload / PS2X_QUICK*_AT) are OFF
+                    // by default now; PS2X_QUICKSAVE=1 turns them back on. The env-driven
+                    // PS2X_SAVESTATE / PS2X_LOADSTATE path above is untouched.
+                    static const bool s_quickKeys = [](){
+                        const char *v = std::getenv("PS2X_QUICKSAVE");
+                        return v && v[0] && v[0] != '0';
+                    }();
+                    if (s_quickKeys)
+                    {
+                    static const char *s_slot = [](){
+                        const char *v = std::getenv("PS2X_SAVESTATE_PATH");
+                        return (v && v[0]) ? v : "savedata/bt3-quicksave.sst";
+                    }();
+                    // [savestate] deferred quickload: never load while the game is still opening
+                    // memory cards / bringing the IOP up. A frame-30 load restored the whole
+                    // IOP/EE/VU image into a process whose own init had not run yet: the sound
+                    // system came up silent (measured: "no BGM after 12s"). A quickload requested
+                    // before the memcard boot phase finishes is therefore DEFERRED until it does.
+                    static bool s_qlPending = false;
+                    const auto mcReady = []() -> bool {
+                        const ps2_stubs::MemoryCardDebugSnapshot mc = ps2_stubs::getMemoryCardDebugSnapshot();
+                        return mc.lastCmd != 0 && mc.openFiles.empty();
+                    };
+                    const auto doLoad = [&](const char *why){
+                        const uint64_t now = g_bt3FrameCount.load(std::memory_order_relaxed);
+                        std::fprintf(stderr, "[savestate] %s load <- %s (frame %llu, snapshot frame %llu)\n",
+                                     why, s_slot, (unsigned long long)now,
+                                     (unsigned long long)bt3PeekStateFrame(s_slot));
+                        bt3LoadState(s_slot, rdram, ctx, runtime);
+                    };
+                    const auto requestLoad = [&](const char *why){
+                        if (mcReady()) doLoad(why);
+                        else if (!s_qlPending)
+                        {
+                            s_qlPending = true;
+                            std::fprintf(stderr, "[savestate] %s load deferred until the memcard boot phase is done\n", why);
+                        }
+                    };
+                    if (s_qlPending && mcReady()) { s_qlPending = false; doLoad("deferred"); }
+                    static bool s_f6 = false, s_f7 = false;
+                    const bool f6 = IsKeyDown(295), f7 = IsKeyDown(296);
+                    if (f6 && !s_f6)
+                    {
+                        std::fprintf(stderr, "[savestate] F6 quicksave -> %s (frame %llu)\n",
+                                     s_slot, (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed));
+                        bt3SaveState(s_slot, rdram, ctx, runtime);
+                    }
+                    s_f6 = f6;
+                    if (f7 && !s_f7) requestLoad("F7");
+                    s_f7 = f7;
+                    // PS2X_QUICKLOAD_AT=<frame> / PS2X_QUICKSAVE_AT=<frame>: fire the same action
+                    // once, automatically, at that frame. This is the reproducible way to "force F7"
+                    // (e.g. PS2X_QUICKLOAD_AT=30 to slam a menu snapshot into a fresh boot and see
+                    // whether the intro is skipped or the mirrored host stack breaks).
+                    static const long s_qlAt = [](){ const char *v = std::getenv("PS2X_QUICKLOAD_AT");
+                        return (v && v[0]) ? std::atol(v) : -1L; }();
+                    static const long s_qsAt = [](){ const char *v = std::getenv("PS2X_QUICKSAVE_AT");
+                        return (v && v[0]) ? std::atol(v) : -1L; }();
+                    static bool s_qlDone = false, s_qsDone = false;
+                    const uint64_t frNow = g_bt3FrameCount.load(std::memory_order_relaxed);
+                    if (!s_qsDone && s_qsAt >= 0 && frNow >= (uint64_t)s_qsAt)
+                    {
+                        s_qsDone = true;
+                        std::fprintf(stderr, "[savestate] QUICKSAVE_AT frame %llu -> %s\n",
+                                     (unsigned long long)frNow, s_slot);
+                        bt3SaveState(s_slot, rdram, ctx, runtime);
+                    }
+                    if (!s_qlDone && s_qlAt >= 0 && frNow >= (uint64_t)s_qlAt)
+                    {
+                        s_qlDone = true;
+                        std::fprintf(stderr, "[savestate] QUICKLOAD_AT frame %llu <- %s (snapshot frame %llu)\n",
+                                     (unsigned long long)frNow, s_slot,
+                                     (unsigned long long)bt3PeekStateFrame(s_slot));
+                        requestLoad("QUICKLOAD_AT");
+                    }
+                    }   // [savestate] s_quickKeys
+                }
         }
         bt3StateWatch(rdram, ctx);   // [statewatch]
         bt3MatchWatch(rdram);        // [matchwatch]
@@ -5528,6 +5705,21 @@ namespace
         bt3MemBlock(rdram);          // [memblock]
         bt3DumpKey(rdram);           // [dumpkey]
         bt3NetJumpCharSelect(rdram, ctx, runtime); // [netjump]
+        bt3MenuJumpFrame(rdram, ctx, runtime);     // [menujump] PS2X_MENU_JUMP + P+L / LMB+RMB combo
+        {   // [netmenu] PS2X_NET_MENU=1: custom "New Dragon Net Menu" page on the hidden Network
+            // row of the retail main menu. The hook hands the module the game's own go-to-screen
+            // (bt3MenuGoto) so its return can use the real transition, with a forced-state fallback.
+            static const bool s_netMenuHooked = [](){
+                ps2x_net_menu::setMenuGotoHook(
+                    [](uint8_t *rd, R5900Context *c, PS2Runtime *r, uint32_t target) {
+                        return bt3MenuGoto(rd, c, r, target);
+                    });
+                return true;
+            }();
+            (void)s_netMenuHooked;
+            ps2x_net_menu::tick(rdram, ctx, runtime);
+        }
+        ps2x_dueldump::tick(rdram, runtime);   // [dueldump] PS2X_DUELDUMP=1
         ps2NetInit();   // [netplay] no-op unless PS2X_NET / PS2X_NET_LISTEN is set
         ps2NetFrame(static_cast<uint32_t>(g_bt3FrameCount.load(std::memory_order_relaxed)));
         ps2DetHashFrame(rdram, ctx->vu0_r);   // [dethash]
