@@ -54,7 +54,11 @@ int main()
     check(!existed, "load() reporta que no habia archivo");
     check(std::filesystem::exists(tomlPath), "settings.toml creado");
     check(s.master == 1.0f && s.music == 1.0f, "defaults de audio");
+#if defined(_WIN32)
     check(s.renderer == ps2x_settings::kRendererOpenGL, "renderer por defecto en Windows");
+#else
+    check(s.renderer == ps2x_settings::kRendererParallelGS, "renderer por defecto fuera de Windows");
+#endif
 
     std::printf("[2] round-trip de valores no default\n");
     {

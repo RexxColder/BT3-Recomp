@@ -179,6 +179,10 @@ namespace hw
 
     double benchSingleThreadR()
     {
+        // The volatile sink is what stops the loop from being optimized away; a plain
+        // uint64 would let the compiler hoist the whole multiply chain out of the
+        // timed loop, and -Wvolatile rejects the compound assignment (deprecated in
+        // C++20, so -Wextra warns on gcc/clang).
         volatile std::uint64_t sink = 0;
         std::uint64_t x = 0x9E3779B97F4A7C15ull;
         constexpr int N = 30000000;
@@ -186,14 +190,14 @@ namespace hw
         {
             x = x * 6364136223846793005ull + 1442695040888963407ull;
             x ^= x >> 33;
-            sink += x;
+            sink = sink + x;
         }
         const auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < N; ++i)
         {
             x = x * 6364136223846793005ull + 1442695040888963407ull;
             x ^= x >> 33;
-            sink += x;
+            sink = sink + x;
         }
         const auto t1 = std::chrono::steady_clock::now();
         (void)sink;
