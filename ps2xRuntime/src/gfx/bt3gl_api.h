@@ -16,6 +16,7 @@ using bt3Image = Image;
 using bt3Texture2D = Texture2D;
 using bt3RenderTexture2D = RenderTexture2D;
 using bt3Music = Music;
+using bt3Sound = Sound;          // [netsfx] UI sound effects for the Dragon Net menu
 using bt3AudioStream = AudioStream;
 using bt3Color = Color;          // [netmenu2d] the custom Dragon Net menu
 using bt3Font = Font;            // [netmenu2d]

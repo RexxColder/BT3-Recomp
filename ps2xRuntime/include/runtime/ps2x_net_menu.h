@@ -53,6 +53,8 @@ namespace ps2x_net_menu
 // [netmenu] Black level for the GS background: the normal fade during entry, 1.0 (total black, no
 // fade) after the exit press until the main menu returns.
 float blackLevel();
+// [netmenu2d] True during the 1.2 s entry lock: the custom menu must ignore input then.
+bool isEntryLocked();
 
     // Preload: the page's own resources (the icon, via raylib/GL) are loaded while the retail
     // main menu is up, hidden from the user, and on the RENDER thread: tick() only raises the

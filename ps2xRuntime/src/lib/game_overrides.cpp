@@ -491,6 +491,16 @@ extern "C" void ps2xNetEntrySetActive(int on)
 extern "C" int ps2xNetEntryActive()
 { return g_netEntryActive.load(std::memory_order_relaxed); }
 
+// [netmenu] Drive the game's OWN SE playback from the host menu (no decoded WAVs).
+// The guest-side sePlay() needs rdram + runtime; bt3FrameKick() stashes them every frame.
+uint8_t *g_ps2xMenuRdram = nullptr;
+PS2Runtime *g_ps2xMenuRuntime = nullptr;
+// While the net entry freezes the game audio (sfx volume 0), keep the reserved SE stream audible
+// so the menu's effects play through the game's own mixer. Read by PS2AudioBackend.
+std::atomic<int> g_ps2xSeMenuBypass{0};
+extern "C" void ps2xSeMenuBypass(int on) { g_ps2xSeMenuBypass.store(on ? 1 : 0, std::memory_order_relaxed); }
+extern "C" int ps2xSeMenuBypassGet() { return g_ps2xSeMenuBypass.load(std::memory_order_relaxed); }
+
 std::atomic<int> g_netServeSwapActive{0};
 std::atomic<uint64_t> g_netServeSwapSlot{0};
 std::shared_ptr<std::vector<uint8_t>> g_netServeSwapData;
@@ -5728,6 +5738,9 @@ namespace
     extern "C" bool ps2xRenderSkipOn();                                                       // [rollback] ps2_memory.cpp
     void bt3FrameKick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00100ab8
     {
+        // [netmenu] stash the pointers so the host menu can call sePlay() (the game's own SE).
+        g_ps2xMenuRdram = rdram;
+        g_ps2xMenuRuntime = runtime;
         // Keep the SE stream fed from the active voices. Effects are produced incrementally so
         // a stop-by-serial can cut a voice's tail; without a per-frame top-up a long effect
         // would only advance when the next SE command happened to arrive.
@@ -7174,4 +7187,25 @@ namespace
     }
     PS2_REGISTER_GAME_OVERRIDE("BT3 NULL packet-list guard", "SLUS_216.78", 0u, 0u, &applyBt3NullPacketGuard);
     PS2_REGISTER_GAME_OVERRIDE("BT3 CD read-state edge guard", "SLUS_216.78", 0u, 0u, &applyBt3CdStateEdge);
+}
+
+// [netmenu] Play one of the game's OWN SEs (system bank A) from the host menu -- no decoded WAVs.
+// bank: a single-slot bitmask (1 = bank A, the 8-sample system set with cursor/confirm/popup).
+// Returns 1 if the bank was captured and a voice was queued, 0 otherwise (so the caller can warn).
+extern "C" int ps2xMenuSePlay(int bank, int idx)
+{
+    if (!g_ps2xMenuRdram || !g_ps2xMenuRuntime) return 0;
+    const uint32_t b = (bank > 0) ? (uint32_t)bank : 1u;
+    if (b == 0u || (b & (b - 1u)) != 0u) return 0;
+    const uint32_t slot = (uint32_t)__builtin_ctz(b);
+    {
+        std::lock_guard<std::mutex> lk(g_seBlobM);
+        if (slot >= kSeSlots || g_seSlot[slot].hdr.empty() || g_seSlot[slot].blob.empty())
+            return 0;
+    }
+    static std::atomic<uint32_t> s_serial{0x9000u};
+    // vol 100/127, pan centre: the exact path the guest uses (sePlay -> a voice into the SE stream).
+    sePlay(g_ps2xMenuRdram, g_ps2xMenuRuntime, b, (uint32_t)(idx < 0 ? 0 : idx), 100u, 64u,
+           s_serial.fetch_add(1u, std::memory_order_relaxed));
+    return 1;
 }

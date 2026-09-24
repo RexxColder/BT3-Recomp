@@ -18,6 +18,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+
+// [netmenu] game_overrides.cpp: keep the game's SE stream audible while the audio is frozen.
+extern "C" void ps2xSeMenuBypass(int on);
 #include <system_error>
 
 extern std::atomic<uint64_t> g_bt3FrameCount;   // defined in game_overrides.cpp (global scope)
@@ -29,6 +32,7 @@ extern "C" void ps2xNetServeSwapOff();
 extern "C" void ps2xNetServeMuteSlots(const char *csv);   // [netmenu] silence other BGM slots
 extern "C" void ps2xNetEntrySetActive(int on);   // [netmenu] slot-read trace gate
 extern "C" void ps2xNetTexDumpOnce(void);        // [netmenu] force-decode QRS textures (env-gated)
+namespace ps2x_net_menu2d { bool atBase(); bool triangleConsumed(); }   // [netmenu2d] base screen? Triangle consumed?
 
 namespace
 {
@@ -122,6 +126,7 @@ namespace
         // the audio files.
         PS2AudioBackend::setMusicVolume(0.0f);
         PS2AudioBackend::setSfxVolume(0.0f);
+        ps2xSeMenuBypass(1);   // [netmenu] keep the game's SE stream (0xF0) audible for our menu
         s_audioFrozen = true;
         std::fprintf(stderr, "[netmenu] BGM+voices muted (master=%.2f music=%.2f sfx=%.2f saved)\n",
                      s_savedMaster, s_savedMusic, s_savedSfx);
@@ -129,6 +134,7 @@ namespace
     void thawAudio()
     {
         if (!s_audioFrozen) return;
+        ps2xSeMenuBypass(0);
         PS2AudioBackend::setMasterVolume(s_savedMaster);
         PS2AudioBackend::setMusicVolume(s_savedMusic);
         PS2AudioBackend::setSfxVolume(s_savedSfx);
@@ -572,6 +578,9 @@ namespace ps2x_net_menu
     {
         return s_enterLockMs != 0 && hostNowMs() < s_enterLockMs;
     }
+    // [netmenu2d] Public: the custom menu must ignore input while the entry lock is up, or the very
+    // Cross that entered netplay also opens a popup on the first frame.
+    bool isEntryLocked() { return enterLocked(); }
 
     void open()
     {
@@ -891,7 +900,9 @@ namespace ps2x_net_menu
                     // Circle closed the page, then a manual Triangle ran the game's transition.
                     // The page reads the PHYSICAL pad, so the gate does not stop it: honour the
                     // entry lock here too, or a Triangle right after X exits immediately.
-                    if (triangleEdge && !enterLocked())
+                    // [netmenu2d] Triangle is the hierarchical back: only exit the net entry when the
+                    // custom menu is on its BASE screen (no popup open); otherwise the menu consumes it.
+                    if (triangleEdge && !enterLocked() && ps2x_net_menu2d::atBase() && !ps2x_net_menu2d::triangleConsumed())
                     {
                         std::fprintf(stderr, "[netmenu] hosted: (Triangle) -> TOTAL black + game's own back\n");
                         ps2xNetMenuPress(kPadTriangle, 3);

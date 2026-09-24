@@ -45,6 +45,8 @@ namespace ps2tex
 
     // [texui] Pack status for the launcher/overlay "Texture Replacement" popup.
     size_t replacementsCount();       // files actually indexed (0 = no pack)
+    // [texui] Button layout preference: 0 = PS2 (Original Buttons), 1 = Xbox (Xbox Layout).
+    int packButtonLayout();
     const char *replacementsRoot();   // indexed root directory ("" if none)
     bool replacementsHave3D();        // true = full pack (Characters/Body present); false = 2D-only Lite
 
@@ -94,4 +96,7 @@ namespace ps2tex
                     const uint8_t *origRgba, int ow, int oh,
                     const uint8_t *repRgba, int rw, int rh, int rfmt);
 }
+// [texui] extern "C" accessor for the runner (menu2d button icons).
+extern "C" int ps2xPackButtonLayout();
+
 #endif

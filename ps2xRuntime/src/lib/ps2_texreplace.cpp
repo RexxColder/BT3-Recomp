@@ -196,21 +196,6 @@ namespace
         return a ^ (b << 1) ^ (b >> 63);
     }
 
-    // [texui] Button layout preference: 0 = PS2 (Original Buttons), 1 = Xbox (Xbox Layout). Read from
-    // savedata/settings.toml [video] button_layout (default Xbox, matching the packs' replacements/
-    // Buttons). PS2X_BUTTONS=ps2|xbox overrides for A/B.
-    int packButtonLayout()
-    {
-        if (const char *v = std::getenv("PS2X_BUTTONS"); v && v[0])
-            return (v[0] == '0' || v[0] == 'p' || v[0] == 'P') ? 0 : 1;
-        const char *xd = ps2xExeDirC();
-        std::ifstream f(std::string((xd && xd[0]) ? xd : ".") + "/savedata/settings.toml");
-        if (!f.is_open()) return 1;
-        ps2x_toml::Document doc;
-        doc.parse(f);
-        return doc.getI("video.button_layout", 1);
-    }
-
     void buildIndex()
     {
         namespace fs = std::filesystem;
@@ -290,6 +275,21 @@ namespace
                                  "in there (any nesting; the folder is searched recursively) and "
                                  "enable Texture Replacement in the overlay\n", dir);
     }
+}
+
+// [texui] Button layout preference: 0 = PS2 (Original Buttons), 1 = Xbox (Xbox Layout). Read from
+// savedata/settings.toml [video] button_layout (default Xbox, matching the packs' replacements/
+// Buttons). PS2X_BUTTONS=ps2|xbox overrides for A/B.
+int packButtonLayout()
+{
+    if (const char *v = std::getenv("PS2X_BUTTONS"); v && v[0])
+        return (v[0] == '0' || v[0] == 'p' || v[0] == 'P') ? 0 : 1;
+    const char *xd = ps2xExeDirC();
+    std::ifstream f(std::string((xd && xd[0]) ? xd : ".") + "/savedata/settings.toml");
+    if (!f.is_open()) return 1;
+    ps2x_toml::Document doc;
+    doc.parse(f);
+    return doc.getI("video.button_layout", 1);
 }
 
 bool replacementsEnabled()
@@ -713,3 +713,7 @@ void megaLookup(const TexIdent &id, uint64_t texKey, uint32_t tbp0, uint32_t tbw
     }
 }
 }
+
+// [texui] extern "C" accessor so the runner (menu2d) can read the button layout: the
+// real function lives in the file-local anonymous namespace above.
+extern "C" int ps2xPackButtonLayout() { return ps2tex::packButtonLayout(); }
