@@ -897,6 +897,8 @@ if(NOT PS2X_IS_VITA)
         src/lib/ps2_settings_overlay.cpp
         src/lib/ps2x_net_menu_draw.cpp   # [netmenu] ImGui half (must stay out of ps2_runtime)
 src/lib/ps2x_net_gs.cpp          # [netmenu] GS-level sprite injection (rlgl immediate)
+src/lib/ps2x_net_music.cpp       # [netmenu] host-side looping music for the net entry
+src/lib/ps2x_net_menu2d.cpp      # [netmenu2d] custom Dragon Net menu, raylib 2D (no ImGui)
         src/gfx/ps2x_ui.cpp          # overlay backend bridge (rlImGui or imgui_impl_dx11)
     )
     if(WIN32)

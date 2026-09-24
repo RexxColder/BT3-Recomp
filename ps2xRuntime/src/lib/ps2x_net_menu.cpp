@@ -488,7 +488,9 @@ namespace ps2x_net_menu
     float fadeLevel() { return s_fade; }
     // [netmenu] The black level the GS background should draw: the normal fade during entry, a
     // hard 1.0 (total black, no fade) after the exit press until the main menu returns.
-    float blackLevel() { return s_exitBlack ? 1.0f : s_fade; }
+    // [netmenu] The fade sits ON TOP of our menu: on entry it goes 1 -> 0 (revealing the menu),
+    // on exit it hard-cuts to 1 (total black).
+    float blackLevel() { return s_exitBlack ? 1.0f : (1.0f - s_fade); }
     ReturnStatus returnStatus() { return s_ret; }
     void setMenuGotoHook(MenuGotoFn fn) { s_gotoHook = fn; }
     bool menuGoto(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t targetState)

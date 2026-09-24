@@ -39,6 +39,10 @@ namespace ps2x_net_gs
 
         // The rlgl immediate path here is in WINDOW pixels (no GS mvp on our injection), so cover
         // the whole window, not the 640x448 logical space.
+        // IMPORTANT: flush the pending raylib 2D batch (our menu's Draw*) first. Mixing an immediate
+        // rlBegin/rlEnd with queued batched geometry left the previous texture (the font atlas)
+        // bound, so this quad sampled the atlas -- the glyph grid all over the screen.
+        bt3rlDrawRenderBatchActive();
         bt3rlSetTexture(0);
         rect(0.0f, 0.0f, (float)bt3GetScreenWidth(), (float)bt3GetScreenHeight(),
              0, 0, 0, (unsigned char)(black * 255.0f + 0.5f));

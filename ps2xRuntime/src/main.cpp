@@ -12,6 +12,8 @@ extern "C" void ps2xWinHostInfo();             // ps2_win_timer.cpp: [host] cpu 
 #include "ps2_settings_overlay.h"
 #include "runtime/ps2x_net_menu.h"   // [netmenu] custom New Dragon Net Menu page
 namespace ps2x_net_gs { void draw(); }   // [netmenu] GS-level sprite injection (ps2x_net_gs.cpp)
+namespace ps2x_net_music { void tick(); }   // [netmenu] host music loop (ps2x_net_music.cpp)
+namespace ps2x_net_menu2d { void draw(); void tick(); }   // [netmenu2d] custom menu (raylib 2D)
 #endif
 
 #ifdef _DEBUG
@@ -685,7 +687,10 @@ int main(int argc, char *argv[])
             [](PS2Runtime &rt, void *userData)
             {
                 static_cast<PS2SettingsOverlay *>(userData)->draw(rt);
-                ps2x_net_gs::draw();     // [netmenu] GS background black (entry fade / instant on exit)
+                ps2x_net_music::tick();  // [netmenu] loop our music while the net entry is up
+                ps2x_net_menu2d::tick(); // [netmenu2d] entry navigation (physical pad)
+                ps2x_net_menu2d::draw(); // [netmenu2d] the custom menu: above the game, below the fade
+                ps2x_net_gs::draw();     // [netmenu] the fade/black ON TOP of both (entry fade / exit black)
                 // ps2x_net_menu::draw();   // ImGui page stays off (GS-only)
             },
             [](PS2Runtime &rt, void *userData)

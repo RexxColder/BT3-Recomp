@@ -69,7 +69,7 @@ public:
         bool operator==(const Settings &o) const;
     };
 
-    static bool isWidescreen() { return s_widescreen; }
+    static bool isWidescreen() { return true; }   // [netmenu] forced ON for the whole game (no env)
     static int getLogLevel() { return s_logLevel; }
     static int getStartupLogLevel() { return s_startupLogLevel; }
 
