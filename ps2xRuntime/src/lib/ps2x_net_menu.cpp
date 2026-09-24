@@ -648,7 +648,7 @@ namespace ps2x_net_menu
     // [netmenu] Arm the serve-swap right now (called from the patched row, before the transition).
     void armServeSwap()
     {
-        s_enterLockMs = hostNowMs() + 1200;   // 1.2 s from the 0x04 entry: the pad stays dead
+        s_enterLockMs = hostNowMs() + 1400;   // 1.4 s from the 0x04 entry: the pad stays dead
         static bool s_muteArmed = false;
         if (!s_muteArmed)
         {
