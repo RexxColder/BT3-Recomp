@@ -5,7 +5,8 @@
 // nested Filters popup, each with a clear way out (the "Volver" link + Circle, and Triangle as the
 // hierarchical back: popup -> base -> exit the net entry).
 //
-// Assets: mods/DragonNet/menu/*.png, font: assets/fonts/RussoOne-Regular.ttf
+// Assets: assets/DragonNet/menu/*.png and assets/DragonNet/buttons/{ps,xbox}/*.png,
+// font: assets/fonts/RussoOne-Regular.ttf
 #include "runtime/ps2x_net_menu.h"
 #include "runtime/pad_config.h"          // ps2xLivePadButtons (the physical pad)
 #include "runtime/ps2_texreplace.h"      // packButtonLayout() (PS2 vs Xbox icons)
@@ -47,7 +48,7 @@ namespace
 
     bt3Texture2D loadTex(const char *name)
     {
-        const std::string p = std::string("mods/DragonNet/menu/") + name;
+        const std::string p = std::string("assets/DragonNet/menu/") + name;
         const bt3Image img = bt3LoadImage(p.c_str());
         if (img.data == nullptr) { std::fprintf(stderr, "[netmenu2d] missing %s\n", p.c_str()); return bt3Texture2D{}; }
         bt3Texture2D t = bt3LoadTextureFromImage(img);
@@ -67,7 +68,7 @@ namespace
 
     bt3Texture2D loadBtn(const char *file)
     {
-        const std::string p = std::string("mods/DragonNet/buttons/")
+        const std::string p = std::string("assets/DragonNet/buttons/")
                             + (isXboxButtons() ? "xbox/" : "ps/") + file + ".png";
         const bt3Image img = bt3LoadImage(p.c_str());
         if (img.data == nullptr) { std::fprintf(stderr, "[netmenu2d] missing %s\n", p.c_str()); return bt3Texture2D{}; }

@@ -4,7 +4,7 @@
 // (an MP3/WAV/OGG via raylib's own audio device) in a loop, and stops when the entry ends. The
 // render-thread draw callback ticks it once per frame.
 //
-// Env: PS2X_NETMENU_MUSIC=<path> (default mods/DragonNet/music/netmenu.mp3)
+// Env: PS2X_NETMENU_MUSIC=<path> (default assets/DragonNet/music/netmenu.mp3)
 //      PS2X_NETMENU_MUSIC_VOL=<0..1> (default 0.7)
 //
 // Compiled into ps2EntryRunner only.
@@ -20,7 +20,7 @@ namespace
 {
     std::string s_path = []() {
         const char *v = std::getenv("PS2X_NETMENU_MUSIC");
-        return std::string((v && v[0]) ? v : "mods/DragonNet/music/netmenu.mp3");
+        return std::string((v && v[0]) ? v : "assets/DragonNet/music/netmenu.mp3");
     }();
     const float s_vol = []() {
         const char *v = std::getenv("PS2X_NETMENU_MUSIC_VOL");

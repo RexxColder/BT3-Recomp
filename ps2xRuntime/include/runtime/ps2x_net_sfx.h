@@ -1,10 +1,10 @@
 // [netsfx] UI sound effects for the custom Dragon Net menu.
 //
-// Reuses the game's REAL menu SEs, decoded from data/DATA/PZS3US1/SE_System.pak (Sony SGB sound
-// bank -> SPU-ADPCM) and stored as WAV in mods/DragonNet/sfx/. Played through raylib's audio device
-// (the same one ps2x_net_music uses). Loaded lazily on the first play.
+// Plays the GAME'S OWN menu SEs through its own SE engine (game_overrides.cpp ps2xMenuSePlay ->
+// sePlay, system bank A). No decoded WAVs and no separate audio device: the effects are decoded by
+// the runtime and mixed into the game's SE stream. See ps2x_net_sfx.cpp.
 //
-// Env: PS2X_NETMENU_SFX=0 disables all menu SFX; PS2X_NETMENU_SFX_VOL=<0..1> (default 0.8).
+// Env: PS2X_NETMENU_SFX=0 disables the menu SFX.
 //
 // Compiled into ps2EntryRunner only.
 #pragma once

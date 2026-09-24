@@ -104,7 +104,7 @@ game's **own** UI sound effects (no extracted WAVs).
 - `ps2x_net_music.cpp` uses **raylib** audio (`InitAudioDevice` + `LoadMusicStream`,
   `Music.looping = true`, `UpdateMusicStream` per frame). It loops while the entry is active and stops
   when it ends.
-  - `PS2X_NETMENU_MUSIC=<path>` (default `mods/DragonNet/music/netmenu.mp3`)
+  - `PS2X_NETMENU_MUSIC=<path>` (default `assets/DragonNet/music/netmenu.mp3`)
   - `PS2X_NETMENU_MUSIC_VOL=<0..1>` (default 0.5)
 
 ### 4.3 UI sound effects — the game's own SE engine (no WAVs)
@@ -206,10 +206,28 @@ The data is **mock** (there is no backend): the line "Backend in development" is
 ### Button icons
 From the pack **`D:\4K 2D Textures Lite.7z`** → `Original Buttons\Buttons\*.dds` (PS2) and
 `Xbox Layout\Buttons\*.dds` (Xbox), converted to PNG with ffmpeg and copied to
-`mods/DragonNet/buttons/{ps,xbox}/`. The layout is read with `ps2tex::packButtonLayout()`
+`assets/DragonNet/buttons/{ps,xbox}/`. The layout is read with `ps2tex::packButtonLayout()`
 (0 = PS2, 1 = Xbox) from `savedata/settings.toml [video] button_layout`.
 
 **Mapping applied**: `✕ = A`, `○ = B`, `□ = X`, `△ = Y` (+ L1/LB, L2/LT, R2/RT available).
+
+### Assets
+
+All menu runtime files live under **`assets/DragonNet/`** (plus the font already in `assets/fonts/`).
+They are opened **relative to the working directory** (the launcher runs with `-WorkingDirectory
+<deploy>`); the build stages the repo's `assets/` next to the executable.
+
+| Path | Used for |
+|---|---|
+| `assets/fonts/RussoOne-Regular.ttf` | menu font |
+| `assets/DragonNet/menu/*.png` | background (Namek), clouds, ship, Frieza, badge |
+| `assets/DragonNet/buttons/{ps,xbox}/*.png` | button icons (layout from `savedata/settings.toml`) |
+| `assets/DragonNet/music/netmenu.mp3` | looping BGM |
+| `assets/DragonNet/*.ps2.pak`, `silence.adx` | optional AFS serve-swap data (`PS2X_NETMENU_SWAP_FILE`) |
+| `assets/DragonNet/textures/*.png`, `sfx/` | F3 / experiments (not used by the menu itself) |
+
+The **UI sound effects are not an asset**: they come from the game's own data
+(`data/DATA/PZS3US1/SE_System.pak`) decoded at runtime (see §4.3).
 
 ---
 
