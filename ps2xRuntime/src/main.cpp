@@ -10,6 +10,7 @@ extern "C" void ps2xWinHostInfo();             // ps2_win_timer.cpp: [host] cpu 
 #include "games_database.h"
 #if !defined(PLATFORM_VITA)
 #include "ps2_settings_overlay.h"
+#include "frontend/fe_app.h"          // [frontend] in-runtime front-end (replaces the Qt launcher)
 #include "runtime/ps2x_net_menu.h"   // [netmenu] custom New Dragon Net Menu page
 namespace ps2x_net_gs { void draw(); }   // [netmenu] GS-level sprite injection (ps2x_net_gs.cpp)
 namespace ps2x_net_music { void tick(); }   // [netmenu] host music loop (ps2x_net_music.cpp)
@@ -31,6 +32,9 @@ namespace ps2x_net_menu2d { void draw(); void tick(); }   // [netmenu2d] custom 
 #include <algorithm>
 #include <cstdlib>
 #include <csignal>
+#if defined(_WIN32)
+#include <windows.h>   // GetModuleFileNameW: the real exe dir (there is no /proc/self/exe on Windows)
+#endif
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
@@ -87,19 +91,32 @@ namespace
 
     // [deploy] Resolve the directory of the running executable (via /proc/self/exe so
     // argv[0] and CWD cannot steer it). The settings overlay anchors its savedata/,
-    // assets/, fonts and settings.toml off this directory, so a launcher can be
+    // assets/, fonts and settings.toml off this directory, so the runner can be
     // double-clicked from any CWD and still find its portable files (same convention as
     // the previous single-binary deploy: <exeDir>/savedata/settings.toml).
     std::filesystem::path getExecutableDirectory()
     {
-        // [deploy] A self-extracting launcher stashes this runner in cache but its
-        // portable files (savedata/, assets/, data/) stay NEXT to the launcher; the
-        // stub passes PS2X_EXEDIR=<launcherDir> so this resolves to the real one.
+        // [deploy] A self-extracting bundle stashes this runner in cache but its
+        // portable files (savedata/, assets/, data/) stay NEXT to the bundle; the
+        // stub passes PS2X_EXEDIR=<bundleDir> so this resolves to the real one.
         if (const char *exeDir = std::getenv("PS2X_EXEDIR"))
             if (exeDir[0] != '\0')
                 return std::filesystem::path(exeDir);
         std::error_code ec;
-#if defined(__APPLE__)
+#if defined(_WIN32)
+        // GetModuleFileNameW: /proc/self/exe does not exist here, so without this the deploy
+        // root silently fell back to the CWD (the Qt launcher used to paper over it by always
+        // exporting PS2X_EXEDIR, and the front-end cannot).
+        wchar_t modulePath[MAX_PATH] = {};
+        const DWORD moduleLen = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+        if (moduleLen > 0 && moduleLen < MAX_PATH)
+        {
+            std::filesystem::path self =
+                std::filesystem::canonical(std::filesystem::path(modulePath), ec);
+            if (!ec && !self.empty()) return self.parent_path();
+        }
+        return std::filesystem::current_path();
+#elif defined(__APPLE__)
         uint32_t size = 0;
         _NSGetExecutablePath(nullptr, &size);
         std::vector<char> path(size);
@@ -542,7 +559,7 @@ int main(int argc, char *argv[])
     // [boot] process/main start: the runtime logs start -> first frame on its first present.
     extern std::chrono::steady_clock::time_point g_ps2xBootT0;
     g_ps2xBootT0 = std::chrono::steady_clock::now();
-    const auto t_boot = g_ps2xBootT0;
+    auto t_boot = g_ps2xBootT0;
 #if defined(_WIN32)
     ps2xWinTimerBegin();   // [wintimer] 1 ms tick: timed waits stop rounding to 15.6 ms
     ps2xWinCrashHandlerInstall();
@@ -605,7 +622,38 @@ int main(int argc, char *argv[])
 
     try
     {
-        std::filesystem::path pathObj = getExecutablePath(argc, argv);
+        // [frontend] The in-runtime front-end IS the UI: with no argv it owns the
+        // first window, hands the chosen ELF back and tears its GL context down BEFORE the
+        // emulator creates its own (bt3gl calls SDL_Init itself on the way in). Passing the ELF
+        // as argv[1] -- what the launcher-based flow and every script did -- skips it, and
+        // PS2X_NOFRONTEND=1 forces the direct boot even with no arguments.
+        std::filesystem::path pathObj;
+#if defined(PS2X_HAVE_FRONTEND)
+        if (argc < 2 && !std::getenv("PS2X_NOFRONTEND"))
+        {
+            frontend::FeConfig cfg;
+            cfg.title = "Budokai Tenkaichi 3 Recompiled";
+            cfg.exeDir = getExecutableDirectory().string();
+            if (const char *def = std::getenv("PS2X_DEFAULT_BOOT_ELF"))
+                cfg.defaultElf = def;
+
+            std::string chosen;
+            if (frontend::run(cfg, chosen) == frontend::FeAction::Quit)
+            {
+                std::fprintf(stderr, "[boot] front-end quit before boot\n");
+                return 0;
+            }
+            if (!chosen.empty())
+                pathObj = std::filesystem::path(chosen);
+        }
+#endif
+        if (pathObj.empty())
+            pathObj = getExecutablePath(argc, argv);
+
+        // [boot] The front-end's wall-clock time is user time, not boot time: restart the clock
+        // so the [boot] lines still measure the emulator's own startup.
+        g_ps2xBootT0 = std::chrono::steady_clock::now();
+        t_boot = g_ps2xBootT0;
 
         std::string filePathStr = pathObj.string();
         std::string elfName = pathObj.filename().string();
@@ -662,7 +710,7 @@ int main(int argc, char *argv[])
                 // [logfix] Only a CONSOLE stderr is moved to the file: a captured one (a pipe or a
                 // "> log 2>&1") already goes somewhere and used to end up empty. The launcher, which
                 // starts the runner without a console, asks for logs/bt3.log through PS2X_LOGFILE
-                // instead, so launcher runs still leave a log for reports (the [winlog] lines).
+                // instead, so front-end runs still leave a log for reports (the [winlog] lines).
                 std::error_code ec;
                 const auto logsDir = exeDir / "logs";
                 std::filesystem::create_directories(logsDir, ec);

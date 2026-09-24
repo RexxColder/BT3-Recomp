@@ -18,6 +18,7 @@
 #include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 
 #include "runtime/ps2_toml.h"
+#include "runtime/ps2x_settings.h"
 
 #include <fstream>
 #include <sstream>
@@ -29,14 +30,9 @@
 #include <cstring>
 #include <ctime>
 
-static const char *kConfigFileName = "settings.toml";        // launcher + overlay + FMV share this
+static const char *kConfigFileName = "settings.toml";        // front-end + overlay + FMV share this
 static const char *kLegacyConfigFileName = "bt3_settings.ini"; // 0.x format, migrated on first load
 static const char *kDumpFileName = "bt3_settings_dump.log";
-
-static const char *kConfigHeader =
-    "# Dragon Ball Z: Budokai Tenkaichi 3 - Recompiled\n"
-    "# User settings - written by the launcher and the in-game overlay.\n"
-    "# Delete this file to reset everything to defaults.\n\n";
 
 namespace
 {
@@ -547,6 +543,7 @@ void PS2SettingsOverlay::loadSettings()
     if (!envUserSet("PS2X_OUTLINE")) m_settings.outline = doc.getB("video.outline", m_settings.outline);
     if (!envUserSet("PS2X_TEXPACK")) m_settings.texPack = doc.getB("video.texture_pack", m_settings.texPack);
     if (!envUserSet("PS2X_FMV_OVERRIDE")) m_settings.introVideo = doc.getB("video.intro_video", m_settings.introVideo);
+    m_settings.texcache = doc.getB("video.texcache", m_settings.texcache);
     if (!envUserSet("PS2X_BUTTONS")) m_settings.buttonLayout = doc.getI("video.button_layout", m_settings.buttonLayout);
     if (!envUserSet("PS2X_SHADOWS")) m_settings.shadows = doc.getB("video.shadows", m_settings.shadows);
     if (!envUserSet("PS2X_DOFMASK")) m_settings.dofBlur = doc.getB("video.dof_blur", m_settings.dofBlur);
@@ -665,7 +662,7 @@ void PS2SettingsOverlay::preloadSettings()
     std::ifstream file(configPath);
     if (!file.is_open())
     {
-        // 0.x legacy INI: the launcher imports it and writes the TOML (dropping the old
+        // 0.x legacy INI: the front-end imports it and writes the TOML (dropping the old
         // file). Running the runner directly, just clear a stray leftover.
         const std::string legacy = s_configDir.empty()
             ? (std::filesystem::current_path() / kLegacyConfigFileName).string()
@@ -704,75 +701,54 @@ void PS2SettingsOverlay::preloadSettings()
 
 void PS2SettingsOverlay::saveSettings() const
 {
-    using ps2x_toml::fmtBool;
-    using ps2x_toml::fmtDbl;
-    using ps2x_toml::fmtInt;
-    using ps2x_toml::fmtIntArray;
-    using ps2x_toml::fmtStr;
+    // [settings] ONE writer for settings.toml: the front-end and this overlay both serialize
+    // through ps2x_settings, so the two cannot drift (the Qt launcher and this overlay did:
+    // the old launcher's `texcache` key was silently dropped every time a play session ended).
+    ps2x_settings::Settings out;
+    out.master = m_settings.masterVolume;
+    out.music = m_settings.musicVolume;
+    out.sfx = m_settings.sfxVolume;
+    out.renderer = m_settings.renderer;
+    out.glow = m_settings.glow;
+    out.glowFix = m_settings.glowFix;
+    out.bilinear = m_settings.bilinear;
+    out.halfTexel = m_settings.halfTexel;
+    out.skipPost = m_settings.skipPost;
+    out.skipStaleVram = m_settings.skipStaleVram;
+    out.renderScale = m_settings.renderScale;
+    out.outline = m_settings.outline;
+    out.texPack = m_settings.texPack;
+    out.introVideo = m_settings.introVideo;
+    out.texcache = m_settings.texcache;
+    out.buttonLayout = m_settings.buttonLayout;
+    out.shadows = m_settings.shadows;
+    out.dofBlur = m_settings.dofBlur;
+    out.dofZFar = m_settings.dofZFar;
+    out.fullscreen = m_settings.fullscreen;
+    out.windowMode = m_settings.windowMode;
+    out.monitor = m_settings.monitor;
+    out.widescreen = m_settings.widescreen;
+    out.windowW = m_settings.windowW;
+    out.windowH = m_settings.windowH;
+    out.forceBilinear = m_settings.forceBilinear;
+    out.fps60 = m_settings.fps60;
+    out.hudLayout = m_settings.hudLayout;
+    out.hudOffL = m_settings.hudOffL;
+    out.hudOffC = m_settings.hudOffC;
+    out.hudOffR = m_settings.hudOffR;
+    out.device = deviceIndexForPlayer(0);   // [paddev] P1 (the front-end has one picker)
+    out.deadzone = m_settings.deadzone;
+    out.overlayEnabled = m_settings.overlayEnabled;
+    out.overlayPadBtns = ps2x_settings::formatIntCsv(m_settings.overlayPadBtns);
+    out.overlayKeys = ps2x_settings::formatIntCsv(m_settings.overlayKeys);
+    out.logLevel = m_settings.logLevel;
+    out.dumpAudio = m_dumpAudio;
+    out.dumpVideo = m_dumpVideo;
+    out.dumpControllers = m_dumpControllers;
+    out.dumpRuntime = m_dumpRuntime;
+    out.dumpGamepad = m_dumpGamepad;
 
-    std::ostringstream os;
-    os << kConfigHeader << "\n";
-
-    os << "[audio]\n";
-    os << "master_volume = " << fmtDbl(m_settings.masterVolume) << "\n";
-    os << "music_volume = " << fmtDbl(m_settings.musicVolume) << "\n";
-    os << "sfx_volume = " << fmtDbl(m_settings.sfxVolume) << "\n\n";
-
-    os << "[video]\n";
-    os << "renderer = " << fmtStr(rendererName(m_settings.renderer)) << "\n";
-    os << "glow = " << fmtBool(m_settings.glow) << "\n";
-    os << "glowfix = " << fmtBool(m_settings.glowFix) << "\n";
-    os << "ink_strength = " << fmtInt(m_settings.inkStrength) << "\n";
-    os << "ink_width = " << fmtInt(m_settings.inkWidth) << "\n";
-    os << "ink_color = " << fmtStr(colorToHex(m_settings.inkColor)) << "\n";
-    os << "bilinear = " << fmtBool(m_settings.bilinear) << "\n";
-    os << "halftexel = " << fmtBool(m_settings.halfTexel) << "\n";
-    os << "skippost = " << fmtBool(m_settings.skipPost) << "\n";
-    os << "skip_stale_vram = " << fmtBool(m_settings.skipStaleVram) << "\n";
-    os << "render_scale = " << fmtInt(m_settings.renderScale) << "\n";
-    os << "outline = " << fmtBool(m_settings.outline) << "\n";
-    os << "texture_pack = " << fmtBool(m_settings.texPack) << "\n";
-    os << "intro_video = " << fmtBool(m_settings.introVideo) << "\n";
-    os << "button_layout = " << fmtInt(m_settings.buttonLayout) << "\n";
-    os << "shadows = " << fmtBool(m_settings.shadows) << "\n";
-    os << "dof_blur = " << fmtBool(m_settings.dofBlur) << "\n";
-    os << "dof_zfar = " << fmtInt(m_settings.dofZFar) << "\n";
-    os << "fullscreen = " << fmtBool(m_settings.fullscreen) << "\n";
-    os << "widescreen = " << fmtBool(m_settings.widescreen) << "\n";
-    os << "window_w = " << fmtInt(m_settings.windowW) << "\n";
-    os << "window_h = " << fmtInt(m_settings.windowH) << "\n";
-    os << "force_bilinear = " << fmtBool(m_settings.forceBilinear) << "\n";
-    os << "window_mode = " << m_settings.windowMode << "\n";
-            os << "monitor = " << m_settings.monitor << "\n";
-            os << "fps60 = " << fmtBool(m_settings.fps60) << "\n\n";
-
-    os << "[video.hud]\n";
-    os << "layout = " << fmtInt(m_settings.hudLayout) << "\n";
-    os << "offset_left = " << fmtInt(m_settings.hudOffL) << "\n";
-    os << "offset_center = " << fmtInt(m_settings.hudOffC) << "\n";
-    os << "offset_right = " << fmtInt(m_settings.hudOffR) << "\n\n";
-
-    os << "[controllers]\n";
-    os << "device = " << fmtInt(deviceIndexForPlayer(0)) << "\n";   // [paddev] P1 (the launcher has one picker)
-    os << "deadzone = " << fmtDbl(m_settings.deadzone) << "\n";
-    os << "overlay_enabled = " << fmtBool(m_settings.overlayEnabled) << "\n\n";
-
-    os << "[controllers.hotkey]\n";
-    os << "pad_btns = " << fmtIntArray(m_settings.overlayPadBtns) << "\n";
-    os << "keys = " << fmtIntArray(m_settings.overlayKeys) << "\n\n";
-
-    os << "[logging]\n";
-    os << "log_level = " << fmtInt(m_settings.logLevel) << "\n";
-    os << "dump_audio = " << fmtBool(m_dumpAudio) << "\n";
-    os << "dump_video = " << fmtBool(m_dumpVideo) << "\n";
-    os << "dump_controllers = " << fmtBool(m_dumpControllers) << "\n";
-    os << "dump_runtime = " << fmtBool(m_dumpRuntime) << "\n";
-    os << "dump_gamepad = " << fmtBool(m_dumpGamepad) << "\n";
-
-    std::ofstream file(m_configPath, std::ios::trunc);
-    if (!file.is_open())
-        return;
-    file << os.str();
+    ps2x_settings::saveToFile(out, m_configPath);
 }
 
 void PS2SettingsOverlay::applyDeadzone()
@@ -1502,7 +1478,7 @@ void PS2SettingsOverlay::drawVideoTab()
                 ImGui::TextColored(ImVec4(0.97f, 0.32f, 0.29f, 1.0f), "*");
                 ImGui::SameLine(0.0f, 8.0f);
                 ImGui::TextUnformatted("No texture pack indexed");
-                ImGui::TextDisabled("Install one from the launcher (Misc tab) or set PS2X_TEXREPLACE=<dir>.");
+                ImGui::TextDisabled("Install one from the front-end (Misc tab) or set PS2X_TEXREPLACE=<dir>.");
             }
             ImGui::Separator();
             if (!havePack) ImGui::BeginDisabled();
@@ -2125,7 +2101,7 @@ void PS2SettingsOverlay::drawBindingsPopup()
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, dbz(1.00f, 0.62f, 0.10f, 0.30f));
         if (ImGui::Button("Close", ImVec2(100, 30)))
         {   // [noapply] closing the popup saves: settings + per-action bindings (pad.conf), so bindings
-            // edited here survive a restart and reach the Qt launcher's Bindings tab.
+            // edited here survive a restart and reach the front-end's Bindings tab.
             m_showBindingsPopup = false;
             applySettings();
             saveSettings();
@@ -2303,7 +2279,7 @@ void PS2SettingsOverlay::drawAboutTab()
     ImGui::TextWrapped("z3xox - owner / lead developer");
     ImGui::TextDisabled("  recompiler, runtime (EE/GS/VU1/scheduler), renderer, game overrides, generators");
     ImGui::TextWrapped("RexxColder - supporter / colaborador");
-    ImGui::TextDisabled("  optimizacion (perf/async), launcher + install wizard, input & gamepads, "
+    ImGui::TextDisabled("  optimizacion (perf/async), front-end + install wizard, input & gamepads, "
                         "build/release, deploy, game-data (AFS/AFL), docs");
     ImGui::TextWrapped("valenvivaldi - colaborador");
     ImGui::TextDisabled("  port macOS arm64, packaging, audio");

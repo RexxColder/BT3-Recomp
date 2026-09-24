@@ -32,9 +32,10 @@ instead of raylib's `DrawTexturePro`; the GS still renders through rlgl, only th
 The presented raylib texture is adopted by GL name (never freed by us) and the quad reuses the
 existing letterbox/widescreen/atlas math. Without `PS2X_ALTGL` the raylib path is untouched.
 
-### Launch recipe (how the launcher starts the runner)
+### Launch recipe (how the front-end starts the game)
 
-The launcher runs `bt3-runner.exe` with working directory = deploy root and sets:
+The front-end (inside `bt3-runner.exe`) runs with working directory = deploy root, and when the user
+presses PLAY it re-executes itself with:
 
 ```
 PS2X_EXEDIR=<deploy root>          PS2X_ASSETDIR=<deploy root>/assets
@@ -82,8 +83,8 @@ unrelated to the frame rate.
 
 ## Known issues / next
 
-- **Launcher selector** `OpenGL (altGL)` (renderer 4 → `PS2X_D3D11=0`, `PS2X_ALTGL=1`) so the mode
-  can be picked without environment variables.
+- **Front-end Video tab** has the `OpenGL (altGL)` selector (renderer 4 → `PS2X_D3D11=0`, `PS2X_ALTGL=1`),
+  so the mode can be picked without environment variables.
 - Migrate the GS replay itself off rlgl to `gfx::` (`rg*` wrappers, then the D3D11/GL backends).
 
 ## Fixed: garbled overlay text

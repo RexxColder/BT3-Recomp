@@ -10,8 +10,8 @@ BT3-Recomp-linux-x86_64.sha256
 ```
 
 or `BT3-Recomp-win-x86_64.zip` on Windows, `BT3-Recomp-macos-x86_64.tar.gz` on
-macOS. There is no SELFX stub any more: unzip the archive and run the launcher,
-which installs the game from your ISO on first run.
+macOS. There is no SELFX stub any more: unzip the archive and run `bt3-runner`,
+which shows the front-end and installs the game from your ISO on first run.
 
 ## Deploy tree
 
@@ -19,18 +19,17 @@ Unpacking `Dragon Ball Budokai Tenkaichi 3 Recompiled/` gives:
 
 ```
 Dragon Ball Budokai Tenkaichi 3 Recompiled/
-├── Launcher                # Qt 6 config UI (Linux/X11; Windows → Launcher.exe)
-├── bt3-runner              # the recompiled game (Windows → bt3-runner.exe)
+├── bt3-runner              # the game + front-end (Windows → bt3-runner.exe)
 ├── install game.sh         # Linux helper: menu entry + desktop icon
 ├── assets/lib/             # runner's shared-library closure (Linux)
-├── assets/                 # launcher artwork, fonts (background.png, icon.png, …)
+├── assets/                 # app artwork, fonts, AFS name lists (background.png, icon.png, …)
 ├── savedata/
 │   ├── settings.toml    # user settings ([logging], [video], …)
-│   └── pad_p1.conf / pad_p2.conf       # launcher bindings
+│   └── pad_p1.conf / pad_p2.conf       # front-end bindings
 └── savedata_slot1/         # BASLUS-21678DBZT3 memory-card slot, kept across runs
 ```
 
-The game data is **not** part of the distribution. On first launch the launcher's
+The game data is **not** part of the distribution. On first launch the front-end's
 install wizard extracts `SLUS_216.78` plus `BIN/ DATA/ IRX/ SYSTEM.CNF` from the
 user's own ISO into `<install>/data/`. (Build-time only, `BIN/DBZP.BIN` — the
 game's overlay code — is recompiled into the runner and never shipped.)
@@ -45,11 +44,11 @@ Python script that hosts the build pipeline (and is the base for Windows).
 
 | Script | Platform | Role |
 |---|---|---|
-| `scripts/build-linux.sh` | Linux | Thin wrapper: `setup.py <iso> --package`. The script itself detects the platform, installs missing dependencies (stage 2), builds (stage 3) and assembles the portable tree + `tar.gz` (stage 4): `ldd` closure minus the glibc/C++ core, Qt platform plugins, `bt3-runner` rename, assets, `install game.sh`, glibc floor gate. |
+| `scripts/build-linux.sh` | Linux | Thin wrapper: `setup.py <iso> --package`. The script itself detects the platform, installs missing dependencies (stage 2), builds (stage 3) and assembles the portable tree + `tar.gz` (stage 4): `ldd` closure minus the glibc/C++ core, `bt3-runner` rename, assets, `install game.sh`, glibc floor gate. |
 | `scripts/build-linux-portable.sh` | Linux | **Portable release**: runs the same build inside `ubuntu:22.04` with `BT3_GLIBC_MAX=2.35`, so the artifact runs on Ubuntu/Kubuntu 22.04 and 24.04 (glibc 2.35 / 2.39). Use this for **anything you distribute**; a native `build-linux.sh` on a rolling distro (e.g. Arch, glibc 2.44) produces a binary that aborts on 24.04 with ``libm.so.6: version `GLIBC_2.43' not found``. Self-builds on a user's own distro are unaffected (they link their own glibc). |
-| `games/bt3/setup.py` | All | The single entry point. Four stages: **1 detect** (platform/toolchain/deps, `--report json`), **2 deps** (interactive install of what is missing), **3 build** (extract/verify ISO, VU1, recompiler, ~7,800 sources, patches, overlay, runner), **4 package** (Qt launcher, portable tree, PE/glibc gate, zip/tar.gz/`.app` + sha256), then asks where to send the artifact. |
+| `games/bt3/setup.py` | All | The single entry point. Four stages: **1 detect** (platform/toolchain/deps, `--report json`), **2 deps** (interactive install of what is missing), **3 build** (extract/verify ISO, VU1, recompiler, ~7,800 sources, patches, overlay, runner), **4 package** (portable tree, PE/glibc gate, zip/tar.gz/`.app` + sha256), then asks where to send the artifact. |
 | `scripts/build-macos.sh` | macOS (experimental) | Thin wrapper: `setup.py <iso> --package`. Stage 4 hands the bundle over to `tools/macos/deploy.py --skip-build` (relocated dylibs, `Info.plist`, icudata, ad-hoc signing). |
-| `scripts/build-windows.ps1` / `package-windows.ps1` | Windows | Native build + package wrappers: `setup.py <iso> --package` with VS Build Tools + ClangCL + Ninja and Qt 6 fetched via aqtinstall. |
+| `scripts/build-windows.ps1` / `package-windows.ps1` | Windows | Native build + package wrappers: `setup.py <iso> --package` with VS Build Tools + ClangCL + Ninja. |
 
 ## Build + deploy (Linux)
 
@@ -90,21 +89,21 @@ LTS. The script installs the required build dependencies (including
 Inside the unpacked folder, `install game.sh` (copy made from
 `scripts/install-game.sh.in`) does three things:
 
-1. copies the launcher, runner, bundled libs and assets to `~/.local/share/bt3-recomp/`,
-2. writes a `~/.local/share/bt3-launcher.sh` wrapper,
+1. copies the runner, bundled libs and assets to `~/.local/share/bt3-recomp/`,
+2. writes a `~/.local/share/bt3-recomp.sh` wrapper,
 3. installs `~/.local/share/applications/Dragon-Ball-Budokai-Tenkaichi-3.desktop`
    plus `~/.local/share/icons/bt3.png`, so the game shows in the applications
    menu with its artwork.
 
 Existing `~/.local/share/bt3-recomp/savedata/` is preserved on re-run, so saves
 and settings survive reinstallation. The folder itself remains fully portable:
-you can skip the install script and run `Launcher` straight from the unpacked
+you can skip the install script and run `bt3-runner` straight from the unpacked
 tree.
 
 ## Build + deploy (Windows, native)
 
 The Windows build runs natively with Visual Studio Build Tools 2022 (ClangCL +
-Win11 SDK), Ninja, Python 3 and Qt 6 (fetched via aqtinstall); no WSL required.
+Win11 SDK), Ninja and Python 3; no WSL required.
 
 ```powershell
 .\scripts\build-windows.ps1 -Iso "C:\path\to\bt3-usa.iso"
@@ -112,9 +111,9 @@ Win11 SDK), Ninja, Python 3 and Qt 6 (fetched via aqtinstall); no WSL required.
 ```
 
 The pipeline generates the sources (`setup.py --gen-only` is target-agnostic),
-builds the runner and the Qt 6 launcher, bundles Qt, FFmpeg and the VC++ runtime
+builds the runner with the front-end in it, bundles the FFmpeg and VC++ runtime
 DLLs into `assets/lib/`, writes the portable tree to
-`build/release-windows/out/stage/` (`Launcher.exe`, `bt3-runner.exe`, `qt.conf`,
+`build/release-windows/out/stage/` (`bt3-runner.exe`,
 `assets/`, `savedata/`, licences, `settings.toml`) and runs a PE gate —
 `check_windows_deps.py` (pefile) verifies that every PE import resolves either
 from `assets/lib/` or to a Windows OS component, and that the layout is complete.
@@ -124,14 +123,14 @@ so no `LD_LIBRARY_PATH` games are needed.
 
 ## macOS .app (experimental)
 
-Use a Mac with Xcode Command Line Tools and `brew install cmake ninja pkg-config ffmpeg qt`.
+Use a Mac with Xcode Command Line Tools and `brew install cmake ninja pkg-config ffmpeg`.
 The Linux self-extracting ELF script is not used on macOS.
 
 ```sh
 ./scripts/build-macos.sh --iso /path/game.iso --jobs 3
 # Reuse the generated sources and rebuild into a new output path:
 ./scripts/build-macos.sh --skip-setup --output /path/BT3-Recomp-new.app
-# Package existing runner + Launcher.app without rebuilding:
+# Package the existing runner without rebuilding:
 ./scripts/build-macos.sh --skip-build --output /path/BT3-Recomp-test.app
 ```
 
@@ -140,9 +139,9 @@ rejected so a failed build cannot overwrite a working app. `PS2X_BUILD_DIR` sele
 an alternate build directory. Build each CPU architecture separately; Universal 2
 is not supported by the shared SIMD configuration.
 
-The script stages the launcher and `bt3-runner` in `Contents/MacOS`, assets in
-`Contents/Resources`, and uses `macdeployqt` to collect dylibs, Qt frameworks and
-plugins (including Cocoa). It checks architectures, rejects external absolute
+The script stages `bt3-runner` in `Contents/MacOS`, assets in `Contents/Resources`,
+and walks the runner's dylib closure into `Contents/Frameworks` with
+`install_name_tool`. It checks architectures, rejects external absolute
 library paths, checks the minimum OS versions in Mach-O load commands, then signs
 inside out with an ad-hoc identity and verifies the bundle. The destination appears
 only after these steps succeed. No game files are embedded in the app.
@@ -160,8 +159,8 @@ At first launch, select the USA ISO in the install wizard. Mutable files live in
 - `savedata/`: memory cards, settings and per-player bindings.
 - `mods/`, `logs/`: mods and diagnostics.
 
-The launcher keeps reading fonts and other bundled assets from Resources. Gamepad
-capture/testing in the launcher is unavailable outside Linux; use the in-game
+The front-end keeps reading fonts and other bundled assets from Resources. Gamepad
+capture/testing in the front-end is unavailable outside Linux; use the in-game
 settings overlay. The EE sampling profiler is unavailable on macOS; the phase
 profiler (`PS2X_GUESTPROF=1`) uses the native monotonic counter. OpenGL uses the
 existing fallbacks for unsupported persistent-buffer and texture-barrier extensions.
@@ -177,7 +176,7 @@ python3 games/bt3/setup.py <iso|elf> [--stage N] [--jobs N] [-y] [--deploy OUT] 
 | 1 `detect` | platform, arch, distro, package manager, toolchain and build inputs (`--report json`) |
 | 2 `deps` | reports the per-platform dependencies and installs the missing ones (interactive; `-y`, `--no-deps`, `--deps-only`) |
 | 3 `build` | extract + verify the ISO, VU1 microprograms, recompiler, source generation, patches, overlay module, runner build |
-| 4 `package` | builds the Qt launcher, assembles the portable tree, runs the release gate and writes the archive + `.sha256` |
+| 4 `package` | assembles the portable tree, runs the release gate and writes the archive + `.sha256` |
 
 | Flag | Effect |
 |---|---|
@@ -188,7 +187,7 @@ python3 games/bt3/setup.py <iso|elf> [--stage N] [--jobs N] [-y] [--deploy OUT] 
 | `--deploy OUT` | assemble the playable tree in `OUT` (no archive) |
 | `--package` / `--no-package` | write the release artifact for this OS + `.sha256` (on by default); `--no-package` assembles the deploy tree only |
 | `--output DIR` | where the stage tree and the artifact go (default `build/release-<os>/out`) |
-| `--skip-launcher`, `--no-gate`, `--no-desktop-copy` | developer escapes |
+| `--no-gate`, `--no-desktop-copy` | developer escapes |
 | `--skip-setup` | reuse `games/bt3/work/` + generated sources; rebuild the runner only |
 | `--gen-only` | stop after generation/patches (no runner build) |
 | `--log PATH`, `--no-log` | full execution log (default `build/setup.log`, overwritten on each run); it always keeps every line and the failing command |
@@ -198,7 +197,7 @@ Failures print `FAILED at stage N ... Full log: <path>` instead of a Python trac
 
 ### Linux distributions (stage 2)
 
-Stage 2 detects the package manager and installs the toolchain, FFmpeg and Qt with the right package
+Stage 2 detects the package manager and installs the toolchain and FFmpeg with the right package
 names; the build cache (`ccache`/`mold`) is optional (a failure only warns). It only installs when
 there is a prompt or `-y`/`--install-deps` was passed -- without a TTY it stops with the exact commands.
 
@@ -214,12 +213,11 @@ there is a prompt or `-y`/`--install-deps` was passed -- without a TTY it stops 
 | `eopkg` | Solus | |
 | `emerge` | Gentoo | not automated: prints the `emerge` atoms |
 
-## Input handling (launcher)
+## Input handling (front-end)
 
-The launcher reads controllers through **GLFW** (same joystick mapping database
-the runner uses via raylib) and the keyboard through **Qt key events** — there
-is no evdev/`linux/input.h` anywhere, so the identical code builds on Linux,
-Windows and macOS. Captured binds are stored as raylib `KEY_*` / `GAMEPAD_*`
+The front-end reads controllers and the keyboard through the same **SDL2** the runtime
+already uses for its own window, so there is no evdev/`linux/input.h` anywhere and
+the identical code builds on Linux, Windows and macOS. Captured binds are stored as raylib `KEY_*` / `GAMEPAD_*`
 codes so the runtime interprets them in-game without translation.
 
 ## Settings: `[logging] log_level`
@@ -254,9 +252,8 @@ before unpacking.
 
 ## Notes / troubleshooting
 
-- The launcher is Qt 6 (Widgets only) and builds its GLFW dependency from
-  source via `FetchContent`, so no system GLFW install is needed on any
-  platform.
+- The front-end brings no UI framework of its own: it is ImGui on the SDL2 backend the
+  runtime already had, so there is no Qt/GLFW dependency to install on any platform.
 - On Linux the runner's shared libraries travel in `assets/lib/`, resolvable via
   `LD_LIBRARY_PATH`; macOS uses its own loader search-path semantics and Windows
   its DLL search order — the same tree, no per-OS tweaks in the game itself.

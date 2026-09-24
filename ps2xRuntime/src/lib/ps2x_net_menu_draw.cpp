@@ -1,4 +1,4 @@
-﻿// [netmenu] Drawing half of the custom "New Dragon Net Menu" page.
+// [netmenu] Drawing half of the custom "New Dragon Net Menu" page.
 //
 // Compiled into ps2EntryRunner ONLY (see CMakeLists): ImGui must not leak into ps2_runtime or
 // the recompiler. The logic half is ps2x_net_menu.cpp.
@@ -17,7 +17,7 @@
 
 namespace
 {
-    const char *kIconPath = "assets/icon.png";   // deploy-relative (see CMake: launcher assets)
+    const char *kIconPath = "assets/icon.png";   // deploy-relative (staged by CMake from ps2xRuntime/assets)
 
     bt3Texture2D s_icon{};
     int s_iconState = 0;    // 0 = not tried, 1 = loaded, 2 = failed

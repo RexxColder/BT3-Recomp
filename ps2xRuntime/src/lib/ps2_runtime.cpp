@@ -1496,7 +1496,7 @@ bool PS2Runtime::initialize(const char *title)
             if (v && v[0] && v[0] != '0') bt3SetConfigFlags(FLAG_VSYNC_HINT);
         }
         // [winmode] Window mode / monitor / window size come from settings.toml [video] -- the same keys
-        // the launcher and the overlay write (window_mode, monitor, window_w, window_h). Windowed (0) is
+        // the front-end and the overlay write (window_mode, monitor, window_w, window_h). Windowed (0) is
         // resizable AND decorated: it used to come up fixed and without a title bar, which left no way to
         // move or resize the window. Borderless (1) fills the chosen monitor with no chrome; fullscreen
         // (2) uses the monitor's own mode. PS2X_WINDOW_MODE / PS2X_MONITOR / PS2X_WINDOW_W / PS2X_WINDOW_H
@@ -1574,7 +1574,7 @@ bool PS2Runtime::initialize(const char *title)
                 bt3SetWindowSize(hostWinW, hostWinH);   // moving monitors can leave the window fitted
         }
         _mark("window+monitor");
-        // [icon] Carry the launcher's icon onto the runner window. Same asset
+        // [icon] Carry the app icon onto the runner window. Same asset
         // convention as the overlay font (<exeDir>/assets/icon.png); exeDir is
         // PS2X_EXEDIR (deploy root) else the executable's own directory.
         // raylib's bt3SetWindowIcon must be called on a live (hidden) window.

@@ -2,10 +2,10 @@
 """PE dependency + layout gate for the Windows release stage.
 
 Analyses every PE under <stage_dir> with pefile and verifies the "portable tree"
-contract the flat layout enforces (qt.conf + DLLs next to the executables):
+contract the flat layout enforces (DLLs next to the executable):
 
   * every import of every bundled binary resolves either inside the stage's own
-    lib/ (Qt6, FFmpeg, VC++ runtime) or to a Windows OS / driver component that
+    lib/ (FFmpeg, VC++ runtime) or to a Windows OS / driver component that
     is guaranteed present (kernels, api-set stubs, vulkan via volk, ...);
   * every required artefact sits where the tree expects it (DLLs, plugins,
     wrapper, licences, default settings).
@@ -114,18 +114,11 @@ MACHINE_AMD64 = 0x8664  # IMAGE_FILE_MACHINE_AMD64
 SUBSYSTEM_WINDOWS_GUI = 2  # IMAGE_SUBSYSTEM_WINDOWS_GUI
 
 REQUIRED_LAYOUT = [
-    "Launcher.exe",
     "bt3-runner.exe",
-    "qt.conf",
     "LICENSE",
     "COPYING.LGPLv3",
     "savedata/settings.toml",
     "savedata/fps60_sites.txt",
-    "assets/lib/Qt6Core.dll",
-    "assets/lib/Qt6Gui.dll",
-    "assets/lib/Qt6Widgets.dll",
-    "assets/lib/Qt6Network.dll",
-    "assets/lib/qt6/plugins/platforms/qwindows.dll",
     "assets/lib/vcruntime140.dll",
     "assets/lib/vcruntime140_1.dll",
     "assets/lib/msvcp140.dll",
@@ -195,7 +188,7 @@ def main() -> int:
             subsystem = pe.OPTIONAL_HEADER.Subsystem
         except Exception:
             subsystem = None
-        if rel.name.lower() in ("launcher.exe", "bt3-runner.exe"):
+        if rel.name.lower() == "bt3-runner.exe":
             if subsystem != SUBSYSTEM_WINDOWS_GUI:
                 problems.append(
                     f"{rel}: subsystem {subsystem if subsystem is not None else 'n/a'} is not Windows GUI "

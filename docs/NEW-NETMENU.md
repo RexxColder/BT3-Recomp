@@ -214,7 +214,7 @@ From the pack **`D:\4K 2D Textures Lite.7z`** → `Original Buttons\Buttons\*.dd
 ### Assets
 
 All menu runtime files live under **`assets/DragonNet/`** (plus the font already in `assets/fonts/`).
-They are opened **relative to the working directory** (the launcher runs with `-WorkingDirectory
+They are opened **relative to the working directory** (the front-end runs with `-WorkingDirectory
 <deploy>`); the build stages the repo's `assets/` next to the executable.
 
 | Path | Used for |

@@ -189,7 +189,7 @@ namespace
     std::unordered_map<uint64_t, std::string> g_byTex0;
     std::once_flag g_once;
     bool g_on = false;
-    std::string g_root;   // [texui] the indexed pack root, for the launcher/overlay status
+    std::string g_root;   // [texui] the indexed pack root, for the front-end/overlay status
 
     inline uint64_t pairKey(uint64_t a, uint64_t b)
     {
@@ -335,7 +335,7 @@ void maybeDumpResolved(const TexIdent &id, const uint8_t *rgba, int w, int h)
     bt3ExportImage(img, (base + ".png").c_str());
 }
 
-// [texui] Pack status for the launcher/overlay popup.
+// [texui] Pack status for the front-end/overlay popup.
 size_t replacementsCount()
 {
     std::call_once(g_once, buildIndex);

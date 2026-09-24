@@ -44,6 +44,10 @@ public:
         bool outline = false;
         bool texPack = false;   // [texreplace] use the PCSX2 replacement pack when one is indexed (default OFF)
         bool introVideo = true; // [texui] 4K opening-video override when the pack ships it (applies on restart)
+        // [texcache] persisted texture cache. Nothing in the runtime reads this yet (the cache
+        // is env-gated through PS2X_TEXCACHE), but the key exists in users' settings.toml, so
+        // it is loaded and written back verbatim: dropping it would clobber the front-end.
+        bool texcache = true;
         int buttonLayout = 1;   // [texui] 0 = PS2 (Original Buttons), 1 = Xbox (Xbox Layout); applies on restart
         bool fps60 = false;   // [fps60] 60 fps mode: fight step 1 + the pacing table (applies between fights)
         int inkStrength = 199;   // [inkstrength] cel-outline darkener, % of Cs (199 = hardware 255/128)
