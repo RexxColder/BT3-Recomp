@@ -90,14 +90,54 @@ from an in-memory image instead of the folder file. Outside the entry, original 
 
 ## 4. Audio
 
-- **Silencing the game**: `freezeAudio()` lowers `music` **and** `sfx` (the backend groups voices
-  under SFX) to 0; master is untouched. `thawAudio()` is called **at release** (when the main menu
-  is already back), not at the end of the fade-out: doing it earlier produced a **BGM blip**.
-- **Own music**: `ps2x_net_music.cpp` uses **raylib** audio (`InitAudioDevice` +
-  `LoadMusicStream`, `Music.looping = true`, `UpdateMusicStream` per frame). It loops while the entry
-  is active and stops when it ends.
+The net entry owns the whole audio picture: it silences the game, plays its own music, and plays the
+game's **own** UI sound effects (no extracted WAVs).
+
+### 4.1 Silencing the game
+
+- `freezeAudio()` lowers `music` **and** `sfx` (the backend groups voices under SFX) to 0; master is
+  untouched. `thawAudio()` is called **at release** (when the main menu is already back), not at the
+  end of the fade-out: doing it earlier produced a **BGM blip**.
+
+### 4.2 Own background music
+
+- `ps2x_net_music.cpp` uses **raylib** audio (`InitAudioDevice` + `LoadMusicStream`,
+  `Music.looping = true`, `UpdateMusicStream` per frame). It loops while the entry is active and stops
+  when it ends.
   - `PS2X_NETMENU_MUSIC=<path>` (default `mods/DragonNet/music/netmenu.mp3`)
-  - `PS2X_NETMENU_MUSIC_VOL=<0..1>` (default 0.7)
+  - `PS2X_NETMENU_MUSIC_VOL=<0..1>` (default 0.5)
+
+### 4.3 UI sound effects — the game's own SE engine (no WAVs)
+
+The menu plays the **same SEs the retail menus use**, straight from the game's own sound engine.
+
+- **Where they come from**: the system effects live in `data/DATA/PZS3US1/SE_System.pak`, a Sony
+  **SCEI SGB** bank (chunks `Vers`/`Head`/`Vagi`/`Setb`, byte-swapped) whose samples are PS2
+  **SPU-ADPCM**. During research they were decoded (SGB -> VAG -> WAV) and identified by ear; the WAVs
+  are **not shipped** — the game decodes and mixes them at runtime.
+- **How they are played**: `ps2x_net_sfx.cpp` calls `ps2xMenuSePlay(bank=1, idx)`
+  (`game_overrides.cpp`), which drives the runtime's existing `sePlay()`: it decodes the bank the game
+  already uploaded to RAM and hands it to the SE voice mixer, mixed into the reserved SE stream
+  (`kSeStreamId = 0xF0`) and out through the **same audio backend the game uses**
+  (`ps2x_audio`). Because `sePlay` needs `rdram` + `runtime`, `bt3FrameKick()` stashes both every
+  frame.
+- **Index map** (system bank A, matching the retail usage in `seName()`):
+
+  | Event | SE idx | | Event | SE idx |
+  |---|---|---|---|---|
+  | Cursor move | 0 | | Popup open | 4 |
+  | Confirm | 1 | | Popup close | 5 |
+  | Netplay exit (Triangle at base) | 5 | | Error | 7 |
+
+- **Audible while frozen**: `freezeAudio()` sets `sfx` volume to 0, which would also silence the SE
+  stream. So a bypass flag (`ps2xSeMenuBypass`) makes `PS2AudioBackend::serviceStreams()` keep stream
+  `0xF0` at a fixed menu level (~0.6 * master) while the entry is up — the menu's effects are heard
+  without unmuting the game's own voices.
+- **Env**: `PS2X_NETMENU_SFX=0` disables the menu SE. If the bank was not captured it logs
+  `[netsfx] game SE bank not captured`.
+- **Why not raylib's own sounds**: opening raylib's audio device plays the effects on a **separate**
+  device at full scale (oversaturated, not ducked with the game). Everything must go through
+  `ps2x_audio` / the game backend.
 
 ---
 

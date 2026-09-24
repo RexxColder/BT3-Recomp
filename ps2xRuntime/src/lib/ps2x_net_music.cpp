@@ -24,7 +24,7 @@ namespace
     }();
     const float s_vol = []() {
         const char *v = std::getenv("PS2X_NETMENU_MUSIC_VOL");
-        return v ? (float)std::atof(v) : 0.6f;
+        return v ? (float)std::atof(v) : 0.5f;
     }();
 
     bt3Music s_music{};
