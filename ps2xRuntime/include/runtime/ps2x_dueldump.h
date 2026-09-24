@@ -57,4 +57,17 @@ namespace ps2x_dueldump
     // Decoded-texture hook: called where the renderer has the decoded RGBA in hand (so PNGs can
     // be written once per unique hash while armed). `rgba` is w*h*4 bytes.
     void offerDecodedTexture(uint64_t hash, const uint8_t *rgba, uint32_t w, uint32_t h);
+
+    // [duelsettings] PS2X_DUELSETTINGS=1: independent of PS2X_DUELDUMP. Every time the Battle
+    // Settings cursor (duelObj+0x13C) changes it snapshots duelObj[0..0x400] + stateObj+0x600..0x660
+    // to dumps/duelsettings_<ts>/ and logs the offsets that changed vs the previous snapshot -- the
+    // diff is what reveals the per-row VALUE fields (Duel Time, COM level, referee, ...).
+    void tickSettings(uint8_t *rdram);
+
+    // [dueltime] PS2X_DUELTIME=1: log the Duel Time plumbing while the Duel flow is up -- the
+    // live cursor (duelObj+0x13C), the value table the main executable holds (RAM 0x2C3480, u16[5]
+    // = [INF,60,90,180,240]) and the committed copies (stateObj+0x620..0x640), on every change, to
+    // dumps/dueltime_<ts>/time.csv. This is what shows WHERE the chosen time is committed, since
+    // writing +0x13C alone did not stick.
+    void tickTime(uint8_t *rdram);
 }

@@ -41,6 +41,8 @@ namespace
     { uint32_t v = 0; std::memcpy(&v, rd + (addr & 0x1FFFFFFFu), 4); return v; }
     inline uint8_t rd8(const uint8_t *rd, uint32_t addr)
     { return rd[(addr & 0x1FFFFFFFu)]; }
+    inline uint16_t rd16(const uint8_t *rd, uint32_t addr)
+    { uint16_t v = 0; std::memcpy(&v, rd + (addr & 0x1FFFFFFFu), 2); return v; }
 
     // ---- state ---------------------------------------------------------------------
     bool s_armed = false, s_sawDuel = false, s_done = false;
@@ -294,8 +296,7 @@ namespace
         std::fflush(s_fEvents);
     }
 
-    void drainTextures()
-    {
+    void drainTextures()    {
         if (!s_fTex) return;
         std::vector<ps2x_dueldump::TexSample> q;
         { std::lock_guard<std::mutex> lk(s_texMx); q.swap(s_texQ); }
@@ -311,6 +312,107 @@ namespace
             ++s_texRows;
         }
         if (!q.empty()) std::fflush(s_fTex);
+    }
+
+    // ---- [dueltime] -----------------------------------------------------------------
+    std::string s_tmDir;
+    std::FILE *s_tmCsv = nullptr;
+    uint32_t s_tmCur = 0xFFFFFFFFu, s_tmState = 0xFFFFFFFFu;
+
+    void timeDump(const uint8_t *rdram, uint32_t d, uint32_t s)
+    {
+        if (s_tmDir.empty())
+        {
+            s_tmDir = "dumps/dueltime_" + stamp();
+            ensureDir(s_tmDir);
+            s_tmCsv = std::fopen((s_tmDir + "/time.csv").c_str(), "w");
+            if (s_tmCsv)
+                std::fprintf(s_tmCsv, "frame,state,cur,t0,t1,t2,t3,t4,c620,c624,c628,c630,c634,c638,c63c,c640\n");
+            std::fprintf(stderr, "[dueltime] writing to %s\n", s_tmDir.c_str());
+        }
+        const uint32_t frame = (uint32_t)nowFrame();
+        const uint32_t state = stateOf(rdram);
+        const uint32_t cur = rd32(rdram, d + 0x13Cu);
+        // The value table the main executable holds (SLUS file 0x1C4482 -> RAM 0x2C3480).
+        uint16_t t[5];
+        for (int i = 0; i < 5; ++i) t[i] = rd16(rdram, 0x2C3480u + 2u * (uint32_t)i);
+        uint32_t c[9];
+        for (int i = 0; i < 9; ++i) c[i] = rd32(rdram, s + 0x620u + 4u * (uint32_t)i);
+        if (s_tmCsv)
+        {
+            std::fprintf(s_tmCsv, "%u,0x%x,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+                         frame, state, cur, t[0], t[1], t[2], t[3], t[4],
+                         c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+            std::fflush(s_tmCsv);
+        }
+        std::fprintf(stderr, "[dueltime] frame=%u state=0x%x cur=%u table=[%u,%u,%u,%u,%u] "
+                             "st620..63c=[%u,%u,%u,%u,%u,%u,%u,%u]\n",
+                     frame, state, cur, t[0], t[1], t[2], t[3], t[4],
+                     c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+    }
+
+    // ---- [duelsettings] -------------------------------------------------------------
+    // The Battle Settings cursor (duelObj+0x13C) is what the arrows used to move. Snapshotting the
+    // duel object and the committed copies on every change, and diffing consecutive snapshots,
+    // isolates the field each row actually writes its VALUE into.
+    std::string s_setDir;
+    std::FILE *s_setCsv = nullptr;
+    uint32_t s_setCur = 0xFFFFFFFFu, s_setN = 0;
+    std::vector<uint8_t> s_setDuel, s_setState;
+
+    void settingsDump(const uint8_t *rdram, uint32_t d, uint32_t s, uint32_t cur)
+    {
+        if (s_setDir.empty())
+        {
+            s_setDir = "dumps/duelsettings_" + stamp();
+            ensureDir(s_setDir);
+            s_setCsv = std::fopen((s_setDir + "/settings.csv").c_str(), "w");
+            if (s_setCsv) std::fprintf(s_setCsv, "n,frame,state,cur,vs,type,dp,changed_offsets\n");
+            std::fprintf(stderr, "[duelsettings] writing to %s\n", s_setDir.c_str());
+        }
+        const uint32_t frame = (uint32_t)nowFrame();
+        const uint32_t state = stateOf(rdram);
+        const uint32_t vs   = rd32(rdram, d + 0x110u);
+        const uint32_t type = rd32(rdram, d + 0x114u);
+        const uint32_t dp   = rd32(rdram, d + 0x118u);
+
+        std::vector<uint8_t> duel(0x400u), stb(0x60u);
+        for (uint32_t i = 0; i < duel.size(); ++i) duel[i] = rd8(rdram, d + i);
+        for (uint32_t i = 0; i < stb.size();  ++i) stb[i]  = rd8(rdram, s + 0x600u + i);
+
+        std::string diff;
+        if (!s_setDuel.empty())
+        {
+            char b[48];
+            for (uint32_t i = 0; i < duel.size(); ++i)
+                if (duel[i] != s_setDuel[i])
+                { std::snprintf(b, sizeof b, "duel+0x%X:%02X>%02X ", i, s_setDuel[i], duel[i]); diff += b; }
+            for (uint32_t i = 0; i < stb.size(); ++i)
+                if (stb[i] != s_setState[i])
+                { std::snprintf(b, sizeof b, "st+0x%X:%02X>%02X ", 0x600u + i, s_setState[i], stb[i]); diff += b; }
+        }
+
+        char nm[512];
+        std::snprintf(nm, sizeof nm, "%s/set_%u_%u_cur%u.txt", s_setDir.c_str(), s_setN, frame, cur);
+        if (std::FILE *f = std::fopen(nm, "w"))
+        {
+            std::fprintf(f, "frame=%u state=0x%x cur=%u vs=%u type=%u dp=%u duelObj=0x%x stateObj=0x%x\n",
+                         frame, state, cur, vs, type, dp, d, s);
+            hexRegion(f, rdram, d, 0x400u, "duelObj");
+            hexRegion(f, rdram, s + 0x600u, 0x60u, "stateObj+0x600");
+            std::fclose(f);
+        }
+        if (s_setCsv)
+        {
+            std::fprintf(s_setCsv, "%u,%u,0x%x,%u,%u,%u,%u,%s\n",
+                         s_setN, frame, state, cur, vs, type, dp, diff.c_str());
+            std::fflush(s_setCsv);
+        }
+        std::fprintf(stderr, "[duelsettings] #%u frame=%u state=0x%x cur=%u changed: %s\n",
+                     s_setN, frame, state, cur, diff.empty() ? "(first)" : diff.c_str());
+        s_setDuel.swap(duel);
+        s_setState.swap(stb);
+        ++s_setN;
     }
 }
 
@@ -404,6 +506,68 @@ namespace ps2x_dueldump
         std::snprintf(s.how, sizeof s.how, "%s", how ? how : "?");
         pushTexSample(s);
         if (rgba && w > 0 && h > 0) offerDecodedTexture(id.tex0Hash, rgba, (uint32_t)w, (uint32_t)h);
+
+        // [netmenu] Swizzle probe: PS2X_NETMENU_TEXPROBE=<tbp0> dumps everything needed to derive the
+        // exact texel map for one texture -- the params, the CLUT (256 u32), the whole VRAM and the
+        // runtime's decoded RGBA -- so the permutation can be solved offline instead of guessed.
+        static const long s_probeTbp = []() {
+            const char *v = std::getenv("PS2X_NETMENU_TEXPROBE");
+            return v ? std::strtol(v, nullptr, 0) : -1L;
+        }();
+        if (s_probeTbp >= 0 && (long)tbp0 == s_probeTbp && rgba && w > 0 && h > 0)
+        {
+            char nm[512];
+            std::snprintf(nm, sizeof nm, "%s/probe_%u_%dx%d.bin", s_dir.c_str(), tbp0, w, h);
+            FILE *pf = std::fopen(nm, "wb");
+            if (pf)
+            {
+                const uint32_t hdr[12] = { tbp0, tbw, psm, tw, th, cbp, csa, csm, cpsm,
+                                           (uint32_t)w, (uint32_t)h, 0u };
+                std::fwrite(hdr, 4, 12, pf);
+                if (clut) std::fwrite(clut, 4, 256, pf);
+                if (vram) std::fwrite(vram, 1, 4u * 1024u * 1024u, pf);
+                std::fwrite(rgba, 1, (size_t)w * (size_t)h * 4u, pf);
+                std::fclose(pf);
+                std::fprintf(stderr, "[texprobe] dumped %s (tbp=%u %dx%d psm=%u cbp=%u)\n",
+                             nm, tbp0, w, h, psm, cbp);
+            }
+        }
+    }
+
+    void tickTime(uint8_t *rdram)
+    {
+        if (!rdram) return;
+        static const bool on = [](){
+            const char *v = std::getenv("PS2X_DUELTIME");
+            return v && v[0] && v[0] != '0';
+        }();
+        if (!on) return;
+        const uint32_t d = rd32(rdram, kDuelObjAddr) & 0x1FFFFFFFu;
+        const uint32_t s = rd32(rdram, kMainPtrAddr) & 0x1FFFFFFFu;
+        if (!d || !s) return;
+        const uint32_t state = stateOf(rdram);
+        const uint32_t cur = rd32(rdram, d + 0x13Cu);
+        if (state == s_tmState && cur == s_tmCur && s_tmCsv) return;   // log on change
+        s_tmState = state;
+        s_tmCur = cur;
+        timeDump(rdram, d, s);
+    }
+
+    void tickSettings(uint8_t *rdram)
+    {
+        if (!rdram) return;
+        static const bool on = [](){
+            const char *v = std::getenv("PS2X_DUELSETTINGS");
+            return v && v[0] && v[0] != '0';
+        }();
+        if (!on) return;
+        const uint32_t d = rd32(rdram, kDuelObjAddr) & 0x1FFFFFFFu;
+        const uint32_t s = rd32(rdram, kMainPtrAddr) & 0x1FFFFFFFu;
+        if (!d || !s) return;
+        const uint32_t cur = rd32(rdram, d + 0x13Cu);
+        if (cur == s_setCur && s_setN != 0u) return;   // nothing changed
+        s_setCur = cur;
+        settingsDump(rdram, d, s, cur);
     }
 
     void offerDecodedTexture(uint64_t hash, const uint8_t *rgba, uint32_t w, uint32_t h)

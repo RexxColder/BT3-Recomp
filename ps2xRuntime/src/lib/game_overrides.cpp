@@ -46,7 +46,8 @@ extern "C" unsigned long long ps2xWinThreadCpuNs();
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"   // [savestate] getMemoryCardDebugSnapshot (deferred quickload)
 #include "runtime/ps2x_net_menu.h"     // [netmenu] custom New Dragon Net Menu page
-#include "runtime/ps2x_dueldump.h"     // [dueldump] total capture of the Duel menu flow
+#include "runtime/ps2x_dueldump.h"
+#include "runtime/ps2x_netmenutest.h"   // [netmenutest] Duel Menu 2 experiment     // [dueldump] total capture of the Duel menu flow
 #include "runtime/ps2_netplay.h"   // [netplay]
 
 // [netjump] Frames of display HOLD remaining. While non-zero, GsGpuRenderer::swapFrame() returns
@@ -450,9 +451,134 @@ namespace
 // [netmenu] frames of synthetic CROSS remaining for the custom page's direct-subtype start.
 // Same seam as the netjump's press, but NOT gated by netplay: BT3 never calls libpad, so the
 // only pad the game sees is built in writeNeutralPadPacket below.
-std::atomic<int> g_netMenuPressCross{0};
-extern "C" void ps2xNetMenuPressCross(int frames)
-{ g_netMenuPressCross.store(frames, std::memory_order_relaxed); }   // [netmenu] cross-TU setter
+// [netmenu] synthetic button frames for the custom page (any button: Cross to confirm a start,
+// Circle to go back). Same seam as the netjump's press, but NOT gated by netplay: BT3 never calls
+// libpad, so the only pad the game sees is built in writeNeutralPadPacket below.
+std::atomic<uint32_t> g_netMenuPressMask{0};   // PS2 button mask (active low: clear the bit)
+std::atomic<int> g_netMenuPressFrames{0};
+extern "C" void ps2xNetMenuPress(int mask, int frames)
+{
+    g_netMenuPressMask.store((uint32_t)mask, std::memory_order_relaxed);
+    g_netMenuPressFrames.store(frames > 0 ? frames : 0, std::memory_order_relaxed);
+}
+// [netmenu] while the custom page owns the screen the guest must see NO input at all (the libpad
+// override is invisible to BT3, so this is the only place that can freeze it). The Cross pulse
+// above is applied AFTER the freeze, so the start sequence can still confirm.
+std::atomic<int> g_netMenuFreeze{0};
+extern "C" void ps2xNetMenuFreeze(int on)
+{ g_netMenuFreeze.store(on ? 1 : 0, std::memory_order_relaxed); }
+// [netmenu] Selective gate: while armed, ONLY the buttons in the allow mask pass through to the
+// guest (player 1 / socket 0); everything else -- including the sticks -- is forced neutral. Used
+// by the net-entry flow: the pad is denied except Triangle, which is the game's own back button,
+// so the Duel state entered from the hidden row can still be left naturally.
+std::atomic<int> g_netMenuGate{0};
+std::atomic<uint32_t> g_netMenuAllowMask{0};
+extern "C" void ps2xNetMenuGate(int on, int allowMask)
+{
+    g_netMenuAllowMask.store((uint32_t)allowMask, std::memory_order_relaxed);
+    g_netMenuGate.store(on ? 1 : 0, std::memory_order_relaxed);
+}
+
+// [netmenu] Conditional AFS serve. While the net entry is active ONE chosen AFS slot is served
+// from an in-memory image instead of the folder file, so the SAME game code (the voice/BGM/loader
+// that already knows this container) runs on our converted Wii data -- and a native entry into the
+// same screen keeps the original bytes untouched. Zero-fills past the image end.
+// [netmenu] True only while the NET entry owns the screen. The [slot-read] trace keys off it, so
+// the log stays clean: it shows the reads that happen because the net entry was pressed.
+std::atomic<int> g_netEntryActive{0};
+extern "C" void ps2xNetEntrySetActive(int on)
+{ g_netEntryActive.store(on ? 1 : 0, std::memory_order_relaxed); }
+extern "C" int ps2xNetEntryActive()
+{ return g_netEntryActive.load(std::memory_order_relaxed); }
+
+std::atomic<int> g_netServeSwapActive{0};
+std::atomic<uint64_t> g_netServeSwapSlot{0};
+std::shared_ptr<std::vector<uint8_t>> g_netServeSwapData;
+extern "C" void ps2xNetServeSwapLoad(const char *path, unsigned long long slot)
+{
+    auto image = std::make_shared<std::vector<uint8_t>>();
+    if (path && path[0])
+    {
+        std::ifstream f(path, std::ios::binary);
+        if (f.is_open())
+        {
+            f.seekg(0, std::ios::end);
+            const std::streamoff n = f.tellg();
+            f.seekg(0, std::ios::beg);
+            if (n > 0)
+            {
+                image->resize(static_cast<size_t>(n));
+                f.read(reinterpret_cast<char *>(image->data()), n);
+            }
+        }
+    }
+    g_netServeSwapData = std::move(image);
+    g_netServeSwapSlot.store(slot, std::memory_order_relaxed);
+    g_netServeSwapActive.store(g_netServeSwapData->empty() ? 0 : 1, std::memory_order_relaxed);
+    std::fprintf(stderr, "[netmenu] serve-swap: slot %llu <- %s (%zu bytes)%s\n",
+                 slot, path ? path : "(none)", g_netServeSwapData->size(),
+                 g_netServeSwapData->empty() ? " [INACTIVE: empty]" : "");
+}
+extern "C" void ps2xNetServeSwapOff()
+{
+    g_netServeSwapActive.store(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[netmenu] serve-swap: off (original bytes)\n");
+}
+// [netmenu] Extra AFS slots silenced while the net entry is active: every OTHER BGM stream the game
+// keeps playing is served as zeros, so only the requested (swapped) one is heard.
+uint64_t g_netServeMuteSlots[16] = {};
+std::atomic<int> g_netServeMuteN{0};
+extern "C" void ps2xNetServeMuteSlots(const char *csv)
+{
+    int n = 0;
+    if (csv && csv[0])
+    {
+        const char *p = csv;
+        while (*p && n < 16)
+        {
+            char *end = nullptr;
+            const unsigned long long v = std::strtoull(p, &end, 0);
+            if (end == p) break;
+            g_netServeMuteSlots[n++] = (uint64_t)v;
+            p = (*end == ',') ? end + 1 : end;
+            if (*end == '\0') break;
+        }
+    }
+    g_netServeMuteN.store(n, std::memory_order_relaxed);
+    std::fprintf(stderr, "[netmenu] serve-swap: muting %d other BGM slot(s): %s\n", n, csv ? csv : "");
+}
+extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long long off,
+                                    unsigned char *dst, unsigned long long n)
+{
+    if (g_netServeSwapActive.load(std::memory_order_relaxed) == 0 || !dst)
+        return 0;
+    // [netmenu] The swap slot AND every "muted" slot are served the SAME image -- a valid silent
+    // stream. Serving raw zeros here produced decoder NOISE, not silence.
+    bool useImage = (slotId == g_netServeSwapSlot.load(std::memory_order_relaxed));
+    if (!useImage)
+    {
+        const int mn = g_netServeMuteN.load(std::memory_order_relaxed);
+        for (int i = 0; i < mn; ++i)
+            if (slotId == g_netServeMuteSlots[i]) { useImage = true; break; }
+    }
+    if (!useImage)
+        return 0;
+    static std::atomic<uint64_t> s_hits{0};
+    const uint64_t hit = s_hits.fetch_add(1, std::memory_order_relaxed);
+    if (hit < 12)
+        std::fprintf(stderr, "[netmenu] serve-swap HIT #%llu slot=%llu off=%llu n=%llu\n",
+                     hit, slotId, off, n);
+    const std::vector<uint8_t> &img = *g_netServeSwapData;
+    if (off >= img.size())
+        std::memset(dst, 0, static_cast<size_t>(n));
+    else
+    {
+        const size_t avail = static_cast<size_t>(std::min<unsigned long long>(img.size() - off, n));
+        std::memcpy(dst, img.data() + static_cast<size_t>(off), avail);
+        if (avail < n) std::memset(dst + avail, 0, static_cast<size_t>(n - avail));
+    }
+    return 1;
+}
     // [statesync] 0 = no jump this session, 1 = jumping, 2 = settled / gave up. The state sync waits for
     // 2 on both sides: the host publishes AFTER its jump (so the joiner adopts character select), the
     // joiner adopts only once its own jump has it in the same screen (comparable call chains).
@@ -544,12 +670,33 @@ extern "C" void ps2xNetMenuPressCross(int frames)
         // pad and are sent to the peer; the REMOTE player's arrive over UDP. The game reads two
         // pads and cannot tell the difference. Input sampled now is applied delay frames later,
         // so the packet has that long to cross the network.
-        // [netmenu] synthetic CROSS for the direct-subtype start (player 1 / socket 0). Applied here
-    // and NOT inside the netplay block, so it works offline too.
-    if ((socket & 3u) == 0u && g_netMenuPressCross.load(std::memory_order_relaxed) > 0)
+        // [netmenu] the custom page owns input: release everything for player 1 before the pulse below
+    // (and before the netplay block, so it holds offline too).
+    if ((socket & 3u) == 0u && g_netMenuFreeze.load(std::memory_order_relaxed) > 0)
     {
-        g_netMenuPressCross.fetch_sub(1, std::memory_order_relaxed);
-        b1 = static_cast<uint8_t>(b1 & ~0x40u);   // CROSS (active low), bit 14
+        b0 = 0xFFu;
+        b1 = 0xFFu;
+    }
+    // [netmenu] Selective gate (see ps2xNetMenuGate): deny everything except the allowed buttons,
+    // and force the sticks neutral so the hidden state's menu cannot be navigated.
+    if ((socket & 3u) == 0u && g_netMenuGate.load(std::memory_order_relaxed) > 0)
+    {
+        const uint32_t allow = g_netMenuAllowMask.load(std::memory_order_relaxed);
+        const uint8_t a0 = static_cast<uint8_t>(allow & 0xFFu);
+        const uint8_t a1 = static_cast<uint8_t>((allow >> 8) & 0xFFu);
+        b0 = static_cast<uint8_t>(static_cast<uint8_t>(~a0) | (b0 & a0));
+        b1 = static_cast<uint8_t>(static_cast<uint8_t>(~a1) | (b1 & a1));
+        rx = 0x80u; ry = 0x80u; lx = 0x80u; ly = 0x80u;
+    }
+    // [netmenu] synthetic button (player 1 / socket 0). Applied here, NOT inside the netplay
+    // block, so it works offline too. Runs AFTER the freeze above, so a press still lands while
+    // the guest input is held.
+    if ((socket & 3u) == 0u && g_netMenuPressFrames.load(std::memory_order_relaxed) > 0)
+    {
+        g_netMenuPressFrames.fetch_sub(1, std::memory_order_relaxed);
+        const uint32_t m = g_netMenuPressMask.load(std::memory_order_relaxed);
+        b0 = static_cast<uint8_t>(b0 & ~(uint8_t)(m & 0xFFu));
+        b1 = static_cast<uint8_t>(b1 & ~(uint8_t)((m >> 8) & 0xFFu));
     }
     if (ps2NetActive())
         {
@@ -5719,7 +5866,10 @@ namespace
             (void)s_netMenuHooked;
             ps2x_net_menu::tick(rdram, ctx, runtime);
         }
+        ps2x_netmenutest::init(rdram, runtime);          // [netmenutest] PS2X_NETMENUTEST=1
         ps2x_dueldump::tick(rdram, runtime);   // [dueldump] PS2X_DUELDUMP=1
+        ps2x_dueldump::tickSettings(rdram);    // [duelsettings] PS2X_DUELSETTINGS=1
+        ps2x_dueldump::tickTime(rdram);        // [dueltime] PS2X_DUELTIME=1
         ps2NetInit();   // [netplay] no-op unless PS2X_NET / PS2X_NET_LISTEN is set
         ps2NetFrame(static_cast<uint32_t>(g_bt3FrameCount.load(std::memory_order_relaxed)));
         ps2DetHashFrame(rdram, ctx->vu0_r);   // [dethash]

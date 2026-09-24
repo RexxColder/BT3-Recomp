@@ -2,7 +2,8 @@
 #include "runtime/ps2_guestprof.h"
 #include "runtime/ps2_fiber.h"   // [fibers]
 #include <deque>
-#include "runtime/ps2_netplay.h" // [rollback] the netplay controller
+#include "runtime/ps2_netplay.h"
+#include "runtime/ps2x_injected.h"   // [injected] function registry for cloned guest code // [rollback] the netplay controller
 #include "runtime/ps2_statesync.h"   // [statesync] portable snapshot forms
 extern std::atomic<uint64_t> g_bt3FrameCount;   // game_overrides.cpp: the frame hook's counter
 extern "C" bool ps2xFrameStepOn();               // frame-stepped mode (defined with the frame gate below)
@@ -2256,6 +2257,16 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
     static thread_local uint32_t s_lastValidDispatch = 0;
     static thread_local uint32_t s_prevValidDispatch = 0;
 
+    // [injected] Code we bring ourselves (e.g. a cloned game module) MUST win over the generated
+    // tables: those are dense, so an address with no real code still has a slot -- and it can hold
+    // a placeholder. Checked first for that reason.
+    if (RecompiledFunction fn = ps2x_injected::find(address))
+    {
+        s_prevValidDispatch = s_lastValidDispatch;
+        s_lastValidDispatch = address;
+        return fn;
+    }
+
     if (RecompiledFunction fn = lookupGeneratedFunction(address))
     {
         s_prevValidDispatch = s_lastValidDispatch;
@@ -3774,6 +3785,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     t_bjCtx = ctx; t_bjRdram = rdram;   // [thunkwatch] for the [badjump] slot dump
     ctx->pc = targetPc;
+    // [DIAG] temporary: is our injected address even reaching the branch dispatcher?
+    if (targetPc >= 0x00D00000u && targetPc < 0x00E00000u)
+    {
+        static std::atomic<int> s_dn{0};
+        if (s_dn.fetch_add(1) < 10)
+            std::fprintf(stderr, "[DIAG] branch to 0x%08x kind=%d hasFn=%d inj=%d\n",
+                         targetPc, (int)kind, hasFunction(targetPc) ? 1 : 0,
+                         ps2x_injected::find(targetPc) ? 1 : 0);
+    }
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
     // SUPER-TRACE tap (PS2X_SUPERTRACE + F10): see the rig above dispatchGuestBranch.
@@ -4422,7 +4442,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (kind == GuestBranchKind::Return)
     {
-        if (!hasFunction(targetPc))
+    // [injected] Addresses we bring ourselves (a cloned game module, see runtime/ps2x_injected.h)
+    // are NOT in the generated tables, so without this they would fall into the missing-function
+    // policy below and the generated code would just continue past the branch. Treat them as
+    // present so the normal path invokes them via lookupFunction().
+    if (!hasFunction(targetPc) && !ps2x_injected::find(targetPc))
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
         }
@@ -4447,10 +4471,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return ctx->pc == fallthroughPc;
     }
 
-    if (!hasFunction(targetPc))
+    // [injected] Treat addresses we bring ourselves (a cloned game module, see
+    // runtime/ps2x_injected.h) as PRESENT here too: they are not in the generated tables, so
+    // without this the branch falls into the missing-function policy and never invokes them.
+    if (!hasFunction(targetPc) && !ps2x_injected::find(targetPc))
     {
         // Interpreter fallback for dynamically-loaded (overlay) code: if this is
-        // a call into a RAM address that holds plausible code, interpret it until
         // it returns to the recompiled caller (fallthroughPc).
         if (isCall && rdram)
         {
@@ -4511,6 +4537,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         for (uint32_t a : s_mainCalls) if (a == targetPc) { traceThis = true; break; }
     if (traceThis)
         std::cerr << "[m>] 0x" << std::hex << targetPc << std::dec << std::endl;
+    if (targetPc >= 0x00D00000u && targetPc < 0x00E00000u)
+        std::fprintf(stderr, "[DIAG] invoking 0x%08x fn=%p pc=0x%x ra=0x%x\n", targetPc, (void *)targetFn, ctx->pc, static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)));
     targetFn(rdram, ctx, this);
     if (traceThis)
         std::cerr << "[m<] 0x" << std::hex << targetPc << " ret pc=0x" << ctx->pc << std::dec << std::endl;

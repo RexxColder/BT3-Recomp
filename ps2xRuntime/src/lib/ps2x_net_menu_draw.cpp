@@ -1,4 +1,4 @@
-// [netmenu] Drawing half of the custom "New Dragon Net Menu" page.
+﻿// [netmenu] Drawing half of the custom "New Dragon Net Menu" page.
 //
 // Compiled into ps2EntryRunner ONLY (see CMakeLists): ImGui must not leak into ps2_runtime or
 // the recompiler. The logic half is ps2x_net_menu.cpp.
@@ -76,56 +76,16 @@ namespace ps2x_net_menu
         dl->AddRectFilled(ImVec2(0.0f, 0.0f), screen,
                           IM_COL32(0, 0, 0, (int)(fade * 255.0f + 0.5f)));
 
-        const float base = screen.y * 0.30f;
+        // [netmenu] F3 sprites are injected at the GS level now (ps2x_net_gs.cpp, rlgl immediate),
+        // not as an ImGui image: the page only carries the text + the way out.
+        // [netmenutest] Native placeholder: only the three text lines + the way out. No icon, no
+        // wired options, no counters -- the menu itself is hosted by a real game state now.
+        const float base = screen.y * 0.38f;
         const float step = ImGui::GetFontSize() * 2.2f;
         centered(dl, screen, base,               "New Dragon Net Menu", withAlpha(IM_COL32(255, 210, 90, 255), fade), 1.7f);
         centered(dl, screen, base + step,        "By RexxColder",       withAlpha(IM_COL32(235, 235, 235, 255), fade), 1.2f);
         centered(dl, screen, base + step * 2.0f, "Work in progress",    withAlpha(IM_COL32(160, 160, 160, 255), fade), 1.0f);
-
-        if (returnStatus() == ReturnStatus::Failed)
-            centered(dl, screen, base + step * 3.3f,
-                     "RETURN FAILED - press (O) to retry", withAlpha(IM_COL32(255, 80, 80, 255), fade), 1.0f);
-        else
-            centered(dl, screen, screen.y - 60.0f,
-                     "(TRI) SINGLE 1P VS 2P       (SQ) DP BATTLE 15       (O) VOLVER",
-                     withAlpha(IM_COL32(220, 220, 220, 255), fade), 1.0f);
-
-        // Start counters (failure detection): attempts/ok/fail + the live stage and its frame count.
-        {
-            const StartStats st = startStats();
-            std::ostringstream c;
-            c << "start ok=" << st.ok << " fail=" << st.fail << " attempts=" << st.attempts;
-            if (std::strcmp(st.stage, "-") != 0)
-                c << "  stage=" << st.stage << ' ' << st.stageFrames << '/' << st.stageBudget;
-            centered(dl, screen, screen.y - 92.0f, c.str().c_str(),
-                     withAlpha(IM_COL32(140, 200, 150, 255), fade), 0.85f);
-        }
-
-        // Game icon, on the left, purely as a test that we can draw an image over the game.
-        ensureIcon();
-        if (s_iconState == 1 && s_icon.id != 0u)
-        {
-            if (ps2x::gfx::NativeVideo())
-            {
-                static bool s_warned = false;
-                if (!s_warned)
-                {
-                    s_warned = true;
-                    std::fprintf(stderr, "[netmenu] icon: skipped on the native-d3d11 path "
-                                         "(ImTextureID is not a GL id)\n");
-                }
-            }
-            else
-            {
-                const float h = screen.y * 0.18f;
-                const float w = h * (float)s_icon.width / (float)(s_icon.height ? s_icon.height : 1);
-                const ImVec2 p0(24.0f, screen.y - h - 24.0f);
-                const ImVec2 p1(p0.x + w, p0.y + h);
-                dl->AddImage((ImTextureID)(intptr_t)s_icon.id, p0, p1, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f),
-                             withAlpha(IM_COL32(255, 255, 255, 255), fade));
-            }
-        }
-
+        centered(dl, screen, screen.y - 60.0f,   "(Triangle) volver",  withAlpha(IM_COL32(220, 220, 220, 255), fade), 1.0f);
         ps2x::gfx::UiEnd();
     }
 }

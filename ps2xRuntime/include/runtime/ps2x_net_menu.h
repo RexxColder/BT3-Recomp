@@ -50,6 +50,9 @@ namespace ps2x_net_menu
     // 0 = the game is fully visible, 1 = fully faded to black. Driven per frame by tick();
     // PS2X_NET_MENU_FADE=<frames> sets the length (default 24 ≈ 0.4 s at 60 fps).
     float fadeLevel();
+// [netmenu] Black level for the GS background: the normal fade during entry, 1.0 (total black, no
+// fade) after the exit press until the main menu returns.
+float blackLevel();
 
     // Preload: the page's own resources (the icon, via raylib/GL) are loaded while the retail
     // main menu is up, hidden from the user, and on the RENDER thread: tick() only raises the
@@ -77,6 +80,9 @@ namespace ps2x_net_menu
                                 uint32_t targetState);
     void setMenuGotoHook(MenuGotoFn fn);
 
+    // The game's own go-to-screen (registered by game_overrides). False when not hooked yet.
+    bool menuGoto(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t targetState);
+
     // ---- "Dragon Net Battle" direct subtypes --------------------------------------
     // Drop straight into character select (0x27) for a chosen 1P VS 2P subtype: the runtime jumps
     // to the Duel menu, stamps the mode fields (exactly the values the netplay path uses) and
@@ -100,7 +106,38 @@ namespace ps2x_net_menu
     void startSubtype(uint32_t battleType, uint32_t dpVariant, uint32_t timeLimit = 0xFFFFFFFFu);
     void startOneVsTwo();          // convenience: SINGLE, 1P VS 2P
     bool starting();
+
+    // [netmenutest] Hosted mode: the page lives INSIDE a real game state (the cloned 0x47) instead
+    // of over the main menu. The game draws black behind it, input is NOT frozen, and Triangle
+    // returns to the main menu.
+void setHosted(bool v);
+bool hosted();
+// [netmenutest] True while the deferred raise is armed but its deadline has not passed yet: the
+// state dispatcher treats it as "ours" so the state's real handler is skipped during the transition.
+bool hostPending();
+// [netmenutest] Deferred raise: arm a deadline (ms); tick() raises the hosted page when it passes,
+// so the game's own entry animation is seen before the screen covers it.
+void requestHosted(uint32_t delayMs);
+// [netmenu] Mark that the Duel state was reached through the hidden NET row. While that state is
+// active the guest pad is denied except Triangle (the game's own back); a normal Duel entry is not
+// affected. Cleared automatically when the state is left.
+void markNetEntry();
+// [netmenu] Arm the conditional AFS serve immediately (called from the patched row, before the
+// state transition and before the target state's BGM starts streaming).
+void armServeSwap();
     StartStats startStats();
+
+    // ---- wired options (for the page hints) ----------------------------------------
+    // One label per Duel option that is bound to a pad input. Table-driven, so the hints on the
+    // page and the input handling can never disagree. Returns how many were written.
+    unsigned inputHints(const char **lines, unsigned maxLines);
+
+    // The timing setting picked with the arrows (Duel Time index and its retail label).
+    // DISABLED by default: duelObj+0x13C is the Battle Settings row cursor, not the value, so the
+    // arrows are gated behind PS2X_NET_MENU_TIME until [duelsettings] maps the real field.
+    unsigned timeSel();
+    const char *timeLabel();
+    bool timeArrowsEnabled();
 
     // ---- drawing (src/lib/ps2x_net_menu_draw.cpp, ps2EntryRunner target only) ------
     void draw();

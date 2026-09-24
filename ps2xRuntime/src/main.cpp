@@ -11,6 +11,7 @@ extern "C" void ps2xWinHostInfo();             // ps2_win_timer.cpp: [host] cpu 
 #if !defined(PLATFORM_VITA)
 #include "ps2_settings_overlay.h"
 #include "runtime/ps2x_net_menu.h"   // [netmenu] custom New Dragon Net Menu page
+namespace ps2x_net_gs { void draw(); }   // [netmenu] GS-level sprite injection (ps2x_net_gs.cpp)
 #endif
 
 #ifdef _DEBUG
@@ -684,7 +685,8 @@ int main(int argc, char *argv[])
             [](PS2Runtime &rt, void *userData)
             {
                 static_cast<PS2SettingsOverlay *>(userData)->draw(rt);
-                ps2x_net_menu::draw();   // [netmenu] own ImGui frame; no-op unless the page is up
+                ps2x_net_gs::draw();     // [netmenu] GS background black (entry fade / instant on exit)
+                // ps2x_net_menu::draw();   // ImGui page stays off (GS-only)
             },
             [](PS2Runtime &rt, void *userData)
             {
