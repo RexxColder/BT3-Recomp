@@ -9,8 +9,8 @@ namespace frontend
         std::string title;
         std::string exeDir;
         std::string defaultElf;
-        int width = 1024;
-        int height = 640;
+        int width = 800;
+        int height = 600;
     };
 
     enum class FeAction

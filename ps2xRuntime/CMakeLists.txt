@@ -1008,6 +1008,7 @@ src/lib/ps2x_net_menu2d.cpp      # [netmenu2d] custom Dragon Net menu, raylib 2D
         set(PS2X_FRONTEND_SOURCES
             src/frontend/fe_app.cpp
             src/frontend/fe_afs.cpp
+            src/frontend/fe_background.cpp
             src/frontend/fe_hash.cpp
             src/frontend/fe_hw.cpp
             src/frontend/fe_install.cpp

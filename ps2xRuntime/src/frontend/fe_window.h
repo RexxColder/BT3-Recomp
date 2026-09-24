@@ -31,6 +31,9 @@ namespace frontend
         float dpiScale() const { return m_dpiScale; }
 
         void *sdlWindow() const { return m_window; }
+        // Current drawable size of the window, so the shell can remember it. False when the
+        // window is already gone.
+        bool querySize(int *width, int *height) const;
 
     private:
         SDL_Window *m_window = nullptr;

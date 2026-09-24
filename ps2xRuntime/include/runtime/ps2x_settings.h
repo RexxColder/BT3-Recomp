@@ -44,6 +44,12 @@ namespace ps2x_settings
         bool widescreen = false;
         int windowW = 0;
         int windowH = 0;
+        // Front-end window size, remembered between runs. It lives here so the shell opens at
+        // the size the user left it, and it is NOT what the game window uses: the game applies
+        // windowW/windowH on PLAY. Deliberately left out of operator== (see ps2x_settings.cpp)
+        // so resizing the window never marks the game settings as unsaved.
+        int feWidth = 800;
+        int feHeight = 600;
         bool forceBilinear = true;
         bool texPack = false;
         bool introVideo = true;

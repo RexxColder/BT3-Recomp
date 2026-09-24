@@ -161,6 +161,8 @@ namespace
         s.monitor = doc.getI("video.monitor", 0);
         s.widescreen = doc.getB("video.widescreen", s.widescreen);
         s.windowW = doc.getI("video.window_w", s.windowW);
+    s.feWidth = clampi(doc.getI("frontend.width", s.feWidth), 640, 7680);
+    s.feHeight = clampi(doc.getI("frontend.height", s.feHeight), 480, 4320);
         s.windowH = doc.getI("video.window_h", s.windowH);
         s.forceBilinear = doc.getB("video.force_bilinear", s.forceBilinear);
         s.fps60 = doc.getB("video.fps60", s.fps60);
@@ -292,6 +294,9 @@ namespace ps2x_settings
 {
     bool operator==(const Settings &a, const Settings &b)
     {
+        // feWidth/feHeight are intentionally NOT compared: they track the shell
+        // window the user dragged, so they would report "cambios sin guardar" for
+        // something that is not a game setting.
         return a.master == b.master && a.music == b.music && a.sfx == b.sfx &&
                a.renderer == b.renderer && a.glow == b.glow && a.glowFix == b.glowFix &&
                a.bilinear == b.bilinear && a.halfTexel == b.halfTexel && a.skipPost == b.skipPost &&
@@ -431,7 +436,14 @@ namespace ps2x_settings
         os << "dump_video = " << fmtBool(s.dumpVideo) << "\n";
         os << "dump_controllers = " << fmtBool(s.dumpControllers) << "\n";
         os << "dump_runtime = " << fmtBool(s.dumpRuntime) << "\n";
-        os << "dump_gamepad = " << fmtBool(s.dumpGamepad) << "\n";
+        os << "dump_gamepad = " << fmtBool(s.dumpGamepad) << "\n\n";
+
+        // [frontend] shell window only. The game never reads this: on PLAY it applies
+        // [video] window_w/window_h to its own window, and this window just reopens at
+        // whatever size the user left it.
+        os << "[frontend]\n";
+        os << "width = " << fmtInt(s.feWidth) << "\n";
+        os << "height = " << fmtInt(s.feHeight) << "\n";
 
         return os.str();
     }

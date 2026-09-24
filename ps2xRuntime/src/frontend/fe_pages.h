@@ -19,10 +19,13 @@ namespace frontend
         // Set by a page when it wants the shell to switch to the install view / open a picker.
         bool requestInstallWizard = false;
         bool requestPackInstall = false;
-        // Data verification hashes the boot ELF, so it is done once, the first time the Misc
-        // page is actually drawn (not on every front-end launch).
-        int dataState = -1;
-    };
+          // Data verification hashes the boot ELF, so it is done once, the first time the Misc
+          // page is actually drawn (not on every front-end launch).
+          int dataState = -1;
+          // A page can leave one line of text for the shell to draw on its own line just above
+          // the action bar, instead of spending page height on a paragraph.
+          const char *footerHint = nullptr;
+      };
 
     void drawVideoPage(PageContext &ctx);
     void drawAudioPage(PageContext &ctx);

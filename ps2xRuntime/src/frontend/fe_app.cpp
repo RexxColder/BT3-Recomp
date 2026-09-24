@@ -1,5 +1,8 @@
 #include "frontend/fe_app.h"
 
+#include <cstring>
+
+#include "frontend/fe_background.h"
 #include "frontend/fe_install.h"
 #include "frontend/fe_pages.h"
 #include "frontend/fe_picker.h"
@@ -7,11 +10,15 @@
 #include "frontend/fe_window.h"
 
 #include "imgui.h"
+#include "runtime/pad_config.h"
+#include "runtime/ps2_host_pad.h"
 #include "runtime/ps2x_settings.h"
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -179,30 +186,103 @@ namespace
         return out;
     }
 
-    void drawHeader(const std::string &title, bool canPlay, bool &wantBoot, bool &wantQuit)
+    // Footer actions. SALIR is the way back to the menu now that the top VOLVER is gone: the
+    // window is only really quit from the menu (Esc or the X).
+    void drawPlayQuit(bool canPlay, bool &playAsked, bool &backAsked)
     {
-        ImGui::PushStyleColor(ImGuiCol_Text, gold());
-        ImGui::TextUnformatted(title.c_str());
-        ImGui::PopStyleColor();
-
-        const float avail = ImGui::GetContentRegionAvail().x;
-        ImGui::SameLine(avail - 168.0f);
-        ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.18f, 0.55f, 0.30f));
+                        ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.18f, 0.55f, 0.30f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.25f, 0.73f, 0.40f));
         ImGui::PushStyleColor(ImGuiCol_Text, dbz(0.02f, 0.06f, 0.03f));
         ImGui::BeginDisabled(!canPlay);
-        const bool pressedPlay = ImGui::Button("JUGAR", ImVec2(80.0f, 0.0f));
+        const bool pressedPlay = ImGui::Button("JUGAR", ImVec2(74.0f, 0.0f));
         ImGui::EndDisabled();
         ImGui::PopStyleColor(3);
         if (pressedPlay && canPlay)
-            wantBoot = true;
+            playAsked = true;
 
         ImGui::SameLine(0.0f, 6.0f);
         ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.55f, 0.16f, 0.12f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.80f, 0.24f, 0.18f));
-        if (ImGui::Button("SALIR", ImVec2(80.0f, 0.0f)))
-            wantQuit = true;
+        if (ImGui::Button("SALIR", ImVec2(74.0f, 0.0f)))
+            backAsked = true;
         ImGui::PopStyleColor(2);
+    }
+
+    // Menu buttons sit on the artwork, so they get a glow: a few concentric translucent rounded
+    // rects behind the ImGui button, pulsing slowly. Cheap (4 draw-list rects) and it reads as
+    // "glowing" without a shader.
+    void glowButton(const char *label, const ImVec2 &size, bool enabled, bool *pressed,
+                    const ImVec4 &tint)
+    {
+        const ImVec2 at = ImGui::GetCursorScreenPos();
+        const float pulse = 0.5f + 0.5f * (float)std::sin((double)ImGui::GetTime() * 2.2);
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        for (int i = 3; i >= 1; --i)
+        {
+            const float grow = 2.0f + 5.0f * (float)i * (0.75f + 0.25f * pulse);
+            const ImU32 col = ImGui::GetColorU32(ImVec4(tint.x, tint.y, tint.z,
+                                                        (0.10f * (4 - i) / 3.0f) * (0.65f + 0.35f * pulse)));
+            dl->AddRect(ImVec2(at.x - grow, at.y - grow), ImVec2(at.x + size.x + grow, at.y + size.y + grow),
+                        col, 8.0f + grow, 0, 2.0f);
+        }
+
+        ImGui::PushStyleColor(ImGuiCol_Button, enabled ? tint : ImVec4(0.16f, 0.17f, 0.18f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(tint.x * 1.25f, tint.y * 1.25f, tint.z * 1.25f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(tint.x * 0.8f, tint.y * 0.8f, tint.z * 0.8f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.02f, 0.05f, 0.03f, 1.0f));
+        ImGui::BeginDisabled(!enabled);
+        *pressed = ImGui::Button(label, size);
+        ImGui::EndDisabled();
+        ImGui::PopStyleColor(4);
+    }
+
+    void drawMenu(std::uint32_t bgTex, const ImVec2 &size, bool canPlay, bool &playAsked,
+                  bool &settingsAsked, bool &navFocus)
+    {
+        // The bar owns the bottom strip; the artwork is laid out in what is left above it, so
+        // nothing important ends up hidden behind the bar.
+        const float barH = 76.0f;
+        const ImVec2 artSize(size.x, size.y - barH);
+
+        if (bgTex)
+        {
+            ImGui::SetCursorPos(ImVec2(0.0f, 0.0f));
+            ImGui::Image(ImTextureRef((ImTextureID)(intptr_t)bgTex), artSize);
+        }
+
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const ImVec2 barTop(0.0f, artSize.y);
+        dl->AddRectFilled(barTop, ImVec2(size.x, size.y), IM_COL32(0, 0, 0, 255));
+        dl->AddLine(barTop, ImVec2(size.x, barTop.y), IM_COL32(255, 255, 255, 28), 1.0f);
+
+        const ImVec2 btn(210.0f, 44.0f);
+        const float by = barTop.y + (barH - btn.y) * 0.5f;
+        bool pressed = false;
+
+        ImGui::SetCursorPos(ImVec2(18.0f, by));
+        // The navigation cursor has no target until we give it one, otherwise the D-pad does
+        // nothing on the very first screen.
+        if (navFocus)
+        {
+            ImGui::SetKeyboardFocusHere();
+            navFocus = false;
+        }
+        glowButton("JUGAR", btn, canPlay, &pressed, ImVec4(0.18f, 0.55f, 0.30f, 1.0f));
+        if (pressed && canPlay)
+            playAsked = true;
+
+        ImGui::SetCursorPos(ImVec2(size.x - btn.x - 18.0f, by));
+        pressed = false;
+        glowButton("AJUSTES", btn, true, &pressed, ImVec4(0.22f, 0.36f, 0.58f, 1.0f));
+        if (pressed)
+            settingsAsked = true;
+    }
+
+    void drawHeader(const std::string &title)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, gold());
+        ImGui::TextUnformatted(title.c_str());
+        ImGui::PopStyleColor();
     }
 
     void statusRow(const char *label, bool ok, const char *okText, const char *badText)
@@ -218,14 +298,25 @@ namespace frontend
 {
     FeAction run(const FeConfig &cfg, std::string &bootElfOut)
     {
+        const std::filesystem::path exeDir(cfg.exeDir);
+
+        // [settings] The SAME savedata/settings.toml the in-game overlay reads. It is loaded
+        // before the window opens because the front-end reopens at the size the user left it
+        // ([frontend] width/height), which is NOT the game's window_w/window_h: those are what
+        // the game window applies on PLAY.
+        const std::string configDir = (exeDir / "savedata").string();
+        ps2x_settings::Settings settings;
+        const bool settingsExisted = ps2x_settings::load(settings, configDir);
+        ps2x_settings::Settings settingsSaved = settings;
+
         FeWindow win;
-        if (!win.open(cfg.title, cfg.width, cfg.height))
+        if (!win.open(cfg.title, settings.feWidth, settings.feHeight))
         {
             std::fprintf(stderr, "[fe] front-end unavailable; booting directly\n");
             return FeAction::Boot;
         }
+        std::fprintf(stderr, "[fe] front-end window %dx%d\n", settings.feWidth, settings.feHeight);
 
-        const std::filesystem::path exeDir(cfg.exeDir);
         ScanResult scan = scanDeploy(exeDir);
         if (scan.elf.empty() && !cfg.defaultElf.empty())
         {
@@ -238,6 +329,22 @@ namespace frontend
         applyStyle();
         if (win.dpiScale() > 1.0f)
             ImGui::GetStyle().ScaleAllSizes(win.dpiScale());
+        // Density: the stock ImGui spacing costs ~30 px per row, which does not fit the longest
+        // page (Video) into a 600 px window. These are set once on the style the front-end owns,
+        // NOT pushed/popped per frame: a popup is a second ImGui window, and the per-frame
+        // Push/PopStyleVar pair then unbalances against the window ImGui itself opens, which
+        // spams "PopStyleVar() too many times" the moment a popup shows.
+        {
+            ImGuiStyle &st = ImGui::GetStyle();
+            st.ItemSpacing = ImVec2(8.0f, 4.0f);
+            st.FramePadding = ImVec2(6.0f, 3.0f);
+            st.CellPadding = ImVec2(6.0f, 2.0f);
+            st.ItemInnerSpacing = ImVec2(5.0f, 2.0f);
+            st.ScrollbarSize = 11.0f;
+            st.GrabMinSize = 11.0f;
+            // Gamepad/keyboard navigation needs a cursor you can actually see on a dark UI.
+            st.Colors[ImGuiCol_NavCursor] = dbz(1.00f, 0.78f, 0.20f, 0.95f);
+        }
 
         ImGuiIO &io = ImGui::GetIO();
         io.Fonts->Clear();
@@ -249,25 +356,46 @@ namespace frontend
             io.Fonts->AddFontDefault();
 
         static const char *const kPages[] = {
-            "Inicio", "Video", "Audio", "Mandos", "Registro", "Varios", "Acerca de"
+            "Estado", "Video", "Audio", "Mandos", "Registro", "Varios", "Acerca de"
         };
+        // The first screen is just the artwork with PLAY and SETTINGS; the tabbed window is
+        // what SETTINGS opens. PS2X_FE_PAGE jumps straight into it for the headless checks.
+        enum class Screen
+        {
+            Menu,
+            Settings
+        } screen = Screen::Menu;
         int page = 0;
         if (const char *p = std::getenv("PS2X_FE_PAGE"))
         {
             const int n = std::atoi(p);
             if (n >= 0 && n < (int)(sizeof(kPages) / sizeof(kPages[0])))
+            {
                 page = n;
+                screen = Screen::Settings;
+            }
         }
         bool wantBoot = false;
         bool wantQuit = false;
 
-        // [settings] The SAME savedata/settings.toml the in-game overlay reads: the front-end
-        // owns a working copy and writes it back on exit only when it actually changed, so an
-        // untouched session never rewrites what the overlay saved last time.
-        const std::string configDir = (exeDir / "savedata").string();
-        ps2x_settings::Settings settings;
-        const bool settingsExisted = ps2x_settings::load(settings, configDir);
-        ps2x_settings::Settings settingsSaved = settings;
+        // [anim] Screen, tab and boot transitions. The swap happens while the fade is at full
+        // darkness, so nothing pops. PLAY holds the fade instead of returning: the game creates
+        // its own window and this one is destroyed on the way out.
+        enum class Transition
+        {
+            None,
+            OpenSettings,
+            BackToMenu,
+            SwitchPage,
+            Play
+        };
+        fe::Fader fader;
+        Transition transition = Transition::None;
+        int transitionPage = 0;
+        // True when the navigation cursor still needs a target (first frame, or just after the
+        // screen/page it was pointing at stopped existing).
+        bool navFocusWanted = true;
+        auto t_prev = std::chrono::steady_clock::now();
 
         PageContext pageCtx;
         pageCtx.settings = &settings;
@@ -303,8 +431,30 @@ namespace frontend
         if (const char *d = std::getenv("PS2X_FE_DELAY_MS"))
             autoDelayMs = std::atoi(d);
         const bool autoPlay = autoDelayMs > 0 && std::getenv("PS2X_FE_AUTOPLAY") != nullptr;
+        const bool measure = std::getenv("PS2X_FE_MEASURE") != nullptr;
         const bool autoQuit = autoDelayMs > 0 && std::getenv("PS2X_FE_AUTOQUIT") != nullptr;
         const auto t_start = std::chrono::steady_clock::now();
+
+        int bgW = 0, bgH = 0;
+        const std::uint32_t bgTex = loadBackground(exeDir / "assets" / "background.png", &bgW, &bgH);
+
+        // The per-player pad profiles live in <exeDir>/savedata; point PadConfig there and read
+        // them once so the Mandos page shows what the game will actually use.
+        ps2_stubs::PadConfig::instance().setDefaultDir(exeDir.string());
+        if (ps2_stubs::PadConfig::instance().load())
+            std::fprintf(stderr, "[fe] pad profiles loaded from %s\n", exeDir.string().c_str());
+
+        // The pad tester reads the same host layer the game polls. Its SDL2 backend only needs
+        // SDL_InitSubSystem(GAMECONTROLLER), so it works from this window; the raylib fallback
+        // would want a raylib window we do not have, so if we land there we skip the tester.
+        ps2x_pad::init();
+        const bool padTesterUsable = std::strcmp(ps2x_pad::backendName(), "sdl2") == 0;
+        if (!padTesterUsable)
+            std::fprintf(stderr, "[fe] pad tester disabled (host pad backend is %s)\n",
+                         ps2x_pad::backendName());
+        else
+            std::fprintf(stderr, "[fe] pad tester ready (host pad backend: %s)\n",
+                         ps2x_pad::backendName());
 
         while (!wantBoot && !wantQuit && !win.closeRequested())
         {
@@ -335,154 +485,312 @@ namespace frontend
                 ImGui::Begin("##fe_host", nullptr, hostFlags);
 
                 const bool canPlay = !scan.elf.empty();
-                drawHeader(cfg.title, canPlay, wantBoot, wantQuit);
-                ImGui::Separator();
-
-                const ImVec2 avail = ImGui::GetContentRegionAvail();
-                if (showWizard && wizard)
+                // Cleared every frame so a page's footer hint never leaks into the next one.
+                pageCtx.footerHint = nullptr;
+                if (screen == Screen::Menu)
                 {
-                    if (ImGui::BeginChild("##fe_wizard", ImVec2(0.0f, avail.y), ImGuiChildFlags_Borders))
-                        wizard->draw();
-                    ImGui::EndChild();
-
-                    if (wizard->wantedPick() != InstallWizard::PickKind::None && !picker.isOpen())
+                    bool settingsAsked = false;
+                    bool playAsked = false;
+                    drawMenu(bgTex, ImGui::GetContentRegionAvail(), canPlay, playAsked,
+                              settingsAsked, navFocusWanted);
+                    if (transition == Transition::None)
                     {
-                        if (wizard->wantedPick() == InstallWizard::PickKind::Dump)
-                            picker.open("Selecciona tu dump del juego", homeDir,
-                                        {".iso", ".img", ".7z", ".zip", ".rar", ".tar", ".gz", ".tgz"});
-                        else
-                            picker.open("Selecciona el pack de texturas", homeDir, {".7z", ".zip"});
-                        wizard->clearWantedPick();
-                    }
-                    if (picker.draw())
-                    {
-                        if (wizard->packMode())
-                            wizard->onPickedPack(picker.result());
-                        else
-                            wizard->onPickedDump(picker.result());
-                    }
-                    if (wizard->closing())
-                    {
-                        wizard.reset();
-                        showWizard = false;
+                        if (settingsAsked && fader.start(1.0f, 0.16f, 0.20f))
+                            transition = Transition::OpenSettings;
+                        else if (playAsked && fader.start(1.0f, 0.45f, 0.20f))
+                            transition = Transition::Play;
                     }
                 }
-                else
-                {
-                    if (ImGui::BeginChild("##fe_side", ImVec2(190.0f, avail.y), ImGuiChildFlags_Borders))
+    else
+    {
+
+                        drawHeader(cfg.title);
+                    ImGui::Separator();
+
+                    const ImVec2 avail = ImGui::GetContentRegionAvail();
+                    if (showWizard && wizard)
                     {
-                        for (int i = 0; i < (int)(sizeof(kPages) / sizeof(kPages[0])); ++i)
+                        if (ImGui::BeginChild("##fe_wizard", ImVec2(0.0f, avail.y), ImGuiChildFlags_Borders))
+                            wizard->draw();
+                        ImGui::EndChild();
+
+                        if (wizard->wantedPick() != InstallWizard::PickKind::None && !picker.isOpen())
                         {
-                            if (ImGui::Selectable(kPages[i], page == i))
-                                page = i;
+                            if (wizard->wantedPick() == InstallWizard::PickKind::Dump)
+                                picker.open("Selecciona tu dump del juego", homeDir,
+                                            {".iso", ".img", ".7z", ".zip", ".rar", ".tar", ".gz", ".tgz"});
+                            else
+                                picker.open("Selecciona el pack de texturas", homeDir, {".7z", ".zip"});
+                            wizard->clearWantedPick();
+                        }
+                        if (picker.draw())
+                        {
+                            if (wizard->packMode())
+                                wizard->onPickedPack(picker.result());
+                            else
+                                wizard->onPickedDump(picker.result());
+                        }
+                        if (wizard->closing())
+                        {
+                            wizard.reset();
+                            showWizard = false;
                         }
                     }
-                    ImGui::EndChild();
-
-                    ImGui::SameLine(0.0f, 0.0f);
-                    if (ImGui::BeginChild("##fe_page", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders))
-                {
-                    if (ImGui::BeginChild("##fe_scroll", ImVec2(0.0f, -30.0f), ImGuiChildFlags_None))
+                    else
                     {
-                    if (page == 0)
-                    {
-                        ImGui::TextColored(gold(), "ESTADO");
-                        ImGui::Separator();
-                        statusRow("Datos del juego (data/)", scan.dataDir,
-                                  "presente", "FALTA: instalar los datos del juego");
-                        statusRow("Contenedores AFS", scan.afsCount > 0, "", "ninguno");
-                        if (scan.afsCount > 0)
+                        // Sidebar padding too, so the tab labels are not glued to its border.
+                        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                                            ImVec2(ImGui::GetFontSize() * 0.6f,
+                                                   ImGui::GetFontSize() * 0.4f));
+                        if (ImGui::BeginChild("##fe_side", ImVec2(190.0f, avail.y), ImGuiChildFlags_Borders))
                         {
-                            char buf[128];
-                            std::snprintf(buf, sizeof buf, "%u  (%.1f MB)",
-                                          scan.afsCount, scan.afsBytes / 1048576.0);
-                            statusRow("  total", true, buf, "");
-                        }
-                        statusRow("ELF de arranque", canPlay, "encontrado", "FALTA: no se encontro el ELF");
-                        if (canPlay)
-                            ImGui::TextWrapped("%s", scan.elf.c_str());
-                        ImGui::Separator();
-                        ImGui::TextColored(gold(), "JUGAR");
-                        ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.18f, 0.55f, 0.30f));
-                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.25f, 0.73f, 0.40f));
-                        ImGui::PushStyleColor(ImGuiCol_Text, dbz(0.02f, 0.06f, 0.03f));
-                        if (ImGui::Button("INICIAR EL JUEGO", ImVec2(240.0f, 34.0f)) && canPlay)
-                            wantBoot = true;
-                        ImGui::PopStyleColor(3);
-                        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) && canPlay)
-                            wantBoot = true;
-                        ImGui::Separator();
-                        if (!scan.dataDir || scan.afsCount == 0)
-                        {
-                            if (fe::primaryButton("INSTALAR DATOS DEL JUEGO", ImVec2(240.0f, 30.0f)))
+                            for (int i = 0; i < (int)(sizeof(kPages) / sizeof(kPages[0])); ++i)
                             {
-                                wizard = std::make_unique<InstallWizard>(exeDir);
-                                wizard->begin(false);
-                                showWizard = true;
+                            // Park the navigation cursor on the tab being shown, so a fresh
+                            // screen or a swapped page starts from a known place.
+                            if (i == page && navFocusWanted)
+                            {
+                                ImGui::SetKeyboardFocusHere();
+                                navFocusWanted = false;
+                            }
+                            if (ImGui::Selectable(kPages[i], page == i) && page != i &&
+                                transition == Transition::None)
+                            {
+                                // A tab swap does not need a black screen; a quick dip reads as
+                                // "the page changed" without flashing the whole window.
+                                if (fader.start(0.80f, 0.08f, 0.12f))
+                                {
+                                    transitionPage = i;
+                                    transition = Transition::SwitchPage;
+                                }
+                            }
                             }
                         }
-                        ImGui::TextDisabled("Tambien podes instalarlos desde Varios > Modo reinstalar.");
-                    }
-                    else if (page == 1)
+                        ImGui::EndChild();
+                        ImGui::PopStyleVar();
+
+                        ImGui::SameLine(0.0f, 0.0f);
+                        // Page padding keeps every label and section header off the border.
+                        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                                            ImVec2(ImGui::GetFontSize() * 0.7f,
+                                                   ImGui::GetFontSize() * 0.4f));
+                        if (ImGui::BeginChild("##fe_page", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders))
                     {
-                        drawVideoPage(pageCtx);
+                        // Fixed height, less the footer, so the action bar is pinned to the bottom.
+                        // The hint line is only reserved when one was shown last frame: the page
+                        // sets it later in the frame, so measuring it here would size the region
+                        // without it (buttons falling off the bottom) or leave a permanent gap
+                        // on the pages that never use one (bar floating mid-window).
+                        static bool hintShownLastFrame = false;
+                        const float ff = ImGui::GetFontSize();
+                        const float footerH = ff * (hintShownLastFrame ? 1.45f : 0.0f) + ff * 2.35f;
+                        if (ImGui::BeginChild("##fe_scroll", ImVec2(0.0f, -footerH), ImGuiChildFlags_None))
+                        {
+                        if (page == 0)
+                        {
+                            ImGui::TextColored(gold(), "ESTADO");
+                            ImGui::Separator();
+                            statusRow("Datos del juego (data/)", scan.dataDir,
+                                      "presente", "FALTA: instalar los datos del juego");
+                            statusRow("Contenedores AFS", scan.afsCount > 0, "", "ninguno");
+                            if (scan.afsCount > 0)
+                            {
+                                char buf[128];
+                                std::snprintf(buf, sizeof buf, "%u  (%.1f MB)",
+                                              scan.afsCount, scan.afsBytes / 1048576.0);
+                                statusRow("  total", true, buf, "");
+                            }
+                            statusRow("ELF de arranque", canPlay, "encontrado", "FALTA: no se encontro el ELF");
+                            if (canPlay)
+                                ImGui::TextWrapped("%s", scan.elf.c_str());
+                            ImGui::Separator();
+                            ImGui::TextColored(gold(), "JUGAR");
+                            ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.18f, 0.55f, 0.30f));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.25f, 0.73f, 0.40f));
+                            ImGui::PushStyleColor(ImGuiCol_Text, dbz(0.02f, 0.06f, 0.03f));
+                            if (ImGui::Button("INICIAR EL JUEGO", ImVec2(240.0f, 34.0f)) && canPlay)
+                                wantBoot = true;
+                            ImGui::PopStyleColor(3);
+                            if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) && canPlay)
+                                wantBoot = true;
+                            ImGui::Separator();
+                            if (!scan.dataDir || scan.afsCount == 0)
+                            {
+                                if (fe::primaryButton("INSTALAR DATOS DEL JUEGO", ImVec2(240.0f, 30.0f)))
+                                {
+                                    wizard = std::make_unique<InstallWizard>(exeDir);
+                                    wizard->begin(false);
+                                    showWizard = true;
+                                }
+                            }
+                            ImGui::TextDisabled("Tambien podes instalarlos desde Varios > Modo reinstalar.");
+                        }
+                        else if (page == 1)
+                        {
+                            drawVideoPage(pageCtx);
+                        }
+                        else if (page == 2)
+                        {
+                            drawAudioPage(pageCtx);
+                        }
+                        else if (page == 3)
+                        {
+                            drawInputPage(pageCtx);
+                        }
+                        else if (page == 4)
+                        {
+                            drawLoggingPage(pageCtx);
+                        }
+                        else if (page == 5)
+                        {
+                            drawMiscPage(pageCtx);
+                        }
+                        else
+                        {
+                            drawAboutPage(pageCtx);
+                        }
+                        // PS2X_FE_MEASURE reports how tall each page really is against the
+                        // viewport, so "does it all fit" is a number and not a guess.
+                        if (measure)
+                            std::fprintf(stderr, "[fe-measure] %-10s %5.0f px de contenido / %5.0f px de ventana  %s\n",
+                                         kPages[page], ImGui::GetCursorPosY(), ImGui::GetWindowHeight(),
+                                         ImGui::GetCursorPosY() > ImGui::GetWindowHeight() ? "DESBORDA" : "entra");
+                        }   // fe_scroll
+                        ImGui::EndChild();
+
+                        // Footer: a page can leave one line of text that goes just above the bar
+                        // (so it costs no page height), and the bar is only a separator line
+                        // here, not a black slab: the menu owns the heavy bar.
+                        {
+                            const float f = ImGui::GetFontSize();
+                            const char *hint = pageCtx.footerHint;
+                            if (hint)
+                            {
+                                const float hintH = f * 1.35f;
+                                ImGui::Dummy(ImVec2(0.0f, hintH));
+                                const ImVec2 hp = ImGui::GetCursorScreenPos();
+                                ImDrawList *hdl = ImGui::GetWindowDrawList();
+                                hdl->AddText(ImGui::GetFont(), f * 0.85f,
+                                             ImVec2(hp.x, hp.y - hintH * 0.95f),
+                                             ImGui::GetColorU32(fe::warnCol()), hint);
+                            }
+                            hintShownLastFrame = hint != nullptr;
+                            const float barTop = ImGui::GetCursorScreenPos().y - f * 0.45f;
+                            ImDrawList *fdl = ImGui::GetWindowDrawList();
+                            fdl->AddLine(ImVec2(0.0f, barTop), ImVec2(ImGui::GetWindowWidth(), barTop),
+                                         ImGui::GetColorU32(fe::accent(0.35f)), 1.0f);
+                        }
+
+                    bool playAsked = false;
+                    bool backAsked = false;
+                    drawPlayQuit(canPlay, playAsked, backAsked);
+                        if (transition == Transition::None)
+                        {
+                            if (backAsked && fader.start(1.0f, 0.16f, 0.20f))
+                                transition = Transition::BackToMenu;
+                            else if (playAsked && fader.start(1.0f, 0.45f, 0.20f))
+                                transition = Transition::Play;
+                        }
+                        ImGui::SameLine(0.0f, 18.0f);
+                        if (settings != settingsSaved)
+                            ImGui::TextColored(fe::gold(), "cambios sin guardar");
+                        else
+                            ImGui::TextDisabled("sin cambios pendientes");
+                        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 150.0f);
+                        if (fe::primaryButton("GUARDAR Y APLICAR", ImVec2(150.0f, 0.0f), true))
+                        {
+                            // Save and apply: the file is written now, and the per-player pad
+                            // profiles are flushed too, so what the game reads at boot is exactly
+                            // what the window shows.
+                            const bool okSettings = ps2x_settings::save(settings, configDir);
+                            const bool okPads = ps2_stubs::PadConfig::instance().save();
+                            if (okSettings)
+                                settingsSaved = settings;
+                            std::fprintf(stderr, "[fe] settings %s, pad config %s\n",
+                                         okSettings ? "saved" : "SAVE FAILED",
+                                         okPads ? "saved" : "not written");
+                        }
+                        }   // fe_page
+                        ImGui::PopStyleVar();
+
+                        // A page asked for the install view or a pack picker.
+                        if (pageCtx.requestInstallWizard || pageCtx.requestPackInstall)
+                        {
+                            wizard = std::make_unique<InstallWizard>(exeDir);
+                            wizard->begin(pageCtx.requestInstallWizard && scan.afsCount > 0);
+                            wizard->setPackMode(pageCtx.requestPackInstall);
+                            showWizard = true;
+                            if (pageCtx.requestPackInstall)
+                                wizard->requestPick(InstallWizard::PickKind::Pack);
+                            pageCtx.requestInstallWizard = false;
+                            pageCtx.requestPackInstall = false;
+                        }
                     }
-                    else if (page == 2)
-                    {
-                        drawAudioPage(pageCtx);
-                    }
-                    else if (page == 3)
-                    {
-                        drawInputPage(pageCtx);
-                    }
-                    else if (page == 4)
-                    {
-                        drawLoggingPage(pageCtx);
-                    }
-                    else if (page == 5)
-                    {
-                        drawMiscPage(pageCtx);
-                    }
-                    else
-                    {
-                        drawAboutPage(pageCtx);
-                    }
-                    }   // fe_scroll
                     ImGui::EndChild();
 
-                    if (settings != settingsSaved)
-                        ImGui::TextColored(fe::gold(), "cambios sin guardar");
-                    else
-                        ImGui::TextDisabled("sin cambios pendientes");
-                    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 110.0f);
-                    if (fe::primaryButton("GUARDAR", ImVec2(110.0f, 0.0f), true))
-                    {
-                        if (ps2x_settings::save(settings, configDir))
-                            settingsSaved = settings;
-                    }
-                    }   // fe_page
-
-                    // A page asked for the install view or a pack picker.
-                    if (pageCtx.requestInstallWizard || pageCtx.requestPackInstall)
-                    {
-                        wizard = std::make_unique<InstallWizard>(exeDir);
-                        wizard->begin(pageCtx.requestInstallWizard && scan.afsCount > 0);
-                        wizard->setPackMode(pageCtx.requestPackInstall);
-                        showWizard = true;
-                        if (pageCtx.requestPackInstall)
-                            wizard->requestPick(InstallWizard::PickKind::Pack);
-                        pageCtx.requestInstallWizard = false;
-                        pageCtx.requestPackInstall = false;
-                    }
                 }
-                ImGui::EndChild();
-
                 ImGui::End();
                 ImGui::PopStyleVar();
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
-                wantQuit = true;
-            win.endFrame();
+                // Esc walks back one level: Ajustes -> menu, menu -> quit.
+                if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) &&
+                    transition == Transition::None)
+                {
+                    if (screen == Screen::Settings)
+                    {
+                        if (fader.start(1.0f, 0.16f, 0.20f))
+                            transition = Transition::BackToMenu;
+                    }
+                    else
+                        wantQuit = true;
+                }
+
+                // [anim] Advance the fade and run the pending swap at full darkness, so the menu,
+                // the settings page and the handoff to the game never cut hard.
+                const auto t_now = std::chrono::steady_clock::now();
+                const float dt = std::chrono::duration<float>(t_now - t_prev).count();
+                t_prev = t_now;
+                fader.tick(dt, [&] {
+                    switch (transition)
+                    {
+                    case Transition::OpenSettings:
+                        screen = Screen::Settings;
+                        navFocusWanted = true;
+                        break;
+                    case Transition::BackToMenu:
+                        screen = Screen::Menu;
+                        navFocusWanted = true;
+                        break;
+                    case Transition::SwitchPage:
+                        page = transitionPage;
+                        navFocusWanted = true;
+                        break;
+                    case Transition::Play:
+                        wantBoot = true;
+                        fader.hold();
+                        break;
+                    case Transition::None:
+                        break;
+                    }
+                    transition = Transition::None;
+                });
+                fader.draw();
+                win.endFrame();
+        }
+        // Remember how the user left this window. Queried before shutdown, and saved whenever
+        // it moved, on top of the usual "only if the game settings changed" rule.
+        {
+            int curW = settings.feWidth, curH = settings.feHeight;
+            if (win.querySize(&curW, &curH) && curW > 0 && curH > 0 &&
+                (curW != settings.feWidth || curH != settings.feHeight))
+            {
+                settings.feWidth = curW;
+                settings.feHeight = curH;
+                settingsSaved.feWidth = curW;
+                settingsSaved.feHeight = curH;
+                if (ps2x_settings::save(settings, configDir))
+                    std::fprintf(stderr, "[fe] front-end window size saved: %dx%d\n", curW, curH);
+            }
         }
         if (settings != settingsSaved)
         {
@@ -492,6 +800,8 @@ namespace frontend
             else
                 std::fprintf(stderr, "[fe] settings NOT written (save failed)\n");
         }
+        if (padTesterUsable)
+            ps2x_pad::shutdown();
         std::fprintf(stderr, "[fe] settings: %s\n",
                      settingsExisted ? "loaded existing settings.toml"
                                      : "no settings.toml yet (defaults written)");

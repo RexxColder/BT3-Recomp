@@ -41,12 +41,30 @@ namespace frontend
 
     bool FeWindow::open(const std::string &title, int width, int height)
     {
-        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_EVENTS) != 0)
+        // GAMECONTROLLER is what the ImGui SDL2 backend polls to fill the gamepad navigation
+        // keys, and it has to be up before the backend looks for devices. The pad layer opens
+        // the very same controllers for the game, and SDL refcounts the subsystem.
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0)
         {
             std::fprintf(stderr, "[fe] SDL_Init failed: %s\n", SDL_GetError());
-            return false;
+            // Retry without the pad subsystem: a front-end with no gamepad navigation still beats
+            // no front-end at all.
+            if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_EVENTS) != 0)
+            {
+                std::fprintf(stderr, "[fe] SDL_Init (no gamepad) failed: %s\n", SDL_GetError());
+                return false;
+            }
+            std::fprintf(stderr, "[fe] continuing without gamepad navigation\n");
         }
         m_sdlUp = true;
+
+        int pads = 0;
+        for (int i = 0; i < SDL_NumJoysticks(); ++i)
+        {
+            if (SDL_IsGameController(i))
+                ++pads;
+        }
+        std::fprintf(stderr, "[fe] gamepads for navigation: %d\n", pads);
 
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
@@ -105,6 +123,7 @@ namespace frontend
         io.IniFilename = nullptr;
         io.LogFilename = nullptr;
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
 
         if (!ImGui_ImplSDL2_InitForOpenGL(m_window, m_gl))
         {
@@ -148,7 +167,22 @@ namespace frontend
         SDL_GL_SwapWindow(m_window);
     }
 
-    void FeWindow::shutdown()
+    bool FeWindow::querySize(int *width, int *height) const
+{
+    if (!m_window)
+        return false;
+    int w = 0, h = 0;
+    SDL_GetWindowSize(m_window, &w, &h);
+    if (w <= 0 || h <= 0)
+        return false;
+    if (width)
+        *width = w;
+    if (height)
+        *height = h;
+    return true;
+}
+
+void FeWindow::shutdown()
     {
         if (m_imguiUp)
         {
