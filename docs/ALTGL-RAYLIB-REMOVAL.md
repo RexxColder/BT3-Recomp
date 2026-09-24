@@ -186,7 +186,7 @@ verified.
 $env:PS2X_D3D11="0"; $env:PS2X_ALTGL="1"; $env:PS2X_GPU="1"
 $env:PS2X_EXEDIR="D:\Dragon Ball Budokai Tenkaichi 3 Recompiled"
 $env:PS2X_ASSETDIR="$env:PS2X_EXEDIR\assets"
-& "$env:PS2X_EXEDIR\bt3-runner.exe" "$env:PS2X_EXEDIR\data\SLUS_216.78"
+& "$env:PS2X_EXEDIR\Dragon Ball Z Budokai Tenkaichi 3 - Recompiled.exe" "$env:PS2X_EXEDIR\data\SLUS_216.78"
 ```
 
 Success line: `[altgl] present init ok (GL 3.3.0 Core ...)`.

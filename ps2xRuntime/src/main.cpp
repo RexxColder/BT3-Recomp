@@ -632,7 +632,9 @@ int main(int argc, char *argv[])
         if (argc < 2 && !std::getenv("PS2X_NOFRONTEND"))
         {
             frontend::FeConfig cfg;
-            cfg.title = "Budokai Tenkaichi 3 Recompiled";
+            // Single source of truth for the product name in C++. Keep it byte-identical to
+            // PRODUCT_NAME in games/bt3/setup.py, which names the deployed executable.
+            cfg.title = "Dragon Ball Z Budokai Tenkaichi 3 - Recompiled";
             cfg.exeDir = getExecutableDirectory().string();
             if (const char *def = std::getenv("PS2X_DEFAULT_BOOT_ELF"))
                 cfg.defaultElf = def;
@@ -750,7 +752,7 @@ int main(int argc, char *argv[])
 #endif
         if (!runtime.initialize(windowTitle.c_str()))
         {
-            std::cerr << "Failed to initialize PS2 runtime" << std::endl;
+            std::cerr << "Failed to initialize BT3 runtime" << std::endl;
             return 1;
         }
         std::fprintf(stderr, "[boot] start -> runtime init: %.1f ms\n",

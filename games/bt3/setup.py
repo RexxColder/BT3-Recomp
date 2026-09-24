@@ -48,6 +48,11 @@ ELF_SHA256 = "811188ba9b416500d921cd4d9514df0cbf42f3a41a99cf5aac5a3da37171bf99"
 # job count is auto-sized from CPU/RAM (see plan_build), and 16 GB lands back on this value.
 DEFAULT_JOBS = "3"
 
+# Name of the deployed executable (and therefore the process name on Windows). It carries
+# spaces and a hyphen on purpose, so every script that touches it has to quote it. Keep it
+# byte-identical to the kProductName title in ps2xRuntime/src/main.cpp.
+PRODUCT_NAME = "Dragon Ball Z Budokai Tenkaichi 3 - Recompiled"
+
 # Pinned tool versions (stage 2 installs exactly these; keep in sync with the release builds).
 CMAKE_MIN = (3, 21)
 MESA_LAVAPIPE_VERSION = "26.2.0"
@@ -1704,7 +1709,7 @@ def bundle_windows(ctx: "Context", stage: Path, runner: Path) -> None:
     stage_lib = stage_assets / "lib"
     stage_lib.mkdir(parents=True, exist_ok=True)
 
-    runner_name = "bt3-runner.exe"
+    runner_name = PRODUCT_NAME + ".exe"
     if (stage / runner_name).exists():
         pass
     elif (stage / "ps2EntryRunner.exe").exists():
@@ -1727,7 +1732,7 @@ def bundle_windows(ctx: "Context", stage: Path, runner: Path) -> None:
             warn(f"VC++ runtime {dll} not found; the target machine must install the VC++ redistributable")
 
     # Windows resolves DLLs from the EXE's directory before main(): flatten EVERY bundled DLL next to
-    # the executable so a double-click on bt3-runner.exe works. assets/lib stays the canonical bundle;
+    # the executable so a double-click on it works. assets/lib stays the canonical bundle;
     # the flat copies are the load-time safety net.
     flat = 0
     for p in stage_lib.glob("*.dll"):
@@ -1803,7 +1808,7 @@ def bundle_linux(ctx: "Context", stage: Path, runner: Path) -> None:
     stage_lib = stage_assets / "lib"
     stage_lib.mkdir(parents=True, exist_ok=True)
 
-    bin_runner = stage / "bt3-runner"
+    bin_runner = stage / PRODUCT_NAME
     shutil.copy2(runner, bin_runner)
     bin_runner.chmod(bin_runner.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     raw = stage / "ps2EntryRunner"   # deploy_tree dropped the build name here

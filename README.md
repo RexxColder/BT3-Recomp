@@ -64,8 +64,8 @@ _Screenshots are on the way._
    `BT3-Recomp-linux-x86_64.tar.gz` / `BT3-Recomp-macos-x86_64.tar.gz` elsewhere).
 2. Extract it.
 3. Launch:
-   - **Windows** — `bt3-runner.exe`
-   - **Linux** — `./bt3-runner` (or `./install game.sh` for a desktop menu entry + icon)
+   - **Windows** — `Dragon Ball Z Budokai Tenkaichi 3 - Recompiled.exe`
+   - **Linux** — `./Dragon Ball Z Budokai Tenkaichi 3 - Recompiled` (or `./install game.sh` for a desktop menu entry + icon)
    - **macOS (experimental)** — open `BT3-Recomp.app`
 
 Run it with no arguments and the front-end opens: it reads your USA ISO on first
@@ -194,7 +194,7 @@ limitations.
 ```powershell
 cd build\ps2xRuntime\Release
 set PS2X_CD_IMAGE=C:\path\to\your\bt3-usa.iso
-bt3-runner.exe ..\..\..\games\bt3\work\SLUS_216.78
+"Dragon Ball Z Budokai Tenkaichi 3 - Recompiled.exe" ..\..\..\games\bt3\work\SLUS_216.78
 ```
 
 ### Project structure & developer docs

@@ -11,7 +11,7 @@ DEST="$BASE/bt3-recomp"
 echo "== installing to $DEST"
 mkdir -p "$DEST"
 
-cp -a "$SRC"/bt3-runner "$SRC"/assets "$DEST"/
+cp -a "$SRC"/"Dragon Ball Z Budokai Tenkaichi 3 - Recompiled" "$SRC"/assets "$DEST"/
 
 # no game data here: the install wizard in the front-end extracts it from the
 # user's own ISO into $DEST/data on first run. Existing $DEST/data is left untouched.
@@ -39,7 +39,7 @@ set -euo pipefail
 cd "$DEST"
 export LD_LIBRARY_PATH="\$PWD/assets/lib"
 export PS2X_EXEDIR="\$PWD"
-exec ./bt3-runner "\$@"
+exec "./Dragon Ball Z Budokai Tenkaichi 3 - Recompiled" "\$@"
 EOF
 chmod +x "$WRAP"
 

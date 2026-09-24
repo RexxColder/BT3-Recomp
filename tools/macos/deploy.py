@@ -21,6 +21,10 @@ def output(*args):
     return subprocess.check_output(list(map(str, args)), text=True).strip()
 
 
+# Must match PRODUCT_NAME in games/bt3/setup.py. It carries spaces on purpose.
+RUNNER_NAME = "Dragon Ball Z Budokai Tenkaichi 3 - Recompiled"
+
+
 def version(value):
     return tuple((list(map(int, value.split("."))) + [0, 0])[:3])
 
@@ -43,7 +47,7 @@ def make_icns(source, destination, workdir):
 
 def audit(app, minimum):
     """Reject unresolved external libraries and a falsely advertised OS floor."""
-    required_arches = set(output("lipo", "-archs", app / "Contents/MacOS/bt3-runner").split())
+    required_arches = set(output("lipo", "-archs", app / "Contents/MacOS" / RUNNER_NAME).split())
     macho = []
     seen = set()
     for path in app.rglob("*"):
@@ -145,7 +149,7 @@ def main():
         app = Path(tmp) / "BT3-Recomp.app"
         # The front-end lives inside the runner, so the bundle is just the runner plus its
         # resources, closure and icon; there is no second executable to embed.
-        bundled_runner = app / "Contents/MacOS/bt3-runner"
+        bundled_runner = app / "Contents/MacOS" / RUNNER_NAME
         resources = app / "Contents/Resources"
         bundled_runner.parent.mkdir(parents=True)
         resources.mkdir(parents=True)
@@ -155,7 +159,7 @@ def main():
             "CFBundleName": "BT3-Recomp",
             "CFBundleDisplayName": "BT3-Recomp",
             "CFBundleIdentifier": "org.bt3recomp.app",
-            "CFBundleExecutable": "bt3-runner",
+            "CFBundleExecutable": RUNNER_NAME,
             "CFBundlePackageType": "APPL",
             "CFBundleShortVersionString": "1.0",
             "CFBundleVersion": "1.0",

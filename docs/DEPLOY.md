@@ -10,7 +10,7 @@ BT3-Recomp-linux-x86_64.sha256
 ```
 
 or `BT3-Recomp-win-x86_64.zip` on Windows, `BT3-Recomp-macos-x86_64.tar.gz` on
-macOS. There is no SELFX stub any more: unzip the archive and run `bt3-runner`,
+macOS. There is no SELFX stub any more: unzip the archive and run `Dragon Ball Z Budokai Tenkaichi 3 - Recompiled`,
 which shows the front-end and installs the game from your ISO on first run.
 
 ## Deploy tree
@@ -19,7 +19,7 @@ Unpacking `Dragon Ball Budokai Tenkaichi 3 Recompiled/` gives:
 
 ```
 Dragon Ball Budokai Tenkaichi 3 Recompiled/
-├── bt3-runner              # the game + front-end (Windows → bt3-runner.exe)
+├── Dragon Ball Z Budokai Tenkaichi 3 - Recompiled  # the game + front-end (Windows: Dragon Ball Z Budokai Tenkaichi 3 - Recompiled.exe)
 ├── install game.sh         # Linux helper: menu entry + desktop icon
 ├── assets/lib/             # runner's shared-library closure (Linux)
 ├── assets/                 # app artwork, fonts, AFS name lists (background.png, icon.png, …)
@@ -44,7 +44,7 @@ Python script that hosts the build pipeline (and is the base for Windows).
 
 | Script | Platform | Role |
 |---|---|---|
-| `scripts/build-linux.sh` | Linux | Thin wrapper: `setup.py <iso> --package`. The script itself detects the platform, installs missing dependencies (stage 2), builds (stage 3) and assembles the portable tree + `tar.gz` (stage 4): `ldd` closure minus the glibc/C++ core, `bt3-runner` rename, assets, `install game.sh`, glibc floor gate. |
+| `scripts/build-linux.sh` | Linux | Thin wrapper: `setup.py <iso> --package`. The script itself detects the platform, installs missing dependencies (stage 2), builds (stage 3) and assembles the portable tree + `tar.gz` (stage 4): `ldd` closure minus the glibc/C++ core, the product-name rename, assets, `install game.sh`, glibc floor gate. |
 | `scripts/build-linux-portable.sh` | Linux | **Portable release**: runs the same build inside `ubuntu:22.04` with `BT3_GLIBC_MAX=2.35`, so the artifact runs on Ubuntu/Kubuntu 22.04 and 24.04 (glibc 2.35 / 2.39). Use this for **anything you distribute**; a native `build-linux.sh` on a rolling distro (e.g. Arch, glibc 2.44) produces a binary that aborts on 24.04 with ``libm.so.6: version `GLIBC_2.43' not found``. Self-builds on a user's own distro are unaffected (they link their own glibc). |
 | `games/bt3/setup.py` | All | The single entry point. Four stages: **1 detect** (platform/toolchain/deps, `--report json`), **2 deps** (interactive install of what is missing), **3 build** (extract/verify ISO, VU1, recompiler, ~7,800 sources, patches, overlay, runner), **4 package** (portable tree, PE/glibc gate, zip/tar.gz/`.app` + sha256), then asks where to send the artifact. |
 | `scripts/build-macos.sh` | macOS (experimental) | Thin wrapper: `setup.py <iso> --package`. Stage 4 hands the bundle over to `tools/macos/deploy.py --skip-build` (relocated dylibs, `Info.plist`, icudata, ad-hoc signing). |
@@ -97,7 +97,7 @@ Inside the unpacked folder, `install game.sh` (copy made from
 
 Existing `~/.local/share/bt3-recomp/savedata/` is preserved on re-run, so saves
 and settings survive reinstallation. The folder itself remains fully portable:
-you can skip the install script and run `bt3-runner` straight from the unpacked
+you can skip the install script and run `Dragon Ball Z Budokai Tenkaichi 3 - Recompiled` straight from the unpacked
 tree.
 
 ## Build + deploy (Windows, native)
@@ -113,7 +113,7 @@ Win11 SDK), Ninja and Python 3; no WSL required.
 The pipeline generates the sources (`setup.py --gen-only` is target-agnostic),
 builds the runner with the front-end in it, bundles the FFmpeg and VC++ runtime
 DLLs into `assets/lib/`, writes the portable tree to
-`build/release-windows/out/stage/` (`bt3-runner.exe`,
+`build/release-windows/out/stage/` (`Dragon Ball Z Budokai Tenkaichi 3 - Recompiled.exe`,
 `assets/`, `savedata/`, licences, `settings.toml`) and runs a PE gate —
 `check_windows_deps.py` (pefile) verifies that every PE import resolves either
 from `assets/lib/` or to a Windows OS component, and that the layout is complete.
@@ -139,7 +139,7 @@ rejected so a failed build cannot overwrite a working app. `PS2X_BUILD_DIR` sele
 an alternate build directory. Build each CPU architecture separately; Universal 2
 is not supported by the shared SIMD configuration.
 
-The script stages `bt3-runner` in `Contents/MacOS`, assets in `Contents/Resources`,
+The script stages `Dragon Ball Z Budokai Tenkaichi 3 - Recompiled` in `Contents/MacOS`, assets in `Contents/Resources`,
 and walks the runner's dylib closure into `Contents/Frameworks` with
 `install_name_tool`. It checks architectures, rejects external absolute
 library paths, checks the minimum OS versions in Mach-O load commands, then signs

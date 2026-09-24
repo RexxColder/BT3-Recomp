@@ -1391,11 +1391,11 @@ PS2Runtime::~PS2Runtime()
     }
     catch (const std::exception &e)
     {
-        std::cerr << "[~PS2Runtime] cleanup exception: " << e.what() << std::endl;
+        std::cerr << "[~BTRuntime] cleanup exception: " << e.what() << std::endl;
     }
     catch (...)
     {
-        std::cerr << "[~PS2Runtime] cleanup exception: unknown" << std::endl;
+        std::cerr << "[~BTRuntime] cleanup exception: unknown" << std::endl;
     }
 }
 
@@ -1787,11 +1787,11 @@ bool PS2Runtime::initialize(const char *title)
     }
     catch (const std::exception &e)
     {
-        std::cerr << "Failed to initialize PS2 runtime: " << e.what() << std::endl;
+        std::cerr << "Failed to initialize BT3 runtime: " << e.what() << std::endl;
     }
     catch (...)
     {
-        std::cerr << "Failed to initialize PS2 runtime: unknown exception" << std::endl;
+        std::cerr << "Failed to initialize BT3 runtime: unknown exception" << std::endl;
     }
 
     return false;

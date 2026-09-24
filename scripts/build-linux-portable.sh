@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Build a **portable** Linux release against glibc 2.35 (Ubuntu 22.04), so the packaged
-# `bt3-runner` runs on Ubuntu/Kubuntu 22.04 and 24.04 (glibc 2.35 / 2.39) and other
+# the runner runs on Ubuntu/Kubuntu 22.04 and 24.04 (glibc 2.35 / 2.39) and other
 # distros with glibc >= 2.35.
 #
 # Why: a native build inherits the build host's glibc. Building on a rolling distro (e.g. Arch,
 # glibc 2.44) produces a binary that needs GLIBC_2.4x and aborts on 24.04 with:
-#     libm.so.6: version `GLIBC_2.43' not found (required by bt3-runner)
+#     libm.so.6: version `GLIBC_2.43' not found (required by the runner)
 # Self-builds on the user's own distro are unaffected (they use their own glibc); this wrapper is
 # only for producing a distributable artifact.
 #

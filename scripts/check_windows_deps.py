@@ -112,9 +112,11 @@ def is_os_component(name: str) -> bool:
 
 MACHINE_AMD64 = 0x8664  # IMAGE_FILE_MACHINE_AMD64
 SUBSYSTEM_WINDOWS_GUI = 2  # IMAGE_SUBSYSTEM_WINDOWS_GUI
+# Must match PRODUCT_NAME in games/bt3/setup.py (the name the pipeline gives the exe).
+RUNNER_EXE = "dragon ball z budokai tenkaichi 3 - recompiled.exe"
 
 REQUIRED_LAYOUT = [
-    "bt3-runner.exe",
+    RUNNER_EXE,
     "LICENSE",
     "COPYING.LGPLv3",
     "savedata/settings.toml",
@@ -188,7 +190,7 @@ def main() -> int:
             subsystem = pe.OPTIONAL_HEADER.Subsystem
         except Exception:
             subsystem = None
-        if rel.name.lower() == "bt3-runner.exe":
+        if rel.name.lower() == RUNNER_EXE:
             if subsystem != SUBSYSTEM_WINDOWS_GUI:
                 problems.append(
                     f"{rel}: subsystem {subsystem if subsystem is not None else 'n/a'} is not Windows GUI "
