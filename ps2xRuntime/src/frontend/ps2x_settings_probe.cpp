@@ -87,8 +87,7 @@ int main()
         w.texPack = true;
         w.introVideo = false;
         w.buttonLayout = 0;
-        w.texcache = false;
-        check(ps2x_settings::save(w, dir), "save()");
+            check(ps2x_settings::save(w, dir), "save()");
 
         ps2x_settings::Settings r;
         check(ps2x_settings::load(r, dir), "load() del archivo escrito");
@@ -96,7 +95,7 @@ int main()
         check(r.renderer == ps2x_settings::kRendererSoftware, "renderer");
         check(r.outline && r.inkStrength == 250 && r.inkColor == 0xFF8800u, "ink");
         check(r.renderScale == 3 && r.windowMode == 2 && r.monitor == 1, "escala/modo/monitor");
-        check(r.fps60 && r.texPack && !r.introVideo && r.buttonLayout == 0 && !r.texcache, "flags de video");
+        check(r.fps60 && r.texPack && !r.introVideo && r.buttonLayout == 0, "flags de video");
         check(r.hudLayout == 2 && r.hudOffR == -7, "hud");
         check(r.device == 3 && r.deadzone == 0.25f && !r.overlayEnabled, "mandos");
         check(r.overlayPadBtns == "12,14,16" && r.overlayKeys == "340,258,262", "hotkeys");

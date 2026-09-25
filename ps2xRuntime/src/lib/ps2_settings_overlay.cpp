@@ -570,7 +570,6 @@ void PS2SettingsOverlay::loadSettings()
         else m_settings.texPack = doc.getB("video.texture_pack", m_settings.texPack);
         if (envUserSet("PS2X_FMV_OVERRIDE")) m_envLocked |= ps2x_settings::kLockIntroVideo;
         else m_settings.introVideo = doc.getB("video.intro_video", m_settings.introVideo);
-        m_settings.texcache = doc.getB("video.texcache", m_settings.texcache);
         if (envUserSet("PS2X_BUTTONS")) m_envLocked |= ps2x_settings::kLockButtonLay;
         else m_settings.buttonLayout = doc.getI("video.button_layout", m_settings.buttonLayout);
         if (envUserSet("PS2X_SHADOWS")) m_envLocked |= ps2x_settings::kLockShadows;
@@ -765,7 +764,6 @@ void PS2SettingsOverlay::saveSettings() const
     live.outline = m_settings.outline;
     live.texPack = m_settings.texPack;
     live.introVideo = m_settings.introVideo;
-    live.texcache = m_settings.texcache;
     live.buttonLayout = m_settings.buttonLayout;
     live.shadows = m_settings.shadows;
     live.dofBlur = m_settings.dofBlur;

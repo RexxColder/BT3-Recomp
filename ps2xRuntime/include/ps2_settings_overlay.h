@@ -45,14 +45,6 @@ public:
         bool outline = false;
         bool texPack = false;   // [texreplace] use the PCSX2 replacement pack when one is indexed (default OFF)
         bool introVideo = true; // [texui] 4K opening-video override when the pack ships it (applies on restart)
-        // [texcache] persisted texture cache. Env-gated through PS2X_TEXCACHE at runtime; this
-        // key only rides along so the front-end does not clobber it. DEFAULT OFF (2026-09-25):
-        // loading a 1.95 GB cache.bin costs 9.1 s of boot before the first frame, and every
-        // 512 newly cached textures rewrites the whole file -- 1.2 GB per flush, ~5.8 GB per
-        // 3-minute session. Measured against the frame pacing it did not buy back the startup
-        // (see the [texcache] flush log lines), so the cost is paid up front by default and
-        // anyone who wants the cache back flips this in the launcher.
-        bool texcache = false;
         int buttonLayout = 1;   // [texui] 0 = PS2 (Original Buttons), 1 = Xbox (Xbox Layout); applies on restart
         bool fps60 = false;   // [fps60] 60 fps mode: fight step 1 + the pacing table (applies between fights)
     // [perf] Show the live fps / frame-time / GPU-busy block in this tab's STATUS section. Off by

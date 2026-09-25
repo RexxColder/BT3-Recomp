@@ -5007,7 +5007,7 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
     // [texblackrace] g_texAlphaBinary is filled on the GL thread (see the s_ups upload pass in
     // renderAndGetTextureId), NOT here: putTexture runs on decode/worker threads and the draw
     // loop reads it WITHOUT m_mtx (PS2X_DATE, default on). A concurrent rehash crashed the map.
-    // [texcache] Write-back lives in GSRasterizer::applyTexReplacement (it knows whether the pack
+    // Write-back lives in GSRasterizer::applyTexReplacement (it knows whether the pack
     // replacement is final vs still pending). See the comment there.
 }
 

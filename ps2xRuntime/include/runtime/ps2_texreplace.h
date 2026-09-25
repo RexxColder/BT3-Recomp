@@ -78,9 +78,8 @@ namespace ps2tex
     bool loadReplacement(const TexIdent &id, uint64_t texKey, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt);
     bool takeReadySwap(uint64_t texKey);
 
-    // [texcache] True while the async replacement for `id` is queued/decoding (its first decode
-    // uploads the ORIGINAL). The texcache must NOT store the result then, or it would bake the
-    // original and the read hook would cancel the later swap re-decode.
+    // True while the async replacement for `id` is queued/decoding (its first decode uploads the
+    // ORIGINAL), so a caller must re-decode rather than reuse the first decode's result.
     bool replacementPending(const TexIdent &id);
 
     // [texmega] One-shot diagnostic dump (enable PS2X_TEXMEGA=1, arm with F9). While armed it

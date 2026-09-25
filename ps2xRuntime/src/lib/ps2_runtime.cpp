@@ -23,10 +23,9 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #endif
 #include "ps2_host_window.h"   // [B] native window handle (SDL returns SDL_Window*, not the HWND)
 #include "runtime/ps2_texreplace.h"   // [texreplace]
-#include "runtime/ps2_texcache.h"     // [texcache]
 #include "runtime/ps2_coverage.h"     // [coverage]
 #include "runtime/ps2_iop_module.h"   // [r3000] IRX loader
-#include "runtime/ps2_toml.h"         // [texcache] settings.toml
+#include "runtime/ps2_toml.h"         // settings.toml
 #include "runtime/ps2_video_status.h"   // [video] the Video-tab status the overlay polls
 #include "runtime/ps2x_perf_status.h"   // [perf] the fps / frame-time / GPU-busy readout
 #include "runtime/ps2_toml.h"   // [winmode] startup read of [video] window_mode / monitor
@@ -1668,45 +1667,8 @@ bool PS2Runtime::initialize(const char *title)
             // extracted ISO tree; the folder is created if absent.)
             ps2tex::replacementsEnabled();
         }
-        ps2cov::init();   // [coverage] PS2X_COVERAGE: capture interpreter fallbacks
-        {   // [texcache] Persistent write-back texture cache: configure + load at startup. Filled by
-            // the write-back hook in putTexture (the FINAL payload: decode + pack replacement).
-            const char *xd = ps2xExeDirC();
-            const std::string base = (xd && xd[0]) ? xd : ".";
-            // Read the toggles that change WHAT the cache contains: texture_pack (originals vs
-            // replaced) and button_layout. They go into packHash so a change invalidates the file,
-            // otherwise a cache built with the pack OFF would keep serving originals after enabling.
-            bool tcEnabled = true, packOn = false;
-            int btnLayout = 1;
-            {
-                std::ifstream f(base + "/savedata/settings.toml");
-                if (f.is_open())
-                {
-                    ps2x_toml::Document doc; doc.parse(f);
-                      // Default OFF, matching Settings::texcache. This fallback is what a user with no
-                      // settings.toml gets, so leaving it true would hand everyone the 1.95 GB /
-                      // 9.1 s-boot cache that the in-game default no longer asks for.
-                      tcEnabled = doc.getB("video.texcache", false);
-                    packOn = doc.getB("video.texture_pack", false);
-                    btnLayout = doc.getI("video.button_layout", 1);
-                }
-            }
-            if (const char *v = std::getenv("PS2X_TEXCACHE_ON"); v && v[0] == '0') tcEnabled = false;
-            uint64_t packHash = 1469598103934665603ull;
-            for (const char *p = ps2tex::replacementsRoot(); p && *p; ++p)
-                packHash = (packHash ^ (uint8_t)*p) * 1099511628211ull;
-            packHash ^= (uint64_t)ps2tex::replacementsCount();
-            packHash ^= packOn ? 0x9E3779B97F4A7C15ull : 0ull;
-            packHash ^= (uint64_t)(uint32_t)btnLayout * 0xC2B2AE3D27D4EB4Full;
-            uint64_t dataHash = 1469598103934665603ull;
-            for (const char *p = base.c_str(); p && *p; ++p)
-                dataHash = (dataHash ^ (uint8_t)*p) * 1099511628211ull;
-            const std::string tcPath = base + "/data/texcache.bin";
-            ps2texcache::setConfig(tcEnabled, packHash, dataHash, tcPath.c_str());
-            ps2texcache::load();
-        }
-        _mark("texcache");
-        {   // [fps60] PS2X_FPS60=1: enable the 60-fps fight mode from the env (loads fps60_sites.txt,
+    ps2cov::init();   // [coverage] PS2X_COVERAGE: capture interpreter fallbacks
+    {   // [fps60] PS2X_FPS60=1: enable the 60-fps fight mode from the env (loads fps60_sites.txt,
             // staged next to the runner). Lets the perf A/B be run without touching settings.toml.
             const char *f60 = std::getenv("PS2X_FPS60");
             if (f60 && f60[0] && f60[0] != '0') ps2Set60Fps(true, nullptr);

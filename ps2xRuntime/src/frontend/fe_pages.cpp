@@ -719,35 +719,6 @@ namespace frontend
             }
         }
 
-        if (fe::beginSection("CACHE DE TEXTURAS", false,
-                             "Guarda cada textura ya resuelta (decodificacion PSMT y reemplazo del "
-                             "pack aplicados) en un unico archivo. Las siguientes ejecuciones suben la "
-                             "cache directo: sin busqueda de hash en VRAM, sin lookup del pack y sin "
-                             "decodificar PNG/DDS. Se rehace sola cuando cambian el pack o el "
-                             "reemplazo. Borrarla solo fuerza la reconstruccion; no toca el pack."))
-        {
-            fe::toggleSwitch("Activar cache de texturas", &s.texcache);
-
-            std::error_code ec;
-            const std::filesystem::path cache = dataDir / "texcache.bin";
-            if (std::filesystem::is_regular_file(cache, ec))
-            {
-                char size[32];
-                fe::formatBytes((unsigned long long)std::filesystem::file_size(cache, ec), size, sizeof size);
-                fe::statusRow("Estado", fe::okCol(), size);
-                fe::rowLabel("Borrar");
-                if (ImGui::Button("Borrar cache de texturas"))
-                {
-                    std::filesystem::remove(cache, ec);
-                    std::filesystem::remove(std::filesystem::path(cache.string() + ".tmp"), ec);
-                }
-            }
-            else
-            {
-                fe::statusRow("Estado", fe::warnCol(), "todavia no construida (se llena al jugar)");
-            }
-        }
-
     // The overlay shortcut belongs with the other runtime switches, not with the pad.
     if (fe::beginSection("OVERLAY DEL JUEGO", false,
                          "Atajo para abrir y cerrar el menu de ajustes dentro de la partida. "

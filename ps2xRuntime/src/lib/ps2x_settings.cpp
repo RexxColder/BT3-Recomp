@@ -152,7 +152,6 @@ namespace
         s.texPack = doc.getB("video.texture_pack", s.texPack);
         s.introVideo = doc.getB("video.intro_video", s.introVideo);
         s.buttonLayout = doc.getI("video.button_layout", s.buttonLayout);
-        s.texcache = doc.getB("video.texcache", s.texcache);
         s.shadows = doc.getB("video.shadows", s.shadows);
         s.dofBlur = doc.getB("video.dof_blur", s.dofBlur);
         s.dofZFar = doc.getI("video.dof_zfar", s.dofZFar);
@@ -259,7 +258,6 @@ namespace
                 else if (key == "texture_pack") s.texPack = b;
                 else if (key == "intro_video") s.introVideo = b;
                 else if (key == "button_layout") s.buttonLayout = asInt(s.buttonLayout);
-                else if (key == "texcache") s.texcache = b;
                 else if (key == "fps60") s.fps60 = b;
                 else if (key == "hud_layout") s.hudLayout = asInt(s.hudLayout);
                 else if (key == "hud_off_l") s.hudOffL = asInt(s.hudOffL);
@@ -310,7 +308,7 @@ namespace ps2x_settings
                a.dofZFar == b.dofZFar && a.fullscreen == b.fullscreen && a.windowMode == b.windowMode &&
                a.monitor == b.monitor && a.gpu == b.gpu && a.widescreen == b.widescreen && a.windowW == b.windowW &&
                a.windowH == b.windowH && a.forceBilinear == b.forceBilinear && a.texPack == b.texPack &&
-               a.introVideo == b.introVideo && a.texcache == b.texcache &&
+               a.introVideo == b.introVideo &&
                a.buttonLayout == b.buttonLayout && a.fps60 == b.fps60 && a.showPerf == b.showPerf &&
                a.hudOffL == b.hudOffL && a.hudOffC == b.hudOffC && a.hudOffR == b.hudOffR &&
                a.device == b.device && a.deadzone == b.deadzone &&
@@ -411,7 +409,6 @@ namespace ps2x_settings
         os << "texture_pack = " << fmtBool(s.texPack) << "\n";
         os << "intro_video = " << fmtBool(s.introVideo) << "\n";
         os << "button_layout = " << fmtInt(s.buttonLayout) << "\n";
-        os << "texcache = " << fmtBool(s.texcache) << "\n";
         os << "shadows = " << fmtBool(s.shadows) << "\n";
         os << "dof_blur = " << fmtBool(s.dofBlur) << "\n";
         os << "dof_zfar = " << fmtInt(s.dofZFar) << "\n";
@@ -515,8 +512,7 @@ namespace ps2x_settings
         out.sfx = live.sfx;
         out.inkWidth = live.inkWidth;
         out.inkColor = live.inkColor;
-        out.texcache = live.texcache;
-        out.fullscreen = live.fullscreen;
+            out.fullscreen = live.fullscreen;
         out.windowMode = live.windowMode;
         out.monitor = live.monitor;
         out.widescreen = live.widescreen;

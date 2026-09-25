@@ -61,8 +61,7 @@ namespace ps2x_settings
         bool forceBilinear = true;
         bool texPack = false;
         bool introVideo = true;
-        bool texcache = true;
-        int buttonLayout = 1;
+            int buttonLayout = 1;
         bool fps60 = false;
         // [perf] Live fps / frame-time / GPU-busy readout in the overlay's Video tab. Off by default:
         // the GPU side costs a timing query per draw call, and nothing should pay that unless someone
