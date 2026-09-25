@@ -60,7 +60,14 @@ struct PerfStatus
     GpuSource gpuSource = GpuSource::None;
     GpuQuality gpuQuality = GpuQuality::Unknown;
     double   gpuCoverage = 0.0;    // 0..1, what fraction of the frame the measurement spans
+    int      gpuSamples = 0;       // queries that landed in this window
     int      gpuSamplesDropped = 0;// queries whose result had not landed and were discarded
+
+    // A percentage is only meaningful with samples behind it, and "the backend registered but the
+    // guest issued no draw list this window" is a real state that a bare 0% cannot express -- it looks
+    // exactly like an idle GPU. gpuSamples == 0 with a real gpuSource is that state. Measured live:
+    // three consecutive windows went 61% -> 0.65% -> 0.61% purely because the guest stopped drawing.
+    bool gpuMeasured() const { return gpuSamples > 0; }
 
     // Wall seconds covered by the most recent sample. A caller updating its own average needs this
     // rather than assuming a fixed interval.
@@ -80,8 +87,10 @@ bool PerfOverlayEnabled();
 // the figures as CPU-only.
 void PerfSetGpuSource(GpuSource source, GpuQuality quality);
 
-// Add GPU busy time for the current window, in nanoseconds, plus how many samples were lost.
-void PerfAddGpuBusyNs(unsigned long long ns, int samplesDropped);
+// Add GPU busy time for the current window. samplesLanded is how many measurements backed `ns` and
+// samplesDropped how many were discarded because their result had not arrived. Keeping the landed
+// count is what lets a caller tell a real 0% from "nothing was measured this window".
+void PerfAddGpuBusyNs(unsigned long long ns, int samplesLanded, int samplesDropped);
 
 // The CPU counters live in other translation units' namespaces, so the runtime's once-a-second stats
 // tick publishes absolute totals and this module differences them. Passing 0 until the first publish

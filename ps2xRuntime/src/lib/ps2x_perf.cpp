@@ -36,14 +36,20 @@ struct PerfState
     double windowSeconds = 0.0;
 
     // CPU side. The counters live in other translation units' namespaces, so the runtime's [fps]
-    // block publishes absolute totals once a second via PerfPublishCpu() and we difference them.
+    // block publishes absolute totals once a second via PerfPublishCpu(), which differences them
+    // against the previous publish and accumulates the delta into the current window.
     unsigned long long guestBusyNs = 0;
     unsigned long long wallNs = 0;
     unsigned long long submitNs = 0;
+    unsigned long long cpuGuestWindowNs = 0;
+    unsigned long long cpuWallWindowNs = 0;
+    unsigned long long cpuSubmitWindowNs = 0;
     bool cpuSeen = false;
+    bool cpuResetSeen = false;   // a counter went backwards this window: the CPU figures are unknown
 
     // GPU side, accumulated over the current window.
     unsigned long long gpuBusyNs = 0;
+    int gpuSamplesLanded = 0;
     int gpuDropped = 0;
 
     ps2x::GpuSource gpuSource = ps2x::GpuSource::None;
@@ -111,16 +117,43 @@ void PerfSetRefreshHz(int hz)
 void PerfPublishCpu(unsigned long long guestBusyNs, unsigned long long wallNs, unsigned long long submitNs)
 {
     std::lock_guard<std::mutex> lk(g_perf.mtx);
+    // These arrive as CUMULATIVE totals, not per-window values, and the difference matters: dividing
+    // an absolute nanosecond count by a one-second window produced guest_pct values in the hundreds
+    // and thousands, which is not a percentage of anything. Take the delta here, where the previous
+    // sample lives, and accumulate it into the window -- a single publish per second is then one
+    // window's worth of work.
+    //
+    // A counter that moves BACKWARDS is a reset, not a negative delta: g_bt3FrameCount is store()d
+    // (not just incremented) on a savestate load, and the timing accumulators reset with the runtime.
+    // Treat it as zero for that window rather than wrapping into an absurd figure.
+    if (g_perf.cpuSeen)
+    {
+        const auto delta = [](unsigned long long now, unsigned long long prev, bool *reset) -> unsigned long long
+        {
+            if (now < prev)
+            {
+                *reset = true;   // savestate load or runtime restart, not a negative delta
+                return 0ull;
+            }
+            return now - prev;
+        };
+        bool reset = false;
+        g_perf.cpuGuestWindowNs += delta(guestBusyNs, g_perf.guestBusyNs, &reset);
+        g_perf.cpuWallWindowNs += delta(wallNs, g_perf.wallNs, &reset);
+        g_perf.cpuSubmitWindowNs += delta(submitNs, g_perf.submitNs, &reset);
+        g_perf.cpuResetSeen = g_perf.cpuResetSeen || reset;
+    }
     g_perf.guestBusyNs = guestBusyNs;
     g_perf.wallNs = wallNs;
     g_perf.submitNs = submitNs;
     g_perf.cpuSeen = true;
 }
 
-void PerfAddGpuBusyNs(unsigned long long ns, int samplesDropped)
+void PerfAddGpuBusyNs(unsigned long long ns, int samplesLanded, int samplesDropped)
 {
     std::lock_guard<std::mutex> lk(g_perf.mtx);
     g_perf.gpuBusyNs += ns;
+    g_perf.gpuSamplesLanded += samplesLanded < 0 ? 0 : samplesLanded;
     g_perf.gpuDropped += samplesDropped < 0 ? 0 : samplesDropped;
 }
 
@@ -162,21 +195,28 @@ void PerfTick(double frameSeconds)
     out.frameMsP95 = static_cast<float>(percentileOfSorted(sorted, 0.95));
     out.frameMsMax = static_cast<float>(sorted.empty() ? 0.0 : sorted.back());
 
-    // CPU percentages over the same wall window.
-    if (g_perf.cpuSeen)
+    // CPU percentages over the same wall window, from the accumulated deltas. A window in which a
+    // counter moved backwards reports 0 rather than carrying the previous window's figure forward:
+    // same rule as the GPU side -- a number we did not measure must not be shown as a stale one.
+    if (g_perf.cpuResetSeen)
     {
-        const double windowNs = g_perf.windowSeconds * 1.0e9;
-        if (windowNs > 0.0)
-        {
-            out.guestPct = 100.0 * static_cast<double>(g_perf.guestBusyNs) / windowNs;
-            out.submitPct = 100.0 * static_cast<double>(g_perf.submitNs) / windowNs;
-        }
+        out.guestPct = 0.0;
+        out.submitPct = 0.0;
+    }
+    else if (g_perf.cpuSeen && g_perf.cpuWallWindowNs > 0)
+    {
+        out.guestPct = 100.0 * static_cast<double>(g_perf.cpuGuestWindowNs)
+                              / static_cast<double>(g_perf.cpuWallWindowNs);
+        out.submitPct = 100.0 * static_cast<double>(g_perf.cpuSubmitWindowNs)
+                               / static_cast<double>(g_perf.cpuWallWindowNs);
     }
 
     // gpuBusyPct has the same shape as a vendor 3D-engine counter, so that is the one to compare with
     // Task Manager. gpuMsPerFrame answers a different question: whether this machine is GPU-bound
-    // against the frame budget.
+    // against the frame budget. With no samples this window both are reported as 0 AND flagged by
+    // gpuSamples == 0, because a registered backend that got no measurement is not an idle GPU.
     const double windowNsGpu = g_perf.windowSeconds * 1.0e9;
+    out.gpuSamples = g_perf.gpuSamplesLanded;
     out.gpuBusyPct = windowNsGpu > 0.0 ? 100.0 * static_cast<double>(g_perf.gpuBusyNs) / windowNsGpu : 0.0;
     out.gpuMsPerFrame = g_perf.windowPresents > 0.0
                             ? static_cast<double>(g_perf.gpuBusyNs) / 1.0e6 / g_perf.windowPresents
@@ -188,7 +228,12 @@ void PerfTick(double frameSeconds)
 
     g_perf.windowPresents = 0.0;
     g_perf.windowSeconds = 0.0;
+    g_perf.cpuGuestWindowNs = 0;
+    g_perf.cpuWallWindowNs = 0;
+    g_perf.cpuSubmitWindowNs = 0;
+    g_perf.cpuResetSeen = false;
     g_perf.gpuBusyNs = 0;
+    g_perf.gpuSamplesLanded = 0;
     g_perf.gpuDropped = 0;
 }
 

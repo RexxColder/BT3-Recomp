@@ -2217,7 +2217,7 @@ namespace
             // [perf] In split mode the whole-frame [gputime] query is replaced by these class queries,
             // so the shared readout used to read a flat 0 -- indistinguishable from an idle GPU. Hand
             // it the sum of the classes instead; it is the same work, just attributed.
-            ps2x::PerfAddGpuBusyNs(static_cast<unsigned long long>(tot * 1.0e6), 0);
+            ps2x::PerfAddGpuBusyNs(static_cast<unsigned long long>(tot * 1.0e6), 1, 0);
             std::fprintf(stderr, "[gpusplit] gpu ms/s total %.1f:", tot / dt);
             for (int i = 0; i < GS_N; ++i) std::fprintf(stderr, " %s %.1f", kGsName[i], g_gsAcc[i] / dt);
             std::fprintf(stderr, " | calls/s %.0f switches/call %.1f | shaded Mfrag/s %.1f (%.2f Mfrag/call)\n", g_gsFrames / dt,
@@ -2276,13 +2276,15 @@ namespace
                 unsigned int ns = 0u; glGetQueryObjectuiv(g_gpqIds[old], 0x8866u /*GL_QUERY_RESULT*/, &ns);
                 g_gpuNsAccum.fetch_add(ns, std::memory_order_relaxed); g_gpuCallsAccum.fetch_add(1u, std::memory_order_relaxed);
                 // [perf] Feed the shared readout too, not just the [fps] line's own accumulator: the
-                // overlay reads ps2x::GetPerfStatus() and has no access to these statics.
-                ps2x::PerfAddGpuBusyNs(ns, 0);
+                // overlay reads ps2x::GetPerfStatus() and has no access to these statics. The landed
+                // count matters as much as the time: a window where the guest issued no draw list
+                // collects no samples at all, and that has to be distinguishable from an idle GPU.
+                ps2x::PerfAddGpuBusyNs(ns, 1, 0);
             }
             else
             {
                 g_gpuDropped.fetch_add(1u, std::memory_order_relaxed);
-                ps2x::PerfAddGpuBusyNs(0, 1);
+                ps2x::PerfAddGpuBusyNs(0, 0, 1);
             }
             g_gpqIssued[old] = false;
         }

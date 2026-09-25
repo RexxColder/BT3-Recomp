@@ -120,16 +120,17 @@ int main()
         // that is 1.67 ms per frame. Both units have to be right: the percentage is the one to hold
         // against Task Manager, the per-frame one is the one to hold against the frame budget.
         ps2x::PerfSetGpuSource(ps2x::GpuSource::OpenGL, ps2x::GpuQuality::DrawListOnly);
-        ps2x::PerfAddGpuBusyNs(100ull * 1000ull * 1000ull, 0);
+        ps2x::PerfAddGpuBusyNs(100ull * 1000ull * 1000ull, 1, 0);
         for (int i = 0; i < 60; ++i)
             ps2x::PerfTick(1.0 / 60.0);
         ps2x::PerfStatus p = ps2x::GetPerfStatus();
         check(near(p.gpuCoverage, 0.0), "OpenGL draw-list: cobertura 0 (se muestra como minimo)");
         check(near(p.gpuBusyPct, 10.0, 0.5), "100 ms de GPU en 1 s -> ~10 %%");
         check(near(p.gpuMsPerFrame, 1.667, 0.05), "y ~1.67 ms por frame");
+        check(p.gpuSamples == 1 && p.gpuMeasured(), "1 muestra, y gpuMeasured() da true");
 
         ps2x::PerfSetGpuSource(ps2x::GpuSource::VulkanTimestamps, ps2x::GpuQuality::FullFrame);
-        ps2x::PerfAddGpuBusyNs(100ull * 1000ull * 1000ull, 0);
+        ps2x::PerfAddGpuBusyNs(100ull * 1000ull * 1000ull, 1, 0);
         for (int i = 0; i < 60; ++i)
             ps2x::PerfTick(1.0 / 60.0);
         p = ps2x::GetPerfStatus();
@@ -146,21 +147,78 @@ int main()
         check(near(p.gpuBusyPct, 0.0), "y 0% real, no un 0 que hides una falta de medicion");
     }
 
-    std::printf("[8] las muestras perdidas se cuentan y se reportan\n");
+    std::printf("[8] una ventana sin muestras NO es una GPU ociosa\n");
+    {
+        // This is the case the whole gpuSource/gpuQuality pair existed for, and it was found by
+        // measuring: three windows in a row read 61% -> 0.65% -> 0.61% because the guest stopped
+        // issuing draw lists, and 0.65% is indistinguishable from "the GPU is doing nothing".
+        ps2x::PerfSetGpuSource(ps2x::GpuSource::OpenGL, ps2x::GpuQuality::DrawListOnly);
+        closeWindow();                       // a full window with nothing fed
+        ps2x::PerfStatus p = ps2x::GetPerfStatus();
+        check(p.gpuSource == ps2x::GpuSource::OpenGL, "la fuente sigue registrada");
+        check(p.gpuSamples == 0, "gpuSamples == 0");
+        check(!p.gpuMeasured(), "gpuMeasured() da false: la ventana no se midio");
+        check(near(p.gpuBusyPct, 0.0), "gpuBusyPct == 0, que SOLO se lee bien con gpuSamples == 0 al lado");
+
+        // And a real idle GPU is a different thing: samples landed, each one measuring nothing.
+        ps2x::PerfAddGpuBusyNs(0ull, 4, 0);
+        closeWindow();
+        p = ps2x::GetPerfStatus();
+        check(p.gpuSamples == 4 && p.gpuMeasured(), "4 muestras que miden 0: eso SI es una GPU ociosa");
+        check(near(p.gpuBusyPct, 0.0), "y tambien da 0% -- de ahi la necesidad del contador");
+    }
+
+    std::printf("[9] las muestras perdidas se cuentan y se reportan\n");
     {
         ps2x::PerfSetGpuSource(ps2x::GpuSource::OpenGL, ps2x::GpuQuality::DrawListOnly);
-        ps2x::PerfAddGpuBusyNs(0, 3);
+        ps2x::PerfAddGpuBusyNs(0, 0, 3);
         for (int i = 0; i < 60; ++i)
             ps2x::PerfTick(1.0 / 60.0);
         const ps2x::PerfStatus p = ps2x::GetPerfStatus();
         check(p.gpuSamplesDropped == 3, "gpuSamplesDropped == 3");
-        for (int i = 0; i < 60; ++i)
-            ps2x::PerfTick(1.0 / 60.0);
-        check(ps2x::GetPerfStatus().gpuSamplesDropped == 0, "y el contador se reinicia por window");
+        check(p.gpuSamples == 0, "y no cuentan como muestras: una muestra perdida no es una medida");
+        closeWindow();
+        check(ps2x::GetPerfStatus().gpuSamplesDropped == 0, "el contador se reinicia por window");
     }
 
-    std::printf("[9] refresh nominal y habilitacion del overlay\n");
+    std::printf("[10] los contadores de CPU llegan acumulados y hay que diferenciarlos\n");
     {
+        // Caught by running it: guest_pct came out at 413% and once at 1572%, because an absolute
+        // nanosecond count was being divided by a one-second window. PerfPublishCpu takes CUMULATIVE
+        // totals, so the delta has to happen where the previous sample lives.
+        const unsigned long long ms = 1000ull * 1000ull * 1000ull;   // one ms in ns
+
+        // The FIRST publish only establishes the baseline: there is no previous sample to difference
+        // against, so that window has no CPU data. It reports 0 rather than a guess.
+        ps2x::PerfPublishCpu(300ull * ms, 1000ull * ms, 20ull * ms);
+        closeWindow();
+        check(near(ps2x::GetPerfStatus().guestPct, 0.0, 0.01), "el primer publish es linea de base: 0%%");
+
+        // Second window: the guest gained 300 ms of busy time over 1 s of wall -> 30%.
+        ps2x::PerfPublishCpu(600ull * ms, 2000ull * ms, 40ull * ms);
+        closeWindow();
+        ps2x::PerfStatus p = ps2x::GetPerfStatus();
+        check(near(p.guestPct, 30.0, 0.5), "guest_pct ~ 30%% de 300 ms en 1 s");
+        check(near(p.submitPct, 2.0, 0.5), "submit_pct ~ 2%%");
+
+        // The next window keeps growing from there: 900 ms cumulative busy over 3 s of wall is still
+        // 30%, and only differencing gets that. A non-differencing version would report 900%.
+        ps2x::PerfPublishCpu(900ull * ms, 3000ull * ms, 60ull * ms);
+        closeWindow();
+        p = ps2x::GetPerfStatus();
+        check(near(p.guestPct, 30.0, 0.5), "sigue en 30%%: 900 ms acumulados sobre 3 s, no 900%%");
+        check(p.guestPct < 100.0, "y nunca puede pasar de 100%%");
+
+        // A counter that jumps BACKWARDS is a savestate load or a runtime reset, not a negative
+        // delta. That window is unmeasured, so it reports 0 instead of wrapping or going stale.
+        ps2x::PerfPublishCpu(10ull * ms, 1000ull * ms, 5ull * ms);
+        closeWindow();
+        p = ps2x::GetPerfStatus();
+        check(near(p.guestPct, 0.0, 0.01), "un reset de contador da 0%%, no unWrap gigante");
+        check(p.guestPct >= 0.0 && p.guestPct <= 100.0, "el rango es siempre 0..100");
+    }
+
+    std::printf("[11] refresh nominal y habilitacion del overlay\n");    {
         ps2x::PerfSetRefreshHz(144);
         for (int i = 0; i < 60; ++i)
             ps2x::PerfTick(1.0 / 60.0);

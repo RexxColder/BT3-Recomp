@@ -9076,9 +9076,19 @@ void PS2Runtime::run()
                 for (auto &kv : s_mainPcHist) { tot += kv.second;
                     if (kv.second > n1) { t2=t1;n2=n1; n1=kv.second; t1=kv.first; }
                     else if (kv.second > n2) { n2=kv.second; t2=kv.first; } }
-                std::cerr << "[main] hot=0x" << std::hex << t1 << std::dec << " " << (tot?100*n1/tot:0)
-                          << "% 2nd=0x" << std::hex << t2 << std::dec << " " << (tot?100*n2/tot:0)
-                          << "% (samples=" << tot << ")" << std::endl;
+                // [logstream] fprintf, NOT std::cerr. The runtime redirects stderr to
+                // <deploy>/logs/bt3.log with freopen() at boot, and on this toolchain the
+                // std::cerr stream does not follow it: every fprintf(stderr) line lands in the log and
+                // every std::cerr line is lost. That made this always-on perf line -- and 118 other
+                // diagnostics -- invisible, which is very likely why the "GPU usage disagrees" report
+                // was never diagnosable from a log. Compose into a string and hand it to the C stream
+                // that is known to reach the file.
+                {
+                    char hot[128];
+                    std::snprintf(hot, sizeof hot, "[main] hot=0x%X %u%% 2nd=0x%X %u%% (samples=%u)",
+                                  t1, tot ? (100u * n1 / tot) : 0u, t2, tot ? (100u * n2 / tot) : 0u, tot);
+                    std::fprintf(stderr, "%s\n", hot);
+                }
                 s_mainPcHist.clear();
                 uint64_t prims = g_rasterPrimCount.load(std::memory_order_relaxed);
                 uint64_t pix = g_rasterPixelCount.load(std::memory_order_relaxed);
@@ -9126,50 +9136,59 @@ void PS2Runtime::run()
                 // [perf] The stutter percentiles are the diagnostic bugs 4 and 5 need, but they are
                 // noise on a line that prints unconditionally, so they ride the existing opt-in gate.
                 static const bool s_frameProf = [](){ const char *v = std::getenv("PS2X_FRAMEPROF"); return !(v && v[0] && v[0] == '0'); }();
-                std::cerr << "[fps] GAME=" << (double)((gameFrames - s_lastGameFrames) / dt)
-                          << " guest_ms=" << guestMs
-                          << " wall_ms=" << wallMs
-                          << " host=" << (uint32_t)(s_fpsFrames / dt)
-                          << " prims/sec=" << (uint64_t)((prims - s_lastPrims) / dt)
-                          << " glhoist/sec=" << [&]{ extern std::atomic<unsigned long> g_glHoistCmds, g_glHoistTris;   // [glhoist]
-                                 static unsigned long s_lc = 0, s_lt = 0;
-                                 const unsigned long cc = g_glHoistCmds.load(std::memory_order_relaxed), tt = g_glHoistTris.load(std::memory_order_relaxed);
-                                 const unsigned long d = (unsigned long)((cc - s_lc) / dt); s_lastHoistTris = (unsigned long)((tt - s_lt) / dt);
-                                 s_lc = cc; s_lt = tt; return d; }()
-                          << " glhoisttris/sec=" << s_lastHoistTris
-                          << " vu1pairs/sec=" << [&]{ extern std::atomic<uint64_t> g_vu1PairCount;   // [vupairs]
-                                 static uint64_t s_lastVp = 0; const uint64_t vp = g_vu1PairCount.load(std::memory_order_relaxed);
-                                 const uint64_t d = (uint64_t)((vp - s_lastVp) / dt); s_lastVp = vp; return d; }()
-                          << " Mpix/sec=" << (double)((pix - s_lastPix) / dt / 1.0e6)
-                          << " swaps/sec=" << (uint64_t)((swaps - s_lastSwaps) / dt)
-                          << " glcalls/sec=" << (uint64_t)((glc - s_lastGlCalls) / dt)
-                          << " glflush/sec=" << (uint64_t)((glf - s_lastGlFlush) / dt)
-                          << " decodes/sec=" << (uint64_t)((tdc - s_lastTdc) / dt)
-                          << " uploads/sec=" << (uint64_t)((upc - s_lastUp) / dt) << " vramcopies/sec=" << (uint64_t)((vcc - s_lastVc) / dt)   // [xferstat]
-                          << " upconftex/sec=" << (uint64_t)((uct - s_lastUct) / dt) << " upconfclut/sec=" << (uint64_t)((ucc - s_lastUcc) / dt)   // [upconf]
-                          << " flush_ms/s=" << (g_rlglFlushNs - s_lastFlushNs) / 1.0e6 / dt
-                          // [perf] From here down the GPU figures come from the shared readout, so this
-                          // line and the overlay cannot drift apart. gpu_src says which backend produced
-                          // it and gpu_cov whether it covers the whole frame; without those two, a 0 here
-                          // is unreadable -- it used to mean "not measured" on two of the three backends
-                          // and looked exactly like "the GPU is idle".
-                          << " gpu_pct=" << perf.gpuBusyPct
-                          << " gpu_ms=" << perf.gpuMsPerFrame
-                          << " gpu_src=" << gpuSrcName
-                          << " gpu_cov=" << (perf.gpuCoverage >= 1.0 ? "full" : perf.gpuQuality == ps2x::GpuQuality::CpuOnly ? "cpu" : "partial")
-                          << " gpu_drop=" << perf.gpuSamplesDropped
-                          << " fps=" << perf.displayFps
-                          << " p50=" << perf.frameMsP50 << " p95=" << perf.frameMsP95
-                          << (s_frameProf ? [&]{ std::ostringstream o; o << " fmax=" << perf.frameMsMax
-                                                    << " guest_pct=" << perf.guestPct
-                                                    << " submit_pct=" << perf.submitPct; return o.str(); }()
-                                          : std::string())
-                          << " vbring=" << g_rlglVbRingOn << [&]{   // [vbring] fence waits + ring wraps per second, MVP uploads skipped per second
-                                 static unsigned long long s_w = 0, s_r = 0, s_m = 0;
-                                 const unsigned long long w = g_rlglVbRingWaits, r = g_rlglVbRingWraps, m = g_rlglVbRingMvpSkips;
-                                 std::ostringstream o; o << " vbr_waits/s=" << (uint64_t)((w - s_w) / dt) << " vbr_wraps/s=" << (uint64_t)((r - s_r) / dt)
-                                                         << " mvpskip/s=" << (uint64_t)((m - s_m) / dt);
-                                 s_w = w; s_r = r; s_m = m; return o.str(); }() << std::endl;
+                // [logstream] fprintf, NOT std::cerr -- see the note on the [main] line above. This is
+                // the whole always-on perf readout, and it was reaching nobody.
+                {
+                    std::ostringstream o;
+                    o << "[fps] GAME=" << (double)((gameFrames - s_lastGameFrames) / dt)
+                      << " guest_ms=" << guestMs
+                      << " wall_ms=" << wallMs
+                      << " host=" << (uint32_t)(s_fpsFrames / dt)
+                      << " prims/sec=" << (uint64_t)((prims - s_lastPrims) / dt)
+                      << " glhoist/sec=" << [&]{ extern std::atomic<unsigned long> g_glHoistCmds, g_glHoistTris;   // [glhoist]
+                             static unsigned long s_lc = 0, s_lt = 0;
+                             const unsigned long cc = g_glHoistCmds.load(std::memory_order_relaxed), tt = g_glHoistTris.load(std::memory_order_relaxed);
+                             const unsigned long d = (unsigned long)((cc - s_lc) / dt); s_lastHoistTris = (unsigned long)((tt - s_lt) / dt);
+                             s_lc = cc; s_lt = tt; return d; }()
+                      << " glhoisttris/sec=" << s_lastHoistTris
+                      << " vu1pairs/sec=" << [&]{ extern std::atomic<uint64_t> g_vu1PairCount;   // [vupairs]
+                             static uint64_t s_lastVp = 0; const uint64_t vp = g_vu1PairCount.load(std::memory_order_relaxed);
+                             const uint64_t d = (uint64_t)((vp - s_lastVp) / dt); s_lastVp = vp; return d; }()
+                      << " Mpix/sec=" << (double)((pix - s_lastPix) / dt / 1.0e6)
+                      << " swaps/sec=" << (uint64_t)((swaps - s_lastSwaps) / dt)
+                      << " glcalls/sec=" << (uint64_t)((glc - s_lastGlCalls) / dt)
+                      << " glflush/sec=" << (uint64_t)((glf - s_lastGlFlush) / dt)
+                      << " decodes/sec=" << (uint64_t)((tdc - s_lastTdc) / dt)
+                      << " uploads/sec=" << (uint64_t)((upc - s_lastUp) / dt) << " vramcopies/sec=" << (uint64_t)((vcc - s_lastVc) / dt)   // [xferstat]
+                      << " upconftex/sec=" << (uint64_t)((uct - s_lastUct) / dt) << " upconfclut/sec=" << (uint64_t)((ucc - s_lastUcc) / dt)   // [upconf]
+                      << " flush_ms/s=" << (g_rlglFlushNs - s_lastFlushNs) / 1.0e6 / dt
+                      // [perf] From here down the GPU figures come from the shared readout, so this line
+                      // and the overlay cannot drift apart. gpu_src says which backend produced it and
+                      // gpu_cov whether it covers the whole frame; without those two a 0 here is
+                      // unreadable -- it used to mean "not measured" on two of the three backends and
+                      // looked exactly like an idle GPU.
+                      << " gpu_pct=" << perf.gpuBusyPct
+                      << " gpu_ms=" << perf.gpuMsPerFrame
+                      << " gpu_src=" << gpuSrcName
+                      << " gpu_cov=" << (perf.gpuSource == ps2x::GpuSource::None ? "none"
+                                       : perf.gpuQuality == ps2x::GpuQuality::CpuOnly ? "cpu"
+                                       : perf.gpuSamples == 0 ? "unmeasured"
+                                       : perf.gpuCoverage >= 1.0 ? "full" : "partial")
+                      << " gpu_n=" << perf.gpuSamples
+                      << " gpu_drop=" << perf.gpuSamplesDropped
+                      << " fps=" << perf.displayFps
+                      << " p50=" << perf.frameMsP50 << " p95=" << perf.frameMsP95;
+                    if (s_frameProf)
+                        o << " fmax=" << perf.frameMsMax << " guest_pct=" << perf.guestPct << " submit_pct=" << perf.submitPct;
+                    o << " vbring=" << g_rlglVbRingOn << [&]{   // [vbring] fence waits + ring wraps per second, MVP uploads skipped per second
+                           static unsigned long long s_w = 0, s_r = 0, s_m = 0;
+                           const unsigned long long w = g_rlglVbRingWaits, r = g_rlglVbRingWraps, m = g_rlglVbRingMvpSkips;
+                           std::ostringstream v; v << " vbr_waits/s=" << (uint64_t)((w - s_w) / dt) << " vbr_wraps/s=" << (uint64_t)((r - s_r) / dt)
+                                                   << " mvpskip/s=" << (uint64_t)((m - s_m) / dt);
+                           s_w = w; s_r = r; s_m = m; return v.str(); }();
+                    const std::string line = o.str();
+                    std::fprintf(stderr, "%s\n", line.c_str());
+                }
                 s_lastGlCalls = glc; s_lastGlFlush = glf; s_lastTdc = tdc; s_lastUp = upc; s_lastVc = vcc; s_lastUct = uct; s_lastUcc = ucc; s_lastFlushNs = g_rlglFlushNs;
                 if (gprof::g_on)
                 {   // [guestprof] exclusive phase time on the guest thread(s), ms per second; tsc calibrated over this interval

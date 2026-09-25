@@ -1881,7 +1881,7 @@ void onSwap()
             if (d > 0.0)
                 swapTotalS += d;
         }
-        ps2x::PerfAddGpuBusyNs(static_cast<unsigned long long>(swapTotalS * 1.0e9), 0);
+        ps2x::PerfAddGpuBusyNs(static_cast<unsigned long long>(swapTotalS * 1.0e9), 1, 0);
     }
     const double dt = std::chrono::duration<double>(t2 - s.tStat).count();
     if (dt >= 5.0)
