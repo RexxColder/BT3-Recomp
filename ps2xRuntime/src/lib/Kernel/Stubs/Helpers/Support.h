@@ -652,6 +652,22 @@ namespace
             {
                 afTable = loadFolderTable(idxCandidate, folderCandidate);
             }
+            if (!afTable)
+            {
+                // The guest always asks for \DATA\PZS3US1.AFS;1, but the install is allowed to be
+                // flat, with the converted folder at the root of data/ instead of under DATA/.
+                // Try that same pair one level up before giving up: without this, a flat install
+                // leaves the game with no data at all, because the .AFS itself is deleted once
+                // the folder exists and there is no loose file left to fall back to.
+                const std::filesystem::path root = getCdRootPath();
+                const std::filesystem::path idxFlat = root / (stem.string() + ".idx");
+                const std::filesystem::path folderFlat = root / stem;
+                if (std::filesystem::exists(idxFlat, e1) &&
+                    std::filesystem::is_directory(folderFlat, e2))
+                {
+                    afTable = loadFolderTable(idxFlat, folderFlat);
+                }
+            }
         }
 
         std::error_code ec;
