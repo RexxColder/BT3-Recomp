@@ -281,21 +281,24 @@ The **UI sound effects are not an asset**: they come from the game's own data
 
 ## 9. Pending
 
-- **The entry lock and the black are timed, not state-driven** (open, 2026-09-25). On the row press
-  `markNetEntry()` arms `s_enterLockMs = now + 1400` and the pad gate stays denied while
+- **The entry lock was timed, not state-driven** (found and fixed 2026-09-25). On the row press
+  `markNetEntry()` armed `s_enterLockMs = now + 1400` and the pad gate stayed denied while
   `s_hosted || exitLocked() || enterLocked() || st == kMainMenuState`; `ps2xNetMenuFreeze()` also
-  holds for as long as the page is hosted. So how long the player stares at a black screen with a
-  dead pad depends on a wall-clock guess, not on how far the game actually got: a slow load lifts it
-  mid-transition, and a fast one leaves it up over a live screen. **Wanted: hold both until the
-  guest reaches character selection, then hand the image and the pad back to the player.**
-  - The flow is `0x04 → 0x26` (Duel) and the engine "commits and switches to `0x27`"
-    (`ps2x_net_menu.cpp:159-161`), so `0x27` is the likely release point — but that is read off a
-    comment, not measured.
-  - `PS2X_NETMENU_TRACE=1` now logs every state change while the entry is latched
-    (`[netmenu-trace] state 0x.. (pad denied|live, black .., hosted ..)`). Run the Duel once with
-    it, confirm which state is character select, and key the release to that.
-  - Keep the timer as a failsafe ceiling so a state that never arrives cannot strand the player on a
-    black screen with a dead pad — that is the failure mode worth guarding.
+  held for as long as the page was hosted. So how long the player stared at a black screen with a
+  dead pad, and with the net track still playing, depended on a wall-clock guess rather than on how
+  far the game actually got. **The handoff is now keyed to the state: the entry owns the screen while
+  the guest is in `0x26`, and the moment the engine leaves `0x26` for any other state the page comes
+  down, the pad gate and the freeze are released, and the audio bookkeeping runs its normal close
+  path — image, music and controller all go back to the player.**
+  - Releasing on "no longer `0x26`" rather than on one expected state means a flow this build has
+    never seen still hands control back, instead of stranding the player on a black screen.
+  - The transition window is why `s_seenDuelState` exists: between the row press and `0x26` the
+    state is still the main menu (`0x04`), and that must not read as a handoff.
+  - The 1400 ms stays as a **failsafe ceiling** so a state that never arrives cannot leave the
+    player locked out — that is the failure mode worth guarding.
+  - `PS2X_NETMENU_TRACE=1` logs every state change while the entry is latched
+    (`[netmenu-trace] state 0x.. (pad denied|live, black .., hosted ..)`), which is how to see where
+    a handoff landed if it lands somewhere unexpected.
 - **Phase 3 — sounds**: reuse the game's SE (hover/confirm/cancel) or extract them from the pack.
 - Popup polish (transitions, more options, validations).
 - **F3 — Wii assets**: the real Dragon Net paks (`DragonNet_UP/US.pak`) exist on the Wii and use the

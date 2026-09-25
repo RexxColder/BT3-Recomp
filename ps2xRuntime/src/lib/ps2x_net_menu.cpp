@@ -168,6 +168,12 @@ namespace
     // an entry that came from the net row gates the pad; a normal Duel entry is left alone.
     bool s_netEntry = false;
     constexpr uint32_t kDuelState = 0x26u;
+    // [netmenu] The entry owns the screen while the guest is in kDuelState: our page is up, the BGM
+    // is frozen and the pad is denied. The moment the engine leaves 0x26 for ANY other state it has
+    // handed the machine to the player (character select, or wherever the flow goes), so the image,
+    // the music and the controller all go back then. Keying it to "no longer 0x26" rather than to
+    // one guessed state means a flow this build has never seen still releases correctly;
+    // PS2X_NETMENU_TRACE=1 prints the state walk if the handoff lands somewhere unexpected.
     constexpr uint32_t kDragonNetState = 0x40u;   // the Wii report: Dragon Net Battle unit id
     // [netmenu] Conditional AFS serve config (env): while the NET entry owns the screen, AFS slot
     // PS2X_NETMENU_SWAP_SLOT is served from the file at PS2X_NETMENU_SWAP_FILE. A native entry into
@@ -187,6 +193,8 @@ namespace
     bool s_dumpIsNet = false;
     uint32_t s_lastState = 0xFFFFFFFFu;
     uint32_t s_traceLast = 0xFFFFFFFFu;   // [netmenu-trace] last state logged, see the tick
+    bool s_reachedCharSelect = false;     // [netmenu] the entry handed the screen back to the player
+    bool s_seenDuelState = false;         // [netmenu] 0x26 was entered, so leaving it is a real handoff
     void writeRamDump(uint8_t *rdram, bool isNet)
     {
         if (!s_dumpDir || !s_dumpDir[0]) return;
@@ -660,7 +668,12 @@ namespace ps2x_net_menu
     // [netmenu] Arm the serve-swap right now (called from the patched row, before the transition).
     void armServeSwap()
     {
-        s_enterLockMs = hostNowMs() + 1400;   // 1.4 s from the 0x04 entry: the pad stays dead
+        // Failsafe ceiling only. The lock is normally lifted by reaching character select (see the
+        // kCharSelectState handoff in the tick), so a slow load keeps the transition clean instead
+        // of handing a half-drawn screen to a player whose pad just went live.
+        s_enterLockMs = hostNowMs() + 1400;
+        s_reachedCharSelect = false;   // a new entry re-arms the handoff
+        s_seenDuelState = false;      // ...and has not reached 0x26 yet, so 0x04 is not a handoff
         static bool s_muteArmed = false;
         if (!s_muteArmed)
         {
@@ -777,6 +790,25 @@ namespace ps2x_net_menu
                              stNow,
                              (s_hosted || exitLocked() || enterLocked() || stNow == kMainMenuState) ? "denied" : "live",
                              blackLevel(), s_hosted ? 1 : 0);
+            }
+            // [netmenu] Handoff: the engine leaving 0x26 means the screen is the player's again.
+            // Drop the page, release the pad gate and the freeze, and make sure the exit never paints
+            // a total black over a live game. The net latch stays until the main menu, so the origin
+            // (serve swap, audio bookkeeping) is still this entry.
+            if (s_netEntry)
+            {
+                if (stNow == kDuelState)
+                    s_seenDuelState = true;
+                else if (s_seenDuelState && !s_reachedCharSelect)
+                {
+                    s_reachedCharSelect = true;
+                    s_enterLockMs = 0;              // release the pad gate
+                    s_exitBlack = false;            // and never paint a total black on the way out
+                    s_hosted = false;               // the page is done owning the screen
+                    close();
+                    std::fprintf(stderr, "[netmenu] left 0x26 for 0x%02x: page down, pad and image "
+                                         "back to the player\n", stNow);
+                }
             }
             if (stNow == kDuelState && s_lastState != kDuelState)
             {
