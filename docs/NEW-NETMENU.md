@@ -1,5 +1,45 @@
 # New Dragon Net Menu — full implementation
 
+> **Retired on 2026-09-25.** The custom page and its main-menu entry were removed; this document is
+> kept as the record of how it was built and of what was measured while trying to finish it. Nothing
+> in the build ships it any more. The short version is in
+> [`DEPLOY.md`](DEPLOY.md#the-dragon-net-menu-entry-is-retired); the rest of this file is the
+> detail, including the parts that were wrong and why.
+>
+> **What actually broke it.** The entry routes the hidden "Network Battle" row into the real Duel
+> state (`0x26`) and then wants to draw the page over it. To keep the guest from reacting behind
+> the page, the entry freezes the pad. But the game is then sitting in the Duel menu *waiting for a
+> confirm that the freeze denies*, so it never leaves `0x26` — and the handoff that was supposed to
+> hand the screen, the music and the pad back when the game moved on could never fire. The two
+> requirements were in direct opposition: hold the pad long enough to own the screen, and release it
+> early enough for the game to advance. Freezing the pad blocks the advance; releasing it lets the
+> player reach a screen the page is meant to replace.
+>
+> The two ways out were to release the pad for the Duel menu's own controls, or to inject the confirm
+> ourselves and let the page drive. Both were built and neither was verified end to end before the
+> entry was dropped, and neither is the kind of change to leave half-proven in a shipping tree.
+>
+> **What was measured and is worth keeping:**
+> - Character select is state **`0x27`**, not a sub-screen of `0x26`. Two independent signals in
+>   32 MB guest-RAM dumps: the screen id at `*(0x2FF10C)+0x18` goes `0x26 → 0x27`, and the Duel object
+>   pointer at `*(0x3B38E8)` goes non-null → null. Two dumps of the *same* screen differ by 0.29%,
+>   versus 20.3% across the two screens, so the signal is far above the noise.
+> - The row is index **4** of the main-menu jump table, and row 3 is the retail Duel entry
+>   (`target=0x26`) — the two are adjacent, which is why pressing X on the Duel plate reaches the
+>   Duel without ever touching the net entry.
+> - The pad seam applies a synthetic press **after** the freeze, so a freeze does not block input we
+>   inject ourselves; it only blocks the *player*. That ordering is what made the "two pools" idea
+>   workable, and it is easy to get backwards from the seam's own comments.
+> - The freeze in `game_overrides.cpp` only ever released **buttons**, on **player 1**; the sticks
+>   were neutralised by the gate, which is also player 1 only. A freeze without a gate therefore let
+>   the sticks through. Both are now handled in the freeze itself.
+>
+> **What was removed:** the page (`ps2x_net_menu*.cpp`), the GS fade layer, the entry's music and UI
+> sounds, the art blob and its packer, the `[netplay] dragon_net_menu` setting, the Settings → Varios
+> section, the row-4 and state-table patches in `apply_overlay_patches.py`, and the
+> `PS2X_ENABLE_DRAGONNET` runtime block. `queryCursor()` moved to `ps2x_dueldump.cpp`, its only
+> remaining consumer. The netplay transport is untouched.
+
 How it was built, what was tested, what failed, and how the method works.
 
 This document covers **all** the work around the new menu (beyond the "ghost" and the state-hosting

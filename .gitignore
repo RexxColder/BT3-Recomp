@@ -44,10 +44,6 @@ games/bt3/work
 music/
 ps2xRuntime/assets/music/
 
-# The Dragon Net art is committed as ONE blob (games/bt3/dragonnet_assets.bin, written by
-# tools/iop/dragonnet_assets.py) so the repo does not carry 19 loose PNGs. This is the working
-# tree the packer reads from and the build unpacks from; the blob is the source of truth.
-ps2xRuntime/assets/DragonNet/
 
 # local build/deploy scratch
 log.txt

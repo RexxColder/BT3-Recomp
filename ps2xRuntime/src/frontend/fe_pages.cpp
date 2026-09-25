@@ -758,32 +758,6 @@ namespace frontend
         fe::kv("Boton del pad", s.overlayPadBtns.c_str());
         fe::kv("Teclas", s.overlayKeys.c_str());
     }
-
-    if (fe::beginSection("NETPLAY", false,
-                         "Menu Dragon Net: los parches que revelan la placa oculta de Network "
-                         "Battle del menu del juego y alojan la pagina nativa. Se aplica al "
-                         "volver a lanzar el juego."))
-    {
-        fe::toggleSwitch("Menu Dragon Net (parches)", &s.netMenu);
-
-        // The art is one blob: the build stages dragonnet_assets.bin next to the runner and the
-        // runtime installs it as data/NETPLAY.BIN. Say where it is instead of letting the user
-        // find a "missing" line per file in the log.
-        const std::filesystem::path installed = ctx.exeDir / "data" / "NETPLAY.BIN";
-        const std::filesystem::path staged = ctx.exeDir / "dragonnet_assets.bin";
-        std::error_code ec;
-        if (std::filesystem::exists(installed, ec))
-            fe::statusRow("Arte", fe::okCol(), "data/NETPLAY.BIN");
-        else if (std::filesystem::exists(staged, ec))
-            fe::statusRow("Arte", fe::warnCol(), "se instala al abrir el juego");
-        else
-        {
-            fe::statusRow("Arte", fe::badCol(), "falta dragonnet_assets.bin");
-            fe::hint("El menu se dibuja sin arte: falta dragonnet_assets.bin al lado del runner. "
-                     "El juego no se ve afectado.");
-        }
-        fe::statusRow("Conectividad", fe::warnCol(), "experimental: solo la pagina, sin servidor");
-    }
 }
 
     void drawAboutPage(PageContext &ctx)

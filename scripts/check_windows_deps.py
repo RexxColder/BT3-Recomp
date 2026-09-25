@@ -120,7 +120,6 @@ REQUIRED_LAYOUT = [
     "LICENSE",
     "savedata/settings.toml",
     "fps60_sites.txt",
-    "data/NETPLAY.BIN",
     "assets/lib/vcruntime140.dll",
     "assets/lib/vcruntime140_1.dll",
     "assets/lib/msvcp140.dll",

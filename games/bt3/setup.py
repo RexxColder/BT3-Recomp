@@ -1149,11 +1149,6 @@ AUDIO_SUFFIXES = (".flac", ".mp3", ".ogg", ".wav", ".qoa")
 # file with a predictable name and the release does not ship someone's personal filename.
 MUSIC_NAME = "music.flac"
 
-# Same idea for the Dragon Net entry's track: the runtime looks for this exact name under
-# assets/DragonNet/music/, and like the menu theme it is copyrighted audio that only ships with
-# --with-music.
-NETMENU_MUSIC_NAME = "netmenu.mp3"
-
 
 def find_music(folder: Path) -> Optional[Path]:
     """The audio file to use as the menu theme, preferring the canonical name."""
@@ -1777,21 +1772,6 @@ def deploy_tree(runner: Path, out: Path, keep_music: bool = False) -> None:
         LOG.info(f"  menu theme -> {theme / MUSIC_NAME} (--with-music)")
     elif src_theme is not None:
         LOG.info("  dropped the menu theme (copyrighted audio, pass --with-music to keep it)")
-
-    # The Dragon Net entry's own track, same rule as the menu theme: copyrighted audio the project
-    # does not redistribute, so it only rides along with --with-music. It lives beside the art
-    # because that is where the runtime looks, and it is normalised to netmenu.mp3 so the artifact
-    # does not carry whatever filename the user happened to download.
-    netmusic_dir = out / "assets" / "DragonNet" / "music"
-    if netmusic_dir.is_dir():
-        shutil.rmtree(netmusic_dir, ignore_errors=True)
-    src_netmusic = runner.parent / "assets" / "DragonNet" / "music" / NETMENU_MUSIC_NAME
-    if keep_music and src_netmusic.is_file():
-        netmusic_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_netmusic, netmusic_dir / NETMENU_MUSIC_NAME)
-        LOG.info(f"  net entry theme -> {netmusic_dir / NETMENU_MUSIC_NAME} (--with-music)")
-    elif src_netmusic.is_file():
-        LOG.info("  dropped the net entry theme (copyrighted audio, pass --with-music to keep it)")
     # Mirror what CMake stages next to the runner. Only data/Textures, never all of data/: a build
     # directory can hold a full installed game and that is gigabytes of user data.
     for rel in ("data/Textures", "mods"):
@@ -1866,17 +1846,6 @@ def bundle_windows(ctx: "Context", stage: Path, runner: Path) -> None:
     fps60 = HERE / "fps60_sites.txt"
     if fps60.exists() and not (stage / "fps60_sites.txt").exists():
         shutil.copy2(fps60, stage / "fps60_sites.txt")
-
-    # [netmenu] The Dragon Net art travels as one blob (19 PNGs would be 19 files in the zip).
-    # The deploy already knows where data/ is, so it writes the final name straight into
-    # data/NETPLAY.BIN -- next to DBZP.BIN -- and the runtime only ever reads it. CMake still
-    # stages the source blob next to the runner for a hand-run build, where data/ does not
-    # exist yet and the runtime does the install itself.
-    netart = HERE / "dragonnet_assets.bin"
-    if netart.exists():
-        installed = stage / "data" / "NETPLAY.BIN"
-        installed.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(netart, installed)
 
     # FFmpeg DLLs staged next to the runner by CMake POST_BUILD.
     for pattern in ("avcodec-*.dll", "avformat-*.dll", "avutil-*.dll",

@@ -186,8 +186,6 @@ namespace
         s.dumpRuntime = doc.getB("logging.dump_runtime", s.dumpRuntime);
         s.dumpGamepad = doc.getB("logging.dump_gamepad", s.dumpGamepad);
 
-        s.netMenu = doc.getB("netplay.dragon_net_menu", s.netMenu);
-
         clamp(s);
         return true;
     }
@@ -318,7 +316,7 @@ namespace ps2x_settings
                a.overlayKeys == b.overlayKeys && a.logLevel == b.logLevel &&
                a.dumpAudio == b.dumpAudio && a.dumpVideo == b.dumpVideo &&
                a.dumpControllers == b.dumpControllers && a.dumpRuntime == b.dumpRuntime &&
-               a.dumpGamepad == b.dumpGamepad && a.netMenu == b.netMenu;
+               a.dumpGamepad == b.dumpGamepad;
     }
 
     const char *rendererName(int renderer)
@@ -442,12 +440,6 @@ namespace ps2x_settings
         os << "dump_controllers = " << fmtBool(s.dumpControllers) << "\n";
         os << "dump_runtime = " << fmtBool(s.dumpRuntime) << "\n";
         os << "dump_gamepad = " << fmtBool(s.dumpGamepad) << "\n\n";
-
-        // [netplay] The Dragon Net Menu patches are applied at boot from PS2X_NET_MENU, which
-        // main.cpp fills in from here. The transport itself (PS2X_NET / PS2X_NET_LISTEN) stays
-        // env-only on purpose: hosting or joining is a session, not a preference.
-        os << "[netplay]\n";
-        os << "dragon_net_menu = " << fmtBool(s.netMenu) << "\n";
 
         // [frontend] shell window only. The game never reads this: on PLAY it applies
         // [video] window_w/window_h to its own window, and this window just reopens at

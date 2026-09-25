@@ -45,9 +45,7 @@ extern "C" unsigned long long ps2xWinThreadCpuNs();
 #include "runtime/pad_config.h"
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"   // [savestate] getMemoryCardDebugSnapshot (deferred quickload)
-#include "runtime/ps2x_net_menu.h"     // [netmenu] custom New Dragon Net Menu page
 #include "runtime/ps2x_dueldump.h"
-#include "runtime/ps2x_netmenutest.h"   // [netmenutest] Duel Menu 2 experiment     // [dueldump] total capture of the Duel menu flow
 #include "runtime/ps2_netplay.h"   // [netplay]
 
 // [netjump] Frames of display HOLD remaining. While non-zero, GsGpuRenderer::swapFrame() returns
@@ -451,9 +449,10 @@ namespace
 // [netmenu] frames of synthetic CROSS remaining for the custom page's direct-subtype start.
 // Same seam as the netjump's press, but NOT gated by netplay: BT3 never calls libpad, so the
 // only pad the game sees is built in writeNeutralPadPacket below.
-// [netmenu] synthetic button frames for the custom page (any button: Cross to confirm a start,
-// Circle to go back). Same seam as the netjump's press, but NOT gated by netplay: BT3 never calls
-// libpad, so the only pad the game sees is built in writeNeutralPadPacket below.
+// [netmenu] synthetic button frames for the retired custom page. Same seam as the netjump's press,
+// but NOT gated by netplay: BT3 never calls libpad, so the only pad the game sees is built in
+// writeNeutralPadPacket below. Nothing drives these any more (the page that used them is gone), so
+// the mask stays 0 and this is inert; kept because it is the pad seam an entry test would need.
 std::atomic<uint32_t> g_netMenuPressMask{0};   // PS2 button mask (active low: clear the bit)
 std::atomic<int> g_netMenuPressFrames{0};
 extern "C" void ps2xNetMenuPress(int mask, int frames)
@@ -461,16 +460,18 @@ extern "C" void ps2xNetMenuPress(int mask, int frames)
     g_netMenuPressMask.store((uint32_t)mask, std::memory_order_relaxed);
     g_netMenuPressFrames.store(frames > 0 ? frames : 0, std::memory_order_relaxed);
 }
-// [netmenu] while the custom page owns the screen the guest must see NO input at all (the libpad
+// [netmenu] while a custom page owns the screen the guest must see NO input at all (the libpad
 // override is invisible to BT3, so this is the only place that can freeze it). The Cross pulse
-// above is applied AFTER the freeze, so the start sequence can still confirm.
+// above is applied AFTER the freeze, so the start sequence can still confirm. Unused for now --
+// see g_netMenuPressMask. The freeze releases buttons, both sticks and every socket, not just
+// player 1: a freeze that only cleared buttons leaked the sticks, because the only thing that used
+// to neutralise them (the gate below) is player 1 only.
 std::atomic<int> g_netMenuFreeze{0};
 extern "C" void ps2xNetMenuFreeze(int on)
 { g_netMenuFreeze.store(on ? 1 : 0, std::memory_order_relaxed); }
 // [netmenu] Selective gate: while armed, ONLY the buttons in the allow mask pass through to the
-// guest (player 1 / socket 0); everything else -- including the sticks -- is forced neutral. Used
-// by the net-entry flow: the pad is denied except Triangle, which is the game's own back button,
-// so the Duel state entered from the hidden row can still be left naturally.
+// guest (player 1 / socket 0); everything else is forced neutral. Unused for now -- see
+// g_netMenuPressMask.
 std::atomic<int> g_netMenuGate{0};
 std::atomic<uint32_t> g_netMenuAllowMask{0};
 extern "C" void ps2xNetMenuGate(int on, int allowMask)
@@ -682,10 +683,14 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
         // so the packet has that long to cross the network.
         // [netmenu] the custom page owns input: release everything for player 1 before the pulse below
     // (and before the netplay block, so it holds offline too).
-    if ((socket & 3u) == 0u && g_netMenuFreeze.load(std::memory_order_relaxed) > 0)
+    // [netmenu] the custom page owns input: release everything, every socket and both sticks, not
+    // just player 1's buttons -- the gate below is player 1 only, so a freeze that only cleared
+    // b0/b1 leaked the sticks. (And before the netplay block, so it holds offline too.)
+    if (g_netMenuFreeze.load(std::memory_order_relaxed) > 0)
     {
         b0 = 0xFFu;
         b1 = 0xFFu;
+        rx = 0x80u; ry = 0x80u; lx = 0x80u; ly = 0x80u;
     }
     // [netmenu] Selective gate (see ps2xNetMenuGate): deny everything except the allowed buttons,
     // and force the sticks neutral so the hidden state's menu cannot be navigated.
@@ -5866,20 +5871,6 @@ namespace
         bt3DumpKey(rdram);           // [dumpkey]
         bt3NetJumpCharSelect(rdram, ctx, runtime); // [netjump]
         bt3MenuJumpFrame(rdram, ctx, runtime);     // [menujump] PS2X_MENU_JUMP + P+L / LMB+RMB combo
-        {   // [netmenu] PS2X_NET_MENU=1: custom "New Dragon Net Menu" page on the hidden Network
-            // row of the retail main menu. The hook hands the module the game's own go-to-screen
-            // (bt3MenuGoto) so its return can use the real transition, with a forced-state fallback.
-            static const bool s_netMenuHooked = [](){
-                ps2x_net_menu::setMenuGotoHook(
-                    [](uint8_t *rd, R5900Context *c, PS2Runtime *r, uint32_t target) {
-                        return bt3MenuGoto(rd, c, r, target);
-                    });
-                return true;
-            }();
-            (void)s_netMenuHooked;
-            ps2x_net_menu::tick(rdram, ctx, runtime);
-        }
-        ps2x_netmenutest::init(rdram, runtime);          // [netmenutest] PS2X_NETMENUTEST=1
         ps2x_dueldump::tick(rdram, runtime);   // [dueldump] PS2X_DUELDUMP=1
         ps2x_dueldump::tickSettings(rdram);    // [duelsettings] PS2X_DUELSETTINGS=1
         ps2x_dueldump::tickTime(rdram);        // [dueltime] PS2X_DUELTIME=1

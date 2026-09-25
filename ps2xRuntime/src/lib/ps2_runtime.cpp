@@ -7665,19 +7665,6 @@ void PS2Runtime::run()
                                   std::memcpy(rw + (0x333990u & PS2_RAM_MASK), &tri, 4); }
                     }
 
-                    // [dragonnet] PS2X_ENABLE_DRAGONNET=1: the main menu's hidden DRAGON_NET
-                    // entry (index 4) is navigable but its State-4 CONFIRM_ACCEPT gate
-                    // checks flags at 0x330000 + 4*448 + 0x398C = 0x33408C for bits 0x600;
-                    // nothing ever writes them (overlay BSS) so the confirm is always
-                    // skipped and X on the entry does nothing. Stamp the bits each
-                    // heartbeat so the gate starts passing.
-                    static const bool s_dragonNet = [](){ const char *v=std::getenv("PS2X_ENABLE_DRAGONNET"); return v&&v[0]&&v[0]!='0'; }();
-                    if (s_dragonNet)
-                    {
-                        uint8_t *rw = m_memory.getRDRAM();
-                        uint32_t flags6 = 0x600u;
-                        if (rw) { std::memcpy(rw + (0x33408cu & PS2_RAM_MASK), &flags6, 4); }
-                    }
                     // Intro auto-advance timer: *(*(0x3b0eb8)+0xc4) counts to 0x708.
                     uint32_t p = 0u;
                     std::memcpy(&p, rd + (0x3b0eb8u & PS2_RAM_MASK), 4);

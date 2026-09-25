@@ -29,6 +29,19 @@ namespace ps2x_dueldump
 {
     bool enabled();
 
+    // Where the main menu's cursor is pointing, using the game's own row formula
+    // (0x33643C..0x33648C). entry = RAM address in the jump table, handler = the per-row
+    // confirm handler stored there, target = the screen state that row jumps to (0xFFFFFFFF
+    // for the hidden Network row, which has none). Lived in ps2x_net_menu.h until the Dragon
+    // Net entry was retired; this dump was its only consumer.
+    struct CursorInfo
+    {
+        uint32_t row = 0xFFFFFFFFu, idx = 0xFFFFFFFFu;
+        uint32_t entry = 0xFFFFFFFFu, handler = 0u, target = 0xFFFFFFFFu;
+        bool valid = false;
+    };
+    bool queryCursor(const uint8_t *rdram, CursorInfo &out);
+
     // One call per frame from the frame hook (game_overrides.cpp).
     void tick(uint8_t *rdram, PS2Runtime *runtime);
 

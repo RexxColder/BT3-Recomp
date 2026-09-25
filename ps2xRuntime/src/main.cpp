@@ -12,10 +12,6 @@ extern "C" void ps2xWinHostInfo();             // ps2_win_timer.cpp: [host] cpu 
 #include "ps2_settings_overlay.h"
 #include "runtime/ps2x_settings.h"     // [netmenu] the Dragon Net Menu toggle ships in settings.toml
 #include "frontend/fe_app.h"          // [frontend] in-runtime front-end (replaces the Qt launcher)
-#include "runtime/ps2x_net_menu.h"   // [netmenu] custom New Dragon Net Menu page
-namespace ps2x_net_gs { void draw(); }   // [netmenu] GS-level sprite injection (ps2x_net_gs.cpp)
-namespace ps2x_net_music { void tick(); }   // [netmenu] host music loop (ps2x_net_music.cpp)
-namespace ps2x_net_menu2d { void draw(); void tick(); }   // [netmenu2d] custom menu (raylib 2D)
 #endif
 
 #ifdef _DEBUG
@@ -616,8 +612,11 @@ int main(int argc, char *argv[])
         // [reveal-hidden-entry] The game hides its 5th main-menu plate ("Network Battle", the
         // network entry) by hardcoding the skip index to 4 (0x335568). The overlay patch disables
         // that skip when this is set, so the entry renders (equivalent to the PCSX2 cheat
-        // 00335568 000000FF). ON by user request; PS2X_REVEAL_HIDDEN_MENU_ENTRY=0 restores stock.
-        def("PS2X_REVEAL_HIDDEN_MENU_ENTRY", "1");
+        // 00335568 000000FF).
+        // NOT defaulted any more: the Dragon Net Menu entry is retired (docs/NEW-NETMENU.md), and
+        // revealing a plate that leads nowhere is worse than the stock menu. Set
+        // PS2X_REVEAL_HIDDEN_MENU_ENTRY=1 by hand to bring the plate back.
+        def("PS2X_REVEAL_HIDDEN_MENU_ENTRY", "0");
         setenv("PS2X_DEFAULTED", s_defaulted.c_str(), 1);
         // Deliberately NOT defaulted: PS2X_BARSTAT (diagnostic spam), PS2X_TIMERMULT.
     }
@@ -691,17 +690,6 @@ int main(int argc, char *argv[])
             const int lvl = PS2SettingsOverlay::getStartupLogLevel();
             const auto exeDir = getExecutableDirectory();
 
-            // [netmenu] The Dragon Net Menu patches are gated on PS2X_NET_MENU, which is read once
-            // on the first frame hook, so exporting it here -- after the front-end has had its
-            // chance to save the toggle, before anything can call it -- is what makes the checkbox
-            // work. overwrite=0: an explicit PS2X_NET_MENU=0 in the environment still wins over the
-            // file, exactly like the other defaults above.
-            {
-                ps2x_settings::Settings s;
-                if (ps2x_settings::load(s, (exeDir / "savedata").string()))
-                    setenv("PS2X_NET_MENU", s.netMenu ? "1" : "0", 0);
-            }
-
             auto enable = [&](const char *name)
             {
                 if (!std::getenv(name))
@@ -766,11 +754,6 @@ int main(int argc, char *argv[])
             [](PS2Runtime &rt, void *userData)
             {
                 static_cast<PS2SettingsOverlay *>(userData)->draw(rt);
-                ps2x_net_music::tick();  // [netmenu] loop our music while the net entry is up
-                ps2x_net_menu2d::tick(); // [netmenu2d] entry navigation (physical pad)
-                ps2x_net_menu2d::draw(); // [netmenu2d] the custom menu: above the game, below the fade
-                ps2x_net_gs::draw();     // [netmenu] the fade/black ON TOP of both (entry fade / exit black)
-                // ps2x_net_menu::draw();   // ImGui page stays off (GS-only)
             },
             [](PS2Runtime &rt, void *userData)
             {

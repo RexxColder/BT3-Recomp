@@ -6,7 +6,6 @@
 #include "runtime/ps2x_dueldump.h"
 
 #include "gfx/bt3gl_api.h"          // raylib Image + ExportImage (PNG, no GL needed)
-#include "runtime/ps2x_net_menu.h"   // reuse queryCursor (the game's own row formula)
 #include "runtime/ps2_texreplace.h" // ps2tex::identify (PCSX2-compatible texture identity)
 #include "ps2_runtime.h"            // PS2Runtime::memory(), PS2_RAM_SIZE/PS2_GS_VRAM_SIZE
 
@@ -43,6 +42,12 @@ namespace
     { return rd[(addr & 0x1FFFFFFFu)]; }
     inline uint16_t rd16(const uint8_t *rd, uint32_t addr)
     { uint16_t v = 0; std::memcpy(&v, rd + (addr & 0x1FFFFFFFu), 2); return v; }
+
+    // The main-menu row states, indexed by the row's entry in the 11-row jump table at
+    // kJumpTableAddr. 0xFFFFFFFF = the row has no target (the hidden Network row).
+    const uint32_t kRowState[11] = { 0x06u, 0x0Du, 0x21u, 0x26u, 0xFFFFFFFFu,
+                                     0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                                     0xFFFFFFFFu, 0xFFFFFFFFu };
 
     // ---- state ---------------------------------------------------------------------
     bool s_armed = false, s_sawDuel = false, s_done = false;
@@ -264,7 +269,7 @@ namespace
         }
     }
 
-    void writeEvent(const uint8_t *rdram, uint32_t state, const ps2x_net_menu::CursorInfo &ci)
+    void writeEvent(const uint8_t *rdram, uint32_t state, const ps2x_dueldump::CursorInfo &ci)
     {
         if (!s_fEvents) return;
         const uint32_t dod = rd32(rdram, kDuelObjAddr) & 0x1FFFFFFFu;
@@ -418,6 +423,32 @@ namespace
 
 namespace ps2x_dueldump
 {
+    // Where the main menu's cursor is pointing. This used to live in ps2x_net_menu.cpp for the
+    // Dragon Net entry; it moved here when that entry was retired, because this dump was the only
+    // thing still reading it. The formula is the game's own (0x33643C..0x33648C).
+    bool queryCursor(const uint8_t *rdram, CursorInfo &out)
+    {
+        out = CursorInfo{};
+        if (!rdram) return false;
+        const uint32_t mo = rd32(rdram, kMenuObjAddr) & 0x1FFFFFFFu;
+        if (!mo) return false;
+        //   row = (menuObj+0x10C + menuObj+0x148 + 1) % menuObj+0x144
+        const uint32_t base  = rd32(rdram, mo + 0x10Cu);
+        const uint32_t curs  = rd32(rdram, mo + 0x148u);
+        const uint32_t count = rd32(rdram, mo + 0x144u);
+        if (!count) return false;
+        const uint32_t row = (base + curs + 1u) % count;
+        const uint32_t idx = rd32(rdram, mo + 0x118u + 4u * row);
+        if (idx >= 11u) return false;
+        out.row     = row;
+        out.idx     = idx;
+        out.entry   = kJumpTableAddr + 4u * idx;
+        out.handler = rd32(rdram, out.entry);
+        out.target  = kRowState[idx];
+        out.valid   = true;
+        return true;
+    }
+
     bool enabled()
     {
         static const bool s = [](){
@@ -437,8 +468,8 @@ namespace ps2x_dueldump
         {
             if (frame - s_armFrame > kMaxFrames) { disarm(); return; }
 
-            ps2x_net_menu::CursorInfo ci;
-            (void)ps2x_net_menu::queryCursor(rdram, ci);
+            CursorInfo ci;
+            (void)queryCursor(rdram, ci);
 
             // Capture the transition FIRST (hex/vram/delta at the moment we enter the screen),
             // then the event row. They use separate "previous" trackers on purpose: writeEvent
@@ -463,8 +494,8 @@ namespace ps2x_dueldump
         // Arm: the main-menu cursor sits on the Duel entry (row 3), or we are already entering it.
         if (state == kMainMenuState)
         {
-            ps2x_net_menu::CursorInfo ci;
-            if (ps2x_net_menu::queryCursor(rdram, ci) && ci.row == kDuelRow) arm(rdram, runtime);
+            CursorInfo ci;
+            if (queryCursor(rdram, ci) && ci.row == kDuelRow) arm(rdram, runtime);
         }
         else if (state == kDuelState)
         {
