@@ -650,6 +650,18 @@ void InstallWizard::draw()
     {
         ImGui::TextWrapped("Selecciona la imagen de tu disco:");
         ImGui::Spacing();
+        // [isopatch] The verify below is a SHA-256 of the boot ELF, so a dump that is the right
+        // title and region but code-patched inside .bin/.elf fails here with no explanation. Say so
+        // up front: the runtime recompiles BIN/DBZP.BIN and the overlay tables are keyed by raw
+        // address, so patching code moves every address after it and the recompiled data no longer
+        // matches the image the guest loads.
+        ImGui::TextColored(fe::warnCol(), "%s", "Ojo: el dump debe ser del titulo y la region correctos (USA).");
+        ImGui::TextWrapped("%s",
+                           "Si esta parcheado a nivel de codigo dentro de los .bin o el .elf no va a funcionar: "
+                           "el juego se recompila, asi que un parche que mueve una instruccion invalida las "
+                           "tablas de direcciones. Los demas parches (texturas, parcheado de disco, "
+                           "traducciones) no tocan el codigo y si sirven.");
+        ImGui::Spacing();
         if (dumpPath.empty())
             ImGui::TextDisabled("Ningun archivo seleccionado");
         else
