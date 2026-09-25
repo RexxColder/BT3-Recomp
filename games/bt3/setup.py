@@ -1848,11 +1848,15 @@ def bundle_windows(ctx: "Context", stage: Path, runner: Path) -> None:
         shutil.copy2(fps60, stage / "fps60_sites.txt")
 
     # [netmenu] The Dragon Net art travels as one blob (19 PNGs would be 19 files in the zip).
-    # CMake stages it next to the runner; the runtime installs it as data/NETPLAY.BIN on first
-    # use, so the install gets the art without shipping loose images.
+    # The deploy already knows where data/ is, so it writes the final name straight into
+    # data/NETPLAY.BIN -- next to DBZP.BIN -- and the runtime only ever reads it. CMake still
+    # stages the source blob next to the runner for a hand-run build, where data/ does not
+    # exist yet and the runtime does the install itself.
     netart = HERE / "dragonnet_assets.bin"
-    if netart.exists() and not (stage / "dragonnet_assets.bin").exists():
-        shutil.copy2(netart, stage / "dragonnet_assets.bin")
+    if netart.exists():
+        installed = stage / "data" / "NETPLAY.BIN"
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(netart, installed)
 
     # FFmpeg DLLs staged next to the runner by CMake POST_BUILD.
     for pattern in ("avcodec-*.dll", "avformat-*.dll", "avutil-*.dll",
