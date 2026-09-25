@@ -118,13 +118,19 @@ RUNNER_EXE = "dragon ball z budokai tenkaichi 3 - recompiled.exe"
 REQUIRED_LAYOUT = [
     RUNNER_EXE,
     "LICENSE",
-    "COPYING.LGPLv3",
     "savedata/settings.toml",
     "savedata/fps60_sites.txt",
     "assets/lib/vcruntime140.dll",
     "assets/lib/vcruntime140_1.dll",
     "assets/lib/msvcp140.dll",
 ]
+
+# paraLLEl-GS ships under LGPL-3.0, so its licence has to travel with a build that bundles it.
+# The dependency is an optional git submodule: on a clean checkout without it the runtime builds
+# without PGS and there is nothing to license, so requiring the file unconditionally failed the
+# gate on exactly the checkouts that legitimately do not have it.
+PGS_LICENCE = "COPYING.LGPLv3"
+PGS_SOURCE = Path(__file__).resolve().parent.parent / "ps2xRuntime" / "third_party" / "parallel-gs"
 
 REQUIRED_GLOB = [
     ("assets/lib/avcodec-*.dll", "FFmpeg avcodec"),
@@ -156,6 +162,8 @@ def main() -> int:
     for rel in REQUIRED_LAYOUT:
         if not (stage / rel).is_file():
             problems.append(f"missing required artefact: {rel}")
+    if (PGS_SOURCE / "COPYING.LGPLv3").is_file() and not (stage / PGS_LICENCE).is_file():
+        problems.append(f"paraLLEl-GS is in the tree but its licence is missing: {PGS_LICENCE}")
     for pattern, what in REQUIRED_GLOB:
         hits = list(stage.glob(pattern))
         if not hits:

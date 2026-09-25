@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
+#include <system_error>
 
 namespace
 {
@@ -132,8 +134,15 @@ namespace frontend
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
         ImGuiIO &io = ImGui::GetIO();
-        io.IniFilename = nullptr;
-        io.LogFilename = nullptr;
+    io.IniFilename = nullptr;
+    // [imgui-error] Recoverable ImGui errors raise a sticky red tooltip that, in this 1.93 tree,
+    // re-raises itself every frame (BeginErrorTooltip ends the window when it is hidden and
+    // EndErrorTooltip ends it again, imgui.cpp). The tooltip is off and so is the hard assert;
+    // the message still goes to the debug log and to our own stderr line, so a real mistake is
+    // reported once instead of drowning the UI.
+    io.ConfigErrorRecoveryEnableTooltip = false;
+    io.ConfigErrorRecoveryEnableAssert = false;
+    io.ConfigErrorRecoveryEnableDebugLog = true;
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
 

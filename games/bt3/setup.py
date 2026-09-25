@@ -1637,7 +1637,7 @@ def stage_build(ctx: "Context") -> None:
 # ------------------------------------------------------------------------------------------------
 # Stage 4: deploy (+ packaging, added in the packaging phase)
 # ------------------------------------------------------------------------------------------------
-def deploy_tree(runner: Path, out: Path) -> None:
+def deploy_tree(runner: Path, out: Path, keep_music: bool = False) -> None:
     """Assemble the portable tree in OUT.
 
     layout: OUT/savedata/ (settings.toml; existing user saves are preserved), OUT/assets/ (fonts).
@@ -1657,6 +1657,23 @@ def deploy_tree(runner: Path, out: Path) -> None:
         src = runner.parent / a
         if src.exists():
             copytree_overlay(src, out / a)
+    # The menu theme is the game's own soundtrack: a local file the user drops in, never part of
+    # the release. CMake stages the whole assets/ tree next to the runner for local runs, so it
+    # is dropped again unless --with-music says to keep it.
+    theme = out / "assets" / "music"
+    if theme.is_dir() and not keep_music:
+        shutil.rmtree(theme, ignore_errors=True)
+        LOG.info("  dropped assets/music (copyrighted audio, pass --with-music to keep it)")
+    elif theme.is_dir():
+        LOG.info("  keeping assets/music (--with-music)")
+    # Mirror what CMake stages next to the runner. Only data/Textures, never all of data/: a build
+    # directory can hold a full installed game and that is gigabytes of user data.
+    for rel in ("data/Textures", "mods"):
+        src = runner.parent / rel
+        if src.is_dir():
+            copytree_overlay(src, out / rel)
+            LOG.info(f"  {rel} -> {out / rel}")
+    (out / "logs").mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
         for p in runner.parent.glob("*.dll"):
             shutil.copy2(p, out / p.name)
@@ -1942,10 +1959,6 @@ def stage_package(ctx: "Context") -> None:
     if ctx.runner is None:
         ctx.runner = find_binary("ps2EntryRunner")
 
-    if ctx.args.deploy and not ctx.args.package:
-        deploy_tree(ctx.runner, Path(ctx.args.deploy).resolve())
-        return
-
     out_root = _release_out(ctx)
     stage = out_root / "stage"
     if stage.exists():
@@ -1957,11 +1970,9 @@ def stage_package(ctx: "Context") -> None:
             VIEW.item(n, 6, name, status)
 
     item(1, "Assemble deploy tree")
-    deploy_tree(ctx.runner, stage)
+    deploy_tree(ctx.runner, stage, ctx.args.with_music)
     item(2, "Seed savedata")
     seed_savedata(ctx, stage)
-    if ctx.args.deploy:
-        deploy_tree(ctx.runner, Path(ctx.args.deploy).resolve())
 
     if ctx.platform.is_macos:
         bundler = ROOT / "tools" / "macos" / "deploy.py"
@@ -1981,6 +1992,17 @@ def stage_package(ctx: "Context") -> None:
     if not ctx.args.no_gate:
         item(5, "Dependency gate")
         run_gate(ctx, stage)
+
+    # --deploy mirrors the finished stage, so the copy carries the seeded savedata, the bundled
+    # runtime and the release exe name. Re-assembling from the build dir instead (the old
+    # behaviour) produced a tree missing all three, which is why --no-package --deploy was not a
+    # playable tree. copytree_overlay overwrites but never prunes: --deploy can point at a
+    # directory that already holds an installed game, and that must survive.
+    if ctx.args.deploy:
+        item(4, "Mirror to --deploy")
+        deploy_out = Path(ctx.args.deploy).resolve()
+        copytree_overlay(stage, deploy_out)
+        LOG.info(f"  mirrored stage -> {deploy_out}")
 
     if ctx.args.package:
         item(6, "Package artifact")
@@ -2030,6 +2052,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="produce the release artifact for this OS (+ checksum); on by default")
     ap.add_argument("--no-package", dest="package", action="store_false",
                     help="do not produce the release artifact (stage 4 assembles the deploy tree only)")
+    ap.add_argument("--with-music", action="store_true",
+                    help="keep the menu theme (assets/music) in the deploy tree and the artifact; "
+                         "off by default because the track is copyrighted game audio that the "
+                         "project does not redistribute")
     ap.add_argument("--output", metavar="DIR",
                     help="where the stage tree and the artifact go (default build/release-<os>/out)")
     ap.add_argument("--no-gate", dest="no_gate", action="store_true",

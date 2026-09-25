@@ -98,7 +98,8 @@ namespace fe
             if (ImGui::SmallButton("?"))
                 ImGui::OpenPopup("##fe_help");
             ImGui::PopStyleColor(3);
-            if (ImGui::BeginPopup("##fe_help"))
+            const bool helpVisible = ImGui::BeginPopup("##fe_help");
+            if (helpVisible)
             {
                 ImGui::PushStyleColor(ImGuiCol_Text, gold());
                 ImGui::TextUnformatted(label);
@@ -108,8 +109,10 @@ namespace fe
                 ImGui::Separator();
                 if (ImGui::Button("Cerrar", ImVec2(90.0f, 0.0f)))
                     ImGui::CloseCurrentPopup();
-                ImGui::EndPopup();
             }
+            // Outside the if, like every other Begin/End pair: a popup that reports itself
+            // invisible on its closing frame still has to be ended.
+            ImGui::EndPopup();
         }
         ImGui::PopID();
         return open;
@@ -196,7 +199,8 @@ namespace fe
         ImGui::PushID(label);
         ImGui::SetNextItemWidth(width > 0.0f ? width : unit() * 16.0f);
         bool changed = false;
-        if (ImGui::BeginCombo("##cs", current))
+        const bool comboOpen = ImGui::BeginCombo("##cs", current);
+        if (comboOpen)
         {
             for (int i = 0; i < count; ++i)
             {
@@ -209,8 +213,9 @@ namespace fe
                 if (sel)
                     ImGui::SetItemDefaultFocus();
             }
-            ImGui::EndCombo();
         }
+        // Same rule as every other pair: a combo that reports itself closed still owns a window.
+        ImGui::EndCombo();
         ImGui::PopID();
         return changed;
     }

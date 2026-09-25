@@ -7,8 +7,9 @@
 namespace frontend
 {
     // In-app file picker. SDL2 has no native open dialog (SDL_ShowOpenFileDialog is SDL3), and
-    // the front-end does not carry Qt, so the browser is built from ImGui: a path box, ".."
-    // navigation and a filtered listing. Portable, and it looks like the rest of the HUD.
+    // the front-end does not carry Qt, so the browser is built from ImGui: a places bar with every
+    // mounted volume, a path box, "up" navigation and a filtered listing. Portable, and it looks
+    // like the rest of the HUD.
     class FilePicker
     {
     public:
@@ -31,17 +32,29 @@ namespace frontend
             unsigned long long size = 0;
         };
 
+        // A jump target in the places bar: a mounted volume, a user folder, or the start dir.
+        struct Place
+        {
+            std::string label;
+            std::filesystem::path path;
+        };
+
+        void buildPlaces();
         void listDir();
         bool matches(const Entry &e) const;
+        void goTo(const std::filesystem::path &p);
+        void acceptCurrent();
 
         bool m_open = false;
         bool m_accepted = false;
+        bool m_justOpened = false;
         std::string m_title;
         std::filesystem::path m_dir;
         std::filesystem::path m_selected;
-        char m_pathBuffer[512] = {};
+        char m_pathBuffer[1024] = {};
         std::vector<std::string> m_exts;
         std::vector<Entry> m_entries;
+        std::vector<Place> m_places;
         std::string m_result;
     };
 }

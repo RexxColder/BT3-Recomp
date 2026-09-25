@@ -193,7 +193,34 @@ def main():
             raise
         if had_previous:
             shutil.rmtree(previous)
-    print(f"Ready: {dest}\nGame data and saves: ~/Library/Application Support/BT3-Recomp")
+
+    # The runtime anchors data/, savedata/ and logs/ to the executable directory, which inside a
+    # bundle is Contents/MacOS. Leaving them there would put gigabytes of game data (and the
+    # player's saves) inside the app, where replacing or moving the bundle loses them. Linking the
+    # writable names to Application Support is what actually makes the promise below true, and it
+    # needs no environment variable, so it works from Finder, Dock and `open` alike.
+    support = Path.home() / "Library" / "Application Support" / "BT3-Recomp"
+    macos_dir = dest / "Contents" / "MacOS"
+    linked = []
+    for name in ("data", "savedata", "mods", "logs"):
+        target = support / name
+        target.mkdir(parents=True, exist_ok=True)
+        link = macos_dir / name
+        if link.is_symlink() or link.exists():
+            if link.is_symlink() and link.resolve() == target.resolve():
+                linked.append(name)
+                continue
+            if link.is_dir() and not link.is_symlink():
+                # First run on a bundle that already collected data: move it out, then link.
+                for child in link.iterdir():
+                    shutil.move(str(child), str(target / child.name))
+                shutil.rmtree(link)
+            else:
+                link.unlink()
+        link.symlink_to(target, target_is_directory=True)
+        linked.append(name)
+    print(f"Ready: {dest}")
+    print(f"Game data and saves: {support}  (linked into the bundle: {', '.join(linked)})")
     print("Local ad-hoc signature; Developer ID and notarization are not performed.")
 
 

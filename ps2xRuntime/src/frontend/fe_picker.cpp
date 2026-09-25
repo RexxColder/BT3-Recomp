@@ -7,7 +7,14 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <system_error>
+
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  define NOMINMAX
+#  include <windows.h>
+#endif
 
 namespace
 {
@@ -17,6 +24,58 @@ namespace
                        [](unsigned char c) { return (char)std::tolower(c); });
         return s;
     }
+
+    bool isDir(const std::filesystem::path &p)
+    {
+        std::error_code ec;
+        return std::filesystem::is_directory(p, ec);
+    }
+
+    // Shorten a path for a one-line label: C:\Users\Rexx\Downloads -> C:\...\Downloads
+    std::string shortPath(const std::filesystem::path &p)
+    {
+        const std::string s = p.string();
+        if (s.size() <= 42)
+            return s;
+        return s.substr(0, 3) + "..." + s.substr(s.size() - 38);
+    }
+
+#if defined(_WIN32)
+    // Volume label ("Windows", "DATA"), so two drives are told apart by more than their letter.
+    std::string volumeLabel(const std::string &root)
+    {
+        char name[256] = "";
+        const DWORD n = GetVolumeInformationA(root.c_str(), name, sizeof name, nullptr, nullptr,
+                                              nullptr, nullptr, 0);
+        if (n && name[0])
+            return name;
+        return std::string();
+    }
+
+    // Every drive Windows currently has mounted. The old picker started at C:\ and offered no way
+    // out of it, which is exactly the case this replaces.
+    void appendWindowsDrives(std::vector<std::pair<std::string, std::filesystem::path>> &out)
+    {
+        DWORD mask = GetLogicalDrives();
+        for (int i = 0; i < 26; ++i)
+        {
+            if (!(mask & (1u << i)))
+                continue;
+            const std::string root = std::string(1, (char)('A' + i)) + ":\\";
+            const UINT type = GetDriveTypeA(root.c_str());
+            if (type == DRIVE_NO_ROOT_DIR)
+                continue;   // an empty card reader slot, not a volume
+            std::string label = volumeLabel(root);
+            if (type == DRIVE_CDROM)
+                label = label.empty() ? "CD/DVD" : label;
+            else if (label.empty())
+                label = type == DRIVE_REMOVABLE ? "Removible" : "Unidad";
+            out.push_back({root + "  " + label, std::filesystem::path(root)});
+        }
+    }
+#else
+    void appendWindowsDrives(std::vector<std::pair<std::string, std::filesystem::path>> &) {}
+#endif
 }
 
 namespace frontend
@@ -26,13 +85,79 @@ namespace frontend
     {
         m_open = true;
         m_accepted = false;
+        m_justOpened = true;   // the modal is opened by draw(), not here: it needs a frame
         m_title = title;
-        m_dir = startDir;
+        m_exts = std::move(extensions);
         m_selected.clear();
         m_result.clear();
-        m_exts = std::move(extensions);
-        std::snprintf(m_pathBuffer, sizeof m_pathBuffer, "%s", m_dir.string().c_str());
+        buildPlaces();
+        goTo(startDir);
+    }
+
+    void FilePicker::buildPlaces()
+    {
+        m_places.clear();
+        std::vector<std::pair<std::string, std::filesystem::path>> drives;
+        appendWindowsDrives(drives);
+        for (auto &d : drives)
+            m_places.push_back({d.first, d.second});
+
+        // The user folders people actually keep dumps in, when they exist.
+        std::error_code ec;
+        std::filesystem::path home;
+#if defined(_WIN32)
+        if (const char *h = std::getenv("USERPROFILE"))
+            home = h;
+        else if (const char *h = std::getenv("HOME"))
+            home = h;
+#else
+        if (const char *h = std::getenv("HOME"))
+            home = h;
+#endif
+        if (home.empty())
+            home = std::filesystem::current_path(ec);
+        struct { const char *label; const char *sub; } shortcuts[] = {
+            {"Descargas", "Downloads"}, {"Escritorio", "Desktop"}, {"Documentos", "Documents"},
+            {"Videos", "Videos"},
+        };
+        for (const auto &s : shortcuts)
+        {
+            const std::filesystem::path p = home / s.sub;
+            if (isDir(p))
+                m_places.push_back({s.label, p});
+        }
+    }
+
+    void FilePicker::goTo(const std::filesystem::path &p)
+    {
+        std::error_code ec;
+        std::filesystem::path target = p;
+        if (isDir(target))
+        {
+            m_dir = target;
+        }
+        else
+        {
+            // A file, or something that does not exist: start from the deepest parent that does.
+            std::filesystem::path parent = target.parent_path();
+            if (parent.empty())
+                parent = std::filesystem::path(target).root_path();
+            while (!parent.empty() && !isDir(parent))
+                parent = parent.parent_path();
+            if (parent.empty())
+                parent = std::filesystem::current_path(ec);
+            m_dir = parent;
+        }
+        m_selected.clear();
         listDir();
+    }
+
+    void FilePicker::acceptCurrent()
+    {
+        if (m_selected.empty())
+            return;
+        m_result = m_selected.string();
+        m_accepted = true;
     }
 
     bool FilePicker::matches(const Entry &e) const
@@ -52,21 +177,22 @@ namespace frontend
     {
         m_entries.clear();
         std::error_code ec;
-        if (!std::filesystem::is_directory(m_dir, ec))
+        if (!isDir(m_dir))
         {
-            // The typed path was not a directory: fall back to its parent.
-            const std::filesystem::path parent = m_dir.parent_path();
-            if (!parent.empty() && std::filesystem::is_directory(parent, ec))
-                m_dir = parent;
-            else
+            m_dir = m_dir.root_path();
+            if (!isDir(m_dir))
                 return;
         }
         std::snprintf(m_pathBuffer, sizeof m_pathBuffer, "%s", m_dir.string().c_str());
 
         for (const auto &de : std::filesystem::directory_iterator(m_dir, ec))
         {
+            if (ec)
+                break;
             Entry e;
             e.name = de.path().filename().string();
+            if (e.name.empty() || e.name == "." || e.name == "..")
+                continue;
             e.dir = de.is_directory(ec);
             if (!e.dir)
             {
@@ -90,97 +216,166 @@ namespace frontend
         if (!m_open)
             return false;
 
-        ImGui::OpenPopup("##fe_picker");
+        // Open on the frame the modal is asked for, not every frame: a repeated OpenPopup resets
+        // the modal's state and swallows the click that was meant to close it.
+        if (m_justOpened)
+        {
+            m_justOpened = false;
+            ImGui::OpenPopup("##fe_picker");
+        }
+
         bool result = false;
-        if (ImGui::BeginPopupModal("##fe_picker", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        const bool visible = ImGui::BeginPopupModal("##fe_picker", nullptr,
+                                                    ImGuiWindowFlags_AlwaysAutoResize);
+        if (visible)
         {
             ImGui::TextColored(fe::gold(), "%s", m_title.c_str());
             ImGui::Separator();
 
-            ImGui::SetNextItemWidth(520.0f);
+            // Places: every mounted volume first, then the user folders.
+            if (!m_places.empty())
+            {
+                ImGui::TextDisabled("Ir a:");
+                for (std::size_t i = 0; i < m_places.size(); ++i)
+                {
+                    if (i > 0)
+                        ImGui::SameLine();
+                    ImGui::PushID(static_cast<int>(i));
+                    if (ImGui::SmallButton(m_places[i].label.c_str()))
+                        goTo(m_places[i].path);
+                    ImGui::PopID();
+                }
+                ImGui::Separator();
+            }
+
+            ImGui::SetNextItemWidth(560.0f);
             if (ImGui::InputText("##path", m_pathBuffer, sizeof m_pathBuffer))
             {
                 const std::filesystem::path typed(m_pathBuffer);
-                std::error_code ec;
-                if (std::filesystem::is_directory(typed, ec))
-                {
-                    m_dir = typed;
-                    listDir();
-                }
+                if (isDir(typed))
+                    goTo(typed);
             }
             ImGui::SameLine();
             if (ImGui::Button("Ir"))
-            {
-                m_dir = std::filesystem::path(m_pathBuffer);
-                listDir();
-            }
+                goTo(std::filesystem::path(m_pathBuffer));
             ImGui::SameLine();
-            if (ImGui::Button(".."))
+            if (ImGui::Button("Subir"))
             {
                 const std::filesystem::path parent = m_dir.parent_path();
                 if (!parent.empty())
-                {
-                    m_dir = parent;
-                    listDir();
-                }
+                    goTo(parent);
             }
+            ImGui::SameLine();
+            ImGui::TextDisabled("  %s", shortPath(m_dir).c_str());
 
             ImGui::Separator();
-            ImGui::BeginChild("##fe_picker_list", ImVec2(520.0f, 320.0f), ImGuiChildFlags_Borders);
-            for (const Entry &e : m_entries)
+            ImGui::BeginChild("##fe_picker_list", ImVec2(620.0f, 300.0f), ImGuiChildFlags_Borders);
             {
-                ImGui::PushID(e.name.c_str());
-                if (e.dir)
+                ImDrawList *dl = ImGui::GetWindowDrawList();
+                const ImU32 dirCol = ImGui::GetColorU32(fe::gold());
+                const ImU32 fileCol = ImGui::GetColorU32(fe::dbz(0.62f, 0.68f, 0.78f));
+                const ImU32 dimCol = ImGui::GetColorU32(fe::dbz(0.45f, 0.48f, 0.55f));
+                const float rowH = ImGui::GetTextLineHeight();
+                const std::filesystem::path listedDir = m_dir;
+
+                for (const Entry &e : m_entries)
                 {
-                    if (ImGui::Selectable(("[DIR] " + e.name).c_str()))
+                    ImGui::PushID(e.name.c_str());
+                    // The row is an empty selectable and the glyph plus the text are painted on its
+                    // draw list: Russo One has no folder or page character, and a "[DIR]" prefix
+                    // read like a log line rather than a file browser.
+                    const bool sel = !e.dir && m_selected == (m_dir / e.name);
+                    ImGui::Selectable("##row", sel);
+                    const ImVec2 a = ImGui::GetItemRectMin();
+                    const ImVec2 b = ImGui::GetItemRectMax();
+                    const float cy = (a.y + b.y) * 0.5f;
+                    const float ix = a.x + 11.0f;
+
+                    if (e.dir)
                     {
-                        m_dir = m_dir / e.name;
-                        listDir();
+                        // Folder: body plus a tab on the top left.
+                        const ImVec2 bodyMin(a.x + 4.0f, cy - rowH * 0.34f);
+                        const ImVec2 bodyMax(a.x + 19.0f, cy + rowH * 0.40f);
+                        dl->AddRectFilled(bodyMin, ImVec2(a.x + 12.0f, cy - rowH * 0.44f), dirCol);
+                        dl->AddRectFilled(ImVec2(a.x + 4.0f, cy - rowH * 0.34f), bodyMax, dirCol);
+                        dl->AddRectFilled(ImVec2(a.x + 4.0f, cy - rowH * 0.34f),
+                                          ImVec2(a.x + 19.0f, cy - rowH * 0.20f), dirCol);
                     }
-                }
-                else
-                {
-                    char label[320];
-                    std::snprintf(label, sizeof label, "%s   (%.1f MB)", e.name.c_str(),
-                                  e.size / 1048576.0);
-                    const bool sel = m_selected == (m_dir / e.name);
-                    if (ImGui::Selectable(label, sel))
-                        m_selected = m_dir / e.name;
+                    else
+                    {
+                        // Page: a rectangle with the top-right corner folded over.
+                        const ImVec2 p0(a.x + 6.0f, cy - rowH * 0.44f);
+                        const ImVec2 p1(a.x + 17.0f, cy + rowH * 0.44f);
+                        const float fold = rowH * 0.22f;
+                        dl->AddRectFilled(p0, p1, fileCol);
+                        dl->AddTriangleFilled(ImVec2(p1.x - fold, p0.y), ImVec2(p1.x, p0.y),
+                                              ImVec2(p1.x, p0.y + fold), dimCol);
+                    }
+
+                    const char *name = e.name.c_str();
+                    dl->AddText(ImVec2(ix + 14.0f, a.y + (rowH - ImGui::GetFontSize()) * 0.5f),
+                                sel ? dirCol : ImGui::GetColorU32(ImGuiCol_Text), name);
+                    if (!e.dir)
+                    {
+                        char sz[64];
+                        if (e.size >= 1073741824ull)
+                            std::snprintf(sz, sizeof sz, "%.2f GB", e.size / 1073741824.0);
+                        else
+                            std::snprintf(sz, sizeof sz, "%.1f MB", e.size / 1048576.0);
+                        const float w = ImGui::CalcTextSize(sz).x;
+                        dl->AddText(ImVec2(b.x - 10.0f - w, a.y + (rowH - ImGui::GetFontSize()) * 0.5f),
+                                    dimCol, sz);
+                    }
+
                     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                     {
-                        m_result = m_selected.string();
-                        m_accepted = true;
+                        if (e.dir)
+                            goTo(m_dir / e.name);
+                        else
+                        {
+                            m_selected = m_dir / e.name;
+                            acceptCurrent();
+                        }
                     }
+                    else if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+                    {
+                        if (e.dir)
+                            goTo(m_dir / e.name);   // single click walks into the folder
+                        else
+                            m_selected = m_dir / e.name;
+                    }
+                    ImGui::PopID();
+                    if (m_dir != listedDir)
+                        break;   // the entry list was just rebuilt; stop iterating it
                 }
-                ImGui::PopID();
             }
             ImGui::EndChild();
 
             ImGui::Separator();
-            char picked[520];
-            std::snprintf(picked, sizeof picked, "%s",
-                          m_selected.empty() ? "(nada seleccionado)" : m_selected.string().c_str());
-            ImGui::TextDisabled("%s", picked);
-            ImGui::TextDisabled("Doble click para elegir. %zu entradas.", m_entries.size());
+            if (m_selected.empty())
+                ImGui::TextDisabled("Doble click en un archivo para elegirlo.");
+            else
+                ImGui::TextWrapped("%s", m_selected.string().c_str());
+            ImGui::TextDisabled("%zu entradas%s", m_entries.size(),
+                                m_exts.empty() ? "" : " (filtradas)");
 
             ImGui::BeginDisabled(m_selected.empty());
             if (ImGui::Button("Seleccionar"))
-            {
-                m_result = m_selected.string();
-                m_accepted = true;
-            }
+                acceptCurrent();
             ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Cancelar"))
                 m_open = false;
-            ImGui::EndPopup();
+        }
+        // End outside the if: a modal that reports itself invisible still owns a window, and
+        // skipping this is what produced "Calling End() too many times!".
+        ImGui::EndPopup();
 
-            if (!m_open || m_accepted)
-            {
-                m_open = false;
-                result = m_accepted;
-                m_accepted = false;
-            }
+        if (m_accepted)
+        {
+            m_open = false;
+            result = true;
+            m_accepted = false;
         }
         return result;
     }
