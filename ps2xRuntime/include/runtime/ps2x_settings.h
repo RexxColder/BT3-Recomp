@@ -64,6 +64,10 @@ namespace ps2x_settings
         bool texcache = true;
         int buttonLayout = 1;
         bool fps60 = false;
+        // [perf] Live fps / frame-time / GPU-busy readout in the overlay's Video tab. Off by default:
+        // the GPU side costs a timing query per draw call, and nothing should pay that unless someone
+        // is reading the numbers. Not env-guarded -- there is no env for it, it is purely a view.
+        bool showPerf = false;
         int hudLayout = 0;
         int hudOffL = 0;
         int hudOffC = 0;

@@ -1,4 +1,4 @@
-#include "runtime/ps2x_settings.h"
+﻿#include "runtime/ps2x_settings.h"
 
 #include "runtime/ps2_toml.h"
 
@@ -167,7 +167,9 @@ namespace
     s.musicMuted = doc.getB("frontend.music_muted", s.musicMuted);
         s.windowH = doc.getI("video.window_h", s.windowH);
         s.forceBilinear = doc.getB("video.force_bilinear", s.forceBilinear);
+
         s.fps60 = doc.getB("video.fps60", s.fps60);
+        s.showPerf = doc.getB("video.show_perf", s.showPerf);
 
         s.hudLayout = doc.getI("video.hud.layout", s.hudLayout);
         s.hudOffL = doc.getI("video.hud.offset_left", s.hudOffL);
@@ -309,7 +311,7 @@ namespace ps2x_settings
                a.monitor == b.monitor && a.gpu == b.gpu && a.widescreen == b.widescreen && a.windowW == b.windowW &&
                a.windowH == b.windowH && a.forceBilinear == b.forceBilinear && a.texPack == b.texPack &&
                a.introVideo == b.introVideo && a.texcache == b.texcache &&
-               a.buttonLayout == b.buttonLayout && a.fps60 == b.fps60 && a.hudLayout == b.hudLayout &&
+               a.buttonLayout == b.buttonLayout && a.fps60 == b.fps60 && a.showPerf == b.showPerf &&
                a.hudOffL == b.hudOffL && a.hudOffC == b.hudOffC && a.hudOffR == b.hudOffR &&
                a.device == b.device && a.deadzone == b.deadzone &&
                a.overlayEnabled == b.overlayEnabled && a.overlayPadBtns == b.overlayPadBtns &&
@@ -421,7 +423,8 @@ namespace ps2x_settings
         os << "window_w = " << fmtInt(s.windowW) << "\n";
         os << "window_h = " << fmtInt(s.windowH) << "\n";
         os << "force_bilinear = " << fmtBool(s.forceBilinear) << "\n";
-        os << "fps60 = " << fmtBool(s.fps60) << "\n\n";
+        os << "fps60 = " << fmtBool(s.fps60) << "\n";
+        os << "show_perf = " << fmtBool(s.showPerf) << "\n\n";
 
         os << "[video.hud]\n";
         os << "layout = " << fmtInt(s.hudLayout) << "\n";
@@ -521,6 +524,7 @@ namespace ps2x_settings
         out.windowH = live.windowH;
         out.forceBilinear = live.forceBilinear;
         out.fps60 = live.fps60;
+        out.showPerf = live.showPerf;
         out.hudLayout = live.hudLayout;
         out.hudOffL = live.hudOffL;
         out.hudOffC = live.hudOffC;

@@ -51,6 +51,9 @@ public:
         bool texcache = true;
         int buttonLayout = 1;   // [texui] 0 = PS2 (Original Buttons), 1 = Xbox (Xbox Layout); applies on restart
         bool fps60 = false;   // [fps60] 60 fps mode: fight step 1 + the pacing table (applies between fights)
+    // [perf] Show the live fps / frame-time / GPU-busy block in this tab's STATUS section. Off by
+    // default because the GPU side costs a timing query per draw call.
+    bool showPerf = false;
         int inkStrength = 199;   // [inkstrength] cel-outline darkener, % of Cs (199 = hardware 255/128)
         int inkWidth = 100;      // [pgsink] paraLLEl-GS: outline stroke width, % of a PS2 texel (100 = native, 25 = thinnest)
         unsigned inkColor = 0;   // [pgsink] paraLLEl-GS: outline colour 0xRRGGBB (0 = the game's black)

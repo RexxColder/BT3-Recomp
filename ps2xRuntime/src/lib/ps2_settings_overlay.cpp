@@ -14,7 +14,8 @@
 
 #include "imgui.h"
 #include "gfx/ps2x_ui.h"
-#include "runtime/ps2_video_status.h"   // [video] the status dots   // UiSetup/Begin/End: rlImGui (GL) or imgui_impl_dx11 (PS2X_D3D11)
+#include "runtime/ps2_video_status.h"   // [video] the status dots
+#include "runtime/ps2x_perf_status.h"   // [perf] the live fps / frame-time / GPU-busy readout   // UiSetup/Begin/End: rlImGui (GL) or imgui_impl_dx11 (PS2X_D3D11)
 #include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 
 #include "runtime/ps2_toml.h"
@@ -580,7 +581,8 @@ void PS2SettingsOverlay::loadSettings()
         else m_settings.dofZFar = std::clamp(doc.getI("video.dof_zfar", m_settings.dofZFar), 20000, 800000);
     m_settings.fullscreen = doc.getB("video.fullscreen", m_settings.fullscreen);
     m_settings.widescreen = doc.getB("video.widescreen", m_settings.widescreen);
-    m_settings.fps60 = doc.getB("video.fps60", m_settings.fps60);
+        m_settings.fps60 = doc.getB("video.fps60", m_settings.fps60);
+        m_settings.showPerf = doc.getB("video.show_perf", m_settings.showPerf);
     m_settings.windowW = doc.getI("video.window_w", m_settings.windowW);
     m_settings.windowH = doc.getI("video.window_h", m_settings.windowH);
     m_settings.forceBilinear = doc.getB("video.force_bilinear", m_settings.forceBilinear);
@@ -776,6 +778,7 @@ void PS2SettingsOverlay::saveSettings() const
     live.windowH = m_settings.windowH;
     live.forceBilinear = m_settings.forceBilinear;
     live.fps60 = m_settings.fps60;
+    live.showPerf = m_settings.showPerf;
     live.hudLayout = m_settings.hudLayout;
     live.hudOffL = m_settings.hudOffL;
     live.hudOffC = m_settings.hudOffC;
@@ -844,6 +847,7 @@ void PS2SettingsOverlay::syncFromRuntime()
 void PS2SettingsOverlay::applySettings()
 {
     ps2Set60Fps(m_settings.fps60, nullptr);   // [fps60]
+    ps2x::SetPerfOverlayEnabled(m_settings.showPerf);   // [perf] arm the GPU timing queries at boot too
     s_widescreen = m_settings.widescreen;
     PS2AudioBackend::setMasterVolume(m_settings.masterVolume);
     PS2AudioBackend::setMusicVolume(m_settings.musicVolume);
@@ -1369,6 +1373,69 @@ void PS2SettingsOverlay::drawVideoTab()
             vs.upscale == ps2x::VideoState::Ok ? "active"
           : vs.scaleNeedsRestart               ? "applies on restart"
                                                : "not available (software renderer)");
+
+        // [perf] Live frame pacing. The nominal refresh is already in hand from the Monitor row, and
+        // showing it NEXT TO the measured rate is the whole trick: a bare "60" is unreadable (vsync
+        // locked? or a coincidence?), while "59.8 / 60 Hz" says at a glance whether the present is
+        // being held to the panel's rate or is running free.
+        if (m_settings.showPerf)
+        {
+            const ps2x::PerfStatus pf = ps2x::GetPerfStatus();
+            if (!pf.valid)
+            {
+                std::snprintf(val, sizeof val, "esperando el primer frame");
+                dot(ps2x::VideoState::Fallback, "FPS", val, "");
+            }
+            else
+            {
+                std::snprintf(val, sizeof val, "%.1f", pf.displayFps);
+                std::snprintf(note, sizeof note, "%s",
+                              pf.displayRefreshHz > 0 ? "" : "  (refresh del monitor desconocido)");
+                if (pf.displayRefreshHz > 0)
+                    std::snprintf(note, sizeof note, "de %d Hz", pf.displayRefreshHz);
+                dot(ps2x::VideoState::Ok, "FPS", val, note);
+
+                // p50 alone hides stutter completely: a mean of 16.7 can be all 16 ms frames plus
+                // one 80 ms hitch, which is exactly what the 60fps patch and the Windows
+                // micro-freezes look like. p95 is the frame that actually happened.
+                std::snprintf(val, sizeof val, "%.1f / %.1f / %.1f ms",
+                              static_cast<double>(pf.frameMsP50), static_cast<double>(pf.frameMsP95),
+                              static_cast<double>(pf.frameMsMax));
+                std::snprintf(note, sizeof note, "p50 / p95 / max  de %d frames", pf.frameSamples);
+                dot(pf.frameMsP95 > 1000.0 / 45.0 ? ps2x::VideoState::Fallback : ps2x::VideoState::Ok,
+                    "Frame", val, note);
+
+                // The GPU line names its own source and coverage. Without that, a 0 here is
+                // unreadable -- it used to mean "not measured" on two of the three backends.
+                const bool noGpu = pf.gpuSource == ps2x::GpuSource::SoftwareCpu
+                                || pf.gpuSource == ps2x::GpuSource::None;
+                if (noGpu)
+                {
+                    std::snprintf(val, sizeof val, "n/d");
+                    std::snprintf(note, sizeof note, "%s",
+                                  pf.gpuSource == ps2x::GpuSource::SoftwareCpu
+                                      ? "rasterizado por CPU, no hay GPU que medir"
+                                      : "el renderer no reporta tiempos de GPU");
+                    dot(ps2x::VideoState::Fail, "GPU", val, note);
+                }
+                else
+                {
+                    std::snprintf(val, sizeof val, "%.0f %%", pf.gpuBusyPct);
+                    const char *src = pf.gpuSource == ps2x::GpuSource::VulkanTimestamps ? "Vulkan, frame completo"
+                                    : pf.gpuSource == ps2x::GpuSource::OpenGL ? "OpenGL" : "?";
+                    if (pf.gpuCoverage >= 1.0)
+                        std::snprintf(note, sizeof note, "%s  -  %.1f ms/frame", src, pf.gpuMsPerFrame);
+                    else
+                        std::snprintf(note, sizeof note,
+                                      "%s, solo la lista de dibujado: es un minimo  -  %.1f ms/frame", src, pf.gpuMsPerFrame);
+                    dot(ps2x::VideoState::Ok, "GPU", val, note);
+                }
+
+                std::snprintf(val, sizeof val, "invitado %.0f %%  submit %.0f %%", pf.guestPct, pf.submitPct);
+                std::snprintf(note, sizeof note, "de la CPU, sobre el tiempo real");
+                dot(ps2x::VideoState::Ok, "CPU", val, note);
+            }
+        }
     }
 
     // [display] Display settings live in a popup so the tab stays short. Apply = live only; Save = live
@@ -1458,6 +1525,13 @@ void PS2SettingsOverlay::drawVideoTab()
         if (toggleSwitch("60 FPS (experimental)", &m_settings.fps60))
         {   // [fps60] step 1 + the pacing table; the runtime applies it between fights, never mid-fight
             ps2Set60Fps(m_settings.fps60, nullptr);
+            m_dirty = true;
+        }
+        // [perf] Toggling this also arms the runtime, which is what turns the GPU timing queries on:
+        // they are not free, so nothing should pay for them unless someone is reading the numbers.
+        if (toggleSwitch("Mostrar FPS y GPU", &m_settings.showPerf))
+        {
+            ps2x::SetPerfOverlayEnabled(m_settings.showPerf);
             m_dirty = true;
         }
         if (toggleSwitch("Character Shadows", &m_settings.shadows))

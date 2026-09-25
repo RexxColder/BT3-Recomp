@@ -579,6 +579,13 @@ if(PS2X_BUILD_PROBES AND NOT PS2X_IS_VITA)
     add_executable(ps2x_settings_probe src/frontend/ps2x_settings_probe.cpp)
     target_link_libraries(ps2x_settings_probe PRIVATE ps2x_settings)
 
+    # [fe-probe] The perf accumulator's arithmetic: present rate, nearest-rank percentiles, and the
+    # coverage/source contract. No GL and no window, so the claims the readout makes are checkable.
+    add_executable(fe_perf_probe src/frontend/fe_perf_probe.cpp src/lib/ps2x_perf.cpp)
+    target_include_directories(fe_perf_probe PRIVATE src include)
+    target_compile_options(fe_perf_probe PRIVATE /W4)
+    target_compile_options(fe_perf_probe PRIVATE -Wall -Wextra)
+
     # [fe-probe] Drives the front-end's combo/popup widgets through real frames on ImGui's null
     # backend and asserts the Begin/End contract holds. Needs no window and no GL, so the
     # dropdown-cannot-open / whole-UI-unclickable class of bug is catchable in a headless run.
@@ -626,6 +633,7 @@ src/lib/ui_sdl.cpp          # [C] ImGui platform glue on SDL2 (replaces rlImGui)
     src/lib/ps2_iop_module.cpp   # [iop] IRX (IOP module) loader
     src/lib/ps2_fmv_override.cpp # [fmvoverride] inject a user 4K video as the opening FMV
     src/lib/ps2_netplay.cpp      # [netplay] deterministic lockstep transport
+    src/lib/ps2x_perf.cpp        # [perf] present rate, frame-time percentiles, GPU busy + its source
     src/lib/ps2_iop.cpp
     src/lib/ps2_iop_audio.cpp
     src/lib/ps2_iop_dbcman.cpp

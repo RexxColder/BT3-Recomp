@@ -229,7 +229,32 @@ int main()
         check(d.renderer == ps2x_settings::kRendererOpenGL, "sin lock, el valor del overlay se escribe");
     }
 
-    std::printf("[7] el archivo resultante\n");
+    std::printf("[7] el flag del medidor de rendimiento sobrevive un round-trip\n");
+    {
+        ps2x_settings::Settings w;
+        w.showPerf = true;
+        check(ps2x_settings::save(w, dir), "save() con show_perf");
+        ps2x_settings::Settings r;
+        check(ps2x_settings::load(r, dir), "load()");
+        check(r.showPerf, "video.show_perf se guardo y se leyo");
+
+        // It is not env-guarded, so the overlay must always be able to write it -- if someone later
+        // gives it an EnvLock bit and forgets the mask, the value would silently stop persisting.
+        ps2x_settings::Settings seeded;
+        check(ps2x_settings::loadFromFile(seeded, ps2x_settings::configPath(dir)), "loadFromFile()");
+        ps2x_settings::Settings live;
+        live.showPerf = false;
+        ps2x_settings::applyOverlayValues(seeded, live, 0);
+        check(!seeded.showPerf, "el overlay puede apagar show_perf (sin EnvLock)");
+
+        // And it has to be in operator==, or the front-end's "unsaved changes" test never fires and
+        // the toggle is a lie: the box moves, the file never changes.
+        ps2x_settings::Settings a, b;
+        a.showPerf = true; b.showPerf = false;
+        check(!(a == b), "show_perf participa en operator==");
+    }
+
+    std::printf("[8] el archivo resultante\n");
     std::printf("----------------------------------------\n%s\n", readAll(tomlPath).c_str());
     std::printf("----------------------------------------\n");
 

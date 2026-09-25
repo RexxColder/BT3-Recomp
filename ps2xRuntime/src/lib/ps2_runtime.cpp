@@ -28,6 +28,7 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #include "runtime/ps2_iop_module.h"   // [r3000] IRX loader
 #include "runtime/ps2_toml.h"         // [texcache] settings.toml
 #include "runtime/ps2_video_status.h"   // [video] the Video-tab status the overlay polls
+#include "runtime/ps2x_perf_status.h"   // [perf] the fps / frame-time / GPU-busy readout
 #include "runtime/ps2_toml.h"   // [winmode] startup read of [video] window_mode / monitor
 #include "runtime/ps2_fmv_override.h"  // [fmvoverride]
 #include <filesystem>
@@ -342,7 +343,7 @@ namespace ps2_syscalls { bool bt3WakeThreadByEntry(uint32_t entry); }
 #include <unordered_set>
 #include <mutex>
 #include <sstream>
-extern "C" double ps2xGpuMsTake(uint64_t *calls);
+    extern "C" double ps2xGpuMsTake(uint64_t *calls, uint64_t *dropped);
 extern "C" void ps2xEeProfAddCurrentThread(const char *name);   // [eeprof]   // [gputime] ps2_gs_gpu_renderer.cpp
 
 // BT3 debug tracing: extremely verbose ([main-pc] etc.). Off unless PS2X_TRACE=1.
@@ -8036,6 +8037,24 @@ void PS2Runtime::run()
         // GPU mode: render the recorded GS command list into the FBO and present that
         // (its texture is bottom-up, so flip Y). Software mode: upload guest VRAM.
         const bool gpuMode = GsGpuRenderer::enabled();
+        {   // [perf] Declare what the GPU column is going to MEASURE, before anything reports a
+            // number. This is the whole point of the field: the three backends cannot measure the
+            // same thing, and a percentage with no source is a number nobody can act on.
+            //   - OpenGL: GL_TIME_ELAPSED spans renderAndGetTextureId only. Composite, ImGui and the
+            //     present happen later and on the runtime's thread, not the GL context's, so
+            //     widening it would mean moving the query across threads. Reported as a lower bound.
+            //   - paraLLEl-GS: its own GPU timestamps, which DO bracket the scanout and the readback.
+            //   - Software: no GPU. Say so, instead of printing 0% and letting it read as "idle".
+            if (!gpuMode)
+                ps2x::PerfSetGpuSource(ps2x::GpuSource::SoftwareCpu, ps2x::GpuQuality::CpuOnly);
+#if defined(PS2X_HAVE_PGS)
+            else if (ps2x_pgs::enabled())
+                ps2x::PerfSetGpuSource(ps2x::GpuSource::VulkanTimestamps, ps2x::GpuQuality::FullFrame);
+#endif
+            else
+                ps2x::PerfSetGpuSource(ps2x::GpuSource::OpenGL, ps2x::GpuQuality::DrawListOnly);
+            ps2x::PerfSetRefreshHz(bt3GetMonitorRefreshRate(bt3GetCurrentMonitor()));
+        }
 #if !defined(PLATFORM_VITA)
         {   // [truews] aspect-aware TRUE widescreen. Generalizes the community 16:9 hack
             // (SLUS-21678_428113C2.pnach: FOV floats @2fe4cc/@2fe594 x4/3, lui 0.75->0.5625
@@ -8457,6 +8476,13 @@ void PS2Runtime::run()
             }
             else if (m_debugUiInitialized && m_debugUiDrawCallback)
                 m_debugUiDrawCallback(*this, m_debugUiUserData);   // overlay via imgui_impl_dx11
+            {   // [perf] Same present-to-present tick as the GL path below, for the D3D11 present.
+                static std::chrono::steady_clock::time_point s_perfPrevPresentD3{};
+                const auto perfNow = std::chrono::steady_clock::now();
+                if (s_perfPrevPresentD3.time_since_epoch().count() != 0)
+                    ps2x::PerfTick(std::chrono::duration<double>(perfNow - s_perfPrevPresentD3).count());
+                s_perfPrevPresentD3 = perfNow;
+            }
             g_ps2xD3D11.EndFrame();
         }
         else
@@ -8750,6 +8776,19 @@ void PS2Runtime::run()
                 }
             }
             const auto tP0 = std::chrono::steady_clock::now();
+            // [perf] Present-to-present interval, which is what "display fps" means here: the delta
+            // between consecutive presents, NOT the duration of this one. The difference matters --
+            // a present that blocks on vsync spends its time INSIDE bt3EndDrawing(), so timing that
+            // call would report the swap cost and lose the frame pacing entirely. This is the one
+            // point all three backends pass through (GL here, D3D11 at its own EndFrame()), so the
+            // rate and the frame-time distribution are measured here rather than in any one renderer.
+            {
+                static std::chrono::steady_clock::time_point s_perfPrevPresent{};
+                const auto perfNow = std::chrono::steady_clock::now();
+                if (s_perfPrevPresent.time_since_epoch().count() != 0)
+                    ps2x::PerfTick(std::chrono::duration<double>(perfNow - s_perfPrevPresent).count());
+                s_perfPrevPresent = perfNow;
+            }
             bt3EndDrawing();
             // [boot] First presented frame: process start -> boot. One-shot.
             if (!g_ps2xBootLogged && g_ps2xBootT0.time_since_epoch().count() != 0)
@@ -9054,6 +9093,15 @@ void PS2Runtime::run()
                 const double guestMs = (bf > s_lastBusyFrames) ? (double)(bn - s_lastBusyNs) / 1.0e6 / (double)(bf - s_lastBusyFrames) : 0.0;   // [guestbusy] ms of guest CPU per published frame
                 const double wallMs = (bf > s_lastBusyFrames) ? (double)(wn - s_lastWallNs) / 1.0e6 / (double)(bf - s_lastBusyFrames) : 0.0;   // [guestwall]
                 s_lastBusyNs = bn; s_lastBusyFrames = bf; s_lastWallNs = wn;
+                // [perf] Publish the CPU totals the shared readout differences, and read back what the
+                // backends have fed it. The [fps] line below now prints THESE numbers instead of its
+                // own private calculation, so the log and the overlay can never disagree.
+                ps2x::PerfPublishCpu(bn, wn, g_rlglFlushNs);
+                const ps2x::PerfStatus perf = ps2x::GetPerfStatus();
+                const char *const gpuSrcName = perf.gpuSource == ps2x::GpuSource::OpenGL ? "opengl-drawlist"
+                                       : perf.gpuSource == ps2x::GpuSource::VulkanTimestamps ? "vulkan-ts"
+                                       : perf.gpuSource == ps2x::GpuSource::SoftwareCpu ? "software-cpu"
+                                       : "none";
                 static unsigned long long s_lastGlCalls = 0, s_lastGlFlush = 0; static double s_lastFlushNs = 0.0;
                 const unsigned long long glc = g_rlglDrawCalls, glf = g_rlglBatchFlushes;
                 extern std::atomic<unsigned long> g_texDecodeCount; static unsigned long s_lastTdc = 0;
@@ -9063,6 +9111,21 @@ void PS2Runtime::run()
                 const unsigned long upc = g_gsUploadCount.load(std::memory_order_relaxed), vcc = g_gsVramCopyCount.load(std::memory_order_relaxed);
                 static unsigned long s_lastHoistTris = 0;   // [glhoist]
                 const unsigned long tdc = g_texDecodeCount.load(std::memory_order_relaxed);
+                // [gputime] Two figures, because they answer different questions and conflating them
+                // is what makes this look like a bug: gpu_ms is milliseconds of GPU work per GAME
+                // frame, useful for asking "is this machine GPU-bound against the frame budget";
+                // gpu_busy_pct is that work over the window's WALL time, which is the shape a vendor
+                // 3D-engine counter and Task Manager report, so THAT is the one to compare against
+                // them. gpu_busy_pct is a lower bound -- the queries only span
+                // renderAndGetTextureId, so compositing and the swap are not counted (see the
+                // [gputime] note in ps2_gs_gpu_renderer.cpp) -- and gpu_drop says how many samples
+                // were thrown away, so a window that lost queries cannot read as a complete one.
+                uint64_t gpuCalls = 0, gpuDrop = 0;
+                const double gpuMsWin = ps2xGpuMsTake(&gpuCalls, &gpuDrop);
+                const double gfWin = (double)(gameFrames - s_lastGameFrames);
+                // [perf] The stutter percentiles are the diagnostic bugs 4 and 5 need, but they are
+                // noise on a line that prints unconditionally, so they ride the existing opt-in gate.
+                static const bool s_frameProf = [](){ const char *v = std::getenv("PS2X_FRAMEPROF"); return !(v && v[0] && v[0] == '0'); }();
                 std::cerr << "[fps] GAME=" << (double)((gameFrames - s_lastGameFrames) / dt)
                           << " guest_ms=" << guestMs
                           << " wall_ms=" << wallMs
@@ -9085,9 +9148,22 @@ void PS2Runtime::run()
                           << " uploads/sec=" << (uint64_t)((upc - s_lastUp) / dt) << " vramcopies/sec=" << (uint64_t)((vcc - s_lastVc) / dt)   // [xferstat]
                           << " upconftex/sec=" << (uint64_t)((uct - s_lastUct) / dt) << " upconfclut/sec=" << (uint64_t)((ucc - s_lastUcc) / dt)   // [upconf]
                           << " flush_ms/s=" << (g_rlglFlushNs - s_lastFlushNs) / 1.0e6 / dt
-                          << " gpu_ms=" << [&]{   // [gputime] GPU execution ms per GAME frame (ps2xGpuMsTake declared at file scope: block-scope extern "C" is ill-formed on clang-cl)
-                                 uint64_t c = 0; const double ms = ps2xGpuMsTake(&c); const double gf = (double)(gameFrames - s_lastGameFrames);
-                                 return gf > 0.0 ? ms / gf : 0.0; }()
+                          // [perf] From here down the GPU figures come from the shared readout, so this
+                          // line and the overlay cannot drift apart. gpu_src says which backend produced
+                          // it and gpu_cov whether it covers the whole frame; without those two, a 0 here
+                          // is unreadable -- it used to mean "not measured" on two of the three backends
+                          // and looked exactly like "the GPU is idle".
+                          << " gpu_pct=" << perf.gpuBusyPct
+                          << " gpu_ms=" << perf.gpuMsPerFrame
+                          << " gpu_src=" << gpuSrcName
+                          << " gpu_cov=" << (perf.gpuCoverage >= 1.0 ? "full" : perf.gpuQuality == ps2x::GpuQuality::CpuOnly ? "cpu" : "partial")
+                          << " gpu_drop=" << perf.gpuSamplesDropped
+                          << " fps=" << perf.displayFps
+                          << " p50=" << perf.frameMsP50 << " p95=" << perf.frameMsP95
+                          << (s_frameProf ? [&]{ std::ostringstream o; o << " fmax=" << perf.frameMsMax
+                                                    << " guest_pct=" << perf.guestPct
+                                                    << " submit_pct=" << perf.submitPct; return o.str(); }()
+                                          : std::string())
                           << " vbring=" << g_rlglVbRingOn << [&]{   // [vbring] fence waits + ring wraps per second, MVP uploads skipped per second
                                  static unsigned long long s_w = 0, s_r = 0, s_m = 0;
                                  const unsigned long long w = g_rlglVbRingWaits, r = g_rlglVbRingWraps, m = g_rlglVbRingMvpSkips;
