@@ -1591,7 +1591,17 @@ def extract_inputs(ctx: "Context") -> None:
         # present in WORK.
         if WORK.exists():
             make_writable(WORK)
-        shutil.copyfile(src, ctx.elf)
+        # Re-running setup against an already-extracted tree is normal (the ELF is the build's own
+        # input, so there is no ISO to hand it), and copyfile() raises SameFileError when src and
+        # dst are the same path. Compare resolved paths and skip the copy in that case.
+        try:
+            same = src.resolve() == ctx.elf.resolve()
+        except OSError:
+            same = False
+        if not same:
+            shutil.copyfile(src, ctx.elf)
+        else:
+            LOG.info(f"NOTE: {ctx.elf.name} is already in place; reusing it as the build input.")
         make_writable(WORK)
         LOG.info("NOTE: you passed a bare ELF. The build also needs the ISO's")
         LOG.info(f"      BIN/DBZP.BIN next to it in {WORK}.")
