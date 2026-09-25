@@ -30,6 +30,10 @@ public:
     void begin(bool dataPresent);
     void draw();
 
+    // The shell uses this when it opens the wizard on the user's behalf because nothing is
+    // installed: the browser is the only useful page, the welcome text is not.
+    void startAtLocatePage();
+
     bool closing() const { return m_closing; }
     void requestClose() { m_closing = true; }
     bool installed() const { return m_installed; }

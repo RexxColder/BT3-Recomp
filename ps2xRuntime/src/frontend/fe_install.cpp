@@ -183,6 +183,13 @@ void InstallWizard::begin(bool dataPresent)
             }
 }
 
+void InstallWizard::startAtLocatePage()
+{
+    goTo(Page::Locate);
+    m_reinstall = false;
+    logInstall("wizard opened on the dump page (nothing installed)");
+}
+
 void InstallWizard::goTo(Page page)
 {
     std::lock_guard<std::mutex> lock(m_mutex);

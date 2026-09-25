@@ -3,7 +3,9 @@
 #include <cstring>
 
 #include "frontend/fe_background.h"
+#include "frontend/fe_hash.h"
 #include "frontend/fe_hw.h"
+#include "frontend/fe_iso9660.h"
 #include "frontend/fe_music.h"
 #include "frontend/fe_install.h"
 #include "frontend/fe_pages.h"
@@ -421,13 +423,50 @@ namespace frontend
 
         // PS2X_INSTALL_TEST=<dump> opens the wizard straight away and drives it end to end,
         // so the verify -> extract path can be checked without a human clicking through.
-        if (const char *testDump = std::getenv("PS2X_INSTALL_TEST"))
-            if (testDump[0])
+        const char *installTest = std::getenv("PS2X_INSTALL_TEST");
+        if (installTest && installTest[0])
+        {
+            wizard = std::make_unique<InstallWizard>(exeDir);
+            wizard->begin(false);
+            showWizard = true;
+        }
+        else
+        {
+        // The boot ELF decides whether there is anything to play, and it is checked by hash
+        // rather than by name: an interrupted install, or a dump from another revision, leaves a
+        // file that exists and is not this game. 2 MB of SHA-256 at startup costs nothing.
+        {
+            std::string why;
+            if (scan.elf.empty())
             {
+                why = "no hay ELF de arranque en data/";
+            }
+            else
+            {
+                bool hashed = false;
+                const std::string got = fe::sha256Hex(scan.elf, hashed);
+                if (!hashed)
+                    why = "no se pudo leer el ELF: " + scan.elf;
+                else if (got != DiscVerify::kExpectedDiscElfSha256)
+                    why = "el ELF no es el de esta revision (sha256 " + got.substr(0, 16) + "...)";
+            }
+            if (why.empty())
+            {
+                std::fprintf(stderr, "[fe] boot ELF ok: %s\n", scan.elf.c_str());
+            }
+            else
+            {
+                std::fprintf(stderr, "[fe] %s -> abro el instalador\n", why.c_str());
+                // The shell opened the wizard on the user's behalf, so the welcome page would
+                // only repeat what the file browser already asks for.
                 wizard = std::make_unique<InstallWizard>(exeDir);
                 wizard->begin(false);
+                wizard->startAtLocatePage();
                 showWizard = true;
             }
+        }
+        }
+
 
         // Headless checks: PS2X_FE_AUTOPLAY / PS2X_FE_AUTOQUIT pick the action after
         // PS2X_FE_DELAY_MS so the shell, the teardown and the handoff can be verified

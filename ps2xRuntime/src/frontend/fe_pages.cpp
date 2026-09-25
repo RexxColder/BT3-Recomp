@@ -3,6 +3,7 @@
 #include "frontend/fe_gpu.h"
 #include "frontend/fe_hash.h"
 #include "frontend/fe_hw.h"
+#include "frontend/fe_iso9660.h"
 #include "frontend/fe_music.h"
 #include "frontend/fe_ui.h"
 #include "frontend/fe_window.h"
@@ -31,8 +32,9 @@ namespace
     const char *const kCustomResolution = "Personalizado";
 
     // SLUS_216.78 (US) -- must stay in sync with games/bt3/setup.py.
-    constexpr const char *kExpectedDiscElfSha256 =
-        "811188ba9b416500d921cd4d9514df0cbf42f3a41a99cf5aac5a3da37171bf99";
+    // The expected boot-ELF digest lives in fe_iso9660.h next to the code that verifies the
+// dump: one constant, so the status page and the wizard cannot disagree.
+using DiscVerify::kExpectedDiscElfSha256;
 
     enum class DataState
     {
