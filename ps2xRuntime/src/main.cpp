@@ -548,6 +548,7 @@ extern "C" void ps2xGsRecordOnSignal(int);
 static bool ps2xStderrIsTerminal() { return _isatty(_fileno(stderr)) != 0; }
 #else
 #include <unistd.h>
+#include <fcntl.h>
 static bool ps2xStderrIsTerminal() { return isatty(fileno(stderr)) != 0; }
 #endif
 extern "C" const char *ps2xExeDirC()
@@ -719,24 +720,40 @@ int main(int argc, char *argv[])
                 if (std::freopen(lf, "w", stderr))
                     std::fprintf(stderr, "[logfile] stderr -> %s\n", lf);
             }
-            else if (lvl > 0 && ps2xStderrIsTerminal())   // [mergefix] a captured stderr (rig run.log, a user's "> log 2>&1") keeps its lines
+            else if (lvl > 0)
             {
-                // [logfix] Only a CONSOLE stderr is moved to the file: a captured one (a pipe or a
-                // "> log 2>&1") already goes somewhere and used to end up empty. The launcher, which
-                // starts the runner without a console, asks for logs/bt3.log through PS2X_LOGFILE
-                // instead, so front-end runs still leave a log for reports (the [winlog] lines).
-                std::error_code ec;
-                const auto logsDir = exeDir / "logs";
-                std::filesystem::create_directories(logsDir, ec);
-                if (!ec)
+                // [logfile-gui] A double-clicked runner has no console AND nothing is capturing it,
+                // so every line was going to a handle nobody can read. That is the normal way this
+                // build is started now that the front-end IS the UI, and it left no log at all for
+                // the [netmenu]/[iop-run] lines a bug report needs. Only skip the file when the
+                // output is already going somewhere real: a terminal (keep it readable live) or a
+                // redirect the user set up ("> log 2>&1"), which is already a record.
+                bool alreadyCaptured = false;
+#if defined(_WIN32)
+                const HANDLE h = ::GetStdHandle(STD_ERROR_HANDLE);
+                DWORD mode = 0;
+                alreadyCaptured = (h != nullptr && h != INVALID_HANDLE_VALUE
+                                   && ::GetFileType(h) == FILE_TYPE_DISK
+                                   && ::GetConsoleMode(h, &mode) == 0);
+#else
+                alreadyCaptured = !ps2xStderrIsTerminal() && ::fcntl(::fileno(stderr), F_GETFD) != -1
+                                  && ::isatty(::fileno(stderr)) == 0 && ::fileno(stderr) > 2;
+#endif
+                if (!alreadyCaptured)
                 {
-                    const auto logPath = logsDir / "bt3.log";
-                    const auto prevPath = logsDir / "bt3.prev.log";
-                    std::error_code pc;
-                    std::filesystem::rename(logPath, prevPath, pc); // best-effort
-                    if (std::freopen(logPath.string().c_str(), "w", stderr))
-                        std::fprintf(stderr, "[loglevel] level=%d stderr -> %s\n",
-                                     lvl, logPath.string().c_str());
+                    std::error_code ec;
+                    const auto logsDir = exeDir / "logs";
+                    std::filesystem::create_directories(logsDir, ec);
+                    if (!ec)
+                    {
+                        const auto logPath = logsDir / "bt3.log";
+                        const auto prevPath = logsDir / "bt3.prev.log";
+                        std::error_code pc;
+                        std::filesystem::rename(logPath, prevPath, pc); // best-effort
+                        if (std::freopen(logPath.string().c_str(), "w", stderr))
+                            std::fprintf(stderr, "[loglevel] level=%d stderr -> %s\n",
+                                         lvl, logPath.string().c_str());
+                    }
                 }
             }
         }

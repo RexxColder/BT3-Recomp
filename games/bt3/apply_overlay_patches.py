@@ -200,7 +200,7 @@ PATCHES = [
             "    std::fprintf(stderr, \"[netmenutest] row4 handler (0x3367A4) -> real state 0x26 (native transition)\\n\");\n"
             "    ps2xNetMenuMarkNetEntry();   // [netmenu] remember the origin: the runtime gates the pad for this entry\n"
             "    ps2xNetMenuArmSwap();        // [netmenu] arm the serve-swap NOW, before the BGM streams\n"
-            "    // RAW ENTRY TEST: no screen raise -- the row enters the real Duel menu and its own\n    // transitions/back are the ones under test. Restore ps2xNetMenuRequestHosted(60) to cover it.\n    // ps2xNetMenuRequestHosted(60);\n"
+            "    ps2xNetMenuRequestHosted(60); // [netmenu] raise our page over that state, once the entry anim is done\n"
             "    SET_GPR_S32(ctx, 7, 0x003B0E80);                    // $a3 = &menuObj slot\n"
             "    SET_GPR_S32(ctx, 10, 0x0F);                         // $t2 = 0x0F\n"
             "    SET_GPR_S32(ctx, 3, (int32_t)READ32(0x003B0E80u));  // $v1 = menuObj\n"

@@ -14,14 +14,27 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
+
+extern "C" const char *ps2xExeDirC();   // main.cpp: the exe dir, for paths that must not depend on the CWD
 
 namespace
 {
-    std::string s_path = []() {
-        const char *v = std::getenv("PS2X_NETMENU_MUSIC");
-        return std::string((v && v[0]) ? v : "assets/DragonNet/music/netmenu.mp3");
-    }();
+    // A relative default is resolved against the runner's own directory, not the CWD: the front-end
+    // hands the chosen ELF back and the process can be started from anywhere, and a bare
+    // "assets/..." only worked when the user happened to double-click from the install folder.
+    std::string resolveTrack(const char *env)
+    {
+        std::filesystem::path p = (env && env[0]) ? env : "assets/DragonNet/music/netmenu.mp3";
+        if (p.is_absolute()) return p.lexically_normal().string();
+        std::error_code ec;
+        const std::filesystem::path base = ps2xExeDirC();
+        if (base.empty()) return p.lexically_normal().string();
+        return (base / p).lexically_normal().string();
+    }
+
+    std::string s_path = resolveTrack(std::getenv("PS2X_NETMENU_MUSIC"));
     const float s_vol = []() {
         const char *v = std::getenv("PS2X_NETMENU_MUSIC_VOL");
         return v ? (float)std::atof(v) : 0.5f;

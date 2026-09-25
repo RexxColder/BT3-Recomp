@@ -962,16 +962,16 @@ namespace ps2x_net_menu
 
         CursorInfo ci;
         if (!queryCursor(rdram, ci) || ci.row != kNetRow) return;
-        // [netmenutest] RAW ENTRY TEST: with the row patched to enter the real Duel state, our page
-        // must NOT also open on the same Cross (it would cover the Duel menu and hide the natural
-        // entry/exit the test is about). Flip to false to bring the page back.
-        constexpr bool kRawEntryTest = true;
-        if (kRawEntryTest) return;
+        // [netmenu] The row already opened the page on its own: the patch calls
+        // ps2xNetMenuRequestHosted(60) so the game's entry animation plays first and the page
+        // fades in on top of the state it entered. Opening again here would be the same page
+        // twice, and open() ignores it anyway -- but only because the deferred raise won the
+        // race, which is not a reason to keep a dead branch that looks like the live path.
         if (crossEdge)
         {
             std::fprintf(stderr, "[netmenu] Cross on the hidden row: entry=0x%x handler=0x%x\n",
                          ci.entry, ci.handler);
-            open();
+            if (s_phase == Phase::Idle && !hostPending()) open();
         }
     }
 }

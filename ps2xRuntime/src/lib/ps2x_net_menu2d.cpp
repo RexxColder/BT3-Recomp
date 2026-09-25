@@ -59,8 +59,21 @@ namespace
             std::fprintf(stderr, "[netmenu2d] missing %s in the Dragon Net art\n", name.c_str());
             return bt3Texture2D{};
         }
-        const bt3Image img = bt3LoadImageFromMemory("png", png.data(), (int)png.size());
-        if (img.data == nullptr) { std::fprintf(stderr, "[netmenu2d] cannot decode %s\n", name.c_str()); return bt3Texture2D{}; }
+        // raylib's IsFileExtension() compares the suffix verbatim, so this has to carry the dot:
+        // "png" matches nothing and comes back as an empty image, which is indistinguishable from
+        // a broken PNG unless the result is logged.
+        const bt3Image img = bt3LoadImageFromMemory(".png", png.data(), (int)png.size());
+        if (img.data == nullptr)
+        {
+            std::fprintf(stderr, "[netmenu2d] cannot decode %s: %zu bytes, head=%02x %02x %02x %02x "
+                                 "(want 89 50 4e 47)\n",
+                         name.c_str(), png.size(),
+                         png.size() > 0 ? png[0] : 0, png.size() > 1 ? png[1] : 0,
+                         png.size() > 2 ? png[2] : 0, png.size() > 3 ? png[3] : 0);
+            return bt3Texture2D{};
+        }
+        std::fprintf(stderr, "[netmenu2d] %-28s %zu bytes -> %dx%d\n", name.c_str(), png.size(),
+                     img.width, img.height);
         bt3Texture2D t = bt3LoadTextureFromImage(img);
         bt3UnloadImage(img);
         bt3SetTextureFilter(t, BT3_TEXTURE_FILTER_BILINEAR);

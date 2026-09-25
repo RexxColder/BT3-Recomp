@@ -184,9 +184,28 @@ std::vector<uint8_t> load(const std::string &name, std::vector<std::string> *tri
 {
     ensureInstalled();
     const Blob &b = blob();
+    // [netmenu-assets] PS2X_NETMENU_ASSET_HEX=1: dump what the index actually hands back, so a
+    // decode failure can be told apart from a bad entry (wrong offset) without a debugger.
+    static const bool hex = [] {
+        const char *v = std::getenv("PS2X_NETMENU_ASSET_HEX");
+        return v && v[0] && v[0] != '0';
+    }();
     for (const Entry &e : b.entries)
-        if (e.name == name)
-            return std::vector<uint8_t>(b.bytes.begin() + e.offset, b.bytes.begin() + e.offset + e.size);
+    {
+        if (e.name != name) continue;
+        std::vector<uint8_t> out(b.bytes.begin() + e.offset, b.bytes.begin() + e.offset + e.size);
+        if (hex)
+        {
+            std::fprintf(stderr, "[netmenu-assets] %-28s off=%u size=%u head=", name.c_str(), e.offset, e.size);
+            for (size_t i = 0; i < out.size() && i < 16; ++i)
+                std::fprintf(stderr, "%02x ", out[i]);
+            std::fprintf(stderr, "| ascii=");
+            for (size_t i = 0; i < out.size() && i < 8; ++i)
+                std::fprintf(stderr, "%c", (out[i] >= 32 && out[i] < 127) ? out[i] : '.');
+            std::fprintf(stderr, "\n");
+        }
+        return out;
+    }
     if (tried)
         for (const auto &p : candidates()) tried->push_back(p.string());
     return {};
