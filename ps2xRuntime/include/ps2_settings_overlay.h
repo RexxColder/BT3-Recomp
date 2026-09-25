@@ -109,28 +109,14 @@ private:
     std::string m_configPath;
     int m_activeTab = 0;
 
-    // [envpersist] Which keys the environment owns this session, as a ps2x_settings::EnvLock mask.
-    // loadSettings() sets the bits as it walks its own guards -- that walk is the single definition
-    // of which keys are env-overridable -- and saveSettings() hands the mask to
-    // ps2x_settings::applyOverlayValues() so a locked key keeps the file's value. Persisting an env
-    // override turns a one-session experiment into a permanent setting, and settings.toml is the
-    // only record of what the user chose.
-    using ps2x_settings::kLockBilinear;
-    using ps2x_settings::kLockButtonLay;
-    using ps2x_settings::kLockDofBlur;
-    using ps2x_settings::kLockDofZFar;
-    using ps2x_settings::kLockGlow;
-    using ps2x_settings::kLockGlowFix;
-    using ps2x_settings::kLockHalfTexel;
-    using ps2x_settings::kLockInkStrength;
-    using ps2x_settings::kLockIntroVideo;
-    using ps2x_settings::kLockOutline;
-    using ps2x_settings::kLockRenderScale;
-    using ps2x_settings::kLockRenderer;
-    using ps2x_settings::kLockShadows;
-    using ps2x_settings::kLockSkipPost;
-    using ps2x_settings::kLockSkipStale;
-    using ps2x_settings::kLockTexPack;
+    // [envpersist] Which keys the environment owns this session, as a ps2x_settings::EnvLock mask
+    // (spelled ps2x_settings::kLock*, not imported: a using-declaration for a namespace enumerator
+    // is ill-formed at class scope, and GCC rejects what clang-cl accepts). loadSettings() sets the
+    // bits as it walks its own guards, so that walk stays the one definition of which keys are
+    // env-overridable, and saveSettings() hands the mask to ps2x_settings::applyOverlayValues() so
+    // a locked key keeps the file's value. Persisting an env override turns a one-session
+    // experiment into a permanent setting, and settings.toml is the only record of what the user
+    // chose.
     uint32_t m_envLocked = 0;
 
     // Open/close deploy animation. m_animT is an eased 0..1 value: 0 = fully

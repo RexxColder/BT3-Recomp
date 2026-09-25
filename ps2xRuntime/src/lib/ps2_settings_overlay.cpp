@@ -1,4 +1,4 @@
-#include "ps2_runtime.h"   // [fps60] ps2Set60Fps
+﻿#include "ps2_runtime.h"   // [fps60] ps2Set60Fps
 #include "runtime/ps2_texreplace.h"
 #include "ps2_settings_overlay.h"
 #include "runtime/ps2_netplay.h"   // [netplay]
@@ -521,7 +521,7 @@ void PS2SettingsOverlay::loadSettings()
                 r = Settings::kRendererOpenGL;
                 // Build-capability fallback, not a migration: this build simply cannot run PGS, and
                 // writing the fallback back would erase the choice for a build that can.
-                m_envLocked |= kLockRenderer;
+                m_envLocked |= ps2x_settings::kLockRenderer;
             }
 #endif
             // [d3d11] Direct3D 11 is retired for now: an old settings file that picks it falls back to
@@ -532,13 +532,13 @@ void PS2SettingsOverlay::loadSettings()
             m_settings.windowMode = doc.getI("video.window_mode", m_settings.fullscreen ? 2 : 0);
             m_settings.monitor = doc.getI("video.monitor", m_settings.monitor);
         }
-        if (envUserSet("PS2X_GLOW")) m_envLocked |= kLockGlow;
+        if (envUserSet("PS2X_GLOW")) m_envLocked |= ps2x_settings::kLockGlow;
         else m_settings.glow = doc.getB("video.glow", m_settings.glow);
-        if (envUserSet("PS2X_GLOWFIX")) m_envLocked |= kLockGlowFix;
+        if (envUserSet("PS2X_GLOWFIX")) m_envLocked |= ps2x_settings::kLockGlowFix;
         else m_settings.glowFix = doc.getB("video.glowfix", m_settings.glowFix);
         if (envUserSet("PS2X_INKSTRENGTH") || envUserSet("PS2X_ADGS"))
         {
-            m_envLocked |= kLockInkStrength;
+            m_envLocked |= ps2x_settings::kLockInkStrength;
         }
         else
         {
@@ -546,37 +546,37 @@ void PS2SettingsOverlay::loadSettings()
         }
         m_settings.inkWidth = std::clamp(doc.getI("video.ink_width", m_settings.inkWidth), 25, 100);
         m_settings.inkColor = hexToColor(doc.getS("video.ink_color", colorToHex(m_settings.inkColor)), m_settings.inkColor);
-        if (envUserSet("PS2X_BILINEAR")) m_envLocked |= kLockBilinear;
+        if (envUserSet("PS2X_BILINEAR")) m_envLocked |= ps2x_settings::kLockBilinear;
         else m_settings.bilinear = doc.getB("video.bilinear", m_settings.bilinear);
-        if (envUserSet("PS2X_HALFTEXEL")) m_envLocked |= kLockHalfTexel;
+        if (envUserSet("PS2X_HALFTEXEL")) m_envLocked |= ps2x_settings::kLockHalfTexel;
         else m_settings.halfTexel = doc.getB("video.halftexel", m_settings.halfTexel);
-        if (envUserSet("PS2X_SKIPPOST")) m_envLocked |= kLockSkipPost;
+        if (envUserSet("PS2X_SKIPPOST")) m_envLocked |= ps2x_settings::kLockSkipPost;
         else m_settings.skipPost = doc.getB("video.skippost", m_settings.skipPost);
-        if (envUserSet("PS2X_SKIP_STALE_VRAM")) m_envLocked |= kLockSkipStale;
+        if (envUserSet("PS2X_SKIP_STALE_VRAM")) m_envLocked |= ps2x_settings::kLockSkipStale;
         else m_settings.skipStaleVram = doc.getB("video.skip_stale_vram", m_settings.skipStaleVram);
         if (envUserSet("PS2X_RENDER_SCALE"))
         {
-            m_envLocked |= kLockRenderScale;
+            m_envLocked |= ps2x_settings::kLockRenderScale;
         }
         else
         {
             const int s = doc.getI("video.render_scale", m_settings.renderScale);
             m_settings.renderScale = (s >= 1 && s <= 4) ? s : 1;
         }
-        if (envUserSet("PS2X_OUTLINE")) m_envLocked |= kLockOutline;
+        if (envUserSet("PS2X_OUTLINE")) m_envLocked |= ps2x_settings::kLockOutline;
         else m_settings.outline = doc.getB("video.outline", m_settings.outline);
-        if (envUserSet("PS2X_TEXPACK")) m_envLocked |= kLockTexPack;
+        if (envUserSet("PS2X_TEXPACK")) m_envLocked |= ps2x_settings::kLockTexPack;
         else m_settings.texPack = doc.getB("video.texture_pack", m_settings.texPack);
-        if (envUserSet("PS2X_FMV_OVERRIDE")) m_envLocked |= kLockIntroVideo;
+        if (envUserSet("PS2X_FMV_OVERRIDE")) m_envLocked |= ps2x_settings::kLockIntroVideo;
         else m_settings.introVideo = doc.getB("video.intro_video", m_settings.introVideo);
         m_settings.texcache = doc.getB("video.texcache", m_settings.texcache);
-        if (envUserSet("PS2X_BUTTONS")) m_envLocked |= kLockButtonLay;
+        if (envUserSet("PS2X_BUTTONS")) m_envLocked |= ps2x_settings::kLockButtonLay;
         else m_settings.buttonLayout = doc.getI("video.button_layout", m_settings.buttonLayout);
-        if (envUserSet("PS2X_SHADOWS")) m_envLocked |= kLockShadows;
+        if (envUserSet("PS2X_SHADOWS")) m_envLocked |= ps2x_settings::kLockShadows;
         else m_settings.shadows = doc.getB("video.shadows", m_settings.shadows);
-        if (envUserSet("PS2X_DOFMASK")) m_envLocked |= kLockDofBlur;
+        if (envUserSet("PS2X_DOFMASK")) m_envLocked |= ps2x_settings::kLockDofBlur;
         else m_settings.dofBlur = doc.getB("video.dof_blur", m_settings.dofBlur);
-        if (envUserSet("PS2X_DOFZFAR")) m_envLocked |= kLockDofZFar;
+        if (envUserSet("PS2X_DOFZFAR")) m_envLocked |= ps2x_settings::kLockDofZFar;
         else m_settings.dofZFar = std::clamp(doc.getI("video.dof_zfar", m_settings.dofZFar), 20000, 800000);
     m_settings.fullscreen = doc.getB("video.fullscreen", m_settings.fullscreen);
     m_settings.widescreen = doc.getB("video.widescreen", m_settings.widescreen);
