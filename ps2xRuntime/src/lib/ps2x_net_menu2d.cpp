@@ -5,9 +5,11 @@
 // nested Filters popup, each with a clear way out (the "Volver" link + Circle, and Triangle as the
 // hierarchical back: popup -> base -> exit the net entry).
 //
-// Assets: assets/DragonNet/menu/*.png and assets/DragonNet/buttons/{ps,xbox}/*.png,
-// font: assets/fonts/RussoOne-Regular.ttf
+// Assets: the Dragon Net art ships as ONE blob (data/NETPLAY.BIN next to DBZP.BIN, installed
+// from the build-time dragonnet_assets.bin) and is read by name out of it, so the install
+// carries no loose PNGs. Font: assets/fonts/RussoOne-Regular.ttf
 #include "runtime/ps2x_net_menu.h"
+#include "runtime/dragonnet_assets.h"   // [netmenu] the art blob
 #include "runtime/pad_config.h"          // ps2xLivePadButtons (the physical pad)
 #include "runtime/ps2_texreplace.h"      // packButtonLayout() (PS2 vs Xbox icons)
 #include "runtime/ps2x_net_sfx.h"        // [netsfx] the game's own UI SEs
@@ -19,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -46,15 +49,27 @@ namespace
     bt3Font s_font{};
     int s_assetsState = 0;
 
-    bt3Texture2D loadTex(const char *name)
+    // One entry point for both the menu art and the button icons: pull the PNG out of the
+    // blob by name and hand the bytes to raylib. A missing entry logs once, not per file.
+    bt3Texture2D loadFromBlob(const std::string &name)
     {
-        const std::string p = std::string("assets/DragonNet/menu/") + name;
-        const bt3Image img = bt3LoadImage(p.c_str());
-        if (img.data == nullptr) { std::fprintf(stderr, "[netmenu2d] missing %s\n", p.c_str()); return bt3Texture2D{}; }
+        const std::vector<uint8_t> png = dragonnet::load(name);
+        if (png.empty())
+        {
+            std::fprintf(stderr, "[netmenu2d] missing %s in the Dragon Net art\n", name.c_str());
+            return bt3Texture2D{};
+        }
+        const bt3Image img = bt3LoadImageFromMemory("png", png.data(), (int)png.size());
+        if (img.data == nullptr) { std::fprintf(stderr, "[netmenu2d] cannot decode %s\n", name.c_str()); return bt3Texture2D{}; }
         bt3Texture2D t = bt3LoadTextureFromImage(img);
         bt3UnloadImage(img);
         bt3SetTextureFilter(t, BT3_TEXTURE_FILTER_BILINEAR);
         return t;
+    }
+
+    bt3Texture2D loadTex(const char *name)
+    {
+        return loadFromBlob(std::string("menu/") + name);
     }
 
     // ---- button icons (from the 4K 2D Textures pack: PS or Xbox per the setting) ------
@@ -68,14 +83,8 @@ namespace
 
     bt3Texture2D loadBtn(const char *file)
     {
-        const std::string p = std::string("assets/DragonNet/buttons/")
-                            + (isXboxButtons() ? "xbox/" : "ps/") + file + ".png";
-        const bt3Image img = bt3LoadImage(p.c_str());
-        if (img.data == nullptr) { std::fprintf(stderr, "[netmenu2d] missing %s\n", p.c_str()); return bt3Texture2D{}; }
-        bt3Texture2D t = bt3LoadTextureFromImage(img);
-        bt3UnloadImage(img);
-        bt3SetTextureFilter(t, BT3_TEXTURE_FILTER_BILINEAR);
-        return t;
+        return loadFromBlob(std::string("buttons/")
+                            + (isXboxButtons() ? "xbox/" : "ps/") + file + ".png");
     }
 
     void ensureButtons()

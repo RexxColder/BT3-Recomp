@@ -10,6 +10,7 @@ extern "C" void ps2xWinHostInfo();             // ps2_win_timer.cpp: [host] cpu 
 #include "games_database.h"
 #if !defined(PLATFORM_VITA)
 #include "ps2_settings_overlay.h"
+#include "runtime/ps2x_settings.h"     // [netmenu] the Dragon Net Menu toggle ships in settings.toml
 #include "frontend/fe_app.h"          // [frontend] in-runtime front-end (replaces the Qt launcher)
 #include "runtime/ps2x_net_menu.h"   // [netmenu] custom New Dragon Net Menu page
 namespace ps2x_net_gs { void draw(); }   // [netmenu] GS-level sprite injection (ps2x_net_gs.cpp)
@@ -688,6 +689,17 @@ int main(int argc, char *argv[])
         {
             const int lvl = PS2SettingsOverlay::getStartupLogLevel();
             const auto exeDir = getExecutableDirectory();
+
+            // [netmenu] The Dragon Net Menu patches are gated on PS2X_NET_MENU, which is read once
+            // on the first frame hook, so exporting it here -- after the front-end has had its
+            // chance to save the toggle, before anything can call it -- is what makes the checkbox
+            // work. overwrite=0: an explicit PS2X_NET_MENU=0 in the environment still wins over the
+            // file, exactly like the other defaults above.
+            {
+                ps2x_settings::Settings s;
+                if (ps2x_settings::load(s, (exeDir / "savedata").string()))
+                    setenv("PS2X_NET_MENU", s.netMenu ? "1" : "0", 0);
+            }
 
             auto enable = [&](const char *name)
             {

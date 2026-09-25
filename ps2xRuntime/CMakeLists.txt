@@ -998,7 +998,8 @@ if(NOT PS2X_IS_VITA)
         src/lib/ps2x_net_menu_draw.cpp   # [netmenu] ImGui half (must stay out of ps2_runtime)
 src/lib/ps2x_net_gs.cpp          # [netmenu] GS-level sprite injection (rlgl immediate)
 src/lib/ps2x_net_music.cpp       # [netmenu] host-side looping music for the net entry
-src/lib/ps2x_net_menu2d.cpp      # [netmenu2d] custom Dragon Net menu, raylib 2D (no ImGui)
+    src/lib/ps2x_net_menu2d.cpp      # [netmenu2d] custom Dragon Net menu, raylib 2D (no ImGui)
+    src/lib/dragonnet_assets.cpp      # [netmenu] the Dragon Net art blob (data/NETPLAY.BIN)
         src/lib/ps2x_net_sfx.cpp         # [netsfx] UI sound effects for the Dragon Net menu
         src/gfx/ps2x_ui.cpp          # overlay backend bridge (rlImGui or imgui_impl_dx11)
     )
@@ -1149,5 +1150,16 @@ add_custom_command(TARGET ps2EntryRunner POST_BUILD
             "${CMAKE_SOURCE_DIR}/games/bt3/fps60_sites.txt"
             "$<TARGET_FILE_DIR:ps2EntryRunner>/fps60_sites.txt"
     COMMENT "Staging fps60_sites.txt next to ps2EntryRunner")
+
+# [netmenu] The Dragon Net art is one blob so the repo carries a single file. The build
+# stages it next to the runner; the runtime installs it as data/NETPLAY.BIN (next to
+# DBZP.BIN) on first use and reads the PNGs out of it, so the install keeps no loose art.
+if (EXISTS "${CMAKE_SOURCE_DIR}/games/bt3/dragonnet_assets.bin")
+    add_custom_command(TARGET ps2EntryRunner POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/games/bt3/dragonnet_assets.bin"
+                "$<TARGET_FILE_DIR:ps2EntryRunner>/dragonnet_assets.bin"
+        COMMENT "Staging dragonnet_assets.bin next to ps2EntryRunner")
+endif()
 
 

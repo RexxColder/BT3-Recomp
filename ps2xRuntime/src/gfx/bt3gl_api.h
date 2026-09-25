@@ -70,6 +70,7 @@ using bt3Font = Font;            // [netmenu2d]
 #define bt3IsWindowReady IsWindowReady
 #define bt3IsWindowResized IsWindowResized
 #define bt3LoadImage LoadImage
+#define bt3LoadImageFromMemory LoadImageFromMemory
 #define bt3LoadImageFromScreen LoadImageFromScreen
 #define bt3LoadImageFromTexture LoadImageFromTexture
 #define bt3LoadShaderFromMemory LoadShaderFromMemory

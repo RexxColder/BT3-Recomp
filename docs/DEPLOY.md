@@ -24,6 +24,7 @@ Dragon Ball Budokai Tenkaichi 3 Recompiled/
 ├── assets/lib/             # runner's shared-library closure (Linux)
 ├── assets/                 # app artwork, fonts, AFS name lists (background.png, icon.png, …)
 ├── fps60_sites.txt         # 60 fps pacing table, read next to the runner on first enable
+├── dragonnet_assets.bin    # Dragon Net menu art (one blob; installed as data/NETPLAY.BIN)
 ├── savedata/
 │   ├── settings.toml    # user settings ([logging], [video], …)
 │   └── pad_p1.conf / pad_p2.conf       # front-end bindings

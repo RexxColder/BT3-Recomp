@@ -80,6 +80,11 @@ namespace ps2x_settings
         bool dumpControllers = true;
         bool dumpRuntime = true;
         bool dumpGamepad = false;
+
+        // Dragon Net Menu: the post-generation patches that reveal the retail main menu's hidden
+        // "Network Battle" plate and host the custom page (PS2X_NET_MENU). Off by default, and
+        // applied on the next launch: the flag is read once, on the first frame.
+        bool netMenu = false;
     };
 
     const char *rendererName(int renderer);
