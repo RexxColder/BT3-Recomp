@@ -281,6 +281,21 @@ The **UI sound effects are not an asset**: they come from the game's own data
 
 ## 9. Pending
 
+- **The entry lock and the black are timed, not state-driven** (open, 2026-09-25). On the row press
+  `markNetEntry()` arms `s_enterLockMs = now + 1400` and the pad gate stays denied while
+  `s_hosted || exitLocked() || enterLocked() || st == kMainMenuState`; `ps2xNetMenuFreeze()` also
+  holds for as long as the page is hosted. So how long the player stares at a black screen with a
+  dead pad depends on a wall-clock guess, not on how far the game actually got: a slow load lifts it
+  mid-transition, and a fast one leaves it up over a live screen. **Wanted: hold both until the
+  guest reaches character selection, then hand the image and the pad back to the player.**
+  - The flow is `0x04 → 0x26` (Duel) and the engine "commits and switches to `0x27`"
+    (`ps2x_net_menu.cpp:159-161`), so `0x27` is the likely release point — but that is read off a
+    comment, not measured.
+  - `PS2X_NETMENU_TRACE=1` now logs every state change while the entry is latched
+    (`[netmenu-trace] state 0x.. (pad denied|live, black .., hosted ..)`). Run the Duel once with
+    it, confirm which state is character select, and key the release to that.
+  - Keep the timer as a failsafe ceiling so a state that never arrives cannot strand the player on a
+    black screen with a dead pad — that is the failure mode worth guarding.
 - **Phase 3 — sounds**: reuse the game's SE (hover/confirm/cancel) or extract them from the pack.
 - Popup polish (transitions, more options, validations).
 - **F3 — Wii assets**: the real Dragon Net paks (`DragonNet_UP/US.pak`) exist on the Wii and use the

@@ -186,6 +186,7 @@ namespace
     int s_dumpCountdown = -1;
     bool s_dumpIsNet = false;
     uint32_t s_lastState = 0xFFFFFFFFu;
+    uint32_t s_traceLast = 0xFFFFFFFFu;   // [netmenu-trace] last state logged, see the tick
     void writeRamDump(uint8_t *rdram, bool isNet)
     {
         if (!s_dumpDir || !s_dumpDir[0]) return;
@@ -762,6 +763,21 @@ namespace ps2x_net_menu
         // [netmenu] RAM dump scheduling (both origins) -- see writeRamDump.
         {
             const uint32_t stNow = readState(rdram);
+            // [netmenu-trace] PS2X_NETMENU_TRACE=1: log every state change while the net entry is
+            // latched. The entry lock and the black are keyed to a state, not to a timer, and this
+            // is how the character-select state gets identified instead of guessed.
+            static const bool s_trace = []() {
+                const char *v = std::getenv("PS2X_NETMENU_TRACE");
+                return v && v[0] && v[0] != '0';
+            }();
+            if (s_trace && s_netEntry && stNow != s_traceLast)
+            {
+                s_traceLast = stNow;
+                std::fprintf(stderr, "[netmenu-trace] state 0x%02x (pad %s, black %.2f, hosted %d)\n",
+                             stNow,
+                             (s_hosted || exitLocked() || enterLocked() || stNow == kMainMenuState) ? "denied" : "live",
+                             blackLevel(), s_hosted ? 1 : 0);
+            }
             if (stNow == kDuelState && s_lastState != kDuelState)
             {
                 s_dumpIsNet = s_netEntry;
