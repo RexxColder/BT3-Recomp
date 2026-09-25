@@ -1840,6 +1840,13 @@ def bundle_windows(ctx: "Context", stage: Path, runner: Path) -> None:
     else:
         shutil.copy2(runner, stage / runner_name)
 
+    # [fps60] the pacing table is build-time data the runner reads on the first enable, so it
+    # belongs next to the runner (where CMake stages it). It used to go to savedata/, which made
+    # the 60 fps switch depend on the save folder.
+    fps60 = HERE / "fps60_sites.txt"
+    if fps60.exists() and not (stage / "fps60_sites.txt").exists():
+        shutil.copy2(fps60, stage / "fps60_sites.txt")
+
     # FFmpeg DLLs staged next to the runner by CMake POST_BUILD.
     for pattern in ("avcodec-*.dll", "avformat-*.dll", "avutil-*.dll",
                     "swresample-*.dll", "swscale-*.dll"):
@@ -1953,16 +1960,13 @@ def bundle_linux(ctx: "Context", stage: Path, runner: Path) -> None:
 
 
 def seed_savedata(ctx: "Context", stage: Path) -> None:
-    """settings.toml (only when absent), fps60 pacing table and the memory-card slot."""
+    """settings.toml (only when absent) and the memory-card slot."""
     savedata = stage / "savedata"
     savedata.mkdir(parents=True, exist_ok=True)
     default = ROOT / "scripts" / "settings.toml.default"
     cfg = savedata / "settings.toml"
     if default.exists() and not cfg.exists():
         shutil.copy2(default, cfg)
-    fps60 = HERE / "fps60_sites.txt"
-    if fps60.exists():
-        shutil.copy2(fps60, savedata / "fps60_sites.txt")
     (savedata / "BASLUS-21678DBZT3").mkdir(exist_ok=True)
 
 

@@ -46,6 +46,7 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #include "game_overrides.h"
 #include "Kernel/Stubs/Pad.h"        // [hstate]/[fightprobe]: ps2_stubs::getPadDebugSnapshot()
 #include "Kernel/Stubs/MemoryCard.h" // [hstate]: ps2_stubs::getMemoryCardDebugSnapshot()
+#include "Kernel/Syscalls/Helpers/Path.h" // [r3000] getConfiguredCdRoot() for the IRX paths
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_gpu_renderer.h"
@@ -3230,6 +3231,40 @@ bool PS2Runtime::dispatchIopBranch(uint8_t *rdram, R5900Context *ctx, uint32_t t
 }
 
 // [r3000] Load an IRX at the next IOP base, register its recompiled functions and run its entry.
+std::string PS2Runtime::resolveIopModulePath(const std::string &fileName)
+{
+    if (fileName.empty())
+        return {};
+
+    // PS2X_IOP_DIR wins outright, exactly as before.
+    if (const char *d = std::getenv("PS2X_IOP_DIR"); d && d[0])
+    {
+        std::error_code dirEc;
+        std::filesystem::path p(d);
+        if (std::filesystem::is_directory(p, dirEc))
+            p /= fileName;
+        return p.lexically_normal().string();
+    }
+
+    // The guest names the module, the install does not have to. The CD root IS data/, so
+    // <cdRoot>/IRX/<mod> is the disc layout and <cdRoot>/<mod> the flat one. Anchored to the CD
+    // root, not the process directory, so PS2X_EXEDIR and a launch from another folder still
+    // find the modules.
+    const std::filesystem::path cd = getConfiguredCdRoot();
+    const std::filesystem::path inIrx = cd / "IRX" / fileName;
+    std::error_code ec;
+    if (std::filesystem::exists(inIrx, ec))
+        return inIrx.lexically_normal().string();
+    const std::filesystem::path flat = cd / fileName;
+    ec.clear();
+    if (std::filesystem::exists(flat, ec))
+        return flat.lexically_normal().string();
+
+    // Nothing on disk. Hand back the disc-layout path so the log names the place that was
+    // looked for, and the HLE path stays in charge.
+    return inIrx.lexically_normal().string();
+}
+
 bool PS2Runtime::loadAndRunIopModule(const char *path)
 {
     if (!path || !path[0])

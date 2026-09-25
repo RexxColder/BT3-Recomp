@@ -119,7 +119,7 @@ REQUIRED_LAYOUT = [
     RUNNER_EXE,
     "LICENSE",
     "savedata/settings.toml",
-    "savedata/fps60_sites.txt",
+    "fps60_sites.txt",
     "assets/lib/vcruntime140.dll",
     "assets/lib/vcruntime140_1.dll",
     "assets/lib/msvcp140.dll",
