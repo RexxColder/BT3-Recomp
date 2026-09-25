@@ -1683,7 +1683,10 @@ bool PS2Runtime::initialize(const char *title)
                 if (f.is_open())
                 {
                     ps2x_toml::Document doc; doc.parse(f);
-                    tcEnabled = doc.getB("video.texcache", true);
+                      // Default OFF, matching Settings::texcache. This fallback is what a user with no
+                      // settings.toml gets, so leaving it true would hand everyone the 1.95 GB /
+                      // 9.1 s-boot cache that the in-game default no longer asks for.
+                      tcEnabled = doc.getB("video.texcache", false);
                     packOn = doc.getB("video.texture_pack", false);
                     btnLayout = doc.getI("video.button_layout", 1);
                 }
