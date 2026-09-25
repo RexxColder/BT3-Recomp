@@ -23,7 +23,13 @@ namespace
 {
     std::string trimmed(const char *begin, std::size_t n)
     {
-        std::string s(begin, n);
+        // Registry and /proc buffers are NUL-terminated inside the reported length, so the
+        // terminator has to end the string first: the CPU name comes back space-padded and the
+        // padding would otherwise survive the trim.
+        std::size_t len = 0;
+        while (len < n && begin[len] != '\0')
+            ++len;
+        std::string s(begin, len);
         while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n'))
             s.pop_back();
         std::size_t start = 0;

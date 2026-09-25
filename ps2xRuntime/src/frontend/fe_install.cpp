@@ -738,8 +738,8 @@ void InstallWizard::draw()
             ImGui::TextWrapped("%s", hw::summary(hw::detect()).c_str());
             fe::sectionHeader("AJUSTES RECOMENDADOS");
             char line[256];
-            std::snprintf(line, sizeof line, "Nivel %s  -  escala %dx  -  widescreen %s  -  pack %s  -  %d fps",
-                          m_rec.tierName.c_str(), m_rec.renderScale, m_rec.widescreen ? "SI" : "NO",
+            std::snprintf(line, sizeof line, "Nivel %s  -  escala %dx  -  pack %s  -  %d fps",
+                          m_rec.tierName.c_str(), m_rec.renderScale,
                           m_rec.texPackFull ? "completo" : "leve", m_rec.fps60 ? 60 : 30);
             ImGui::TextWrapped("%s", line);
         }

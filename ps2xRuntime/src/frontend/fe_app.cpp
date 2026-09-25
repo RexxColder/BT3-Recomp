@@ -3,6 +3,8 @@
 #include <cstring>
 
 #include "frontend/fe_background.h"
+#include "frontend/fe_hw.h"
+#include "frontend/fe_music.h"
 #include "frontend/fe_install.h"
 #include "frontend/fe_pages.h"
 #include "frontend/fe_picker.h"
@@ -392,6 +394,9 @@ namespace frontend
         fe::Fader fader;
         Transition transition = Transition::None;
         int transitionPage = 0;
+        // PLAY stops here after the fade: the screen is black and the theme is fading out, and
+        // the boot only happens once the audio device has been let go.
+        bool playPending = false;
         // True when the navigation cursor still needs a target (first frame, or just after the
         // screen/page it was pointing at stopped existing).
         bool navFocusWanted = true;
@@ -437,6 +442,10 @@ namespace frontend
 
         int bgW = 0, bgH = 0;
         const std::uint32_t bgTex = loadBackground(exeDir / "assets" / "background.png", &bgW, &bgH);
+    // Menu theme from <exeDir>/music. Silence when there is no file, which is the normal case
+    // for anyone who did not drop a track there.
+    music::setMuted(settings.musicMuted);
+    music::start(exeDir);
 
         // The per-player pad profiles live in <exeDir>/savedata; point PadConfig there and read
         // them once so the Mandos page shows what the game will actually use.
@@ -604,15 +613,17 @@ namespace frontend
                             if (canPlay)
                                 ImGui::TextWrapped("%s", scan.elf.c_str());
                             ImGui::Separator();
-                            ImGui::TextColored(gold(), "JUGAR");
-                            ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.18f, 0.55f, 0.30f));
-                            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.25f, 0.73f, 0.40f));
-                            ImGui::PushStyleColor(ImGuiCol_Text, dbz(0.02f, 0.06f, 0.03f));
-                            if (ImGui::Button("INICIAR EL JUEGO", ImVec2(240.0f, 34.0f)) && canPlay)
-                                wantBoot = true;
-                            ImGui::PopStyleColor(3);
-                            if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) && canPlay)
-                                wantBoot = true;
+                            ImGui::TextColored(gold(), "TU HARDWARE");
+                            // Probed once: this walks the registry and DXGI, which has no business
+                            // running 60 times a second.
+                            {
+                                static const std::string hwLine = hw::summary(hw::detect());
+                                if (hwLine.empty())
+                                    ImGui::TextDisabled("No se pudo leer el hardware");
+                                else
+                                    ImGui::TextWrapped("%s", hwLine.c_str());
+                            }
+                            ImGui::Separator();
                             ImGui::Separator();
                             if (!scan.dataDir || scan.afsCount == 0)
                             {
@@ -766,14 +777,23 @@ namespace frontend
                         navFocusWanted = true;
                         break;
                     case Transition::Play:
-                        wantBoot = true;
+                        // Hold on black while the menu theme fades away, then let the game have
+                        // the audio device. playPending is what the frame loop watches.
+                        playPending = true;
                         fader.hold();
+                        music::fadeOut(0.55f);
                         break;
                     case Transition::None:
                         break;
                     }
-                    transition = Transition::None;
+                transition = Transition::None;
                 });
+                music::update(dt);
+                if (playPending && music::silent())
+                {
+                    wantBoot = true;
+                    playPending = false;
+                }
                 fader.draw();
                 win.endFrame();
         }
@@ -806,7 +826,10 @@ namespace frontend
                      settingsExisted ? "loaded existing settings.toml"
                                      : "no settings.toml yet (defaults written)");
 
-        win.shutdown();
+        // The runtime opens its own audio device, and two WASAPI clients fight over it: hand the
+    // device back before returning, whatever way the front-end ended.
+    music::shutdown();
+    win.shutdown();
         if (wantBoot && !scan.elf.empty())
             bootElfOut = scan.elf;
         std::fprintf(stderr, "[fe] front-end done (boot=%d elf=%s)\n",

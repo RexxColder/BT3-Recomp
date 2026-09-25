@@ -22,6 +22,18 @@ namespace frontend
         return n > 0 ? n : 0;
     }
 
+    bool monitorSize(int index, int *width, int *height)
+    {
+        SDL_DisplayMode mode;
+        if (SDL_GetDesktopDisplayMode(index, &mode) != 0 || mode.w <= 0 || mode.h <= 0)
+            return false;
+        if (width)
+            *width = mode.w;
+        if (height)
+            *height = mode.h;
+        return true;
+    }
+
     std::string monitorName(int index)
     {
         SDL_DisplayMode mode;

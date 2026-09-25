@@ -1,6 +1,9 @@
 #include "frontend/fe_pages.h"
 
+#include "frontend/fe_gpu.h"
 #include "frontend/fe_hash.h"
+#include "frontend/fe_hw.h"
+#include "frontend/fe_music.h"
 #include "frontend/fe_ui.h"
 #include "frontend/fe_window.h"
 
@@ -9,6 +12,7 @@
 #include "runtime/pad_config.h"
 #include "runtime/ps2_host_pad.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -101,12 +105,115 @@ namespace
 
 namespace frontend
 {
-    // Video: the five settings you almost always want (renderer, resolution, scale, monitor,
-    // window mode) stay open and unboxed; the rest is grouped into two collapsible sections and
+    // Video: the settings you almost always want (renderer, GPU, resolution, scale, monitor,
+    // window mode) stay open and unboxed; the rest is grouped into collapsible sections and
     // the "only in game" note is a plain line instead of a section.
     static const char *const kVideoSections[] = {
-        "EFECTOS Y FILTRADO", "PACK Y OPCIONES"
+        "EFECTOS Y FILTRADO", "PACK Y OPCIONES", "RECOMENDADO"
     };
+
+    // The game window's GL context is created by SDL with no adapter argument, so on Windows the
+    // only lever the OS exposes is the per-app graphics preference. That makes this a
+    // launch-time choice: it is written the moment it changes and lands on the next game start.
+    static void drawGpuRow(ps2x_settings::Settings &s)
+    {
+        static std::vector<gpu::Adapter> list;
+        static std::vector<std::string> names;
+        static std::vector<const char *> ptrs;
+        static std::string lastError;
+        static bool listed = false;
+        if (!listed)
+        {
+            listed = true;
+            list = gpu::adapters(gpu::currentRenderer());
+            for (const gpu::Adapter &a : list)
+                std::fprintf(stderr, "[fe] gpu: %s (%llu MB)%s%s\n", a.name.c_str(),
+                             static_cast<unsigned long long>(a.vramMB), a.software ? " software" : "",
+                             a.active ? " ACTIVA" : "");
+            // WARP and the other software adapters are not a choice: picking one would run the
+            // game on the CPU rasterizer. They stay in the log, out of the dropdown.
+            list.erase(std::remove_if(list.begin(), list.end(),
+                                      [](const gpu::Adapter &a) { return a.software; }),
+                       list.end());
+        }
+        if (list.empty())
+        {
+            if (!gpu::supported())
+            {
+                fe::rowLabel("GPU");
+                ImGui::TextDisabled("Seleccion de GPU disponible solo en Windows");
+            }
+            return;
+        }
+
+        names.clear();
+        ptrs.clear();
+        names.push_back("Automatica (decide Windows)");
+        ptrs.push_back(names.back().c_str());
+        int current = 0;
+        for (std::size_t i = 0; i < list.size(); ++i)
+        {
+            char buf[320];
+            std::snprintf(buf, sizeof buf, "%s  (%llu GB)%s", list[i].name.c_str(),
+                          static_cast<unsigned long long>((list[i].vramMB + 512) / 1024),
+                          list[i].active ? "   <-- ACTIVA" : "");
+            names.push_back(buf);
+            ptrs.push_back(names.back().c_str());
+            if (!s.gpu.empty() && list[i].name == s.gpu)
+                current = static_cast<int>(i) + 1;
+        }
+
+        if (list.size() == 1)
+        {
+            // One adapter is not a choice; name it and move on.
+            fe::rowLabel("GPU");
+            ImGui::Text("%s", names[1].c_str());
+            if (s.gpu.empty() && list[0].active)
+                s.gpu = list[0].name;
+            return;
+        }
+
+        if (fe::comboRowStr("GPU", &current, ptrs.data(), static_cast<int>(ptrs.size()),
+                            names[current].c_str()))
+        {
+            s.gpu = current == 0 ? std::string() : list[current - 1].name;
+            std::string err;
+            lastError = gpu::applyPreference(s.gpu, &err) ? std::string() : err;
+        }
+        if (!lastError.empty())
+            ImGui::TextColored(fe::warnCol(), "%s", lastError.c_str());
+        else if (current > 0 && !list[current - 1].active)
+            ImGui::TextDisabled("Se aplica al reiniciar el juego");
+    }
+
+    // Write a detected recommendation into the settings the shell owns. The texture pack is only
+    // switched on when one is actually installed, so a recommendation never points at files
+    // that are not there.
+    static void applyRecommendation(ps2x_settings::Settings &s, const hw::Recommendation &r,
+                                    const std::filesystem::path &dataDir)
+    {
+        std::error_code ec;
+        const std::filesystem::path packDir = dataDir / "Textures";
+        const bool packThere =
+            std::filesystem::is_directory(packDir, ec) &&
+            std::filesystem::directory_iterator(packDir, ec) != std::filesystem::directory_iterator();
+
+        s.renderScale = r.renderScale;
+        // widescreen is not touched here: it is fixed, so a recommendation has no say over it.
+        s.texPack = r.texPackFull && packThere;
+        s.fps60 = r.fps60;
+        s.windowMode = r.windowMode;
+        s.fullscreen = r.windowMode == 2;
+        if (r.windowMode != 2)
+        {
+            int w = 0, h = 0;
+            if (frontend::monitorSize(s.monitor, &w, &h))
+            {
+                s.windowW = w;
+                s.windowH = h;
+            }
+        }
+    }
 
     void drawVideoPage(PageContext &ctx)
     {
@@ -183,6 +290,7 @@ namespace frontend
             ImGui::SameLine();
             ImGui::RadioButton("3x", &s.renderScale, 3);
         }
+        drawGpuRow(s);
 
         if (fe::beginSection("EFECTOS Y FILTRADO", false,
                              "El contorno de cel a 199% replica la linea de la consola; mas bajo, "
@@ -233,6 +341,45 @@ namespace frontend
             fe::comboRow("Estilo de botones", &s.buttonLayout, buttons, 2);
         }
 
+        if (fe::beginSection("RECOMENDADO", false,
+                             "Detecta tu CPU, RAM y GPU y mide un banco de pruebas de un solo "
+                             "hilo para decidir el nivel. Aplicar escribe la escala de render, "
+                             "el pack de texturas, los 60 fps y el modo de ventana."))
+        {
+            static hw::Recommendation rec;
+            static std::string recText;
+            static bool haveRec = false;
+            static bool applied = false;
+            if (fe::primaryButton("DETECTAR", ImVec2(120.0f, 28.0f)))
+            {
+                rec = hw::recommend(hw::detect(), hw::benchSingleThreadR());
+                char buf[256];
+                std::snprintf(buf, sizeof buf,
+                              "%s  -  %dx render, pack %s, %d fps, %s",
+                              rec.tierName.c_str(), rec.renderScale,
+                              rec.texPackFull ? "4K" : "lite", rec.fps60 ? 60 : 30,
+                              rec.windowMode == 2 ? "pantalla completa"
+                                                  : rec.windowMode == 1 ? "borderless" : "ventana");
+                recText = buf;
+                haveRec = true;
+                applied = false;
+            }
+            ImGui::SameLine(0.0f, 10.0f);
+            if (fe::primaryButton("APLICAR", ImVec2(120.0f, 28.0f)) && haveRec)
+            {
+                applyRecommendation(s, rec, dataDir);
+                applied = true;
+            }
+            if (!recText.empty())
+            {
+                ImGui::TextWrapped("%s", recText.c_str());
+                if (applied)
+                    ImGui::TextColored(fe::okCol(), "Aplicado. Guardalo para que sobreviva al cierre.");
+                else if (haveRec)
+                    ImGui::TextDisabled("Aplica los valores de arriba a los ajustes de esta pagina.");
+            }
+        }
+
         ctx.footerHint = "Half texel, saltar post, VRAM obsoleta, widescreen, 60 fps y el HUD se "
                          "cambian en caliente desde el overlay del juego (Shift+Tab).";
     }
@@ -241,13 +388,30 @@ namespace frontend
     {
         ps2x_settings::Settings &s = *ctx.settings;
 
-        if (fe::beginSection("VOLUMENES", true,
-                             "El juego y el menu del Dragon Net comparten estos tres volumenes."))
+    if (fe::beginSection("VOLUMENES", true,
+                         "El juego y el menu del Dragon Net comparten estos tres volumenes."))
+    {
+        fe::sliderRow("General", &s.master, 0.0f, 1.0f, "%.2f");
+        fe::sliderRow("Musica", &s.music, 0.0f, 1.0f, "%.2f");
+        fe::sliderRow("Efectos", &s.sfx, 0.0f, 0.4f, "%.2f");
+    }
+
+    // The menu theme is a local file, not part of the project, so muting it is a shell setting
+    // and not one of the game's own volume sliders. It applies on the spot instead of waiting
+    // for the session to end, which is why it is written out immediately.
+    {
+        bool muted = s.musicMuted;
+        if (fe::toggleSwitch("Silenciar la musica del menu", &muted) && muted != s.musicMuted)
         {
-            fe::sliderRow("General", &s.master, 0.0f, 1.0f, "%.2f");
-            fe::sliderRow("Musica", &s.music, 0.0f, 1.0f, "%.2f");
-            fe::sliderRow("Efectos", &s.sfx, 0.0f, 0.4f, "%.2f");
+            s.musicMuted = muted;
+            music::setMuted(muted);
+            if (ps2x_settings::save(s, ctx.configDir.string()))
+                std::fprintf(stderr, "[fe] menu theme %s\n", muted ? "muted" : "unmuted");
         }
+        if (music::trackName().empty())
+            fe::hintPending("No hay ninguna pista en <carpeta del ejecutable>/music/ ni en "
+                            "assets/music/, asi que el menu trabaja en silencio.");
+    }
     }
 
     // Live pad tester: reads the same host pad layer the game polls, so what lights up here is
@@ -610,11 +774,14 @@ namespace frontend
         fe::kv("Audio", "motor SE/ADX del propio juego");
         fe::kv("Mando", "SDL2 gamecontroller");
 
-        fe::sectionHeader("CREDITOS");
-        fe::hint("PS2Recomp (ran-j) - recompilador estatico (GPL-3.0)\n"
-                 "paraLLEl-GS (Arntzen-Software) - backend de GS (LGPL-3.0-or-later)\n"
-                 "BT3-Recomp (z3xox) - este proyecto\n"
-                 "ViveTheModder - listas de archivos AFS NTSC-U (Apache-2.0)\n"
-                 "Russo One - tipografia (SIL Open Font License)");
+    fe::sectionHeader("CREDITOS");
+    fe::hint("PS2Recomp (ran-j) - recompilador estatico (GPL-3.0)\n"
+    "paraLLEl-GS (Arntzen-Software) - backend de GS (LGPL-3.0-or-later)\n"
+    "BT3-Recomp (z3xox) - este proyecto\n"
+    "ViveTheModder - listas de archivos AFS NTSC-U (Apache-2.0)\n"
+    "Russo One - tipografia (SIL Open Font License)\n"
+    "Musica del menu: pista 08 \"Shine\" de la banda sonora de Dragon Ball Z: Budokai Tenkaichi 3 "
+    "(2007). El audio es material con derechos de autor y NO se distribuye con el proyecto: "
+    "copiala vos a <carpeta del ejecutable>/music/ y el front-end la reproduce desde ahi.");
     }
 }

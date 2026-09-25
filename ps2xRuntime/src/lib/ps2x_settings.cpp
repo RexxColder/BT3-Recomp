@@ -159,10 +159,12 @@ namespace
         s.fullscreen = doc.getB("video.fullscreen", s.fullscreen);
         s.windowMode = doc.getI("video.window_mode", s.fullscreen ? 2 : 0);
         s.monitor = doc.getI("video.monitor", 0);
+        s.gpu = doc.getS("video.gpu", s.gpu);
         s.widescreen = doc.getB("video.widescreen", s.widescreen);
         s.windowW = doc.getI("video.window_w", s.windowW);
     s.feWidth = clampi(doc.getI("frontend.width", s.feWidth), 640, 7680);
     s.feHeight = clampi(doc.getI("frontend.height", s.feHeight), 480, 4320);
+    s.musicMuted = doc.getB("frontend.music_muted", s.musicMuted);
         s.windowH = doc.getI("video.window_h", s.windowH);
         s.forceBilinear = doc.getB("video.force_bilinear", s.forceBilinear);
         s.fps60 = doc.getB("video.fps60", s.fps60);
@@ -304,7 +306,7 @@ namespace ps2x_settings
                a.outline == b.outline && a.inkStrength == b.inkStrength && a.inkWidth == b.inkWidth &&
                a.inkColor == b.inkColor && a.shadows == b.shadows && a.dofBlur == b.dofBlur &&
                a.dofZFar == b.dofZFar && a.fullscreen == b.fullscreen && a.windowMode == b.windowMode &&
-               a.monitor == b.monitor && a.widescreen == b.widescreen && a.windowW == b.windowW &&
+               a.monitor == b.monitor && a.gpu == b.gpu && a.widescreen == b.widescreen && a.windowW == b.windowW &&
                a.windowH == b.windowH && a.forceBilinear == b.forceBilinear && a.texPack == b.texPack &&
                a.introVideo == b.introVideo && a.texcache == b.texcache &&
                a.buttonLayout == b.buttonLayout && a.fps60 == b.fps60 && a.hudLayout == b.hudLayout &&
@@ -409,6 +411,7 @@ namespace ps2x_settings
         os << "fullscreen = " << fmtBool(s.fullscreen) << "\n";
         os << "window_mode = " << fmtInt(s.windowMode) << "\n";
         os << "monitor = " << fmtInt(s.monitor) << "\n";
+        os << "gpu = " << fmtStr(s.gpu) << "\n";
         os << "widescreen = " << fmtBool(s.widescreen) << "\n";
         os << "window_w = " << fmtInt(s.windowW) << "\n";
         os << "window_h = " << fmtInt(s.windowH) << "\n";
@@ -444,6 +447,7 @@ namespace ps2x_settings
         os << "[frontend]\n";
         os << "width = " << fmtInt(s.feWidth) << "\n";
         os << "height = " << fmtInt(s.feHeight) << "\n";
+        os << "music_muted = " << fmtBool(s.musicMuted) << "\n";
 
         return os.str();
     }

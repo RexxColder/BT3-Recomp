@@ -38,6 +38,12 @@ ps2xRuntime/include/ps2_overlay_functions.h
 # user's own ripped disc content, and it is gigabytes.
 games/bt3/work
 
+# Menu theme for the front-end. This is the game's own soundtrack, so it stays a local file the
+# user drops next to the executable: the front-end looks for <exeDir>/music/. Never commit, and
+# never let setup.py stage it into a distributed zip.
+music/
+ps2xRuntime/assets/music/
+
 # local build/deploy scratch
 log.txt
 log_*.txt

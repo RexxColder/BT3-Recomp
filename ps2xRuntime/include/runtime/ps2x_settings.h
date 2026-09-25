@@ -42,6 +42,10 @@ namespace ps2x_settings
         int windowMode = 0;
         int monitor = 0;
         bool widescreen = false;
+        // Preferred GPU, by DXGI adapter name. Empty means "let the OS decide". Only takes
+        // effect on the next launch of the game window, since the OpenGL context is created by
+        // SDL without an adapter argument.
+        std::string gpu;
         int windowW = 0;
         int windowH = 0;
         // Front-end window size, remembered between runs. It lives here so the shell opens at
@@ -50,6 +54,9 @@ namespace ps2x_settings
         // so resizing the window never marks the game settings as unsaved.
         int feWidth = 800;
         int feHeight = 600;
+        // Menu-theme mute, also shell-only and also outside operator== for the same reason: the
+        // toggle applies the moment it is pressed, so it must not read as an unsaved change.
+        bool musicMuted = false;
         bool forceBilinear = true;
         bool texPack = false;
         bool introVideo = true;

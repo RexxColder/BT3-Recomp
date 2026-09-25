@@ -11,6 +11,8 @@ namespace frontend
     // runtime already has SDL2, so the front-end does not need another dependency).
     int monitorCount();
     std::string monitorName(int index);
+    // Native desktop size of a display, used to size a borderless/windowed game window.
+    bool monitorSize(int index, int *width, int *height);
 
     class FeWindow
     {

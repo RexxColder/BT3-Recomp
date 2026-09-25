@@ -97,6 +97,12 @@ else()
     # the same static build (linked after that block, see PS2X_SDL2_TARGET).
     target_compile_definitions(bt3gl PUBLIC PLATFORM_DESKTOP_SDL GRAPHICS_API_OPENGL_33)
 
+    # [audio] raylib ships SUPPORT_FILEFORMAT_FLAC commented out in its config.h, which also
+    # leaves dr_flac out of raudio.c, so LoadMusicStream() rejects a FLAC even though the vendored
+    # tree carries the decoder. The front-end menu theme is a FLAC, so switch it on here instead
+    # of editing the vendored source: config.h has the line commented, so there is no clash.
+    target_compile_definitions(bt3gl PUBLIC SUPPORT_FILEFORMAT_FLAC=1)
+
     if(WIN32)
         target_link_libraries(bt3gl PUBLIC opengl32 winmm)
     else()
@@ -1007,13 +1013,15 @@ src/lib/ps2x_net_menu2d.cpp      # [netmenu2d] custom Dragon Net menu, raylib 2D
     if(TARGET imgui AND DEFINED PS2X_SDL2_TARGET)
         set(PS2X_FRONTEND_SOURCES
             src/frontend/fe_app.cpp
-            src/frontend/fe_afs.cpp
-            src/frontend/fe_background.cpp
-            src/frontend/fe_hash.cpp
+    src/frontend/fe_afs.cpp
+    src/frontend/fe_background.cpp
+    src/frontend/fe_gpu.cpp
+    src/frontend/fe_hash.cpp
             src/frontend/fe_hw.cpp
             src/frontend/fe_install.cpp
-            src/frontend/fe_iso9660.cpp
-            src/frontend/fe_pages.cpp
+    src/frontend/fe_iso9660.cpp
+    src/frontend/fe_music.cpp
+    src/frontend/fe_pages.cpp
             src/frontend/fe_picker.cpp
             src/frontend/fe_window.cpp
         )
