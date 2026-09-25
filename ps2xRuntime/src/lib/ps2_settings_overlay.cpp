@@ -1054,6 +1054,65 @@ void PS2SettingsOverlay::readGamepadStateForDevice(
     // Keyboard: no gamepad axes/buttons to read
 }
 
+void PS2SettingsOverlay::drawPerfHud()
+{
+    // [perf] Medidor de esquina, arriba a la derecha. Solo el numero de presents por segundo: es lo
+    // unico que se lee de un vistazo sin tapar nada. Lo demas (p50/p95, gpu, cpu) esta en la pestana
+    // Video, que se abre cuando uno quiere el detalle.
+    //
+    // El dato se actualiza una vez por segundo, asi que no tiene sentido cambiar el texto 60 veces
+    // por segundo. Se limita la ACTUALIZACION a 4 Hz, no el dibujado: una ventana de ImGui que no
+    // se abre un frame simplemente no existe ese frame, asi que throttlear con un return temprano
+    // la hacia parpadear. Se dibuja siempre, con el ultimo valor conocido.
+    static double s_lastShown = -1.0;
+    static float s_shownAt = -1.0f;
+
+    const ps2x::PerfStatus pf = ps2x::GetPerfStatus();
+    if (!pf.valid)
+        return;
+
+    const float now = ImGui::GetTime();
+    if (s_shownAt < 0.0f || now - s_shownAt >= 0.25f)
+    {
+        s_shownAt = now;
+        s_lastShown = pf.displayFps;
+    }
+
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    const float margin = ImGui::GetFontSize() * 0.75f;
+    // Pivote (1,0): la BORDE derecho de la ventana cae en el del viewport, asi el ancho variable de
+    // AlwaysAutoResize nunca la empuja fuera de la pantalla.
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x - margin, vp->Pos.y + margin),
+                            ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+
+    // NoInputs es lo que garantiza que no se coma clics: sin eso la ventana se traga el raton en la
+    // esquina. NoDecoration quita borde, titulo y boton de cerrar.
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration
+                                 | ImGuiWindowFlags_NoInputs
+                                 | ImGuiWindowFlags_AlwaysAutoResize
+                                 | ImGuiWindowFlags_NoSavedSettings
+                                 | ImGuiWindowFlags_NoFocusOnAppearing;
+    if (!ImGui::Begin("##bt3_perf_hud", nullptr, flags))
+    {
+        ImGui::End();
+        return;
+    }
+
+    // Acento para el numero y apagado para la unidad, igual que el resto del panel.
+    ImGui::PushStyleColor(ImGuiCol_Text, accent());
+    ImGui::Text("%.1f", s_lastShown);
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0.0f, 3.0f);
+    ImGui::TextDisabled("fps");
+    if (pf.displayRefreshHz > 0)
+    {
+        ImGui::SameLine(0.0f, 6.0f);
+        ImGui::TextDisabled("/ %d Hz", pf.displayRefreshHz);
+    }
+
+    ImGui::End();
+}
+
 void PS2SettingsOverlay::draw(PS2Runtime &runtime)
 {
     if (!m_initialized)
@@ -1145,8 +1204,28 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
             m_animT = std::max(target, m_animT - step);
     }
 
+    // [perf] Rama propia para cuando el panel esta retraido, que es el estado normal. El HUD y el
+    // panel NUNCA coexisten, y por eso esto no necesita un segundo frame: UiBegin() hace
+    // ImGui::NewFrame() y UiEnd() hace ImGui::Render(), o sea que el par es un frame completo y
+    // solo puede haber uno por iteracion. La rama del panel de mas abajo queda intacta.
     if (m_animT <= 0.0001f)
+    {
+        if (!m_settings.showPerf)
+            return;
+        try
+        {
+            ps2x::gfx::UiBegin();
+            pushDbzTheme();
+            DbzThemeScope dbzTheme;   // pops all 40 style colours on scope exit
+            drawPerfHud();
+        }
+        catch (...)
+        {
+            // Misma politica que el panel: un fallo dibujando nunca debe matar el juego.
+        }
+        ps2x::gfx::UiEnd();
         return;
+    }
 
     const float animEase = overlayAnimEase(m_animT);
 
@@ -1161,6 +1240,12 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
 
         pushDbzTheme();
         DbzThemeScope dbzTheme;   // pops all 40 style colours on scope exit
+
+        // [perf] El HUD va ANTES del fade: ScopedStyleVar animAlpha tiene scope hasta el final del
+        // try, asi que cualquier ventana abierta despues heredaria la opacidad del panel y el medidor
+        // se desvaneceria con el. Acá va a opacidad completa siempre.
+        if (m_settings.showPerf)
+            drawPerfHud();
 
         // Fade the whole window (and the bindings popup, if open) in/out with the
         // deploy animation.
@@ -1418,16 +1503,27 @@ void PS2SettingsOverlay::drawVideoTab()
                                       : "el renderer no reporta tiempos de GPU");
                     dot(ps2x::VideoState::Fail, "GPU", val, note);
                 }
+                else if (!pf.gpuMeasured())
+                {
+                    // The backend is live but collected nothing this window. Measured live: three
+                    // windows in a row went 61% -> 0.65% -> 0.61% only because the guest stopped
+                    // issuing draw lists. A 0% here would read as an idle GPU, which is the opposite
+                    // of the truth, so say what actually happened.
+                    std::snprintf(val, sizeof val, "sin muestras");
+                    std::snprintf(note, sizeof note, "el juego no emitio ninguna lista de dibujado en este segundo");
+                    dot(ps2x::VideoState::Fallback, "GPU", val, note);
+                }
                 else
                 {
                     std::snprintf(val, sizeof val, "%.0f %%", pf.gpuBusyPct);
                     const char *src = pf.gpuSource == ps2x::GpuSource::VulkanTimestamps ? "Vulkan, frame completo"
                                     : pf.gpuSource == ps2x::GpuSource::OpenGL ? "OpenGL" : "?";
                     if (pf.gpuCoverage >= 1.0)
-                        std::snprintf(note, sizeof note, "%s  -  %.1f ms/frame", src, pf.gpuMsPerFrame);
+                        std::snprintf(note, sizeof note, "%s  -  %.1f ms/frame, %d muestras", src, pf.gpuMsPerFrame, pf.gpuSamples);
                     else
                         std::snprintf(note, sizeof note,
-                                      "%s, solo la lista de dibujado: es un minimo  -  %.1f ms/frame", src, pf.gpuMsPerFrame);
+                                      "%s, solo la lista de dibujado: es un minimo  -  %.1f ms/frame, %d muestras",
+                                      src, pf.gpuMsPerFrame, pf.gpuSamples);
                     dot(ps2x::VideoState::Ok, "GPU", val, note);
                 }
 
@@ -1529,7 +1625,7 @@ void PS2SettingsOverlay::drawVideoTab()
         }
         // [perf] Toggling this also arms the runtime, which is what turns the GPU timing queries on:
         // they are not free, so nothing should pay for them unless someone is reading the numbers.
-        if (toggleSwitch("Mostrar FPS y GPU", &m_settings.showPerf))
+        if (toggleSwitch("Medidor de FPS (esquina)", &m_settings.showPerf))
         {
             ps2x::SetPerfOverlayEnabled(m_settings.showPerf);
             m_dirty = true;

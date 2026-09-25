@@ -96,6 +96,12 @@ public:
 
     void initialize();
     void draw(PS2Runtime &runtime);
+    // [perf] El medidor de esquina. Se dibuja dentro del MISMO frame de ImGui que el panel: el
+    // HUD y el panel nunca coexisten, asi que draw() tiene una rama propia para cuando el panel esta
+    // retraido (el estado normal) y, cuando esta desplegandose, lo pinta antes del fade para que no
+    // herede su opacidad.
+    void drawPerfHud();
+
     void shutdown();
 
 private:

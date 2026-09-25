@@ -1,4 +1,4 @@
-#include "frontend/fe_pages.h"
+﻿#include "frontend/fe_pages.h"
 
 #include "frontend/fe_gpu.h"
 #include "frontend/fe_hash.h"
@@ -757,12 +757,11 @@ namespace frontend
         fe::toggleSwitch("Overlay del juego (Shift+Tab)", &s.overlayEnabled);
         fe::kv("Boton del pad", s.overlayPadBtns.c_str());
         fe::kv("Teclas", s.overlayKeys.c_str());
-        fe::toggleSwitch("Mostrar FPS y GPU", &s.showPerf);
-        fe::hint("Muestra en la pestana Video del overlay los FPS reales, la distribucion de "
-                 "tiempos de frame (p50/p95/max) y el uso de GPU. El uso de GPU se mide con lo que "
-                 "el renderer tenga: OpenGL solo cubre la lista de dibujado y paraLLEl-GS el frame "
-                 "entero, asi que el panel lo dice. Las consultas de tiempo de GPU cuestan algo, "
-                 "por eso esta apagado por default.");
+        fe::toggleSwitch("Medidor de FPS (esquina)", &s.showPerf);
+        fe::hint("Muestra los presents por segundo en la esquina superior derecha, durante "
+                 "la partida. La pestana Video del overlay tiene el detalle: distribucion de "
+                 "tiempos de frame (p50/p95/max) y uso de GPU, que se mide con lo que el renderer "
+                 "tenga y el panel declara que cobertura tiene.");
     }
 }
 
