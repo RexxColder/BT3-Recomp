@@ -134,15 +134,16 @@ namespace frontend
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
         ImGuiIO &io = ImGui::GetIO();
-    io.IniFilename = nullptr;
-    // [imgui-error] Recoverable ImGui errors raise a sticky red tooltip that, in this 1.93 tree,
-    // re-raises itself every frame (BeginErrorTooltip ends the window when it is hidden and
-    // EndErrorTooltip ends it again, imgui.cpp). The tooltip is off and so is the hard assert;
-    // the message still goes to the debug log and to our own stderr line, so a real mistake is
-    // reported once instead of drowning the UI.
-    io.ConfigErrorRecoveryEnableTooltip = false;
-    io.ConfigErrorRecoveryEnableAssert = false;
-    io.ConfigErrorRecoveryEnableDebugLog = true;
+        io.IniFilename = nullptr;
+        // [imgui-error] Both channels are ON. They were turned off to stop a sticky red tooltip
+        // from re-raising every frame, but the errors feeding it were ours: an EndPopup/EndCombo
+        // called outside its Begin's `if` (see comboRowStr) raised 8-10 of them per frame. ImGui's
+        // own callers guard EndErrorTooltip correctly, so the tooltip is not the problem. A
+        // release build compiles IM_ASSERT out, so the tooltip is the only channel a player or a
+        // non-debugging dev will ever see -- keep it on, or the next unbalanced pair is invisible.
+        io.ConfigErrorRecoveryEnableTooltip = true;
+        io.ConfigErrorRecoveryEnableAssert = true;
+        io.ConfigErrorRecoveryEnableDebugLog = true;
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
 

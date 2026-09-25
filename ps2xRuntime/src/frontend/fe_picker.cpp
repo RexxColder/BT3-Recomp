@@ -366,10 +366,11 @@ namespace frontend
             ImGui::SameLine();
             if (ImGui::Button("Cancelar"))
                 m_open = false;
+            // Inside the if, like comboRowStr: a Begin* that returns false opened no window.
+            // BeginPopupModal even ends the popup itself when its own Begin fails, so ending it
+            // here too was a double-end.
+            ImGui::EndPopup();
         }
-        // End outside the if: a modal that reports itself invisible still owns a window, and
-        // skipping this is what produced "Calling End() too many times!".
-        ImGui::EndPopup();
 
         if (m_accepted)
         {

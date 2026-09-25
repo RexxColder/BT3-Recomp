@@ -109,10 +109,10 @@ namespace fe
                 ImGui::Separator();
                 if (ImGui::Button("Cerrar", ImVec2(90.0f, 0.0f)))
                     ImGui::CloseCurrentPopup();
+                // Inside the if: BeginPopup returning false opened no window, so ending one here
+                // would be EndPopup() in the parent window, once per section per frame.
+                ImGui::EndPopup();
             }
-            // Outside the if, like every other Begin/End pair: a popup that reports itself
-            // invisible on its closing frame still has to be ended.
-            ImGui::EndPopup();
         }
         ImGui::PopID();
         return open;
@@ -213,9 +213,15 @@ namespace fe
                 if (sel)
                     ImGui::SetItemDefaultFocus();
             }
+            // Inside the if, and that is the whole contract: a Begin* that returns false opened
+            // no window, so there is nothing to end. EndCombo() also decrements
+            // g.BeginComboDepth unconditionally, and BeginComboPopup names its popup
+            // "##Combo_%02d" from that depth (imgui_widgets.cpp), so ending an unopened combo
+            // every frame walks the depth negative and the popup can never hold a stable window:
+            // the dropdown stops opening, and the popup it did open is left on the window stack
+            // unended, which desyncs every Begin/End after it and kills hover for the whole app.
+            ImGui::EndCombo();
         }
-        // Same rule as every other pair: a combo that reports itself closed still owns a window.
-        ImGui::EndCombo();
         ImGui::PopID();
         return changed;
     }

@@ -100,10 +100,49 @@ namespace ps2x_settings
     // and the defaults had to be written instead.
     bool load(Settings &out, const std::string &configDir);
 
+    // Pure read of one settings.toml: no migration, no writing, and `out` is left untouched when
+    // the file is missing. A caller that only means to amend a few keys seeds itself with this
+    // so every key it does not know about is carried over instead of snapping to a struct default.
+    bool loadFromFile(Settings &out, const std::string &path);
+
     std::string serialize(const Settings &s);
     bool save(const Settings &s, const std::string &configDir);
     bool saveToFile(const Settings &s, const std::string &path);
 
     std::vector<int> parseIntCsv(const std::string &csv);
     std::string formatIntCsv(const std::vector<int> &values);
+
+    // The keys whose effective value came from the environment instead of the file. PS2SettingsOverlay
+    // sets these as it walks its own guards, so that walk stays the one definition of which keys are
+    // env-overridable, and lives here only so applyOverlayValues() can be unit-tested without the
+    // whole runtime.
+    enum EnvLock : uint32_t
+    {
+        kLockGlow        = 1u << 0,
+        kLockGlowFix     = 1u << 1,
+        kLockInkStrength = 1u << 2,
+        kLockBilinear    = 1u << 3,
+        kLockHalfTexel   = 1u << 4,
+        kLockSkipPost    = 1u << 5,
+        kLockSkipStale   = 1u << 6,
+        kLockRenderScale = 1u << 7,
+        kLockOutline     = 1u << 8,
+        kLockTexPack     = 1u << 9,
+        kLockIntroVideo  = 1u << 10,
+        kLockButtonLay   = 1u << 11,
+        kLockShadows     = 1u << 12,
+        kLockDofBlur     = 1u << 13,
+        kLockDofZFar     = 1u << 14,
+        // Set when video.renderer had to be bent because the build cannot do what the file asked
+        // for. A retired renderer (d3d11) is a one-way migration and does get written back; a
+        // build-capability fallback (paraLLEl-GS compiled out) must not, or re-enabling PGS later
+        // finds the user's choice already overwritten.
+        kLockRenderer    = 1u << 15,
+    };
+
+    // Folds the in-game overlay's live values into `out`, which the caller must have seeded from the
+    // file (see loadFromFile). A locked key is simply not assigned, so the file's value stands:
+    // PS2X_GLOW=0 for one session must not leave glow = false behind once the variable is gone.
+    // Keys the overlay does not model are never mentioned here and ride along untouched.
+    void applyOverlayValues(Settings &out, const Settings &live, uint32_t envLockedMask);
 }

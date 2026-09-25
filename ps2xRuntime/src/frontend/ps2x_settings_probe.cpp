@@ -148,7 +148,88 @@ int main()
         check(p.renderer == ps2x_settings::kRendererOpenGL, "renderer explicito gana");
     }
 
-    std::printf("[5] el archivo resultante\n");
+    std::printf("[5] el overlay reescribe el archivo entero: lo que no modela debe sobrevivir\n");
+    {
+        // This is the shape of PS2SettingsOverlay::saveSettings(): seed from disk, overwrite only
+        // the keys the overlay owns, serialize the lot. Default-constructing instead silently reset
+        // every key the overlay has no field for, which is how the shell lost its window size and
+        // the menu theme un-muted itself at the end of a session.
+        writeAll(tomlPath,
+                 "[video]\ngpu = \"NVIDIA GeForce RTX 4070\"\nink_strength = 300\nink_width = 60\n"
+                 "ink_color = \"#1a2b3c\"\nrender_scale = 3\n\n"
+                 "[frontend]\nwidth = 1600\nheight = 900\nmusic_muted = true\n");
+        ps2x_settings::Settings out;
+        check(ps2x_settings::loadFromFile(out, tomlPath), "loadFromFile() lee sin escribir");
+
+        // Only what the overlay actually edits.
+        out.renderScale = 2;
+        out.inkStrength = 275;
+        out.inkWidth = 55;
+        check(ps2x_settings::saveToFile(out, tomlPath), "saveToFile() del overlay");
+
+        ps2x_settings::Settings back;
+        check(ps2x_settings::load(back, dir), "relectura");
+        check(back.renderScale == 2, "la clave editada por el overlay se aplica");
+        check(back.inkStrength == 275 && back.inkWidth == 55, "las claves ink del overlay se aplican");
+        check(back.gpu == "NVIDIA GeForce RTX 4070", "video.gpu sobrevive (el overlay no lo modela)");
+        check(back.feWidth == 1600 && back.feHeight == 900, "[frontend] width/height sobreviven");
+        check(back.musicMuted, "[frontend] music_muted sobrevive");
+
+        // loadFromFile() on a missing file must not create one, or the overlay would write defaults
+        // over a user's file just by saving once.
+        const std::string gone = (std::filesystem::path(dir) / "nada.toml").string();
+        ps2x_settings::Settings untouched;
+        check(!ps2x_settings::loadFromFile(untouched, gone), "loadFromFile() falla si no hay archivo");
+        check(!std::filesystem::exists(gone), "loadFromFile() no crea el archivo");
+        check(untouched.feWidth == 800 && untouched.musicMuted == false, "y deja el struct intacto");
+    }
+
+    std::printf("[6] un override de env no se persiste en el archivo\n");
+    {
+        // The file says glow = false and the user runs one session with PS2X_GLOW=1. The overlay
+        // must not write the env's value back, or the experiment outlives the variable.
+        ps2x_settings::Settings fromFile;
+        writeAll(tomlPath, "[video]\nglow = false\nrender_scale = 2\nink_strength = 250\n\n"
+                           "[logging]\nlog_level = 2\n");
+        check(ps2x_settings::loadFromFile(fromFile, tomlPath), "lectura del archivo");
+
+        ps2x_settings::Settings live;
+        live.glow = true;              // what PS2X_GLOW=1 did to the running config
+        live.renderScale = 3;          // the user also changed this one, in the overlay
+        live.inkStrength = 275;
+        live.logLevel = 2;
+
+        ps2x_settings::Settings out = fromFile;
+        ps2x_settings::applyOverlayValues(out, live, ps2x_settings::kLockGlow);
+        check(!out.glow, "la clave con override de env conserva el valor del archivo");
+        check(out.renderScale == 3, "una clave SIN override de env si se escribe");
+        check(out.inkStrength == 275, "ink_strength se escribe cuando no esta bloqueado");
+        check(out.logLevel == 2, "las claves que el overlay no modela no se tocan aqui");
+
+        // And the full round-trip through the file, to prove it survives serialization.
+        check(ps2x_settings::saveToFile(out, tomlPath), "saveToFile()");
+        ps2x_settings::Settings back;
+        check(ps2x_settings::load(back, dir), "relectura");
+        check(!back.glow, "glow = false sigue en el archivo despues del round-trip");
+        check(back.renderScale == 3, "render_scale = 3 llego al archivo");
+
+        // The renderer case: this build cannot do parallel-gs, so it runs OpenGL, but the file must
+        // keep saying parallel-gs for the build that can.
+        ps2x_settings::Settings r;
+        ps2x_settings::Settings rlive;
+        r.renderer = ps2x_settings::kRendererParallelGS;
+        rlive.renderer = ps2x_settings::kRendererOpenGL;   // the fallback this build applied
+        ps2x_settings::applyOverlayValues(r, rlive, ps2x_settings::kLockRenderer);
+        check(r.renderer == ps2x_settings::kRendererParallelGS, "el fallback de build no se persiste");
+
+        // Without the lock it does persist, which is what makes a retired renderer a real migration.
+        ps2x_settings::Settings d;
+        d.renderer = ps2x_settings::kRendererD3D11;
+        ps2x_settings::applyOverlayValues(d, rlive, 0);
+        check(d.renderer == ps2x_settings::kRendererOpenGL, "sin lock, el valor del overlay se escribe");
+    }
+
+    std::printf("[7] el archivo resultante\n");
     std::printf("----------------------------------------\n%s\n", readAll(tomlPath).c_str());
     std::printf("----------------------------------------\n");
 

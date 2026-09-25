@@ -496,6 +496,7 @@ static bool envUserSet(const char *name)
 void PS2SettingsOverlay::loadSettings()
 {
     m_sawRendererKey = false;
+    m_envLocked = 0;
     // [defaults-sync] Seed from LIVE runtime state (env + main()'s baked defaults) so a
     // missing INI -- or a key the INI doesn't mention -- never pushes this struct's
     // hardcoded values over the validated configuration.
@@ -515,7 +516,13 @@ void PS2SettingsOverlay::loadSettings()
     {
             int r = nameToRenderer(doc.getS("video.renderer", rendererName(m_settings.renderer)), m_settings.renderer);
 #if !defined(PS2X_HAVE_PGS)
-            if (r == Settings::kRendererParallelGS) r = Settings::kRendererOpenGL;
+            if (r == Settings::kRendererParallelGS)
+            {
+                r = Settings::kRendererOpenGL;
+                // Build-capability fallback, not a migration: this build simply cannot run PGS, and
+                // writing the fallback back would erase the choice for a build that can.
+                m_envLocked |= kLockRenderer;
+            }
 #endif
             // [d3d11] Direct3D 11 is retired for now: an old settings file that picks it falls back to
             // the new OpenGL present. paraLLEl-GS is a normal option on every platform again.
@@ -523,31 +530,54 @@ void PS2SettingsOverlay::loadSettings()
             if (r >= 0 && r <= 3) { m_settings.renderer = r; m_sawRendererKey = true; }
             // [display] window mode / monitor: the popup owns them, defaulted from the legacy fullscreen flag
             m_settings.windowMode = doc.getI("video.window_mode", m_settings.fullscreen ? 2 : 0);
-            m_settings.monitor = doc.getI("video.monitor", 0);
-    }
-    if (!envUserSet("PS2X_GLOW")) m_settings.glow = doc.getB("video.glow", m_settings.glow);
-    if (!envUserSet("PS2X_GLOWFIX")) m_settings.glowFix = doc.getB("video.glowfix", m_settings.glowFix);
-    if (!envUserSet("PS2X_INKSTRENGTH") && !envUserSet("PS2X_ADGS"))
-        m_settings.inkStrength = std::clamp(doc.getI("video.ink_strength", m_settings.inkStrength), 100, 400);
-    m_settings.inkWidth = std::clamp(doc.getI("video.ink_width", m_settings.inkWidth), 25, 100);
-    m_settings.inkColor = hexToColor(doc.getS("video.ink_color", colorToHex(m_settings.inkColor)), m_settings.inkColor);
-    if (!envUserSet("PS2X_BILINEAR")) m_settings.bilinear = doc.getB("video.bilinear", m_settings.bilinear);
-    if (!envUserSet("PS2X_HALFTEXEL")) m_settings.halfTexel = doc.getB("video.halftexel", m_settings.halfTexel);
-    if (!envUserSet("PS2X_SKIPPOST")) m_settings.skipPost = doc.getB("video.skippost", m_settings.skipPost);
-    if (!envUserSet("PS2X_SKIP_STALE_VRAM")) m_settings.skipStaleVram = doc.getB("video.skip_stale_vram", m_settings.skipStaleVram);
-    if (!envUserSet("PS2X_RENDER_SCALE"))
-    {
-        const int s = doc.getI("video.render_scale", m_settings.renderScale);
-        m_settings.renderScale = (s >= 1 && s <= 4) ? s : 1;
-    }
-    if (!envUserSet("PS2X_OUTLINE")) m_settings.outline = doc.getB("video.outline", m_settings.outline);
-    if (!envUserSet("PS2X_TEXPACK")) m_settings.texPack = doc.getB("video.texture_pack", m_settings.texPack);
-    if (!envUserSet("PS2X_FMV_OVERRIDE")) m_settings.introVideo = doc.getB("video.intro_video", m_settings.introVideo);
-    m_settings.texcache = doc.getB("video.texcache", m_settings.texcache);
-    if (!envUserSet("PS2X_BUTTONS")) m_settings.buttonLayout = doc.getI("video.button_layout", m_settings.buttonLayout);
-    if (!envUserSet("PS2X_SHADOWS")) m_settings.shadows = doc.getB("video.shadows", m_settings.shadows);
-    if (!envUserSet("PS2X_DOFMASK")) m_settings.dofBlur = doc.getB("video.dof_blur", m_settings.dofBlur);
-    if (!envUserSet("PS2X_DOFZFAR")) m_settings.dofZFar = std::clamp(doc.getI("video.dof_zfar", m_settings.dofZFar), 20000, 800000);
+            m_settings.monitor = doc.getI("video.monitor", m_settings.monitor);
+        }
+        if (envUserSet("PS2X_GLOW")) m_envLocked |= kLockGlow;
+        else m_settings.glow = doc.getB("video.glow", m_settings.glow);
+        if (envUserSet("PS2X_GLOWFIX")) m_envLocked |= kLockGlowFix;
+        else m_settings.glowFix = doc.getB("video.glowfix", m_settings.glowFix);
+        if (envUserSet("PS2X_INKSTRENGTH") || envUserSet("PS2X_ADGS"))
+        {
+            m_envLocked |= kLockInkStrength;
+        }
+        else
+        {
+            m_settings.inkStrength = std::clamp(doc.getI("video.ink_strength", m_settings.inkStrength), 100, 400);
+        }
+        m_settings.inkWidth = std::clamp(doc.getI("video.ink_width", m_settings.inkWidth), 25, 100);
+        m_settings.inkColor = hexToColor(doc.getS("video.ink_color", colorToHex(m_settings.inkColor)), m_settings.inkColor);
+        if (envUserSet("PS2X_BILINEAR")) m_envLocked |= kLockBilinear;
+        else m_settings.bilinear = doc.getB("video.bilinear", m_settings.bilinear);
+        if (envUserSet("PS2X_HALFTEXEL")) m_envLocked |= kLockHalfTexel;
+        else m_settings.halfTexel = doc.getB("video.halftexel", m_settings.halfTexel);
+        if (envUserSet("PS2X_SKIPPOST")) m_envLocked |= kLockSkipPost;
+        else m_settings.skipPost = doc.getB("video.skippost", m_settings.skipPost);
+        if (envUserSet("PS2X_SKIP_STALE_VRAM")) m_envLocked |= kLockSkipStale;
+        else m_settings.skipStaleVram = doc.getB("video.skip_stale_vram", m_settings.skipStaleVram);
+        if (envUserSet("PS2X_RENDER_SCALE"))
+        {
+            m_envLocked |= kLockRenderScale;
+        }
+        else
+        {
+            const int s = doc.getI("video.render_scale", m_settings.renderScale);
+            m_settings.renderScale = (s >= 1 && s <= 4) ? s : 1;
+        }
+        if (envUserSet("PS2X_OUTLINE")) m_envLocked |= kLockOutline;
+        else m_settings.outline = doc.getB("video.outline", m_settings.outline);
+        if (envUserSet("PS2X_TEXPACK")) m_envLocked |= kLockTexPack;
+        else m_settings.texPack = doc.getB("video.texture_pack", m_settings.texPack);
+        if (envUserSet("PS2X_FMV_OVERRIDE")) m_envLocked |= kLockIntroVideo;
+        else m_settings.introVideo = doc.getB("video.intro_video", m_settings.introVideo);
+        m_settings.texcache = doc.getB("video.texcache", m_settings.texcache);
+        if (envUserSet("PS2X_BUTTONS")) m_envLocked |= kLockButtonLay;
+        else m_settings.buttonLayout = doc.getI("video.button_layout", m_settings.buttonLayout);
+        if (envUserSet("PS2X_SHADOWS")) m_envLocked |= kLockShadows;
+        else m_settings.shadows = doc.getB("video.shadows", m_settings.shadows);
+        if (envUserSet("PS2X_DOFMASK")) m_envLocked |= kLockDofBlur;
+        else m_settings.dofBlur = doc.getB("video.dof_blur", m_settings.dofBlur);
+        if (envUserSet("PS2X_DOFZFAR")) m_envLocked |= kLockDofZFar;
+        else m_settings.dofZFar = std::clamp(doc.getI("video.dof_zfar", m_settings.dofZFar), 20000, 800000);
     m_settings.fullscreen = doc.getB("video.fullscreen", m_settings.fullscreen);
     m_settings.widescreen = doc.getB("video.widescreen", m_settings.widescreen);
     m_settings.fps60 = doc.getB("video.fps60", m_settings.fps60);
@@ -704,49 +734,65 @@ void PS2SettingsOverlay::saveSettings() const
     // [settings] ONE writer for settings.toml: the front-end and this overlay both serialize
     // through ps2x_settings, so the two cannot drift (the Qt launcher and this overlay did:
     // the old launcher's `texcache` key was silently dropped every time a play session ended).
+    //
+    // Read-modify-write, and that is the part that matters. Default-constructing `out` made every
+    // key this overlay does not model snap back to its struct default on every save: video.gpu,
+    // and the whole [frontend] section, so the shell forgot the window size it was left at and
+    // the menu theme un-muted itself. Seeding from the file on disk carries those across, and also
+    // makes a key added later survive by default instead of needing a line here on day one.
     ps2x_settings::Settings out;
-    out.master = m_settings.masterVolume;
-    out.music = m_settings.musicVolume;
-    out.sfx = m_settings.sfxVolume;
-    out.renderer = m_settings.renderer;
-    out.glow = m_settings.glow;
-    out.glowFix = m_settings.glowFix;
-    out.bilinear = m_settings.bilinear;
-    out.halfTexel = m_settings.halfTexel;
-    out.skipPost = m_settings.skipPost;
-    out.skipStaleVram = m_settings.skipStaleVram;
-    out.renderScale = m_settings.renderScale;
-    out.outline = m_settings.outline;
-    out.texPack = m_settings.texPack;
-    out.introVideo = m_settings.introVideo;
-    out.texcache = m_settings.texcache;
-    out.buttonLayout = m_settings.buttonLayout;
-    out.shadows = m_settings.shadows;
-    out.dofBlur = m_settings.dofBlur;
-    out.dofZFar = m_settings.dofZFar;
-    out.fullscreen = m_settings.fullscreen;
-    out.windowMode = m_settings.windowMode;
-    out.monitor = m_settings.monitor;
-    out.widescreen = m_settings.widescreen;
-    out.windowW = m_settings.windowW;
-    out.windowH = m_settings.windowH;
-    out.forceBilinear = m_settings.forceBilinear;
-    out.fps60 = m_settings.fps60;
-    out.hudLayout = m_settings.hudLayout;
-    out.hudOffL = m_settings.hudOffL;
-    out.hudOffC = m_settings.hudOffC;
-    out.hudOffR = m_settings.hudOffR;
-    out.device = deviceIndexForPlayer(0);   // [paddev] P1 (the front-end has one picker)
-    out.deadzone = m_settings.deadzone;
-    out.overlayEnabled = m_settings.overlayEnabled;
-    out.overlayPadBtns = ps2x_settings::formatIntCsv(m_settings.overlayPadBtns);
-    out.overlayKeys = ps2x_settings::formatIntCsv(m_settings.overlayKeys);
-    out.logLevel = m_settings.logLevel;
-    out.dumpAudio = m_dumpAudio;
-    out.dumpVideo = m_dumpVideo;
-    out.dumpControllers = m_dumpControllers;
-    out.dumpRuntime = m_dumpRuntime;
-    out.dumpGamepad = m_dumpGamepad;
+    ps2x_settings::loadFromFile(out, m_configPath);
+
+    // The overlay's live values, in the shared module's own struct so the field names line up.
+    // device has no counterpart: the front-end has a single picker and P1 is what it writes.
+    ps2x_settings::Settings live;
+    live.master = m_settings.masterVolume;
+    live.music = m_settings.musicVolume;
+    live.sfx = m_settings.sfxVolume;
+    live.renderer = m_settings.renderer;
+    live.glow = m_settings.glow;
+    live.glowFix = m_settings.glowFix;
+    live.inkStrength = m_settings.inkStrength;
+    live.inkWidth = m_settings.inkWidth;
+    live.inkColor = m_settings.inkColor;
+    live.bilinear = m_settings.bilinear;
+    live.halfTexel = m_settings.halfTexel;
+    live.skipPost = m_settings.skipPost;
+    live.skipStaleVram = m_settings.skipStaleVram;
+    live.renderScale = m_settings.renderScale;
+    live.outline = m_settings.outline;
+    live.texPack = m_settings.texPack;
+    live.introVideo = m_settings.introVideo;
+    live.texcache = m_settings.texcache;
+    live.buttonLayout = m_settings.buttonLayout;
+    live.shadows = m_settings.shadows;
+    live.dofBlur = m_settings.dofBlur;
+    live.dofZFar = m_settings.dofZFar;
+    live.fullscreen = m_settings.fullscreen;
+    live.windowMode = m_settings.windowMode;
+    live.monitor = m_settings.monitor;
+    live.widescreen = m_settings.widescreen;
+    live.windowW = m_settings.windowW;
+    live.windowH = m_settings.windowH;
+    live.forceBilinear = m_settings.forceBilinear;
+    live.fps60 = m_settings.fps60;
+    live.hudLayout = m_settings.hudLayout;
+    live.hudOffL = m_settings.hudOffL;
+    live.hudOffC = m_settings.hudOffC;
+    live.hudOffR = m_settings.hudOffR;
+    live.device = deviceIndexForPlayer(0);   // [paddev] P1 (the front-end has one picker)
+    live.deadzone = m_settings.deadzone;
+    live.overlayEnabled = m_settings.overlayEnabled;
+    live.overlayPadBtns = ps2x_settings::formatIntCsv(m_settings.overlayPadBtns);
+    live.overlayKeys = ps2x_settings::formatIntCsv(m_settings.overlayKeys);
+    live.logLevel = m_settings.logLevel;
+    live.dumpAudio = m_dumpAudio;
+    live.dumpVideo = m_dumpVideo;
+    live.dumpControllers = m_dumpControllers;
+    live.dumpRuntime = m_dumpRuntime;
+    live.dumpGamepad = m_dumpGamepad;
+
+    ps2x_settings::applyOverlayValues(out, live, m_envLocked);
 
     ps2x_settings::saveToFile(out, m_configPath);
 }

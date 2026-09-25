@@ -579,6 +579,16 @@ if(PS2X_BUILD_PROBES AND NOT PS2X_IS_VITA)
     add_executable(ps2x_settings_probe src/frontend/ps2x_settings_probe.cpp)
     target_link_libraries(ps2x_settings_probe PRIVATE ps2x_settings)
 
+    # [fe-probe] Drives the front-end's combo/popup widgets through real frames on ImGui's null
+    # backend and asserts the Begin/End contract holds. Needs no window and no GL, so the
+    # dropdown-cannot-open / whole-UI-unclickable class of bug is catchable in a headless run.
+    add_executable(fe_imgui_probe src/frontend/fe_imgui_probe.cpp)
+    target_include_directories(fe_imgui_probe PRIVATE src)
+    target_link_libraries(fe_imgui_probe PRIVATE imgui)
+    target_sources(imgui PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_null.cpp")
+    target_compile_options(fe_imgui_probe PRIVATE /W4)
+    target_compile_options(fe_imgui_probe PRIVATE -Wall -Wextra)
+
     # Reads a disc image: directory tree, case-insensitive lookup, streamed read and the
     # SHA-256 over the boot ELF inside the image. The installer depends on all of it.
     add_executable(fe_iso_probe

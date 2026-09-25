@@ -158,7 +158,7 @@ namespace
         s.dofZFar = doc.getI("video.dof_zfar", s.dofZFar);
         s.fullscreen = doc.getB("video.fullscreen", s.fullscreen);
         s.windowMode = doc.getI("video.window_mode", s.fullscreen ? 2 : 0);
-        s.monitor = doc.getI("video.monitor", 0);
+        s.monitor = doc.getI("video.monitor", s.monitor);
         s.gpu = doc.getS("video.gpu", s.gpu);
         s.widescreen = doc.getB("video.widescreen", s.widescreen);
         s.windowW = doc.getI("video.window_w", s.windowW);
@@ -347,12 +347,17 @@ namespace ps2x_settings
         return (std::filesystem::path(configDir) / kConfigFileName).string();
     }
 
+    bool loadFromFile(Settings &out, const std::string &path)
+    {
+        return loadToml(out, path);
+    }
+
     bool load(Settings &out, const std::string &configDir)
     {
         const std::string path = configPath(configDir);
         std::error_code ec;
         if (std::filesystem::exists(path, ec))
-            return loadToml(out, path);
+            return loadFromFile(out, path);
 
         const std::string legacy =
             configDir.empty() ? std::string(kLegacyConfigFileName)
@@ -479,5 +484,51 @@ namespace ps2x_settings
     std::string formatIntCsv(const std::vector<int> &values)
     {
         return intsToCsv(values);
+    }
+
+    void applyOverlayValues(Settings &out, const Settings &live, uint32_t envLockedMask)
+    {
+        // Env-guarded: a locked key is left at the file's value, because `out` came from the file.
+        if (!(envLockedMask & kLockGlow))        out.glow = live.glow;
+        if (!(envLockedMask & kLockGlowFix))     out.glowFix = live.glowFix;
+        if (!(envLockedMask & kLockInkStrength)) out.inkStrength = live.inkStrength;
+        if (!(envLockedMask & kLockBilinear))    out.bilinear = live.bilinear;
+        if (!(envLockedMask & kLockHalfTexel))   out.halfTexel = live.halfTexel;
+        if (!(envLockedMask & kLockSkipPost))    out.skipPost = live.skipPost;
+        if (!(envLockedMask & kLockSkipStale))   out.skipStaleVram = live.skipStaleVram;
+        if (!(envLockedMask & kLockRenderScale)) out.renderScale = live.renderScale;
+        if (!(envLockedMask & kLockOutline))     out.outline = live.outline;
+        if (!(envLockedMask & kLockTexPack))     out.texPack = live.texPack;
+        if (!(envLockedMask & kLockIntroVideo))  out.introVideo = live.introVideo;
+        if (!(envLockedMask & kLockButtonLay))   out.buttonLayout = live.buttonLayout;
+        if (!(envLockedMask & kLockShadows))     out.shadows = live.shadows;
+        if (!(envLockedMask & kLockDofBlur))     out.dofBlur = live.dofBlur;
+        if (!(envLockedMask & kLockDofZFar))     out.dofZFar = live.dofZFar;
+        if (!(envLockedMask & kLockRenderer))    out.renderer = live.renderer;
+
+        // No env var reaches these, so the overlay always owns them.
+        out.master = live.master;
+        out.music = live.music;
+        out.sfx = live.sfx;
+        out.inkWidth = live.inkWidth;
+        out.inkColor = live.inkColor;
+        out.texcache = live.texcache;
+        out.fullscreen = live.fullscreen;
+        out.windowMode = live.windowMode;
+        out.monitor = live.monitor;
+        out.widescreen = live.widescreen;
+        out.windowW = live.windowW;
+        out.windowH = live.windowH;
+        out.forceBilinear = live.forceBilinear;
+        out.fps60 = live.fps60;
+        out.hudLayout = live.hudLayout;
+        out.hudOffL = live.hudOffL;
+        out.hudOffC = live.hudOffC;
+        out.hudOffR = live.hudOffR;
+        out.deadzone = live.deadzone;
+        out.overlayEnabled = live.overlayEnabled;
+        out.overlayPadBtns = live.overlayPadBtns;
+        out.overlayKeys = live.overlayKeys;
+        out.logLevel = live.logLevel;
     }
 }
