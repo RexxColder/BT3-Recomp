@@ -1144,6 +1144,105 @@ def _try_drop(ctx: "Context", d: "Dep") -> bool:
     return bool(d.check(ctx.platform))
 
 
+AUDIO_SUFFIXES = (".flac", ".mp3", ".ogg", ".wav", ".qoa")
+# The menu theme is always called this, whoever supplied it, so a drop-in replacement is one
+# file with a predictable name and the release does not ship someone's personal filename.
+MUSIC_NAME = "music.flac"
+
+
+def find_music(folder: Path) -> Optional[Path]:
+    """The audio file to use as the menu theme, preferring the canonical name."""
+    if not folder.is_dir():
+        return None
+    picks = [p for p in sorted(folder.iterdir())
+             if p.is_file() and p.suffix.lower() in AUDIO_SUFFIXES]
+    if not picks:
+        return None
+    for p in picks:
+        if p.stem.lower() == "music":
+            return p
+    return picks[0]
+
+
+def offer_music_by_hand(dest: Path) -> Optional[Path]:
+    """After a failed download, ask for a track on the console.
+
+    Dragging a file onto a Windows console pastes its quoted path, which is the whole point: the
+    user does not have to type a path. An empty line means "no thanks" and is not an error.
+    Skipped entirely when there is no terminal to ask, so CI and piped runs never block.
+    """
+    if not sys.stdin or not sys.stdin.isatty():
+        LOG.info(f"  drop any mp3/flac/ogg as {dest} to have a menu theme")
+        return None
+    print()
+    print("  No se pudo descargar la musica del menu.")
+    print(f"  Arrastra un archivo de audio (mp3/flac/ogg) sobre esta ventana y presiona Enter,")
+    print(f"  o solo presiona Enter para seguir sin musica.")
+    print(f"  Destino: {dest}")
+    try:
+        answer = input("  > ").strip().strip('"').strip("'")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not answer:
+        LOG.info("  menu theme skipped (empty answer)")
+        return None
+    src = Path(answer).expanduser()
+    if not src.is_file():
+        warn(f"not a file: {src}")
+        return None
+    if src.suffix.lower() not in AUDIO_SUFFIXES:
+        warn(f"unsupported audio format: {src.suffix} (use one of {', '.join(AUDIO_SUFFIXES)})")
+        return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if src.resolve() != dest.resolve():
+        shutil.copy2(src, dest)
+    LOG.info(f"  menu theme -> {dest} ({dest.stat().st_size / 1048576:.1f} MB)")
+    return dest
+
+
+def fetch_music(ctx: "Context") -> Optional[Path]:
+    """Download the menu theme named by --music-url / BT3_MUSIC_URL into assets/music/.
+
+    There is no hash on purpose: the track is the user's own file, its name is normalised to
+    music.flac, and anyone can replace it by dropping their own music.flac in the same place.
+    The URL is never stored in the repository, so this has no default and does nothing unless
+    the user passes one.
+    """
+    url = ctx.args.music_url or os.environ.get("BT3_MUSIC_URL") or ""
+    # Into the source assets tree: CMake copies all of assets/ next to the runner on every build,
+    # so this lands in the build output, in the deploy tree and in the artifact without any of
+    # them needing to know about it. The folder is git-ignored, so it is never committed.
+    dest_dir = ROOT / "ps2xRuntime" / "assets" / "music"
+    dest = dest_dir / MUSIC_NAME
+    if dest.is_file() and not ctx.args.music_force:
+        LOG.info(f"  menu theme already there: {dest}")
+        return dest
+    if not url:
+        if not dest.is_file():
+            LOG.info(f"  no menu theme (pass --music-url or set BT3_MUSIC_URL; "
+                     f"or drop your own {MUSIC_NAME} in <exe>/assets/music/)")
+        return None
+    import urllib.request
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    step(f"downloading the menu theme from {url}")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as r, tmp.open("wb") as f:
+            shutil.copyfileobj(r, f, 1024 * 1024)
+    except Exception as e:  # a missing track must never fail the build
+        warn(f"menu theme download failed: {e}")
+        tmp.unlink(missing_ok=True)
+        return offer_music_by_hand(dest)
+    if tmp.stat().st_size < 1024:
+        warn("menu theme download looks truncated")
+        tmp.unlink(missing_ok=True)
+        return offer_music_by_hand(dest)
+    tmp.replace(dest)
+    LOG.info(f"  menu theme -> {dest} ({dest.stat().st_size / 1048576:.1f} MB)")
+    return dest
+
+
 def stage_deps(ctx: "Context") -> None:
     """Report the platform dependencies, then resolve what is missing -- NEVER aborting on a single
     failure.
@@ -1155,6 +1254,9 @@ def stage_deps(ctx: "Context") -> None:
     step("stage 2: dependencies")
     if VIEW is not None:
         VIEW.stage(2, 4, "dependencies" + (" (Windows)" if ctx.platform.is_windows else ""))
+    # Menu theme first: it is a user asset, not a build input, and fetching it before the
+    # dependency work means a failed download is reported before anything else happens.
+    fetch_music(ctx)
     deps = deps_for(ctx.platform)
     missing = [d for d in deps if not d.check(ctx.platform)]
     resolved, failed = [], []
@@ -1657,15 +1759,19 @@ def deploy_tree(runner: Path, out: Path, keep_music: bool = False) -> None:
         src = runner.parent / a
         if src.exists():
             copytree_overlay(src, out / a)
-    # The menu theme is the game's own soundtrack: a local file the user drops in, never part of
-    # the release. CMake stages the whole assets/ tree next to the runner for local runs, so it
-    # is dropped again unless --with-music says to keep it.
+    # The menu theme is the game's own soundtrack: a local file the user supplies, never part of
+    # the release by default. When it is kept it is renamed to music.flac, so the artifact is
+    # reproducible and does not carry whatever filename the user happened to have.
     theme = out / "assets" / "music"
-    if theme.is_dir() and not keep_music:
+    if theme.is_dir():
         shutil.rmtree(theme, ignore_errors=True)
-        LOG.info("  dropped assets/music (copyrighted audio, pass --with-music to keep it)")
-    elif theme.is_dir():
-        LOG.info("  keeping assets/music (--with-music)")
+    src_theme = find_music(runner.parent / "assets" / "music")
+    if keep_music and src_theme is not None:
+        theme.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_theme, theme / MUSIC_NAME)
+        LOG.info(f"  menu theme -> {theme / MUSIC_NAME} (--with-music)")
+    elif src_theme is not None:
+        LOG.info("  dropped the menu theme (copyrighted audio, pass --with-music to keep it)")
     # Mirror what CMake stages next to the runner. Only data/Textures, never all of data/: a build
     # directory can hold a full installed game and that is gigabytes of user data.
     for rel in ("data/Textures", "mods"):
@@ -2056,6 +2162,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="keep the menu theme (assets/music) in the deploy tree and the artifact; "
                          "off by default because the track is copyrighted game audio that the "
                          "project does not redistribute")
+    ap.add_argument("--music-url", metavar="URL",
+                    help="download the menu theme from URL into assets/music/music.flac (stage 2); "
+                         "no default, nothing is fetched unless you ask for it")
+    ap.add_argument("--music-force", action="store_true",
+                    help="re-download the menu theme even when assets/music/music.flac exists")
     ap.add_argument("--output", metavar="DIR",
                     help="where the stage tree and the artifact go (default build/release-<os>/out)")
     ap.add_argument("--no-gate", dest="no_gate", action="store_true",

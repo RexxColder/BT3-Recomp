@@ -1,5 +1,7 @@
 #include "frontend/fe_iso9660.h"
 
+#include "frontend/fe_fileio.h"
+
 #include "frontend/fe_hash.h"
 
 #include <algorithm>
@@ -80,7 +82,7 @@ bool Iso9660::readBlocks(std::uint32_t startLba, std::uint64_t byteLen, const Si
         return false;
 
     const long long offset = (long long)startLba * m_blockSize;
-    if (std::fseek(f, offset, SEEK_SET) != 0)
+    if (feio::seek(f, offset, SEEK_SET) != 0)
     {
         std::fclose(f);
         return false;
@@ -249,7 +251,7 @@ std::int64_t Iso9660::readFile(const File &f, const Sink &sink) const
     for (const Extent &e : f.extents)
     {
         const long long offset = (long long)e.start * m_blockSize;
-        if (std::fseek(file, offset, SEEK_SET) != 0)
+        if (feio::seek(file, offset, SEEK_SET) != 0)
         {
             std::fclose(file);
             return -1;

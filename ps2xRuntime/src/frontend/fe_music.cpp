@@ -39,14 +39,17 @@ namespace music
 
         int preference(const std::filesystem::path &p)
         {
-            // The menu theme is "Shine"; if it is there, play that one, otherwise take whatever
-            // single track the folder has so a renamed file still works.
+            // music.flac is the name setup.py normalises any download to, and what a user dropping
+            // their own track is told to use, so it wins. Anything else in the folder is still
+            // accepted rather than ignored.
             std::string n = p.filename().string();
             std::transform(n.begin(), n.end(), n.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
-            if (n.find("shine") != std::string::npos)
+            if (n == "music.flac")
                 return 0;
-            return 1;
+            if (n.find("shine") != std::string::npos)
+                return 1;
+            return 2;
         }
     }
 

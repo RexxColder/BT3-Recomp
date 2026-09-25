@@ -1,5 +1,7 @@
 #include "frontend/fe_afs.h"
 
+#include "frontend/fe_fileio.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -74,10 +76,10 @@ bool readFile(const fs::path &p, std::vector<uint8_t> &out)
     std::FILE *f = std::fopen(p.string().c_str(), "rb");
     if (!f)
         return false;
-    std::fseek(f, 0, SEEK_END);
-    long sz = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (sz < 0)
+    // 64-bit throughout: PZS3US1.AFS is 1.46 GB and a bigger container would report a negative
+    // size through a 32-bit long, then allocate nothing and read nothing.
+    long long sz = 0;
+    if (!feio::size(f, &sz) || sz < 0)
     {
         std::fclose(f);
         return false;

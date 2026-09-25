@@ -409,8 +409,8 @@ namespace frontend
                 std::fprintf(stderr, "[fe] menu theme %s\n", muted ? "muted" : "unmuted");
         }
         if (music::trackName().empty())
-            fe::hintPending("No hay ninguna pista en <carpeta del ejecutable>/music/ ni en "
-                            "assets/music/, asi que el menu trabaja en silencio.");
+            fe::hintPending("No hay ninguna pista. Poner un music.flac en "
+                            "assets/music/ la activa.");
     }
     }
 
@@ -782,6 +782,6 @@ namespace frontend
     "Russo One - tipografia (SIL Open Font License)\n"
     "Musica del menu: pista 08 \"Shine\" de la banda sonora de Dragon Ball Z: Budokai Tenkaichi 3 "
     "(2007). El audio es material con derechos de autor y NO se distribuye con el proyecto: "
-    "copiala vos a <carpeta del ejecutable>/music/ y el front-end la reproduce desde ahi.");
+    "ponela como assets/music/music.flac y el front-end la reproduce desde ahi.");
     }
 }
