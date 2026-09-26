@@ -6615,6 +6615,49 @@ namespace
                 std::fprintf(stderr, "[ovmain] filled %d mid-body re-entry slots (1..19) of f_334c00\n", n_filled);
             }
         }
+        {   // [ovlazy] Report NULL runs in the overlay dispatch table. The table gets one entry
+            // per LABEL the generator detected, so a function body with a single label leaves
+            // every intermediate slot NULL. A host re-dispatch at one of those slots falls into
+            // the gap handler, which re-dispatches the same PC forever -- that is what froze the
+            // game on a populated save (see docs/BUGFIXES-TODO.md). A NULL slot is not itself a
+            // bug: most of the body is straight-line code the host never re-enters. But a NULL
+            // run inside a function that HAS been re-dispatched is the signature, and a
+            // re-dispatch counter makes that visible without waiting for a hang.
+            // PS2X_OVLAZY=0 disables; PS2X_OVLAZYFULL=1 lists every run instead of the summary.
+            static const bool s_lazy = [](){ const char *v = std::getenv("PS2X_OVLAZY"); return !(v && v[0] == (char)48); }();
+            if (s_lazy)
+            {
+                const bool full = std::getenv("PS2X_OVLAZYFULL") != nullptr;
+                uint32_t n_null_total = 0u, n_runs = 0u, run_start = 0u;
+                bool in_run = false;
+                for (uint32_t slot = 0u; slot < g_ps2OverlayFunctionTableSlotCount; ++slot)
+                {
+                    const bool is_null = (g_ps2OverlayFunctionTable[slot] == nullptr);
+                    if (is_null)
+                    {
+                        ++n_null_total;
+                        if (!in_run) { in_run = true; run_start = slot; }
+                    }
+                    else if (in_run)
+                    {
+                        in_run = false;
+                        ++n_runs;
+                        if (full)
+                        {
+                            const uint32_t len = slot - run_start;
+                            std::fprintf(stderr, "[ovlazy] NULL run: slots %u..%u (0x%X..0x%X, %u)\n",
+                                         run_start, slot - 1u,
+                                         g_ps2OverlayFunctionTableBase + run_start * 4u,
+                                         g_ps2OverlayFunctionTableBase + slot * 4u - 4u, len);
+                        }
+                    }
+                }
+                if (in_run) ++n_runs;   // table ran out mid-run
+                std::fprintf(stderr, "[ovlazy] overlay table: %u slots, %u NULL in %u runs%s\n",
+                             g_ps2OverlayFunctionTableSlotCount, n_null_total, n_runs,
+                             full ? "" : "  (PS2X_OVLAZYFULL=1 to list them)");
+            }
+        }
         if (std::getenv("PS2X_PROBE_STREAM"))
         {
             g_orig27f518 = runtime.lookupFunction(0x0027e938u);
