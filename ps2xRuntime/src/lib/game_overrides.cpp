@@ -6551,6 +6551,29 @@ namespace
         if (g_orig35DE58) g_orig35DE58(rdram, ctx, runtime);
     }
 
+    // [ovmain] The overlay ENTRY POINT f_334c00 (DBZP.BIN e_entry = 0x334c00) hangs with a REAL
+    // memory-card save loaded. overlay_register maps only two slots for it:
+    //     [0]  = 0x334c00 (entry)   [20] = 0x334c50 (the one real label)
+    // and leaves 1..19 NULL. The host re-dispatches the function with ctx->pc = 0x334c40 (mid-body,
+    // right before the first `jal`); the dispatcher resolves slot (0x334c40-0x334c00)/4 = 16, finds
+    // it NULL, and falls into the gap handler which re-dispatches the SAME pc -> infinite
+    // host-side re-entry. The profiler pegs 100% at 0x334c40 (that pc, not a guest loop). The
+    // empty save never reached the overlay, which is why this only appears with a populated card.
+    //
+    // Fix: point slot 16 at a stub that jumps to the return path (0x334c50, slot 20) so the
+    // pending call sequence completes instead of spinning. Same for the other mid-body slots
+    // (1..19) so any of them can re-enter without the same fate. PS2X_OVMAIN=0 disables.
+    void bt3OverlayMidReentry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static int s_n = 0;
+        if (s_n < 20)
+        {
+            ++s_n;
+            std::fprintf(stderr, "[ovmain] mid-body re-entry at 0x%X -> jump 0x334c50\n", ctx->pc);
+        }
+        ctx->pc = 0x334c50u;   // the real label: the two `jal`s have already been dispatched
+    }
+
     void applyBt3SoundInitBypass(PS2Runtime &runtime)
     {
         std::cerr << "[game_overrides] BT3: sound init bypass + lock-callback stub" << std::endl;
@@ -6571,6 +6594,26 @@ namespace
             std::fprintf(stderr, "[movprobe] hooks start=%d stop=%d endpred=%d seq=%d\n",
                          g_orig126D40 ? 1 : 0, g_orig126DD8 ? 1 : 0,
                          g_orig126E88 ? 1 : 0, g_orig35DE58 ? 1 : 0);
+        }
+        {   // [ovmain] The overlay table is populated by a static initializer (overlay_register.cpp),
+            // so it is already filled when this runs -- this does NOT belong inside the
+            // PS2X_MOVIEPROBE gate above. Fill the NULL mid-body slots of the overlay entry
+            // f_334c00 (1..19, addresses 0x334c04..0x334c4c) with the re-entry stub so a host
+            // re-dispatch there resolves instead of falling into the gap handler and spinning.
+            static const bool s_ov = [](){ const char *v = std::getenv("PS2X_OVMAIN"); return !(v && v[0] == (char)48); }();
+            if (s_ov)
+            {
+                int n_filled = 0;
+                for (uint32_t slot = 1u; slot < 20u; ++slot)
+                {
+                    if (slot < g_ps2OverlayFunctionTableSlotCount && g_ps2OverlayFunctionTable[slot] == nullptr)
+                    {
+                        g_ps2OverlayFunctionTable[slot] = &bt3OverlayMidReentry;
+                        ++n_filled;
+                    }
+                }
+                std::fprintf(stderr, "[ovmain] filled %d mid-body re-entry slots (1..19) of f_334c00\n", n_filled);
+            }
         }
         if (std::getenv("PS2X_PROBE_STREAM"))
         {
