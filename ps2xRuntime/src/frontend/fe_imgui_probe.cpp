@@ -102,7 +102,7 @@ int main()
         {
             char label[32];
             std::snprintf(label, sizeof(label), "SECCION_%d", s);
-            const bool open = fe::beginSection(label, true, "texto de ayuda");
+            const bool open = fe::beginSection(label, true, "help text");
             if (s == 0)
                 sectionOpen = open;
             if (open)
@@ -121,7 +121,7 @@ int main()
 
         if (comboDepth() != 0)
         {
-            check(false, "BeginComboDepth vuelve a 0 tras cada frame");
+            check(false, "BeginComboDepth returns to 0 after every frame");
             std::printf("       frame=%d depth=%d\n", frame, comboDepth());
             break;
         }
@@ -132,13 +132,13 @@ int main()
             break;
         }
     }
-    check(comboDepth() == 0, "BeginComboDepth termina en 0 (no se filtra hacia negativo)");
+    check(comboDepth() == 0, "BeginComboDepth ends at 0 (it does not filter towards negative)");
     check(windowStack() == stackBaseline, "the window stack did not grow (nothing left unclosed)");
     check(ImGui::GetCurrentContext()->BeginPopupStack.Size == 0, "the popup stack ends up empty");
     check(sectionOpen, "the section stays as the user left it");
 
     std::printf("[2] no ImGui error during the whole run\n");
-    check(g_errors == 0, "ErrorCountCurrentFrame quedo en 0 siempre");
+    check(g_errors == 0, "ErrorCountCurrentFrame stayed at 0 the whole time");
     if (g_errors)
         std::printf("       errores=%d\n", g_errors);
 
@@ -146,6 +146,6 @@ int main()
     ImGui_ImplNull_Shutdown();
     ImGui::DestroyContext();
 
-    std::printf("%s (%d fallos)\n", g_fail ? "PROBE FALLIDO" : "PROBE OK", g_fail);
+    std::printf("%s (%d fallos)\n", g_fail ? "PROBE FAILED" : "PROBE OK", g_fail);
     return g_fail ? 1 : 0;
 }

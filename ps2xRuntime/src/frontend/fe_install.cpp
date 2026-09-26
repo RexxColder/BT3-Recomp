@@ -21,12 +21,12 @@
 namespace
 {
     const char *const kDumpFilters[] = {
-        "Dump del juego (*.iso;*.img;*.7z;*.zip;*.rar;*.tar;*.tar.gz;*.tgz)",
+        "Game dump (*.iso;*.img;*.7z;*.zip;*.rar;*.tar;*.tar.gz;*.tgz)",
         "*.iso;*.img;*.7z;*.zip;*.rar;*.tar;*.tar.gz;*.tgz",
         "All files (*)", "*"
     };
     const char *const kPackFilters[] = {
-        "Pack de texturas (*.7z;*.zip)", "*.7z;*.zip",
+        "Texture pack (*.7z;*.zip)", "*.7z;*.zip",
         "All files (*)", "*"
     };
 
@@ -65,7 +65,7 @@ namespace
         const std::int64_t remainMs = (std::int64_t)((double)(total - done) / rate);
         const std::int64_t sec = remainMs / 1000;
         char buf[64];
-        std::snprintf(buf, sizeof buf, "~%lld:%02lld restante", (long long)(sec / 60),
+        std::snprintf(buf, sizeof buf, "~%lld:%02lld left", (long long)(sec / 60),
                       (long long)(sec % 60));
         return buf;
     }
@@ -331,7 +331,7 @@ void InstallWizard::workerVerify()
         }
         else
         {
-            m_status = "Disco verificado";
+            m_status = "Disc verified";
             m_phase = Phase::Idle;
         }
     }
@@ -398,7 +398,7 @@ void InstallWizard::workerExtract()
             continue;
         if (m_cancel.load())
         {
-            fail("Cancelado.");
+            fail("Cancelled.");
             return;
         }
 
@@ -469,7 +469,7 @@ void InstallWizard::workerAfs()
         if (m_cancel.load())
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_error = "Cancelado.";
+            m_error = "Cancelled.";
             m_phase = Phase::Failed;
             m_progressKnown = false;
             m_workerRunning = false;
@@ -505,7 +505,7 @@ void InstallWizard::workerAfs()
 
         base += fileTotal;
         m_done.store(base, std::memory_order_relaxed);
-        setStatus("Eliminando " + p.filename().string());
+        setStatus("Deleting " + p.filename().string());
         std::filesystem::remove(p, ec);
     }
 
@@ -747,17 +747,17 @@ void InstallWizard::draw()
     {
         ImGui::TextColored(fe::okCol(), "%s", doneLabel.c_str());
         ImGui::Spacing();
-        ImGui::BulletText("Disco verificado (SLUS_216.78)");
-        ImGui::BulletText("Datos en %s", (m_exeDir / "data").string().c_str());
+        ImGui::BulletText("Disc verified (SLUS_216.78)");
+        ImGui::BulletText("Data in %s", (m_exeDir / "data").string().c_str());
         if (installed)
             ImGui::Spacing();
         if (m_recValid)
         {
-            fe::sectionHeader("TU HARDWARE");
+            fe::sectionHeader("YOUR HARDWARE");
             ImGui::TextWrapped("%s", hw::summary(hw::detect()).c_str());
-            fe::sectionHeader("AJUSTES RECOMENDADOS");
+            fe::sectionHeader("RECOMMENDED SETTINGS");
             char line[256];
-            std::snprintf(line, sizeof line, "Nivel %s  -  escala %dx  -  pack %s  -  %d fps",
+            std::snprintf(line, sizeof line, "%s  -  %dx render  -  pack %s  -  %d fps",
                           m_rec.tierName.c_str(), m_rec.renderScale,
                           m_rec.texPackFull ? "completo" : "leve", m_rec.fps60 ? 60 : 30);
             ImGui::TextWrapped("%s", line);

@@ -131,7 +131,7 @@ namespace frontend
             for (const gpu::Adapter &a : list)
                 std::fprintf(stderr, "[fe] gpu: %s (%llu MB)%s%s\n", a.name.c_str(),
                              static_cast<unsigned long long>(a.vramMB), a.software ? " software" : "",
-                             a.active ? " ACTIVA" : "");
+                             a.active ? " ACTIVE" : "");
             // WARP and the other software adapters are not a choice: picking one would run the
             // game on the CPU rasterizer. They stay in the log, out of the dropdown.
             list.erase(std::remove_if(list.begin(), list.end(),
@@ -150,7 +150,7 @@ namespace frontend
 
         names.clear();
         ptrs.clear();
-        names.push_back("Automatica (decide Windows)");
+        names.push_back("Automatic (Windows decides)");
         ptrs.push_back(names.back().c_str());
         int current = 0;
         for (std::size_t i = 0; i < list.size(); ++i)
@@ -158,7 +158,7 @@ namespace frontend
             char buf[320];
             std::snprintf(buf, sizeof buf, "%s  (%llu GB)%s", list[i].name.c_str(),
                           static_cast<unsigned long long>((list[i].vramMB + 512) / 1024),
-                          list[i].active ? "   <-- ACTIVA" : "");
+                          list[i].active ? "   <-- ACTIVE" : "");
             names.push_back(buf);
             ptrs.push_back(names.back().c_str());
             if (!s.gpu.empty() && list[i].name == s.gpu)
@@ -285,7 +285,7 @@ namespace frontend
             }
         }
         {
-            fe::rowLabel("Escala de render");
+            fe::rowLabel("Render scale");
             ImGui::RadioButton("1x", &s.renderScale, 1);
             ImGui::SameLine();
             ImGui::RadioButton("2x", &s.renderScale, 2);
@@ -529,9 +529,9 @@ namespace frontend
                         ImGui::GetColorU32(fe::dbz(0.45f, 0.50f, 0.53f)), buf);
         };
         analog(m + inner * 0.50f, GAMEPAD_AXIS_LEFT_X, GAMEPAD_AXIS_LEFT_Y,
-               ps2x_pad::buttonDown(slot, GAMEPAD_BUTTON_LEFT_THUMB), "STICK IZQ (L3)");
+               ps2x_pad::buttonDown(slot, GAMEPAD_BUTTON_LEFT_THUMB), "LEFT STICK (L3)");
         analog(m + inner * 0.80f, GAMEPAD_AXIS_RIGHT_X, GAMEPAD_AXIS_RIGHT_Y,
-               ps2x_pad::buttonDown(slot, GAMEPAD_BUTTON_RIGHT_THUMB), "STICK DER (R3)");
+               ps2x_pad::buttonDown(slot, GAMEPAD_BUTTON_RIGHT_THUMB), "RIGHT STICK (R3)");
 
         // Shoulder row: L1/L2 hard left, SEL/PS/STA centred, R2/R1 hard right.
         const float bw = u * 1.6f;
@@ -662,7 +662,7 @@ namespace frontend
                 s.logLevel = level;
             fe::rowLabel("Status");
             if (s.logLevel == 0)
-                ImGui::TextColored(fe::gold(), "Registro desactivado");
+                ImGui::TextColored(fe::gold(), "Logging disabled");
             else
                 ImGui::TextColored(fe::gold(), "Level %d", s.logLevel);
             fe::hint(kDescriptions[s.logLevel]);

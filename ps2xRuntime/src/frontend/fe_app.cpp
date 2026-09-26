@@ -190,7 +190,7 @@ namespace
         return out;
     }
 
-    // Footer actions. SALIR is the way back to the menu now that the top VOLVER is gone: the
+    // Footer actions. QUIT is the way back to the menu now that the top VOLVER is gone: the
     // window is only really quit from the menu (Esc or the X).
     void drawPlayQuit(bool canPlay, bool &playAsked, bool &backAsked)
     {
@@ -207,7 +207,7 @@ namespace
         ImGui::SameLine(0.0f, 6.0f);
         ImGui::PushStyleColor(ImGuiCol_Button, dbz(0.55f, 0.16f, 0.12f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.80f, 0.24f, 0.18f));
-        if (ImGui::Button("SALIR", ImVec2(74.0f, 0.0f)))
+        if (ImGui::Button("QUIT", ImVec2(74.0f, 0.0f)))
             backAsked = true;
         ImGui::PopStyleColor(2);
     }
@@ -277,7 +277,7 @@ namespace
 
         ImGui::SetCursorPos(ImVec2(size.x - btn.x - 18.0f, by));
         pressed = false;
-        glowButton("AJUSTES", btn, true, &pressed, ImVec4(0.22f, 0.36f, 0.58f, 1.0f));
+        glowButton("SETTINGS", btn, true, &pressed, ImVec4(0.22f, 0.36f, 0.58f, 1.0f));
         if (pressed)
             settingsAsked = true;
     }
@@ -442,7 +442,7 @@ namespace frontend
             std::string why;
             if (scan.elf.empty())
             {
-                why = "no hay ELF de arranque en data/";
+                why = "no boot ELF in data/";
             }
             else
             {
@@ -639,11 +639,11 @@ namespace frontend
                         {
                         if (page == 0)
                         {
-                            ImGui::TextColored(gold(), "ESTADO");
+                            ImGui::TextColored(gold(), "STATUS");
                             ImGui::Separator();
                             statusRow("Game data (data/)", scan.dataDir,
                                       "presente", "MISSING: install the game data");
-                            statusRow("Contenedores AFS", scan.afsCount > 0, "", "none");
+                            statusRow("AFS containers", scan.afsCount > 0, "", "none");
                             if (scan.afsCount > 0)
                             {
                                 char buf[128];
@@ -651,11 +651,11 @@ namespace frontend
                                               scan.afsCount, scan.afsBytes / 1048576.0);
                                 statusRow("  total", true, buf, "");
                             }
-                            statusRow("ELF de arranque", canPlay, "encontrado", "MISSING: the ELF was not found");
+                            statusRow("Boot ELF", canPlay, "found", "MISSING: the ELF was not found");
                             if (canPlay)
                                 ImGui::TextWrapped("%s", scan.elf.c_str());
                             ImGui::Separator();
-                            ImGui::TextColored(gold(), "TU HARDWARE");
+                            ImGui::TextColored(gold(), "YOUR HARDWARE");
                             // Probed once: this walks the registry and DXGI, which has no business
                             // running 60 times a second.
                             {

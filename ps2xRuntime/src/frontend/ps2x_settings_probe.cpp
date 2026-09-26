@@ -52,15 +52,15 @@ int main()
     ps2x_settings::Settings s;
     const bool existed = ps2x_settings::load(s, dir);
     check(!existed, "load() reports there was no file");
-    check(std::filesystem::exists(tomlPath), "settings.toml creado");
-    check(s.master == 1.0f && s.music == 1.0f, "defaults de audio");
+    check(std::filesystem::exists(tomlPath), "settings.toml created");
+    check(s.master == 1.0f && s.music == 1.0f, "audio defaults");
 #if defined(_WIN32)
     check(s.renderer == ps2x_settings::kRendererOpenGL, "default renderer on Windows");
 #else
     check(s.renderer == ps2x_settings::kRendererParallelGS, "default renderer off Windows");
 #endif
 
-    std::printf("[2] round-trip de valores no default\n");
+    std::printf("[2] round-trip of non-default values\n");
     {
         ps2x_settings::Settings w;
         ps2x_settings::load(w, dir);
@@ -95,7 +95,7 @@ int main()
         check(r.renderer == ps2x_settings::kRendererSoftware, "renderer");
         check(r.outline && r.inkStrength == 250 && r.inkColor == 0xFF8800u, "ink");
         check(r.renderScale == 3 && r.windowMode == 2 && r.monitor == 1, "scale/mode/monitor");
-        check(r.fps60 && r.texPack && !r.introVideo && r.buttonLayout == 0, "flags de video");
+        check(r.fps60 && r.texPack && !r.introVideo && r.buttonLayout == 0, "video flags");
         check(r.hudLayout == 2 && r.hudOffR == -7, "hud");
         check(r.device == 3 && r.deadzone == 0.25f && !r.overlayEnabled, "mandos");
         check(r.overlayPadBtns == "12,14,16" && r.overlayKeys == "340,258,262", "hotkeys");
@@ -113,14 +113,14 @@ int main()
         ps2x_settings::Settings c;
         check(ps2x_settings::load(c, dir), "load() of the file with garbage");
         check(c.master == 1.0f && c.music == 0.0f && c.sfx == 0.4f, "audio clamp 0..1 / sfx 0..0.4");
-        check(c.renderer == ps2x_settings::kRendererOpenGL, "d3d11 -> opengl (retirado)");
+        check(c.renderer == ps2x_settings::kRendererOpenGL, "d3d11 -> opengl (retired)");
         check(c.inkStrength == 400 && c.inkWidth == 25, "ink clamp 100..400 / 25..100");
         check(c.renderScale == 4 && c.dofZFar == 20000, "render_scale 1..4 / dof_zfar 20000..");
         check(c.device == 100 && c.deadzone == 0.5f, "device 0..100 / deadzone 0..0.5");
         check(c.logLevel == 3, "log_level 0..3");
     }
 
-    std::printf("[4] migracion del INI 0.x\n");
+    std::printf("[4] migration of the 0.x INI\n");
     {
         std::filesystem::remove(tomlPath, ec);
         writeAll((std::filesystem::path(dir) / "bt3_settings.ini").string(),
@@ -129,13 +129,13 @@ int main()
                  "[logging]\nlog_level = 2\n");
         ps2x_settings::Settings m;
         const bool ok = ps2x_settings::load(m, dir);
-        check(ok, "migracion reportada");
-        check(std::filesystem::exists(tomlPath), "settings.toml creado tras migrar");
+        check(ok, "migration reported");
+        check(std::filesystem::exists(tomlPath), "settings.toml created after migrating");
         check(!std::filesystem::exists((std::filesystem::path(dir) / "bt3_settings.ini")),
               "the old INI is dropped");
-        check(m.master == 0.5f, "master_volume migrado");
-        check(m.texPack && m.inkStrength == 300, "video migrado");
-        check(m.logLevel == 2, "logging migrado");
+        check(m.master == 0.5f, "master_volume migrated");
+        check(m.texPack && m.inkStrength == 300, "video migrated");
+        check(m.logLevel == 2, "logging migrated");
         check(m.renderer == ps2x_settings::kRendererSoftware, "gpu_renderer=0 -> software");
 
         std::printf("[4b] in the old INI, 'renderer' wins over 'gpu_renderer'\n");
@@ -144,7 +144,7 @@ int main()
                  "[video]\nrenderer = \"opengl\"\ngpu_renderer = 0\n");
         ps2x_settings::Settings p;
         ps2x_settings::load(p, dir);
-        check(p.renderer == ps2x_settings::kRendererOpenGL, "renderer explicito gana");
+        check(p.renderer == ps2x_settings::kRendererOpenGL, "explicit renderer wins");
     }
 
     std::printf("[5] the overlay rewrites the whole file: what it does not model must survive\n");
@@ -171,8 +171,8 @@ int main()
         check(back.renderScale == 2, "the key edited by the overlay is applied");
         check(back.inkStrength == 275 && back.inkWidth == 55, "the overlay's ink keys are applied");
         check(back.gpu == "NVIDIA GeForce RTX 4070", "video.gpu survives (the overlay does not model it)");
-        check(back.feWidth == 1600 && back.feHeight == 900, "[frontend] width/height sobreviven");
-        check(back.musicMuted, "[frontend] music_muted sobrevive");
+        check(back.feWidth == 1600 && back.feHeight == 900, "[frontend] width/height survive");
+        check(back.musicMuted, "[frontend] music_muted survives");
 
         // loadFromFile() on a missing file must not create one, or the overlay would write defaults
         // over a user's file just by saving once.
@@ -235,7 +235,7 @@ int main()
         check(ps2x_settings::save(w, dir), "save() with show_perf");
         ps2x_settings::Settings r;
         check(ps2x_settings::load(r, dir), "load()");
-        check(r.showPerf, "video.show_perf se guardo y se leyo");
+        check(r.showPerf, "video.show_perf was written and read");
 
         // It is not env-guarded, so the overlay must always be able to write it -- if someone later
         // gives it an EnvLock bit and forgets the mask, the value would silently stop persisting.
@@ -250,7 +250,7 @@ int main()
         // the toggle is a lie: the box moves, the file never changes.
         ps2x_settings::Settings a, b;
         a.showPerf = true; b.showPerf = false;
-        check(!(a == b), "show_perf participa en operator==");
+        check(!(a == b), "show_perf takes part in operator==");
     }
 
     std::printf("[8] the resulting file\n");
@@ -259,6 +259,6 @@ int main()
 
     std::filesystem::remove_all(dir, ec);
 
-    std::printf("%s (%d fallos)\n", g_fail ? "PROBE FALLIDO" : "PROBE OK", g_fail);
+    std::printf("%s (%d fallos)\n", g_fail ? "PROBE FAILED" : "PROBE OK", g_fail);
     return g_fail ? 1 : 0;
 }

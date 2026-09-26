@@ -44,10 +44,10 @@ int main()
     {
         const ps2x::PerfStatus p = ps2x::GetPerfStatus();
         check(!p.valid, "valid == false before the first frame");
-        check(near(p.displayFps, 0.0), "displayFps arranca en 0");
+        check(near(p.displayFps, 0.0), "displayFps starts at 0");
     }
 
-    std::printf("[2] 60 frames de 16.667 ms -> 60 fps, p50 = p95 = 16.7\n");
+    std::printf("[2] 60 frames of 16.667 ms -> 60 fps, p50 = p95 = 16.7\n");
     {
         for (int i = 0; i < 60; ++i)
             ps2x::PerfTick(1.0 / 60.0);
@@ -90,7 +90,7 @@ int main()
         ps2x::PerfTick(0.080);
         closeWindow();
         const ps2x::PerfStatus p = ps2x::GetPerfStatus();
-        check(near(p.frameMsP95, 16.667, 0.05), "p95 NO ve un hitch de 0.5%% (limite real del percentil)");
+        check(near(p.frameMsP95, 16.667, 0.05), "p95 does NOT see a 0.5%% hitch (the percentile's real limit)");
         check(near(p.frameMsMax, 80.0, 0.01), "max does see it: that is why it is here");
     }
 
@@ -127,7 +127,7 @@ int main()
         check(near(p.gpuCoverage, 0.0), "OpenGL draw-list: coverage 0 (shown as a minimum)");
         check(near(p.gpuBusyPct, 10.0, 0.5), "100 ms of GPU in 1 s -> ~10 %%");
         check(near(p.gpuMsPerFrame, 1.667, 0.05), "-> ~1.67 ms per frame");
-        check(p.gpuSamples == 1 && p.gpuMeasured(), "1 muestra, y gpuMeasured() da true");
+        check(p.gpuSamples == 1 && p.gpuMeasured(), "1 sample, and gpuMeasured() returns true");
 
         ps2x::PerfSetGpuSource(ps2x::GpuSource::VulkanTimestamps, ps2x::GpuQuality::FullFrame);
         ps2x::PerfAddGpuBusyNs(100ull * 1000ull * 1000ull, 1, 0);
@@ -198,7 +198,7 @@ int main()
         ps2x::PerfPublishCpu(600ull * ms, 2000ull * ms, 40ull * ms);
         closeWindow();
         ps2x::PerfStatus p = ps2x::GetPerfStatus();
-        check(near(p.guestPct, 30.0, 0.5), "guest_pct ~ 30%% de 300 ms en 1 s");
+        check(near(p.guestPct, 30.0, 0.5), "guest_pct ~ 30%% of 300 ms in 1 s");
         check(near(p.submitPct, 2.0, 0.5), "submit_pct ~ 2%%");
 
         // The next window keeps growing from there: 900 ms cumulative busy over 3 s of wall is still
@@ -206,15 +206,15 @@ int main()
         ps2x::PerfPublishCpu(900ull * ms, 3000ull * ms, 60ull * ms);
         closeWindow();
         p = ps2x::GetPerfStatus();
-        check(near(p.guestPct, 30.0, 0.5), "sigue en 30%%: 900 ms acumulados sobre 3 s, no 900%%");
-        check(p.guestPct < 100.0, "y nunca puede pasar de 100%%");
+        check(near(p.guestPct, 30.0, 0.5), "stays at 30%%: 900 ms accumulated over 3 s, not 900%%");
+        check(p.guestPct < 100.0, "and can never exceed 100%%");
 
         // A counter that jumps BACKWARDS is a savestate load or a runtime reset, not a negative
         // delta. That window is unmeasured, so it reports 0 instead of wrapping or going stale.
         ps2x::PerfPublishCpu(10ull * ms, 1000ull * ms, 5ull * ms);
         closeWindow();
         p = ps2x::GetPerfStatus();
-        check(near(p.guestPct, 0.0, 0.01), "un reset de contador da 0%%, no unWrap gigante");
+        check(near(p.guestPct, 0.0, 0.01), "a counter reset gives 0%%, not a giant unwrap");
         check(p.guestPct >= 0.0 && p.guestPct <= 100.0, "the range is always 0..100");
     }
 
@@ -226,9 +226,9 @@ int main()
         ps2x::SetPerfOverlayEnabled(true);
         check(ps2x::PerfOverlayEnabled(), "the overlay can be assembled");
         ps2x::SetPerfOverlayEnabled(false);
-        check(!ps2x::PerfOverlayEnabled(), "y desarmar");
+        check(!ps2x::PerfOverlayEnabled(), "and disassemble");
     }
 
-    std::printf("%s (%d fallos)\n", g_fail ? "PROBE FALLIDO" : "PROBE OK", g_fail);
+    std::printf("%s (%d fallos)\n", g_fail ? "PROBE FAILED" : "PROBE OK", g_fail);
     return g_fail ? 1 : 0;
 }

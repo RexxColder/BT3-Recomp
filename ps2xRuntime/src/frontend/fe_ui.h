@@ -118,10 +118,10 @@ namespace fe
         return open;
     }
 
-    // PLEGAR / DESPLEGAR TODO for the page a section belongs to.
+    // COLLAPSE / EXPAND ALL for the page a section belongs to.
     inline void allSectionsToggle(const char *const *labels, int count, bool wantOpen)
     {
-        if (!ImGui::SmallButton(wantOpen ? "DESPLEGAR TODO" : "PLEGAR TODO"))
+        if (!ImGui::SmallButton(wantOpen ? "EXPAND ALL" : "COLLAPSE ALL"))
             return;
         for (int i = 0; i < count; ++i)
             sectionState(labels[i], wantOpen);

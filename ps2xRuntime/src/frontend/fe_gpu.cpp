@@ -190,12 +190,12 @@ namespace gpu
             return false;
         }
         if (error)
-            *error = preference > 0 ? "applies when the game restarts" : "preferencia borrada";
+            *error = preference > 0 ? "applies when the game restarts" : "preference cleared";
         return true;
 #else
         (void)adapterName;
         if (error)
-            *error = "solo disponible en Windows";
+            *error = "Windows only";
         return false;
 #endif
     }

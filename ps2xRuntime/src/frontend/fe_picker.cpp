@@ -235,7 +235,7 @@ namespace frontend
             // Places: every mounted volume first, then the user folders.
             if (!m_places.empty())
             {
-                ImGui::TextDisabled("Ir a:");
+                ImGui::TextDisabled("Go to:");
                 for (std::size_t i = 0; i < m_places.size(); ++i)
                 {
                     if (i > 0)
@@ -356,8 +356,8 @@ namespace frontend
                 ImGui::TextDisabled("Double-click a file to choose it.");
             else
                 ImGui::TextWrapped("%s", m_selected.string().c_str());
-            ImGui::TextDisabled("%zu entradas%s", m_entries.size(),
-                                m_exts.empty() ? "" : " (filtradas)");
+            ImGui::TextDisabled("%zu entries%s", m_entries.size(),
+                                m_exts.empty() ? "" : " (filtered)");
 
             ImGui::BeginDisabled(m_selected.empty());
             if (ImGui::Button("Seleccionar"))

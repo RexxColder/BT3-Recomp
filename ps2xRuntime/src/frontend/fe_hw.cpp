@@ -159,7 +159,7 @@ namespace hw
         }
         else if (i.logicalCores > 0)
         {
-            parts.push_back(std::to_string(i.logicalCores) + " hilos");
+            parts.push_back(std::to_string(i.logicalCores) + " threads");
         }
 
         if (i.ramMB)
@@ -222,19 +222,19 @@ namespace hw
 
         if (cpuR < 0.55)
         {
-            r.tierName = "Minima";
+            r.tierName = "Minimum";
             r.renderScale = 1;
             r.fps60 = false;
         }
         else if (cpuR < 0.80)
         {
-            r.tierName = "Entrada";
+            r.tierName = "Entry";
             r.renderScale = 2;
             r.fps60 = false;
         }
         else if (cpuR < 1.10)
         {
-            r.tierName = "Equilibrada";
+            r.tierName = "Balanced";
             r.renderScale = 3;
             r.fps60 = true;
         }
