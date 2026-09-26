@@ -642,14 +642,20 @@ namespace frontend
                             ImGui::TextColored(gold(), "STATUS");
                             ImGui::Separator();
                             statusRow("Game data (data/)", scan.dataDir,
-                                      "presente", "MISSING: install the game data");
-                            statusRow("AFS containers", scan.afsCount > 0, "", "none");
+                                      "present", "MISSING: install the game data");
+                            // [afs] The install wizard CONVERTS the .afs files into folders, so
+                            // zero of them left in data/ is the finished state, not a problem.
+                            // Reporting that as a yellow "none" read as if something were missing.
                             if (scan.afsCount > 0)
                             {
                                 char buf[128];
                                 std::snprintf(buf, sizeof buf, "%u  (%.1f MB)",
                                               scan.afsCount, scan.afsBytes / 1048576.0);
-                                statusRow("  total", true, buf, "");
+                                statusRow("AFS containers", true, buf, "");
+                            }
+                            else
+                            {
+                                statusRow("AFS containers", true, "Extracted", "");
                             }
                             statusRow("Boot ELF", canPlay, "found", "MISSING: the ELF was not found");
                             if (canPlay)

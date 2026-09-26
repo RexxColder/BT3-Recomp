@@ -54,7 +54,8 @@ namespace ps2x_settings
         // windowW/windowH on PLAY. Deliberately left out of operator== (see ps2x_settings.cpp)
         // so resizing the window never marks the game settings as unsaved.
         int feWidth = 800;
-        int feHeight = 600;
+        int feHeight = 480;   // was 600: the shell pages are all scrollable and the taller
+                              // window just left empty space under the last row.
         // Menu-theme mute, also shell-only and also outside operator== for the same reason: the
         // toggle applies the moment it is pressed, so it must not read as an unsaved change.
         bool musicMuted = false;
