@@ -1466,14 +1466,14 @@ void PS2SettingsOverlay::drawVideoTab()
             const ps2x::PerfStatus pf = ps2x::GetPerfStatus();
             if (!pf.valid)
             {
-                std::snprintf(val, sizeof val, "esperando el primer frame");
+                std::snprintf(val, sizeof val, "waiting for the first frame");
                 dot(ps2x::VideoState::Fallback, "FPS", val, "");
             }
             else
             {
                 std::snprintf(val, sizeof val, "%.1f", pf.displayFps);
                 std::snprintf(note, sizeof note, "%s",
-                              pf.displayRefreshHz > 0 ? "" : "  (refresh del monitor desconocido)");
+                              pf.displayRefreshHz > 0 ? "" : "  (monitor refresh unknown)");
                 if (pf.displayRefreshHz > 0)
                     std::snprintf(note, sizeof note, "de %d Hz", pf.displayRefreshHz);
                 dot(ps2x::VideoState::Ok, "FPS", val, note);
@@ -1497,8 +1497,8 @@ void PS2SettingsOverlay::drawVideoTab()
                     std::snprintf(val, sizeof val, "n/d");
                     std::snprintf(note, sizeof note, "%s",
                                   pf.gpuSource == ps2x::GpuSource::SoftwareCpu
-                                      ? "rasterizado por CPU, no hay GPU que medir"
-                                      : "el renderer no reporta tiempos de GPU");
+                                      ? "rasterized by CPU, there is no GPU to measure"
+                                      : "the renderer reports no GPU timings");
                     dot(ps2x::VideoState::Fail, "GPU", val, note);
                 }
                 else if (!pf.gpuMeasured())
@@ -1507,8 +1507,8 @@ void PS2SettingsOverlay::drawVideoTab()
                     // windows in a row went 61% -> 0.65% -> 0.61% only because the guest stopped
                     // issuing draw lists. A 0% here would read as an idle GPU, which is the opposite
                     // of the truth, so say what actually happened.
-                    std::snprintf(val, sizeof val, "sin muestras");
-                    std::snprintf(note, sizeof note, "el juego no emitio ninguna lista de dibujado en este segundo");
+                    std::snprintf(val, sizeof val, "no samples");
+                    std::snprintf(note, sizeof note, "the game emitted no draw list in this second");
                     dot(ps2x::VideoState::Fallback, "GPU", val, note);
                 }
                 else
@@ -1520,13 +1520,13 @@ void PS2SettingsOverlay::drawVideoTab()
                         std::snprintf(note, sizeof note, "%s  -  %.1f ms/frame, %d muestras", src, pf.gpuMsPerFrame, pf.gpuSamples);
                     else
                         std::snprintf(note, sizeof note,
-                                      "%s, solo la lista de dibujado: es un minimo  -  %.1f ms/frame, %d muestras",
+                                      "%s, draw-list only: it is a minimum  -  %.1f ms/frame, %d samples",
                                       src, pf.gpuMsPerFrame, pf.gpuSamples);
                     dot(ps2x::VideoState::Ok, "GPU", val, note);
                 }
 
                 std::snprintf(val, sizeof val, "invitado %.0f %%  submit %.0f %%", pf.guestPct, pf.submitPct);
-                std::snprintf(note, sizeof note, "de la CPU, sobre el tiempo real");
+                std::snprintf(note, sizeof note, "of CPU time, over the real time");
                 dot(ps2x::VideoState::Ok, "CPU", val, note);
             }
         }
@@ -1623,7 +1623,7 @@ void PS2SettingsOverlay::drawVideoTab()
         }
         // [perf] Toggling this also arms the runtime, which is what turns the GPU timing queries on:
         // they are not free, so nothing should pay for them unless someone is reading the numbers.
-        if (toggleSwitch("Medidor de FPS (esquina)", &m_settings.showPerf))
+        if (toggleSwitch("FPS meter (corner)", &m_settings.showPerf))
         {
             ps2x::SetPerfOverlayEnabled(m_settings.showPerf);
             m_dirty = true;
@@ -1696,7 +1696,7 @@ void PS2SettingsOverlay::drawVideoTab()
             }
             ImGui::Separator();
             if (!havePack) ImGui::BeginDisabled();
-            if (toggleSwitch("Video overlay (4K intro)", &m_settings.introVideo))
+            if (toggleSwitch("4K intro video", &m_settings.introVideo))
                 m_dirty = true;
             ImGui::TextDisabled("Video overlay replaces the opening movie; applies on restart.");
             ImGui::Spacing();

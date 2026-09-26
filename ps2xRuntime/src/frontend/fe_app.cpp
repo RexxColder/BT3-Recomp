@@ -198,7 +198,7 @@ namespace
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dbz(0.25f, 0.73f, 0.40f));
         ImGui::PushStyleColor(ImGuiCol_Text, dbz(0.02f, 0.06f, 0.03f));
         ImGui::BeginDisabled(!canPlay);
-        const bool pressedPlay = ImGui::Button("JUGAR", ImVec2(74.0f, 0.0f));
+        const bool pressedPlay = ImGui::Button("PLAY", ImVec2(74.0f, 0.0f));
         ImGui::EndDisabled();
         ImGui::PopStyleColor(3);
         if (pressedPlay && canPlay)
@@ -271,7 +271,7 @@ namespace
             ImGui::SetKeyboardFocusHere();
             navFocus = false;
         }
-        glowButton("JUGAR", btn, canPlay, &pressed, ImVec4(0.18f, 0.55f, 0.30f, 1.0f));
+        glowButton("PLAY", btn, canPlay, &pressed, ImVec4(0.18f, 0.55f, 0.30f, 1.0f));
         if (pressed && canPlay)
             playAsked = true;
 
@@ -360,7 +360,7 @@ namespace frontend
             io.Fonts->AddFontDefault();
 
         static const char *const kPages[] = {
-            "Estado", "Video", "Audio", "Mandos", "Registro", "Varios", "Acerca de"
+            "Status", "Video", "Audio", "Pads", "Logging", "Misc", "About"
         };
         // The first screen is just the artwork with PLAY and SETTINGS; the tabbed window is
         // what SETTINGS opens. PS2X_FE_PAGE jumps straight into it for the headless checks.
@@ -409,6 +409,9 @@ namespace frontend
         pageCtx.exeDir = exeDir;
         pageCtx.configDir = configDir;
         pageCtx.bootElf = scan.elf;
+        // [bt3save] One-shot result of the memory-card save install, drawn by the Misc page.
+        static uint64_t frameCounter = 0u;
+        ++frameCounter;
 
         // [install] The install wizard is a whole-window view on top of the tabs; it is only
         // created when the user asks for it (Varios page) or installs a texture pack (Video).
@@ -446,9 +449,9 @@ namespace frontend
                 bool hashed = false;
                 const std::string got = fe::sha256Hex(scan.elf, hashed);
                 if (!hashed)
-                    why = "no se pudo leer el ELF: " + scan.elf;
+                    why = "could not read the ELF: " + scan.elf;
                 else if (got != DiscVerify::kExpectedDiscElfSha256)
-                    why = "el ELF no es el de esta revision (sha256 " + got.substr(0, 16) + "...)";
+                    why = "the ELF is not this revision's (sha256 " + got.substr(0, 16) + "...)";
             }
             if (why.empty())
             {
@@ -456,7 +459,7 @@ namespace frontend
             }
             else
             {
-                std::fprintf(stderr, "[fe] %s -> abro el instalador\n", why.c_str());
+                std::fprintf(stderr, "[fe] %s -> opening the installer\n", why.c_str());
                 // The shell opened the wizard on the user's behalf, so the welcome page would
                 // only repeat what the file browser already asks for.
                 wizard = std::make_unique<InstallWizard>(exeDir);
@@ -565,10 +568,10 @@ namespace frontend
                         if (wizard->wantedPick() != InstallWizard::PickKind::None && !picker.isOpen())
                         {
                             if (wizard->wantedPick() == InstallWizard::PickKind::Dump)
-                                picker.open("Selecciona tu dump del juego", homeDir,
+                                picker.open("Select your game dump", homeDir,
                                             {".iso", ".img", ".7z", ".zip", ".rar", ".tar", ".gz", ".tgz"});
                             else
-                                picker.open("Selecciona el pack de texturas", homeDir, {".7z", ".zip"});
+                                picker.open("Select the texture pack", homeDir, {".7z", ".zip"});
                             wizard->clearWantedPick();
                         }
                         if (picker.draw())
@@ -638,9 +641,9 @@ namespace frontend
                         {
                             ImGui::TextColored(gold(), "ESTADO");
                             ImGui::Separator();
-                            statusRow("Datos del juego (data/)", scan.dataDir,
-                                      "presente", "FALTA: instalar los datos del juego");
-                            statusRow("Contenedores AFS", scan.afsCount > 0, "", "ninguno");
+                            statusRow("Game data (data/)", scan.dataDir,
+                                      "presente", "MISSING: install the game data");
+                            statusRow("Contenedores AFS", scan.afsCount > 0, "", "none");
                             if (scan.afsCount > 0)
                             {
                                 char buf[128];
@@ -648,7 +651,7 @@ namespace frontend
                                               scan.afsCount, scan.afsBytes / 1048576.0);
                                 statusRow("  total", true, buf, "");
                             }
-                            statusRow("ELF de arranque", canPlay, "encontrado", "FALTA: no se encontro el ELF");
+                            statusRow("ELF de arranque", canPlay, "encontrado", "MISSING: the ELF was not found");
                             if (canPlay)
                                 ImGui::TextWrapped("%s", scan.elf.c_str());
                             ImGui::Separator();
@@ -658,7 +661,7 @@ namespace frontend
                             {
                                 static const std::string hwLine = hw::summary(hw::detect());
                                 if (hwLine.empty())
-                                    ImGui::TextDisabled("No se pudo leer el hardware");
+                                    ImGui::TextDisabled("Could not read the hardware");
                                 else
                                     ImGui::TextWrapped("%s", hwLine.c_str());
                             }
@@ -666,14 +669,14 @@ namespace frontend
                             ImGui::Separator();
                             if (!scan.dataDir || scan.afsCount == 0)
                             {
-                                if (fe::primaryButton("INSTALAR DATOS DEL JUEGO", ImVec2(240.0f, 30.0f)))
+                                if (fe::primaryButton("INSTALL GAME DATA", ImVec2(240.0f, 30.0f)))
                                 {
                                     wizard = std::make_unique<InstallWizard>(exeDir);
                                     wizard->begin(false);
                                     showWizard = true;
                                 }
                             }
-                            ImGui::TextDisabled("Tambien podes instalarlos desde Varios > Modo reinstalar.");
+                            ImGui::TextDisabled("You can also install them from Misc > Reinstall mode.");
                         }
                         else if (page == 1)
                         {
@@ -702,7 +705,7 @@ namespace frontend
                         // PS2X_FE_MEASURE reports how tall each page really is against the
                         // viewport, so "does it all fit" is a number and not a guess.
                         if (measure)
-                            std::fprintf(stderr, "[fe-measure] %-10s %5.0f px de contenido / %5.0f px de ventana  %s\n",
+                            std::fprintf(stderr, "[fe-measure] %-10s %5.0f px content / %5.0f px window  %s\n",
                                          kPages[page], ImGui::GetCursorPosY(), ImGui::GetWindowHeight(),
                                          ImGui::GetCursorPosY() > ImGui::GetWindowHeight() ? "DESBORDA" : "entra");
                         }   // fe_scroll
@@ -743,11 +746,11 @@ namespace frontend
                         }
                         ImGui::SameLine(0.0f, 18.0f);
                         if (settings != settingsSaved)
-                            ImGui::TextColored(fe::gold(), "cambios sin guardar");
+                            ImGui::TextColored(fe::gold(), "unsaved changes");
                         else
-                            ImGui::TextDisabled("sin cambios pendientes");
+                            ImGui::TextDisabled("no pending changes");
                         ImGui::SameLine(ImGui::GetContentRegionAvail().x - 150.0f);
-                        if (fe::primaryButton("GUARDAR Y APLICAR", ImVec2(150.0f, 0.0f), true))
+                        if (fe::primaryButton("SAVE AND APPLY", ImVec2(150.0f, 0.0f), true))
                         {
                             // Save and apply: the file is written now, and the per-player pad
                             // profiles are flushed too, so what the game reads at boot is exactly
@@ -774,6 +777,58 @@ namespace frontend
                                 wizard->requestPick(InstallWizard::PickKind::Pack);
                             pageCtx.requestInstallWizard = false;
                             pageCtx.requestPackInstall = false;
+                        }
+                        // [bt3save] Install the progressed memory-card save. The mc* layer cannot
+                        // write the card back, so this is the only way to get a card with progress
+                        // on it. Backup the old one, drop the new one in, and say so plainly:
+                        // anything earned in-session is still lost on exit.
+                        if (pageCtx.requestSaveInstall)
+                        {
+                            pageCtx.requestSaveInstall = false;
+                            const std::filesystem::path src = exeDir / "saves" / "BASLUS-21678DBZT3" / "BASLUS-21678DBZT3";
+                            const std::filesystem::path dir = exeDir / "savedata" / "BASLUS-21678DBZT3";
+                            const std::filesystem::path dst = dir / "BASLUS-21678DBZT3";
+                            std::error_code ec;
+                            std::string msg, col = "ok";
+                            if (!std::filesystem::is_regular_file(src, ec))
+                            {
+                                msg = "completed save not found in saves/";
+                                col = "bad";
+                            }
+                            else
+                            {
+                                std::filesystem::create_directories(dir, ec);
+                                if (std::filesystem::is_regular_file(dst, ec))
+                                {
+                                    ec.clear();
+                                    std::filesystem::copy_file(dst, dir / "BASLUS-21678DBZT3.bak",
+                                                               std::filesystem::copy_options::overwrite_existing, ec);
+                                    if (ec)
+                                    {
+                                        msg = "backup failed: " + ec.message();
+                                        col = "bad";
+                                    }
+                                }
+                                ec.clear();
+                                std::filesystem::copy_file(src, dst,
+                                                           std::filesystem::copy_options::overwrite_existing, ec);
+                                if (ec)
+                                {
+                                    msg = "copy failed: " + ec.message();
+                                    col = "bad";
+                                }
+                                else
+                                {
+                                    msg = "Completed save installed. Restart the game.";
+                                    std::fprintf(stderr, "[fe] bt3 save installed: %s\n", dst.string().c_str());
+                                }
+                            }
+                            pageCtx.footerHint = nullptr;
+                            // [bt3save] the page reads these back; PageContext is per-frame so this
+                            // is how the result crosses from the handler to the UI.
+                            pageCtx.saveInstallMsg = msg;
+                            pageCtx.saveInstallOk = (col == "ok");
+                            pageCtx.saveInstallMsgFrame = frameCounter;
                         }
                     }
                     ImGui::EndChild();

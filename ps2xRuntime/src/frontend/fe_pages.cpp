@@ -111,7 +111,7 @@ namespace frontend
     // window mode) stay open and unboxed; the rest is grouped into collapsible sections and
     // the "only in game" note is a plain line instead of a section.
     static const char *const kVideoSections[] = {
-        "EFECTOS Y FILTRADO", "PACK Y OPCIONES", "RECOMENDADO"
+        "EFFECTS AND FILTERING", "PACK AND OPTIONS", "RECOMMENDED"
     };
 
     // The game window's GL context is created by SDL with no adapter argument, so on Windows the
@@ -143,7 +143,7 @@ namespace frontend
             if (!gpu::supported())
             {
                 fe::rowLabel("GPU");
-                ImGui::TextDisabled("Seleccion de GPU disponible solo en Windows");
+                ImGui::TextDisabled("GPU selection is Windows-only");
             }
             return;
         }
@@ -185,7 +185,7 @@ namespace frontend
         if (!lastError.empty())
             ImGui::TextColored(fe::warnCol(), "%s", lastError.c_str());
         else if (current > 0 && !list[current - 1].active)
-            ImGui::TextDisabled("Se aplica al reiniciar el juego");
+            ImGui::TextDisabled("Applied when the game restarts");
     }
 
     // Write a detected recommendation into the settings the shell owns. The texture pack is only
@@ -232,7 +232,7 @@ namespace frontend
             int renderer = s.renderer;
             if (renderer < 0 || renderer >= count)
                 renderer = 0;
-            fe::comboRow("Motor grafico", &renderer, items, count);
+            fe::comboRow("Graphics", &renderer, items, count);
             if (renderer != s.renderer)
                 s.renderer = renderer;
         }
@@ -250,7 +250,7 @@ namespace frontend
             if (namePtrs.empty())
             {
                 fe::rowLabel("Monitor");
-                ImGui::TextDisabled("No se pudo enumerar monitores");
+                ImGui::TextDisabled("Could not enumerate monitors");
             }
             else
             {
@@ -261,12 +261,12 @@ namespace frontend
             }
         }
         {
-            fe::rowLabel("Modo de ventana");
-            ImGui::RadioButton("Ventana", &s.windowMode, 0);
+            fe::rowLabel("Window mode");
+            ImGui::RadioButton("Windowed", &s.windowMode, 0);
             ImGui::SameLine();
             ImGui::RadioButton("Borderless", &s.windowMode, 1);
             ImGui::SameLine();
-            ImGui::RadioButton("Pantalla completa", &s.windowMode, 2);
+            ImGui::RadioButton("Fullscreen", &s.windowMode, 2);
         }
 
         {
@@ -275,7 +275,7 @@ namespace frontend
                 if (s.windowW == kResolutionW[i] && s.windowH == kResolutionH[i])
                     current = i;
             const char *label = current >= 0 ? kResolutionLabels[current] : kCustomResolution;
-            if (fe::comboRowStr("Resolucion", &current, kResolutionLabels, kResolutionCount, label))
+            if (fe::comboRowStr("Resolution", &current, kResolutionLabels, kResolutionCount, label))
             {
                 if (current >= 0)
                 {
@@ -294,65 +294,65 @@ namespace frontend
         }
         drawGpuRow(s);
 
-        if (fe::beginSection("EFECTOS Y FILTRADO", false,
-                             "El contorno de cel a 199% replica la linea de la consola; mas bajo, "
-                             "tinta mas fina. El DoF y el resplandor (aura Kaioken) tambien se "
-                             "activan aqui."))
+        if (fe::beginSection("EFFECTS AND FILTERING", false,
+                             "The cel outline at 199% replicates the console's line; lower means "
+                             "thinner ink. DoF and the glow (Kaioken aura) are enabled "
+                             "here too."))
         {
-            fe::toggleSwitch("Contorno cel (cel outline)", &s.outline);
+            fe::toggleSwitch("Cel outline", &s.outline);
             if (s.outline)
-                fe::intSliderRow("Intensidad del contorno", &s.inkStrength, 100, 400, "%d %%");
-            fe::toggleSwitch("Sombras de personajes", &s.shadows);
-            fe::toggleSwitch("Desenfoque de profundidad (DoF)", &s.dofBlur);
+                fe::intSliderRow("Outline strength", &s.inkStrength, 100, 400, "%d %%");
+            fe::toggleSwitch("Character shadows", &s.shadows);
+            fe::toggleSwitch("Depth of field (DoF)", &s.dofBlur);
             if (s.dofBlur)
-                fe::intSliderRow("Alcance del DoF", &s.dofZFar, 20000, 800000, "%d k");
-            fe::toggleSwitch("Resplandor (aura Kaioken)", &s.glow);
-            fe::toggleSwitch("Filtro bilinear", &s.bilinear);
-            fe::toggleSwitch("Forzar filtrado (terreno suave)", &s.forceBilinear);
+                fe::intSliderRow("DoF range", &s.dofZFar, 20000, 800000, "%d k");
+            fe::toggleSwitch("Glow (Kaioken aura)", &s.glow);
+            fe::toggleSwitch("Bilinear filter", &s.bilinear);
+            fe::toggleSwitch("Force filtering (soft terrain)", &s.forceBilinear);
         }
 
-        if (fe::beginSection("PACK Y OPCIONES", false,
-                             "El pack se instala en la carpeta de arriba: el archivo se descomprime "
-                             "ahi. La descarga automatica ya no existe. Las opciones se aplican al "
-                             "iniciar el juego."))
+        if (fe::beginSection("PACK AND OPTIONS", false,
+                             "The pack installs into the folder above: the file is decompressed "
+                             "there. The automatic download no longer exists. The options apply when the "
+                             "to start the game."))
         {
             const PackStatus pack = scanTexturePack(dataDir);
             if (pack.files > 0)
             {
                 char size[32];
                 fe::formatBytes(pack.bytes, size, sizeof size);
-                fe::statusRow("Pack", fe::okCol(), "instalado");
+                fe::statusRow("Pack", fe::okCol(), "installed");
                 char line[96];
-                std::snprintf(line, sizeof line, "%u archivos, %s", pack.files, size);
-                fe::statusRow("Contenido", fe::dbz(0.84f, 0.89f, 0.92f), line);
+                std::snprintf(line, sizeof line, "%u files, %s", pack.files, size);
+                fe::statusRow("Content", fe::dbz(0.84f, 0.89f, 0.92f), line);
             }
             else
             {
-                fe::statusRow("Pack", fe::warnCol(), "no instalado");
+                fe::statusRow("Pack", fe::warnCol(), "not installed");
             }
             char path[512];
             std::snprintf(path, sizeof path, "%s", (dataDir / "Textures").string().c_str());
-            fe::kv("Carpeta", path);
+            fe::kv("Folder", path);
 
-            fe::toggleSwitch("Activar reemplazo de texturas", &s.texPack);
-            fe::rowLabel("Instalar");
-            if (ImGui::Button("Instalar pack desde archivo..."))
+            fe::toggleSwitch("Enable texture replacement", &s.texPack);
+            fe::rowLabel("Install");
+            if (ImGui::Button("Install pack from file..."))
                 ctx.requestPackInstall = true;
-            fe::toggleSwitch("Video de intro 4K", &s.introVideo);
-            static const char *const buttons[] = {"PS2 (botones originales)", "Xbox"};
-            fe::comboRow("Estilo de botones", &s.buttonLayout, buttons, 2);
+            fe::toggleSwitch("4K intro video", &s.introVideo);
+            static const char *const buttons[] = {"PS2 (original buttons)", "Xbox"};
+            fe::comboRow("Button layout", &s.buttonLayout, buttons, 2);
         }
 
-        if (fe::beginSection("RECOMENDADO", false,
-                             "Detecta tu CPU, RAM y GPU y mide un banco de pruebas de un solo "
-                             "hilo para decidir el nivel. Aplicar escribe la escala de render, "
-                             "el pack de texturas, los 60 fps y el modo de ventana."))
+        if (fe::beginSection("RECOMMENDED", false,
+                             "Detects your CPU, RAM and GPU and runs a single-threaded benchmark to "
+                             "decide the tier. Apply writes the render scale, "
+                             "the texture pack, 60 fps and window mode."))
         {
             static hw::Recommendation rec;
             static std::string recText;
             static bool haveRec = false;
             static bool applied = false;
-            if (fe::primaryButton("DETECTAR", ImVec2(120.0f, 28.0f)))
+            if (fe::primaryButton("DETECT", ImVec2(120.0f, 28.0f)))
             {
                 rec = hw::recommend(hw::detect(), hw::benchSingleThreadR());
                 char buf[256];
@@ -360,14 +360,14 @@ namespace frontend
                               "%s  -  %dx render, pack %s, %d fps, %s",
                               rec.tierName.c_str(), rec.renderScale,
                               rec.texPackFull ? "4K" : "lite", rec.fps60 ? 60 : 30,
-                              rec.windowMode == 2 ? "pantalla completa"
-                                                  : rec.windowMode == 1 ? "borderless" : "ventana");
+                              rec.windowMode == 2 ? "fullscreen"
+                                                  : rec.windowMode == 1 ? "borderless" : "windowed");
                 recText = buf;
                 haveRec = true;
                 applied = false;
             }
             ImGui::SameLine(0.0f, 10.0f);
-            if (fe::primaryButton("APLICAR", ImVec2(120.0f, 28.0f)) && haveRec)
+            if (fe::primaryButton("APPLY", ImVec2(120.0f, 28.0f)) && haveRec)
             {
                 applyRecommendation(s, rec, dataDir);
                 applied = true;
@@ -376,26 +376,26 @@ namespace frontend
             {
                 ImGui::TextWrapped("%s", recText.c_str());
                 if (applied)
-                    ImGui::TextColored(fe::okCol(), "Aplicado. Guardalo para que sobreviva al cierre.");
+                    ImGui::TextColored(fe::okCol(), "Applied. Save it so it survives closing.");
                 else if (haveRec)
-                    ImGui::TextDisabled("Aplica los valores de arriba a los ajustes de esta pagina.");
+                    ImGui::TextDisabled("Applies the values above to this page's settings.");
             }
         }
 
-        ctx.footerHint = "Half texel, saltar post, VRAM obsoleta, widescreen, 60 fps y el HUD se "
-                         "cambian en caliente desde el overlay del juego (Shift+Tab).";
+        ctx.footerHint = "Half texel, skip post, stale VRAM, widescreen, 60 fps and the HUD "
+                         "change live from the game overlay (Shift+Tab).";
     }
 
     void drawAudioPage(PageContext &ctx)
     {
         ps2x_settings::Settings &s = *ctx.settings;
 
-    if (fe::beginSection("VOLUMENES", true,
-                         "El juego y el menu del Dragon Net comparten estos tres volumenes."))
+    if (fe::beginSection("VOLUMES", true,
+                         "The game and the Dragon Net menu share these three volumes."))
     {
-        fe::sliderRow("General", &s.master, 0.0f, 1.0f, "%.2f");
-        fe::sliderRow("Musica", &s.music, 0.0f, 1.0f, "%.2f");
-        fe::sliderRow("Efectos", &s.sfx, 0.0f, 0.4f, "%.2f");
+        fe::sliderRow("Master", &s.master, 0.0f, 1.0f, "%.2f");
+        fe::sliderRow("Music", &s.music, 0.0f, 1.0f, "%.2f");
+        fe::sliderRow("SFX", &s.sfx, 0.0f, 0.4f, "%.2f");
     }
 
     // The menu theme is a local file, not part of the project, so muting it is a shell setting
@@ -403,7 +403,7 @@ namespace frontend
     // for the session to end, which is why it is written out immediately.
     {
         bool muted = s.musicMuted;
-        if (fe::toggleSwitch("Silenciar la musica del menu", &muted) && muted != s.musicMuted)
+        if (fe::toggleSwitch("Mute the menu music", &muted) && muted != s.musicMuted)
         {
             s.musicMuted = muted;
             music::setMuted(muted);
@@ -411,8 +411,8 @@ namespace frontend
                 std::fprintf(stderr, "[fe] menu theme %s\n", muted ? "muted" : "unmuted");
         }
         if (music::trackName().empty())
-            fe::hintPending("No hay ninguna pista. Poner un music.flac en "
-                            "assets/music/ la activa.");
+            fe::hintPending("No track. Drop a music.flac in "
+                            "assets/music/ turns it on.");
     }
     }
 
@@ -442,17 +442,17 @@ namespace frontend
 
         if (slot < 0 || !ps2x_pad::available(slot))
         {
-            fe::hintPending("No hay ningun mando conectado. Conecta uno y el probador se enciende "
-                            "solo; mientras tanto el juego usara el teclado.");
+            fe::hintPending("No controller connected. Connect one and the tester turns on by "
+                            "itself; until then the game uses the keyboard.");
             return;
         }
 
-        fe::kv("Mando fisico", ps2x_pad::name(slot) ? ps2x_pad::name(slot) : "(sin nombre)");
-        fe::kv("Asignado a", cfg.device.kind == ps2_stubs::PadDeviceKind::Gamepad
-                                 ? "este mando, fijo"
+        fe::kv("Physical pad", ps2x_pad::name(slot) ? ps2x_pad::name(slot) : "(no name)");
+        fe::kv("Assigned to", cfg.device.kind == ps2_stubs::PadDeviceKind::Gamepad
+                                 ? "this pad, fixed"
                                  : (cfg.device.kind == ps2_stubs::PadDeviceKind::Keyboard
-                                        ? "solo teclado"
-                                        : "automatico (primer mando)"));
+                                        ? "keyboard only"
+                                        : "automatic (first pad)"));
 
         const float f = fe::unit();
         ImDrawList *dl = ImGui::GetWindowDrawList();
@@ -509,7 +509,7 @@ namespace frontend
         pad(fx, top + u, u, u, ps2x_pad::buttonDown(slot, GAMEPAD_BUTTON_RIGHT_FACE_LEFT), "CUAD");
         pad(fx + u * 2.0f, top + u, u, u, ps2x_pad::buttonDown(slot, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT), "CIR");
         pad(fx + u, top + u * 2.0f, u, u, ps2x_pad::buttonDown(slot, GAMEPAD_BUTTON_RIGHT_FACE_DOWN), "CRU");
-        dl->AddText(ImGui::GetFont(), f2 * 0.8f, ImVec2(org.x + fx, org.y + capY), dim, "BOTONES");
+        dl->AddText(ImGui::GetFont(), f2 * 0.8f, ImVec2(org.x + fx, org.y + capY), dim, "BUTTONS");
 
         // Analogs: same 3u square, live dot, caption and value underneath.
         auto analog = [&](float x, int axisX, int axisY, bool clicked, const char *name) {
@@ -559,18 +559,18 @@ namespace frontend
         if (player < 0 || (size_t)player >= ps2_stubs::PadConfig::kPlayerCount)
             player = 0;
 
-        fe::sectionHeader("MANDO");
+        fe::sectionHeader("PAD");
         {
             // The runtime has always had two per-player profiles (savedata/pad_p1.conf and
             // pad_p2.conf); the front-end only exposed P1. Editing them here goes through the
             // same PadConfig the game polls, so what you set is what it reads.
-            static const char *const kPlayers[] = {"Jugador 1", "Jugador 2"};
-            fe::comboRow("Jugador", &player, kPlayers, (int)ps2_stubs::PadConfig::kPlayerCount);
+            static const char *const kPlayers[] = {"Player 1", "Player 2"};
+            fe::comboRow("Player", &player, kPlayers, (int)ps2_stubs::PadConfig::kPlayerCount);
 
             const ps2_stubs::PadPlayerConfig cur = pads.snapshot((size_t)player);
 
             // The list is the pads actually plugged in, by their real names, so nobody has to
-            // guess which physical pad is "Mando 2".
+            // guess which physical pad is "Pad 2".
             ps2x_pad::update();
             static std::vector<std::string> devNames;
             static std::vector<const char *> devPtrs;
@@ -578,14 +578,14 @@ namespace frontend
             devNames.clear();
             devPtrs.clear();
             devSlots.clear();
-            devNames.emplace_back("Automatico (primer mando)");
-            devNames.emplace_back("Teclado");
+            devNames.emplace_back("Automatic (first pad)");
+            devNames.emplace_back("Keyboard");
             for (int i = 0; i < ps2x_pad::kMaxSlots; ++i)
             {
                 if (!ps2x_pad::isController(i))
                     continue;
                 const char *n = ps2x_pad::name(i);
-                devNames.emplace_back(n && *n ? n : ("Mando " + std::to_string(i + 1)));
+                devNames.emplace_back(n && *n ? n : ("Pad " + std::to_string(i + 1)));
                 devSlots.push_back(i);
             }
             for (size_t i = 0; i < devNames.size(); ++i)
@@ -602,7 +602,7 @@ namespace frontend
             }
 
             int pick = chosen;
-            fe::comboRow("Dispositivo", &pick, devPtrs.data(), (int)devPtrs.size());
+            fe::comboRow("Device", &pick, devPtrs.data(), (int)devPtrs.size());
             if (pick != chosen)
             {
                 ps2_stubs::PadDevice dev;
@@ -623,48 +623,48 @@ namespace frontend
                 pads.setDevice((size_t)player, dev);
                 pads.save();
             }
-            fe::kv("Perfil", pads.playerConfigPath((size_t)player).c_str());
-            fe::sliderRow("Zona muerta de los analogicos", &s.deadzone, 0.0f, 0.5f, "%.2f");
+            fe::kv("Profile", pads.playerConfigPath((size_t)player).c_str());
+            fe::sliderRow("Stick deadzone", &s.deadzone, 0.0f, 0.5f, "%.2f");
         }
 
-        fe::sectionHeader("PROBAR MANDO");
+        fe::sectionHeader("TEST PAD");
         drawPadTester(player, pads);
 
-        ctx.footerHint = "ASIGNAR CONTROLES: se edita desde el overlay del juego (Shift+Tab).";
+        ctx.footerHint = "ASSIGN CONTROLS: edited from the game overlay (Shift+Tab).";
     }
 
     void drawLoggingPage(PageContext &ctx)
     {
         ps2x_settings::Settings &s = *ctx.settings;
 
-        static const char *const kLevels[] = {"OFF", "Equilibrado", "Detallado", "Depuracion"};
+        static const char *const kLevels[] = {"OFF", "Balanced", "Detailed", "Debug"};
         static const char *const kDescriptions[4] = {
-            "Todo silencioso. No se escriben logs y el juego corre sin coste extra.",
-            "Perfil + mclog + eventos del planificador: paradas al arrancar, tormentas de guardado y "
-            "tirones de cadencia. Recomendado para jugar.",
-            "Anade draws de GPU por frame, trafico de tarjeta de memoria, estado de voces de audio y "
-            "eventos del pad. Para cazar un fallo concreto.",
-            "Todo lo que el runtime puede emitir (recompilador por opcode, JIT de VU1, recorridos del "
-            "heap del juego y volcados de VRVR crudos). Muy lento: solo para diagnostico de fallos."
+            "All silent. No logs are written and the game runs with no extra cost.",
+            "Profile + mclog + scheduler events: stalls at boot, save storms and pacing hitches. "
+            "Recommended for playing.",
+            "Adds per-frame GPU draws, memory-card traffic, audio voice state and pad events. "
+            "For hunting a specific failure.",
+            "Everything the runtime can emit (per-opcode recompiler, VU1 JIT, walks of the game "
+            "heap and raw VRAM dumps). Very slow: failure diagnosis only."
         };
         static const char *const kLogNote =
-            "Los logs van a logs/bt3.log junto al ejecutable. El nivel coincide con el overlay del "
-            "juego (Shift+Tab).";
+            "Logs go to logs/bt3.log next to the executable. The level matches the in-game overlay "
+            "(Shift+Tab).";
 
         if (fe::beginSection("NIVEL", true, kLogNote))
         {
             bool enabled = s.logLevel > 0;
-            if (fe::toggleSwitch("Activar registro", &enabled))
+            if (fe::toggleSwitch("Enable logging", &enabled))
                 s.logLevel = enabled ? (s.logLevel > 0 ? s.logLevel : 1) : 0;
 
             int level = s.logLevel;
-            if (fe::comboRow("Nivel", &level, kLevels, 4))
+            if (fe::comboRow("Level", &level, kLevels, 4))
                 s.logLevel = level;
-            fe::rowLabel("Estado");
+            fe::rowLabel("Status");
             if (s.logLevel == 0)
                 ImGui::TextColored(fe::gold(), "Registro desactivado");
             else
-                ImGui::TextColored(fe::gold(), "Nivel %d", s.logLevel);
+                ImGui::TextColored(fe::gold(), "Level %d", s.logLevel);
             fe::hint(kDescriptions[s.logLevel]);
         }
     }
@@ -674,11 +674,11 @@ namespace frontend
         ps2x_settings::Settings &s = *ctx.settings;
         const std::filesystem::path dataDir = ctx.exeDir / "data";
 
-        if (fe::beginSection("DATOS DEL JUEGO", true,
-                             "El asistente extrae el ELF y los recursos de tu propia ISO. El "
-                             "tamano y el estado se comprueban contra el hash del arranque."))
+        if (fe::beginSection("GAME DATA", true,
+                             "The wizard extracts the ELF and the resources from your own ISO. The "
+                             "size and state are checked against the boot hash."))
         {
-            fe::rowLabel("Tamano");
+            fe::rowLabel("Size");
             {
                 char size[32];
                 fe::formatBytes(dirSize(dataDir), size, sizeof size);
@@ -696,70 +696,125 @@ namespace frontend
             switch ((DataState)ctx.dataState)
             {
             case DataState::Valid:
-                fe::statusRow("Estado", fe::okCol(), "instalado y validado");
+                fe::statusRow("Status", fe::okCol(), "installed and verified");
                 break;
             case DataState::Corrupt:
-                fe::statusRow("Estado", fe::badCol(), "corrupto: reinstalar");
+                fe::statusRow("Status", fe::badCol(), "corrupt: reinstall");
                 break;
             case DataState::Missing:
-                fe::statusRow("Estado", fe::badCol(), "falta");
+                fe::statusRow("Status", fe::badCol(), "missing");
                 break;
             }
 
             char path[512];
             std::snprintf(path, sizeof path, "%s", dataDir.string().c_str());
-            fe::kv("Carpeta", path);
+            fe::kv("Folder", path);
 
-            fe::toggleSwitch("Modo reinstalar", &ctx.reinstallMode);
+            fe::toggleSwitch("Reinstall mode", &ctx.reinstallMode);
             if (ctx.reinstallMode)
             {
                 fe::rowLabel("Asistente");
-                if (ImGui::Button("Instalar datos del juego...", ImVec2(240.0f, 0.0f)))
+                if (ImGui::Button("Install game data...", ImVec2(240.0f, 0.0f)))
                     ctx.requestInstallWizard = true;
             }
         }
 
+        {   // [bt3save] Install the progressed memory-card save (bug 8). The runtime's mc* layer is
+            // a stub, so a save the game writes itself is 99.2% zeros -- nothing persists, and
+            // with no progress on the card nothing ever unlocks. This ships a real save extracted
+            // from an Mcd001.ps2 (the BASLUS-21678DBZT3 entry) and drops it over the card dir.
+            // The previous save is kept as .bak next to it. Env PS2X_BT3SAVE=0 hides the section.
+            static const bool s_showSave = [](){ const char *v = std::getenv("PS2X_BT3SAVE"); return !(v && v[0] == (char)48); }();
+            const std::filesystem::path saveSrc = ctx.exeDir / "saves" / "BASLUS-21678DBZT3" / "BASLUS-21678DBZT3";
+            const std::filesystem::path cardDir = ctx.exeDir / "savedata" / "BASLUS-21678DBZT3";
+            const std::filesystem::path cardFile = cardDir / "BASLUS-21678DBZT3";
+            if (s_showSave && fe::beginSection("COMPLETED SAVE", false,
+                                                "Copies a real save that already has story progress, "
+                                                "so you start with the match underway and the characters, "
+                                                "stages, missions and items that progress "
+                                                "unlocked. The game reads it as a normal card."))
+            {
+                std::error_code ec;
+                const bool haveSrc = std::filesystem::is_regular_file(saveSrc, ec);
+                const bool haveCard = std::filesystem::is_regular_file(cardFile, ec);
+                char sbuf[32];
+                if (haveCard)
+                {
+                    fe::formatBytes((unsigned long long)std::filesystem::file_size(cardFile, ec), sbuf, sizeof sbuf);
+                    fe::statusRow("Current save", haveSrc ? fe::okCol() : fe::warnCol(), sbuf);
+                }
+                else
+                {
+                    fe::statusRow("Current save", fe::warnCol(), "no save");
+                }
+                if (!haveSrc)
+                {
+                    fe::statusRow("Completed save", fe::badCol(), "no encontrada en saves/");
+                }
+                fe::toggleSwitch("Install completed save", &ctx.installSaveMode);
+                if (ctx.installSaveMode)
+                {
+                    fe::rowLabel("Accion");
+                    ImGui::BeginDisabled(!haveSrc);
+                    if (ImGui::Button("Install now", ImVec2(180.0f, 0.0f)))
+                        ctx.requestSaveInstall = true;
+                    ImGui::EndDisabled();
+                    fe::hint("Replaces the save in savedata/BASLUS-21678DBZT3/ and keeps the previous "
+                             "as .bak next to it. The match you play from now on is NOT "
+                             "saved on exit: the memory card still cannot write back, "
+                             "so this is for starting with the match unlocked, "
+                             "not for carrying progress between sessions.");
+                }
+                if (!ctx.saveInstallMsg.empty())
+                {
+                    fe::statusRow("Resultado", ctx.saveInstallOk ? fe::okCol() : fe::badCol(),
+                                  ctx.saveInstallMsg.c_str());
+                }
+            }
+        }
+
     // The overlay shortcut belongs with the other runtime switches, not with the pad.
-    if (fe::beginSection("OVERLAY DEL JUEGO", false,
-                         "Atajo para abrir y cerrar el menu de ajustes dentro de la partida. "
-                         "Los botones y teclas se capturan mantendo pulsado el boton o la "
-                         "combinacion durante 3 s, desde el propio overlay del juego."))
+    if (fe::beginSection("GAME OVERLAY", false,
+                         "Shortcut to open and close the settings menu during a match. "
+                         "Buttons and keys are captured by holding the button or the "
+                         "combination for 3 s, from the game's own overlay."))
     {
-        fe::toggleSwitch("Overlay del juego (Shift+Tab)", &s.overlayEnabled);
-        fe::kv("Boton del pad", s.overlayPadBtns.c_str());
-        fe::kv("Teclas", s.overlayKeys.c_str());
-        fe::toggleSwitch("Medidor de FPS (esquina)", &s.showPerf);
-        fe::hint("Muestra los presents por segundo en la esquina superior derecha, durante "
-                 "la partida. La pestana Video del overlay tiene el detalle: distribucion de "
-                 "tiempos de frame (p50/p95/max) y uso de GPU, que se mide con lo que el renderer "
-                 "tenga y el panel declara que cobertura tiene.");
+        fe::toggleSwitch("Game overlay (Shift+Tab)", &s.overlayEnabled);
+        fe::kv("Pad button", s.overlayPadBtns.c_str());
+        fe::kv("Keys", s.overlayKeys.c_str());
+        fe::toggleSwitch("FPS meter (corner)", &s.showPerf);
+        fe::hint("Shows the presents per second in the top-right corner, during the match. "
+                 "The overlay's Video tab has the detail: frame-time distribution (p50/p95/max) "
+                 "and GPU usage, measured from what the renderer has and labelled with the "
+                 "coverage it actually has.");
     }
 }
 
     void drawAboutPage(PageContext &ctx)
     {
         // All fixed: the page is short and there is nothing to fold away.
-        fe::sectionHeader("ACERCA DE");
-        fe::rowLabel("Juego");
+        fe::sectionHeader("ABOUT");
+        fe::rowLabel("Game");
         ImGui::TextColored(fe::gold(), "Dragon Ball Z: Budokai Tenkaichi 3 Recompiled");
-        fe::hint("Recompilacion estatica del juego de PS2: el codigo MIPS del disco se traduce a "
-                 "C++ y corre de forma nativa, con el hardware de PS2 emulado en el proceso host.");
+        fe::hint("Static recompilation of the PS2 game: the MIPS code on disc is translated to "
+                 "C++ and runs natively, with the PS2 hardware emulated on the host process.");
 
-        fe::sectionHeader("COMPONENTES");
-        fe::kv("Interfaz", "ImGui + SDL2 (dentro del runtime)");
-        fe::kv("Grafico", "OpenGL 3.3 / paraLLEl-GS (Vulkan)");
+        fe::sectionHeader("COMPONENTS");
+        fe::kv("Interface", "ImGui + SDL2 (inside the runtime)");
+        fe::kv("Graphics", "OpenGL 3.3 / paraLLEl-GS (Vulkan)");
         fe::kv("Video", "FFmpeg");
-        fe::kv("Audio", "motor SE/ADX del propio juego");
-        fe::kv("Mando", "SDL2 gamecontroller");
+        fe::kv("Audio", "the game's own SE/ADX engine");
+        fe::kv("Pad", "SDL2 gamecontroller");
 
-    fe::sectionHeader("CREDITOS");
-    fe::hint("PS2Recomp (ran-j) - recompilador estatico (GPL-3.0)\n"
-    "paraLLEl-GS (Arntzen-Software) - backend de GS (LGPL-3.0-or-later)\n"
-    "BT3-Recomp (z3xox) - este proyecto\n"
-    "ViveTheModder - listas de archivos AFS NTSC-U (Apache-2.0)\n"
-    "Russo One - tipografia (SIL Open Font License)\n"
-    "Musica del menu: pista 08 \"Shine\" de la banda sonora de Dragon Ball Z: Budokai Tenkaichi 3 "
-    "(2007). El audio es material con derechos de autor y NO se distribuye con el proyecto: "
-    "ponela como assets/music/music.flac y el front-end la reproduce desde ahi.");
+        fe::sectionHeader("CREDITS");
+        fe::hint("PS2Recomp (ran-j) - static recompiler (GPL-3.0)\n"
+                 "paraLLEl-GS (Arntzen-Software) - GS backend (LGPL-3.0-or-later)\n"
+                 "BT3-Recomp (z3xox) - this project\n"
+                 "ViveTheModder - NTSC-U AFS file lists (Apache-2.0)\n"
+                 "Russo One - typeface (SIL Open Font License)\n"
+                 "Menu music: track 08 \"Shine\" from the Dragon Ball Z: Budokai Tenkaichi 3 "
+                 "soundtrack (2007). The audio is copyrighted material and is NOT distributed "
+                 "with the project: drop it in as assets/music/music.flac and the front-end "
+                 "plays it from there.");
     }
 }

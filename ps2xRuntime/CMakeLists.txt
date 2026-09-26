@@ -1083,12 +1083,16 @@ endif()
 # next to the executable. The game runs from the build output, so without this the folders would
 # exist in the repo but not where a user would actually look. copy_directory MERGES, so rebuilding
 # never disturbs a pack someone has dropped in.
+# [bt3save] games/bt3/saves/ is the progressed memory-card save the front-end offers to install
+# (bug 8). Staged next to the runner so the front-end finds it in the deploy tree.
 add_custom_command(TARGET ps2EntryRunner POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/../textures" "$<TARGET_FILE_DIR:ps2EntryRunner>/data/Textures"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/../mods"     "$<TARGET_FILE_DIR:ps2EntryRunner>/mods"
-    COMMENT "Staging data/Textures and mods/ next to ps2EntryRunner"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/../games/bt3/saves" "$<TARGET_FILE_DIR:ps2EntryRunner>/saves"
+    COMMENT "Staging data/Textures, mods/ and saves/ next to ps2EntryRunner"
 )
 
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)

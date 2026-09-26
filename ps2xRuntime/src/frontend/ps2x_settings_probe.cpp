@@ -48,16 +48,16 @@ int main()
 
     const std::string tomlPath = ps2x_settings::configPath(dir);
 
-    std::printf("[1] primera carga sin archivos: escribe los defaults\n");
+    std::printf("[1] first load with no files: writes the defaults\n");
     ps2x_settings::Settings s;
     const bool existed = ps2x_settings::load(s, dir);
-    check(!existed, "load() reporta que no habia archivo");
+    check(!existed, "load() reports there was no file");
     check(std::filesystem::exists(tomlPath), "settings.toml creado");
     check(s.master == 1.0f && s.music == 1.0f, "defaults de audio");
 #if defined(_WIN32)
-    check(s.renderer == ps2x_settings::kRendererOpenGL, "renderer por defecto en Windows");
+    check(s.renderer == ps2x_settings::kRendererOpenGL, "default renderer on Windows");
 #else
-    check(s.renderer == ps2x_settings::kRendererParallelGS, "renderer por defecto fuera de Windows");
+    check(s.renderer == ps2x_settings::kRendererParallelGS, "default renderer off Windows");
 #endif
 
     std::printf("[2] round-trip de valores no default\n");
@@ -90,11 +90,11 @@ int main()
             check(ps2x_settings::save(w, dir), "save()");
 
         ps2x_settings::Settings r;
-        check(ps2x_settings::load(r, dir), "load() del archivo escrito");
+        check(ps2x_settings::load(r, dir), "load() of the written file");
         check(r.master == 0.75f && r.music == 0.30f && r.sfx == 0.20f, "audio");
         check(r.renderer == ps2x_settings::kRendererSoftware, "renderer");
         check(r.outline && r.inkStrength == 250 && r.inkColor == 0xFF8800u, "ink");
-        check(r.renderScale == 3 && r.windowMode == 2 && r.monitor == 1, "escala/modo/monitor");
+        check(r.renderScale == 3 && r.windowMode == 2 && r.monitor == 1, "scale/mode/monitor");
         check(r.fps60 && r.texPack && !r.introVideo && r.buttonLayout == 0, "flags de video");
         check(r.hudLayout == 2 && r.hudOffR == -7, "hud");
         check(r.device == 3 && r.deadzone == 0.25f && !r.overlayEnabled, "mandos");
@@ -102,7 +102,7 @@ int main()
         check(r.logLevel == 3 && r.dumpGamepad, "logging");
     }
 
-    std::printf("[3] clamps: un archivo a mano con valores fuera de rango\n");
+    std::printf("[3] clamps: a hand-written file with out-of-range values\n");
     {
         writeAll(tomlPath,
                  "[audio]\nmaster_volume = 9.0\nmusic_volume = -3.0\nsfx_volume = 5.0\n\n"
@@ -111,7 +111,7 @@ int main()
                  "[controllers]\ndevice = 9999\ndeadzone = 7.5\n\n"
                  "[logging]\nlog_level = 42\n");
         ps2x_settings::Settings c;
-        check(ps2x_settings::load(c, dir), "load() del archivo con garbage");
+        check(ps2x_settings::load(c, dir), "load() of the file with garbage");
         check(c.master == 1.0f && c.music == 0.0f && c.sfx == 0.4f, "audio clamp 0..1 / sfx 0..0.4");
         check(c.renderer == ps2x_settings::kRendererOpenGL, "d3d11 -> opengl (retirado)");
         check(c.inkStrength == 400 && c.inkWidth == 25, "ink clamp 100..400 / 25..100");
@@ -132,13 +132,13 @@ int main()
         check(ok, "migracion reportada");
         check(std::filesystem::exists(tomlPath), "settings.toml creado tras migrar");
         check(!std::filesystem::exists((std::filesystem::path(dir) / "bt3_settings.ini")),
-              "el INI viejo se borra");
+              "the old INI is dropped");
         check(m.master == 0.5f, "master_volume migrado");
         check(m.texPack && m.inkStrength == 300, "video migrado");
         check(m.logLevel == 2, "logging migrado");
         check(m.renderer == ps2x_settings::kRendererSoftware, "gpu_renderer=0 -> software");
 
-        std::printf("[4b] en el INI viejo manda 'renderer' sobre 'gpu_renderer'\n");
+        std::printf("[4b] in the old INI, 'renderer' wins over 'gpu_renderer'\n");
         std::filesystem::remove(tomlPath, ec);
         writeAll((std::filesystem::path(dir) / "bt3_settings.ini").string(),
                  "[video]\nrenderer = \"opengl\"\ngpu_renderer = 0\n");
@@ -147,7 +147,7 @@ int main()
         check(p.renderer == ps2x_settings::kRendererOpenGL, "renderer explicito gana");
     }
 
-    std::printf("[5] el overlay reescribe el archivo entero: lo que no modela debe sobrevivir\n");
+    std::printf("[5] the overlay rewrites the whole file: what it does not model must survive\n");
     {
         // This is the shape of PS2SettingsOverlay::saveSettings(): seed from disk, overwrite only
         // the keys the overlay owns, serialize the lot. Default-constructing instead silently reset
@@ -158,19 +158,19 @@ int main()
                  "ink_color = \"#1a2b3c\"\nrender_scale = 3\n\n"
                  "[frontend]\nwidth = 1600\nheight = 900\nmusic_muted = true\n");
         ps2x_settings::Settings out;
-        check(ps2x_settings::loadFromFile(out, tomlPath), "loadFromFile() lee sin escribir");
+        check(ps2x_settings::loadFromFile(out, tomlPath), "loadFromFile() reads without writing");
 
         // Only what the overlay actually edits.
         out.renderScale = 2;
         out.inkStrength = 275;
         out.inkWidth = 55;
-        check(ps2x_settings::saveToFile(out, tomlPath), "saveToFile() del overlay");
+        check(ps2x_settings::saveToFile(out, tomlPath), "the overlay's saveToFile()");
 
         ps2x_settings::Settings back;
         check(ps2x_settings::load(back, dir), "relectura");
-        check(back.renderScale == 2, "la clave editada por el overlay se aplica");
-        check(back.inkStrength == 275 && back.inkWidth == 55, "las claves ink del overlay se aplican");
-        check(back.gpu == "NVIDIA GeForce RTX 4070", "video.gpu sobrevive (el overlay no lo modela)");
+        check(back.renderScale == 2, "the key edited by the overlay is applied");
+        check(back.inkStrength == 275 && back.inkWidth == 55, "the overlay's ink keys are applied");
+        check(back.gpu == "NVIDIA GeForce RTX 4070", "video.gpu survives (the overlay does not model it)");
         check(back.feWidth == 1600 && back.feHeight == 900, "[frontend] width/height sobreviven");
         check(back.musicMuted, "[frontend] music_muted sobrevive");
 
@@ -178,19 +178,19 @@ int main()
         // over a user's file just by saving once.
         const std::string gone = (std::filesystem::path(dir) / "nada.toml").string();
         ps2x_settings::Settings untouched;
-        check(!ps2x_settings::loadFromFile(untouched, gone), "loadFromFile() falla si no hay archivo");
-        check(!std::filesystem::exists(gone), "loadFromFile() no crea el archivo");
-        check(untouched.feWidth == 800 && untouched.musicMuted == false, "y deja el struct intacto");
+        check(!ps2x_settings::loadFromFile(untouched, gone), "loadFromFile() fails when there is no file");
+        check(!std::filesystem::exists(gone), "loadFromFile() does not create the file");
+        check(untouched.feWidth == 800 && untouched.musicMuted == false, "and leaves the struct intact");
     }
 
-    std::printf("[6] un override de env no se persiste en el archivo\n");
+    std::printf("[6] an env override is not persisted in the file\n");
     {
         // The file says glow = false and the user runs one session with PS2X_GLOW=1. The overlay
         // must not write the env's value back, or the experiment outlives the variable.
         ps2x_settings::Settings fromFile;
         writeAll(tomlPath, "[video]\nglow = false\nrender_scale = 2\nink_strength = 250\n\n"
                            "[logging]\nlog_level = 2\n");
-        check(ps2x_settings::loadFromFile(fromFile, tomlPath), "lectura del archivo");
+        check(ps2x_settings::loadFromFile(fromFile, tomlPath), "reading the file");
 
         ps2x_settings::Settings live;
         live.glow = true;              // what PS2X_GLOW=1 did to the running config
@@ -200,17 +200,17 @@ int main()
 
         ps2x_settings::Settings out = fromFile;
         ps2x_settings::applyOverlayValues(out, live, ps2x_settings::kLockGlow);
-        check(!out.glow, "la clave con override de env conserva el valor del archivo");
-        check(out.renderScale == 3, "una clave SIN override de env si se escribe");
-        check(out.inkStrength == 275, "ink_strength se escribe cuando no esta bloqueado");
-        check(out.logLevel == 2, "las claves que el overlay no modela no se tocan aqui");
+        check(!out.glow, "the key with an env override keeps the file's value");
+        check(out.renderScale == 3, "a key WITHOUT an env override is written");
+        check(out.inkStrength == 275, "ink_strength is written when it is not locked");
+        check(out.logLevel == 2, "the keys the overlay does not model are not touched here");
 
         // And the full round-trip through the file, to prove it survives serialization.
         check(ps2x_settings::saveToFile(out, tomlPath), "saveToFile()");
         ps2x_settings::Settings back;
         check(ps2x_settings::load(back, dir), "relectura");
-        check(!back.glow, "glow = false sigue en el archivo despues del round-trip");
-        check(back.renderScale == 3, "render_scale = 3 llego al archivo");
+        check(!back.glow, "glow = false still in the file after the round-trip");
+        check(back.renderScale == 3, "render_scale = 3 reached the file");
 
         // The renderer case: this build cannot do parallel-gs, so it runs OpenGL, but the file must
         // keep saying parallel-gs for the build that can.
@@ -219,20 +219,20 @@ int main()
         r.renderer = ps2x_settings::kRendererParallelGS;
         rlive.renderer = ps2x_settings::kRendererOpenGL;   // the fallback this build applied
         ps2x_settings::applyOverlayValues(r, rlive, ps2x_settings::kLockRenderer);
-        check(r.renderer == ps2x_settings::kRendererParallelGS, "el fallback de build no se persiste");
+        check(r.renderer == ps2x_settings::kRendererParallelGS, "the build fallback is not persisted");
 
         // Without the lock it does persist, which is what makes a retired renderer a real migration.
         ps2x_settings::Settings d;
         d.renderer = ps2x_settings::kRendererD3D11;
         ps2x_settings::applyOverlayValues(d, rlive, 0);
-        check(d.renderer == ps2x_settings::kRendererOpenGL, "sin lock, el valor del overlay se escribe");
+        check(d.renderer == ps2x_settings::kRendererOpenGL, "without a lock, the overlay's value is written");
     }
 
-    std::printf("[7] el flag del medidor de rendimiento sobrevive un round-trip\n");
+    std::printf("[7] the perf meter flag survives a round-trip\n");
     {
         ps2x_settings::Settings w;
         w.showPerf = true;
-        check(ps2x_settings::save(w, dir), "save() con show_perf");
+        check(ps2x_settings::save(w, dir), "save() with show_perf");
         ps2x_settings::Settings r;
         check(ps2x_settings::load(r, dir), "load()");
         check(r.showPerf, "video.show_perf se guardo y se leyo");
@@ -244,7 +244,7 @@ int main()
         ps2x_settings::Settings live;
         live.showPerf = false;
         ps2x_settings::applyOverlayValues(seeded, live, 0);
-        check(!seeded.showPerf, "el overlay puede apagar show_perf (sin EnvLock)");
+        check(!seeded.showPerf, "the overlay can turn show_perf off (without EnvLock)");
 
         // And it has to be in operator==, or the front-end's "unsaved changes" test never fires and
         // the toggle is a lie: the box moves, the file never changes.
@@ -253,7 +253,7 @@ int main()
         check(!(a == b), "show_perf participa en operator==");
     }
 
-    std::printf("[8] el archivo resultante\n");
+    std::printf("[8] the resulting file\n");
     std::printf("----------------------------------------\n%s\n", readAll(tomlPath).c_str());
     std::printf("----------------------------------------\n");
 

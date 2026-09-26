@@ -1784,7 +1784,7 @@ def deploy_tree(runner: Path, out: Path, keep_music: bool = False) -> None:
         LOG.info("  dropped the menu theme (copyrighted audio, pass --with-music to keep it)")
     # Mirror what CMake stages next to the runner. Only data/Textures, never all of data/: a build
     # directory can hold a full installed game and that is gigabytes of user data.
-    for rel in ("data/Textures", "mods"):
+    for rel in ("data/Textures", "mods", "saves"):
         src = runner.parent / rel
         if src.is_dir():
             copytree_overlay(src, out / rel)

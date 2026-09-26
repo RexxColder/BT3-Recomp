@@ -23,11 +23,11 @@ namespace
     const char *const kDumpFilters[] = {
         "Dump del juego (*.iso;*.img;*.7z;*.zip;*.rar;*.tar;*.tar.gz;*.tgz)",
         "*.iso;*.img;*.7z;*.zip;*.rar;*.tar;*.tar.gz;*.tgz",
-        "Todos los archivos (*)", "*"
+        "All files (*)", "*"
     };
     const char *const kPackFilters[] = {
         "Pack de texturas (*.7z;*.zip)", "*.7z;*.zip",
-        "Todos los archivos (*)", "*"
+        "All files (*)", "*"
     };
 
     bool iequalsAscii(const std::string &a, const char *b)
@@ -252,7 +252,7 @@ void InstallWizard::startVerify(const std::string &dumpPath)
         m_verified = false;
         m_error.clear();
         m_isoPath.clear();
-        m_status = "Abriendo el dump...";
+        m_status = "Opening the dump...";
         m_phase = Phase::Busy;
     }
     m_workerRunning = true;
@@ -266,7 +266,7 @@ void InstallWizard::resolveInnerImage(const std::string &dumpPath, std::string &
     std::filesystem::remove_all(m_tempDir, ec);
     std::filesystem::create_directories(m_tempDir, ec);
 
-    setStatus("Extrayendo el archivo comprimido...");
+    setStatus("Extracting the compressed file...");
     ArchiveExtractJob job;
     job.start(dumpPath, m_tempDir.string());
     while (!job.finished())
@@ -286,12 +286,12 @@ void InstallWizard::resolveInnerImage(const std::string &dumpPath, std::string &
 
     if (!job.ok())
     {
-        err = "No se pudo descomprimir. Proba a extraer el ISO a mano.";
+        err = "Could not decompress. Try extracting the ISO by hand.";
         return;
     }
     out = findImageRecursive(m_tempDir, 3);
     if (out.empty())
-        err = "El archivo no contiene una imagen de disco (ISO/IMG).";
+        err = "The file does not contain a disc image (ISO/IMG).";
 }
 
 void InstallWizard::workerVerify()
@@ -307,7 +307,7 @@ void InstallWizard::workerVerify()
         if (iso.empty())
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_error = err.empty() ? "No se encontro una imagen de disco dentro." : err;
+            m_error = err.empty() ? "No disc image found inside." : err;
             m_phase = Phase::Failed;
             logInstall("verify FAIL: " + m_error);
             m_workerRunning = false;
@@ -315,7 +315,7 @@ void InstallWizard::workerVerify()
         }
     }
 
-    setStatus("Verificando el disco (SLUS_216.78)...");
+    setStatus("Verifying the disc (SLUS_216.78)...");
     const bool ok = DiscVerify::verifySlusFromIso(iso);
     logInstall(std::string("verify ") + (ok ? "OK" : "FAIL") + ": " + iso +
                " sha256=" + DiscVerify::kExpectedDiscElfSha256);
@@ -326,7 +326,7 @@ void InstallWizard::workerVerify()
         m_verified = ok;
         if (!ok)
         {
-            m_error = "No se pudo verificar el disco. Es la version correcta?";
+            m_error = "Could not verify the disc. Is it the right version?";
             m_phase = Phase::Failed;
         }
         else
@@ -377,7 +377,7 @@ void InstallWizard::workerExtract()
     Iso9660 iso;
     if (!iso.open(m_isoPath))
     {
-        fail("No se pudo leer la imagen ISO: " + iso.error());
+        fail("Could not read the ISO image: " + iso.error());
         return;
     }
 
@@ -406,15 +406,15 @@ void InstallWizard::workerExtract()
         std::filesystem::create_directories(out.parent_path(), ec);
         if (ec)
         {
-            fail("No se pudo crear " + out.parent_path().string());
+            fail("Could not create " + out.parent_path().string());
             return;
         }
 
-        setStatus("Extrayendo " + f.path);
+        setStatus("Extracting " + f.path);
         std::FILE *fp = std::fopen(out.string().c_str(), "wb");
         if (!fp)
         {
-            fail("No se pudo escribir " + out.string());
+            fail("Could not write " + out.string());
             return;
         }
         const std::int64_t got = iso.readFile(
@@ -427,7 +427,7 @@ void InstallWizard::workerExtract()
         std::fclose(fp);
         if (got < 0)
         {
-            fail("Error de lectura al extraer " + f.path);
+            fail("Read error while extracting " + f.path);
             return;
         }
     }
@@ -437,7 +437,7 @@ void InstallWizard::workerExtract()
     {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_doneLabel = "Convirtiendo los datos del juego a carpetas...";
+            m_doneLabel = "Converting the game data to folders...";
         }
         workerAfs();
         return;
@@ -480,7 +480,7 @@ void InstallWizard::workerAfs()
         const std::uint64_t fileTotal = ec ? 0 : 2ull * (std::uint64_t)sz;
         const std::uint64_t localBase = base;
 
-        setStatus("Convirtiendo " + p.filename().string());
+        setStatus("Converting " + p.filename().string());
         const AfsConvertResult r = convertAfsToFolder(
             p.string(), p.parent_path().string(),
             [this](const std::string &s) { setStatus(s); },
@@ -512,7 +512,7 @@ void InstallWizard::workerAfs()
     logInstall("afs done: ok=1");
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_doneLabel = "Instalacion completa. Datos del juego convertidos a carpetas.";
+        m_doneLabel = "Install complete. Game data converted to folders.";
     }
     applySummary();
 }
@@ -527,7 +527,7 @@ void InstallWizard::applySummary()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_doneLabel.empty())
-            m_doneLabel = "Instalacion completa. Disco verificado.";
+            m_doneLabel = "Install complete. Disc verified.";
         m_installed = true;
         m_phase = Phase::Done;
         m_page = Page::Summary;
@@ -547,8 +547,8 @@ void InstallWizard::installPack(const std::string &archivePath)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_error.clear();
-        m_status = "Instalando el pack de texturas...";
-        m_doneLabel = "Instalando el pack de texturas...";
+        m_status = "Installing the texture pack...";
+        m_doneLabel = "Installing the texture pack...";
         m_page = Page::Install;
         m_phase = Phase::Busy;
     }
@@ -572,7 +572,7 @@ void InstallWizard::workerPack(const std::string &archivePath, std::string archi
         m_progressKnown = job.bytesTotal() > 0;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_status = "Extrayendo el pack (" + fmtMb(job.bytesDone()) + " MB)...";
+            m_status = "Extracting the pack (" + fmtMb(job.bytesDone()) + " MB)...";
         }
         if (m_cancel.load())
             job.requestCancel();
@@ -586,7 +586,7 @@ void InstallWizard::workerPack(const std::string &archivePath, std::string archi
     {
         logInstall("pack install FAIL");
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_error = "No se pudo instalar el pack: " + job.error();
+        m_error = "Could not install the pack: " + job.error();
         m_phase = Phase::Failed;
         m_workerRunning = false;
         return;
@@ -594,7 +594,7 @@ void InstallWizard::workerPack(const std::string &archivePath, std::string archi
 
     logInstall("pack install done: ok=1");
     std::lock_guard<std::mutex> lock(m_mutex);
-    m_doneLabel = "Pack de texturas instalado en " + packDir.string();
+    m_doneLabel = "Texture pack installed in " + packDir.string();
     m_installed = true;
     m_phase = Phase::Done;
     m_page = Page::Summary;
@@ -625,45 +625,45 @@ void InstallWizard::draw()
         doneLabel = m_doneLabel;
     }
 
-    fe::sectionHeader("ASISTENTE DE INSTALACION");
+    fe::sectionHeader("INSTALL WIZARD");
 
     switch (page)
     {
     case Page::Welcome:
     {
         ImGui::TextWrapped(
-            "Antes de jugar hay que instalar los archivos del juego desde tu propia imagen del "
-            "disco. Se hace una sola vez; tus guardados y ajustes no se tocan.");
+            "Before playing you have to install the game files from your own disc image. "
+            "This is done once; your saves and settings are not touched.");
         ImGui::Spacing();
-        ImGui::BulletText("1. Apunta el asistente a tu dump (ISO o archivo comprimido).");
-        ImGui::BulletText("2. Verificamos el disco y extraemos los datos a esta carpeta.");
-        ImGui::BulletText("3. Convertimos los AFS a carpetas, que es como el juego los lee.");
+        ImGui::BulletText("1. Point the wizard at your dump (ISO or compressed archive).");
+        ImGui::BulletText("2. We verify the disc and extract the data into this folder.");
+        ImGui::BulletText("3. We convert the AFS files into folders, which is how the game reads them.");
         ImGui::Spacing();
-        if (fe::primaryButton("SIGUIENTE", ImVec2(160.0f, 30.0f)))
+        if (fe::primaryButton("NEXT", ImVec2(160.0f, 30.0f)))
             goTo(Page::Locate);
         ImGui::SameLine();
-        if (ImGui::Button("Cancelar"))
+        if (ImGui::Button("Cancel"))
             requestClose();
         break;
     }
     case Page::Locate:
     {
-        ImGui::TextWrapped("Selecciona la imagen de tu disco:");
+        ImGui::TextWrapped("Select the disc image:");
         ImGui::Spacing();
         // [isopatch] The verify below is a SHA-256 of the boot ELF, so a dump that is the right
         // title and region but code-patched inside .bin/.elf fails here with no explanation. Say so
         // up front: the runtime recompiles BIN/DBZP.BIN and the overlay tables are keyed by raw
         // address, so patching code moves every address after it and the recompiled data no longer
         // matches the image the guest loads.
-        ImGui::TextColored(fe::warnCol(), "%s", "Ojo: el dump debe ser del titulo y la region correctos (USA).");
+        ImGui::TextColored(fe::warnCol(), "%s", "Note: the dump must be the correct title and region (USA).");
         ImGui::TextWrapped("%s",
-                           "Si esta parcheado a nivel de codigo dentro de los .bin o el .elf no va a funcionar: "
-                           "el juego se recompila, asi que un parche que mueve una instruccion invalida las "
-                           "tablas de direcciones. Los demas parches (texturas, parcheado de disco, "
-                           "traducciones) no tocan el codigo y si sirven.");
+                           "If it is code-patched inside the .bin or the .elf it will not work: "
+                           "the game is recompiled, so a patch that moves an instruction invalidates "
+                           "the address tables. The other patches (textures, disc patching, "
+                           "translations) do not touch code and do work.");
         ImGui::Spacing();
         if (dumpPath.empty())
-            ImGui::TextDisabled("Ningun archivo seleccionado");
+            ImGui::TextDisabled("No file selected");
         else
             ImGui::TextWrapped("%s", dumpPath.c_str());
         ImGui::Spacing();
@@ -671,29 +671,29 @@ void InstallWizard::draw()
         if (phase == Phase::Busy)
             ImGui::TextColored(fe::warnCol(), "%s", st.c_str());
         else if (verified)
-            ImGui::TextColored(fe::okCol(), "Disco verificado (SHA-256 %s...)",
+            ImGui::TextColored(fe::okCol(), "Disc verified (SHA-256 %s...)",
                                std::string(DiscVerify::kExpectedDiscElfSha256).substr(0, 16).c_str());
         else if (!err.empty())
             ImGui::TextColored(fe::badCol(), "%s", err.c_str());
         else
-            ImGui::TextDisabled("Esperando una imagen...");
+            ImGui::TextDisabled("Waiting for an image...");
 
         ImGui::Spacing();
-        if (ImGui::Button("Seleccionar imagen..."))
+        if (ImGui::Button("Select image..."))
             m_wantedPick = PickKind::Dump;
         ImGui::SameLine();
         ImGui::BeginDisabled(dumpPath.empty() || phase == Phase::Busy);
-        if (ImGui::Button("Verificar de nuevo"))
+        if (ImGui::Button("Verify again"))
             startVerify(dumpPath);
         ImGui::EndDisabled();
 
         ImGui::Spacing();
         ImGui::BeginDisabled(!verified || phase == Phase::Busy);
-        if (fe::primaryButton("INSTALAR", ImVec2(160.0f, 30.0f), verified))
+        if (fe::primaryButton("INSTALL", ImVec2(160.0f, 30.0f), verified))
             startInstall();
         ImGui::EndDisabled();
         ImGui::SameLine();
-        if (ImGui::Button("Atras"))
+        if (ImGui::Button("Back"))
         {
             if (m_reinstall)
                 requestClose();
@@ -738,7 +738,7 @@ void InstallWizard::draw()
                 std::snprintf(line, sizeof line, "%s MB / %s MB   -   %s", fmtMb(done).c_str(),
                               fmtMb(total).c_str(), st.c_str());
             ImGui::TextDisabled("%s", line);
-            if (ImGui::Button("Cancelar"))
+            if (ImGui::Button("Cancel"))
                 m_cancel = true;
         }
         break;

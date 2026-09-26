@@ -89,7 +89,7 @@ int main()
     bool sectionOpen = true;
     int stackBaseline = -1;
 
-    std::printf("[1] 300 frames con 3 secciones plegables y 3 combos cada una\n");
+    std::printf("[1] 300 frames with 3 collapsible sections and 3 combos each\n");
     for (int frame = 0; frame < 300; ++frame)
     {
         beginFrame();
@@ -127,17 +127,17 @@ int main()
         }
         if (windowStack() != stackBaseline)
         {
-            check(false, "la pila de ventanas vuelve a su base tras cada frame");
+            check(false, "the window stack returns to its base after every frame");
             std::printf("       frame=%d stack=%d base=%d\n", frame, windowStack(), stackBaseline);
             break;
         }
     }
     check(comboDepth() == 0, "BeginComboDepth termina en 0 (no se filtra hacia negativo)");
-    check(windowStack() == stackBaseline, "la pila de ventanas no crecio (nada quedo sin cerrar)");
-    check(ImGui::GetCurrentContext()->BeginPopupStack.Size == 0, "la pila de popups queda vacia");
-    check(sectionOpen, "la seccion sigue como el usuario la dejo");
+    check(windowStack() == stackBaseline, "the window stack did not grow (nothing left unclosed)");
+    check(ImGui::GetCurrentContext()->BeginPopupStack.Size == 0, "the popup stack ends up empty");
+    check(sectionOpen, "the section stays as the user left it");
 
-    std::printf("[2] ningun error de ImGui en toda la corrida\n");
+    std::printf("[2] no ImGui error during the whole run\n");
     check(g_errors == 0, "ErrorCountCurrentFrame quedo en 0 siempre");
     if (g_errors)
         std::printf("       errores=%d\n", g_errors);

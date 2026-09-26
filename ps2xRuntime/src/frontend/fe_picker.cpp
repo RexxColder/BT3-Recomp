@@ -353,7 +353,7 @@ namespace frontend
 
             ImGui::Separator();
             if (m_selected.empty())
-                ImGui::TextDisabled("Doble click en un archivo para elegirlo.");
+                ImGui::TextDisabled("Double-click a file to choose it.");
             else
                 ImGui::TextWrapped("%s", m_selected.string().c_str());
             ImGui::TextDisabled("%zu entradas%s", m_entries.size(),
@@ -364,7 +364,7 @@ namespace frontend
                 acceptCurrent();
             ImGui::EndDisabled();
             ImGui::SameLine();
-            if (ImGui::Button("Cancelar"))
+            if (ImGui::Button("Cancel"))
                 m_open = false;
             // Inside the if, like comboRowStr: a Begin* that returns false opened no window.
             // BeginPopupModal even ends the popup itself when its own Begin fails, so ending it

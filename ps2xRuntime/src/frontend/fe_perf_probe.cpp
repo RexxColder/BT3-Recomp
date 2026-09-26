@@ -40,10 +40,10 @@ static void closeWindow()
 
 int main()
 {
-    std::printf("[1] sin presents, el estado es invalido (no 0 fps presented as real)\n");
+    std::printf("[1] no presents, the state is invalid (not 0 fps presented as real)\n");
     {
         const ps2x::PerfStatus p = ps2x::GetPerfStatus();
-        check(!p.valid, "valid == false antes del primer frame");
+        check(!p.valid, "valid == false before the first frame");
         check(near(p.displayFps, 0.0), "displayFps arranca en 0");
     }
 
@@ -52,15 +52,15 @@ int main()
         for (int i = 0; i < 60; ++i)
             ps2x::PerfTick(1.0 / 60.0);
         const ps2x::PerfStatus p = ps2x::GetPerfStatus();
-        check(p.valid, "valid tras el primer window");
+        check(p.valid, "valid after the first window");
         check(near(p.displayFps, 60.0, 0.5), "displayFps ~ 60");
         check(near(p.frameMsP50, 16.667, 0.05), "p50 ~ 16.7 ms");
         check(near(p.frameMsP95, 16.667, 0.05), "p95 ~ 16.7 ms");
         check(near(p.frameMsMax, 16.667, 0.05), "max ~ 16.7 ms");
-        check(p.frameSamples == 60, "60 muestras en el anillo");
+        check(p.frameSamples == 60, "60 samples in the ring");
     }
 
-    std::printf("[3] un 10%% de frames lento: el p50 no se mueve, el p95 y el max si\n");
+    std::printf("[3] 10%% of frames slow: p50 does not move, p95 and max do\n");
     {
         // This is the shape of bugs 4 and 5: mostly-16 ms with a visible share of slow frames. A mean
         // here reads ~20 ms and looks like mild jitter; p95 names the slow frames. The rate is 10% and
@@ -70,17 +70,17 @@ int main()
             ps2x::PerfTick((i % 10 == 0) ? 0.050 : (1.0 / 60.0));
         closeWindow();
         const ps2x::PerfStatus p = ps2x::GetPerfStatus();
-        check(p.frameMsP50 < 17.0, "p50 sigue en 16.7 (los frames lentos no lo mueven)");
-        check(near(p.frameMsP95, 50.0, 0.01), "p95 == 50.0: los frames lentos aparecen arriba");
-        check(near(p.frameMsMax, 50.0, 0.01), "max == 50.0, el frame real");
+        check(p.frameMsP50 < 17.0, "p50 stays at 16.7 (the slow frames do not move it)");
+        check(near(p.frameMsP95, 50.0, 0.01), "p95 == 50.0: the slow frames show up here");
+        check(near(p.frameMsMax, 50.0, 0.01), "max == 50.0, the real frame");
         double sum = 0.0;
         for (int i = 0; i < p.frameSamples; ++i)
             sum += 16.667;
-        std::printf("       el promedio habria leido ~%.1f ms y no diria nada\n",
+        std::printf("       the average would have read ~%.1f ms and said nothing\n",
                     (sum + 50.0 * (p.frameSamples / 10)) / static_cast<double>(p.frameSamples));
     }
 
-    std::printf("[4] un hitch raro lo ve max, NO p95 -- y esa es la razon de tener los tres\n");
+    std::printf("[4] a rare hitch is seen by max, NOT p95 -- which is why we have all three\n");
     {
         // One 80 ms frame in ~180 is 0.5%. p95 covers the worst 5%, so it correctly does not see it;
         // max does. Asserting that here on purpose: it is the honest limit of a percentile, and the
@@ -91,10 +91,10 @@ int main()
         closeWindow();
         const ps2x::PerfStatus p = ps2x::GetPerfStatus();
         check(near(p.frameMsP95, 16.667, 0.05), "p95 NO ve un hitch de 0.5%% (limite real del percentil)");
-        check(near(p.frameMsMax, 80.0, 0.01), "max si lo ve: por eso esta al lado");
+        check(near(p.frameMsMax, 80.0, 0.01), "max does see it: that is why it is here");
     }
 
-    std::printf("[5] el p95 es un frame que ocurrio, no un punto entre dos\n");
+    std::printf("[5] the p95 is a frame that happened, not a point between two\n");
     {
         // Half at 10 ms, half at 30 ms. Nearest-rank p95 must land ON 30; a linear interpolation
         // would report 29, a frame that never happened.
@@ -106,15 +106,15 @@ int main()
         check(p.frameMsMax >= 30.0, "max >= 30.0");
     }
 
-    std::printf("[6] sin fuente registrada, el GPU dice 'no medido' (cobertura 0), no 0%%\n");
+    std::printf("[6] with no source registered, the GPU says 'not measured' (coverage 0), not 0%%\n");
     {
         const ps2x::PerfStatus p = ps2x::GetPerfStatus();
-        check(p.gpuSource == ps2x::GpuSource::None, "la fuente arranca en None");
-        check(near(p.gpuCoverage, 0.0), "cobertura 0 con fuente desconocida");
-        check(near(p.gpuBusyPct, 0.0), "y el porcentaje en 0, que la UI debe rotular como n/d");
+        check(p.gpuSource == ps2x::GpuSource::None, "the source starts as None");
+        check(near(p.gpuCoverage, 0.0), "coverage 0 with an unknown source");
+        check(near(p.gpuBusyPct, 0.0), "and the percentage at 0, which the UI must label as n/a");
     }
 
-    std::printf("[7] cobertura por fuente\n");
+    std::printf("[7] coverage by source\n");
     {
         // 100 ms of GPU work inside a 1 s window is 10% busy, and spread over the window's 60 frames
         // that is 1.67 ms per frame. Both units have to be right: the percentage is the one to hold
@@ -124,9 +124,9 @@ int main()
         for (int i = 0; i < 60; ++i)
             ps2x::PerfTick(1.0 / 60.0);
         ps2x::PerfStatus p = ps2x::GetPerfStatus();
-        check(near(p.gpuCoverage, 0.0), "OpenGL draw-list: cobertura 0 (se muestra como minimo)");
-        check(near(p.gpuBusyPct, 10.0, 0.5), "100 ms de GPU en 1 s -> ~10 %%");
-        check(near(p.gpuMsPerFrame, 1.667, 0.05), "y ~1.67 ms por frame");
+        check(near(p.gpuCoverage, 0.0), "OpenGL draw-list: coverage 0 (shown as a minimum)");
+        check(near(p.gpuBusyPct, 10.0, 0.5), "100 ms of GPU in 1 s -> ~10 %%");
+        check(near(p.gpuMsPerFrame, 1.667, 0.05), "-> ~1.67 ms per frame");
         check(p.gpuSamples == 1 && p.gpuMeasured(), "1 muestra, y gpuMeasured() da true");
 
         ps2x::PerfSetGpuSource(ps2x::GpuSource::VulkanTimestamps, ps2x::GpuQuality::FullFrame);
@@ -134,20 +134,20 @@ int main()
         for (int i = 0; i < 60; ++i)
             ps2x::PerfTick(1.0 / 60.0);
         p = ps2x::GetPerfStatus();
-        check(near(p.gpuCoverage, 1.0), "Vulkan: cobertura 1.0, comparable con el Task Manager");
-        check(near(p.gpuBusyPct, 10.0, 0.5), "el mismo trabajo se reporta igual");
+        check(near(p.gpuCoverage, 1.0), "Vulkan: coverage 1.0, comparable with Task Manager");
+        check(near(p.gpuBusyPct, 10.0, 0.5), "the same work reports the same");
 
         // A window with no GPU work at all must read 0, not "unknown" -- and a source we never set
         // must read unknown, not 0. That distinction is the whole point of the field.
         ps2x::PerfSetGpuSource(ps2x::GpuSource::SoftwareCpu, ps2x::GpuQuality::CpuOnly);
         closeWindow();
         p = ps2x::GetPerfStatus();
-        check(p.gpuSource == ps2x::GpuSource::SoftwareCpu, "software: la fuente lo dice");
-        check(near(p.gpuCoverage, 0.0), "software: cobertura 0, no se presenta como GPU ociosa");
-        check(near(p.gpuBusyPct, 0.0), "y 0% real, no un 0 que hides una falta de medicion");
+        check(p.gpuSource == ps2x::GpuSource::SoftwareCpu, "software: the source says so");
+        check(near(p.gpuCoverage, 0.0), "software: coverage 0, not reported as an idle GPU");
+        check(near(p.gpuBusyPct, 0.0), "and a real 0%, not a 0 that hides a missing measurement");
     }
 
-    std::printf("[8] una ventana sin muestras NO es una GPU ociosa\n");
+    std::printf("[8] a window with no samples is NOT an idle GPU\n");
     {
         // This is the case the whole gpuSource/gpuQuality pair existed for, and it was found by
         // measuring: three windows in a row read 61% -> 0.65% -> 0.61% because the guest stopped
@@ -155,20 +155,20 @@ int main()
         ps2x::PerfSetGpuSource(ps2x::GpuSource::OpenGL, ps2x::GpuQuality::DrawListOnly);
         closeWindow();                       // a full window with nothing fed
         ps2x::PerfStatus p = ps2x::GetPerfStatus();
-        check(p.gpuSource == ps2x::GpuSource::OpenGL, "la fuente sigue registrada");
+        check(p.gpuSource == ps2x::GpuSource::OpenGL, "the source stays registered");
         check(p.gpuSamples == 0, "gpuSamples == 0");
-        check(!p.gpuMeasured(), "gpuMeasured() da false: la ventana no se midio");
-        check(near(p.gpuBusyPct, 0.0), "gpuBusyPct == 0, que SOLO se lee bien con gpuSamples == 0 al lado");
+        check(!p.gpuMeasured(), "gpuMeasured() returns false: the window was not measured");
+        check(near(p.gpuBusyPct, 0.0), "gpuBusyPct == 0, which only reads correctly with gpuSamples == 0 alongside");
 
         // And a real idle GPU is a different thing: samples landed, each one measuring nothing.
         ps2x::PerfAddGpuBusyNs(0ull, 4, 0);
         closeWindow();
         p = ps2x::GetPerfStatus();
-        check(p.gpuSamples == 4 && p.gpuMeasured(), "4 muestras que miden 0: eso SI es una GPU ociosa");
-        check(near(p.gpuBusyPct, 0.0), "y tambien da 0% -- de ahi la necesidad del contador");
+        check(p.gpuSamples == 4 && p.gpuMeasured(), "4 samples measuring 0: that IS an idle GPU");
+        check(near(p.gpuBusyPct, 0.0), "and also gives 0% -- hence the need for the counter");
     }
 
-    std::printf("[9] las muestras perdidas se cuentan y se reportan\n");
+    std::printf("[9] dropped samples are counted and reported\n");
     {
         ps2x::PerfSetGpuSource(ps2x::GpuSource::OpenGL, ps2x::GpuQuality::DrawListOnly);
         ps2x::PerfAddGpuBusyNs(0, 0, 3);
@@ -176,12 +176,12 @@ int main()
             ps2x::PerfTick(1.0 / 60.0);
         const ps2x::PerfStatus p = ps2x::GetPerfStatus();
         check(p.gpuSamplesDropped == 3, "gpuSamplesDropped == 3");
-        check(p.gpuSamples == 0, "y no cuentan como muestras: una muestra perdida no es una medida");
+        check(p.gpuSamples == 0, "and do not count as samples: a dropped sample is not a measurement");
         closeWindow();
-        check(ps2x::GetPerfStatus().gpuSamplesDropped == 0, "el contador se reinicia por window");
+        check(ps2x::GetPerfStatus().gpuSamplesDropped == 0, "the counter resets per window");
     }
 
-    std::printf("[10] los contadores de CPU llegan acumulados y hay que diferenciarlos\n");
+    std::printf("[10] the CPU counters arrive cumulative and must be differenced\n");
     {
         // Caught by running it: guest_pct came out at 413% and once at 1572%, because an absolute
         // nanosecond count was being divided by a one-second window. PerfPublishCpu takes CUMULATIVE
@@ -192,7 +192,7 @@ int main()
         // against, so that window has no CPU data. It reports 0 rather than a guess.
         ps2x::PerfPublishCpu(300ull * ms, 1000ull * ms, 20ull * ms);
         closeWindow();
-        check(near(ps2x::GetPerfStatus().guestPct, 0.0, 0.01), "el primer publish es linea de base: 0%%");
+        check(near(ps2x::GetPerfStatus().guestPct, 0.0, 0.01), "the first publish is the baseline: 0%%");
 
         // Second window: the guest gained 300 ms of busy time over 1 s of wall -> 30%.
         ps2x::PerfPublishCpu(600ull * ms, 2000ull * ms, 40ull * ms);
@@ -215,16 +215,16 @@ int main()
         closeWindow();
         p = ps2x::GetPerfStatus();
         check(near(p.guestPct, 0.0, 0.01), "un reset de contador da 0%%, no unWrap gigante");
-        check(p.guestPct >= 0.0 && p.guestPct <= 100.0, "el rango es siempre 0..100");
+        check(p.guestPct >= 0.0 && p.guestPct <= 100.0, "the range is always 0..100");
     }
 
-    std::printf("[11] refresh nominal y habilitacion del overlay\n");    {
+    std::printf("[11] nominal refresh and overlay enable\n");    {
         ps2x::PerfSetRefreshHz(144);
         for (int i = 0; i < 60; ++i)
             ps2x::PerfTick(1.0 / 60.0);
         check(ps2x::GetPerfStatus().displayRefreshHz == 144, "refresh nominal 144 Hz");
         ps2x::SetPerfOverlayEnabled(true);
-        check(ps2x::PerfOverlayEnabled(), "el overlay se puede armar");
+        check(ps2x::PerfOverlayEnabled(), "the overlay can be assembled");
         ps2x::SetPerfOverlayEnabled(false);
         check(!ps2x::PerfOverlayEnabled(), "y desarmar");
     }

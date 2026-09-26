@@ -132,7 +132,7 @@ namespace gpu
         if (exe.empty())
         {
             if (error)
-                *error = "no se pudo obtener la ruta del ejecutable";
+                *error = "could not get the executable path";
             return false;
         }
 
@@ -145,7 +145,7 @@ namespace gpu
             if (list.empty())
             {
                 if (error)
-                    *error = "no se pudieron enumerar las GPU";
+                    *error = "could not enumerate the GPUs";
                 return false;
             }
             const Adapter *chosen = nullptr;
@@ -162,7 +162,7 @@ namespace gpu
             if (!chosen)
             {
                 if (error)
-                    *error = "la GPU elegida ya no esta conectada";
+                    *error = "the selected GPU is no longer connected";
                 return false;
             }
             preference = (biggest && chosen != biggest) ? 1 : 2;
@@ -173,7 +173,7 @@ namespace gpu
                            &key, nullptr) != ERROR_SUCCESS)
         {
             if (error)
-                *error = "no se pudo abrir la clave de preferencias de Windows";
+                *error = "could not open the Windows preferences key";
             return false;
         }
         char data[64] = "";
@@ -186,11 +186,11 @@ namespace gpu
         if (rc != ERROR_SUCCESS)
         {
             if (error)
-                *error = "Windows no acepto la preferencia de GPU";
+                *error = "Windows did not accept the GPU preference";
             return false;
         }
         if (error)
-            *error = preference > 0 ? "se aplica al reiniciar el juego" : "preferencia borrada";
+            *error = preference > 0 ? "applies when the game restarts" : "preferencia borrada";
         return true;
 #else
         (void)adapterName;

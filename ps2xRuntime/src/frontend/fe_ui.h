@@ -107,7 +107,7 @@ namespace fe
                 ImGui::Separator();
                 ImGui::TextWrapped("%s", help);
                 ImGui::Separator();
-                if (ImGui::Button("Cerrar", ImVec2(90.0f, 0.0f)))
+                if (ImGui::Button("Close", ImVec2(90.0f, 0.0f)))
                     ImGui::CloseCurrentPopup();
                 // Inside the if: BeginPopup returning false opened no window, so ending one here
                 // would be EndPopup() in the parent window, once per section per frame.

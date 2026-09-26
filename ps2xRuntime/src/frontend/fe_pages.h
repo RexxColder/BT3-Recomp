@@ -19,6 +19,14 @@ namespace frontend
         // Set by a page when it wants the shell to switch to the install view / open a picker.
         bool requestInstallWizard = false;
         bool requestPackInstall = false;
+        // [bt3save] Set by the Misc page when the user asks to install the progressed
+        // memory-card save. The shell does the file work (backup + copy) off the UI path.
+        bool requestSaveInstall = false;
+        bool installSaveMode = false;
+        // Filled by the shell after an install so the page can report the outcome.
+        std::string saveInstallMsg;
+        bool saveInstallOk = false;
+        uint64_t saveInstallMsgFrame = 0;
           // Data verification hashes the boot ELF, so it is done once, the first time the Misc
           // page is actually drawn (not on every front-end launch).
           int dataState = -1;

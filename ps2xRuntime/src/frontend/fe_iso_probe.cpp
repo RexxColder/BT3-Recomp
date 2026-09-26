@@ -39,7 +39,7 @@ int main(int argc, char **argv)
         h.update(d, n);
         content.append(d, n);
     });
-    std::printf("leidos: %lld bytes, contenido='%s'\n", (long long)got, content.c_str());
+    std::printf("read: %lld bytes, content='%s'\n", (long long)got, content.c_str());
     std::printf("sha256(SLUS): %s\n", h.finalHex().c_str());
 
     const Iso9660::File *notes = iso.find("SUB/NOTES.TXT");
@@ -53,7 +53,7 @@ int main(int argc, char **argv)
     std::printf("subdirectorio: '%s'\n", sub.c_str());
 
     const bool verified = DiscVerify::verifySlusFromIso(argv[1]);
-    std::printf("verifySlusFromIso (contra el hash real del juego): %s  [esperado false con un ISO sintetico]\n",
+    std::printf("verifySlusFromIso (against the real game hash): %s  [expected false with a synthetic ISO]\n",
                 verified ? "true" : "false");
     std::printf("PROBE OK\n");
     return 0;
